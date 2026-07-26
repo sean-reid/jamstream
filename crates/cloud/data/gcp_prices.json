@@ -1,0 +1,17 @@
+{
+  "comment": "Approximate public on-demand pricing for the e2-small machine type, in integer microusd per hour. Snapshot of cloud.google.com/compute/vm-instance-pricing; refresh this file when GCP publishes new rates or when a region is added to the catalog in src/providers/gcp.rs. Egress is a flat approximation of premium-tier internet egress.",
+  "machine_type": "e2-small",
+  "egress_microusd_per_gb": 120000,
+  "included_egress_gb": 0,
+  "hourly_microusd": {
+    "us-central1": 16800,
+    "us-east1": 16800,
+    "us-east4": 18900,
+    "us-west1": 16800,
+    "us-west2": 20200,
+    "northamerica-northeast1": 18500,
+    "europe-west1": 18500,
+    "europe-west2": 21700,
+    "europe-west3": 21700
+  }
+}
