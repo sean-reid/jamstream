@@ -10,3 +10,5 @@ repository.workspace = true
 jamstream-protocol.workspace = true
 jamstream-engine.workspace = true
 rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
