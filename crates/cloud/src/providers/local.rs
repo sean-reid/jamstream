@@ -556,6 +556,9 @@ mod process {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The contract test spawns a shell-script fake server, so it and its
+    // import are unix-gated.
+    #[cfg(unix)]
     use crate::contract::assert_provider_contract;
     use crate::types::InstanceClass;
 

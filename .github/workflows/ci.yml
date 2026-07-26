@@ -36,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # libasound2-dev: cpal/alsa-sys. libxkbcommon-dev + libwayland-dev:
       # eframe 0.35 (winit/wayland) build-time requirements on Linux.
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -68,7 +68,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - if: runner.os == 'macOS'
         run: cargo test --workspace --exclude jamstream-harness
       - if: runner.os != 'macOS'
@@ -117,7 +117,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - name: Workspace coverage (lcov)
         run: cargo llvm-cov --workspace --exclude jamstream-client --lcov --output-path lcov.info
       - name: Coverage summary
