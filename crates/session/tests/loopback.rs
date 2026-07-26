@@ -1,0 +1,791 @@
+//! In-memory loopback of ServerCore against several ClientCores: a tiny
+//! shuttle pumps datagrams between fixed fake addresses while virtual time
+//! advances in 2.5 ms steps. No sockets, no threads, no real clock.
+
+use std::net::SocketAddr;
+
+use jamstream_protocol::control::{ControlLink, ControlMsg, MemberInfo};
+use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
+use jamstream_protocol::invite::{Invite, Issuer, Token};
+use jamstream_protocol::media::{FrameDuration, MediaFrame};
+use jamstream_protocol::transport::{Initiator, Session, generate_keypair};
+use jamstream_protocol::wire::{self, Packet};
+use jamstream_session::{
+    ClientCore, ClientEvent, ClientState, ServerConfig, ServerCore, ServerEvent,
+};
+use proptest::prelude::*;
+
+const STEP_MS: f64 = 2.5;
+
+fn addr_of(n: u8) -> SocketAddr {
+    format!("10.0.0.{n}:5000").parse().unwrap()
+}
+
+struct TestClient {
+    addr: SocketAddr,
+    core: ClientCore,
+    role: Role,
+    /// Some(hz): push a sine at this frequency every step (0.0 = silence).
+    tone_hz: Option<f32>,
+    frames_pushed: u64,
+    playout: Vec<f32>,
+    blocked: bool,
+    events: Vec<ClientEvent>,
+}
+
+struct Harness {
+    issuer: Issuer,
+    server_pk: [u8; 32],
+    session_id: SessionId,
+    server: ServerCore,
+    clients: Vec<TestClient>,
+    t: f64,
+    now_unix: u64,
+    to_server: Vec<(SocketAddr, Vec<u8>)>,
+    server_events: Vec<ServerEvent>,
+}
+
+impl Harness {
+    fn new(max_musicians: usize, max_listeners: usize) -> Self {
+        let issuer = Issuer::generate();
+        let kp = generate_keypair();
+        let session_id = SessionId::generate();
+        let server = ServerCore::new(ServerConfig {
+            session_id,
+            server_private: kp.private.to_vec(),
+            server_public: kp.public,
+            issuer_pk: issuer.public_key(),
+            max_musicians,
+            max_listeners,
+            member_timeout_ms: 10_000,
+        });
+        Self {
+            issuer,
+            server_pk: kp.public,
+            session_id,
+            server,
+            clients: Vec::new(),
+            t: 0.0,
+            now_unix: 1_000,
+            to_server: Vec::new(),
+            server_events: Vec::new(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.t as u64
+    }
+
+    fn mint(&self, member: u16, role: Role) -> Invite {
+        self.issuer.mint(
+            self.session_id,
+            vec![addr_of(1)],
+            self.server_pk,
+            Token {
+                member_id: MemberId(member),
+                role,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId::generate(),
+            },
+        )
+    }
+
+    fn add_client(&mut self, invite: &Invite, tone_hz: Option<f32>) -> usize {
+        let idx = self.clients.len();
+        let addr = addr_of(10 + idx as u8);
+        let (core, first) = ClientCore::connect(invite, self.now_ms()).unwrap();
+        self.to_server.push((addr, first));
+        self.clients.push(TestClient {
+            addr,
+            core,
+            role: invite.token.role,
+            tone_hz,
+            frames_pushed: 0,
+            playout: Vec::new(),
+            blocked: false,
+            events: Vec::new(),
+        });
+        idx
+    }
+
+    /// One 2.5 ms step: capture and poll every client, deliver to the
+    /// server, tick, deliver back, then pull playout.
+    fn step(&mut self) {
+        let now = self.now_ms();
+        for i in 0..self.clients.len() {
+            let c = &mut self.clients[i];
+            let mut dgs: Vec<Vec<u8>> = Vec::new();
+            if c.role == Role::Musician
+                && let Some(hz) = c.tone_hz
+            {
+                let mut pcm = [0.0f32; 120];
+                for (j, s) in pcm.iter_mut().enumerate() {
+                    let n = (c.frames_pushed * 120 + j as u64) as f32;
+                    *s = (std::f32::consts::TAU * hz * n / 48_000.0).sin() * 0.5;
+                }
+                c.frames_pushed += 1;
+                dgs.extend(c.core.push_capture(now, &pcm));
+            }
+            dgs.extend(c.core.poll(now));
+            let (addr, blocked) = (c.addr, c.blocked);
+            if !blocked {
+                self.to_server.extend(dgs.into_iter().map(|d| (addr, d)));
+            }
+        }
+
+        let batch = std::mem::take(&mut self.to_server);
+        let mut to_clients = Vec::new();
+        for (src, dg) in batch {
+            to_clients.extend(self.server.handle_datagram(now, self.now_unix, src, &dg));
+        }
+        to_clients.extend(self.server.tick(now));
+        self.server_events.extend(self.server.events());
+
+        for (addr, dg) in to_clients {
+            let Some(i) = self.clients.iter().position(|c| c.addr == addr) else {
+                continue;
+            };
+            if self.clients[i].blocked {
+                continue;
+            }
+            let replies = self.clients[i].core.handle_datagram(now, &dg);
+            self.to_server
+                .extend(replies.into_iter().map(|d| (addr, d)));
+        }
+
+        for c in &mut self.clients {
+            let mut buf = [0.0f32; 240];
+            c.core.pull_playout(&mut buf);
+            c.playout.extend_from_slice(&buf);
+            c.events.extend(c.core.events());
+        }
+        self.t += STEP_MS;
+    }
+
+    fn run(&mut self, steps: usize) {
+        for _ in 0..steps {
+            self.step();
+        }
+    }
+
+    fn run_ms(&mut self, ms: u64) {
+        self.run((ms as f64 / STEP_MS) as usize);
+    }
+
+    /// Coarse 100 ms hops for timeout scenarios: control keepalives flow,
+    /// no capture or playout. Legal because the cores take time as input.
+    fn advance_quiet(&mut self, ms: u64) {
+        for _ in 0..ms / 100 {
+            self.t += 100.0;
+            let now = self.now_ms();
+            for i in 0..self.clients.len() {
+                let c = &mut self.clients[i];
+                let dgs = c.core.poll(now);
+                let (addr, blocked) = (c.addr, c.blocked);
+                if !blocked {
+                    self.to_server.extend(dgs.into_iter().map(|d| (addr, d)));
+                }
+            }
+            let batch = std::mem::take(&mut self.to_server);
+            let mut to_clients = Vec::new();
+            for (src, dg) in batch {
+                to_clients.extend(self.server.handle_datagram(now, self.now_unix, src, &dg));
+            }
+            to_clients.extend(self.server.tick(now));
+            self.server_events.extend(self.server.events());
+            for (addr, dg) in to_clients {
+                let Some(i) = self.clients.iter().position(|c| c.addr == addr) else {
+                    continue;
+                };
+                if self.clients[i].blocked {
+                    continue;
+                }
+                let replies = self.clients[i].core.handle_datagram(now, &dg);
+                self.to_server
+                    .extend(replies.into_iter().map(|d| (addr, d)));
+            }
+            for c in &mut self.clients {
+                c.events.extend(c.core.events());
+            }
+        }
+    }
+
+    fn clear_playouts(&mut self) {
+        for c in &mut self.clients {
+            c.playout.clear();
+        }
+    }
+
+    fn last_roster(&self, i: usize) -> Option<&Vec<MemberInfo>> {
+        self.clients[i].events.iter().rev().find_map(|e| match e {
+            ClientEvent::Roster(r) => Some(r),
+            _ => None,
+        })
+    }
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+fn tail_rms(h: &Harness, i: usize, samples: usize) -> f32 {
+    let p = &h.clients[i].playout;
+    rms(&p[p.len().saturating_sub(samples)..])
+}
+
+/// A protocol-level member driven directly, bypassing ClientCore, for
+/// crafting traffic an honest client cannot produce.
+struct RawMember {
+    id: MemberId,
+    addr: SocketAddr,
+    session: Session,
+    link: ControlLink,
+}
+
+fn raw_join(h: &mut Harness, invite: &Invite, addr: SocketAddr) -> RawMember {
+    let (init, pkt) = Initiator::new(invite).unwrap();
+    let now = h.now_ms();
+    let replies = h.server.handle_datagram(now, h.now_unix, addr, &pkt);
+    let (_, resp) = replies
+        .into_iter()
+        .find(|(a, _)| *a == addr)
+        .expect("handshake response");
+    let Packet::HandshakeResp { noise } = wire::parse(&resp).unwrap() else {
+        panic!("expected handshake response");
+    };
+    let (session, welcome) = init.finish(noise).unwrap();
+    RawMember {
+        id: welcome.member_id,
+        addr,
+        session,
+        link: ControlLink::new(),
+    }
+}
+
+impl RawMember {
+    fn send_control(&mut self, h: &mut Harness, msg: ControlMsg) {
+        self.link.send(msg).unwrap();
+        let now = h.now_ms();
+        for dg in self.link.poll(now) {
+            let sealed = self.session.seal(self.id, &dg).unwrap();
+            // Replies (acks) are dropped; this member never listens.
+            let _ = h
+                .server
+                .handle_datagram(now, h.now_unix, self.addr, &sealed);
+        }
+    }
+
+    fn send_media(&mut self, h: &mut Harness, frame: &[u8]) {
+        let sealed = self.session.seal(self.id, frame).unwrap();
+        let now = h.now_ms();
+        let _ = h
+            .server
+            .handle_datagram(now, h.now_unix, self.addr, &sealed);
+    }
+}
+
+#[test]
+fn three_musicians_join_and_roster() {
+    let mut h = Harness::new(10, 20);
+    for id in 0..3u16 {
+        let inv = h.mint(id, Role::Musician);
+        h.add_client(&inv, Some(0.0));
+    }
+    h.run_ms(1_500);
+
+    assert_eq!(h.server.musicians_connected(), 3);
+    for i in 0..3 {
+        assert_eq!(*h.clients[i].core.state(), ClientState::Joined);
+        assert!(h.clients[i].events.contains(&ClientEvent::Joined));
+        let roster = h.last_roster(i).expect("roster event");
+        assert_eq!(roster.len(), 3);
+        assert!(roster.iter().all(|m| m.connected));
+        assert_eq!(
+            roster.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![MemberId(0), MemberId(1), MemberId(2)]
+        );
+    }
+    let joined = h
+        .server_events
+        .iter()
+        .filter(|e| matches!(e, ServerEvent::MemberJoined { .. }))
+        .count();
+    assert_eq!(joined, 3);
+    assert!(h.server_events.contains(&ServerEvent::MemberJoined {
+        id: MemberId(0),
+        name: "member 0".into()
+    }));
+    assert!(
+        h.server_events
+            .contains(&ServerEvent::MusicianCountChanged(3))
+    );
+    // Keepalive pings produced RTT samples on both sides.
+    assert!(
+        h.clients[0]
+            .events
+            .iter()
+            .any(|e| matches!(e, ClientEvent::RttSample { .. }))
+    );
+    assert!(
+        h.server
+            .stats()
+            .iter()
+            .all(|s| s.connected && s.violations == 0)
+    );
+}
+
+#[test]
+fn audio_flows_and_excludes_self() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_c = h.mint(2, Role::Musician);
+    let a = h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    let c = h.add_client(&inv_c, Some(0.0));
+    h.run_ms(1_000);
+
+    let win = 48_000; // last 0.5 s of interleaved stereo
+    assert!(
+        tail_rms(&h, b, win) > 0.02,
+        "B should hear A's tone, rms {}",
+        tail_rms(&h, b, win)
+    );
+    assert!(tail_rms(&h, c, win) > 0.02);
+    // Minus-self: A's personal mix carries only B and C, who push silence.
+    assert!(
+        tail_rms(&h, a, win) < 5e-3,
+        "A's mix must exclude A, rms {}",
+        tail_rms(&h, a, win)
+    );
+}
+
+#[test]
+fn fader_mute_applies_per_member() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_c = h.mint(2, Role::Musician);
+    let _a = h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    let c = h.add_client(&inv_c, Some(0.0));
+    h.run_ms(500);
+
+    h.clients[b]
+        .core
+        .set_fader(MemberId(0), 0.0, 0.0, true)
+        .unwrap();
+    h.run_ms(250); // propagate
+    h.clear_playouts();
+    h.run_ms(1_000);
+
+    let win = 48_000;
+    assert!(
+        tail_rms(&h, b, win) < 5e-3,
+        "B muted A, rms {}",
+        tail_rms(&h, b, win)
+    );
+    assert!(
+        tail_rms(&h, c, win) > 0.02,
+        "C still hears A, rms {}",
+        tail_rms(&h, c, win)
+    );
+}
+
+#[test]
+fn chat_from_field_is_forced_by_server() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    h.add_client(&inv_a, Some(0.0));
+    h.add_client(&inv_b, Some(0.0));
+    h.run_ms(500);
+
+    h.clients[0].core.send_chat("hello").unwrap();
+    h.run_ms(100);
+    for i in 0..2 {
+        assert!(h.clients[i].events.contains(&ClientEvent::Chat {
+            from: MemberId(0),
+            text: "hello".into()
+        }));
+    }
+
+    // A raw member (id 3) lies in the from field; receivers must see the
+    // authenticated sender id instead.
+    let inv = h.mint(3, Role::Musician);
+    let mut raw = raw_join(&mut h, &inv, addr_of(99));
+    raw.send_control(
+        &mut h,
+        ControlMsg::Chat {
+            from: MemberId(0),
+            text: "spoof".into(),
+        },
+    );
+    h.run_ms(100);
+    for i in 0..2 {
+        assert!(h.clients[i].events.contains(&ClientEvent::Chat {
+            from: MemberId(3),
+            text: "spoof".into()
+        }));
+        assert!(!h.clients[i].events.contains(&ClientEvent::Chat {
+            from: MemberId(0),
+            text: "spoof".into()
+        }));
+    }
+}
+
+#[test]
+fn metronome_host_controls_and_clicks() {
+    let mut h = Harness::new(10, 20);
+    for id in 0..3u16 {
+        let inv = h.mint(id, Role::Musician);
+        h.add_client(&inv, Some(0.0));
+    }
+    h.run_ms(500);
+
+    h.clients[0].core.set_metronome(120, 4, true).unwrap();
+    h.run_ms(250);
+    for i in 0..3 {
+        assert!(
+            h.clients[i]
+                .events
+                .contains(&ClientEvent::MetronomeChanged {
+                    bpm: 120,
+                    beats_per_bar: 4,
+                    enabled: true
+                }),
+            "client {i} missed the metronome change"
+        );
+    }
+
+    h.clear_playouts();
+    h.run_ms(1_500);
+    let win = 96_000; // last second
+    for i in 0..3 {
+        let r = tail_rms(&h, i, win);
+        assert!(r > 0.005, "client {i} click rms {r}");
+        // Bursty, not continuous: clicks live at beat positions.
+        let p = &h.clients[i].playout;
+        let tail = &p[p.len() - win..];
+        let loud = tail.chunks(240).filter(|b| rms(b) > 0.02).count();
+        let total = tail.chunks(240).count();
+        assert!(
+            loud > 0 && loud * 3 < total,
+            "client {i}: clicks should be sparse, {loud}/{total} loud blocks"
+        );
+    }
+
+    // Non-host MetronomeSet is ignored: no state change reaches anyone.
+    for c in &mut h.clients {
+        c.events.clear();
+    }
+    h.clients[2].core.set_metronome(240, 3, true).unwrap();
+    h.run_ms(250);
+    assert!(
+        h.clients[0]
+            .events
+            .iter()
+            .all(|e| !matches!(e, ClientEvent::MetronomeChanged { .. }))
+    );
+    assert!(h.server_events.iter().any(|e| matches!(
+        e,
+        ServerEvent::ProtocolViolation {
+            id: MemberId(2),
+            what: "metronome set by non-host"
+        }
+    )));
+}
+
+#[test]
+fn listener_receives_broadcast_and_cannot_send_media() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_a, Some(440.0));
+    h.add_client(&inv_b, Some(0.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(2_000);
+
+    assert_eq!(*h.clients[l].core.state(), ClientState::Joined);
+    assert!(
+        tail_rms(&h, l, 48_000) > 0.02,
+        "listener broadcast rms {}",
+        tail_rms(&h, l, 48_000)
+    );
+
+    // A raw listener pushing media is a protocol violation, not a crash.
+    let inv6 = h.mint(6, Role::Listener);
+    let mut raw = raw_join(&mut h, &inv6, addr_of(98));
+    let frame = MediaFrame {
+        seq: 0,
+        timestamp: 0,
+        duration: FrameDuration::Ms2_5,
+        stereo: false,
+        payload: &[1, 2, 3],
+        redundant: None,
+    }
+    .encode();
+    raw.send_media(&mut h, &frame);
+    h.run(1);
+    assert!(h.server_events.iter().any(|e| matches!(
+        e,
+        ServerEvent::ProtocolViolation {
+            id: MemberId(6),
+            what: "media from listener"
+        }
+    )));
+}
+
+#[test]
+fn revoke_ejects_and_blocks_rejoin() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_c = h.mint(2, Role::Musician);
+    h.add_client(&inv_a, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    h.add_client(&inv_c, Some(0.0));
+    h.run_ms(500);
+    assert_eq!(h.server.musicians_connected(), 3);
+
+    h.clients[0].core.revoke(inv_b.token.jti).unwrap();
+    h.run_ms(250);
+    assert_eq!(
+        *h.clients[b].core.state(),
+        ClientState::Ejected {
+            reason: "invite revoked".into()
+        }
+    );
+    assert!(
+        h.clients[b]
+            .events
+            .iter()
+            .any(|e| matches!(e, ClientEvent::Ejected { .. }))
+    );
+    assert!(
+        h.server_events
+            .contains(&ServerEvent::MemberRevoked { id: MemberId(1) })
+    );
+    assert_eq!(h.server.musicians_connected(), 2);
+    let roster = h.last_roster(0).expect("roster after revoke");
+    assert!(roster.iter().all(|m| m.id != MemberId(1)));
+
+    // The same token cannot come back: refusal is silent.
+    let now = h.now_ms();
+    let init = h.clients[b].core.reconnect(now).unwrap();
+    let baddr = h.clients[b].addr;
+    h.to_server.push((baddr, init));
+    h.run_ms(1_000);
+    assert_ne!(*h.clients[b].core.state(), ClientState::Joined);
+    assert_eq!(h.server.musicians_connected(), 2);
+}
+
+#[test]
+fn timeout_then_rejoin_with_same_token() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_c = h.mint(2, Role::Musician);
+    h.add_client(&inv_a, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    let c = h.add_client(&inv_c, Some(0.0));
+    h.run_ms(500);
+    assert_eq!(h.server.musicians_connected(), 3);
+
+    // B falls off the network for more than 10 s of virtual time.
+    h.clients[b].blocked = true;
+    h.advance_quiet(11_000);
+    assert!(
+        h.server_events
+            .contains(&ServerEvent::MemberDisconnected { id: MemberId(1) })
+    );
+    assert_eq!(h.server.musicians_connected(), 2);
+    assert_eq!(*h.clients[b].core.state(), ClientState::TimedOut);
+    let roster = h.last_roster(0).expect("roster after timeout");
+    assert!(roster.iter().any(|m| m.id == MemberId(1) && !m.connected));
+
+    // Fresh handshake, same token: welcome back.
+    h.clients[b].blocked = false;
+    let now = h.now_ms();
+    let init = h.clients[b].core.reconnect(now).unwrap();
+    let baddr = h.clients[b].addr;
+    h.to_server.push((baddr, init));
+    h.run_ms(500);
+    assert_eq!(*h.clients[b].core.state(), ClientState::Joined);
+    assert_eq!(h.server.musicians_connected(), 3);
+    let roster = h.last_roster(c).expect("roster after rejoin");
+    assert_eq!(roster.len(), 3);
+    assert!(roster.iter().all(|m| m.connected));
+}
+
+#[test]
+fn version_reject_rate_limited_and_verified() {
+    let mut h = Harness::new(10, 20);
+    let src = addr_of(50);
+    let fake_init = wire::build_handshake_init(3, &[0x5A; 64]);
+    let now = h.now_ms();
+
+    let out = h.server.handle_datagram(now, h.now_unix, src, &fake_init);
+    assert_eq!(out.len(), 1);
+    let Ok(Packet::VersionReject { ours, theirs, mac }) = wire::parse(&out[0].1) else {
+        panic!("expected a version reject");
+    };
+    assert_eq!((ours, theirs), (1, 3));
+    assert!(wire::verify_version_reject(
+        &h.server_pk,
+        ours,
+        theirs,
+        &mac,
+        &fake_init
+    ));
+    // Same source inside the window: silence.
+    assert!(
+        h.server
+            .handle_datagram(now + 500, h.now_unix, src, &fake_init)
+            .is_empty()
+    );
+    // After the window: answered again.
+    assert_eq!(
+        h.server
+            .handle_datagram(now + 1_500, h.now_unix, src, &fake_init)
+            .len(),
+        1
+    );
+
+    // A client presented with a forged reject (wrong MAC key) ignores it.
+    let inv = h.mint(0, Role::Musician);
+    let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+    let forged = wire::build_version_reject(&[0xEE; 32], 1, 1, &init);
+    assert!(core.handle_datagram(1, &forged).is_empty());
+    assert_eq!(*core.state(), ClientState::Connecting);
+    assert!(core.events().is_empty());
+}
+
+#[test]
+fn musician_capacity_enforced() {
+    let mut h = Harness::new(10, 20);
+    let invites: Vec<Invite> = (0..11u16).map(|i| h.mint(i, Role::Musician)).collect();
+    for inv in &invites {
+        h.add_client(inv, Some(0.0));
+    }
+    h.run_ms(500);
+
+    assert_eq!(h.server.musicians_connected(), 10);
+    let joined = h
+        .clients
+        .iter()
+        .filter(|c| *c.core.state() == ClientState::Joined)
+        .count();
+    assert_eq!(joined, 10);
+    // Refusal is a silent drop: the 11th client keeps retrying until its
+    // own connection timeout, indistinguishable from packet loss.
+    assert_eq!(*h.clients[10].core.state(), ClientState::Connecting);
+}
+
+fn run_media_scenario() -> (Vec<f32>, Vec<ServerEvent>, Vec<ClientEvent>) {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    h.run_ms(1_000);
+    (
+        h.clients[b].playout.clone(),
+        h.server_events.clone(),
+        h.clients[b].events.clone(),
+    )
+}
+
+#[test]
+fn media_path_is_deterministic_after_join() {
+    // Handshakes use fresh randomness, so wire bytes differ between runs;
+    // behavior after join must not: same pushed frames, same event ordering,
+    // bit-identical pulled audio.
+    let (p1, se1, ce1) = run_media_scenario();
+    let (p2, se2, ce2) = run_media_scenario();
+    assert_eq!(p1.len(), p2.len());
+    assert!(
+        p1.iter().zip(&p2).all(|(x, y)| x.to_bits() == y.to_bits()),
+        "playout audio must be bit-identical across runs"
+    );
+    assert_eq!(se1, se2);
+    assert_eq!(ce1, ce2);
+    assert!(rms(&p1[p1.len() - 48_000..]) > 0.02, "and it carried audio");
+}
+
+#[test]
+fn garbage_datagrams_never_panic() {
+    let mut h = Harness::new(10, 20);
+    let inv = h.mint(0, Role::Musician);
+    h.add_client(&inv, Some(0.0));
+    h.run_ms(250);
+    assert_eq!(*h.clients[0].core.state(), ClientState::Joined);
+
+    let mut lcg: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        lcg = lcg
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        lcg
+    };
+    for i in 0..500 {
+        let len = (next() % 200) as usize;
+        let mut data: Vec<u8> = (0..len).map(|_| (next() >> 32) as u8).collect();
+        if !data.is_empty() && i % 3 == 0 {
+            // Bias toward valid type tags to reach deeper parse paths.
+            data[0] = (next() % 5) as u8;
+        }
+        let src = addr_of(60 + (next() % 4) as u8);
+        let now = h.now_ms();
+        h.server.handle_datagram(now, h.now_unix, src, &data);
+        h.clients[0].core.handle_datagram(now, &data);
+        if i % 50 == 0 {
+            h.step();
+        }
+    }
+    h.run_ms(100);
+    assert_eq!(*h.clients[0].core.state(), ClientState::Joined);
+    let _ = h.server.stats();
+    let _ = h.clients[0].core.stats();
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn cores_survive_arbitrary_datagrams(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+        let issuer = Issuer::generate();
+        let kp = generate_keypair();
+        let sid = SessionId::generate();
+        let mut server = ServerCore::new(ServerConfig {
+            session_id: sid,
+            server_private: kp.private.to_vec(),
+            server_public: kp.public,
+            issuer_pk: issuer.public_key(),
+            max_musicians: 2,
+            max_listeners: 2,
+            member_timeout_ms: 10_000,
+        });
+        let invite = issuer.mint(
+            sid,
+            vec![addr_of(1)],
+            kp.public,
+            Token {
+                member_id: MemberId(0),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId::generate(),
+            },
+        );
+        let (mut client, _init) = ClientCore::connect(&invite, 0).unwrap();
+        server.handle_datagram(0, 0, addr_of(2), &data);
+        client.handle_datagram(0, &data);
+        server.tick(1);
+        client.poll(1);
+    }
+}

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/protocol",
     "crates/engine",
+    "crates/session",
     "crates/audio-io",
     "crates/cloud",
     "crates/server",
@@ -22,6 +23,7 @@ repository = "https://github.com/sean-reid/jamstream"
 [workspace.dependencies]
 jamstream-protocol = { path = "crates/protocol" }
 jamstream-engine = { path = "crates/engine" }
+jamstream-session = { path = "crates/session" }
 jamstream-audio-io = { path = "crates/audio-io" }
 jamstream-cloud = { path = "crates/cloud" }
 jamstream-harness = { path = "crates/harness" }
@@ -48,6 +50,8 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json = "1"
 wiremock = "0.6"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+mimalloc = "0.1"
 
 [profile.release]
 lto = "thin"
