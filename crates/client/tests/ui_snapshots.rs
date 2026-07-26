@@ -1,18 +1,16 @@
-//! Renders every screen and key state, compares against the committed
-//! baselines in tests/snapshots/, and drops a human-reviewable copy of each
-//! render under target/ui-previews/.
+//! Renders every screen and key state through the full application shell
+//! (top bar plus screen content, driven by `JamApp::root_ui`), compares
+//! against the committed baselines in tests/snapshots/, and drops a
+//! human-reviewable copy of each render under target/ui-previews/.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use egui::vec2;
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::Harness;
+use jamstream_client::app::{JamApp, Screen};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
-use jamstream_client::runtime::{LevelsView, Runtime};
-use jamstream_client::screens::devices::{DeviceCatalog, DevicesScreen};
-use jamstream_client::screens::home::{HomeScreen, RecentSession};
+use jamstream_client::screens::home::RecentSession;
 use jamstream_client::screens::host::{HostWizard, LaunchOutcome, ProviderRow, RegionRow};
-use jamstream_client::screens::session::SessionScreen;
 use jamstream_client::theme::{self, Theme};
 use jamstream_cloud::{Price, ProviderKind, Region, RegionId};
 
@@ -39,125 +37,163 @@ fn snapshot(harness: &mut Harness<'_>, name: &str) {
     egui_kittest::image_snapshot(&image, name);
 }
 
-/// Mirrors `JamApp::ui`: full-bleed surface0 background, 10 px margin.
-fn themed_ui<'a>(
-    size: egui::Vec2,
-    theme: Theme,
-    mut body: impl FnMut(&mut egui::Ui) + 'a,
-) -> Harness<'a> {
-    Harness::builder().with_size(size).build_ui(move |ui| {
-        theme::apply(ui.ctx(), theme);
-        let fill = theme::palette(theme).surface0;
-        egui::CentralPanel::default_margins()
-            .frame(
-                egui::Frame::new()
-                    .fill(fill)
-                    .inner_margin(egui::Margin::same(10)),
-            )
-            .show(ui, |ui| body(ui));
-    })
+/// The real application shell, exactly as `JamApp::ui` runs it: top bar,
+/// screen routing, settings sheet, full-bleed surface0 with 10 px margin.
+fn app_harness(mut app: JamApp, size: egui::Vec2) -> Harness<'static> {
+    let theme = app.theme;
+    // 2x: pixel-true to a retina display; layout stays in points.
+    Harness::builder()
+        .with_size(size)
+        .with_pixels_per_point(2.0)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), theme);
+            let fill = theme::palette(theme).surface0;
+            egui::CentralPanel::default_margins()
+                .frame(
+                    egui::Frame::new()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::same(10)),
+                )
+                .show(ui, |ui| app.root_ui(ui));
+        })
+}
+
+/// A JamApp with environment-dependent state pinned for reproducibility.
+fn test_app(theme: Theme) -> JamApp {
+    let mut app = JamApp::new();
+    app.theme = theme;
+    app.recent = Vec::new();
+    app
 }
 
 fn sample_recent() -> Vec<RecentSession> {
     vec![RecentSession {
-        short_id: "deadbeef".to_owned(),
+        short_id: "a3f29c41".to_owned(),
         provider: "mock".to_owned(),
         region: "mock-east".to_owned(),
         status: "running".to_owned(),
     }]
 }
 
+fn session_app(rt: DemoRuntime, theme: Theme) -> JamApp {
+    let mut app = test_app(theme);
+    app.runtime = Some(Box::new(rt));
+    app.screen = Screen::Session;
+    app
+}
+
 #[test]
 fn home_empty() {
-    let mut screen = HomeScreen::default();
-    let mut harness = themed_ui(WIDE, Theme::Dark, move |ui| {
-        screen.ui(ui, &[]);
-    });
+    let mut harness = app_harness(test_app(Theme::Dark), WIDE);
     snapshot(&mut harness, "home_empty");
 }
 
 #[test]
 fn home_invalid_invite() {
-    let mut screen = HomeScreen {
-        invite_text: "jamstream://join/not-a-real-invite".to_owned(),
-        error: None,
-    };
-    let recent = sample_recent();
-    let mut harness = themed_ui(WIDE, Theme::Dark, move |ui| {
-        screen.ui(ui, &recent);
-    });
-    harness.run_steps(2);
-    harness.get_by_label("Join").click();
+    // The exact error a failed Join produces; clicking itself is covered
+    // by the interaction tests.
+    let bad = "jamstream://join/not-a-real-invite";
+    let err = jamstream_protocol::invite::Invite::decode(bad)
+        .expect_err("invite must not decode")
+        .to_string();
+    let mut app = test_app(Theme::Dark);
+    app.recent = sample_recent();
+    app.home.invite_text = bad.to_owned();
+    app.home.error = Some(err);
+    let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_invalid_invite");
 }
 
 #[test]
 fn home_light() {
-    let mut screen = HomeScreen::default();
-    let recent = sample_recent();
-    let mut harness = themed_ui(WIDE, Theme::Light, move |ui| {
-        screen.ui(ui, &recent);
-    });
+    let mut app = test_app(Theme::Light);
+    app.recent = sample_recent();
+    let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_light");
 }
 
 #[test]
 fn devices() {
-    let mut screen = DevicesScreen::default();
-    let catalog = DeviceCatalog::demo();
-    // Fixed levels so the input meter shows a realistic reading.
-    let levels = LevelsView {
-        input_peak: 0.4,
-        input_rms: 0.22,
-        output_peak: 0.0,
-        output_rms: 0.0,
-    };
-    let mut harness = themed_ui(WIDE, Theme::Dark, move |ui| {
-        screen.ui(ui, &catalog, &levels);
-    });
+    // The frozen demo feeds the input meter a deterministic mid reading.
+    let mut app = test_app(Theme::Dark);
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Devices;
+    let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "devices");
-}
-
-fn session_harness(size: egui::Vec2, theme: Theme, is_host: bool) -> Harness<'static> {
-    let rt = Arc::new(DemoRuntime::frozen(FROZEN_FRAME, is_host));
-    let mut screen = SessionScreen::default();
-    themed_ui(size, theme, move |ui| {
-        let snap = rt.snapshot();
-        screen.ui(ui, &snap, &*rt);
-    })
 }
 
 #[test]
 fn session_demo() {
-    let mut harness = session_harness(WIDE, Theme::Dark, false);
+    let app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_demo");
 }
 
 #[test]
 fn session_host() {
-    let mut harness = session_harness(WIDE, Theme::Dark, true);
+    let app = session_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_host");
 }
 
 #[test]
 fn session_light() {
-    let mut harness = session_harness(WIDE, Theme::Light, false);
+    let app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Light);
+    let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_light");
 }
 
 #[test]
 fn session_narrow() {
     // Below 900 px the chat collapses behind a toggle; nothing may overlap.
-    let mut harness = session_harness(NARROW, Theme::Dark, false);
+    let app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
+    let mut harness = app_harness(app, NARROW);
     snapshot(&mut harness, "session_narrow");
 }
 
 #[test]
 fn session_narrow_chat() {
-    let mut harness = session_harness(NARROW, Theme::Dark, false);
-    harness.run_steps(2);
-    harness.get_by_label("Show chat").click();
+    // The toggle stays put and shows its active fill; one click back.
+    // Toggling by click is covered by the interaction tests.
+    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
+    app.session.chat_open = true;
+    let mut harness = app_harness(app, NARROW);
     snapshot(&mut harness, "session_narrow_chat");
+}
+
+#[test]
+fn session_full() {
+    // The design maximum: 10 musicians, 10 listeners. The strip row
+    // scrolls sideways like a console; the listener line stays one line.
+    let app = session_app(DemoRuntime::full(FROZEN_FRAME, false, true), Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_full");
+}
+
+#[test]
+fn session_full_narrow() {
+    let app = session_app(DemoRuntime::full(FROZEN_FRAME, false, true), Theme::Dark);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_full_narrow");
+}
+
+#[test]
+fn session_long_names() {
+    // Names at the 64-char cap truncate inside fixed strips; long chat
+    // lines wrap without pushing the input away.
+    let app = session_app(DemoRuntime::long_names(FROZEN_FRAME, false), Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_long_names");
+}
+
+#[test]
+fn session_settings() {
+    // The settings sheet anchors top right and must leave the strips and
+    // the status readout visible.
+    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
+    app.settings_open = true;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings");
 }
 
 // Wizard states are constructed through the real transitions with fixed
@@ -229,7 +265,7 @@ fn wizard_at(step: &str) -> HostWizard {
         return w;
     }
     w.finish_launch(LaunchOutcome {
-        session_short: "deadbeef".to_owned(),
+        session_short: "a3f29c41".to_owned(),
         server_addr: "203.0.113.10:43210".to_owned(),
         invites: vec![
             (
@@ -245,17 +281,17 @@ fn wizard_at(step: &str) -> HostWizard {
                 "jamstream://join/UUUUVVVVWWWWXXXXYYYYZZZZ0000111122223333".to_owned(),
             ),
         ],
-        state_path: Some("/home/you/.local/share/jamstream/sessions/deadbeef.json".to_owned()),
+        state_path: Some("/home/you/.local/share/jamstream/sessions/a3f29c41.json".to_owned()),
         error: None,
     });
     w
 }
 
 fn wizard_snapshot(step: &'static str, name: &str) {
-    let mut wizard = wizard_at(step);
-    let mut harness = themed_ui(WIDE, Theme::Dark, move |ui| {
-        wizard.ui(ui);
-    });
+    let mut app = test_app(Theme::Dark);
+    app.wizard = wizard_at(step);
+    app.screen = Screen::HostWizard;
+    let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, name);
 }
 

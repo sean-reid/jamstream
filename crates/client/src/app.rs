@@ -2,7 +2,7 @@
 //! lives in `root_ui` on a plain `Ui` so egui_kittest drives the exact code
 //! the eframe window runs.
 
-use egui::{Context, Frame, RichText, Ui};
+use egui::{Context, Frame, Ui};
 
 use crate::demo::DemoRuntime;
 use crate::runtime::{ConnState, LevelsView, Runtime};
@@ -76,8 +76,7 @@ impl JamApp {
         egui::Panel::top(egui::Id::new("app-top")).show(ui, |ui| {
             ui.add_space(theme::SPACE_SM);
             ui.horizontal(|ui| {
-                let wordmark = egui::FontId::new(15.0, theme::semibold(ui));
-                ui.label(RichText::new("jamstream").font(wordmark));
+                theme::wordmark(ui, 15.0);
                 ui.separator();
                 ui.label(theme::muted(ui, self.screen.title()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -159,31 +158,59 @@ impl JamApp {
             .unwrap_or_default()
     }
 
+    /// Settings as a compact sheet anchored top right, under the top bar:
+    /// it never covers the mixer strips or the status readout, and Escape
+    /// or its own Close button dismisses it.
     fn settings_window(&mut self, ctx: &Context) {
         if !self.settings_open {
             return;
         }
-        let mut open = true;
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.settings_open = false;
+            return;
+        }
+        let panel = {
+            let p = theme::palette(self.theme);
+            egui::Frame::new()
+                .fill(p.surface1)
+                .stroke(egui::Stroke::new(1.0, p.border))
+                .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+                .inner_margin(egui::Margin::same(14))
+        };
         egui::Window::new("Settings")
-            .open(&mut open)
-            .collapsible(false)
+            .title_bar(false)
+            .frame(panel)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 56.0))
+            .fixed_size(egui::vec2(340.0, 0.0))
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("Theme");
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.theme, Theme::Dark, "dark");
-                    ui.radio_value(&mut self.theme, Theme::Light, "light");
+                    ui.label(theme::title(ui, "Settings"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            self.settings_open = false;
+                        }
+                    });
                 });
                 ui.add_space(theme::SPACE_SM);
-                ui.label("Devices");
+                ui.label(theme::title(ui, "Theme"));
+                for (value, label) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+                    let response =
+                        crate::widgets::pick_row(ui, label, self.theme == value, true, |ui| {
+                            ui.label(label);
+                        });
+                    if response.clicked() {
+                        self.theme = value;
+                    }
+                }
+                ui.add_space(theme::SPACE_SM);
                 let levels = self
                     .runtime
                     .as_deref()
                     .map(|rt| rt.snapshot().levels)
                     .unwrap_or_default();
-                self.devices.ui(ui, &self.catalog, &levels);
+                self.devices.panels_ui(ui, &self.catalog, &levels);
             });
-        self.settings_open = open;
     }
 }
 

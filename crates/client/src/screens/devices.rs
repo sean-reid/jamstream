@@ -6,7 +6,7 @@ use egui::{ComboBox, Ui, vec2};
 
 use crate::runtime::LevelsView;
 use crate::theme;
-use crate::widgets::{Meter, meter};
+use crate::widgets::{Meter, meter, pick_row};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -55,11 +55,16 @@ impl Default for DevicesScreen {
 }
 
 impl DevicesScreen {
+    /// The full-screen route: a focused column like home and the wizard.
     pub fn ui(&mut self, ui: &mut Ui, catalog: &DeviceCatalog, levels: &LevelsView) {
-        ui.add_space(theme::SPACE_MD);
+        theme::focused_column(ui, 560.0, |ui| self.panels_ui(ui, catalog, levels));
+    }
+
+    /// The bare panels; also embedded in the settings window.
+    pub fn panels_ui(&mut self, ui: &mut Ui, catalog: &DeviceCatalog, levels: &LevelsView) {
         theme::panel(ui).show(ui, |ui| {
             ui.set_width(ui.available_width().min(560.0));
-            ui.label("Devices");
+            ui.label(theme::title(ui, "Devices"));
             egui::Grid::new("device-grid")
                 .num_columns(2)
                 .spacing(vec2(theme::SPACE_LG, 6.0))
@@ -75,19 +80,27 @@ impl DevicesScreen {
         ui.add_space(theme::SPACE_MD);
         theme::panel(ui).show(ui, |ui| {
             ui.set_width(ui.available_width().min(560.0));
-            ui.label("Buffer size");
+            ui.label(theme::title(ui, "Buffer size"));
             ui.label(theme::muted(
                 ui,
                 "Smaller buffers cut latency; pick the smallest that stays clean.",
             ));
+            ui.add_space(theme::SPACE_XS);
             for frames in BUFFER_CHOICES {
-                ui.radio_value(&mut self.buffer_frames, frames, buffer_label(frames));
+                let label = buffer_label(frames);
+                let selected = self.buffer_frames == frames;
+                let response = pick_row(ui, &label, selected, true, |ui| {
+                    ui.label(label.clone());
+                });
+                if response.clicked() {
+                    self.buffer_frames = frames;
+                }
             }
         });
         ui.add_space(theme::SPACE_MD);
         theme::panel(ui).show(ui, |ui| {
             ui.set_width(ui.available_width().min(560.0));
-            ui.label("Input level");
+            ui.label(theme::title(ui, "Input level"));
             ui.horizontal(|ui| {
                 meter(
                     ui,

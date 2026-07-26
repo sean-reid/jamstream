@@ -5,10 +5,12 @@ mod fader;
 mod lamp;
 mod meter;
 mod pan;
+mod pick;
 mod status_dot;
 
-pub use fader::{FADER_DEFAULT_DB, FADER_MAX_DB, FADER_MIN_DB, fader};
+pub use fader::{FADER_DEFAULT_DB, FADER_MAX_DB, FADER_MIN_DB, db_to_t, fader, t_to_db};
 pub use lamp::on_air;
 pub use meter::{Meter, meter};
 pub use pan::pan_slider;
+pub use pick::{PICK_DOT, PICK_INDENT, PICK_ROW_H, pick_row, row_cell};
 pub use status_dot::status_dot;

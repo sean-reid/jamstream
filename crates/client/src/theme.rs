@@ -17,6 +17,9 @@ pub enum Theme {
 }
 
 pub struct Palette {
+    /// Engraved wells: text inputs and meter tracks, one step below the
+    /// window so they read inset without an outline.
+    pub well: Color32,
     /// Window background, the darkest step.
     pub surface0: Color32,
     /// Panel fill, the one panel primitive.
@@ -37,6 +40,7 @@ pub struct Palette {
 }
 
 pub const DARK: Palette = Palette {
+    well: Color32::from_rgb(0x0b, 0x0c, 0x0d),
     surface0: Color32::from_rgb(0x12, 0x13, 0x14),
     surface1: Color32::from_rgb(0x1b, 0x1d, 0x1f),
     surface2: Color32::from_rgb(0x27, 0x2a, 0x2d),
@@ -51,9 +55,12 @@ pub const DARK: Palette = Palette {
 };
 
 pub const LIGHT: Palette = Palette {
+    well: Color32::from_rgb(0xe0, 0xe2, 0xe4),
     surface0: Color32::from_rgb(0xef, 0xf0, 0xf1),
     surface1: Color32::from_rgb(0xf8, 0xf9, 0xfa),
-    surface2: Color32::from_rgb(0xff, 0xff, 0xff),
+    // Light raised controls step darker, the inverse of dark; a white chip
+    // on a white panel would need a border, and borders are for panels.
+    surface2: Color32::from_rgb(0xe7, 0xe9, 0xec),
     text_primary: Color32::from_rgb(0x1b, 0x1d, 0x1f),
     text_muted: Color32::from_rgb(0x53, 0x58, 0x5e),
     accent: Color32::from_rgb(0xd9, 0x48, 0x0f),
@@ -65,10 +72,12 @@ pub const LIGHT: Palette = Palette {
 };
 
 // Spacing scale, px. Densities like a hardware panel: tight but aligned.
+// Every gap in the app comes off this scale, never egui's defaults.
 pub const SPACE_XS: f32 = 2.0;
 pub const SPACE_SM: f32 = 4.0;
 pub const SPACE_MD: f32 = 8.0;
 pub const SPACE_LG: f32 = 12.0;
+pub const SPACE_XL: f32 = 20.0;
 
 /// Uniform corner radius; tight radii read as a tool.
 pub const RADIUS: u8 = 3;
@@ -187,10 +196,24 @@ fn style(theme: Theme) -> Style {
         ..Style::default()
     };
 
+    // Our own spacing scale; egui's defaults are a tell.
     style.spacing.item_spacing = egui::vec2(SPACE_MD, 6.0);
-    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+    style.spacing.button_padding = egui::vec2(12.0, 4.0);
     style.spacing.menu_margin = Margin::same(SPACE_MD as i8);
-    style.spacing.window_margin = Margin::same(SPACE_LG as i8);
+    style.spacing.window_margin = Margin::same(14);
+    style.spacing.indent = 14.0;
+    style.spacing.interact_size = egui::vec2(40.0, 20.0);
+    style.spacing.icon_width = 14.0;
+    style.spacing.icon_width_inner = 8.0;
+    style.spacing.tooltip_width = 360.0;
+    // Scrollbars: thin, solid, surface-stepped; nothing floats or fades.
+    style.spacing.scroll = egui::style::ScrollStyle {
+        bar_width: 6.0,
+        handle_min_length: 24.0,
+        bar_inner_margin: 2.0,
+        bar_outer_margin: 0.0,
+        ..egui::style::ScrollStyle::solid()
+    };
 
     let mut v = match theme {
         Theme::Dark => Visuals::dark(),
@@ -203,7 +226,7 @@ fn style(theme: Theme) -> Style {
     v.window_shadow = egui::epaint::Shadow::NONE;
     v.popup_shadow = egui::epaint::Shadow::NONE;
     v.menu_corner_radius = CornerRadius::same(RADIUS);
-    v.extreme_bg_color = p.surface0;
+    v.extreme_bg_color = p.well;
     v.faint_bg_color = p.surface1;
     v.hyperlink_color = p.text_primary;
     v.warn_fg_color = p.meter_amber;
@@ -225,8 +248,13 @@ fn style(theme: Theme) -> Style {
         // Nothing scales on hover.
         w.expansion = 0.0;
         w.fg_stroke = Stroke::new(1.0, p.text_primary);
-        w.bg_stroke = Stroke::new(1.0, p.border);
+        // Controls are flat surface steps, not outlined boxes; the border
+        // is reserved for panels and text wells. Hover and press step the
+        // surface, focus draws the accent.
+        w.bg_stroke = Stroke::NONE;
     }
+    // Separators and other passive strokes stay a hairline.
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     v.widgets.noninteractive.bg_fill = p.surface1;
     v.widgets.noninteractive.weak_bg_fill = p.surface1;
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text_primary);
@@ -242,6 +270,40 @@ fn style(theme: Theme) -> Style {
 
     style.visuals = v;
     style
+}
+
+/// The wordmark lockup: "jamstream" in the semibold, slightly tightened,
+/// with the single amber tuning dot. The one brand mark in the product.
+pub fn wordmark(ui: &mut Ui, size: f32) {
+    let p = palette_of(ui);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        "jamstream",
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::new(size, semibold(ui)),
+            color: p.text_primary,
+            extra_letter_spacing: -size * 0.015,
+            ..Default::default()
+        },
+    );
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let dot_r = (size * 0.10).max(2.0);
+    let dot_gap = size * 0.28;
+    let width = galley.size().x + dot_gap + dot_r * 2.0;
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width, galley.size().y), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.painter()
+        .galley(rect.min, galley.clone(), p.text_primary);
+    // The dot sits at x-height center, like a channel lamp next to a label.
+    let center = egui::pos2(
+        rect.min.x + galley.size().x + dot_gap + dot_r,
+        rect.min.y + size * 0.62,
+    );
+    ui.painter().circle_filled(center, dot_r, p.accent);
 }
 
 /// Nudges a surface toward the text color for hover/pressed states.
@@ -264,9 +326,38 @@ pub fn panel(ui: &Ui) -> Frame {
         .inner_margin(Margin::same(10))
 }
 
+/// Linear blend of `b` into `a`; `t` in 0..1. Used for tinted surfaces.
+pub fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
+}
+
+/// A centered max-width column anchored in the upper third of the screen.
+/// Content inside stays left-aligned; only the column itself is centered.
+pub fn focused_column(ui: &mut Ui, max_w: f32, add: impl FnOnce(&mut Ui)) {
+    let w = ui.available_width().min(max_w);
+    let pad = ((ui.available_width() - w) / 2.0).max(0.0);
+    ui.add_space((ui.available_height() * 0.16).min(140.0));
+    ui.horizontal(|ui| {
+        ui.add_space(pad);
+        ui.vertical(|ui| {
+            ui.set_width(w);
+            add(ui);
+        });
+    });
+}
+
 /// Secondary text at the muted step.
 pub fn muted(ui: &Ui, text: impl Into<String>) -> RichText {
     RichText::new(text.into()).color(palette_of(ui).text_muted)
+}
+
+/// Panel title: the semibold at body size, one treatment everywhere.
+pub fn title(ui: &Ui, text: impl Into<String>) -> RichText {
+    RichText::new(text.into())
+        .font(FontId::new(13.5, semibold(ui)))
+        .color(palette_of(ui).text_primary)
 }
 
 /// Monospace with the primary text color; every changing number goes
@@ -282,6 +373,15 @@ pub fn mono_muted(ui: &Ui, text: impl Into<String>) -> RichText {
     RichText::new(text.into())
         .monospace()
         .color(palette_of(ui).text_muted)
+}
+
+/// DragValue in monospace, so editable numerals match displayed ones.
+pub fn mono_drag(ui: &mut Ui, drag: egui::DragValue<'_>) -> egui::Response {
+    ui.scope(|ui| {
+        ui.style_mut().override_font_id = Some(FontId::new(12.5, FontFamily::Monospace));
+        ui.add(drag)
+    })
+    .inner
 }
 
 /// "$0.14" from microdollars, always two decimals, trimmed beyond that.
@@ -317,6 +417,7 @@ mod tests {
     fn text_on_every_surface_passes_aa() {
         for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
             for (sname, surface) in [
+                ("well", p.well),
                 ("surface0", p.surface0),
                 ("surface1", p.surface1),
                 ("surface2", p.surface2),

@@ -13,6 +13,7 @@ use jamstream_protocol::invite::{Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
 
 use crate::theme;
+use crate::widgets::{PICK_INDENT, pick_row, row_cell};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRow {
@@ -407,61 +408,87 @@ fn block_on<F: Future>(fut: F) -> F::Output {
     }
 }
 
-// Rendering. One panel, one step at a time, back and continue at the
-// bottom. Numbers are monospace throughout.
+// Rendering. One focused card per step: the step counter and title live
+// inside the card, back and continue at the bottom. Numbers are monospace
+// throughout.
+
 impl HostWizard {
     pub fn ui(&mut self, ui: &mut Ui) -> Option<WizardEvent> {
         let mut event = None;
-        ui.add_space(theme::SPACE_MD);
-        let (num, name) = match self.step {
-            WizardStep::Provider => (1, "provider"),
-            WizardStep::Region => (2, "region"),
-            WizardStep::Preview => (3, "cost preview"),
-            WizardStep::Launching | WizardStep::Done => (4, "launch"),
-        };
-        ui.label(theme::muted(ui, format!("step {num} of 4: {name}")));
-        ui.add_space(theme::SPACE_SM);
-
-        theme::panel(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width().min(640.0));
-            match self.step {
-                WizardStep::Provider => self.provider_ui(ui),
-                WizardStep::Region => self.region_ui(ui),
-                WizardStep::Preview => {
-                    if let Some(e) = self.preview_ui(ui) {
-                        event = Some(e);
+        theme::focused_column(ui, 600.0, |ui| {
+            theme::panel(ui)
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let title = match self.step {
+                        WizardStep::Provider => "Where should the session server run?".to_owned(),
+                        WizardStep::Region => "Pick a region".to_owned(),
+                        WizardStep::Preview => "Cost preview".to_owned(),
+                        WizardStep::Launching => format!(
+                            "Launching in {}",
+                            self.selected_region
+                                .and_then(|i| self.regions.get(i))
+                                .map(|r| r.region.id.to_string())
+                                .unwrap_or_default()
+                        ),
+                        WizardStep::Done => match &self.outcome {
+                            Some(o) if o.error.is_none() => {
+                                format!("Session {} is running", o.session_short)
+                            }
+                            _ => "Launch failed".to_owned(),
+                        },
+                    };
+                    let num = match self.step {
+                        WizardStep::Provider => 1,
+                        WizardStep::Region => 2,
+                        WizardStep::Preview => 3,
+                        WizardStep::Launching | WizardStep::Done => 4,
+                    };
+                    ui.label(theme::muted(ui, format!("Step {num} of 4")).small());
+                    ui.add_space(theme::SPACE_XS);
+                    let title_font = egui::FontId::new(16.0, theme::semibold(ui));
+                    ui.label(RichText::new(title).font(title_font));
+                    ui.add_space(theme::SPACE_LG);
+                    match self.step {
+                        WizardStep::Provider => self.provider_ui(ui),
+                        WizardStep::Region => self.region_ui(ui),
+                        WizardStep::Preview => {
+                            if let Some(e) = self.preview_ui(ui) {
+                                event = Some(e);
+                            }
+                        }
+                        WizardStep::Launching => self.launching_ui(ui),
+                        WizardStep::Done => {
+                            if let Some(e) = self.done_ui(ui) {
+                                event = Some(e);
+                            }
+                        }
                     }
-                }
-                WizardStep::Launching => self.launching_ui(ui),
-                WizardStep::Done => {
-                    if let Some(e) = self.done_ui(ui) {
-                        event = Some(e);
-                    }
-                }
-            }
+                });
         });
         event
     }
 
     fn provider_ui(&mut self, ui: &mut Ui) {
-        ui.label("Where should the session server run?");
         for i in 0..self.providers.len() {
             let row = self.providers[i].clone();
-            ui.horizontal(|ui| {
-                if row.available {
-                    let selected = self.selected_provider == Some(i);
-                    if ui.radio(selected, row.name.clone()).clicked() {
-                        self.select_provider(i);
-                    }
-                } else {
-                    ui.add_enabled_ui(false, |ui| {
-                        let _ = ui.radio(false, row.name.clone());
+            let response = pick_row(
+                ui,
+                &row.name,
+                self.selected_provider == Some(i),
+                row.available,
+                |ui| {
+                    row_cell(ui, 110.0, |ui| {
+                        ui.label(row.name.clone());
                     });
-                }
-                ui.label(theme::muted(ui, row.detail.clone()));
-            });
+                    ui.label(theme::muted(ui, row.detail.clone()));
+                },
+            );
+            if response.clicked() {
+                self.select_provider(i);
+            }
         }
-        ui.add_space(theme::SPACE_SM);
+        ui.add_space(theme::SPACE_LG);
         ui.horizontal(|ui| {
             let can_continue = self.selected_provider.is_some();
             if ui
@@ -482,41 +509,57 @@ impl HostWizard {
     }
 
     fn region_ui(&mut self, ui: &mut Ui) {
-        ui.label("Pick a region. Latency and price carry equal weight.");
+        ui.label(theme::muted(ui, "Latency and price carry equal weight."));
         if self.regions.iter().any(|r| r.fabricated) {
             ui.label(theme::muted(
                 ui,
-                "latency figures are fabricated: real network probes arrive with the networking pass",
+                "Latency figures are fabricated; real network probes arrive with the networking pass.",
             ));
         }
-        ui.add_space(theme::SPACE_SM);
-        egui::Grid::new("region-grid")
-            .num_columns(4)
-            .spacing(vec2(theme::SPACE_LG, 4.0))
-            .show(ui, |ui| {
-                ui.label(theme::muted(ui, "region"));
-                ui.label(theme::muted(ui, "worst rtt"));
-                ui.label(theme::muted(ui, "hourly"));
-                ui.label(theme::muted(ui, "egress"));
-                ui.end_row();
-                for i in 0..self.regions.len() {
-                    let row = self.regions[i].clone();
-                    let selected = self.selected_region == Some(i);
-                    if ui.radio(selected, row.region.id.as_str()).clicked() {
-                        self.select_region(i);
+        ui.add_space(theme::SPACE_MD);
+        let cols = [130.0, 90.0, 110.0, 90.0];
+        ui.horizontal(|ui| {
+            ui.add_space(PICK_INDENT);
+            for (label, w) in ["region", "worst rtt", "hourly", "egress"].iter().zip(cols) {
+                row_cell(ui, w, |ui| {
+                    ui.label(theme::muted(ui, *label).small());
+                });
+            }
+        });
+        for i in 0..self.regions.len() {
+            let row = self.regions[i].clone();
+            let rtt = if row.worst_rtt_ms.is_finite() {
+                format!("{:.0} ms", row.worst_rtt_ms)
+            } else {
+                "no probe".to_owned()
+            };
+            let cells = [
+                row.region.id.to_string(),
+                rtt,
+                row.price.hourly_display(),
+                row.price.egress_display(),
+            ];
+            let response = pick_row(
+                ui,
+                &cells[0].clone(),
+                self.selected_region == Some(i),
+                true,
+                |ui| {
+                    row_cell(ui, cols[0], |ui| {
+                        ui.label(cells[0].clone());
+                    });
+                    for (cell, w) in cells[1..].iter().zip(&cols[1..]) {
+                        row_cell(ui, *w, |ui| {
+                            ui.label(theme::mono(ui, cell.clone()));
+                        });
                     }
-                    let rtt = if row.worst_rtt_ms.is_finite() {
-                        format!("{:.0} ms", row.worst_rtt_ms)
-                    } else {
-                        "no probe".to_owned()
-                    };
-                    ui.label(theme::mono(ui, rtt));
-                    ui.label(theme::mono(ui, row.price.hourly_display()));
-                    ui.label(theme::mono(ui, row.price.egress_display()));
-                    ui.end_row();
-                }
-            });
-        ui.add_space(theme::SPACE_SM);
+                },
+            );
+            if response.clicked() {
+                self.select_region(i);
+            }
+        }
+        ui.add_space(theme::SPACE_LG);
         ui.horizontal(|ui| {
             if ui.button("Back").clicked() {
                 self.back();
@@ -533,34 +576,38 @@ impl HostWizard {
 
     fn preview_ui(&mut self, ui: &mut Ui) -> Option<WizardEvent> {
         let mut event = None;
-        ui.label("Cost preview");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::DragValue::new(&mut self.hours)
-                    .range(0.5..=12.0)
-                    .speed(0.5)
-                    .suffix(" h"),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.musicians)
-                    .range(1..=8)
-                    .suffix(" musicians"),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.listeners)
-                    .range(0..=30)
-                    .suffix(" listeners"),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.destinations)
-                    .range(0..=2)
-                    .suffix(" stream destinations"),
-            );
-        });
-        ui.add_space(theme::SPACE_SM);
+        egui::Grid::new("preview-params")
+            .num_columns(2)
+            .min_col_width(230.0)
+            .spacing(vec2(theme::SPACE_LG, 4.0))
+            .show(ui, |ui| {
+                ui.label(theme::muted(ui, "hours"));
+                theme::mono_drag(
+                    ui,
+                    egui::DragValue::new(&mut self.hours)
+                        .range(0.5..=12.0)
+                        .speed(0.5)
+                        .suffix(" h"),
+                );
+                ui.end_row();
+                ui.label(theme::muted(ui, "musicians"));
+                theme::mono_drag(ui, egui::DragValue::new(&mut self.musicians).range(1..=8));
+                ui.end_row();
+                ui.label(theme::muted(ui, "listeners"));
+                theme::mono_drag(ui, egui::DragValue::new(&mut self.listeners).range(0..=30));
+                ui.end_row();
+                ui.label(theme::muted(ui, "stream destinations"));
+                theme::mono_drag(
+                    ui,
+                    egui::DragValue::new(&mut self.destinations).range(0..=2),
+                );
+                ui.end_row();
+            });
+        ui.add_space(theme::SPACE_MD);
         if let Some(preview) = self.preview() {
             egui::Grid::new("preview-grid")
                 .num_columns(2)
+                .min_col_width(230.0)
                 .spacing(vec2(theme::SPACE_LG, 4.0))
                 .show(ui, |ui| {
                     for item in &preview.line_items {
@@ -577,9 +624,10 @@ impl HostWizard {
                     ui.label(theme::mono(ui, theme::microusd(preview.total_microusd)));
                     ui.end_row();
                 });
+            ui.add_space(theme::SPACE_XS);
             ui.label(theme::muted(
                 ui,
-                "the meter runs until you end the session; this is an estimate, not a cap",
+                "The meter runs until you end the session; this is an estimate, not a cap.",
             ));
         }
         ui.add_space(theme::SPACE_SM);
@@ -587,9 +635,10 @@ impl HostWizard {
         if !is_mock {
             ui.label(theme::muted(
                 ui,
-                "launching on a real provider arrives with the networking pass; the mock runs the full flow",
+                "Launching on a real provider arrives with the networking pass; the mock runs the full flow.",
             ));
         }
+        ui.add_space(theme::SPACE_SM);
         ui.horizontal(|ui| {
             if ui.button("Back").clicked() {
                 self.back();
@@ -606,34 +655,26 @@ impl HostWizard {
     }
 
     fn launching_ui(&mut self, ui: &mut Ui) {
-        let region = self
-            .selected_region
-            .and_then(|i| self.regions.get(i))
-            .map(|r| r.region.id.to_string())
-            .unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(format!("launching in {region}"));
+            ui.add(egui::Spinner::new().color(theme::palette_of(ui).text_muted));
+            ui.label(theme::muted(
+                ui,
+                "Booting the VM, verifying the server artifact, opening the session port.",
+            ));
         });
-        ui.label(theme::muted(
-            ui,
-            "booting the VM, verifying the server artifact, opening the session port",
-        ));
     }
 
     fn done_ui(&mut self, ui: &mut Ui) -> Option<WizardEvent> {
         let mut event = None;
         let outcome = self.outcome.clone()?;
         if let Some(err) = &outcome.error {
-            ui.label(
-                RichText::new(format!("launch failed: {err}")).color(theme::palette_of(ui).danger),
-            );
+            ui.label(RichText::new(err.clone()).color(theme::palette_of(ui).danger));
+            ui.add_space(theme::SPACE_LG);
             if ui.button("Back to home").clicked() {
                 event = Some(WizardEvent::Close);
             }
             return event;
         }
-        ui.label(format!("Session {} is running.", outcome.session_short));
         ui.horizontal(|ui| {
             ui.label(theme::muted(ui, "server"));
             ui.label(theme::mono(ui, outcome.server_addr.clone()));
@@ -652,7 +693,13 @@ impl HostWizard {
                         invite.clone()
                     };
                     ui.label(theme::mono_muted(ui, shown));
-                    if ui.button(format!("Copy {label} invite")).clicked() {
+                    if ui
+                        .add_sized(
+                            vec2(160.0, 22.0),
+                            egui::Button::new(format!("Copy {label} invite")),
+                        )
+                        .clicked()
+                    {
                         ui.ctx().copy_text(invite.clone());
                     }
                     ui.end_row();
@@ -660,12 +707,13 @@ impl HostWizard {
             });
         ui.add_space(theme::SPACE_SM);
         if let Some(path) = &outcome.state_path {
-            ui.label(theme::muted(ui, format!("session recorded at {path}")));
+            ui.label(theme::muted(ui, format!("Session recorded at {path}.")));
         }
         ui.label(theme::muted(
             ui,
-            "cost accrues per second from now; end the session to stop the meter",
+            "Cost accrues per second from now; end the session to stop the meter.",
         ));
+        ui.add_space(theme::SPACE_LG);
         if ui.button("Back to home").clicked() {
             event = Some(WizardEvent::Close);
         }
@@ -746,7 +794,7 @@ mod tests {
         assert!(w.begin_launch());
         assert_eq!(w.step, WizardStep::Launching);
         assert!(w.finish_launch(LaunchOutcome {
-            session_short: "deadbeef".to_owned(),
+            session_short: "a3f29c41".to_owned(),
             server_addr: "10.0.0.1:43210".to_owned(),
             invites: vec![("host".to_owned(), "jamstream://join/AAAA".to_owned())],
             state_path: None,

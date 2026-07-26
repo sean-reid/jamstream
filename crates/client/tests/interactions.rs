@@ -13,7 +13,7 @@ use jamstream_client::theme::{self, Theme};
 
 type Recorder = Arc<RecordingRuntime<DemoRuntime>>;
 
-fn session_harness(is_host: bool) -> (Recorder, Harness<'static>) {
+fn session_harness_sized(is_host: bool, size: egui::Vec2) -> (Recorder, Harness<'static>) {
     let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
         FROZEN_FRAME,
         is_host,
@@ -21,7 +21,7 @@ fn session_harness(is_host: bool) -> (Recorder, Harness<'static>) {
     let rt_ui = rt.clone();
     let mut screen = SessionScreen::default();
     let harness = Harness::builder()
-        .with_size(vec2(1280.0, 800.0))
+        .with_size(size)
         // kittest runs one queued event per frame; keep frames short so a
         // double click stays inside egui's 0.3 s window.
         .with_step_dt(0.05)
@@ -31,6 +31,10 @@ fn session_harness(is_host: bool) -> (Recorder, Harness<'static>) {
             screen.ui(ui, &snap, &*rt_ui);
         });
     (rt, harness)
+}
+
+fn session_harness(is_host: bool) -> (Recorder, Harness<'static>) {
+    session_harness_sized(is_host, vec2(1280.0, 800.0))
 }
 
 fn set_fader_commands(rt: &Recorder, member: u16) -> Vec<(f32, f32, bool)> {
@@ -198,6 +202,44 @@ fn revoke_needs_confirmation_and_sends_the_token() {
     assert_eq!(
         revokes[0],
         Command::Revoke(jamstream_client::runtime::TokenId([1; 16]))
+    );
+}
+
+#[test]
+fn narrow_chat_toggle_is_symmetric_and_escape_closes() {
+    // Below 900 px chat replaces the mixer; the same stationary toggle
+    // reopens the mixer, Escape does too, and the round trip sends nothing.
+    let (rt, mut harness) = session_harness_sized(false, vec2(800.0, 600.0));
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Ana fader").is_some());
+
+    harness.get_by_label("Chat").click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Ana fader").is_none(),
+        "chat must replace the mixer in the narrow layout"
+    );
+    harness.get_by_label("Chat").click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Ana fader").is_some(),
+        "the same toggle must return to the mixer"
+    );
+
+    harness.get_by_label("Chat").click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Ana fader").is_none());
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Ana fader").is_some(),
+        "Escape must close chat and return to the mixer"
+    );
+
+    assert!(
+        rt.commands().is_empty(),
+        "toggling views must not send commands: {:?}",
+        rt.commands()
     );
 }
 

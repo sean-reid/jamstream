@@ -3,7 +3,7 @@
 //! entirely with the painter; ballistic state lives in egui memory keyed by
 //! id, advanced with `stable_dt`.
 
-use egui::{Color32, CornerRadius, Rect, Sense, Stroke, Ui, Vec2, pos2};
+use egui::{Color32, CornerRadius, Rect, Sense, Ui, Vec2, pos2};
 
 use crate::theme;
 
@@ -93,80 +93,58 @@ pub fn meter(ui: &mut Ui, id_salt: &str, peak: f32, rms: f32, size: Vec2, orient
     if !ui.is_rect_visible(rect) {
         return;
     }
+    use egui::emath::GuiRounding;
     let p = theme::palette_of(ui);
+    let ppp = ui.pixels_per_point();
     let painter = ui.painter();
-    painter.rect(
-        rect,
-        CornerRadius::same(2),
-        p.surface0,
-        Stroke::new(1.0, p.border),
-        egui::StrokeKind::Inside,
-    );
+    let rect = rect.round_to_pixels(ppp);
+    painter.rect_filled(rect, CornerRadius::same(2), p.well);
     let inner = rect.shrink(1.0);
     let frac = |db: f32| (db - FLOOR_DB) / -FLOOR_DB;
 
-    // Solid rms fill, split into color zones.
-    let zones = [
-        (FLOOR_DB, AMBER_FROM_DB, p.meter_green),
-        (AMBER_FROM_DB, RED_FROM_DB, p.meter_amber),
-        (RED_FROM_DB, 0.0, p.meter_red),
-    ];
-    for (from, to, color) in zones {
-        let hi = s.rms_db.min(to);
-        if hi <= from {
-            continue;
-        }
-        let seg = segment(inner, frac(from), frac(hi), orientation);
+    // Discrete LED segments; unlit segments stay faintly visible so the
+    // scale reads even in silence.
+    let length = match orientation {
+        Meter::Vertical => inner.height(),
+        Meter::Horizontal => inner.width(),
+    };
+    let count = (length / (SEG_LEN + SEG_GAP)).floor().max(1.0) as usize;
+    let pitch = length / count as f32;
+    let rms_frac = frac(s.rms_db);
+    let peak_seg = ((frac(s.peak_db) * count as f32) as usize).min(count - 1);
+    let hold_seg = ((frac(s.hold_db) * count as f32) as usize).min(count - 1);
+    let hold_live = s.hold_db > FLOOR_DB + 0.5;
+    for i in 0..count {
+        let f0 = i as f32 / count as f32;
+        let f_mid = (i as f32 + 0.5) / count as f32;
+        let color = zone_color(FLOOR_DB + f_mid * -FLOOR_DB, p);
+        let lit = f_mid <= rms_frac
+            || (i == peak_seg && s.peak_db > FLOOR_DB + 0.5)
+            || (i == hold_seg && hold_live);
+        let color = if lit {
+            color
+        } else {
+            theme::blend(p.well, color, 0.16)
+        };
+        let seg =
+            segment_rect(inner, f0 * length, pitch - SEG_GAP, orientation).round_to_pixels(ppp);
         painter.rect_filled(seg, 0.0, color);
     }
-    // Peak line and the 1.5 s hold tick.
-    paint_tick(
-        painter,
-        inner,
-        frac(s.peak_db),
-        orientation,
-        zone_color(s.peak_db, p),
-    );
-    if s.hold_db > FLOOR_DB + 0.5 {
-        paint_tick(
-            painter,
-            inner,
-            frac(s.hold_db),
-            orientation,
-            zone_color(s.hold_db, p),
-        );
-    }
 }
 
-fn segment(inner: Rect, from: f32, to: f32, orientation: Meter) -> Rect {
+const SEG_LEN: f32 = 3.0;
+const SEG_GAP: f32 = 1.0;
+
+/// One segment starting `offset` px from the meter's zero end.
+fn segment_rect(inner: Rect, offset: f32, len: f32, orientation: Meter) -> Rect {
     match orientation {
         Meter::Vertical => Rect::from_min_max(
-            pos2(inner.left(), inner.bottom() - to * inner.height()),
-            pos2(inner.right(), inner.bottom() - from * inner.height()),
+            pos2(inner.left(), inner.bottom() - offset - len),
+            pos2(inner.right(), inner.bottom() - offset),
         ),
         Meter::Horizontal => Rect::from_min_max(
-            pos2(inner.left() + from * inner.width(), inner.top()),
-            pos2(inner.left() + to * inner.width(), inner.bottom()),
+            pos2(inner.left() + offset, inner.top()),
+            pos2(inner.left() + offset + len, inner.bottom()),
         ),
-    }
-}
-
-fn paint_tick(painter: &egui::Painter, inner: Rect, frac: f32, orientation: Meter, color: Color32) {
-    let frac = frac.clamp(0.0, 1.0);
-    match orientation {
-        Meter::Vertical => {
-            let y = inner.bottom() - frac * inner.height();
-            painter.line_segment(
-                [pos2(inner.left(), y), pos2(inner.right(), y)],
-                Stroke::new(2.0, color),
-            );
-        }
-        Meter::Horizontal => {
-            let x = inner.left() + frac * inner.width();
-            painter.line_segment(
-                [pos2(x, inner.top()), pos2(x, inner.bottom())],
-                Stroke::new(2.0, color),
-            );
-        }
     }
 }

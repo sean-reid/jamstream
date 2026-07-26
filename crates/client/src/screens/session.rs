@@ -3,13 +3,26 @@
 //! place every session. Below 900 px the chat collapses behind a toggle so
 //! nothing overlaps.
 
-use egui::{Align, Align2, Button, Layout, RichText, ScrollArea, TextEdit, Ui, vec2};
+use egui::{
+    Align, Align2, Button, CornerRadius, Layout, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui,
+    vec2,
+};
 
 use crate::runtime::{Command, ConnState, MemberView, Role, Runtime, Snapshot};
 use crate::theme;
 use crate::widgets::{Meter, fader, meter, on_air, pan_slider, status_dot};
 
 const NARROW_BELOW_PX: f32 = 900.0;
+
+// Console geometry: every strip is exactly this wide regardless of content.
+const STRIP_W: f32 = 104.0;
+const STRIP_INNER_W: f32 = STRIP_W - 20.0;
+const STRIP_GAP: f32 = 8.0;
+const ROW_H: f32 = 22.0;
+const DB_H: f32 = 16.0;
+const PAN_H: f32 = 14.0;
+const METER_SLOT_H: f32 = 12.0;
+const MIN_FADER_H: f32 = 120.0;
 
 pub enum SessionEvent {
     /// The user confirmed leaving; the app should drop the runtime.
@@ -31,6 +44,19 @@ impl SessionScreen {
         let mut event = None;
         let narrow = ui.available_width() < NARROW_BELOW_PX;
 
+        // Escape always steps back out of the innermost entered state, so
+        // nothing on this screen can trap the user.
+        let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if escape {
+            if self.confirm_leave {
+                self.confirm_leave = false;
+            } else if self.confirm_revoke.is_some() {
+                self.confirm_revoke = None;
+            } else if narrow && self.chat_open {
+                self.chat_open = false;
+            }
+        }
+
         egui::Panel::bottom(egui::Id::new("session-status"))
             .show_separator_line(true)
             .show(ui, |ui| self.status_bar(ui, snap));
@@ -39,21 +65,22 @@ impl SessionScreen {
             egui::Panel::right(egui::Id::new("session-chat"))
                 .resizable(false)
                 .exact_size(280.0)
-                .show(ui, |ui| self.chat_ui(ui, snap, rt));
+                .show(ui, |ui| self.chat_ui(ui, snap, rt, true));
             self.mixer_ui(ui, snap, rt);
         } else {
+            // The toggle is symmetric and stationary: same place, same
+            // label, state shown by the active fill. One click back to the
+            // faders, always.
             ui.horizontal(|ui| {
-                let label = if self.chat_open {
-                    "Show mixer"
-                } else {
-                    "Show chat"
-                };
-                if ui.button(label).clicked() {
+                if ui
+                    .add(Button::new("Chat").selected(self.chat_open))
+                    .clicked()
+                {
                     self.chat_open = !self.chat_open;
                 }
             });
             if self.chat_open {
-                self.chat_ui(ui, snap, rt);
+                self.chat_ui(ui, snap, rt, false);
             } else {
                 self.mixer_ui(ui, snap, rt);
             }
@@ -86,122 +113,208 @@ impl SessionScreen {
             ConnState::Joined | ConnState::Idle => {}
         }
 
-        ScrollArea::vertical()
-            .id_salt("mixer-scroll")
+        let musicians: Vec<MemberView> = snap
+            .members
+            .iter()
+            .filter(|m| m.role == Role::Musician)
+            .cloned()
+            .collect();
+        // Outer strip width includes the 1 px frame stroke on each side.
+        let n = musicians.len() as f32;
+        let row_w = n * (STRIP_W + 2.0) + (n - 1.0).max(0.0) * STRIP_GAP;
+        // The console extends sideways past the window; the lower panel
+        // stays within it.
+        let visible_w = ui.available_width();
+        let lower_w = row_w.min(visible_w);
+        let overflow = row_w > visible_w;
+
+        // Listeners, the self-monitoring note, and the metronome live under
+        // the strips; the strips own the rest of the vertical space.
+        egui::Panel::bottom(egui::Id::new("mixer-lower"))
+            .show_separator_line(false)
+            .frame(egui::Frame::new())
             .show(ui, |ui| {
-                ui.add_space(theme::SPACE_SM);
-                ui.horizontal_top(|ui| {
-                    for member in snap.members.iter().filter(|m| m.role == Role::Musician) {
-                        self.strip_ui(ui, member, snap, rt);
-                    }
-                });
                 ui.add_space(theme::SPACE_SM);
                 let listeners: Vec<&MemberView> = snap
                     .members
                     .iter()
                     .filter(|m| m.role == Role::Listener && m.connected)
                     .collect();
+                let names = listeners
+                    .iter()
+                    .map(|l| l.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let line = match listeners.len() {
                     0 => "no listeners connected".to_owned(),
-                    1 => format!("1 listener connected: {}", listeners[0].name),
-                    n => format!(
-                        "{n} listeners connected: {}",
-                        listeners
-                            .iter()
-                            .map(|l| l.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                    1 => format!("1 listener connected: {names}"),
+                    n => format!("{n} listeners connected: {names}"),
                 };
-                ui.label(theme::muted(ui, line));
+                // One quiet line; the full roster lives in the tooltip.
+                ui.set_max_width(lower_w);
+                let response = ui.add(egui::Label::new(theme::muted(ui, line)).truncate());
+                if listeners.len() > 1 {
+                    response.on_hover_text(names);
+                }
                 ui.add_space(theme::SPACE_SM);
-                self.metronome_ui(ui, snap, rt);
+                self.metronome_ui(ui, snap, rt, lower_w);
             });
-    }
 
-    fn strip_ui(&mut self, ui: &mut Ui, member: &MemberView, snap: &Snapshot, rt: &dyn Runtime) {
-        theme::panel(ui).show(ui, |ui| {
-            ui.set_width(96.0);
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    status_dot(ui, member.connected, snap.stats.rtt_ms, snap.stats.loss_pct);
-                    ui.label(RichText::new(member.name.clone()).strong());
-                    if member.is_you {
-                        ui.label(theme::muted(ui, "you"));
+        ScrollArea::horizontal()
+            .id_salt("mixer-scroll")
+            .show(ui, |ui| {
+                // Leave room for the scrollbar when the row overflows.
+                let bar = if overflow { 10.0 } else { 2.0 };
+                let strip_h = (ui.available_height() - bar).max(0.0);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = STRIP_GAP;
+                    for member in &musicians {
+                        self.strip_ui(ui, member, snap, rt, strip_h);
                     }
                 });
-                if !member.connected {
-                    ui.label(theme::muted(ui, "disconnected"));
-                }
-
-                let mut gain = member.fader.gain_db;
-                let mut pan = member.fader.pan;
-                let mut muted = member.fader.muted;
-                let mut changed = false;
-
-                if member.is_you {
-                    // Your uplink has no fader; monitoring yourself happens
-                    // locally on your interface, not through the server mix.
-                    ui.add_enabled_ui(false, |ui| {
-                        fader(ui, &format!("{} fader", member.name), &mut gain);
-                    });
-                    ui.label(theme::mono_muted(ui, format!("{gain:+.1} dB")));
-                    ui.label(theme::muted(ui, "self monitoring is local"));
-                } else {
-                    changed |= fader(ui, &format!("{} fader", member.name), &mut gain).changed();
-                    ui.label(theme::mono(ui, format!("{gain:+.1} dB")));
-                    changed |= pan_slider(ui, &format!("{} pan", member.name), &mut pan).changed();
-                    let mute_label = if muted { "Unmute" } else { "Mute" };
-                    if ui
-                        .add(Button::new(mute_label).min_size(vec2(60.0, 0.0)))
-                        .clicked()
-                    {
-                        muted = !muted;
-                        changed = true;
-                    }
-                    if snap.is_host && ui.button("Revoke").clicked() {
-                        self.confirm_revoke = Some((member.id, member.name.clone()));
-                    }
-                }
-                if changed {
-                    rt.send(Command::SetFader {
-                        member: member.id,
-                        gain_db: gain,
-                        pan,
-                        muted,
-                    });
-                }
             });
-        });
     }
 
-    fn metronome_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) {
+    fn strip_ui(
+        &mut self,
+        ui: &mut Ui,
+        member: &MemberView,
+        snap: &Snapshot,
+        rt: &dyn Runtime,
+        strip_h: f32,
+    ) {
+        let frame = theme::panel(ui).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(STRIP_INNER_W);
+                ui.set_min_height((strip_h - 20.0).max(0.0));
+                self.strip_body(ui, member, snap, rt);
+            });
+        });
+        if member.is_you {
+            frame
+                .response
+                .on_hover_text("your own channel: self monitoring is local, not part of the mix");
+        }
+    }
+
+    fn strip_body(&mut self, ui: &mut Ui, member: &MemberView, snap: &Snapshot, rt: &dyn Runtime) {
+        ui.horizontal(|ui| {
+            status_dot(ui, member.connected, snap.stats.rtt_ms, snap.stats.loss_pct);
+            // Long names truncate inside the fixed strip; the full name is
+            // one hover away.
+            // Reserve room for the tag plus item spacing so the "you"
+            // strip stays exactly as wide as every other strip.
+            let you_w = if member.is_you { 34.0 } else { 0.0 };
+            let name_w = (ui.available_width() - you_w).max(10.0);
+            let response = ui
+                .allocate_ui_with_layout(
+                    vec2(name_w, 18.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.set_min_width(name_w);
+                        ui.add(
+                            egui::Label::new(RichText::new(member.name.clone()).strong())
+                                .truncate(),
+                        )
+                    },
+                )
+                .inner;
+            if member.name.chars().count() > 8 {
+                response.on_hover_text(member.name.clone());
+            }
+            if member.is_you {
+                ui.label(theme::muted(ui, "you"));
+            }
+        });
+        if !member.connected {
+            ui.label(theme::muted(ui, "disconnected"));
+        }
+
+        let mut gain = member.fader.gain_db;
+        let mut pan = member.fader.pan;
+        let mut muted = member.fader.muted;
+        let mut changed = false;
+        let label = format!("{} fader", member.name);
+
+        // Fixed rows stack from the bottom so their positions are identical
+        // in every strip; the fader takes the exact remainder.
+        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            meter_slot(ui);
+            if snap.is_host {
+                if member.is_you {
+                    // Reserves the revoke row so slots align across strips.
+                    ui.allocate_exact_size(vec2(STRIP_INNER_W, ROW_H), Sense::hover());
+                } else if ui
+                    .add_sized(vec2(STRIP_INNER_W, ROW_H), Button::new("Revoke"))
+                    .clicked()
+                {
+                    self.confirm_revoke = Some((member.id, member.name.clone()));
+                }
+            }
+            if member.is_you {
+                // Your uplink has no fader; monitoring yourself happens
+                // locally on your interface, not through the server mix.
+                ui.add_enabled_ui(false, |ui| {
+                    mute_button(ui, &mut muted);
+                    pan_row(ui, &format!("{} pan", member.name), &mut pan);
+                    db_readout(ui, gain, false);
+                    let fader_h = (ui.available_height() - 2.0).max(MIN_FADER_H);
+                    fader(ui, &label, &mut gain, vec2(STRIP_INNER_W, fader_h))
+                        .on_disabled_hover_text(
+                            "your own channel: self monitoring is local, not part of the mix",
+                        );
+                });
+            } else {
+                if mute_button(ui, &mut muted) {
+                    changed = true;
+                }
+                changed |= pan_row(ui, &format!("{} pan", member.name), &mut pan);
+                db_readout(ui, gain, true);
+                let fader_h = (ui.available_height() - 2.0).max(MIN_FADER_H);
+                changed |= fader(ui, &label, &mut gain, vec2(STRIP_INNER_W, fader_h)).changed();
+            }
+        });
+        if changed {
+            rt.send(Command::SetFader {
+                member: member.id,
+                gain_db: gain,
+                pan,
+                muted,
+            });
+        }
+    }
+
+    fn metronome_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, row_w: f32) {
         theme::panel(ui).show(ui, |ui| {
-            ui.set_width(280.0);
-            ui.label("Metronome");
+            // Margins and stroke add 22; the panel's outer edge lines up
+            // with the strip row above it.
+            ui.set_width((row_w - 22.0).max(240.0));
+            ui.label(theme::title(ui, "Metronome"));
+            ui.add_space(theme::SPACE_XS);
             let m = snap.metronome;
             if snap.is_host {
                 let mut bpm = m.bpm;
                 let mut beats = m.beats_per_bar;
                 let mut enabled = m.enabled;
                 let mut changed = false;
-                ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut bpm)
-                                .range(30..=300)
-                                .suffix(" bpm"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut beats)
-                                .range(1..=16)
-                                .suffix(" beats per bar"),
-                        )
-                        .changed();
-                    changed |= ui.checkbox(&mut enabled, "enabled").changed();
-                });
+                egui::Grid::new("metronome-grid")
+                    .num_columns(2)
+                    .spacing(vec2(theme::SPACE_LG, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(theme::muted(ui, "tempo"));
+                        changed |=
+                            theme::mono_drag(ui, egui::DragValue::new(&mut bpm).range(30..=300))
+                                .changed();
+                        ui.end_row();
+                        ui.label(theme::muted(ui, "beats per bar"));
+                        changed |=
+                            theme::mono_drag(ui, egui::DragValue::new(&mut beats).range(1..=16))
+                                .changed();
+                        ui.end_row();
+                        ui.label(theme::muted(ui, "click"));
+                        changed |= ui.checkbox(&mut enabled, "enabled").changed();
+                        ui.end_row();
+                    });
                 if changed {
                     rt.send(Command::SetMetronome {
                         bpm,
@@ -210,11 +323,20 @@ impl SessionScreen {
                     });
                 }
             } else {
-                let state = if m.enabled { "on" } else { "off" };
-                ui.label(theme::mono_muted(
-                    ui,
-                    format!("{} bpm, {} beats per bar, {state}", m.bpm, m.beats_per_bar),
-                ));
+                egui::Grid::new("metronome-grid")
+                    .num_columns(2)
+                    .spacing(vec2(theme::SPACE_LG, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(theme::muted(ui, "tempo"));
+                        ui.label(theme::mono(ui, format!("{}", m.bpm)));
+                        ui.end_row();
+                        ui.label(theme::muted(ui, "beats per bar"));
+                        ui.label(theme::mono(ui, format!("{}", m.beats_per_bar)));
+                        ui.end_row();
+                        ui.label(theme::muted(ui, "click"));
+                        ui.label(theme::mono(ui, if m.enabled { "on" } else { "off" }));
+                        ui.end_row();
+                    });
             }
             let mut hear = m.you_hear_click;
             if ui.checkbox(&mut hear, "hear the click").changed() {
@@ -223,8 +345,11 @@ impl SessionScreen {
         });
     }
 
-    fn chat_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) {
-        ui.label("Chat");
+    fn chat_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, titled: bool) {
+        // In the narrow layout the toggle already says where you are.
+        if titled {
+            ui.label(theme::title(ui, "Chat"));
+        }
         let input_height = 28.0;
         let list_height = (ui.available_height() - input_height).max(0.0);
         ScrollArea::vertical()
@@ -269,17 +394,28 @@ impl SessionScreen {
                 s.rtt_ms,
                 s.loss_pct,
             );
-            // Mouth to ear is the headline number.
+            // Mouth to ear is the headline number: an instrument readout,
+            // fixed-width digits so nothing wobbles.
+            let p = theme::palette_of(ui);
             let m2e = s
                 .mouth_to_ear_ms
-                .map_or("--".to_owned(), |v| format!("{v:.1} ms"));
+                .map_or("--.-".to_owned(), |v| format!("{v:>4.1}"));
             ui.label(
                 RichText::new(m2e)
                     .monospace()
-                    .size(15.0)
-                    .color(theme::palette_of(ui).text_primary),
+                    .size(21.0)
+                    .color(p.text_primary),
             );
-            ui.label(theme::muted(ui, "mouth to ear"));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.label(
+                    RichText::new("ms")
+                        .monospace()
+                        .size(9.5)
+                        .color(p.text_muted),
+                );
+                ui.label(RichText::new("mouth to ear").size(9.5).color(p.text_muted));
+            });
             ui.separator();
             let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
             ui.label(theme::mono(ui, format!("rtt {rtt} ms")));
@@ -414,4 +550,88 @@ impl SessionScreen {
                 });
         }
     }
+}
+
+/// Fixed-width monospace dB readout; the width never shifts with digits.
+fn db_readout(ui: &mut Ui, gain_db: f32, primary: bool) {
+    let text = if gain_db <= -59.95 {
+        "-inf dB".to_owned()
+    } else {
+        format!("{gain_db:+.1} dB")
+    };
+    let rich = if primary {
+        theme::mono(ui, text)
+    } else {
+        theme::mono_muted(ui, text)
+    };
+    ui.add_sized(
+        vec2(STRIP_INNER_W, DB_H),
+        egui::Label::new(rich).selectable(false),
+    );
+}
+
+/// Pan slider centered in the strip; returns whether it changed.
+fn pan_row(ui: &mut Ui, label: &str, pan: &mut f32) -> bool {
+    let mut changed = false;
+    ui.allocate_ui_with_layout(
+        vec2(STRIP_INNER_W, PAN_H),
+        Layout::top_down(Align::Center),
+        |ui| {
+            changed = pan_slider(ui, label, pan).changed();
+        },
+    );
+    changed
+}
+
+/// Fixed-width mute button; state is shown by fill, the label never moves.
+fn mute_button(ui: &mut Ui, muted: &mut bool) -> bool {
+    let p = theme::palette_of(ui);
+    // Fill only; a stroke would change the button height and shift the
+    // rows above it in the bottom-up stack.
+    let mut button = Button::new("Mute");
+    if *muted {
+        let t = if ui.visuals().dark_mode { 0.45 } else { 0.22 };
+        button = Button::new(RichText::new("Mute").color(p.text_primary))
+            .fill(theme::blend(p.surface2, p.danger, t));
+    }
+    let response = ui
+        .add_sized(vec2(STRIP_INNER_W, ROW_H), button)
+        .on_hover_text(if *muted {
+            "muted in your monitor mix"
+        } else {
+            "mute in your monitor mix"
+        });
+    if response.clicked() {
+        *muted = !*muted;
+        true
+    } else {
+        false
+    }
+}
+
+/// Reserved slot for the per-member meter; protocol support arrives with
+/// the Stats follow-up. Outlined so it reads reserved, not broken.
+fn meter_slot(ui: &mut Ui) {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(STRIP_INNER_W, METER_SLOT_H), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        use egui::emath::GuiRounding;
+        let rect = rect.round_to_pixels(ui.pixels_per_point());
+        let p = theme::palette_of(ui);
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(2),
+            p.surface0,
+            Stroke::new(1.0, p.border),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "meter",
+            egui::FontId::new(9.0, egui::FontFamily::Proportional),
+            p.text_muted,
+        );
+    }
+    response.on_hover_text("per-member meters arrive with a protocol update");
 }

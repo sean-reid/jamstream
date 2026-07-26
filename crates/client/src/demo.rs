@@ -54,6 +54,78 @@ impl DemoRuntime {
         Self::build(is_host, frame, true)
     }
 
+    /// The design maximum: 10 musicians and 10 listeners. `frozen` freezes
+    /// the frame counter for snapshots; a running instance animates.
+    pub fn full(frame: u64, is_host: bool, frozen: bool) -> Self {
+        let rt = Self::build(is_host, frame, frozen);
+        let musicians = [
+            ("Theo", -2.0_f32, 0.2_f32, false),
+            ("Ivy", -4.5, -0.6, false),
+            ("Noor", 1.5, 0.0, false),
+            ("Kai", -9.0, 0.5, true),
+            ("Zoe", -0.5, -0.2, false),
+            ("Raul", -12.0, 0.0, false),
+        ];
+        let listeners = [
+            "Omar", "Pia", "Finn", "Nia", "Eli", "Rosa", "Jun", "Ada", "Max",
+        ];
+        let mut s = rt.state.lock().expect("demo state");
+        let mut id = s.members.len() as u16;
+        for (name, gain_db, pan, muted) in musicians {
+            s.members.insert(
+                (id - 1) as usize,
+                Member {
+                    id,
+                    name,
+                    role: Role::Musician,
+                    fader: FaderView {
+                        gain_db,
+                        pan,
+                        muted,
+                    },
+                },
+            );
+            id += 1;
+        }
+        for name in listeners {
+            s.members.push(Member {
+                id,
+                name,
+                role: Role::Listener,
+                fader: FaderView {
+                    gain_db: 0.0,
+                    pan: 0.0,
+                    muted: false,
+                },
+            });
+            id += 1;
+        }
+        drop(s);
+        rt
+    }
+
+    /// Names at the 64-char protocol cap plus long chat lines; frozen.
+    pub fn long_names(frame: u64, is_host: bool) -> Self {
+        const LONG_A: &str = "Bartholomew Alexander Montgomery Fitzgerald Oyelaran-Wieczorek III";
+        const LONG_B: &str = "Anastasia Wilhelmina Barrington-Smythe of the Greater Hebrides Isle";
+        let rt = Self::build(is_host, frame, true);
+        {
+            let mut s = rt.state.lock().expect("demo state");
+            s.members[1].name = &LONG_A[..64.min(LONG_A.len())];
+            s.members[2].name = &LONG_B[..64.min(LONG_B.len())];
+            s.extra_chat.push(ChatLine {
+                from_name: LONG_A[..64.min(LONG_A.len())].to_owned(),
+                from_id: MemberId(1),
+                text: "the monitor mix on my end could use a little less low end \
+                       between 80 and 120 Hz, and maybe a touch more of the click \
+                       track, if anyone has a hand free before the next take"
+                    .to_owned(),
+                at_ms: 200_000,
+            });
+        }
+        rt
+    }
+
     fn build(is_host: bool, frame: u64, frozen: bool) -> Self {
         let members = vec![
             Member {
@@ -217,7 +289,7 @@ impl Runtime for DemoRuntime {
                 accrued_microusd: HOURLY_MICROUSD * elapsed_secs / 3600,
                 elapsed_secs,
             }),
-            session_short: "deadbeef".to_owned(),
+            session_short: "a3f29c41".to_owned(),
             server_addr: "203.0.113.10:43210".to_owned(),
             is_host: self.is_host,
         }
