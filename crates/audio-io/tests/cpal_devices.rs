@@ -1,0 +1,65 @@
+//! Real-device smoke test. Ignored by default: CI runners have no audio
+//! hardware. Run locally with `cargo test -p jamstream-audio-io -- --ignored`.
+
+#![cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use jamstream_audio_io::{Direction, DuplexHandler, StreamConfig, backend};
+
+#[test]
+#[ignore = "requires real audio devices"]
+fn enumerate_and_open_default_duplex() {
+    let backend = backend();
+    let devices = backend.devices().expect("device enumeration");
+    for d in &devices {
+        println!(
+            "{:?} {:?} default={} buffer={:?}..{:?} id={}",
+            d.direction, d.name, d.is_default, d.min_buffer_frames, d.max_buffer_frames, d.id
+        );
+    }
+
+    let has_capture = devices.iter().any(|d| d.direction == Direction::Capture);
+    let has_playback = devices.iter().any(|d| d.direction == Direction::Playback);
+    if !has_capture || !has_playback {
+        println!("no default duplex pair, skipping stream open");
+        return;
+    }
+
+    let captured = Arc::new(AtomicUsize::new(0));
+    let played = Arc::new(AtomicUsize::new(0));
+    let captured_cb = Arc::clone(&captured);
+    let played_cb = Arc::clone(&played);
+    let handler = DuplexHandler::new(
+        move |samples: &[f32]| {
+            captured_cb.fetch_add(samples.len(), Ordering::Relaxed);
+        },
+        move |out: &mut [f32]| {
+            // Play silence; counting is the point.
+            out.fill(0.0);
+            played_cb.fetch_add(out.len(), Ordering::Relaxed);
+        },
+    );
+
+    let config = StreamConfig {
+        sample_rate: 48_000,
+        buffer_frames: 240,
+        channels: 2,
+    };
+    let handle = backend
+        .open_duplex(None, None, config, handler)
+        .expect("open default duplex stream");
+    println!("latency_frames={:?}", handle.latency_frames());
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    let captured = captured.load(Ordering::Relaxed);
+    let played = played.load(Ordering::Relaxed);
+    println!("captured {captured} samples, played {played} samples in 200 ms");
+    assert!(!handle.errored(), "stream reported an error");
+    assert!(captured > 0, "capture callbacks never fired");
+    assert!(played > 0, "playback callbacks never fired");
+    handle.close();
+}

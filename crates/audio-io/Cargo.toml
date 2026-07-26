@@ -8,3 +8,20 @@ repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+rtrb.workspace = true
+hound.workspace = true
+
+# Target-gated so server/wasm builds never pull platform audio stacks.
+# macOS: CoreAudio. Windows: WASAPI shared mode for bring-up; exclusive mode
+# is a tracked follow-up behind the same trait (see backend() in lib.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal.workspace = true
+
+# Linux gets cpal's native PipeWire host plus dbus-based realtime thread
+# promotion, per the pinned stack. Resolver v3 keeps these features from
+# leaking into non-Linux builds.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { workspace = true, features = ["pipewire", "realtime-dbus"] }
