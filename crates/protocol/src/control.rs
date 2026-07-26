@@ -66,6 +66,20 @@ pub enum ControlMsg {
     Bye {
         reason: String,
     },
+    /// Server's once-per-second view of a musician's uplink, feeding the
+    /// sender's redundancy decision. Percentages are 0..=100 over the last
+    /// reporting window.
+    ///
+    /// Appended last on purpose: postcard encodes the variant index as a
+    /// varint discriminant, so adding a variant at the end leaves every
+    /// existing variant's bytes unchanged. A peer without this variant only
+    /// fails to decode messages that actually carry it; protocol version 1
+    /// is unreleased, so no such peer exists.
+    Stats {
+        uplink_loss_pct: f32,
+        uplink_jitter_depth: u16,
+        uplink_recovered_pct: f32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -221,9 +235,8 @@ impl ControlLink {
 }
 
 fn encode(pkt: &CtlPacket) -> Vec<u8> {
-    let mut out = vec![CHANNEL_CONTROL];
-    out.extend_from_slice(&postcard::to_stdvec(pkt).expect("control serialize"));
-    out
+    // Serialize straight into the datagram; no intermediate Vec.
+    postcard::to_extend(pkt, vec![CHANNEL_CONTROL]).expect("control serialize")
 }
 
 #[cfg(test)]

@@ -30,6 +30,21 @@ struct TestClient {
     frames_pushed: u64,
     playout: Vec<f32>,
     blocked: bool,
+    /// Some(n): drop every nth client-to-server MEDIA datagram; control and
+    /// handshake traffic passes. Models a lossy uplink the client cannot
+    /// observe from its own downlink.
+    drop_uplink_media_nth: Option<u64>,
+    uplink_media_seen: u64,
+    /// Deliver uplink media in bursts of two every other step. The
+    /// interarrival jitter grows the server's buffer target, which is what
+    /// makes a piggybacked redundant copy arrive in time to be usable.
+    uplink_media_stutter: bool,
+    stutter_queue: Vec<Vec<u8>>,
+    stutter_step: u64,
+    /// Some(n): drop every nth server-to-client datagram of any kind; the
+    /// reliable control layer recovers, media does not.
+    drop_downlink_nth: Option<u64>,
+    downlink_seen: u64,
     events: Vec<ClientEvent>,
 }
 
@@ -104,6 +119,13 @@ impl Harness {
             frames_pushed: 0,
             playout: Vec::new(),
             blocked: false,
+            drop_uplink_media_nth: None,
+            uplink_media_seen: 0,
+            uplink_media_stutter: false,
+            stutter_queue: Vec::new(),
+            stutter_step: 0,
+            drop_downlink_nth: None,
+            downlink_seen: 0,
             events: Vec::new(),
         });
         idx
@@ -125,7 +147,24 @@ impl Harness {
                     *s = (std::f32::consts::TAU * hz * n / 48_000.0).sin() * 0.5;
                 }
                 c.frames_pushed += 1;
-                dgs.extend(c.core.push_capture(now, &pcm));
+                for d in c.core.push_capture(now, &pcm) {
+                    c.uplink_media_seen += 1;
+                    let dropped = c
+                        .drop_uplink_media_nth
+                        .is_some_and(|n| c.uplink_media_seen % n == 0);
+                    if dropped {
+                        continue;
+                    }
+                    if c.uplink_media_stutter {
+                        c.stutter_queue.push(d);
+                    } else {
+                        dgs.push(d);
+                    }
+                }
+                c.stutter_step += 1;
+                if c.stutter_step % 2 == 0 {
+                    dgs.append(&mut c.stutter_queue);
+                }
             }
             dgs.extend(c.core.poll(now));
             let (addr, blocked) = (c.addr, c.blocked);
@@ -146,10 +185,17 @@ impl Harness {
             let Some(i) = self.clients.iter().position(|c| c.addr == addr) else {
                 continue;
             };
-            if self.clients[i].blocked {
+            let c = &mut self.clients[i];
+            if c.blocked {
                 continue;
             }
-            let replies = self.clients[i].core.handle_datagram(now, &dg);
+            c.downlink_seen += 1;
+            if c.drop_downlink_nth
+                .is_some_and(|n| c.downlink_seen % n == 0)
+            {
+                continue;
+            }
+            let replies = c.core.handle_datagram(now, &dg);
             self.to_server
                 .extend(replies.into_iter().map(|d| (addr, d)));
         }
@@ -752,6 +798,182 @@ fn garbage_datagrams_never_panic() {
     assert_eq!(*h.clients[0].core.state(), ClientState::Joined);
     let _ = h.server.stats();
     let _ = h.clients[0].core.stats();
+}
+
+#[test]
+fn redundancy_engages_on_server_reported_uplink_loss() {
+    // Only client-to-server media drops; the client's own downlink is
+    // clean, so the old downlink proxy would never have fired. The server's
+    // Stats reports must turn redundancy on.
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, Some(440.0));
+    h.add_client(&inv_b, Some(0.0));
+    h.clients[a].drop_uplink_media_nth = Some(10);
+    h.clients[a].uplink_media_stutter = true;
+    h.run_ms(4_000);
+
+    assert_eq!(*h.clients[a].core.state(), ClientState::Joined);
+    let stats = h.clients[a].core.stats();
+    assert!(
+        stats.redundancy_active,
+        "10% uplink loss must engage redundancy: {stats:?}"
+    );
+    let loss = stats.uplink_loss_pct.expect("a Stats report arrived");
+    assert!(loss > 1.0, "reported uplink loss {loss}%");
+    // Downlink was untouched: local jitter buffer saw no wire loss.
+    assert_eq!(stats.jitter.lost + stats.jitter.recovered, 0);
+    // And the piggybacked copies actually repaired the server's uplink.
+    let m = h
+        .server
+        .stats()
+        .into_iter()
+        .find(|m| m.id == MemberId(0))
+        .expect("member 0");
+    assert!(
+        m.jitter.recovered > 0,
+        "server should recover dropped frames from redundancy: {:?}",
+        m.jitter
+    );
+}
+
+#[test]
+fn redundancy_stays_off_when_only_downlink_is_lossy() {
+    // The reverse: server-to-client datagrams drop, uplink is clean. The
+    // server reports a clean uplink, so redundancy must stay off even
+    // though the client sees downlink loss locally.
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, Some(440.0));
+    h.add_client(&inv_b, Some(440.0));
+    h.clients[a].drop_downlink_nth = Some(10);
+    h.run_ms(4_000);
+
+    assert_eq!(*h.clients[a].core.state(), ClientState::Joined);
+    let stats = h.clients[a].core.stats();
+    assert!(
+        !stats.redundancy_active,
+        "clean uplink must not engage redundancy: {stats:?}"
+    );
+    let loss = stats.uplink_loss_pct.expect("a Stats report arrived");
+    assert!(loss < 1.0, "reported uplink loss {loss}%");
+    // The downlink loss is real and visible locally, just not the input.
+    assert!(stats.jitter.lost + stats.jitter.recovered > 0);
+    let m = h
+        .server
+        .stats()
+        .into_iter()
+        .find(|m| m.id == MemberId(0))
+        .expect("member 0");
+    assert_eq!(m.jitter.recovered, 0, "no redundant copies were sent");
+}
+
+#[test]
+fn lost_handshake_resp_is_recovered_by_identical_retry() {
+    let mut h = Harness::new(10, 20);
+    let inv = h.mint(0, Role::Musician);
+    let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+    let src = addr_of(40);
+
+    // The server admits and answers, but the response never arrives.
+    let out = h.server.handle_datagram(0, h.now_unix, src, &init);
+    assert_eq!(out.len(), 1);
+    let lost_resp = out[0].1.clone();
+    assert_eq!(h.server.musicians_connected(), 1);
+
+    // 500 ms later the client resends the byte-identical init and must get
+    // the byte-identical cached response, not a fresh admission.
+    let resent = core.poll(500);
+    assert_eq!(resent, vec![init.clone()]);
+    let out = h.server.handle_datagram(500, h.now_unix, src, &resent[0]);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].1, lost_resp, "retry must return the cached response");
+    assert_eq!(h.server.musicians_connected(), 1);
+
+    core.handle_datagram(501, &out[0].1);
+    assert_eq!(*core.state(), ClientState::Joined);
+
+    // The response pairs with the transport state from the first receipt:
+    // a keepalive ping round trip completes end to end.
+    let mut back = Vec::new();
+    for d in core.poll(1_501) {
+        back.extend(h.server.handle_datagram(1_501, h.now_unix, src, &d));
+    }
+    assert!(!back.is_empty());
+    for (_, d) in back {
+        core.handle_datagram(1_502, &d);
+    }
+    assert!(
+        core.events()
+            .iter()
+            .any(|e| matches!(e, ClientEvent::RttSample { .. })),
+        "ping round trip over the recovered transport"
+    );
+}
+
+#[test]
+fn fast_rejoin_after_silence_replaces_the_connection() {
+    let mut h = Harness::new(10, 20);
+    let inv = h.mint(0, Role::Musician);
+    let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+    let src = addr_of(41);
+    let out = h.server.handle_datagram(0, h.now_unix, src, &init);
+    core.handle_datagram(1, &out[0].1);
+    assert_eq!(*core.state(), ClientState::Joined);
+
+    // 3 s of silence: past the 2 s rejoin window, under the 10 s timeout.
+    // A fresh handshake (new init bytes, new address) is admitted.
+    let init2 = core.reconnect(3_000).unwrap();
+    assert_ne!(init2, init);
+    let src2 = addr_of(42);
+    let out = h.server.handle_datagram(3_000, h.now_unix, src2, &init2);
+    assert_eq!(out.len(), 1, "fast rejoin must be answered");
+    core.handle_datagram(3_001, &out[0].1);
+    assert_eq!(*core.state(), ClientState::Joined);
+    assert_eq!(h.server.musicians_connected(), 1);
+}
+
+#[test]
+fn replayed_init_against_active_member_yields_nothing() {
+    let mut h = Harness::new(10, 20);
+    let inv = h.mint(0, Role::Musician);
+    let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+    let src = addr_of(43);
+    let out = h.server.handle_datagram(0, h.now_unix, src, &init);
+    core.handle_datagram(1, &out[0].1);
+    assert_eq!(*core.state(), ClientState::Joined);
+
+    // The member stays active: a ping at 5.5 s refreshes last-heard.
+    for d in core.poll(5_500) {
+        h.server.handle_datagram(5_500, h.now_unix, src, &d);
+    }
+
+    // An attacker replays the captured init at 6 s: the response cache has
+    // expired and the member was heard from 0.5 s ago, so the server stays
+    // silent and keeps the existing connection.
+    let attacker = addr_of(66);
+    let out = h.server.handle_datagram(6_000, h.now_unix, attacker, &init);
+    assert!(out.is_empty(), "replayed init must be dropped silently");
+    assert_eq!(h.server.musicians_connected(), 1);
+
+    // The real member is undisturbed: another round trip works and every
+    // server reply still goes to the member's address.
+    let mut back = Vec::new();
+    for d in core.poll(6_600) {
+        back.extend(h.server.handle_datagram(6_600, h.now_unix, src, &d));
+    }
+    assert!(!back.is_empty());
+    assert!(back.iter().all(|(a, _)| *a == src));
+    for (_, d) in back {
+        core.handle_datagram(6_601, &d);
+    }
+    assert!(
+        core.events()
+            .iter()
+            .any(|e| matches!(e, ClientEvent::RttSample { .. }))
+    );
 }
 
 proptest! {

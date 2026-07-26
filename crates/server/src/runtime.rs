@@ -8,10 +8,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
+use jamstream_protocol::transport::derive_public;
 use jamstream_session::server::{ServerConfig, ServerCore, ServerEvent};
 use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
-use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::config::Config;
 
@@ -37,8 +37,8 @@ impl Server {
         let private: [u8; 32] = cfg.server_private_key.as_slice().try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "server key must be 32 bytes")
         })?;
-        let secret = StaticSecret::from(private);
-        let server_public = PublicKey::from(&secret).to_bytes();
+        let server_public = derive_public(&private)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "server key is not valid"))?;
         let issuer_pk = VerifyingKey::from_bytes(&cfg.issuer_public_key)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "issuer key is not valid"))?;
 

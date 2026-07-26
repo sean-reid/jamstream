@@ -97,11 +97,17 @@ pub fn build_handshake_resp(noise: &[u8]) -> Vec<u8> {
 
 pub fn build_transport(member: MemberId, counter: u64, ciphertext: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(11 + ciphertext.len());
+    append_transport_header(member, counter, &mut out);
+    out.extend_from_slice(ciphertext);
+    out
+}
+
+/// Appends just the transport header; the caller appends the ciphertext.
+/// Lives beside `build_transport` so the layout has exactly one home.
+pub fn append_transport_header(member: MemberId, counter: u64, out: &mut Vec<u8>) {
     out.push(TYPE_TRANSPORT);
     out.extend_from_slice(&member.0.to_le_bytes());
     out.extend_from_slice(&counter.to_le_bytes());
-    out.extend_from_slice(ciphertext);
-    out
 }
 
 /// The reject echoes a slice of the init packet it answers, inside the MAC,

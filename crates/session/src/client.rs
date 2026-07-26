@@ -21,8 +21,9 @@ const TICK_SAMPLES: u64 = 120;
 const UPLINK_BITRATE: u32 = 128_000;
 const CONNECTION_TIMEOUT_MS: u64 = 10_000;
 const PING_INTERVAL_MS: u64 = 1_000;
-const INIT_RESEND_MS: u64 = 1_000;
-const LOSS_REPORT_INTERVAL_MS: u64 = 1_000;
+/// First init resend after 500 ms, doubling to the cap while Connecting.
+const INIT_RESEND_MS: u64 = 500;
+const INIT_RESEND_MAX_MS: u64 = 2_000;
 /// Reports of clean link required before redundancy turns back off.
 const REDUNDANCY_OFF_HOLD: u32 = 10;
 
@@ -66,6 +67,13 @@ pub struct ClientStats {
     pub jitter: JitterStats,
     pub state: ClientState,
     pub rtt_ms_last: Option<f32>,
+    /// Server's view of our uplink, from its latest Stats report. None
+    /// until the first report arrives.
+    pub uplink_loss_pct: Option<f32>,
+    pub uplink_jitter_depth: Option<u16>,
+    pub uplink_recovered_pct: Option<f32>,
+    /// Whether capture frames currently carry the previous payload.
+    pub redundancy_active: bool,
 }
 
 pub struct ClientCore {
@@ -87,6 +95,8 @@ pub struct ClientCore {
     /// Listener playout FIFO bridging 20 ms frames to 2.5 ms pulls.
     fifo: VecDeque<f32>,
     redundancy: RedundancyPolicy,
+    /// Latest Stats report from the server: (loss pct, depth, recovered pct).
+    uplink_report: Option<(f32, u16, f32)>,
     prev_payload: Option<Vec<u8>>,
     pkt_buf: Vec<u8>,
     frames_sent: u64,
@@ -94,7 +104,7 @@ pub struct ClientCore {
     last_server_ms: u64,
     last_ping_ms: u64,
     last_init_ms: u64,
-    last_loss_report_ms: u64,
+    init_resend_ms: u64,
     rtt_ms_last: Option<f32>,
     ping_nonce: u32,
 }
@@ -119,6 +129,7 @@ impl ClientCore {
             decode_buf: vec![0.0; decode_len],
             fifo: VecDeque::new(),
             redundancy: RedundancyPolicy::new(REDUNDANCY_OFF_HOLD),
+            uplink_report: None,
             prev_payload: None,
             pkt_buf: Vec::new(),
             frames_sent: 0,
@@ -126,7 +137,7 @@ impl ClientCore {
             last_server_ms: now_ms,
             last_ping_ms: now_ms,
             last_init_ms: now_ms,
-            last_loss_report_ms: now_ms,
+            init_resend_ms: INIT_RESEND_MS,
             rtt_ms_last: None,
             ping_nonce: 0,
         };
@@ -149,10 +160,12 @@ impl ClientCore {
         self.decoder = decoder;
         self.decode_buf = vec![0.0; decode_len];
         self.fifo.clear();
+        self.uplink_report = None;
         self.prev_payload = None;
         self.frames_sent = 0;
         self.last_server_ms = now_ms;
         self.last_init_ms = now_ms;
+        self.init_resend_ms = INIT_RESEND_MS;
         Ok(init_packet)
     }
 
@@ -177,7 +190,6 @@ impl ClientCore {
                         self.state = ClientState::Joined;
                         self.last_server_ms = now_ms;
                         self.last_ping_ms = now_ms;
-                        self.last_loss_report_ms = now_ms;
                         self.events.push(ClientEvent::Joined);
                     }
                     Err(_) => {
@@ -346,8 +358,11 @@ impl ClientCore {
                 if now_ms.saturating_sub(self.last_server_ms) >= CONNECTION_TIMEOUT_MS {
                     self.state = ClientState::TimedOut;
                     self.events.push(ClientEvent::TimedOut);
-                } else if now_ms.saturating_sub(self.last_init_ms) >= INIT_RESEND_MS {
+                } else if now_ms.saturating_sub(self.last_init_ms) >= self.init_resend_ms {
+                    // Same bytes every time: the server answers a resent
+                    // identical init with its cached response.
                     self.last_init_ms = now_ms;
+                    self.init_resend_ms = (self.init_resend_ms * 2).min(INIT_RESEND_MAX_MS);
                     out.push(self.init_packet.clone());
                 }
             }
@@ -365,13 +380,8 @@ impl ClientCore {
                         sent_ms: now_ms,
                     });
                 }
-                if now_ms.saturating_sub(self.last_loss_report_ms) >= LOSS_REPORT_INTERVAL_MS {
-                    self.last_loss_report_ms = now_ms;
-                    // v1: downlink loss stands in for uplink loss. A Stats
-                    // control message carrying the peer's report is the
-                    // proper input once the protocol grows one.
-                    self.redundancy.report(self.jitter.loss_ratio_recent());
-                }
+                // Redundancy is fed by the server's Stats reports as they
+                // arrive (once a second); no downlink proxy here.
                 self.flush_link(now_ms, &mut out);
             }
             _ => {}
@@ -397,6 +407,10 @@ impl ClientCore {
             jitter: self.jitter.stats(),
             state: self.state.clone(),
             rtt_ms_last: self.rtt_ms_last,
+            uplink_loss_pct: self.uplink_report.map(|(loss, _, _)| loss),
+            uplink_jitter_depth: self.uplink_report.map(|(_, depth, _)| depth),
+            uplink_recovered_pct: self.uplink_report.map(|(_, _, rec)| rec),
+            redundancy_active: self.redundancy.active(),
         }
     }
 
@@ -515,6 +529,17 @@ impl ClientCore {
                 self.rtt_ms_last = Some(ms);
                 self.events.push(ClientEvent::RttSample { ms });
             }
+            ControlMsg::Stats {
+                uplink_loss_pct,
+                uplink_jitter_depth,
+                uplink_recovered_pct,
+            } => {
+                self.uplink_report =
+                    Some((uplink_loss_pct, uplink_jitter_depth, uplink_recovered_pct));
+                // The server's view of our uplink drives the redundancy
+                // decision; the policy sanitizes garbage values itself.
+                self.redundancy.report(uplink_loss_pct / 100.0);
+            }
             ControlMsg::Bye { reason } => {
                 self.state = ClientState::Ejected {
                     reason: reason.clone(),
@@ -612,6 +637,20 @@ mod tests {
             core.events(),
             vec![ClientEvent::Rejected { ours: 1, theirs: 2 }]
         );
+    }
+
+    #[test]
+    fn init_resend_backs_off_while_connecting() {
+        let (mut core, _) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
+        assert!(core.poll(499).is_empty());
+        assert_eq!(core.poll(500).len(), 1);
+        // Doubling: 1 s, then 2 s, then capped at 2 s.
+        assert!(core.poll(1_400).is_empty());
+        assert_eq!(core.poll(1_500).len(), 1);
+        assert!(core.poll(3_400).is_empty());
+        assert_eq!(core.poll(3_500).len(), 1);
+        assert!(core.poll(5_400).is_empty());
+        assert_eq!(core.poll(5_500).len(), 1);
     }
 
     #[test]

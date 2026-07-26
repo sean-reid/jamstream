@@ -2712,6 +2712,7 @@ dependencies = [
  "serde",
  "snow",
  "thiserror 2.0.19",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -2729,13 +2730,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "x25519-dalek",
 ]
 
 [[package]]
 name = "jamstream-session"
 version = "0.1.0"
 dependencies = [
+ "blake2",
  "ed25519-dalek",
  "jamstream-engine",
  "jamstream-protocol",
@@ -6350,6 +6351,9 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "hound",
+]
 
 [[package]]
 name = "yoke"

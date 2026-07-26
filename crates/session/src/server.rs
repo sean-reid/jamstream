@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 
+use blake2::{Blake2s256, Digest};
 use ed25519_dalek::VerifyingKey;
 use jamstream_engine::{
     Channels, Decoder, Encoder, Fader, JitterBuffer, JitterStats, Limiter, MediaPacket, Metronome,
@@ -31,6 +32,13 @@ const CLICK_GAIN: f32 = 0.7;
 /// At most one version reject per source address per this interval.
 const REJECT_INTERVAL_MS: u64 = 1_000;
 const REJECT_MAP_MAX: usize = 64;
+/// Uplink Stats reports go to each musician this often.
+const STATS_INTERVAL_MS: u64 = 1_000;
+/// How long a cached handshake response answers an identical resent init.
+const RESP_CACHE_MS: u64 = 5_000;
+/// A connected member silent this long may be replaced by a fresh init
+/// (fast rejoin) without waiting for the full member timeout.
+const REJOIN_SILENCE_MS: u64 = 2_000;
 const LIMITER_CEILING_DB: f32 = -1.0;
 /// 1 ms of lookahead; broadcast listeners never notice.
 const LIMITER_LOOKAHEAD_SAMPLES: usize = 48;
@@ -69,12 +77,22 @@ pub struct MemberStats {
     pub violations: u64,
 }
 
+/// Cached handshake response for idempotent retry: if the client's
+/// HandshakeResp was lost, its resent (byte-identical) init gets the same
+/// response back, paired with the transport state created on first receipt.
+struct RespCache {
+    init_hash: [u8; 32],
+    resp: Vec<u8>,
+    at_ms: u64,
+}
+
 struct Member {
     role: Role,
     name: String,
     jti: TokenId,
     addr: Option<SocketAddr>,
     session: Option<Session>,
+    resp_cache: Option<RespCache>,
     link: ControlLink,
     jitter: JitterBuffer,
     /// Mono uplink decoder; musicians only.
@@ -88,6 +106,9 @@ struct Member {
     rtt_ms_last: Option<f32>,
     send_seq: u32,
     violations: u64,
+    /// Jitter stats snapshot at the last Stats report; deltas against it
+    /// give the per-window uplink numbers.
+    stats_prev: JitterStats,
 }
 
 pub struct ServerCore {
@@ -111,6 +132,7 @@ pub struct ServerCore {
     reject_last: BTreeMap<SocketAddr, u64>,
     events: Vec<ServerEvent>,
     last_musician_count: usize,
+    last_stats_ms: u64,
 }
 
 impl ServerCore {
@@ -135,6 +157,7 @@ impl ServerCore {
             reject_last: BTreeMap::new(),
             events: Vec::new(),
             last_musician_count: 0,
+            last_stats_ms: 0,
         }
     }
 
@@ -279,6 +302,35 @@ impl ServerCore {
         }
         self.tick_count += 1;
 
+        // Once a second, tell each musician what its uplink looks like from
+        // here: their redundancy policy runs on our numbers, not a proxy.
+        if now_ms.saturating_sub(self.last_stats_ms) >= STATS_INTERVAL_MS {
+            self.last_stats_ms = now_ms;
+            for m in self.members.values_mut() {
+                if !m.connected || m.role != Role::Musician {
+                    continue;
+                }
+                let cur = m.jitter.stats();
+                let prev = std::mem::replace(&mut m.stats_prev, cur);
+                let pulled = cur.pulled.saturating_sub(prev.pulled);
+                let lost = cur.lost.saturating_sub(prev.lost);
+                let recovered = cur.recovered.saturating_sub(prev.recovered);
+                let pct = |n: u64| {
+                    if pulled == 0 {
+                        0.0
+                    } else {
+                        100.0 * n as f32 / pulled as f32
+                    }
+                };
+                let _ = m.link.send(ControlMsg::Stats {
+                    // Wire loss counts even when redundancy papered over it.
+                    uplink_loss_pct: pct(lost + recovered),
+                    uplink_jitter_depth: cur.depth_frames.min(usize::from(u16::MAX)) as u16,
+                    uplink_recovered_pct: pct(recovered),
+                });
+            }
+        }
+
         // Control-plane retransmits and acks.
         for (&id, m) in self.members.iter_mut() {
             if !m.connected {
@@ -302,6 +354,7 @@ impl ServerCore {
                 m.connected = false;
                 m.addr = None;
                 m.session = None;
+                m.resp_cache = None;
                 timed_out.push(id);
             }
         }
@@ -410,13 +463,37 @@ impl ServerCore {
             return;
         }
         let id = token.member_id;
-        if self.members.get(&id).is_some_and(|m| m.connected) {
-            return;
+        let init_hash: [u8; 32] = Blake2s256::digest(noise).into();
+        if let Some(m) = self.members.get(&id)
+            && m.connected
+        {
+            // Idempotent retry: the client lost our HandshakeResp and resent
+            // the byte-identical init. Resend the cached response; it pairs
+            // with the transport state created on first receipt, so no new
+            // state is made.
+            if let Some(cache) = m.resp_cache.as_ref()
+                && now_ms.saturating_sub(cache.at_ms) <= RESP_CACHE_MS
+                && cache.init_hash == init_hash
+            {
+                out.push((src, cache.resp.clone()));
+                return;
+            }
+            // Live member, different (or cache-expired) init: silent drop.
+            // A replayed stale init lands here or, past the silence window,
+            // on the fast-rejoin path below; either way the replayer lacks
+            // the ephemeral key behind the init and can never complete the
+            // handshake or produce transport traffic.
+            if now_ms.saturating_sub(m.last_heard_ms) <= REJOIN_SILENCE_MS {
+                return;
+            }
+            // Fast rejoin: the member went quiet and is back with a fresh
+            // handshake before the full timeout. Tear down the old
+            // connection state and admit fresh below.
         }
         let connected_in_role = self
             .members
-            .values()
-            .filter(|m| m.connected && m.role == token.role)
+            .iter()
+            .filter(|(mid, m)| **mid != id && m.connected && m.role == token.role)
             .count();
         let cap = match token.role {
             Role::Musician => self.cfg.max_musicians,
@@ -466,6 +543,11 @@ impl ServerCore {
                 jti: token.jti,
                 addr: Some(src),
                 session: Some(session),
+                resp_cache: Some(RespCache {
+                    init_hash,
+                    resp: resp.clone(),
+                    at_ms: now_ms,
+                }),
                 link: ControlLink::new(),
                 jitter: JitterBuffer::new(),
                 decoder,
@@ -477,6 +559,7 @@ impl ServerCore {
                 rtt_ms_last: None,
                 send_seq: 0,
                 violations: 0,
+                stats_prev: JitterStats::default(),
             },
         );
         out.push((src, resp));
@@ -676,6 +759,7 @@ impl ServerCore {
                     m.connected = false;
                     m.addr = None;
                     m.session = None;
+                    m.resp_cache = None;
                     self.events
                         .push(ServerEvent::MemberDisconnected { id: from });
                     self.queue_roster();
@@ -683,6 +767,7 @@ impl ServerCore {
                 }
             }
             ControlMsg::Roster(_) => self.violation(from, "roster from client"),
+            ControlMsg::Stats { .. } => self.violation(from, "stats from client"),
         }
     }
 

@@ -34,6 +34,14 @@ pub fn generate_keypair() -> Keypair {
     }
 }
 
+/// Derives the X25519 public key for a 32-byte private key, e.g. a server
+/// recovering its public half from injected user-data.
+pub fn derive_public(private: &[u8]) -> Result<[u8; 32], Error> {
+    let private: [u8; 32] = private.try_into().map_err(|_| Error::Malformed)?;
+    let secret = x25519_dalek::StaticSecret::from(private);
+    Ok(x25519_dalek::PublicKey::from(&secret).to_bytes())
+}
+
 /// Client identity material carried in the first handshake message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakePayload {
@@ -155,11 +163,31 @@ impl Session {
     /// Encrypts `plaintext` into a complete wire datagram. `member` tells
     /// the receiving end which session member this connection belongs to.
     pub fn seal(&mut self, member: MemberId, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        self.seal_into(member, plaintext, &mut out)?;
+        Ok(out)
+    }
+
+    /// `seal` into a caller-owned buffer (cleared first), encrypting in
+    /// place: no intermediate ciphertext allocation. Contents are
+    /// unspecified on error. The counter is burned either way.
+    pub fn seal_into(
+        &mut self,
+        member: MemberId,
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
         let counter = self.send_counter;
         self.send_counter += 1;
-        let mut ct = vec![0u8; plaintext.len() + 16];
-        let len = self.ts.write_message(counter, plaintext, &mut ct)?;
-        Ok(wire::build_transport(member, counter, &ct[..len]))
+        out.clear();
+        wire::append_transport_header(member, counter, out);
+        let header = out.len();
+        out.resize(header + plaintext.len() + 16, 0);
+        let len = self
+            .ts
+            .write_message(counter, plaintext, &mut out[header..])?;
+        out.truncate(header + len);
+        Ok(())
     }
 
     /// Decrypts a transport packet body. Replay-checked: a counter is
@@ -315,6 +343,31 @@ mod tests {
         assert!(matches!(server.open(counter, &bad), Err(Error::Decrypt)));
         // The failed decrypt must not have burned the counter.
         assert!(server.open(counter, ciphertext).is_ok());
+    }
+
+    #[test]
+    fn derive_public_matches_generated_keypair() {
+        let kp = generate_keypair();
+        assert_eq!(derive_public(&kp.private).unwrap(), kp.public);
+        assert!(matches!(derive_public(&[0u8; 31]), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn seal_into_reuses_buffer_and_matches_seal() {
+        let (mut client, mut server, _) = handshake();
+        let mut buf = vec![0xFFu8; 512];
+        for msg in [&b"first"[..], &b"second, longer message"[..]] {
+            client.seal_into(MemberId(2), msg, &mut buf).unwrap();
+            let wire::Packet::Transport {
+                counter,
+                ciphertext,
+                ..
+            } = wire::parse(&buf).unwrap()
+            else {
+                panic!("expected transport");
+            };
+            assert_eq!(server.open(counter, ciphertext).unwrap(), msg);
+        }
     }
 
     #[test]

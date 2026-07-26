@@ -35,7 +35,7 @@ pub enum Pull {
     Waiting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct JitterStats {
     pub depth_frames: usize,
     pub target_frames: usize,
@@ -46,6 +46,9 @@ pub struct JitterStats {
     /// Concealed frames whose packet arrived one tick later and was played
     /// after all. Each one already counted in `lost` when it was concealed.
     pub resurrected: u64,
+    /// Pulls that consumed a slot (Frame, Recovered, or Missing; Waiting and
+    /// growth holds excluded). Denominator for loss deltas over a window.
+    pub pulled: u64,
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +67,7 @@ pub struct JitterBuffer {
     recovered: u64,
     late: u64,
     resurrected: u64,
+    pulled: u64,
     /// Seq the most recent pull concealed (Missing with nothing usable).
     /// While set, `next_seq == concealed + 1`; delivering any frame clears it.
     concealed: Option<u32>,
@@ -205,6 +209,7 @@ impl JitterBuffer {
             recovered: self.recovered,
             late: self.late,
             resurrected: self.resurrected,
+            pulled: self.pulled,
         }
     }
 
@@ -225,6 +230,7 @@ impl JitterBuffer {
     }
 
     fn note_loss(&mut self, lost: bool) {
+        self.pulled += 1;
         self.loss_window.push_back(lost);
         while self.loss_window.len() > LOSS_WINDOW {
             self.loss_window.pop_front();
@@ -588,6 +594,7 @@ mod tests {
         assert_eq!(stats.lost, 1);
         assert_eq!(stats.recovered, 1);
         assert_eq!(stats.late, 1);
+        assert_eq!(stats.pulled, 5);
         assert!(jb.loss_ratio_recent() > 0.0);
     }
 }

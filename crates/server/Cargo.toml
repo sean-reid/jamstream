@@ -15,7 +15,6 @@ jamstream-protocol.workspace = true
 jamstream-engine.workspace = true
 jamstream-session.workspace = true
 ed25519-dalek.workspace = true
-x25519-dalek.workspace = true
 data-encoding.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 jamstream-protocol.workspace = true
 jamstream-engine.workspace = true
+blake2.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
