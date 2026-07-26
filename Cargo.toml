@@ -31,7 +31,7 @@ jamstream-cloud = { path = "crates/cloud" }
 jamstream-harness = { path = "crates/harness" }
 
 serde = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 thiserror = "2"
 tracing = "0.1"
 rand = "0.9"

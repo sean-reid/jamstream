@@ -1,6 +1,16 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # ttf-parser is unmaintained; it reaches us only through egui's font
+    # stack, which pins it. Revisit at the next egui upgrade.
+    "RUSTSEC-2026-0192",
+    # quick-xml quadratic-time start-tag check. Reaches us through the
+    # platform audio stack (plist parsing of local system files), never
+    # attacker-supplied input. Revisit when the stack bumps its pin.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2
@@ -14,6 +24,14 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # Weak file-level copyleft, fine as a dependency we do not modify.
+    "MPL-2.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    # Font licenses: we bundle OFL fonts ourselves; egui's default font
+    # crate carries OFL and Ubuntu terms even though we load our own.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 
 [bans]
