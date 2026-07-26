@@ -43,6 +43,9 @@ pub struct JitterStats {
     pub lost: u64,
     pub recovered: u64,
     pub late: u64,
+    /// Concealed frames whose packet arrived one tick later and was played
+    /// after all. Each one already counted in `lost` when it was concealed.
+    pub resurrected: u64,
 }
 
 #[derive(Debug, Default)]
@@ -60,6 +63,10 @@ pub struct JitterBuffer {
     lost: u64,
     recovered: u64,
     late: u64,
+    resurrected: u64,
+    /// Seq the most recent pull concealed (Missing with nothing usable).
+    /// While set, `next_seq == concealed + 1`; delivering any frame clears it.
+    concealed: Option<u32>,
     loss_window: VecDeque<bool>,
 }
 
@@ -89,6 +96,20 @@ impl JitterBuffer {
         if let Some(next) = self.next_seq
             && packet.seq < next
         {
+            // Bounded resurrect: the previous pull concealed exactly this seq
+            // and nothing has played since, so the PLC tick already absorbed
+            // the gap. Stepping back one frame stretches the timeline by one
+            // tick and re-aligns a consumer that overran a slow sender.
+            // Anything older, or anything already delivered (Recovered clears
+            // the marker), stays late.
+            if self.concealed == Some(packet.seq) && packet.seq.wrapping_add(1) == next {
+                self.concealed = None;
+                self.resurrected += 1;
+                self.frames.insert(packet.seq, packet.payload);
+                self.next_seq = Some(packet.seq);
+                // Its redundant copy covers seq - 1, which already played.
+                return;
+            }
             self.late += 1;
             return;
         }
@@ -135,16 +156,21 @@ impl JitterBuffer {
             self.frames.remove(&next);
             self.redundant.remove(&next);
             next += 1;
+            // The skipped frame supersedes any concealed predecessor.
+            self.concealed = None;
         }
 
         let result = if let Some(payload) = self.frames.remove(&next) {
+            self.concealed = None;
             self.note_loss(false);
             Pull::Frame(payload)
         } else if let Some(copy) = self.redundant.remove(&next) {
+            self.concealed = None;
             self.recovered += 1;
             self.note_loss(true);
             Pull::Recovered(copy)
         } else {
+            self.concealed = Some(next);
             self.lost += 1;
             self.note_loss(true);
             Pull::Missing
@@ -178,6 +204,7 @@ impl JitterBuffer {
             lost: self.lost,
             recovered: self.recovered,
             late: self.late,
+            resurrected: self.resurrected,
         }
     }
 
@@ -213,6 +240,7 @@ impl JitterBuffer {
         self.over_ticks = 0;
         self.held_last = false;
         self.drop_pending = false;
+        self.concealed = None;
     }
 }
 
@@ -231,6 +259,19 @@ mod tests {
 
     fn payload_for(seq: u32) -> Vec<u8> {
         seq.to_le_bytes().to_vec()
+    }
+
+    /// Pulls through any growth-hold concealment ticks (late arrivals
+    /// register as jitter and may raise the target) to the next real frame.
+    fn pull_next_frame(jb: &mut JitterBuffer) -> Vec<u8> {
+        for _ in 0..4 {
+            match jb.pull() {
+                Pull::Frame(p) => return p,
+                Pull::Missing => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        panic!("no frame within 4 pulls");
     }
 
     #[test]
@@ -432,6 +473,100 @@ mod tests {
         assert_eq!(jb.pull(), Pull::Waiting);
         jb.push(packet(5, None));
         assert_eq!(jb.pull(), Pull::Frame(payload_for(5)));
+    }
+
+    #[test]
+    fn slow_sender_drift_resurrects_and_stays_bounded() {
+        // Emulates a -ppm sender the way the harness does: the sender's
+        // frame counter crosses one boundary fewer every SLIP ticks, so the
+        // consumer periodically overruns it by exactly one frame.
+        const SLIP: u64 = 50;
+        let mut jb = JitterBuffer::new();
+        let mut emitted = 0u32;
+        let mut expected = 0u32;
+        let mut conceals = 0u64;
+        // 999 ticks, not 1000: the run must not end on a conceal tick or the
+        // final resurrect has no tick left to land in.
+        for tick in 1..=999u64 {
+            let due = (tick - tick / SLIP) as u32;
+            while emitted < due {
+                jb.push(packet(emitted, None));
+                emitted += 1;
+            }
+            match jb.pull() {
+                Pull::Frame(p) => {
+                    assert_eq!(p, payload_for(expected), "tick {tick}");
+                    expected += 1;
+                }
+                Pull::Missing => conceals += 1,
+                other => panic!("tick {tick}: unexpected {other:?}"),
+            }
+        }
+        let stats = jb.stats();
+        // Without resurrection this diverges to one loss per tick (~950 by
+        // the end); with it, losses stay bounded by the drift rate.
+        assert!(
+            stats.lost <= 999 / SLIP + 1,
+            "lost should stay bounded, got {}",
+            stats.lost
+        );
+        assert!(stats.lost > 0, "the drift must actually cause conceals");
+        assert_eq!(stats.resurrected, stats.lost);
+        assert_eq!(stats.late, 0);
+        // Every emitted frame played: delivery is continuous around each
+        // conceal/resurrect pair, nothing is skipped.
+        assert_eq!(u64::from(expected) + conceals, 999);
+        assert_eq!(expected, emitted);
+    }
+
+    #[test]
+    fn late_arrival_of_recovered_frame_does_not_resurrect() {
+        let mut jb = JitterBuffer::new();
+        jb.push(packet(0, None));
+        assert_eq!(jb.pull(), Pull::Frame(payload_for(0)));
+        // Seq 1 lost on the wire but covered by 2's redundant copy.
+        jb.push(packet(2, Some(1)));
+        assert_eq!(jb.pull(), Pull::Recovered(payload_for(1)));
+        // The direct copy straggles in: 1 was already delivered, so it must
+        // count late and not rewind playout.
+        jb.push(packet(1, None));
+        assert_eq!(pull_next_frame(&mut jb), payload_for(2));
+        let stats = jb.stats();
+        assert_eq!(stats.late, 1);
+        assert_eq!(stats.resurrected, 0);
+        assert_eq!(stats.recovered, 1);
+    }
+
+    #[test]
+    fn only_the_immediately_previous_conceal_resurrects() {
+        let mut jb = JitterBuffer::new();
+        jb.push(packet(0, None));
+        assert_eq!(jb.pull(), Pull::Frame(payload_for(0)));
+        // Two consecutive conceals; only the latest (2) is resurrectable.
+        assert_eq!(jb.pull(), Pull::Missing);
+        assert_eq!(jb.pull(), Pull::Missing);
+        jb.push(packet(1, None));
+        assert_eq!(jb.stats().late, 1);
+        assert_eq!(jb.stats().resurrected, 0);
+        jb.push(packet(2, None));
+        assert_eq!(pull_next_frame(&mut jb), payload_for(2));
+        assert_eq!(jb.stats().resurrected, 1);
+        assert_eq!(jb.stats().lost, 2);
+    }
+
+    #[test]
+    fn delivery_after_conceal_clears_the_resurrect_window() {
+        let mut jb = JitterBuffer::new();
+        jb.push(packet(0, None));
+        assert_eq!(jb.pull(), Pull::Frame(payload_for(0)));
+        assert_eq!(jb.pull(), Pull::Missing); // seq 1 concealed
+        jb.push(packet(2, None));
+        assert_eq!(jb.pull(), Pull::Frame(payload_for(2)));
+        // Seq 1 is now two frames behind playout; resurrecting it would
+        // replay it out of order, so it must be dropped as late.
+        jb.push(packet(1, None));
+        assert_eq!(jb.stats().late, 1);
+        assert_eq!(jb.stats().resurrected, 0);
     }
 
     #[test]
