@@ -37,6 +37,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal path dependencies carry no version field; only registry
+# wildcards are worth denying.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
