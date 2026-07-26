@@ -11,11 +11,17 @@
 //! `InstanceInitiatedShutdownBehavior=terminate`, so the cloud-init
 //! `SelfDestruct::AwsShutdown` path (`shutdown -h now`) terminates the VM
 //! for good with no credentials on the box.
+//!
+//! Image selection: launch resolves the current Debian 12 arm64 AMI at
+//! runtime from the public SSM parameter
+//! `/aws/service/debian/release/12/latest/arm64` (JSON protocol, signed
+//! with service "ssm"), cached per region; the ids bundled in
+//! `data/aws_prices.json` are the fallback when SSM is unreachable.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -30,6 +36,12 @@ use crate::types::{
 
 const EC2_API_VERSION: &str = "2016-11-15";
 const CONTENT_TYPE: &str = "application/x-www-form-urlencoded; charset=utf-8";
+
+/// SSM JSON protocol pieces for GetParameter.
+const SSM_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
+const SSM_TARGET_GET_PARAMETER: &str = "AmazonSSM.GetParameter";
+/// Public SSM parameter holding the latest Debian 12 arm64 AMI per region.
+const DEBIAN_12_ARM64_PARAM: &str = "/aws/service/debian/release/12/latest/arm64";
 
 /// Static region catalog: (region id, display name, country).
 const REGIONS: &[(&str, &str, &str)] = &[
@@ -58,6 +70,19 @@ struct AwsRegionData {
     ami: String,
 }
 
+/// The slice of the SSM GetParameter response we need.
+#[derive(Debug, Deserialize)]
+struct SsmGetParameterResponse {
+    #[serde(rename = "Parameter")]
+    parameter: SsmParameter,
+}
+
+#[derive(Debug, Deserialize)]
+struct SsmParameter {
+    #[serde(rename = "Value")]
+    value: String,
+}
+
 fn data() -> &'static AwsData {
     static DATA: OnceLock<AwsData> = OnceLock::new();
     DATA.get_or_init(|| {
@@ -79,9 +104,12 @@ pub struct AwsProvider {
     access_key_id: String,
     secret_access_key: String,
     /// Test override: one base URL used for every region instead of the
-    /// per-region `https://ec2.{region}.amazonaws.com` endpoint.
+    /// per-region `https://{service}.{region}.amazonaws.com` endpoint.
     base_url: Option<String>,
     http: reqwest::Client,
+    /// SSM-resolved AMI id per region, shared across clones so one
+    /// resolution serves every launch this provider instance makes.
+    ami_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Manual Debug: the secret key (and anything derived from it, like an
@@ -103,6 +131,7 @@ impl AwsProvider {
             secret_access_key,
             base_url: None,
             http: http::client(),
+            ami_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -144,26 +173,24 @@ impl AwsProvider {
             .ok_or_else(|| ProviderError::NotFound(format!("aws region {id}")))
     }
 
-    /// Endpoint URL and the query string appended to it. The real
-    /// per-region endpoint takes no query; under a base_url override the
-    /// region is carried as a query parameter (and signed as such).
-    fn endpoint(&self, region: &str) -> (String, String) {
+    /// Endpoint URL and the query string appended to it for one AWS
+    /// service. The real per-region endpoint takes no query; under a
+    /// base_url override the region is carried as a query parameter (and
+    /// signed as such).
+    fn endpoint(&self, service: &str, region: &str) -> (String, String) {
         match &self.base_url {
             Some(base) => (base.clone(), format!("region={}", aws_encode(region))),
-            None => (format!("https://ec2.{region}.amazonaws.com"), String::new()),
+            None => (
+                format!("https://{service}.{region}.amazonaws.com"),
+                String::new(),
+            ),
         }
     }
 
-    /// One signed EC2 Query API call. Every request goes through
-    /// `http::send_retrying`; the request is re-signed per attempt so
-    /// x-amz-date stays fresh across backoff.
-    async fn ec2_call(
-        &self,
-        region: &str,
-        action: &str,
-        params: &[(String, String)],
-    ) -> Result<String> {
-        let (endpoint, query) = self.endpoint(region);
+    /// Full request URL, host header value, and canonical query for one
+    /// signed call against `service` in `region`.
+    fn signed_url(&self, service: &str, region: &str) -> Result<(String, String, String)> {
+        let (endpoint, query) = self.endpoint(service, region);
         let url = if query.is_empty() {
             format!("{endpoint}/")
         } else {
@@ -180,6 +207,19 @@ impl AwsProvider {
                 )));
             }
         };
+        Ok((url, host, query))
+    }
+
+    /// One signed EC2 Query API call. Every request goes through
+    /// `http::send_retrying`; the request is re-signed per attempt so
+    /// x-amz-date stays fresh across backoff.
+    async fn ec2_call(
+        &self,
+        region: &str,
+        action: &str,
+        params: &[(String, String)],
+    ) -> Result<String> {
+        let (url, host, query) = self.signed_url("ec2", region)?;
 
         let mut body = format!("Action={}&Version={EC2_API_VERSION}", aws_encode(action));
         for (key, value) in params {
@@ -195,10 +235,12 @@ impl AwsProvider {
                 access_key_id: &self.access_key_id,
                 secret_access_key: &self.secret_access_key,
                 region,
+                service: "ec2",
                 amz_date: &amz_date,
                 host: &host,
                 query: &query,
                 content_type: CONTENT_TYPE,
+                amz_target: None,
                 body: &body,
             });
             self.http
@@ -215,29 +257,77 @@ impl AwsProvider {
                 .await
                 .map_err(|e| ProviderError::Other(format!("reading {action} response: {e}"))),
             // EC2 signals expected failures (unknown instance id, bad
-            // parameters) as HTTP 400 with an XML error code in the body.
-            // The shared http layer maps a bare 400 to Other and consumes
-            // the response, so fetch the body with one direct, non-retried
-            // send of the same request. A 400 means the API rejected the
-            // call without side effects, so repeating it is safe.
-            Err(ProviderError::Other(msg)) if msg.contains("http 400") => {
-                let resp = build()
-                    .send()
-                    .await
-                    .map_err(|e| ProviderError::Other(e.to_string()))?;
-                let status = resp.status();
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| ProviderError::Other(e.to_string()))?;
-                if status.is_success() {
-                    Ok(text)
-                } else {
-                    Err(map_error_body(&text))
-                }
+            // parameters) as HTTP 400 with an XML error code in the body,
+            // which the shared http layer now carries on the error; remap
+            // that code to a precise ProviderError.
+            Err(err) => {
+                let remapped = match http::error_body(&err) {
+                    Some(body)
+                        if matches!(err, ProviderError::Other(_)) && body.contains("<Code>") =>
+                    {
+                        Some(map_error_body(body))
+                    }
+                    _ => None,
+                };
+                Err(remapped.unwrap_or(err))
             }
-            Err(e) => Err(e),
         }
+    }
+
+    /// Resolves the current Debian 12 arm64 AMI for `region` from the
+    /// public SSM parameter `/aws/service/debian/release/12/latest/arm64`,
+    /// caching the result per region for the provider's lifetime. `launch`
+    /// prefers this over the bundled snapshot id.
+    pub async fn resolve_ami(&self, region: &RegionId) -> Result<String> {
+        self.catalog_region(region)?;
+        let region = region.as_str();
+        if let Some(ami) = self.ami_cache.lock().expect("ami cache lock").get(region) {
+            return Ok(ami.clone());
+        }
+
+        let (url, host, query) = self.signed_url("ssm", region)?;
+        let body = format!("{{\"Name\":\"{DEBIAN_12_ARM64_PARAM}\"}}");
+        let build = || {
+            let amz_date = amz_date_now();
+            let authorization = sigv4::authorization(&sigv4::RequestToSign {
+                access_key_id: &self.access_key_id,
+                secret_access_key: &self.secret_access_key,
+                region,
+                service: "ssm",
+                amz_date: &amz_date,
+                host: &host,
+                query: &query,
+                content_type: SSM_CONTENT_TYPE,
+                amz_target: Some(SSM_TARGET_GET_PARAMETER),
+                body: &body,
+            });
+            self.http
+                .post(url.clone())
+                .header("content-type", SSM_CONTENT_TYPE)
+                .header("x-amz-target", SSM_TARGET_GET_PARAMETER)
+                .header("x-amz-date", amz_date)
+                .header("authorization", authorization)
+                .body(body.clone())
+        };
+
+        let resp = http::send_retrying(build).await?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Other(format!("reading GetParameter response: {e}")))?;
+        let parsed: SsmGetParameterResponse = serde_json::from_str(&text)
+            .map_err(|e| ProviderError::Other(format!("GetParameter response parse: {e}")))?;
+        let ami = parsed.parameter.value;
+        if !ami.starts_with("ami-") {
+            return Err(ProviderError::Other(format!(
+                "GetParameter for {DEBIAN_12_ARM64_PARAM} returned a non-AMI value {ami:?}"
+            )));
+        }
+        self.ami_cache
+            .lock()
+            .expect("ami cache lock")
+            .insert(region.to_owned(), ami.clone());
+        Ok(ami)
     }
 
     /// DescribeInstances with nextToken pagination, parsed into instances.
@@ -331,9 +421,22 @@ impl Provider for AwsProvider {
         let rd = data().regions.get(region.id.as_str()).ok_or_else(|| {
             ProviderError::NotFound(format!("no aws image data for region {}", region.id))
         })?;
+        // Prefer the live SSM-resolved Debian AMI; the bundled id is a
+        // pinned fallback so launches survive an SSM outage.
+        let ami = match self.resolve_ami(&region.id).await {
+            Ok(ami) => ami,
+            Err(err) => {
+                tracing::warn!(
+                    region = %region.id,
+                    error = %err,
+                    "ssm ami resolution failed; falling back to bundled ami"
+                );
+                rd.ami.clone()
+            }
+        };
 
         let mut params = vec![
-            ("ImageId".to_owned(), rd.ami.clone()),
+            ("ImageId".to_owned(), ami),
             (
                 "InstanceType".to_owned(),
                 instance_type(spec.instance_class).to_owned(),
@@ -452,8 +555,9 @@ impl Provider for AwsProvider {
 }
 
 /// Maps an EC2 error body (`<Response><Errors><Error><Code>...`) to a
-/// ProviderError. Only reached for HTTP 400 responses; other statuses are
-/// classified by the shared http layer.
+/// ProviderError. Reached for HTTP 400 responses whose body the shared
+/// http layer carried on the error; other statuses keep the shared
+/// classification.
 fn map_error_body(body: &str) -> ProviderError {
     let code = xml_value(body, "Code")
         .map(xml_unescape)
@@ -769,11 +873,14 @@ mod sigv4 {
         HEXLOWER.encode(&hmac_sha256(&k, string_to_sign.as_bytes()))
     }
 
-    /// Everything needed to sign one jamstream EC2 form POST.
+    /// Everything needed to sign one jamstream AWS POST (EC2 Query form
+    /// posts and SSM JSON-protocol posts share this shape).
     pub struct RequestToSign<'a> {
         pub access_key_id: &'a str,
         pub secret_access_key: &'a str,
         pub region: &'a str,
+        /// Signing service name: "ec2" or "ssm".
+        pub service: &'a str,
         /// `YYYYMMDDTHHMMSSZ`.
         pub amz_date: &'a str,
         pub host: &'a str,
@@ -781,23 +888,36 @@ mod sigv4 {
         /// real per-region endpoint.
         pub query: &'a str,
         pub content_type: &'a str,
+        /// X-Amz-Target header for JSON-protocol services (signed when
+        /// present); None for the EC2 Query API.
+        pub amz_target: Option<&'a str>,
         pub body: &'a str,
     }
 
-    /// Authorization header value for the EC2 Query API POST described by
-    /// `req`. Signed headers are fixed: content-type, host, x-amz-date.
+    /// Authorization header value for the POST described by `req`. Signed
+    /// headers are content-type, host, x-amz-date, plus x-amz-target when
+    /// present (already in ascending order as SigV4 requires).
     pub fn authorization(req: &RequestToSign<'_>) -> String {
         let date = &req.amz_date[..8];
-        let headers = [
+        let mut headers = vec![
             ("content-type", req.content_type),
             ("host", req.host),
             ("x-amz-date", req.amz_date),
         ];
+        if let Some(target) = req.amz_target {
+            headers.push(("x-amz-target", target));
+        }
         let (canonical, signed) =
             canonical_request("POST", "/", req.query, &headers, req.body.as_bytes());
-        let scope = format!("{date}/{}/ec2/aws4_request", req.region);
+        let scope = format!("{date}/{}/{}/aws4_request", req.region, req.service);
         let to_sign = string_to_sign(req.amz_date, &scope, &canonical);
-        let sig = signature(req.secret_access_key, date, req.region, "ec2", &to_sign);
+        let sig = signature(
+            req.secret_access_key,
+            date,
+            req.region,
+            req.service,
+            &to_sign,
+        );
         format!(
             "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={sig}",
             req.access_key_id
@@ -906,16 +1026,40 @@ mod tests {
             access_key_id: "AKIDEXAMPLE",
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
             region: "us-east-1",
+            service: "ec2",
             amz_date: "20150830T123600Z",
             host: "ec2.us-east-1.amazonaws.com",
             query: "",
             content_type: CONTENT_TYPE,
+            amz_target: None,
             body: "Action=DescribeInstances&Version=2016-11-15",
         });
         assert!(auth.starts_with(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/ec2/aws4_request, "
         ));
         assert!(auth.contains("SignedHeaders=content-type;host;x-amz-date, Signature="));
+    }
+
+    #[test]
+    fn authorization_header_shape_for_ssm_signs_the_target() {
+        let auth = sigv4::authorization(&sigv4::RequestToSign {
+            access_key_id: "AKIDEXAMPLE",
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            region: "eu-west-1",
+            service: "ssm",
+            amz_date: "20150830T123600Z",
+            host: "ssm.eu-west-1.amazonaws.com",
+            query: "",
+            content_type: SSM_CONTENT_TYPE,
+            amz_target: Some(SSM_TARGET_GET_PARAMETER),
+            body: r#"{"Name":"/aws/service/debian/release/12/latest/arm64"}"#,
+        });
+        assert!(auth.starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/eu-west-1/ssm/aws4_request, "
+        ));
+        assert!(
+            auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature=")
+        );
     }
 
     // ---- Encoding and dates ----
@@ -1132,15 +1276,22 @@ mod tests {
     fn endpoint_override_carries_region_as_query() {
         let p = AwsProvider::new("id".into(), "secret".into());
         assert_eq!(
-            p.endpoint("eu-west-1"),
+            p.endpoint("ec2", "eu-west-1"),
             (
                 "https://ec2.eu-west-1.amazonaws.com".to_owned(),
                 String::new()
             )
         );
+        assert_eq!(
+            p.endpoint("ssm", "eu-west-1"),
+            (
+                "https://ssm.eu-west-1.amazonaws.com".to_owned(),
+                String::new()
+            )
+        );
         let p = p.with_base_url("http://127.0.0.1:9/".to_owned());
         assert_eq!(
-            p.endpoint("eu-west-1"),
+            p.endpoint("ec2", "eu-west-1"),
             (
                 "http://127.0.0.1:9".to_owned(),
                 "region=eu-west-1".to_owned()

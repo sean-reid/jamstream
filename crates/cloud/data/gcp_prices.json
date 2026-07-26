@@ -1,6 +1,5 @@
 {
-  "comment": "Approximate public on-demand pricing for the e2-small machine type, in integer microusd per hour. Snapshot of cloud.google.com/compute/vm-instance-pricing; refresh this file when GCP publishes new rates or when a region is added to the catalog in src/providers/gcp.rs. Egress is a flat approximation of premium-tier internet egress.",
-  "machine_type": "e2-small",
+  "comment": "Approximate public on-demand pricing in integer microusd per hour. hourly_microusd tracks e2-small; e2_medium_hourly_microusd is an approximation pinned at roughly double the e2-small rate (e2-medium has 2x the vCPU share and memory). Snapshot of cloud.google.com/compute/vm-instance-pricing; refresh this file when GCP publishes new rates or when a region is added to the catalog in src/providers/gcp.rs. Egress is a flat approximation of premium-tier internet egress.",
   "egress_microusd_per_gb": 120000,
   "included_egress_gb": 0,
   "hourly_microusd": {
@@ -13,5 +12,16 @@
     "europe-west1": 18500,
     "europe-west2": 21700,
     "europe-west3": 21700
+  },
+  "e2_medium_hourly_microusd": {
+    "us-central1": 33600,
+    "us-east1": 33600,
+    "us-east4": 37800,
+    "us-west1": 33600,
+    "us-west2": 40400,
+    "northamerica-northeast1": 37000,
+    "europe-west1": 37000,
+    "europe-west2": 43400,
+    "europe-west3": 43400
   }
 }

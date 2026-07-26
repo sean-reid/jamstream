@@ -115,6 +115,43 @@ async fn create_happy_path_sends_full_body_and_parses_response() {
 }
 
 #[tokio::test]
+async fn create_422_surfaces_the_api_message() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/droplets"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "id": "unprocessable_entity",
+            "message": "You specified an invalid image for Droplet creation.",
+        })))
+        .expect(1) // a 422 is a hard rejection; no retry
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let err = p
+        .launch(LaunchSpec {
+            // Catalog-valid region so the request actually goes out; the
+            // fake API rejects it anyway.
+            region: region(&p, "nyc1"),
+            instance_class: InstanceClass::Small,
+            user_data: String::new(),
+            tags: vec![session_tag("sess1")],
+        })
+        .await
+        .unwrap_err();
+    match err {
+        ProviderError::Other(msg) => {
+            assert!(
+                msg.contains("You specified an invalid image for Droplet creation."),
+                "422 message not surfaced: {msg}"
+            );
+            assert!(msg.contains("digitalocean rejected droplet create"));
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn launch_in_unknown_region_is_not_found_without_a_request() {
     // No mocks mounted: any request would 404 the mock server and fail the
     // NotFound-vs-Other distinction below.

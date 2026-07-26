@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::OnceCell;
 
-use crate::http::{client, send_retrying};
+use crate::http::{client, error_body, send_retrying};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
     Instance, InstanceClass, LaunchSpec, Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
@@ -417,15 +417,24 @@ impl Provider for DigitalOceanProvider {
         let url = format!("{}/v2/droplets", self.base_url);
         let resp = send_retrying(|| self.http.post(&url).bearer_auth(&self.token).json(&body))
             .await
-            .map_err(|e| match e {
-                // The shared classifier consumes non-2xx responses before
-                // the body is readable, so a 422's message field cannot be
-                // surfaced here; annotate what a droplet-create 422 means
-                // instead.
-                ProviderError::Other(msg) if msg.contains("422") => ProviderError::Other(format!(
-                    "digitalocean rejected droplet create (invalid region, size, or image): {msg}"
-                )),
-                other => other,
+            .map_err(|e| match &e {
+                // DO explains a rejected create in the 422 body's JSON
+                // "message" field, which the shared http layer now carries
+                // on the error; surface it verbatim.
+                ProviderError::Other(msg) if msg.contains("http 422") => {
+                    let detail = error_body(&e)
+                        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned));
+                    ProviderError::Other(match detail {
+                        Some(message) => {
+                            format!("digitalocean rejected droplet create: {message}")
+                        }
+                        None => format!(
+                            "digitalocean rejected droplet create (invalid region, size, or image): {msg}"
+                        ),
+                    })
+                }
+                _ => e,
             })?;
         let envelope: DropletEnvelope = Self::parse_json(resp).await?;
         // The create response carries no public IP; DO assigns it

@@ -1,5 +1,5 @@
 {
-  "comment": "AWS catalog for the jam-session VM: t4g.small on-demand hourly prices (integer microusd, approximated from public pricing) and Debian 12 (bookworm) arm64 AMI ids per region. Refresh cadence: quarterly, or immediately when a launch fails with an image or price surprise. Prices: https://aws.amazon.com/ec2/pricing/on-demand/. AMIs: resolve the SSM public parameter /aws/service/debian/release/12/latest/arm64 in each region (or https://wiki.debian.org/Cloud/AmazonEC2Image/Bookworm); the ids below were pinned at authoring time and must be re-resolved before real launches.",
+  "comment": "AWS catalog for the jam-session VM: t4g.small on-demand hourly prices (integer microusd, approximated from public pricing) and Debian 12 (bookworm) arm64 AMI ids per region. Refresh cadence: quarterly, or immediately when a launch fails with an image or price surprise. Prices: https://aws.amazon.com/ec2/pricing/on-demand/. AMIs: launch() resolves the SSM public parameter /aws/service/debian/release/12/latest/arm64 at runtime; the ids below are the pinned fallback used when SSM is unreachable, so keep them plausible (https://wiki.debian.org/Cloud/AmazonEC2Image/Bookworm).",
   "instance_type": "t4g.small",
   "egress_microusd_per_gb": 90000,
   "included_egress_gb": 100,

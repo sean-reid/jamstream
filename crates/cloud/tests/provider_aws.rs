@@ -14,7 +14,7 @@ use jamstream_cloud::{
     InstanceClass, LaunchSpec, Provider, ProviderError, ProviderKind, Region, RegionId,
     assert_provider_contract, session_tag,
 };
-use wiremock::matchers::{body_string_contains, method, path, query_param};
+use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const ACCESS_KEY_ID: &str = "AKIDTEST";
@@ -38,10 +38,13 @@ fn error_body(code: &str, message: &str) -> String {
 }
 
 /// Matches requests carrying a well-formed SigV4 authorization for the
-/// given region, signed with the test access key.
-struct SignedForRegion(&'static str);
+/// given region and service, signed with the test access key.
+struct SignedFor {
+    region: &'static str,
+    service: &'static str,
+}
 
-impl Match for SignedForRegion {
+impl Match for SignedFor {
     fn matches(&self, request: &Request) -> bool {
         let Some(auth) = request
             .headers
@@ -51,7 +54,7 @@ impl Match for SignedForRegion {
             return false;
         };
         auth.starts_with(&format!("AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/"))
-            && auth.contains(&format!("/{}/ec2/aws4_request", self.0))
+            && auth.contains(&format!("/{}/{}/aws4_request", self.region, self.service))
             && auth.contains("SignedHeaders=content-type;host;x-amz-date")
             && request.headers.get("x-amz-date").is_some()
     }
@@ -95,7 +98,10 @@ async fn run_instances_happy_path() {
             "TagSpecification.1.Tag.1.Key=jamstream-session",
         ))
         .and(body_string_contains("TagSpecification.1.Tag.1.Value=sess1"))
-        .and(SignedForRegion("us-east-1"))
+        .and(SignedFor {
+            region: "us-east-1",
+            service: "ec2",
+        })
         .respond_with(ResponseTemplate::new(200).set_body_string(xml))
         .expect(1)
         .mount(&server)
@@ -150,9 +156,9 @@ async fn terminate_unknown_instance_maps_to_not_found() {
             "InvalidInstanceID.NotFound",
             "The instance ID 'i-deadbeef' does not exist",
         )))
-        // send_retrying consumes the 400 response; the provider issues one
-        // direct re-send to read the error code from the body.
-        .expect(2)
+        // The shared http layer carries the 400 body on the error, so one
+        // request suffices to map the EC2 error code.
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -431,6 +437,118 @@ async fn refresh_reports_ip_and_not_found_when_terminated() {
         p.refresh(&region, "i-gone").await,
         Err(ProviderError::NotFound(_))
     ));
+}
+
+// ---- SSM AMI resolution ----
+
+const SSM_PARAM: &str = "/aws/service/debian/release/12/latest/arm64";
+/// Bundled fallback AMI for us-east-1 in data/aws_prices.json.
+const BUNDLED_US_EAST_1_AMI: &str = "ami-0e2c8caa4b6378d8c";
+
+fn ssm_parameter_response(ami: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "Parameter": {
+            "ARN": format!("arn:aws:ssm:us-east-1::parameter{SSM_PARAM}"),
+            "Name": SSM_PARAM,
+            "Type": "String",
+            "Value": ami,
+            "Version": 7,
+        }
+    }))
+}
+
+fn launch_spec(p: &AwsProvider, region: &str) -> LaunchSpec {
+    LaunchSpec {
+        region: region_of(p, region),
+        instance_class: InstanceClass::Small,
+        user_data: "#cloud-config\n".to_owned(),
+        tags: vec![session_tag("sess1")],
+    }
+}
+
+const RUN_INSTANCES_XML: &str = "<RunInstancesResponse><instancesSet><item>\
+     <instanceId>i-fromssm</instanceId>\
+     <instanceState><code>0</code><name>pending</name></instanceState>\
+     </item></instancesSet></RunInstancesResponse>";
+
+#[tokio::test]
+async fn launch_resolves_ami_via_ssm_get_parameter() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(query_param("region", "us-east-1"))
+        .and(header("x-amz-target", "AmazonSSM.GetParameter"))
+        .and(header("content-type", "application/x-amz-json-1.1"))
+        .and(body_string_contains(SSM_PARAM))
+        .and(SignedFor {
+            region: "us-east-1",
+            service: "ssm",
+        })
+        .respond_with(ssm_parameter_response("ami-0123resolved456789"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=RunInstances"))
+        .and(body_string_contains("ImageId=ami-0123resolved456789"))
+        .and(SignedFor {
+            region: "us-east-1",
+            service: "ec2",
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(RUN_INSTANCES_XML))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let inst = p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
+    assert_eq!(inst.id, "i-fromssm");
+}
+
+#[tokio::test]
+async fn launch_falls_back_to_bundled_ami_when_ssm_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "AmazonSSM.GetParameter"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=RunInstances"))
+        .and(body_string_contains(format!(
+            "ImageId={BUNDLED_US_EAST_1_AMI}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RUN_INSTANCES_XML))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let inst = p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
+    assert_eq!(inst.id, "i-fromssm");
+}
+
+#[tokio::test]
+async fn ssm_ami_resolution_is_cached_per_region() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "AmazonSSM.GetParameter"))
+        .respond_with(ssm_parameter_response("ami-0cachedvalue000001"))
+        // The whole point: one SSM round trip serves both launches.
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=RunInstances"))
+        .and(body_string_contains("ImageId=ami-0cachedvalue000001"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RUN_INSTANCES_XML))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
+    p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
+    server.verify().await;
 }
 
 // ---- Generic provider contract against a stateful fake EC2 ----

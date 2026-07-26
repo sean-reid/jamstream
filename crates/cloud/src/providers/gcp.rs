@@ -55,9 +55,10 @@
 //! # Pricing
 //!
 //! Prices come from the bundled `data/gcp_prices.json` snapshot of public
-//! on-demand e2-small rates; refresh expectations are documented in that
-//! file. Listing does not paginate: a jam fleet is a handful of VMs and
-//! the API default page size is 500.
+//! on-demand e2-small and e2-medium rates (the e2-medium column is an
+//! approximation, roughly double e2-small); refresh expectations are
+//! documented in that file. Zone listing follows `nextPageToken` until
+//! the token runs out.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -258,6 +259,26 @@ impl GcpProvider {
         format!("{}/{}", self.zone_url(region), name)
     }
 
+    /// Price for one instance class in one region, from the bundled
+    /// snapshot in `data/gcp_prices.json`.
+    pub fn price_for(&self, region: &RegionId, class: InstanceClass) -> Result<Price> {
+        self.require_region(region)?;
+        let table = price_table();
+        let per_region = match class {
+            InstanceClass::Small => &table.hourly_microusd,
+            InstanceClass::Standard => &table.e2_medium_hourly_microusd,
+        };
+        let hourly = per_region
+            .get(region.as_str())
+            .copied()
+            .ok_or_else(|| ProviderError::NotFound(format!("no gcp price for region {region}")))?;
+        Ok(Price {
+            hourly_microusd: hourly,
+            egress_microusd_per_gb: table.egress_microusd_per_gb,
+            included_egress_gb: table.included_egress_gb,
+        })
+    }
+
     /// Builds the instance insert body. Factored out so the shape is unit
     /// testable without a server.
     fn launch_body(&self, spec: &LaunchSpec, name: &str) -> Result<Value> {
@@ -313,19 +334,10 @@ impl Provider for GcpProvider {
             .collect()
     }
 
+    /// Region price for the Standard session size (e2-medium); use
+    /// `price_for` to price a specific class.
     async fn price(&self, region: &RegionId) -> Result<Price> {
-        self.require_region(region)?;
-        let table = price_table();
-        let hourly = table
-            .hourly_microusd
-            .get(region.as_str())
-            .copied()
-            .ok_or_else(|| ProviderError::NotFound(format!("no gcp price for region {region}")))?;
-        Ok(Price {
-            hourly_microusd: hourly,
-            egress_microusd_per_gb: table.egress_microusd_per_gb,
-            included_egress_gb: table.included_egress_gb,
-        })
+        self.price_for(region, InstanceClass::Standard)
     }
 
     async fn launch(&self, spec: LaunchSpec) -> Result<Instance> {
@@ -417,8 +429,6 @@ fn default_zone(region: &str) -> String {
 }
 
 fn machine_type(class: InstanceClass) -> &'static str {
-    // Pricing in data/gcp_prices.json tracks e2-small; e2-medium pricing
-    // lands together with native RS256 auth as a follow-up.
     match class {
         InstanceClass::Small => "e2-small",
         InstanceClass::Standard => "e2-medium",
@@ -480,7 +490,10 @@ fn label_decode(label: &str) -> String {
 struct PriceTable {
     egress_microusd_per_gb: u64,
     included_egress_gb: u32,
+    /// e2-small per-region hourly rates.
     hourly_microusd: BTreeMap<String, u64>,
+    /// e2-medium per-region hourly rates (approximate, about 2x e2-small).
+    e2_medium_hourly_microusd: BTreeMap<String, u64>,
 }
 
 fn price_table() -> &'static PriceTable {
@@ -516,9 +529,12 @@ struct GcpAccessConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GcpInstanceList {
     #[serde(default)]
     items: Vec<GcpInstance>,
+    #[serde(default)]
+    next_page_token: Option<String>,
 }
 
 fn instance_from_gcp(raw: GcpInstance, region: Region) -> Instance {
@@ -546,6 +562,8 @@ fn instance_from_gcp(raw: GcpInstance, region: Region) -> Instance {
     }
 }
 
+/// Lists one zone, following `nextPageToken` until the listing is
+/// complete.
 async fn list_zone(
     http: reqwest::Client,
     url: String,
@@ -553,21 +571,34 @@ async fn list_zone(
     filter: String,
     region: Region,
 ) -> Result<Vec<Instance>> {
-    let resp = send_retrying(|| {
-        http.get(&url)
-            .bearer_auth(&token)
-            .query(&[("filter", filter.as_str())])
-    })
-    .await?;
-    let list: GcpInstanceList = resp
-        .json()
-        .await
-        .map_err(|e| ProviderError::Other(format!("gcp list response parse: {e}")))?;
-    Ok(list
-        .items
-        .into_iter()
-        .map(|item| instance_from_gcp(item, region.clone()))
-        .collect())
+    let mut instances = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let resp = send_retrying(|| {
+            let mut req = http
+                .get(&url)
+                .bearer_auth(&token)
+                .query(&[("filter", filter.as_str())]);
+            if let Some(t) = &page_token {
+                req = req.query(&[("pageToken", t.as_str())]);
+            }
+            req
+        })
+        .await?;
+        let list: GcpInstanceList = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Other(format!("gcp list response parse: {e}")))?;
+        instances.extend(
+            list.items
+                .into_iter()
+                .map(|item| instance_from_gcp(item, region.clone())),
+        );
+        page_token = list.next_page_token.filter(|t| !t.is_empty());
+        if page_token.is_none() {
+            return Ok(instances);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -626,11 +657,24 @@ mod tests {
     }
 
     #[test]
-    fn price_table_covers_catalog() {
+    fn price_table_covers_catalog_for_both_classes() {
         let table = price_table();
         for (id, _, _) in CATALOG {
-            let hourly = table.hourly_microusd.get(*id);
-            assert!(hourly.is_some_and(|p| *p > 0), "missing price for {id}");
+            let small = table
+                .hourly_microusd
+                .get(*id)
+                .copied()
+                .unwrap_or_else(|| panic!("missing e2-small price for {id}"));
+            let medium = table
+                .e2_medium_hourly_microusd
+                .get(*id)
+                .copied()
+                .unwrap_or_else(|| panic!("missing e2-medium price for {id}"));
+            assert!(small > 0, "zero e2-small price for {id}");
+            assert!(
+                medium > small,
+                "e2-medium must cost more than e2-small in {id}"
+            );
         }
         assert_eq!(table.egress_microusd_per_gb, 120_000);
         assert_eq!(table.included_egress_gb, 0);

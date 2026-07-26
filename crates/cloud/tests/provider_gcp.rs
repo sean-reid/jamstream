@@ -5,7 +5,7 @@ use jamstream_cloud::{
     InstanceClass, LaunchSpec, Provider, ProviderError, ProviderKind, Region, RegionId, session_tag,
 };
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const PROJECT: &str = "test-project";
@@ -294,20 +294,82 @@ async fn list_tagged_aggregates_zones_and_skips_failing_zone() {
 }
 
 #[tokio::test]
+async fn list_tagged_follows_next_page_token_within_a_zone() {
+    let server = MockServer::start().await;
+    let marker_filter = || query_param("filter", "labels.jamstream=true");
+
+    // Page one carries a nextPageToken; page two ends the listing. Only
+    // us-central1-b answers, the other zones 404 and are tolerated.
+    Mock::given(method("GET"))
+        .and(path(zone_path("us-central1-b")))
+        .and(marker_filter())
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "name": "jamstream-page1",
+                "labels": { "jamstream": "true", "jamstream-session": "aaaa" }
+            }],
+            "nextPageToken": "tok-page-2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(zone_path("us-central1-b")))
+        .and(marker_filter())
+        .and(query_param("pageToken", "tok-page-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "name": "jamstream-page2",
+                "labels": { "jamstream": "true", "jamstream-session": "bbbb" }
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let mut found = p.list_tagged(None).await.expect("list across pages");
+    found.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(found.len(), 2, "both pages must be fetched");
+    assert_eq!(found[0].id, "jamstream-page1");
+    assert_eq!(found[1].id, "jamstream-page2");
+    assert_eq!(found[1].session_id(), Some("bbbb"));
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn every_catalog_region_has_a_positive_price() {
     let p = GcpProvider::with_access_token(PROJECT.to_owned(), "t".to_owned());
     let regions = p.regions();
     assert_eq!(regions.len(), 9);
     for r in &regions {
         assert_eq!(r.provider, ProviderKind::Gcp);
+        let small = p
+            .price_for(&r.id, InstanceClass::Small)
+            .unwrap_or_else(|e| panic!("small price for {}: {e}", r.id));
+        let standard = p
+            .price_for(&r.id, InstanceClass::Standard)
+            .unwrap_or_else(|e| panic!("standard price for {}: {e}", r.id));
+        assert!(small.hourly_microusd > 0, "zero small price for {}", r.id);
+        assert!(
+            standard.hourly_microusd > small.hourly_microusd,
+            "standard must cost more than small in {}",
+            r.id
+        );
+        // The trait-level price() reports the Standard session size.
         let price = p
             .price(&r.id)
             .await
             .unwrap_or_else(|e| panic!("price for {}: {e}", r.id));
-        assert!(price.hourly_microusd > 0, "zero price for {}", r.id);
+        assert_eq!(price, standard);
         assert_eq!(price.egress_microusd_per_gb, 120_000);
         assert_eq!(price.included_egress_gb, 0);
     }
     let err = p.price(&RegionId::new("mars-north1")).await.unwrap_err();
+    assert!(matches!(err, ProviderError::NotFound(_)));
+    let err = p
+        .price_for(&RegionId::new("mars-north1"), InstanceClass::Small)
+        .unwrap_err();
     assert!(matches!(err, ProviderError::NotFound(_)));
 }
