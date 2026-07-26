@@ -1,0 +1,253 @@
+//! Invites are self-contained: possessing a valid one is necessary and
+//! sufficient to join a session. The issuer signature is checked by the
+//! server, which learned the issuer's public key at boot. The client cannot
+//! verify an invite offline; it trusts the channel it received it through,
+//! and the Noise handshake stops anyone who tampered with the server key
+//! from completing a connection.
+
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+
+use crate::Error;
+use crate::ids::{MemberId, Role, SessionId, TokenId};
+
+const URL_PREFIX: &str = "jamstream://join/";
+const SIGN_DOMAIN: &[u8] = b"jamstream-token-v1";
+
+/// Per-person admission token, signed by the session issuer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Token {
+    pub member_id: MemberId,
+    pub role: Role,
+    /// Display name suggestion shown until the member picks their own.
+    pub name_hint: Option<String>,
+    /// Unix seconds. Defaults to the session's maximum duration.
+    pub expires_unix: u64,
+    /// Revocation handle; the host can invalidate one invite mid-session.
+    pub jti: TokenId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Invite {
+    pub session_id: SessionId,
+    /// Candidate addresses for the session server, tried in order.
+    pub addresses: Vec<SocketAddr>,
+    /// Server static Noise public key; authenticates the server on the
+    /// first handshake flight.
+    pub server_pk: [u8; 32],
+    pub token: Token,
+    pub signature: Signature,
+}
+
+/// Session issuer keypair. Lives only on the host machine.
+pub struct Issuer {
+    key: SigningKey,
+}
+
+impl Issuer {
+    pub fn generate() -> Self {
+        Self {
+            key: SigningKey::from_bytes(&crate::rand_bytes()),
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+        Self {
+            key: SigningKey::from_bytes(bytes),
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.key.to_bytes()
+    }
+
+    pub fn public_key(&self) -> VerifyingKey {
+        self.key.verifying_key()
+    }
+
+    pub fn mint(
+        &self,
+        session_id: SessionId,
+        addresses: Vec<SocketAddr>,
+        server_pk: [u8; 32],
+        token: Token,
+    ) -> Invite {
+        let msg = claims(&session_id, &server_pk, &token);
+        let signature = self.key.sign(&msg);
+        Invite {
+            session_id,
+            addresses,
+            server_pk,
+            token,
+            signature,
+        }
+    }
+}
+
+/// Server-side check at admission time. `now_unix` comes from the caller so
+/// the check stays deterministic under test.
+pub fn verify_token(
+    issuer_pk: &VerifyingKey,
+    session_id: &SessionId,
+    server_pk: &[u8; 32],
+    token: &Token,
+    signature: &Signature,
+    now_unix: u64,
+) -> Result<(), Error> {
+    let msg = claims(session_id, server_pk, token);
+    issuer_pk
+        .verify(&msg, signature)
+        .map_err(|_| Error::Token("bad signature"))?;
+    if now_unix >= token.expires_unix {
+        return Err(Error::Token("expired"));
+    }
+    Ok(())
+}
+
+fn claims(session_id: &SessionId, server_pk: &[u8; 32], token: &Token) -> Vec<u8> {
+    let mut msg = SIGN_DOMAIN.to_vec();
+    let body = postcard::to_stdvec(&(session_id, server_pk, token)).expect("claims serialize");
+    msg.extend_from_slice(&body);
+    msg
+}
+
+impl Invite {
+    /// `jamstream://join/<blob>`. The bare blob is also accepted on parse,
+    /// for people pasting into a text field.
+    pub fn encode(&self) -> String {
+        let blob = postcard::to_stdvec(self).expect("invite serialize");
+        format!(
+            "{URL_PREFIX}{}",
+            data_encoding::BASE64URL_NOPAD.encode(&blob)
+        )
+    }
+
+    pub fn decode(text: &str) -> Result<Self, Error> {
+        let raw = text.trim();
+        let blob = raw.strip_prefix(URL_PREFIX).unwrap_or(raw);
+        let bytes = data_encoding::BASE64URL_NOPAD
+            .decode(blob.as_bytes())
+            .map_err(|_| Error::Invite("not valid encoding"))?;
+        let invite: Invite =
+            postcard::from_bytes(&bytes).map_err(|_| Error::Invite("truncated or corrupt"))?;
+        if invite.addresses.is_empty() {
+            return Err(Error::Invite("no server address"));
+        }
+        Ok(invite)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_token(expires: u64) -> Token {
+        Token {
+            member_id: MemberId(3),
+            role: Role::Musician,
+            name_hint: Some("ana".into()),
+            expires_unix: expires,
+            jti: TokenId::generate(),
+        }
+    }
+
+    fn sample_invite(issuer: &Issuer, expires: u64) -> Invite {
+        issuer.mint(
+            SessionId::generate(),
+            vec!["203.0.113.10:43210".parse().unwrap()],
+            [7u8; 32],
+            sample_token(expires),
+        )
+    }
+
+    #[test]
+    fn round_trips_through_url() {
+        let issuer = Issuer::generate();
+        let invite = sample_invite(&issuer, 10_000);
+        let encoded = invite.encode();
+        assert!(encoded.starts_with(URL_PREFIX));
+        assert_eq!(Invite::decode(&encoded).unwrap(), invite);
+        // Bare blob without the scheme prefix also parses.
+        let bare = encoded.strip_prefix(URL_PREFIX).unwrap();
+        assert_eq!(Invite::decode(bare).unwrap(), invite);
+    }
+
+    #[test]
+    fn verifies_and_rejects() {
+        let issuer = Issuer::generate();
+        let invite = sample_invite(&issuer, 10_000);
+        let pk = issuer.public_key();
+        let ok = verify_token(
+            &pk,
+            &invite.session_id,
+            &invite.server_pk,
+            &invite.token,
+            &invite.signature,
+            5_000,
+        );
+        assert!(ok.is_ok());
+
+        // Expired.
+        assert!(
+            verify_token(
+                &pk,
+                &invite.session_id,
+                &invite.server_pk,
+                &invite.token,
+                &invite.signature,
+                10_000,
+            )
+            .is_err()
+        );
+
+        // Tampered role.
+        let mut tampered = invite.token.clone();
+        tampered.role = Role::Listener;
+        assert!(
+            verify_token(
+                &pk,
+                &invite.session_id,
+                &invite.server_pk,
+                &tampered,
+                &invite.signature,
+                5_000,
+            )
+            .is_err()
+        );
+
+        // Signed for a different server key.
+        assert!(
+            verify_token(
+                &pk,
+                &invite.session_id,
+                &[8u8; 32],
+                &invite.token,
+                &invite.signature,
+                5_000,
+            )
+            .is_err()
+        );
+
+        // Wrong issuer entirely.
+        let other = Issuer::generate();
+        assert!(
+            verify_token(
+                &other.public_key(),
+                &invite.session_id,
+                &invite.server_pk,
+                &invite.token,
+                &invite.signature,
+                5_000,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(Invite::decode("jamstream://join/%%%").is_err());
+        assert!(Invite::decode("").is_err());
+        assert!(Invite::decode("aGVsbG8").is_err());
+    }
+}

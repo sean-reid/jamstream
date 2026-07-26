@@ -10,6 +10,12 @@ repository.workspace = true
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
+snow.workspace = true
+ed25519-dalek.workspace = true
+data-encoding.workspace = true
+blake2.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
