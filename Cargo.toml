@@ -36,6 +36,7 @@ rand = "0.9"
 proptest = "1"
 snow = "0.10"
 ed25519-dalek = { version = "2", features = ["serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 data-encoding = "2"
 blake2 = "0.10"
 getrandom = "0.3"
@@ -46,7 +47,7 @@ cpal = "0.18"
 rtrb = "0.3"
 hound = "3"
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json = "1"
 wiremock = "0.6"
