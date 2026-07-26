@@ -1,0 +1,43 @@
+# Keeps the documentation site current by machinery, not discipline:
+#
+# - cli-docs: the CLI reference pages in site/src/cli/ must mention every
+#   flag the built CLI's --help output has, and mention no flag it lacks.
+#   A change that touches the argument surface must update the docs in the
+#   same change or this job fails.
+# - screenshots: the images in site/src/images/ are committed copies of
+#   the UI snapshot previews. A change that regenerates the snapshot
+#   baselines must run site/copy-previews.sh in the same change or this
+#   job fails on the byte-for-byte comparison.
+
+name: docs-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cli-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-check-cli
+      - name: Check CLI reference pages against --help
+        run: site/check-cli-docs.sh
+
+  screenshots:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-check-previews
+      - name: Render UI previews
+        run: cargo test -p jamstream-client --test ui_snapshots
+      - name: Check committed docs images against fresh previews
+        run: site/copy-previews.sh --check

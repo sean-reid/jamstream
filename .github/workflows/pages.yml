@@ -1,0 +1,68 @@
+# Builds and deploys the documentation site to GitHub Pages.
+#
+# The screenshots in site/src/images/ are committed copies of the UI
+# snapshot previews, so this workflow only builds markdown; it does not
+# need a GPU or a Rust toolchain. site/copy-previews.sh refreshes the
+# images locally after `cargo test -p jamstream-client --test ui_snapshots`,
+# and docs-check.yml fails when the committed copies go stale, which keeps
+# image refreshes in the same change as the UI change that caused them.
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      MDBOOK_VERSION: 0.5.4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdbook (pinned)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # No-op in CI (no target/ui-previews here); kept so a runner that has
+      # just rendered previews, or a local act run, picks up fresh images.
+      - name: Refresh screenshots when previews exist
+        run: |
+          if [ -d target/ui-previews ]; then
+            site/copy-previews.sh
+          else
+            echo "no target/ui-previews; using the committed images"
+          fi
+
+      - name: Build the book
+        run: mdbook build site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

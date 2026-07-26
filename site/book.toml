@@ -1,0 +1,33 @@
+# JamStream user documentation.
+#
+# Keeping these docs current is enforced by machinery, not discipline:
+# - A change that adds, removes, or renames a CLI flag must update the
+#   matching page in src/cli/ in the same change. CI runs
+#   site/check-cli-docs.sh against the built CLI's --help output and fails
+#   on drift in either direction.
+# - A change that regenerates the UI snapshot baselines must refresh the
+#   committed screenshots in src/images/ in the same change: run
+#   site/copy-previews.sh after `cargo test -p jamstream-client --test
+#   ui_snapshots`. CI runs copy-previews.sh --check and fails when the
+#   committed images differ from the freshly rendered previews.
+
+[book]
+title = "JamStream"
+description = "JamStream user documentation: host a short-lived jam server in your own cloud account and play together."
+authors = ["JamStream contributors"]
+language = "en"
+src = "src"
+
+[output.html]
+# One pinned dark theme; the picker is removed in theme/index.hbs and light
+# mode is deliberately skipped for v1 (see theme/css/variables.css).
+default-theme = "jamstream"
+preferred-dark-theme = "jamstream"
+# The prose rules ban em dashes; smart punctuation would synthesize them
+# from "---" in text, so it stays off.
+smart-punctuation = false
+git-repository-url = "https://github.com/sean-reid/jamstream"
+# Unhashed resource filenames so the @font-face urls in theme/fonts/fonts.css
+# resolve as written (mdBook 0.5 does not rewrite urls inside custom theme
+# CSS). Cache busting matters less than working fonts.
+hash-files = false

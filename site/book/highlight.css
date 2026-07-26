@@ -1,0 +1,77 @@
+/* JamStream code highlighting. One dark scheme for the one theme.
+ * Colors stay quiet and desaturated, matching the app's restraint;
+ * nothing is neon. Replaces the stock highlight.js stylesheet;
+ * tomorrow-night and ayu are not linked from index.hbs. */
+
+.hljs {
+    display: block;
+    overflow-x: auto;
+    padding: 0.5em;
+    background: var(--js-well, #0e0f10);
+    color: #d8d5d0;
+}
+
+code.hljs {
+    padding: 3px 5px;
+}
+
+.hljs-comment,
+.hljs-quote {
+    color: #7c7a76;
+    font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-section,
+.hljs-name,
+.hljs-tag {
+    color: #c9b489;
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-attribute,
+.hljs-meta .hljs-string {
+    color: #9fb98a;
+}
+
+.hljs-number,
+.hljs-literal,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-link {
+    color: #c8a06a;
+}
+
+.hljs-title,
+.hljs-attr,
+.hljs-selector-id,
+.hljs-selector-class,
+.hljs-selector-attr,
+.hljs-selector-pseudo,
+.hljs-template-variable,
+.hljs-variable {
+    color: #b8c2c9;
+}
+
+.hljs-built_in,
+.hljs-type,
+.hljs-class .hljs-title,
+.hljs-title.class_ {
+    color: #a9b6a0;
+}
+
+.hljs-meta,
+.hljs-deletion {
+    color: #8f8d88;
+}
+
+.hljs-emphasis {
+    font-style: italic;
+}
+
+.hljs-strong {
+    font-weight: 600;
+}
