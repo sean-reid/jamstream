@@ -1,11 +1,15 @@
 //! Wiremock-backed integration tests for the GCP Compute Engine provider.
 
-use jamstream_cloud::providers::gcp::GcpProvider;
+use std::sync::Arc;
+
+use jamstream_cloud::providers::gcp::{GcpProvider, ServiceAccountTokenSource};
 use jamstream_cloud::{
     InstanceClass, LaunchSpec, Provider, ProviderError, ProviderKind, Region, RegionId, session_tag,
 };
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+use wiremock::matchers::{
+    body_string_contains, header, method, path, query_param, query_param_is_missing,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const PROJECT: &str = "test-project";
@@ -335,6 +339,62 @@ async fn list_tagged_follows_next_page_token_within_a_zone() {
     assert_eq!(found[0].id, "jamstream-page1");
     assert_eq!(found[1].id, "jamstream-page2");
     assert_eq!(found[1].session_id(), Some("bbbb"));
+    server.verify().await;
+}
+
+/// End to end through the native service-account flow: the throwaway
+/// committed test key signs a JWT, the mock token endpoint exchanges it,
+/// and the resulting bearer token authenticates a `list_tagged` call.
+#[tokio::test]
+async fn list_tagged_authenticates_via_native_service_account_source() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer",
+        ))
+        .and(body_string_contains("assertion="))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "native-minted-token",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Only requests carrying the freshly minted token are answered; every
+    // zone list must therefore have authenticated through the source.
+    Mock::given(method("GET"))
+        .and(path(zone_path("us-central1-b")))
+        .and(header("authorization", "Bearer native-minted-token"))
+        .and(query_param(
+            "filter",
+            "labels.jamstream-session=deadbeefcafef00d",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "name": "jamstream-native",
+                "status": "RUNNING",
+                "labels": { "jamstream": "true", "jamstream-session": "deadbeefcafef00d" }
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let key_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/gcp_test_key.json");
+    let source = ServiceAccountTokenSource::from_file(key_path)
+        .expect("committed test fixture must parse")
+        .with_token_endpoint(format!("{}/token", server.uri()));
+    let p = GcpProvider::with_token_source(PROJECT.to_owned(), Arc::new(source))
+        .with_base_url(server.uri());
+
+    let found = p
+        .list_tagged(Some("deadbeefcafef00d"))
+        .await
+        .expect("list via native auth");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, "jamstream-native");
     server.verify().await;
 }
 

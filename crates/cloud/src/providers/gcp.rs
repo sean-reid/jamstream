@@ -7,23 +7,26 @@
 //! # Authentication
 //!
 //! GCP service-account keys require an RS256-signed JWT to mint an OAuth2
-//! access token. This crate has no RSA implementation and adds no
-//! dependencies, so native RS256 signing of service account keys is a
-//! tracked follow-up. Until then the token source is pluggable and two
+//! access token. This crate signs that JWT natively with aws-lc-rs (see
+//! [`ServiceAccountTokenSource`]); no gcloud subprocess is needed. Three
 //! modes are supported:
 //!
-//! 1. [`GcpProvider::with_access_token`]: the caller supplies an OAuth2
-//!    bearer token (the CLI shells out to `gcloud auth
-//!    print-access-token`; tests inject a fake). The token is opaque,
+//! 1. [`GcpProvider::from_env`] with `GOOGLE_APPLICATION_CREDENTIALS`
+//!    pointing at a service-account key file: the key is parsed, a JWT is
+//!    signed, and access tokens are minted and cached natively. The
+//!    project id comes from `GOOGLE_CLOUD_PROJECT` or, failing that, the
+//!    key's own `project_id` field.
+//! 2. [`GcpProvider::from_env`] with `GOOGLE_CLOUD_PROJECT` plus
+//!    `GCP_ACCESS_TOKEN`: a pre-minted bearer token from the environment
+//!    (for example `gcloud auth print-access-token`). This pair takes
+//!    precedence when both modes are configured.
+//! 3. [`GcpProvider::with_access_token`]: the caller supplies an OAuth2
+//!    bearer token directly (tests inject a fake). The token is opaque,
 //!    never logged, and redacted from `Debug` output.
-//! 2. [`GcpProvider::from_env`]: reads `GOOGLE_CLOUD_PROJECT` plus
-//!    `GCP_ACCESS_TOKEN`. If those are absent it fails with an Auth error
-//!    that explains the supported modes; when
-//!    `GOOGLE_APPLICATION_CREDENTIALS` is set and `gcloud` is on PATH the
-//!    error notes that the CLI integration shells out to gcloud (the
-//!    subprocess lives in the CLI, not in this library).
 //!
-//! Arbitrary refresh strategies plug in through [`TokenSource`].
+//! When no credentials are present at all, `from_env` fails with an Auth
+//! error that explains the supported modes. Arbitrary refresh strategies
+//! plug in through [`TokenSource`].
 //!
 //! # Zone selection
 //!
@@ -78,6 +81,8 @@ use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
     Instance, InstanceClass, LaunchSpec, Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
 };
+
+pub use super::gcp_auth::ServiceAccountTokenSource;
 
 /// Static region catalog: (region id, display name, ISO country).
 const CATALOG: &[(&str, &str, &str)] = &[
@@ -175,34 +180,39 @@ impl GcpProvider {
         }
     }
 
-    /// Auth mode 2: `GOOGLE_CLOUD_PROJECT` plus `GCP_ACCESS_TOKEN` from
-    /// the environment. Anything else fails with an Auth error that spells
-    /// out the supported modes; see the module docs.
+    /// Credentials from the environment: `GOOGLE_CLOUD_PROJECT` plus
+    /// `GCP_ACCESS_TOKEN` when both are set, otherwise a service-account
+    /// key file named by `GOOGLE_APPLICATION_CREDENTIALS` (signed and
+    /// exchanged natively, no gcloud involved). Anything else fails with
+    /// an Auth error that spells out the supported modes; see the module
+    /// docs.
     pub fn from_env() -> Result<Self> {
-        Self::from_env_with(&|key| std::env::var(key).ok(), gcloud_on_path())
+        Self::from_env_with(&|key| std::env::var(key).ok())
     }
 
-    fn from_env_with(get: &dyn Fn(&str) -> Option<String>, gcloud_available: bool) -> Result<Self> {
+    fn from_env_with(get: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         if let (Some(project), Some(token)) = (get("GOOGLE_CLOUD_PROJECT"), get("GCP_ACCESS_TOKEN"))
         {
             return Ok(Self::with_access_token(project, token));
         }
-        if get("GOOGLE_APPLICATION_CREDENTIALS").is_some() && gcloud_available {
-            return Err(ProviderError::Auth(
-                "GOOGLE_APPLICATION_CREDENTIALS points at a service account key and gcloud is on \
-                 PATH; the JamStream CLI integration shells out to `gcloud auth \
-                 print-access-token` for this case (this library does not spawn subprocesses). \
-                 Supported modes: GcpProvider::with_access_token(project_id, token), or set \
-                 GOOGLE_CLOUD_PROJECT and GCP_ACCESS_TOKEN. Native RS256 signing of service \
-                 account keys is a tracked follow-up."
-                    .to_owned(),
-            ));
+        if let Some(path) = get("GOOGLE_APPLICATION_CREDENTIALS") {
+            let source = ServiceAccountTokenSource::from_file(&path)?;
+            let project = get("GOOGLE_CLOUD_PROJECT")
+                .or_else(|| source.project_id().map(str::to_owned))
+                .ok_or_else(|| {
+                    ProviderError::Auth(format!(
+                        "service account key {path} has no project_id field and \
+                         GOOGLE_CLOUD_PROJECT is not set; set GOOGLE_CLOUD_PROJECT to the \
+                         target project"
+                    ))
+                })?;
+            return Ok(Self::with_token_source(project, Arc::new(source)));
         }
         Err(ProviderError::Auth(
-            "no GCP credentials: set GOOGLE_CLOUD_PROJECT and GCP_ACCESS_TOKEN (for example from \
-             `gcloud auth print-access-token`), or construct the provider with \
-             GcpProvider::with_access_token(project_id, token). Native RS256 signing of service \
-             account keys is a tracked follow-up."
+            "no GCP credentials: set GOOGLE_APPLICATION_CREDENTIALS to a service account key \
+             file (RS256 signing is native, no gcloud needed), or set GOOGLE_CLOUD_PROJECT and \
+             GCP_ACCESS_TOKEN (for example from `gcloud auth print-access-token`), or construct \
+             the provider with GcpProvider::with_access_token(project_id, token)."
                 .to_owned(),
         ))
     }
@@ -445,11 +455,6 @@ fn generate_name() -> String {
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("jamstream-{nanos:x}-{seq:x}")
-}
-
-fn gcloud_on_path() -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("gcloud").is_file()))
 }
 
 /// Encodes one canonical tag key or value as a GCP-compliant label
@@ -708,6 +713,11 @@ mod tests {
         assert_eq!(body["metadata"]["items"][0]["value"], "#cloud-config\n");
     }
 
+    /// Path of the committed throwaway service-account key fixture.
+    fn fixture_path() -> String {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/gcp_test_key.json").to_owned()
+    }
+
     #[test]
     fn from_env_with_token_pair() {
         let get = |key: &str| match key {
@@ -715,30 +725,59 @@ mod tests {
             "GCP_ACCESS_TOKEN" => Some("tok".to_owned()),
             _ => None,
         };
-        let p = GcpProvider::from_env_with(&get, false).unwrap();
+        let p = GcpProvider::from_env_with(&get).unwrap();
         assert_eq!(p.project_id, "proj");
     }
 
     #[test]
-    fn from_env_service_account_key_mentions_gcloud() {
-        let get = |key: &str| {
-            (key == "GOOGLE_APPLICATION_CREDENTIALS").then(|| "/tmp/key.json".to_owned())
+    fn from_env_service_account_key_builds_native_source() {
+        let get = |key: &str| (key == "GOOGLE_APPLICATION_CREDENTIALS").then(fixture_path);
+        let p = GcpProvider::from_env_with(&get).unwrap();
+        // Project id falls back to the key's own project_id field.
+        assert_eq!(p.project_id, "jamstream-test-project");
+    }
+
+    #[test]
+    fn from_env_project_env_overrides_key_project_id() {
+        let get = |key: &str| match key {
+            "GOOGLE_APPLICATION_CREDENTIALS" => Some(fixture_path()),
+            "GOOGLE_CLOUD_PROJECT" => Some("explicit-project".to_owned()),
+            _ => None,
         };
-        let err = GcpProvider::from_env_with(&get, true).unwrap_err();
+        let p = GcpProvider::from_env_with(&get).unwrap();
+        assert_eq!(p.project_id, "explicit-project");
+    }
+
+    #[test]
+    fn from_env_token_pair_takes_precedence_over_key_file() {
+        let get = |key: &str| match key {
+            "GOOGLE_APPLICATION_CREDENTIALS" => Some(fixture_path()),
+            "GOOGLE_CLOUD_PROJECT" => Some("proj".to_owned()),
+            "GCP_ACCESS_TOKEN" => Some("tok".to_owned()),
+            _ => None,
+        };
+        let p = GcpProvider::from_env_with(&get).unwrap();
+        assert_eq!(p.project_id, "proj");
+    }
+
+    #[test]
+    fn from_env_unreadable_key_file_is_auth_error() {
+        let get = |key: &str| {
+            (key == "GOOGLE_APPLICATION_CREDENTIALS").then(|| "/nonexistent/key.json".to_owned())
+        };
+        let err = GcpProvider::from_env_with(&get).unwrap_err();
         match err {
-            ProviderError::Auth(msg) => {
-                assert!(msg.contains("gcloud auth print-access-token"));
-                assert!(msg.contains("with_access_token"));
-            }
+            ProviderError::Auth(msg) => assert!(msg.contains("/nonexistent/key.json")),
             other => panic!("expected Auth, got {other:?}"),
         }
     }
 
     #[test]
     fn from_env_empty_explains_modes() {
-        let err = GcpProvider::from_env_with(&|_| None, false).unwrap_err();
+        let err = GcpProvider::from_env_with(&|_| None).unwrap_err();
         match err {
             ProviderError::Auth(msg) => {
+                assert!(msg.contains("GOOGLE_APPLICATION_CREDENTIALS"));
                 assert!(msg.contains("GCP_ACCESS_TOKEN"));
                 assert!(msg.contains("with_access_token"));
             }
