@@ -1,0 +1,73 @@
+# Proves the signing secrets work before any release depends on them:
+# imports the Developer ID certificate into a throwaway keychain, signs a
+# freshly built app binary with the hardened runtime, and verifies the
+# signature. Notarization is exercised separately once its credentials
+# exist. Weekly cron doubles as an early warning for certificate problems.
+name: sign-smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 5 * * 1"
+
+jobs:
+  sign:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check secrets are configured
+        id: gate
+        env:
+          CERT: ${{ secrets.APPLE_CERT_P12 }}
+        run: |
+          if [ -z "$CERT" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "signing secrets absent; nothing to smoke test"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.gate.outputs.configured == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.gate.outputs.configured == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.gate.outputs.configured == 'true'
+        run: cargo build -p jamstream-client --release
+      - if: steps.gate.outputs.configured == 'true'
+        name: Import certificate into a throwaway keychain
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -eu
+          KEYCHAIN_PW=$(uuidgen)
+          echo "KEYCHAIN_PW=$KEYCHAIN_PW" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PW" smoke.keychain
+          security set-keychain-settings -lut 1800 smoke.keychain
+          security unlock-keychain -p "$KEYCHAIN_PW" smoke.keychain
+          printf '%s' "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k smoke.keychain \
+            -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PW" smoke.keychain > /dev/null
+          security list-keychains -d user -s smoke.keychain login.keychain
+      - if: steps.gate.outputs.configured == 'true'
+        name: Sign and verify
+        run: |
+          set -eu
+          IDENTITY=$(security find-identity -v -p codesigning smoke.keychain \
+            | grep -oE '"[^"]+"' | head -1 | tr -d '"')
+          if [ -z "$IDENTITY" ]; then
+            echo "no valid signing identity in the imported certificate" >&2
+            exit 1
+          fi
+          echo "signing with: $IDENTITY"
+          BIN=target/release/jamstream-app
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY" --keychain smoke.keychain "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign --display --verbose=2 "$BIN" 2>&1 | grep -E "Authority|TeamIdentifier"
+      - if: always() && steps.gate.outputs.configured == 'true'
+        name: Remove the throwaway keychain
+        run: security delete-keychain smoke.keychain || true
