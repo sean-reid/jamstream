@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 jamstream-protocol.workspace = true
+opus.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

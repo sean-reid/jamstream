@@ -38,6 +38,16 @@ data-encoding = "2"
 blake2 = "0.10"
 getrandom = "0.3"
 zeroize = "1"
+# opus 0.3 (audiopus_sys) fails to build with CMake >= 4; opusic-c bundles a current libopus.
+opus = { package = "opusic-c", version = "1" }
+cpal = "0.18"
+rtrb = "0.3"
+hound = "3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = "1"
+wiremock = "0.6"
 
 [profile.release]
 lto = "thin"
