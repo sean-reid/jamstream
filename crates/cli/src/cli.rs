@@ -147,6 +147,16 @@ pub struct JoinArgs {
     /// Display name to request. Not sent yet; names come from the invite.
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Test hook, host invite only: another member's invite whose token is
+    /// revoked mid-session. Hidden; the desktop app owns interactive
+    /// revocation.
+    #[arg(long = "revoke-invite", hide = true, requires = "revoke_after_secs")]
+    pub revoke_invite: Option<String>,
+
+    /// Test hook: seconds after joining before --revoke-invite fires.
+    #[arg(long = "revoke-after-secs", hide = true, requires = "revoke_invite")]
+    pub revoke_after_secs: Option<u64>,
 }
 
 #[cfg(test)]
@@ -282,5 +292,39 @@ mod tests {
         assert_eq!(args.duration_secs, 3);
         assert_eq!(args.chat.as_deref(), Some("hi"));
         assert_eq!(args.name.as_deref(), Some("ana"));
+        assert!(args.revoke_invite.is_none());
+        assert!(args.revoke_after_secs.is_none());
+    }
+
+    #[test]
+    fn revoke_hooks_come_as_a_pair() {
+        let base = [
+            "jamstream",
+            "join",
+            "blob",
+            "--headless",
+            "--input",
+            "in.wav",
+            "--output",
+            "out.wav",
+            "--duration-secs",
+            "3",
+        ];
+        let mut with_both = base.to_vec();
+        with_both.extend(["--revoke-invite", "other", "--revoke-after-secs", "2"]);
+        let cli = Cli::parse_from(with_both);
+        let Command::Join(args) = cli.command else {
+            panic!("expected join");
+        };
+        assert_eq!(args.revoke_invite.as_deref(), Some("other"));
+        assert_eq!(args.revoke_after_secs, Some(2));
+
+        let mut only_invite = base.to_vec();
+        only_invite.extend(["--revoke-invite", "other"]);
+        assert!(Cli::try_parse_from(only_invite).is_err());
+
+        let mut only_delay = base.to_vec();
+        only_delay.extend(["--revoke-after-secs", "2"]);
+        assert!(Cli::try_parse_from(only_delay).is_err());
     }
 }

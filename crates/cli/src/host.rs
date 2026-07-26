@@ -42,6 +42,28 @@ pub async fn run<W: Write>(
             args.provider
         )));
     }
+
+    // Pre-flight orphan guard: anything already tagged jamstream on this
+    // provider is billing right now, most likely a stray from a session
+    // that never got torn down. Warn before adding another instance.
+    let preexisting = provider.list_tagged(None).await?;
+    if !preexisting.is_empty() && !args.json {
+        writeln!(
+            out,
+            "found {} existing jamstream instances; run jamstream sweep if these are strays",
+            preexisting.len()
+        )?;
+        for inst in &preexisting {
+            writeln!(
+                out,
+                "  {} {} {} (session {})",
+                inst.provider.as_str(),
+                inst.region.id.as_str(),
+                inst.id,
+                inst.session_id().unwrap_or("unknown")
+            )?;
+        }
+    }
     let mut candidates: Vec<(Region, Price)> = Vec::with_capacity(regions.len());
     for region in &regions {
         candidates.push((region.clone(), provider.price(&region.id).await?));
@@ -179,6 +201,17 @@ pub async fn run<W: Write>(
             "reachability": reachability,
             "invites": session_state.invites,
             "state_file": state_path,
+            "preexisting_instances": preexisting
+                .iter()
+                .map(|inst| {
+                    serde_json::json!({
+                        "provider": inst.provider.as_str(),
+                        "region": inst.region.id.as_str(),
+                        "instance_id": inst.id,
+                        "session_id": inst.session_id(),
+                    })
+                })
+                .collect::<Vec<_>>(),
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&value)?)?;
     } else {

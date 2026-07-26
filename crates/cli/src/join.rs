@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use jamstream_protocol::ids::{HOST_MEMBER_ID, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
 use tokio::net::UdpSocket;
@@ -100,6 +101,7 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
         ));
     }
     let invite = Invite::decode(&args.invite)?;
+    let revoke = revoke_plan(args, &invite)?;
     let mut source = WavSource::load(&args.input)?;
 
     let server = invite.addresses[0];
@@ -126,6 +128,7 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
     let mut joined_at: Option<Instant> = None;
     let mut roster_size = 1usize;
     let mut chat_sent = false;
+    let mut revoke_sent = false;
 
     loop {
         tokio::select! {
@@ -172,6 +175,14 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
                     core.send_chat(msg)?;
                     chat_sent = true;
                 }
+                if let Some((jti, after)) = &revoke
+                    && !revoke_sent
+                    && t0.elapsed() >= *after
+                {
+                    core.revoke(*jti)?;
+                    revoke_sent = true;
+                    writeln!(out, "sent revoke after {} s", after.as_secs())?;
+                }
             }
             ClientState::Rejected { ours, theirs } => {
                 write_stereo_wav(&args.output, &received)?;
@@ -209,6 +220,29 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
         args.output.display()
     )?;
     Ok(())
+}
+
+/// Validates the hidden revocation test hook. The wire protocol revokes by
+/// token id, so the flag takes the target's full invite (which the host, who
+/// minted every invite, has at hand) and extracts the jti from it. Only the
+/// host invite may carry the flags: the server treats revoke-by-non-host as
+/// a protocol violation, so refusing early gives a readable error instead.
+fn revoke_plan(args: &JoinArgs, own: &Invite) -> Result<Option<(TokenId, Duration)>, CliError> {
+    match (&args.revoke_invite, args.revoke_after_secs) {
+        (None, None) => Ok(None),
+        (Some(target), Some(secs)) => {
+            if own.token.member_id != HOST_MEMBER_ID {
+                return Err(CliError::Usage(
+                    "--revoke-invite is only usable with the host invite".to_owned(),
+                ));
+            }
+            let target = Invite::decode(target)?;
+            Ok(Some((target.token.jti, Duration::from_secs(secs))))
+        }
+        _ => Err(CliError::Usage(
+            "--revoke-invite and --revoke-after-secs must be passed together".to_owned(),
+        )),
+    }
 }
 
 fn print_event<W: Write>(out: &mut W, event: &ClientEvent) -> std::io::Result<()> {
@@ -295,6 +329,60 @@ mod tests {
             Err(CliError::Usage(msg)) if msg.contains("48 kHz")
         ));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn revoke_plan_is_host_only_and_paired() {
+        use jamstream_protocol::ids::{MemberId, Role, SessionId};
+        use jamstream_protocol::invite::{Issuer, Token};
+
+        let issuer = Issuer::generate();
+        let session_id = SessionId::generate();
+        let mint = |member: u16| {
+            issuer.mint(
+                session_id,
+                vec!["127.0.0.1:43210".parse().unwrap()],
+                [7u8; 32],
+                Token {
+                    member_id: MemberId(member),
+                    role: Role::Musician,
+                    name_hint: None,
+                    expires_unix: u64::MAX,
+                    jti: jamstream_protocol::ids::TokenId::generate(),
+                },
+            )
+        };
+        let host = mint(0);
+        let target = mint(2);
+        let args = |revoke_invite: Option<String>, revoke_after_secs: Option<u64>| JoinArgs {
+            invite: host.encode(),
+            headless: true,
+            input: PathBuf::from("in.wav"),
+            output: PathBuf::from("out.wav"),
+            duration_secs: 1,
+            chat: None,
+            name: None,
+            revoke_invite,
+            revoke_after_secs,
+        };
+
+        assert!(revoke_plan(&args(None, None), &host).unwrap().is_none());
+        let (jti, after) = revoke_plan(&args(Some(target.encode()), Some(2)), &host)
+            .unwrap()
+            .expect("a plan");
+        assert_eq!(jti, target.token.jti);
+        assert_eq!(after, Duration::from_secs(2));
+
+        // Half a pair is a usage error even when clap is bypassed.
+        assert!(matches!(
+            revoke_plan(&args(Some(target.encode()), None), &host),
+            Err(CliError::Usage(_))
+        ));
+        // A non-host invite may not carry the hook.
+        assert!(matches!(
+            revoke_plan(&args(Some(host.encode()), Some(1)), &target),
+            Err(CliError::Usage(msg)) if msg.contains("host invite")
+        ));
     }
 
     #[test]

@@ -1,11 +1,14 @@
 //! The first true end-to-end user story: two headless musicians join a
 //! real jamstreamd server over loopback UDP, each sending a sine tone from
-//! a WAV file. Each must hear the other (the personal mix excludes self,
+//! a WAV fixture. Each must hear the other (the personal mix excludes self,
 //! so a lone client would record near-silence) and see the other's chat.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+mod common;
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+
+use common::{fixture, wav_rms};
 use jamstream_cli::cli::JoinArgs;
 use jamstream_cli::join;
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
@@ -14,46 +17,11 @@ use jamstream_protocol::transport::generate_keypair;
 use jamstream_server::config::Config;
 use jamstream_server::runtime::{Options, Server};
 
-const RATE: u32 = 48_000;
-
 fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "jamstream-cli-headless-{}-{name}",
         std::process::id()
     ))
-}
-
-fn write_sine(path: &Path, freq_hz: f32, secs: f32) {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, spec).unwrap();
-    let total = (secs * RATE as f32) as usize;
-    for i in 0..total {
-        let t = i as f32 / RATE as f32;
-        let sample = (t * freq_hz * std::f32::consts::TAU).sin() * 0.5;
-        writer
-            .write_sample((sample * f32::from(i16::MAX)) as i16)
-            .unwrap();
-    }
-    writer.finalize().unwrap();
-}
-
-/// RMS of the whole file in the -1..1 domain.
-fn wav_rms(path: &Path) -> f64 {
-    let mut reader = hound::WavReader::open(path).unwrap();
-    let mut sum = 0.0f64;
-    let mut count = 0u64;
-    for sample in reader.samples::<i16>() {
-        let v = f64::from(sample.unwrap()) / f64::from(i16::MAX);
-        sum += v * v;
-        count += 1;
-    }
-    assert!(count > 0, "output wav {path:?} is empty");
-    (sum / count as f64).sqrt()
 }
 
 fn join_args(invite: String, input: PathBuf, output: PathBuf, chat: &str) -> JoinArgs {
@@ -65,6 +33,8 @@ fn join_args(invite: String, input: PathBuf, output: PathBuf, chat: &str) -> Joi
         duration_secs: 3,
         chat: Some(chat.to_owned()),
         name: None,
+        revoke_invite: None,
+        revoke_after_secs: None,
     }
 }
 
@@ -114,13 +84,12 @@ async fn two_musicians_hear_each_other_and_chat() {
             .encode()
     };
 
-    let in_one = temp_path("in-one.wav");
-    let in_two = temp_path("in-two.wav");
+    // The 5 s sine fixtures outlast the 3 s session, so neither feed goes
+    // silent early.
+    let in_one = fixture("sine-440-48k.wav");
+    let in_two = fixture("sine-880-48k.wav");
     let out_one = temp_path("out-one.wav");
     let out_two = temp_path("out-two.wav");
-    // Longer than the 3 s session so neither feed goes silent early.
-    write_sine(&in_one, 440.0, 4.0);
-    write_sine(&in_two, 880.0, 4.0);
 
     let args_one = join_args(
         invite_for(1, "one"),
@@ -179,7 +148,8 @@ async fn two_musicians_hear_each_other_and_chat() {
     let _ = stop_tx.send(());
     server_task.await.unwrap().unwrap();
 
-    for path in [&in_one, &in_two, &out_one, &out_two] {
+    // Inputs are shared regenerable fixtures; only the outputs are ours.
+    for path in [&out_one, &out_two] {
         let _ = std::fs::remove_file(path);
     }
 }
