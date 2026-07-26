@@ -24,6 +24,8 @@ repository = "https://github.com/sean-reid/jamstream"
 jamstream-protocol = { path = "crates/protocol" }
 jamstream-engine = { path = "crates/engine" }
 jamstream-session = { path = "crates/session" }
+jamstream-server = { path = "crates/server" }
+jamstream-cli = { path = "crates/cli" }
 jamstream-audio-io = { path = "crates/audio-io" }
 jamstream-cloud = { path = "crates/cloud" }
 jamstream-harness = { path = "crates/harness" }
@@ -55,6 +57,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 mimalloc = "0.1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+eframe = "0.35"
+egui = "0.35"
+egui_extras = "0.35"
+egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 
 [profile.release]
 lto = "thin"

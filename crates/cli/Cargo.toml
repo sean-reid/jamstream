@@ -27,5 +27,4 @@ hound.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# Not in the workspace dependency table; the server is a dev-only test peer.
-jamstream-server = { path = "../server" }
+jamstream-server.workspace = true
