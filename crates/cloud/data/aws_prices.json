@@ -1,16 +1,47 @@
 {
-  "comment": "AWS catalog for the jam-session VM: t4g.small on-demand hourly prices (integer microusd, approximated from public pricing) and Debian 12 (bookworm) arm64 AMI ids per region. Refresh cadence: quarterly, or immediately when a launch fails with an image or price surprise. Prices: https://aws.amazon.com/ec2/pricing/on-demand/. AMIs: launch() resolves the SSM public parameter /aws/service/debian/release/12/latest/arm64 at runtime; the ids below are the pinned fallback used when SSM is unreachable, so keep them plausible (https://wiki.debian.org/Cloud/AmazonEC2Image/Bookworm).",
-  "instance_type": "t4g.small",
+  "comment": "AWS catalog for the jam-session VM: t4g.small and t4g.medium on-demand hourly prices (integer microusd, approximated from public pricing) and Debian 12 (bookworm) arm64 AMI ids per region. Refresh cadence: quarterly, or immediately when a launch fails with an image or price surprise. Prices: https://aws.amazon.com/ec2/pricing/on-demand/. AMIs: launch() resolves the SSM public parameter /aws/service/debian/release/12/latest/arm64 at runtime; the ids below are the pinned fallback used when SSM is unreachable, so keep them plausible (https://wiki.debian.org/Cloud/AmazonEC2Image/Bookworm).",
   "egress_microusd_per_gb": 90000,
   "included_egress_gb": 100,
   "regions": {
-    "us-east-1": { "hourly_microusd": 16800, "ami": "ami-0e2c8caa4b6378d8c" },
-    "us-east-2": { "hourly_microusd": 16800, "ami": "ami-0862be96e41dcaf74" },
-    "us-west-1": { "hourly_microusd": 20200, "ami": "ami-0d413c682033e11fd" },
-    "us-west-2": { "hourly_microusd": 16800, "ami": "ami-079cb33ef719a7b78" },
-    "eu-west-1": { "hourly_microusd": 18400, "ami": "ami-0eb11ab33f229b26c" },
-    "eu-central-1": { "hourly_microusd": 19200, "ami": "ami-0584590e5f0e97daa" },
-    "ca-central-1": { "hourly_microusd": 18400, "ami": "ami-08355844f8bc94f55" },
-    "sa-east-1": { "hourly_microusd": 26900, "ami": "ami-02d5c519b6b0c9b92" }
+    "us-east-1": {
+      "small_hourly_microusd": 16800,
+      "medium_hourly_microusd": 33600,
+      "ami": "ami-0e2c8caa4b6378d8c"
+    },
+    "us-east-2": {
+      "small_hourly_microusd": 16800,
+      "medium_hourly_microusd": 33600,
+      "ami": "ami-0862be96e41dcaf74"
+    },
+    "us-west-1": {
+      "small_hourly_microusd": 20200,
+      "medium_hourly_microusd": 40400,
+      "ami": "ami-0d413c682033e11fd"
+    },
+    "us-west-2": {
+      "small_hourly_microusd": 16800,
+      "medium_hourly_microusd": 33600,
+      "ami": "ami-079cb33ef719a7b78"
+    },
+    "eu-west-1": {
+      "small_hourly_microusd": 18400,
+      "medium_hourly_microusd": 36800,
+      "ami": "ami-0eb11ab33f229b26c"
+    },
+    "eu-central-1": {
+      "small_hourly_microusd": 19200,
+      "medium_hourly_microusd": 38400,
+      "ami": "ami-0584590e5f0e97daa"
+    },
+    "ca-central-1": {
+      "small_hourly_microusd": 18400,
+      "medium_hourly_microusd": 36800,
+      "ami": "ami-08355844f8bc94f55"
+    },
+    "sa-east-1": {
+      "small_hourly_microusd": 26900,
+      "medium_hourly_microusd": 53800,
+      "ami": "ami-02d5c519b6b0c9b92"
+    }
   }
 }

@@ -66,7 +66,8 @@ struct AwsData {
 
 #[derive(Debug, Deserialize)]
 struct AwsRegionData {
-    hourly_microusd: u64,
+    small_hourly_microusd: u64,
+    medium_hourly_microusd: u64,
     ami: String,
 }
 
@@ -357,6 +358,24 @@ impl AwsProvider {
         Ok(out)
     }
 
+    /// Hourly price for a specific instance class in a region.
+    pub fn price_for(&self, region: &RegionId, class: InstanceClass) -> Result<Price> {
+        let region = self.catalog_region(region)?;
+        let d = data();
+        let rd = d.regions.get(region.id.as_str()).ok_or_else(|| {
+            ProviderError::NotFound(format!("no aws pricing for region {}", region.id))
+        })?;
+        let hourly_microusd = match class {
+            InstanceClass::Small => rd.small_hourly_microusd,
+            InstanceClass::Standard => rd.medium_hourly_microusd,
+        };
+        Ok(Price {
+            hourly_microusd,
+            egress_microusd_per_gb: d.egress_microusd_per_gb,
+            included_egress_gb: d.included_egress_gb,
+        })
+    }
+
     /// Fetches the current state of one instance so the CLI can poll for
     /// the public IP after launch. NotFound once the instance is
     /// terminated or gone entirely.
@@ -398,17 +417,11 @@ impl Provider for AwsProvider {
             .collect()
     }
 
+    /// Prices the Standard class (t4g.medium), the size `launch` actually
+    /// creates for a Standard spec, so the preview never understates the
+    /// bill. `price_for` covers both classes.
     async fn price(&self, region: &RegionId) -> Result<Price> {
-        let region = self.catalog_region(region)?;
-        let d = data();
-        let rd = d.regions.get(region.id.as_str()).ok_or_else(|| {
-            ProviderError::NotFound(format!("no aws pricing for region {}", region.id))
-        })?;
-        Ok(Price {
-            hourly_microusd: rd.hourly_microusd,
-            egress_microusd_per_gb: d.egress_microusd_per_gb,
-            included_egress_gb: d.included_egress_gb,
-        })
+        self.price_for(region, InstanceClass::Standard)
     }
 
     async fn launch(&self, spec: LaunchSpec) -> Result<Instance> {
@@ -1214,7 +1227,11 @@ mod tests {
                 .regions
                 .get(*id)
                 .unwrap_or_else(|| panic!("data file missing region {id}"));
-            assert!(rd.hourly_microusd > 0, "zero price for {id}");
+            assert!(rd.small_hourly_microusd > 0, "zero price for {id}");
+            assert!(
+                rd.medium_hourly_microusd > rd.small_hourly_microusd,
+                "medium must cost more than small for {id}"
+            );
             assert!(rd.ami.starts_with("ami-"), "bad ami id for {id}");
         }
         assert_eq!(d.egress_microusd_per_gb, 90_000);
@@ -1240,7 +1257,7 @@ mod tests {
                 .await
                 .unwrap()
                 .hourly_microusd,
-            16_800
+            33_600
         );
         assert!(matches!(
             p.price(&RegionId::new("mars-north-1")).await,
