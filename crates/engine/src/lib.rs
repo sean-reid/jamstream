@@ -3,6 +3,7 @@
 //! is deterministic and time-free; callers supply sample clocks and ticks.
 
 pub mod codec;
+pub mod drift;
 pub mod jitter;
 pub mod limiter;
 pub mod metronome;
@@ -10,6 +11,7 @@ pub mod mixer;
 pub mod redundancy;
 
 pub use codec::{Channels, CodecError, Decoder, Encoder};
+pub use drift::DriftCompensator;
 pub use jitter::{JitterBuffer, JitterStats, MediaPacket, Pull};
 pub use limiter::Limiter;
 pub use metronome::Metronome;

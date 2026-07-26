@@ -172,16 +172,13 @@ fn loss_resilience_hostile_wifi() {
 // 24-frame clamp and playout never gaps longer than 250 ms (= 100 frames,
 // four full clamp depths; anything longer means a buffer reset loop).
 //
-// KNOWN FAILURE (engine finding, not a harness bug): the slow-clock side
-// starves the server's jitter buffer ~12.5 s after join and never recovers.
-// Once the consumer overruns the producer by one frame, every subsequent
-// frame is exactly one tick late: engine::jitter counts lost and late one
-// per tick from then on (measured: lost 18_996 / late 18_987 at t=60 s) and
-// the stream is silent for the rest of the session. The buffer's only
-// re-sync paths are the RESET_JUMP (|jump| > 512) and the growth hold,
-// which requires the expected frame to already be buffered, so a persistent
-// one-frame consumer lead is unrecoverable. Fix belongs in
-// crates/engine/src/jitter.rs; this gate stays red until it lands.
+// History: this gate found a real engine bug (a slow-clock sender starved
+// the server's jitter buffer ~12.5 s after join and never recovered; one
+// loss per tick forever). The jitter buffer's resurrect path fixed it: the
+// timeline stretches one frame per drift period, roughly every 12.5 s at
+// -200 ppm. This test pins that fallback behavior via the exact-frame
+// APIs; drift_200ppm_with_resampler covers the steered raw-audio path,
+// which keeps resurrects at zero entirely.
 #[test]
 fn drift_200ppm_stays_bounded() {
     let mut s = ScenarioBuilder::new(0xC1)
@@ -242,6 +239,97 @@ fn drift_200ppm_stays_bounded() {
         "drift 200ppm: max depth {max_depth}, steady-state depths \
          (client 0, client 1, server members) {final_depths:?}"
     );
+}
+
+// The structural fix for the same drift: clients driven through the raw
+// device-paced APIs, whose capture compensator is steered from the server's
+// once-per-second uplink depth reports (and playout from the local buffer).
+// Every server-side resurrect is one stretched frame papering over a
+// consumer overrun, so once the steering loop has converged they must stop:
+// after a 5 minute startup allowance (the PI loop converges in tens of
+// seconds; 5 minutes is deliberate slack for depth-report noise), at most 5
+// resurrects may land across the last 5 of 10 virtual minutes, against ~24
+// per member without steering (one per 12.5 s at 200 ppm). Depth and
+// audio-continuity bounds stay exactly as in the fallback gate above.
+#[test]
+fn drift_200ppm_with_resampler() {
+    let mut s = ScenarioBuilder::new(0xC2)
+        .profile(profiles::profile("regional-fiber"))
+        .musicians(2)
+        .skew_ppm(0, 200)
+        .skew_ppm(1, -200)
+        .raw_audio(true)
+        .source(
+            0,
+            Source::Sine {
+                hz: 440.0,
+                amp: 0.5,
+            },
+        )
+        .source(
+            1,
+            Source::Sine {
+                hz: 330.0,
+                amp: 0.5,
+            },
+        )
+        .keep_audio(false)
+        .build();
+    s.join_all_or_panic(4_000);
+    s.run_ms(2_000);
+    let mark = s.current_tick();
+
+    let server_resurrects = |s: &jamstream_harness::Scenario| -> u64 {
+        s.server_member_stats()
+            .iter()
+            .map(|m| m.jitter.resurrected)
+            .sum()
+    };
+
+    // 10 virtual minutes, sampling every buffer's depth once per second.
+    let mut max_depth = 0usize;
+    let sample_depths = |s: &jamstream_harness::Scenario, max_depth: &mut usize| {
+        for i in 0..2 {
+            *max_depth = (*max_depth).max(s.client_jitter(i).depth_frames);
+        }
+        for m in s.server_member_stats() {
+            *max_depth = (*max_depth).max(m.jitter.depth_frames);
+        }
+    };
+    for _ in 0..300 {
+        s.run_ms(1_000);
+        sample_depths(&s, &mut max_depth);
+    }
+    let resurrects_at_5m = server_resurrects(&s);
+    for _ in 0..300 {
+        s.run_ms(1_000);
+        sample_depths(&s, &mut max_depth);
+    }
+    let end = s.current_tick();
+    let resurrects_at_10m = server_resurrects(&s);
+    let settled_delta = resurrects_at_10m - resurrects_at_5m;
+
+    println!(
+        "drift 200ppm with resampler: max depth {max_depth}, server resurrects \
+         {resurrects_at_5m} in the first 5 min (startup allowance), \
+         {settled_delta} in the last 5 min (gate 5)"
+    );
+    assert!(
+        max_depth <= 24,
+        "jitter depth reached {max_depth} frames under steered 200 ppm drift (clamp 24)"
+    );
+    assert!(
+        settled_delta <= 5,
+        "steering did not converge: {settled_delta} server resurrects in the last \
+         5 minutes (gate 5; startup 5 minutes had {resurrects_at_5m})"
+    );
+    for i in 0..2 {
+        let gap = s.longest_silence_ms(i, mark, end, 0.02);
+        assert!(
+            gap < 250.0,
+            "musician {i} longest silence {gap:.1} ms under steered 200 ppm drift (gate 250 ms)"
+        );
+    }
 }
 
 // Six musicians with a seeded schedule of leaves, a garbage-stream client, a

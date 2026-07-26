@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 jamstream-protocol.workspace = true
 opus.workspace = true
+rubato.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

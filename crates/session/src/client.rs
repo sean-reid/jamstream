@@ -5,8 +5,8 @@
 use std::collections::VecDeque;
 
 use jamstream_engine::{
-    Channels, CodecError, Decoder, Encoder, JitterBuffer, JitterStats, MediaPacket, Pull,
-    RedundancyPolicy,
+    Channels, CodecError, Decoder, DriftCompensator, Encoder, JitterBuffer, JitterStats,
+    MediaPacket, Pull, RedundancyPolicy,
 };
 use jamstream_protocol::control::{ControlLink, ControlMsg, MemberInfo};
 use jamstream_protocol::ids::{MemberId, Role, TokenId};
@@ -26,6 +26,55 @@ const INIT_RESEND_MS: u64 = 500;
 const INIT_RESEND_MAX_MS: u64 = 2_000;
 /// Reports of clean link required before redundancy turns back off.
 const REDUNDANCY_OFF_HOLD: u32 = 10;
+/// Playout steering samples the local jitter buffer this often, matching the
+/// once-per-second cadence of the server's uplink Stats reports.
+const PLAYOUT_STEER_FRAMES: u64 = 48_000;
+
+/// PI controller steering a `DriftCompensator` from a jitter-buffer depth.
+/// Depth persistently above the setpoint means production outruns
+/// consumption, so the ratio steers down (consume more per frame); depth
+/// pinned below steers up. The plant integrates the rate error at
+/// 4e-4 frames/s/ppm, so KP puts the crossover at ~0.12 rad/s and KI the PI
+/// zero a factor ~3.6 below it: convergent in tens of seconds, no ringing.
+#[derive(Debug, Default)]
+struct DepthSteer {
+    fast: Option<f64>,
+    slow: Option<f64>,
+    integral_ppm: f64,
+    steer_ppm: f64,
+}
+
+impl DepthSteer {
+    const KP: f64 = 300.0;
+    const KI: f64 = 10.0;
+    /// Anti-windup: the integral alone never exceeds the compensator's
+    /// +-500 ppm authority.
+    const INTEGRAL_CLAMP: f64 = 450.0;
+    /// Slow integral leak (tau ~500 updates) purges bias picked up while the
+    /// jitter buffer's own grow/shrink moves depth for its own reasons; the
+    /// residual error it costs is ~0.1 frames, well inside depth tolerance.
+    const LEAK: f64 = 0.998;
+    const ALPHA_FAST: f64 = 0.4;
+    const ALPHA_SLOW: f64 = 0.03;
+
+    /// One controller step from a depth sample (once per second). `floor`
+    /// is the minimum setpoint in frames; the setpoint otherwise tracks a
+    /// slow EWMA of the depth itself, so steering regulates the rate without
+    /// fighting a buffer whose own target sits higher.
+    fn update(&mut self, depth: f64, floor: f64) {
+        let fast = *self.fast.get_or_insert(depth);
+        let fast = fast + Self::ALPHA_FAST * (depth - fast);
+        self.fast = Some(fast);
+        let slow = *self.slow.get_or_insert(depth);
+        let slow = slow + Self::ALPHA_SLOW * (depth - slow);
+        self.slow = Some(slow);
+
+        let e = fast - slow.max(floor);
+        self.integral_ppm = (self.integral_ppm * Self::LEAK + Self::KI * e)
+            .clamp(-Self::INTEGRAL_CLAMP, Self::INTEGRAL_CLAMP);
+        self.steer_ppm = -(Self::KP * e + self.integral_ppm);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientState {
@@ -97,6 +146,17 @@ pub struct ClientCore {
     redundancy: RedundancyPolicy,
     /// Latest Stats report from the server: (loss pct, depth, recovered pct).
     uplink_report: Option<(f32, u16, f32)>,
+    /// Raw-path capture pacing, created on first `push_capture_raw` and
+    /// steered from the server's uplink depth reports. The exact-frame
+    /// `push_capture` never touches it.
+    capture_comp: Option<DriftCompensator>,
+    capture_steer: DepthSteer,
+    /// Raw-path playout pacing, steered from the local jitter buffer depth.
+    playout_comp: Option<DriftCompensator>,
+    playout_steer: DepthSteer,
+    /// Resampled playout awaiting delivery to arbitrary-length raw pulls.
+    playout_stage: VecDeque<f32>,
+    playout_frames_since_steer: u64,
     prev_payload: Option<Vec<u8>>,
     pkt_buf: Vec<u8>,
     frames_sent: u64,
@@ -130,6 +190,12 @@ impl ClientCore {
             fifo: VecDeque::new(),
             redundancy: RedundancyPolicy::new(REDUNDANCY_OFF_HOLD),
             uplink_report: None,
+            capture_comp: None,
+            capture_steer: DepthSteer::default(),
+            playout_comp: None,
+            playout_steer: DepthSteer::default(),
+            playout_stage: VecDeque::new(),
+            playout_frames_since_steer: 0,
             prev_payload: None,
             pkt_buf: Vec::new(),
             frames_sent: 0,
@@ -161,6 +227,12 @@ impl ClientCore {
         self.decode_buf = vec![0.0; decode_len];
         self.fifo.clear();
         self.uplink_report = None;
+        self.capture_comp = None;
+        self.capture_steer = DepthSteer::default();
+        self.playout_comp = None;
+        self.playout_steer = DepthSteer::default();
+        self.playout_stage.clear();
+        self.playout_frames_since_steer = 0;
         self.prev_payload = None;
         self.frames_sent = 0;
         self.last_server_ms = now_ms;
@@ -347,6 +419,66 @@ impl ClientCore {
                 }
             }
         }
+    }
+
+    /// Device-paced capture: arbitrary-length mono samples in, one sealed
+    /// media datagram out per completed 2.5 ms frame (zero or several per
+    /// call). A capture `DriftCompensator`, steered from the server's view
+    /// of our uplink, repaces the device clock onto the frame clock so
+    /// sustained drift never reaches the server's jitter buffer.
+    pub fn push_capture_raw(&mut self, now_ms: u64, samples: &[f32]) -> Vec<Vec<u8>> {
+        let mut comp = self
+            .capture_comp
+            .take()
+            .unwrap_or_else(|| DriftCompensator::new(TICK_SAMPLES as usize, 1));
+        comp.steer(self.capture_steer.steer_ppm);
+        comp.push(samples);
+        let mut out = Vec::new();
+        let mut frame = [0.0f32; TICK_SAMPLES as usize];
+        while comp.pull_frame(&mut frame) {
+            out.append(&mut self.push_capture(now_ms, &frame));
+        }
+        self.capture_comp = Some(comp);
+        out
+    }
+
+    /// Device-paced playout: fills an arbitrary-length interleaved stereo
+    /// buffer from the jitter pull path through a playout
+    /// `DriftCompensator` steered by the local depth-vs-target error.
+    pub fn pull_playout_raw(&mut self, out: &mut [f32]) {
+        debug_assert_eq!(out.len() % 2, 0, "interleaved stereo");
+        let mut comp = self
+            .playout_comp
+            .take()
+            .unwrap_or_else(|| DriftCompensator::new(TICK_SAMPLES as usize, 2));
+        comp.steer(self.playout_steer.steer_ppm);
+        let mut filled = 0;
+        while filled < out.len() {
+            if let Some(s) = self.playout_stage.pop_front() {
+                out[filled] = s;
+                filled += 1;
+                continue;
+            }
+            let mut frame = [0.0f32; TICK_SAMPLES as usize * 2];
+            while !comp.pull_frame(&mut frame) {
+                // The jitter pull always yields audio (silence while
+                // waiting, PLC on a miss), so this feeds until a chunk fits.
+                let mut decoded = [0.0f32; TICK_SAMPLES as usize * 2];
+                self.pull_playout(&mut decoded);
+                comp.push(&decoded);
+            }
+            self.playout_stage.extend(frame);
+        }
+        self.playout_frames_since_steer += (out.len() / 2) as u64;
+        if self.playout_frames_since_steer >= PLAYOUT_STEER_FRAMES {
+            self.playout_frames_since_steer = 0;
+            let js = self.jitter.stats();
+            // Floor at target + 1: the slack position redundancy needs, and
+            // the highest depth the shrink path leaves alone.
+            self.playout_steer
+                .update(js.depth_frames as f64, (js.target_frames + 1) as f64);
+        }
+        self.playout_comp = Some(comp);
     }
 
     /// Periodic housekeeping: handshake resends, keepalive pings, redundancy
@@ -539,6 +671,11 @@ impl ClientCore {
                 // The server's view of our uplink drives the redundancy
                 // decision; the policy sanitizes garbage values itself.
                 self.redundancy.report(uplink_loss_pct / 100.0);
+                // And its jitter depth drives raw-path capture pacing.
+                // Floor at 2: the server buffer's clean-link target plus
+                // its one frame of redundancy slack.
+                self.capture_steer
+                    .update(f64::from(uplink_jitter_depth), 2.0);
             }
             ControlMsg::Bye { reason } => {
                 self.state = ClientState::Ejected {
@@ -668,5 +805,26 @@ mod tests {
         assert!(core.push_capture(0, &[0.0; 120]).is_empty());
         let (mut listener, _) = ClientCore::connect(&invite(Role::Listener), 0).unwrap();
         assert!(listener.push_capture(0, &[0.0; 120]).is_empty());
+    }
+
+    #[test]
+    fn raw_capture_accepts_odd_lengths_and_is_empty_until_joined() {
+        let (mut core, _) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
+        // Device-paced deliveries that straddle frame boundaries.
+        assert!(core.push_capture_raw(0, &[0.0; 250]).is_empty());
+        assert!(core.push_capture_raw(0, &[0.0; 119]).is_empty());
+        assert!(core.push_capture_raw(0, &[0.0; 1]).is_empty());
+    }
+
+    #[test]
+    fn raw_playout_fills_arbitrary_lengths_with_silence_before_media() {
+        let (mut core, _) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
+        // Not a multiple of the 2.5 ms frame; the stage bridges the rest.
+        let mut small = vec![1.0f32; 202];
+        core.pull_playout_raw(&mut small);
+        assert!(small.iter().all(|&s| s == 0.0));
+        let mut large = vec![1.0f32; 966];
+        core.pull_playout_raw(&mut large);
+        assert!(large.iter().all(|&s| s == 0.0));
     }
 }

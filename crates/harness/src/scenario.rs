@@ -88,6 +88,12 @@ struct SimClient {
     source: Source,
     skew: Option<SkewedClock>,
     frames_emitted: u64,
+    /// Raw mode: fractional device-sample accumulators (a +-ppm device
+    /// delivers 120 * (1 +- ppm e-6) samples per master tick) and the
+    /// capture sample index the source renders from.
+    capture_acc: f64,
+    playout_acc: f64,
+    capture_samples: u64,
     /// Full interleaved stereo playout; only kept when `keep_audio` is set.
     recording: Vec<f32>,
     /// Per tick: (peak abs, sum of squares) over that tick's playout frame.
@@ -109,6 +115,7 @@ pub struct ScenarioBuilder {
     sources: HashMap<usize, Source>,
     duration_ms: u64,
     keep_audio: bool,
+    raw_audio: bool,
 }
 
 impl ScenarioBuilder {
@@ -123,6 +130,7 @@ impl ScenarioBuilder {
             sources: HashMap::new(),
             duration_ms: 10_000,
             keep_audio: true,
+            raw_audio: false,
         }
     }
 
@@ -167,6 +175,17 @@ impl ScenarioBuilder {
     /// long soaks turn this off and rely on the per-tick meter instead.
     pub fn keep_audio(mut self, keep: bool) -> Self {
         self.keep_audio = keep;
+        self
+    }
+
+    /// Drives every client through the raw device-paced APIs
+    /// (`push_capture_raw`/`pull_playout_raw`) instead of the exact-frame
+    /// ones: each master tick a client's virtual device produces and
+    /// consumes `120 * (1 + skew_ppm e-6)` samples, accumulated
+    /// fractionally, so drift arrives as a sample-rate error the client's
+    /// compensators must steer out.
+    pub fn raw_audio(mut self, raw: bool) -> Self {
+        self.raw_audio = raw;
         self
     }
 
@@ -242,6 +261,9 @@ impl ScenarioBuilder {
                 source: self.sources.get(&i).copied().unwrap_or(Source::Silence),
                 skew: self.skews.get(&i).map(|&ppm| SkewedClock::new(ppm)),
                 frames_emitted: 0,
+                capture_acc: 0.0,
+                playout_acc: 0.0,
+                capture_samples: 0,
                 recording: Vec::new(),
                 meter: Vec::new(),
                 events: Vec::new(),
@@ -262,6 +284,7 @@ impl ScenarioBuilder {
             server_events: Vec::new(),
             duration_ms: self.duration_ms,
             keep_audio: self.keep_audio,
+            raw_audio: self.raw_audio,
             tick: 0,
             garbage_lcg: self.seed ^ 0x9E37_79B9_7F4A_7C15,
         }
@@ -281,6 +304,7 @@ pub struct Scenario {
     server_events: Vec<ServerEvent>,
     duration_ms: u64,
     keep_audio: bool,
+    raw_audio: bool,
     tick: u64,
     garbage_lcg: u64,
 }
@@ -314,44 +338,90 @@ impl Scenario {
         self.server_events.extend(self.server.events());
 
         for idx in 0..self.clients.len() {
-            // A skewed client emits a frame each time its own clock crosses a
-            // 2.5 ms boundary: +200 ppm occasionally emits two frames in one
-            // master tick, -200 ppm occasionally emits none.
-            let due = match self.clients[idx].skew {
-                Some(sk) => sk.map(now_us) / TICK_US,
-                None => now_us / TICK_US,
-            };
-            while self.clients[idx].frames_emitted < due {
-                let mut pcm = [0.0f32; FRAME_SAMPLES];
-                let first = self.clients[idx].frames_emitted * FRAME_SAMPLES as u64;
-                self.clients[idx].source.render(first, &mut pcm);
-                self.clients[idx].frames_emitted += 1;
-                if self.clients[idx].role == Role::Musician {
-                    let dgs = self.clients[idx].core.push_capture(now_ms, &pcm);
-                    self.forward_client(now_us, idx, dgs);
-                }
+            if self.raw_audio {
+                self.step_client_raw(now_us, now_ms, idx);
+            } else {
+                self.step_client_exact(now_us, now_ms, idx);
             }
-
-            let dgs = self.clients[idx].core.poll(now_ms);
-            self.forward_client(now_us, idx, dgs);
-
-            let mut buf = [0.0f32; STEREO_FRAME];
-            self.clients[idx].core.pull_playout(&mut buf);
             let c = &mut self.clients[idx];
-            let mut peak = 0.0f32;
-            let mut energy = 0.0f32;
-            for &s in &buf {
-                peak = peak.max(s.abs());
-                energy += s * s;
-            }
-            c.meter.push((peak, energy));
-            if self.keep_audio {
-                c.recording.extend_from_slice(&buf);
-            }
             let events = c.core.events();
             c.events.extend(events);
         }
         self.tick += 1;
+    }
+
+    /// Exact-frame drive: a skewed client emits a frame each time its own
+    /// clock crosses a 2.5 ms boundary: +200 ppm occasionally emits two
+    /// frames in one master tick, -200 ppm occasionally emits none.
+    fn step_client_exact(&mut self, now_us: u64, now_ms: u64, idx: usize) {
+        let due = match self.clients[idx].skew {
+            Some(sk) => sk.map(now_us) / TICK_US,
+            None => now_us / TICK_US,
+        };
+        while self.clients[idx].frames_emitted < due {
+            let mut pcm = [0.0f32; FRAME_SAMPLES];
+            let first = self.clients[idx].frames_emitted * FRAME_SAMPLES as u64;
+            self.clients[idx].source.render(first, &mut pcm);
+            self.clients[idx].frames_emitted += 1;
+            if self.clients[idx].role == Role::Musician {
+                let dgs = self.clients[idx].core.push_capture(now_ms, &pcm);
+                self.forward_client(now_us, idx, dgs);
+            }
+        }
+
+        let dgs = self.clients[idx].core.poll(now_ms);
+        self.forward_client(now_us, idx, dgs);
+
+        let mut buf = [0.0f32; STEREO_FRAME];
+        self.clients[idx].core.pull_playout(&mut buf);
+        self.record(idx, &buf);
+    }
+
+    /// Raw device-paced drive: the client's virtual sound card runs at
+    /// `120 * (1 + skew_ppm e-6)` samples per master tick, accumulated
+    /// fractionally and delivered in whole samples, capture and playout
+    /// alike, through the raw client APIs.
+    fn step_client_raw(&mut self, now_us: u64, now_ms: u64, idx: usize) {
+        let ppm = self.clients[idx].skew.map_or(0, |sk| sk.skew_ppm());
+        let rate = FRAME_SAMPLES as f64 * (1.0 + f64::from(ppm) * 1e-6);
+
+        self.clients[idx].capture_acc += rate;
+        let n = self.clients[idx].capture_acc as usize;
+        self.clients[idx].capture_acc -= n as f64;
+        if self.clients[idx].role == Role::Musician && n > 0 {
+            let mut pcm = [0.0f32; 2 * FRAME_SAMPLES];
+            let first = self.clients[idx].capture_samples;
+            self.clients[idx].source.render(first, &mut pcm[..n]);
+            self.clients[idx].capture_samples += n as u64;
+            let dgs = self.clients[idx].core.push_capture_raw(now_ms, &pcm[..n]);
+            self.forward_client(now_us, idx, dgs);
+        }
+
+        let dgs = self.clients[idx].core.poll(now_ms);
+        self.forward_client(now_us, idx, dgs);
+
+        self.clients[idx].playout_acc += rate;
+        let m = self.clients[idx].playout_acc as usize;
+        self.clients[idx].playout_acc -= m as f64;
+        let mut buf = [0.0f32; 4 * FRAME_SAMPLES];
+        self.clients[idx].core.pull_playout_raw(&mut buf[..m * 2]);
+        self.record(idx, &buf[..m * 2]);
+    }
+
+    /// One per-tick meter entry (peak, energy) over this tick's playout,
+    /// plus the raw audio when `keep_audio` is set.
+    fn record(&mut self, idx: usize, buf: &[f32]) {
+        let c = &mut self.clients[idx];
+        let mut peak = 0.0f32;
+        let mut energy = 0.0f32;
+        for &s in buf {
+            peak = peak.max(s.abs());
+            energy += s * s;
+        }
+        c.meter.push((peak, energy));
+        if self.keep_audio {
+            c.recording.extend_from_slice(buf);
+        }
     }
 
     pub fn run_ticks(&mut self, ticks: u64) {
