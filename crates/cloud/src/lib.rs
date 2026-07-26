@@ -6,9 +6,11 @@
 pub mod cloudinit;
 pub mod contract;
 pub mod cost;
+pub mod http;
 pub mod mock;
 pub mod probe;
 pub mod provider;
+pub mod providers;
 pub mod solver;
 pub mod sweeper;
 pub mod types;
