@@ -26,10 +26,44 @@ pub struct Options {
     pub activity_path: Option<PathBuf>,
 }
 
+/// The idle-exit countdown, pure so it is testable without time: feed it
+/// (elapsed-since-start, musician count) once per heartbeat, it answers
+/// whether the server should exit.
+#[derive(Debug)]
+pub struct IdleExit {
+    window: Duration,
+    idle_since: Option<Duration>,
+}
+
+impl IdleExit {
+    /// The countdown starts armed at construction: a server nobody ever
+    /// joins still dies after one window.
+    pub fn new(window: Duration) -> Self {
+        IdleExit {
+            window,
+            idle_since: Some(Duration::ZERO),
+        }
+    }
+
+    /// True means exit now. A zero window never fires.
+    pub fn observe(&mut self, now: Duration, musicians: usize) -> bool {
+        if self.window.is_zero() {
+            return false;
+        }
+        if musicians > 0 {
+            self.idle_since = None;
+            return false;
+        }
+        let since = *self.idle_since.get_or_insert(now);
+        now.saturating_sub(since) >= self.window
+    }
+}
+
 pub struct Server {
     core: ServerCore,
     socket: UdpSocket,
     activity_path: Option<PathBuf>,
+    idle_exit: Duration,
 }
 
 impl Server {
@@ -56,7 +90,19 @@ impl Server {
             core,
             socket,
             activity_path: opts.activity_path,
+            idle_exit: Duration::ZERO,
         })
+    }
+
+    /// Arms the idle self-exit: the server exits cleanly once no musicians
+    /// have been connected for `window`, measured from startup or from the
+    /// last musician leaving. Zero (the default) disables. This is the
+    /// local-mode dead man's switch; cloud deployments keep the external
+    /// guard and leave it off. Builder-style so `Options` stays stable for
+    /// existing constructors.
+    pub fn with_idle_exit(mut self, window: Duration) -> Self {
+        self.idle_exit = window;
+        self
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -72,6 +118,7 @@ impl Server {
         tick.set_missed_tick_behavior(MissedTickBehavior::Burst);
         let mut heartbeat = tokio::time::interval(ACTIVITY_PERIOD);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut idle_exit = IdleExit::new(self.idle_exit);
         let mut buf = [0u8; 2048];
         tokio::pin!(shutdown);
 
@@ -89,8 +136,16 @@ impl Server {
                     }
                 }
                 _ = heartbeat.tick() => {
-                    if self.core.musicians_connected() > 0 {
+                    let musicians = self.core.musicians_connected();
+                    if musicians > 0 {
                         touch(self.activity_path.as_deref());
+                    }
+                    if idle_exit.observe(start.elapsed(), musicians) {
+                        tracing::info!(
+                            idle_secs = self.idle_exit.as_secs_f64(),
+                            "no musicians for the idle window, exiting"
+                        );
+                        break;
                     }
                 }
                 received = self.socket.recv_from(&mut buf) => {
@@ -147,5 +202,53 @@ fn touch(path: Option<&std::path::Path>) {
         .and_then(|f| f.set_modified(SystemTime::now()))
     {
         tracing::warn!(error = %err, "cannot touch activity file");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IdleExit;
+    use std::time::Duration;
+
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    #[test]
+    fn zero_window_never_fires() {
+        let mut ie = IdleExit::new(Duration::ZERO);
+        for t in 0..10_000 {
+            assert!(!ie.observe(secs(t), 0));
+        }
+    }
+
+    #[test]
+    fn fires_after_window_from_startup_when_nobody_joins() {
+        let mut ie = IdleExit::new(secs(60));
+        assert!(!ie.observe(secs(1), 0));
+        assert!(!ie.observe(secs(59), 0));
+        assert!(ie.observe(secs(60), 0));
+    }
+
+    #[test]
+    fn musicians_hold_the_countdown_and_leaving_rearms_it() {
+        let mut ie = IdleExit::new(secs(60));
+        assert!(!ie.observe(secs(10), 1));
+        // Idle long past the window while occupied: never fires.
+        assert!(!ie.observe(secs(500), 2));
+        // Last musician leaves at t=500; the window restarts there.
+        assert!(!ie.observe(secs(501), 0));
+        assert!(!ie.observe(secs(559), 0));
+        assert!(ie.observe(secs(561), 0));
+    }
+
+    #[test]
+    fn rejoin_within_the_window_resets_cleanly() {
+        let mut ie = IdleExit::new(secs(60));
+        assert!(!ie.observe(secs(59), 0));
+        assert!(!ie.observe(secs(60), 1));
+        assert!(!ie.observe(secs(61), 0));
+        assert!(!ie.observe(secs(120), 0));
+        assert!(ie.observe(secs(121), 0));
     }
 }

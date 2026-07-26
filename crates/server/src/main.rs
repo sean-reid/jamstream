@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use jamstream_server::config::Config;
 use jamstream_server::runtime::{Options, Server};
@@ -29,6 +30,18 @@ fn main() -> ExitCode {
         }
     };
 
+    // Fractional minutes are accepted (0.05 = 3 s) so tests and impatient
+    // hosts get short windows; 0 (the default) disables. Local mode passes
+    // this; cloud deployments rely on the external guard instead.
+    let idle_exit = match arg_value("--idle-exit-min").map(|v| v.parse::<f64>()) {
+        None => Duration::ZERO,
+        Some(Ok(min)) if min.is_finite() && min >= 0.0 => Duration::from_secs_f64(min * 60.0),
+        Some(_) => {
+            tracing::error!("--idle-exit-min must be a nonnegative number of minutes");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), cfg.port);
     let opts = Options {
         bind,
@@ -51,7 +64,7 @@ fn main() -> ExitCode {
 
     runtime.block_on(async {
         let server = match Server::bind(&cfg, opts).await {
-            Ok(server) => server,
+            Ok(server) => server.with_idle_exit(idle_exit),
             Err(err) => {
                 tracing::error!(%err, "bind failed");
                 return ExitCode::FAILURE;

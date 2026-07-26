@@ -32,6 +32,29 @@ pub struct BootConfig {
     pub self_destruct: SelfDestruct,
 }
 
+impl BootConfig {
+    /// The flat key=value config jamstreamd parses at startup. This is the
+    /// single home of the format: cloud-init writes it to
+    /// /etc/jamstream/config, and the local provider writes it straight to
+    /// disk as `LaunchSpec::user_data`.
+    pub fn render_flat_config(&self) -> String {
+        format!(
+            "session_id_hex = {}\n\
+             port = {}\n\
+             server_private_key_b64 = {}\n\
+             issuer_public_key_b64 = {}\n\
+             idle_shutdown_min = {}\n\
+             max_duration_min = {}\n",
+            self.session_id_hex,
+            self.port,
+            self.server_private_key_b64,
+            self.issuer_public_key_b64,
+            self.idle_shutdown_min,
+            self.max_duration_min,
+        )
+    }
+}
+
 /// Prefixes every nonempty line for embedding in a YAML block scalar.
 fn indent(text: &str, spaces: usize) -> String {
     let pad = " ".repeat(spaces);
@@ -44,23 +67,6 @@ fn indent(text: &str, spaces: usize) -> String {
         }
     }
     out
-}
-
-fn config_file(cfg: &BootConfig) -> String {
-    format!(
-        "session_id_hex = {}\n\
-         port = {}\n\
-         server_private_key_b64 = {}\n\
-         issuer_public_key_b64 = {}\n\
-         idle_shutdown_min = {}\n\
-         max_duration_min = {}\n",
-        cfg.session_id_hex,
-        cfg.port,
-        cfg.server_private_key_b64,
-        cfg.issuer_public_key_b64,
-        cfg.idle_shutdown_min,
-        cfg.max_duration_min,
-    )
 }
 
 fn self_destruct_script(cfg: &BootConfig) -> String {
@@ -193,7 +199,7 @@ WantedBy=timers.target
 
 pub fn render(cfg: &BootConfig) -> String {
     let files: [(&str, &str, String); 6] = [
-        ("/etc/jamstream/config", "0600", config_file(cfg)),
+        ("/etc/jamstream/config", "0600", cfg.render_flat_config()),
         (
             "/usr/local/sbin/jamstream-self-destruct",
             "0700",

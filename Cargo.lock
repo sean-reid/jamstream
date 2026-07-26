@@ -2797,6 +2797,7 @@ version = "0.1.0"
 dependencies = [
  "data-encoding",
  "ed25519-dalek",
+ "jamstream-cloud",
  "jamstream-engine",
  "jamstream-protocol",
  "jamstream-session",

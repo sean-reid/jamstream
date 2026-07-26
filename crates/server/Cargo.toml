@@ -23,3 +23,6 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mimalloc.workspace = true
+
+[dev-dependencies]
+jamstream-cloud.workspace = true

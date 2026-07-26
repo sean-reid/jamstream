@@ -126,7 +126,7 @@ pub async fn run<W: Write>(
         port: args.port,
         idle_shutdown_min: args.idle_min,
         max_duration_min: args.max_hours * 60,
-        self_destruct: self_destruct_for(provider.kind()),
+        self_destruct: self_destruct_for(provider.kind())?,
     };
 
     let spec = LaunchSpec {
@@ -386,18 +386,37 @@ fn mint_invites(
     invites
 }
 
-fn self_destruct_for(kind: ProviderKind) -> SelfDestruct {
+fn self_destruct_for(kind: ProviderKind) -> Result<SelfDestruct, CliError> {
     match kind {
         // The mock resolves with an Aws kind, so it lands here too; the
         // shutdown script is a harmless placeholder for it.
-        ProviderKind::Aws => SelfDestruct::AwsShutdown,
-        ProviderKind::Gcp => SelfDestruct::GcpMaxRunDuration,
-        // The droplet-scoped token comes with the real DO wiring; until
-        // then this arm is unreachable from resolve().
-        ProviderKind::DigitalOcean => SelfDestruct::ApiToken {
-            endpoint: "https://api.digitalocean.com/v2/droplets".to_owned(),
-            token: "unset".to_owned(),
-        },
+        ProviderKind::Aws => Ok(SelfDestruct::AwsShutdown),
+        ProviderKind::Gcp => Ok(SelfDestruct::GcpMaxRunDuration),
+        // Powered-off droplets still bill, so the VM must hold a token able
+        // to delete itself. DigitalOcean cannot mint narrower per-droplet
+        // tokens, which is why the docs tell DO users to scope theirs to
+        // droplet and tag operations only.
+        ProviderKind::DigitalOcean => {
+            let token = std::env::var("DIGITALOCEAN_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| {
+                    CliError::Usage(
+                        "DIGITALOCEAN_TOKEN is required to arm the droplet's self-destruct; \
+                         refusing to launch a machine that cannot delete itself"
+                            .to_owned(),
+                    )
+                })?;
+            Ok(SelfDestruct::ApiToken {
+                endpoint: "https://api.digitalocean.com/v2/droplets".to_owned(),
+                token,
+            })
+        }
+        // Local sessions self-limit via the server's own idle-exit flag;
+        // the cli wiring for them lands with the local provider.
+        ProviderKind::Local => Err(CliError::Usage(
+            "local sessions are not wired into the cli yet".to_owned(),
+        )),
     }
 }
 

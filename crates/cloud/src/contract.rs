@@ -3,7 +3,7 @@
 //! this passes unchanged.
 
 use crate::provider::{Provider, ProviderError};
-use crate::types::{InstanceClass, LaunchSpec, RegionId, session_tag};
+use crate::types::{InstanceClass, LaunchSpec, ProviderKind, RegionId, session_tag};
 
 /// Panics on the first contract violation. Callers supply a provider with
 /// at least one advertised region and no pre-existing jamstream instances.
@@ -19,8 +19,9 @@ pub async fn assert_provider_contract(p: &dyn Provider) {
             .price(&r.id)
             .await
             .unwrap_or_else(|e| panic!("price lookup failed for region {}: {e}", r.id));
+        // Local sessions are free by design; every cloud must cost money.
         assert!(
-            price.hourly_microusd > 0,
+            price.hourly_microusd > 0 || p.kind() == ProviderKind::Local,
             "region {} advertises a zero hourly price",
             r.id
         );

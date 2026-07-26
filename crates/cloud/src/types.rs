@@ -13,6 +13,8 @@ pub enum ProviderKind {
     Aws,
     DigitalOcean,
     Gcp,
+    /// The host's own machine: jamstreamd runs as a local child process.
+    Local,
 }
 
 impl ProviderKind {
@@ -21,6 +23,7 @@ impl ProviderKind {
             ProviderKind::Aws => "aws",
             ProviderKind::DigitalOcean => "digitalocean",
             ProviderKind::Gcp => "gcp",
+            ProviderKind::Local => "local",
         }
     }
 }
@@ -108,6 +111,9 @@ pub enum InstanceClass {
 pub struct LaunchSpec {
     pub region: Region,
     pub instance_class: InstanceClass,
+    /// Boot payload, interpreted per provider: cloud providers receive
+    /// cloud-init YAML (`cloudinit::render`); the local provider receives
+    /// the flat key=value server config (`BootConfig::render_flat_config`).
     pub user_data: String,
     pub tags: Vec<(String, String)>,
 }
@@ -171,6 +177,18 @@ mod tests {
     }
 
     #[test]
+    fn zero_price_displays_sensibly() {
+        // The local provider is free; its price card must still read well.
+        let p = Price {
+            hourly_microusd: 0,
+            egress_microusd_per_gb: 0,
+            included_egress_gb: 0,
+        };
+        assert_eq!(p.hourly_display(), "$0.00/hr");
+        assert_eq!(p.egress_display(), "$0.00/GB");
+    }
+
+    #[test]
     fn session_tag_round_trip() {
         let tag = session_tag("abc123");
         let tags = vec![("name".to_owned(), "x".to_owned()), tag];
@@ -183,5 +201,6 @@ mod tests {
         assert_eq!(ProviderKind::Aws.as_str(), "aws");
         assert_eq!(ProviderKind::DigitalOcean.as_str(), "digitalocean");
         assert_eq!(ProviderKind::Gcp.as_str(), "gcp");
+        assert_eq!(ProviderKind::Local.as_str(), "local");
     }
 }
