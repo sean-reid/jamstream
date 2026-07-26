@@ -6,11 +6,26 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "jamstream_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "jamstream-app"
 path = "src/main.rs"
 
 [dependencies]
 jamstream-protocol.workspace = true
-jamstream-engine.workspace = true
-jamstream-audio-io.workspace = true
+jamstream-session.workspace = true
+jamstream-cloud.workspace = true
+jamstream-cli.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
