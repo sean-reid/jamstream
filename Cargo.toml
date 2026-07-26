@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/engine",
+    "crates/audio-io",
+    "crates/cloud",
+    "crates/server",
+    "crates/cli",
+    "crates/client",
+    "crates/harness",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sean-reid/jamstream"
+
+[workspace.dependencies]
+jamstream-protocol = { path = "crates/protocol" }
+jamstream-engine = { path = "crates/engine" }
+jamstream-audio-io = { path = "crates/audio-io" }
+jamstream-cloud = { path = "crates/cloud" }
+jamstream-harness = { path = "crates/harness" }
+
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+thiserror = "2"
+tracing = "0.1"
+rand = "0.9"
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+debug = true

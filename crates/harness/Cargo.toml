@@ -1,0 +1,12 @@
+[package]
+name = "jamstream-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jamstream-protocol.workspace = true
+jamstream-engine.workspace = true
+rand.workspace = true
