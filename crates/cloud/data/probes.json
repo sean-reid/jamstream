@@ -1,0 +1,30 @@
+[
+  { "provider": "aws", "region": "us-east-1", "host": "ec2.us-east-1.amazonaws.com", "port": 443 },
+  { "provider": "aws", "region": "us-east-2", "host": "ec2.us-east-2.amazonaws.com", "port": 443 },
+  { "provider": "aws", "region": "us-west-1", "host": "ec2.us-west-1.amazonaws.com", "port": 443 },
+  { "provider": "aws", "region": "us-west-2", "host": "ec2.us-west-2.amazonaws.com", "port": 443 },
+  { "provider": "aws", "region": "eu-west-1", "host": "ec2.eu-west-1.amazonaws.com", "port": 443 },
+  { "provider": "aws", "region": "eu-central-1", "host": "ec2.eu-central-1.amazonaws.com", "port": 443 },
+  { "provider": "aws", "region": "ca-central-1", "host": "ec2.ca-central-1.amazonaws.com", "port": 443 },
+  { "provider": "aws", "region": "sa-east-1", "host": "ec2.sa-east-1.amazonaws.com", "port": 443 },
+
+  { "provider": "digitalocean", "region": "nyc3", "host": "nyc3.digitaloceanspaces.com", "port": 443 },
+  { "provider": "digitalocean", "region": "sfo3", "host": "sfo3.digitaloceanspaces.com", "port": 443 },
+  { "provider": "digitalocean", "region": "ams3", "host": "ams3.digitaloceanspaces.com", "port": 443 },
+  { "provider": "digitalocean", "region": "fra1", "host": "fra1.digitaloceanspaces.com", "port": 443 },
+  { "provider": "digitalocean", "region": "sgp1", "host": "sgp1.digitaloceanspaces.com", "port": 443 },
+  { "provider": "digitalocean", "region": "blr1", "host": "blr1.digitaloceanspaces.com", "port": 443 },
+  { "provider": "digitalocean", "region": "syd1", "host": "syd1.digitaloceanspaces.com", "port": 443 },
+  { "provider": "digitalocean", "region": "tor1", "host": "tor1.digitaloceanspaces.com", "port": 443 },
+  { "provider": "digitalocean", "region": "atl1", "host": "atl1.digitaloceanspaces.com", "port": 443 },
+
+  { "provider": "gcp", "region": "us-central1", "host": "us-central1-run.googleapis.com", "port": 443, "approx": true },
+  { "provider": "gcp", "region": "us-east1", "host": "us-east1-run.googleapis.com", "port": 443, "approx": true },
+  { "provider": "gcp", "region": "us-east4", "host": "us-east4-run.googleapis.com", "port": 443, "approx": true },
+  { "provider": "gcp", "region": "us-west1", "host": "us-west1-run.googleapis.com", "port": 443, "approx": true },
+  { "provider": "gcp", "region": "us-west2", "host": "us-west2-run.googleapis.com", "port": 443, "approx": true },
+  { "provider": "gcp", "region": "europe-west1", "host": "europe-west1-run.googleapis.com", "port": 443, "approx": true },
+  { "provider": "gcp", "region": "europe-west2", "host": "europe-west2-run.googleapis.com", "port": 443, "approx": true },
+  { "provider": "gcp", "region": "europe-west4", "host": "europe-west4-run.googleapis.com", "port": 443, "approx": true },
+  { "provider": "gcp", "region": "asia-northeast1", "host": "asia-northeast1-run.googleapis.com", "port": 443, "approx": true }
+]

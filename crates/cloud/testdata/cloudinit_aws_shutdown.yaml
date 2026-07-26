@@ -1,0 +1,110 @@
+#cloud-config
+write_files:
+  - path: /etc/jamstream/config
+    owner: root:root
+    permissions: "0600"
+    content: |
+      session_id_hex = deadbeefcafef00d
+      port = 43210
+      server_private_key_b64 = c2VydmVyLXByaXZhdGUta2V5
+      issuer_public_key_b64 = aXNzdWVyLXB1YmxpYy1rZXk=
+      idle_shutdown_min = 10
+      max_duration_min = 720
+  - path: /usr/local/sbin/jamstream-self-destruct
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/sh
+      # Instance-initiated shutdown behavior is terminate, so shutdown kills the
+      # instance for good with no credentials on the box.
+      echo "jamstream self-destruct: $1" > /dev/console 2>/dev/null || true
+      shutdown -h now
+  - path: /usr/local/sbin/jamstream-guard
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/sh
+      # Dead man's switch. jamstreamd touches /run/jamstream/last-active while
+      # musicians are connected; staleness past the idle window, or exceeding the
+      # session hard cap, triggers self-destruct.
+      set -eu
+      now=$(date +%s)
+      boot=$((now - $(cut -d. -f1 /proc/uptime)))
+      last=$(stat -c %Y /run/jamstream/last-active 2>/dev/null || echo "$boot")
+      if [ $((now - last)) -ge 600 ]; then
+        exec /usr/local/sbin/jamstream-self-destruct "idle for $((now - last))s"
+      fi
+      if [ $((now - boot)) -ge 43200 ]; then
+        exec /usr/local/sbin/jamstream-self-destruct "max session duration reached"
+      fi
+  - path: /usr/local/sbin/jamstream-bootstrap
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/sh
+      set -eu
+      mkdir -p /run/jamstream
+      touch /run/jamstream/last-active
+      curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download "https://github.com/sean-reid/jamstream/releases/download/v0.1.0/jamstreamd-x86_64-unknown-linux-musl"
+      if ! echo "0f2e5c1d3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d  /usr/local/bin/jamstreamd.download" | sha256sum -c -; then
+        echo "jamstream: artifact sha256 mismatch, refusing to start" >&2
+        rm -f /usr/local/bin/jamstreamd.download
+        exit 1
+      fi
+      mv /usr/local/bin/jamstreamd.download /usr/local/bin/jamstreamd
+      chmod 0755 /usr/local/bin/jamstreamd
+      # Only the session UDP port is reachable from outside.
+      if command -v ufw >/dev/null 2>&1; then
+        ufw default deny incoming
+        ufw allow 43210/udp
+        ufw --force enable
+      else
+        iptables -A INPUT -i lo -j ACCEPT
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A INPUT -p udp --dport 43210 -j ACCEPT
+        iptables -P INPUT DROP
+      fi
+      systemctl daemon-reload
+      systemctl enable --now jamstreamd.service
+      systemctl enable --now jamstream-guard.timer
+  - path: /etc/systemd/system/jamstreamd.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=JamStream session server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/usr/local/bin/jamstreamd --config /etc/jamstream/config
+      Restart=on-failure
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/jamstream-guard.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=JamStream dead man's switch
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/jamstream-guard
+  - path: /etc/systemd/system/jamstream-guard.timer
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Run the JamStream dead man's switch every minute
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=1min
+
+      [Install]
+      WantedBy=timers.target
+runcmd:
+  - [/usr/local/sbin/jamstream-bootstrap]
