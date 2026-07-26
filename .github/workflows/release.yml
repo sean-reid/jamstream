@@ -1,0 +1,94 @@
+# Builds and attaches release artifacts when release-please publishes a
+# release (beta prereleases included; see release-please.yml for the
+# channel design). Plain archives only for now: installers (MSI, notarized
+# DMG, deb/rpm/AppImage) and code signing are a later milestone, with named
+# placeholder steps below marking where they land.
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  # Static musl server tarball: the artifact session VMs download at boot.
+  server-musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build -p jamstream-server --release --target x86_64-unknown-linux-musl
+      - name: Verify the binary is fully static
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/jamstreamd
+          file "$BIN" | grep -q 'static'
+          if ldd "$BIN"; then
+            echo "jamstreamd is dynamically linked" >&2
+            exit 1
+          fi
+      - name: Package and upload tarball
+        run: |
+          ARCHIVE="jamstream-server-${TAG}-x86_64-unknown-linux-musl.tar.gz"
+          tar -C target/x86_64-unknown-linux-musl/release -czf "$ARCHIVE" jamstreamd
+          gh release upload "$TAG" "$ARCHIVE" --clobber
+      # Placeholder: artifact signing (signature published beside the
+      # tarball; cloud-init verifies it before boot) lands with the
+      # signing milestone.
+      - name: Sign server artifact (not yet implemented)
+        run: echo 'Placeholder; detached signature for cloud-init verification lands with the signing milestone.'
+
+  # Desktop app + CLI for each OS, as plain archives.
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
+      - run: cargo build --release -p jamstream-client -p jamstream-cli
+      - name: Package and upload archive
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ARCHIVE="jamstream-${TAG}-${{ matrix.triple }}.zip"
+            7z a "$ARCHIVE" ./target/release/jamstream-app.exe ./target/release/jamstream.exe
+          else
+            ARCHIVE="jamstream-${TAG}-${{ matrix.triple }}.tar.gz"
+            tar -C target/release -czf "$ARCHIVE" jamstream-app jamstream
+          fi
+          gh release upload "$TAG" "$ARCHIVE" --clobber
+      # Placeholders for the installer/signing milestone, one per OS so the
+      # eventual steps have named homes:
+      - name: Build signed MSI (not yet implemented)
+        if: runner.os == 'Windows'
+        run: echo 'Placeholder; signed MSI plus winget manifest lands with the installer milestone.'
+      - name: Build notarized DMG (not yet implemented)
+        if: runner.os == 'macOS'
+        run: echo 'Placeholder; notarized DMG plus Homebrew tap lands with the installer milestone.'
+      - name: Build deb/rpm/AppImage (not yet implemented)
+        if: runner.os == 'Linux'
+        run: echo 'Placeholder; deb, rpm, AppImage, and AUR packaging lands with the installer milestone.'

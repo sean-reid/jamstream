@@ -1,3 +1,18 @@
+# Wall-time budget: the push/PR path must land in about 10 minutes, with all
+# jobs running in parallel so the slowest single job is the bound. Expected
+# wall time per job on a warm Swatinem cache (cold caches pay a one-off
+# compile that no job split can avoid):
+#
+#   lint      ~4 min    fmt + clippy + cargo-deny
+#   test      ~6-8 min  unit + property + integration + E2E stories, per OS
+#   harness   ~4 min    simulation gate suite (~3 min of test runtime)
+#   musl      ~4 min    static server build + verification
+#   coverage  ~12 min   instrumented rebuild; runs on pushes to main only so
+#                       the PR path never waits on it
+#
+# The harness gates run as their own parallel job so unit/integration
+# feedback lands before the ~3 minute simulation suite finishes. Anything
+# that cannot fit the budget lives in nightly.yml, which has none.
 name: ci
 
 on:
@@ -12,28 +27,151 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # libasound2-dev: cpal/alsa-sys. libxkbcommon-dev + libwayland-dev:
+      # eframe 0.35 (winit/wayland) build-time requirements on Linux.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # Unit, property, integration, and E2E story tests, plus a production
+  # build of every binary. The harness gate suite runs in its own job below
+  # so this one is not serialized behind ~3 minutes of simulation.
+  #
+  # jamstream-client tests run only on macOS, deliberately:
+  #   - The kittest UI snapshot baselines were rendered on macOS; pixel
+  #     comparison only holds on the OS that rendered them, so a Linux or
+  #     Windows run could never assert against them anyway.
+  #   - kittest renders through wgpu, which needs a GPU adapter that
+  #     headless ubuntu/windows runners do not reliably provide, and the
+  #     crate has no env-var escape hatch we could set without touching
+  #     src (off-limits here).
+  # So: full workspace on macOS, --exclude jamstream-client elsewhere. The
+  # client still COMPILES on all three OSes via clippy --all-targets (lint
+  # job, Linux) and the release build below.
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
+      - if: runner.os == 'macOS'
+        run: cargo test --workspace --exclude jamstream-harness
+      - if: runner.os != 'macOS'
+        run: cargo test --workspace --exclude jamstream-harness --exclude jamstream-client
+      # The snapshot tests drop a human-reviewable PNG of every screen under
+      # target/ui-previews/; upload them even when a pixel diff fails, since
+      # a failing run is exactly when a human wants to look.
+      - if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-previews
+          path: target/ui-previews/
+          if-no-files-found: error
       - run: cargo build --workspace --release
+
+  # Simulation harness gates: latency budgets, loss resilience, drift, chaos.
+  # ~3 minutes of pure test runtime, and no audio/UI system deps (the harness
+  # wires engine + protocol to virtual clocks), so no apt step.
+  harness:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p jamstream-harness
+
+  # Coverage is the slowest job (fully instrumented rebuild), so it runs on
+  # pushes to main only; PRs get their signal from the jobs above. The
+  # client crate is excluded because its kittest snapshot tests are
+  # platform-tied to macOS (see the test job comment).
+  coverage:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
+      - name: Workspace coverage (lcov)
+        run: cargo llvm-cov --workspace --exclude jamstream-client --lcov --output-path lcov.info
+      - name: Coverage summary
+        run: |
+          {
+            echo '## Coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+      # Per-package line-coverage floors where correctness lives. llvm-cov
+      # has no per-package report filter, so each floor is its own small
+      # invocation (build artifacts are shared, only the tests re-run) with
+      # every other crate's files masked out of the report.
+      - name: Enforce 75 percent line coverage on protocol, engine, session
+        run: |
+          cargo llvm-cov -p jamstream-protocol --summary-only --fail-under-lines 75 \
+            --ignore-filename-regex 'crates/(engine|session|audio-io|cloud|server|cli|client|harness)/|xtask/'
+          cargo llvm-cov -p jamstream-engine --summary-only --fail-under-lines 75 \
+            --ignore-filename-regex 'crates/(protocol|session|audio-io|cloud|server|cli|client|harness)/|xtask/'
+          cargo llvm-cov -p jamstream-session --summary-only --fail-under-lines 75 \
+            --ignore-filename-regex 'crates/(protocol|engine|audio-io|cloud|server|cli|client|harness)/|xtask/'
+
+  # Static musl build of the session server: this is the artifact a session
+  # VM downloads at boot, so it must run on any Linux with no shared libs.
+  musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build -p jamstream-server --release --target x86_64-unknown-linux-musl
+      - name: Verify the binary is fully static
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/jamstreamd
+          file "$BIN"
+          file "$BIN" | grep -q 'static'
+          # ldd exits nonzero on a static binary; a zero exit means
+          # something linked dynamically after all.
+          if ldd "$BIN"; then
+            echo "jamstreamd is dynamically linked" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jamstreamd-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/jamstreamd
+          if-no-files-found: error

@@ -1,0 +1,49 @@
+[package]
+name = "jamstream-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+jamstream-protocol = { path = ".." }
+
+[[bin]]
+name = "wire_parse"
+path = "fuzz_targets/wire_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invite_decode"
+path = "fuzz_targets/invite_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "media_decode"
+path = "fuzz_targets/media_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_receive"
+path = "fuzz_targets/control_receive.rs"
+test = false
+doc = false
+bench = false
+
+# The fuzz crate is its own workspace so the root workspace's member list,
+# lockfile, and MSRV stay untouched; cargo-fuzz builds it independently on
+# nightly with sanitizer flags the main workspace never sees.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1

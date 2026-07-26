@@ -1,0 +1,118 @@
+# Nightly work with no wall-time budget: fuzzing the unauthenticated attack
+# surface, the full test suite (including E2E stories and UI work) on all
+# three OSes, and the gated live cloud smoke.
+name: nightly
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Each target gets 10 minutes on top of its committed seed corpus plus
+  # whatever the cache has grown on previous nights. Crashes upload as
+  # artifacts and then become committed regression tests.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wire_parse, invite_decode, media_decode, control_receive]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/protocol/fuzz
+      - run: cargo install cargo-fuzz --locked
+      # The key includes the run id so every night saves its grown corpus;
+      # restore-keys picks up the most recent previous night. The restore
+      # unpacks on top of the committed seeds, never replacing them.
+      - uses: actions/cache@v4
+        with:
+          path: crates/protocol/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      # The explicit +nightly matters: rust-toolchain.toml pins the repo to
+      # stable and would otherwise win over the installed nightly, and
+      # cargo-fuzz needs nightly for its sanitizer flags.
+      - run: cargo +nightly fuzz run ${{ matrix.target }} --fuzz-dir crates/protocol/fuzz -- -max_total_time=600
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: crates/protocol/fuzz/artifacts/
+          if-no-files-found: warn
+
+  # The full suite, harness gates and multi-second E2E user stories
+  # included, on every OS. Same client exclusion as ci.yml: the kittest
+  # snapshot baselines are macOS renders and headless ubuntu/windows
+  # runners lack a reliable wgpu adapter, so jamstream-client tests run
+  # only on macOS.
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
+      - if: runner.os == 'macOS'
+        run: cargo test --workspace
+      - if: runner.os != 'macOS'
+        run: cargo test --workspace --exclude jamstream-client
+      - if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-ui-previews
+          path: target/ui-previews/
+          if-no-files-found: ignore
+
+  # Live cloud smoke, spending real (sub-cent) money. Secrets are not
+  # readable in a job-level `if`, so the gate is a first step that copies
+  # the secret into env and publishes whether it was non-empty; every later
+  # step conditions on that output. On forks and secretless clones the job
+  # succeeds as a no-op.
+  cloud-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+    steps:
+      - name: Detect cloud credentials
+        id: creds
+        run: |
+          if [ -n "$DIGITALOCEAN_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo 'No cloud credentials configured; live smoke skipped.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.creds.outputs.available == 'true'
+        uses: actions/checkout@v4
+      - if: steps.creds.outputs.available == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.creds.outputs.available == 'true'
+        uses: Swatinem/rust-cache@v2
+      # Placeholder smoke: a real authenticated sweep of the account in
+      # dry-run mode proves credentials, API reachability, and tag listing
+      # without destroying anything.
+      - name: Sweep dry-run against live account
+        if: steps.creds.outputs.available == 'true'
+        run: cargo run -p jamstream-cli --release -- sweep --dry-run --provider digitalocean
+      # Later addition goes here: provision the cheapest real instance,
+      # verify boot + handshake + self-termination, then assert a final
+      # sweep finds nothing (testing.md, "Cloud provider tests" item 3).
+      - name: Full launch and destroy smoke (not yet implemented)
+        if: steps.creds.outputs.available == 'true'
+        run: echo 'Placeholder; full provision/boot/self-terminate/sweep smoke lands in a later change.'

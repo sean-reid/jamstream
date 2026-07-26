@@ -1,0 +1,10 @@
+# Build products and crash findings stay out of the repo; crashes become
+# regression tests, not committed artifacts.
+target/
+artifacts/
+coverage/
+Cargo.lock
+
+# corpus/ is deliberately NOT ignored: seed inputs generated from the
+# crate's own encoders are committed so every fuzz run starts from valid
+# packets, and CI layers its grown corpus on top via actions/cache.

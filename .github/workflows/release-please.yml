@@ -1,0 +1,33 @@
+# Release automation. release-please watches main, keeps a release PR open
+# with the changelog and version bump, and cuts a tag + GitHub Release when
+# that PR merges. release.yml then attaches the build artifacts.
+#
+# Channel design: the workspace versions as a single root package
+# ("jamstream", manifest at 0.1.0). While we are in beta, the config pins
+# the prerelease versioning strategy with the "beta" label, so releases
+# from main come out as v0.1.x-beta.N and are marked prereleases on GitHub;
+# that is the beta channel.
+#
+# Promote path to stable: in release-please-config.json set
+# "prerelease": false and drop "versioning": "prerelease" and
+# "prerelease-type". The next release PR then graduates the version to a
+# plain SemVer release (the stable channel) and GitHub Releases stop being
+# flagged prerelease. Nothing in this workflow file needs to change.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
