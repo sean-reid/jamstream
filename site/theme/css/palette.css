@@ -1,0 +1,94 @@
+/* GENERATED FILE. Do not edit.
+ *
+ * Written by scripts/render-palette.sh from the DARK and LIGHT palettes in
+ * crates/client/src/theme.rs, which is the single source of truth for
+ * JamStream's colors. Change a color there and rerun the script; CI runs
+ * it with --check and fails when the two have drifted apart.
+ *
+ * Every entry appears twice: as a hex for color and background, and as an
+ * "r, g, b" triple for rgba() tints, since rgba() cannot take a hex var.
+ * The docs site is dark only, so the --js-dark-* set is aliased to the
+ * unprefixed --js-* names that theme/css/variables.css consumes; a light
+ * docs theme would only have to repoint those aliases.
+ */
+
+:root {
+    /* The app's dark palette, verbatim. */
+    --js-dark-well: #0b0c0d;
+    --js-dark-well-rgb: 11, 12, 13;
+    --js-dark-surface0: #121314;
+    --js-dark-surface0-rgb: 18, 19, 20;
+    --js-dark-surface1: #1b1d1f;
+    --js-dark-surface1-rgb: 27, 29, 31;
+    --js-dark-surface2: #272a2d;
+    --js-dark-surface2-rgb: 39, 42, 45;
+    --js-dark-text-primary: #e8eaec;
+    --js-dark-text-primary-rgb: 232, 234, 236;
+    --js-dark-text-muted: #9ea4aa;
+    --js-dark-text-muted-rgb: 158, 164, 170;
+    --js-dark-accent: #f5922b;
+    --js-dark-accent-rgb: 245, 146, 43;
+    --js-dark-meter-green: #40c057;
+    --js-dark-meter-green-rgb: 64, 192, 87;
+    --js-dark-meter-amber: #fab005;
+    --js-dark-meter-amber-rgb: 250, 176, 5;
+    --js-dark-meter-red: #fa5252;
+    --js-dark-meter-red-rgb: 250, 82, 82;
+    --js-dark-danger: #e04a4a;
+    --js-dark-danger-rgb: 224, 74, 74;
+    --js-dark-border: #34373b;
+    --js-dark-border-rgb: 52, 55, 59;
+
+    /* The app's light palette. Unused by the dark-only docs theme
+     * today; emitted so a light theme has it when it lands. */
+    --js-light-well: #e0e2e4;
+    --js-light-well-rgb: 224, 226, 228;
+    --js-light-surface0: #eff0f1;
+    --js-light-surface0-rgb: 239, 240, 241;
+    --js-light-surface1: #f8f9fa;
+    --js-light-surface1-rgb: 248, 249, 250;
+    --js-light-surface2: #e7e9ec;
+    --js-light-surface2-rgb: 231, 233, 236;
+    --js-light-text-primary: #1b1d1f;
+    --js-light-text-primary-rgb: 27, 29, 31;
+    --js-light-text-muted: #53585e;
+    --js-light-text-muted-rgb: 83, 88, 94;
+    --js-light-accent: #d9480f;
+    --js-light-accent-rgb: 217, 72, 15;
+    --js-light-meter-green: #2f9e44;
+    --js-light-meter-green-rgb: 47, 158, 68;
+    --js-light-meter-amber: #e8590c;
+    --js-light-meter-amber-rgb: 232, 89, 12;
+    --js-light-meter-red: #e03131;
+    --js-light-meter-red-rgb: 224, 49, 49;
+    --js-light-danger: #c92a2a;
+    --js-light-danger-rgb: 201, 42, 42;
+    --js-light-border: #d3d6d9;
+    --js-light-border-rgb: 211, 214, 217;
+
+    /* The palette the docs theme is currently wired to. */
+    --js-well: var(--js-dark-well);
+    --js-well-rgb: var(--js-dark-well-rgb);
+    --js-surface0: var(--js-dark-surface0);
+    --js-surface0-rgb: var(--js-dark-surface0-rgb);
+    --js-surface1: var(--js-dark-surface1);
+    --js-surface1-rgb: var(--js-dark-surface1-rgb);
+    --js-surface2: var(--js-dark-surface2);
+    --js-surface2-rgb: var(--js-dark-surface2-rgb);
+    --js-text-primary: var(--js-dark-text-primary);
+    --js-text-primary-rgb: var(--js-dark-text-primary-rgb);
+    --js-text-muted: var(--js-dark-text-muted);
+    --js-text-muted-rgb: var(--js-dark-text-muted-rgb);
+    --js-accent: var(--js-dark-accent);
+    --js-accent-rgb: var(--js-dark-accent-rgb);
+    --js-meter-green: var(--js-dark-meter-green);
+    --js-meter-green-rgb: var(--js-dark-meter-green-rgb);
+    --js-meter-amber: var(--js-dark-meter-amber);
+    --js-meter-amber-rgb: var(--js-dark-meter-amber-rgb);
+    --js-meter-red: var(--js-dark-meter-red);
+    --js-meter-red-rgb: var(--js-dark-meter-red-rgb);
+    --js-danger: var(--js-dark-danger);
+    --js-danger-rgb: var(--js-dark-danger-rgb);
+    --js-border: var(--js-dark-border);
+    --js-border-rgb: var(--js-dark-border-rgb);
+}
