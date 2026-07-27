@@ -4,6 +4,12 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+// Session shape, defined once for every surface; see
+// jamstream_session::limits.
+use jamstream_session::{
+    DEFAULT_HOURS, DEFAULT_IDLE_MIN, DEFAULT_LISTENERS, DEFAULT_MAX_HOURS, DEFAULT_MUSICIANS,
+    MAX_LISTENERS, MAX_MUSICIANS,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,16 +46,26 @@ pub struct HostArgs {
     #[arg(long)]
     pub region: Option<String>,
 
-    /// Musician invites to mint, not counting the host.
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=10))]
+    /// Musician seats in the session, counting you: 1 hosts alone, 4 mints
+    /// your host invite plus 3 musician invites. The server admits this many
+    /// musicians in total.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MUSICIANS,
+        value_parser = clap::value_parser!(u8).range(1..=MAX_MUSICIANS as i64),
+    )]
     pub musicians: u8,
 
-    /// Listener invites to mint.
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=20))]
+    /// Listener seats in the session; one listener invite is minted per seat.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_LISTENERS,
+        value_parser = clap::value_parser!(u8).range(0..=MAX_LISTENERS as i64),
+    )]
     pub listeners: u8,
 
     /// Expected session length in hours, for the cost preview.
-    #[arg(long, default_value_t = 3.0)]
+    #[arg(long, default_value_t = DEFAULT_HOURS)]
     pub hours: f32,
 
     /// Stream destination count, for the egress estimate.
@@ -61,11 +77,11 @@ pub struct HostArgs {
     pub port: u16,
 
     /// Minutes without musicians before the server shuts itself down.
-    #[arg(long = "idle-min", default_value_t = 10)]
+    #[arg(long = "idle-min", default_value_t = DEFAULT_IDLE_MIN)]
     pub idle_min: u32,
 
     /// Hard cap on session length in hours. Invites expire at the cap.
-    #[arg(long = "max-hours", default_value_t = 12)]
+    #[arg(long = "max-hours", default_value_t = DEFAULT_MAX_HOURS)]
     pub max_hours: u32,
 
     /// Override the URL of the jamstreamd artifact the VM downloads at
@@ -91,7 +107,7 @@ pub struct HostArgs {
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     /// Hours to project the total cost over.
-    #[arg(long, default_value_t = 3.0)]
+    #[arg(long, default_value_t = DEFAULT_HOURS)]
     pub hours: f32,
 
     /// Emit a JSON array instead of a table.
@@ -179,14 +195,16 @@ mod tests {
         let Command::Host(args) = cli.command else {
             panic!("expected host");
         };
+        // The defaults are the shared ones: the desktop wizard opens on the
+        // same session shape.
         assert_eq!(args.provider, "local");
-        assert_eq!(args.musicians, 4);
-        assert_eq!(args.listeners, 0);
-        assert_eq!(args.hours, 3.0);
+        assert_eq!(args.musicians, DEFAULT_MUSICIANS);
+        assert_eq!(args.listeners, DEFAULT_LISTENERS);
+        assert_eq!(args.hours, DEFAULT_HOURS);
         assert_eq!(args.destinations, 0);
         assert_eq!(args.port, 43210);
-        assert_eq!(args.idle_min, 10);
-        assert_eq!(args.max_hours, 12);
+        assert_eq!(args.idle_min, DEFAULT_IDLE_MIN);
+        assert_eq!(args.max_hours, DEFAULT_MAX_HOURS);
         assert!(!args.yes);
         assert!(!args.json);
     }
@@ -270,10 +288,49 @@ mod tests {
         assert!(Cli::try_parse_from(["jamstream", "host", "--artifact-sha256", "abc"]).is_err());
     }
 
+    // The flag ranges are the capacity the server enforces, not a second
+    // opinion about it: one past the cap must be rejected at parse time, and
+    // exactly the cap must be accepted.
     #[test]
-    fn musician_count_is_capped() {
-        assert!(Cli::try_parse_from(["jamstream", "host", "--musicians", "11"]).is_err());
-        assert!(Cli::try_parse_from(["jamstream", "host", "--listeners", "21"]).is_err());
+    fn seat_counts_are_capped_at_the_server_capacity() {
+        let over_musicians = (MAX_MUSICIANS + 1).to_string();
+        let over_listeners = (MAX_LISTENERS + 1).to_string();
+        assert!(
+            Cli::try_parse_from(["jamstream", "host", "--musicians", &over_musicians]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["jamstream", "host", "--listeners", &over_listeners]).is_err()
+        );
+        // Zero musicians would be a session with no host in it.
+        assert!(Cli::try_parse_from(["jamstream", "host", "--musicians", "0"]).is_err());
+
+        let at_cap = MAX_MUSICIANS.to_string();
+        let cli = Cli::parse_from(["jamstream", "host", "--musicians", &at_cap]);
+        let Command::Host(args) = cli.command else {
+            panic!("expected host");
+        };
+        assert_eq!(usize::from(args.musicians), MAX_MUSICIANS);
+    }
+
+    // --musicians counts the host, which is a change from an earlier build:
+    // the help text has to say so, because the same number used to mean
+    // guests only.
+    #[test]
+    fn musicians_help_says_the_host_is_counted() {
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("host")
+            .expect("host subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("counting you"),
+            "--musicians help must say the host is counted: {help}"
+        );
+        assert!(
+            help.contains("1 hosts alone"),
+            "--musicians help must explain the low end: {help}"
+        );
     }
 
     #[test]
