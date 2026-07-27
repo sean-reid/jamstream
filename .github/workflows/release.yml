@@ -29,7 +29,7 @@
 #
 # Asset names are STABLE (no version embedded) so
 # /releases/latest/download/<name> always resolves:
-#   jamstream-app-macos.dmg              universal app in a signed DMG
+#   jamstream-app-macos.dmg              universal app in a notarized DMG
 #                                        (bundles jamstreamd)
 #   jamstream-cli-macos-universal.tar.gz universal CLI binary
 #   jamstream-cli-windows-x86_64.zip     CLI
@@ -272,10 +272,7 @@ jobs:
           rm -f "$RUNNER_TEMP/asc-key.p8" "$RUNNER_TEMP/JamStream.zip"
           xcrun stapler staple dist/JamStream.app
           xcrun stapler validate dist/JamStream.app
-      # The DMG is built after stapling so it carries the notarized app.
-      # (Notarizing the DMG itself as well can be added inside the gated
-      # step above once the ASC secrets exist, if we want Gatekeeper to
-      # bless the mount too.)
+      # Built after stapling so it carries the notarized app.
       - name: Build and sign the DMG
         run: |
           set -eu
@@ -283,6 +280,32 @@ jobs:
           codesign --force --timestamp \
             --sign "$SIGN_IDENTITY" --keychain release.keychain jamstream-app-macos.dmg
           codesign --verify --strict --verbose=2 jamstream-app-macos.dmg
+      # Gatekeeper evaluates the disk image a user double-clicks, not just
+      # the app inside it, so the dmg needs its own ticket. Without this,
+      # spctl reports the dmg as an unnotarized developer id even when the
+      # enclosed app is stapled.
+      - name: Notarize and staple the DMG
+        if: steps.notary.outputs.configured == 'true'
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eu
+          if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
+          else
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc-key.p8"
+          fi
+          xcrun notarytool submit jamstream-app-macos.dmg \
+            --key "$RUNNER_TEMP/asc-key.p8" \
+            --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" \
+            --wait
+          rm -f "$RUNNER_TEMP/asc-key.p8"
+          xcrun stapler staple jamstream-app-macos.dmg
+          xcrun stapler validate jamstream-app-macos.dmg
+          spctl -a -t open --context context:primary-signature -v jamstream-app-macos.dmg
       - name: Package CLI tarball and upload assets
         run: |
           set -eu
