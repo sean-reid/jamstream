@@ -40,6 +40,17 @@ pub const DEFAULT_MAX_HOURS: u32 = 12;
 /// A member silent this long is dropped from the roster.
 pub const DEFAULT_MEMBER_TIMEOUT_MS: u64 = 10_000;
 
+/// Messages one member may send that the server relays to every other member,
+/// which is a chat line or a change of avatar. One of these costs roughly
+/// [`MAX_MUSICIANS`] + [`MAX_LISTENERS`] times its own size in egress, so the
+/// rate is set by what a person does, not by what a link can carry.
+pub const FANOUT_BURST: u32 = 12;
+
+/// How fast that allowance comes back. Two per second is above a fast typist
+/// in a heated moment and far below the rate at which relaying to everyone
+/// costs the host real money.
+pub const FANOUT_REFILL_PER_SEC: u32 = 2;
+
 /// Illegal packets a member may send before the server drops them. An honest
 /// client sends none: every violation the server counts is something no
 /// shipped client does. 32 is room for a version skew nobody anticipated.

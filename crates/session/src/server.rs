@@ -24,8 +24,8 @@ use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
 
 use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
 use crate::limits::{
-    DEFAULT_MEMBER_TIMEOUT_MS, MAX_LISTENERS, MAX_MUSICIANS, TokenBucket, VIOLATION_BURST,
-    VIOLATION_REFILL_PER_SEC,
+    DEFAULT_MEMBER_TIMEOUT_MS, FANOUT_BURST, FANOUT_REFILL_PER_SEC, MAX_LISTENERS, MAX_MUSICIANS,
+    TokenBucket, VIOLATION_BURST, VIOLATION_REFILL_PER_SEC,
 };
 
 /// Samples per mix tick: 2.5 ms at 48 kHz.
@@ -56,6 +56,11 @@ const REJECT_BURST: u32 = 16;
 /// real Noise IK first message is over 90, so answering anything shorter
 /// would make the server an amplifier by size: `[1, 9, 0]` in, 21 bytes out.
 const REJECT_MIN_INIT_BYTES: usize = 48;
+/// Queue depth at which the avatar pacer stops feeding a link. Well clear of
+/// [`MAX_PENDING`], so the link's hard cap only ever refuses bulk, never a
+/// roster or a chat. A round trip's worth of chunks on a 45 ms path is about
+/// 36, so this also lets a transfer run at full speed on any real link.
+const AVATAR_FEED_HIGH_WATER: usize = 64;
 /// Uplink Stats reports go to each musician this often.
 const STATS_INTERVAL_MS: u64 = 1_000;
 /// While anything is configured for broadcast, every member is told the
@@ -157,6 +162,13 @@ pub enum ServerEvent {
         id: MemberId,
         violations: u64,
     },
+    /// The host revoked a token id that was not already revoked. The core
+    /// holds the list in memory only; whoever drives it is responsible for
+    /// writing this down before the process can exit, or a restart hands the
+    /// invite back.
+    TokenRevoked {
+        jti: TokenId,
+    },
     /// An accepted host request for the broadcast pipeline. The core does not
     /// run processes, so it hands the op to whatever drives it (jamstreamd's
     /// runtime, which owns the stream worker) and stays deterministic. The op
@@ -237,6 +249,11 @@ struct Member {
     /// What is left of this member's allowance for illegal packets. Survives
     /// disconnect and rejoin, so ejection is not undone by a handshake.
     violation_budget: TokenBucket,
+    /// Allowance for messages that cost a fanout to every member or a piece
+    /// of per-hash state. Connection-scoped, unlike the violation budget: a
+    /// reconnecting client asks for every avatar on the roster again, and
+    /// each reconnection costs it a full handshake anyway.
+    fanout_budget: TokenBucket,
     /// Jitter stats snapshot at the last Stats report; deltas against it
     /// give the per-window uplink numbers.
     stats_prev: JitterStats,
@@ -300,6 +317,8 @@ pub struct ServerCore {
     stream_status: Vec<DestinationStatus>,
     last_stream_status_ms: u64,
     roster_epoch: u64,
+    /// Set by any roster change, cleared by the next tick's fanout.
+    roster_dirty: bool,
 }
 
 impl ServerCore {
@@ -335,6 +354,7 @@ impl ServerCore {
             stream_status: Vec::new(),
             last_stream_status_ms: 0,
             roster_epoch: 0,
+            roster_dirty: false,
         }
     }
 
@@ -555,6 +575,9 @@ impl ServerCore {
             }
         }
 
+        // Whatever changed the roster this tick, it fans out once.
+        self.flush_roster();
+
         // Control-plane retransmits and acks. Avatar trains are fed here,
         // capped per tick, so bulk bytes never starve normal control
         // traffic on the ordered link (see the avatar module comment).
@@ -563,7 +586,10 @@ impl ServerCore {
                 continue;
             }
             let mut fed = 0;
-            while fed < AVATAR_CHUNKS_PER_POLL {
+            // Bulk stops while the link is backed up, so the queue's hard cap
+            // is never reached by avatar chunks and a roster or a chat always
+            // has room. A stalled train resumes when the acks catch up.
+            while fed < AVATAR_CHUNKS_PER_POLL && m.link.pending_len() < AVATAR_FEED_HIGH_WATER {
                 let Some(tx) = m.avatar_tx.front_mut() else {
                     break;
                 };
@@ -613,6 +639,55 @@ impl ServerCore {
         }
 
         out
+    }
+
+    /// Tells every connected member the session is over and returns the
+    /// datagrams to send. One flight each, no retransmit: the process is going
+    /// away, and a client that misses this finds out by timeout, which is what
+    /// used to happen to everyone. Members are marked disconnected, so a
+    /// caller that keeps running (the harness) sees a clean roster.
+    pub fn shutdown(&mut self, now_ms: u64, reason: &str) -> Outgoing {
+        let mut out = Vec::new();
+        let connected: Vec<MemberId> = self
+            .members
+            .iter()
+            .filter(|(_, m)| m.connected)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in connected {
+            self.farewell(now_ms, id, reason, &mut out);
+            self.disconnect_member(id);
+            self.events.push(ServerEvent::MemberDisconnected { id });
+        }
+        self.note_musician_count();
+        out
+    }
+
+    /// Drops whichever connected member is bound to this address, for a driver
+    /// that caught a panic partway through that member's datagram and cannot
+    /// trust what was left behind. No Bye: the transport state that would carry
+    /// one is exactly what stopped being trustworthy. Their token stays valid,
+    /// so a client on the receiving end of somebody else's bug comes back with
+    /// a fresh handshake.
+    pub fn drop_peer(&mut self, addr: SocketAddr) -> Option<MemberId> {
+        let id = self
+            .members
+            .iter()
+            .find(|(_, m)| m.connected && m.addr == Some(addr))
+            .map(|(&id, _)| id)?;
+        self.disconnect_member(id);
+        self.events.push(ServerEvent::MemberDisconnected { id });
+        self.queue_roster();
+        self.note_musician_count();
+        Some(id)
+    }
+
+    /// Seeds the revocation list from whatever the driver persisted, before
+    /// the first datagram arrives. The core keeps the list in memory only, so
+    /// without this a restart, which `Restart=on-failure` makes cheap to
+    /// provoke, handed every revoked invite back.
+    pub fn restore_revoked(&mut self, jtis: Vec<TokenId>) {
+        self.revoked.extend(jtis);
     }
 
     /// Drains accumulated events.
@@ -930,6 +1005,7 @@ impl ServerCore {
                 send_seq: 0,
                 violations,
                 violation_budget,
+                fanout_budget: TokenBucket::new(FANOUT_BURST, FANOUT_REFILL_PER_SEC),
                 stats_prev: JitterStats::default(),
                 level_peak: 0.0,
                 level_rms: 0.0,
@@ -1033,6 +1109,9 @@ impl ServerCore {
             // The from field is forced to the authenticated sender; the
             // client-supplied value is never trusted.
             ControlMsg::Chat { text, .. } => {
+                if !self.take_fanout(now_ms, from) {
+                    return;
+                }
                 let relay = ControlMsg::Chat { from, text };
                 for m in self.members.values_mut().filter(|m| m.connected) {
                     let _ = m.link.send(relay.clone());
@@ -1141,30 +1220,19 @@ impl ServerCore {
                     self.violation(now_ms, from, "revoke by non-host");
                     return;
                 }
-                self.revoked.insert(jti);
+                if self.revoked.insert(jti) {
+                    // The driver persists on this: the list lives in memory
+                    // here, and the whole feature was one crash away from
+                    // being silently undone.
+                    self.events.push(ServerEvent::TokenRevoked { jti });
+                }
                 let target = self
                     .members
                     .iter()
                     .find(|(_, m)| m.jti == jti)
                     .map(|(&id, _)| id);
                 if let Some(id) = target {
-                    if let Some(m) = self.members.get_mut(&id)
-                        && m.connected
-                    {
-                        // Best effort Bye: one flight, the link dies with
-                        // the member. Silence also ejects via timeout.
-                        let _ = m.link.send(ControlMsg::Bye {
-                            reason: "invite revoked".into(),
-                        });
-                        let dgs = m.link.poll(now_ms);
-                        if let (Some(s), Some(a)) = (m.session.as_mut(), m.addr) {
-                            for dg in dgs {
-                                if let Ok(p) = s.seal(id, &dg) {
-                                    out.push((a, p));
-                                }
-                            }
-                        }
-                    }
+                    self.farewell(now_ms, id, "invite revoked", out);
                     if id == HOST_MEMBER_ID {
                         self.audition = false;
                     }
@@ -1188,6 +1256,16 @@ impl ServerCore {
                     self.violation(now_ms, from, "avatar length out of range");
                     return;
                 }
+                // A re-announce on rejoin costs nothing and is not charged. A
+                // change costs a roster to every member plus a request back,
+                // which was 224 outbound bytes for every inbound byte.
+                let unchanged = self
+                    .members
+                    .get(&from)
+                    .is_some_and(|m| m.avatar == Some((hash, len)));
+                if !unchanged && !self.take_fanout(now_ms, from) {
+                    return;
+                }
                 let have_bytes = self.avatar_cache.contains(&hash);
                 if have_bytes {
                     self.avatar_cache.touch(&hash);
@@ -1195,7 +1273,6 @@ impl ServerCore {
                 let Some(m) = self.members.get_mut(&from) else {
                     return;
                 };
-                let unchanged = m.avatar == Some((hash, len));
                 m.avatar = Some((hash, len));
                 if have_bytes {
                     m.avatar_rx = None;
@@ -1255,6 +1332,10 @@ impl ServerCore {
                     Err(what) => self.violation(now_ms, from, what),
                 }
             }
+            // Deliberately not metered: a request costs one lookup, one owner
+            // scan, and at most one message to the owner, and a client joining
+            // a full session legitimately sends one per roster entry. What
+            // needed bounding was the waiter map it writes into.
             ControlMsg::AvatarRequest { hash } => {
                 if self.avatar_cache.contains(&hash) {
                     self.avatar_cache.touch(&hash);
@@ -1274,10 +1355,7 @@ impl ServerCore {
                     // member who just left; not worth a violation.
                     return;
                 };
-                let waiters = self.avatar_waiters.entry(hash).or_default();
-                if !waiters.contains(&from) {
-                    waiters.push(from);
-                }
+                self.note_avatar_waiter(hash, from);
                 // Nudge the owner if no upload is running (say its first
                 // train failed validation); otherwise the in-flight upload
                 // will serve the waiter on completion.
@@ -1336,7 +1414,19 @@ impl ServerCore {
         }
     }
 
+    /// Marks the roster stale. The fanout itself waits for the next tick: a
+    /// roster is the widest message the server sends, about 640 bytes to every
+    /// member, and sending one per inbound packet was most of the measured
+    /// 224x egress amplification. Coalescing costs at most 2.5 ms of latency
+    /// on a join or leave notification.
     fn queue_roster(&mut self) {
+        self.roster_dirty = true;
+    }
+
+    fn flush_roster(&mut self) {
+        if !std::mem::take(&mut self.roster_dirty) {
+            return;
+        }
         self.roster_epoch += 1;
         let roster: Vec<MemberInfo> = self
             .members
@@ -1359,6 +1449,50 @@ impl ServerCore {
         if count != self.last_musician_count {
             self.last_musician_count = count;
             self.events.push(ServerEvent::MusicianCountChanged(count));
+        }
+    }
+
+    /// Spends one of a member's fanout tokens, charging a violation and
+    /// answering false when the allowance is gone. The messages metered here
+    /// each cost the server work on every other member's behalf, so at line
+    /// rate one of them is a flood against the whole session and a multiplier
+    /// on the host's egress bill.
+    fn take_fanout(&mut self, now_ms: u64, from: MemberId) -> bool {
+        let Some(m) = self.members.get_mut(&from) else {
+            return false;
+        };
+        if m.fanout_budget.take(now_ms) {
+            return true;
+        }
+        self.violation(now_ms, from, "control rate exceeded");
+        false
+    }
+
+    /// Records that a member is waiting for avatar bytes the server does not
+    /// have yet. Only a hash some member currently announces can be waited
+    /// on, so entries for hashes nobody announces any more are dead: they
+    /// used to be dropped only when a train completed, which let a member
+    /// alternating SetAvatar and AvatarRequest on its own hash leave one
+    /// permanent entry per pair of packets.
+    fn note_avatar_waiter(&mut self, hash: AvatarHash, waiter: MemberId) {
+        let cap = self.cfg.max_musicians + self.cfg.max_listeners;
+        if self.avatar_waiters.len() >= cap && !self.avatar_waiters.contains_key(&hash) {
+            let announced: BTreeSet<AvatarHash> = self
+                .members
+                .values()
+                .filter_map(|m| m.avatar.map(|(h, _)| h))
+                .collect();
+            self.avatar_waiters.retain(|h, _| announced.contains(h));
+            // At most one announced hash per member, so the prune always
+            // frees a slot unless every entry is live, in which case there is
+            // nothing to wait on that is not already tracked.
+            if self.avatar_waiters.len() >= cap {
+                return;
+            }
+        }
+        let waiters = self.avatar_waiters.entry(hash).or_default();
+        if !waiters.contains(&waiter) {
+            waiters.push(waiter);
         }
     }
 
@@ -1387,6 +1521,30 @@ impl ServerCore {
                 .push(ServerEvent::MemberEjected { id, violations });
             self.queue_roster();
             self.note_musician_count();
+        }
+    }
+
+    /// Best-effort Bye to one member: a single flight, no retry, because the
+    /// member is going away and so, on the shutdown path, is the process.
+    /// Silence would eject them by timeout anyway; this only means they learn
+    /// why and when instead of ten seconds later.
+    fn farewell(&mut self, now_ms: u64, id: MemberId, reason: &str, out: &mut Outgoing) {
+        let Some(m) = self.members.get_mut(&id) else {
+            return;
+        };
+        if !m.connected {
+            return;
+        }
+        let _ = m.link.send(ControlMsg::Bye {
+            reason: reason.to_owned(),
+        });
+        let dgs = m.link.poll(now_ms);
+        if let (Some(s), Some(a)) = (m.session.as_mut(), m.addr) {
+            for dg in dgs {
+                if let Ok(p) = s.seal(id, &dg) {
+                    out.push((a, p));
+                }
+            }
         }
     }
 

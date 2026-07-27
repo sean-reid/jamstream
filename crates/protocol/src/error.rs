@@ -18,4 +18,6 @@ pub enum Error {
     Decrypt,
     #[error("encoding failed")]
     Encode(#[from] postcard::Error),
+    #[error("control link is backed up")]
+    LinkFull,
 }
