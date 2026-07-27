@@ -16,6 +16,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# A version reject can only be drawn by a readable init this build refuses.
+jamstream-protocol = { workspace = true, features = ["testing"] }
 proptest.workspace = true
 # Loopback tests scan the bytes the server actually seals.
 postcard.workspace = true

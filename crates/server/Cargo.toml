@@ -28,5 +28,7 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 jamstream-cloud.workspace = true
+# The version reject story sends an init claiming a version we do not speak.
+jamstream-protocol = { workspace = true, features = ["testing"] }
 # The stream integration test scans the bytes a member receives.
 postcard.workspace = true

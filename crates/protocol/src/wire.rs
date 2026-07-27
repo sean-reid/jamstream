@@ -1,10 +1,11 @@
 //! Outer datagram framing. Anything that fails to parse is dropped by the
 //! caller without a response; the version reject is the single exception,
-//! and it is MAC'd with the server key from the invite so only someone who
-//! holds an invite can produce or believe one.
+//! and it is MAC'd with a key only the server and the one client that sent
+//! the init can derive (see [`RejectKey`]).
 
 use blake2::Blake2sMac;
 use blake2::digest::{KeyInit, Mac, consts::U16};
+use zeroize::Zeroizing;
 
 use crate::Error;
 use crate::ids::MemberId;
@@ -19,6 +20,30 @@ pub const CHANNEL_MEDIA: u8 = 0;
 pub const CHANNEL_CONTROL: u8 = 1;
 
 const REJECT_DOMAIN: &[u8] = b"jamstream-version-reject";
+
+/// The key a version reject is authenticated with: a hash of the X25519
+/// shared secret between the server's static key and the per-connection
+/// static key of the client that sent the init being answered.
+///
+/// It used to be the server's public key, which ships in every invite, so
+/// any invite holder including a revoked one could forge a reject at any
+/// client whose address they could see. A shared secret needs the server's
+/// static private key on one side and that one client's private key on the
+/// other, and neither is in an invite. [`crate::transport`] derives it.
+#[derive(Clone)]
+pub struct RejectKey(Zeroizing<[u8; 32]>);
+
+impl RejectKey {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> RejectKey {
+        RejectKey(Zeroizing::new(bytes))
+    }
+}
+
+impl std::fmt::Debug for RejectKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RejectKey(..)")
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Packet<'a> {
@@ -114,12 +139,12 @@ pub fn append_transport_header(member: MemberId, counter: u64, out: &mut Vec<u8>
 /// so it cannot be replayed against a different connection attempt. It is
 /// fixed-size and smaller than the request: useless for amplification.
 pub fn build_version_reject(
-    server_pk: &[u8; 32],
+    key: &RejectKey,
     ours: u16,
     theirs: u16,
     init_packet: &[u8],
 ) -> Vec<u8> {
-    let mac = reject_mac(server_pk, ours, theirs, init_packet);
+    let mac = reject_mac(key, ours, theirs, init_packet);
     let mut out = Vec::with_capacity(21);
     out.push(TYPE_VERSION_REJECT);
     out.extend_from_slice(&ours.to_le_bytes());
@@ -129,13 +154,13 @@ pub fn build_version_reject(
 }
 
 pub fn verify_version_reject(
-    server_pk: &[u8; 32],
+    key: &RejectKey,
     ours: u16,
     theirs: u16,
     mac: &[u8; 16],
     init_packet_sent: &[u8],
 ) -> bool {
-    let expected = reject_mac(server_pk, ours, theirs, init_packet_sent);
+    let expected = reject_mac(key, ours, theirs, init_packet_sent);
     // Not an oracle worth constant-time care, but it costs nothing.
     expected
         .iter()
@@ -144,8 +169,9 @@ pub fn verify_version_reject(
         == 0
 }
 
-fn reject_mac(server_pk: &[u8; 32], ours: u16, theirs: u16, init_packet: &[u8]) -> [u8; 16] {
-    let mut mac = <Blake2sMac<U16> as KeyInit>::new_from_slice(server_pk).expect("32-byte key");
+fn reject_mac(key: &RejectKey, ours: u16, theirs: u16, init_packet: &[u8]) -> [u8; 16] {
+    let mut mac =
+        <Blake2sMac<U16> as KeyInit>::new_from_slice(key.0.as_slice()).expect("32-byte key");
     mac.update(REJECT_DOMAIN);
     mac.update(&ours.to_le_bytes());
     mac.update(&theirs.to_le_bytes());
@@ -199,25 +225,24 @@ mod tests {
 
     #[test]
     fn version_reject_authenticates() {
-        let pk = [3u8; 32];
+        let key = RejectKey::from_bytes([3u8; 32]);
+        let other = RejectKey::from_bytes([4u8; 32]);
         let init = build_handshake_init(2, b"whatever");
-        let reject = build_version_reject(&pk, 1, 2, &init);
+        let reject = build_version_reject(&key, 1, 2, &init);
         let Packet::VersionReject { ours, theirs, mac } = parse(&reject).unwrap() else {
             panic!("wrong packet type");
         };
         assert_eq!((ours, theirs), (1, 2));
-        assert!(verify_version_reject(&pk, ours, theirs, &mac, &init));
+        assert!(verify_version_reject(&key, ours, theirs, &mac, &init));
         // Wrong key, wrong init echo, tampered versions: all refused.
+        assert!(!verify_version_reject(&other, ours, theirs, &mac, &init));
         assert!(!verify_version_reject(
-            &[4u8; 32], ours, theirs, &mac, &init
-        ));
-        assert!(!verify_version_reject(
-            &pk,
+            &key,
             ours,
             theirs,
             &mac,
             b"other-init"
         ));
-        assert!(!verify_version_reject(&pk, 3, theirs, &mac, &init));
+        assert!(!verify_version_reject(&key, 3, theirs, &mac, &init));
     }
 }
