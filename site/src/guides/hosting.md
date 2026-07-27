@@ -34,8 +34,10 @@ A region under 30 ms from everyone keeps the network's share of latency in singl
 
 `host` mints one invite per seat, up front, on your machine:
 
-- `--musicians N` invites for players, default 4, not counting you. Cap 10.
-- `--listeners N` invites for people who only listen, default 0. Cap 20.
+- `--musicians N`: musician seats, **counting you**, default 4. A session of 4 is you plus 3 invites to hand out; `--musicians 1` hosts alone. The cap is 10, which is exactly what the server admits.
+- `--listeners N`: seats for people who only listen, default 0, one invite each. The cap is 20.
+
+Counting yourself in `--musicians` is a change from earlier builds, where the number meant guests only and 10 could mint an eleventh seat the server would refuse. One number now means one thing on every surface: the flag, the app's "musicians, including you" dial, the invites panel's mint limit, and the server's own admission check.
 
 Each invite is tied to one seat and signed. The CLI cannot add seats to a running session; the app's invites panel can mint more mid-session, within the same caps. Unused invites cost nothing. See [Joining a session](joining.md) for how invites behave.
 
@@ -48,6 +50,8 @@ Every session carries two timers, both set at launch:
 
 - `--idle-min`, default 10: with no musicians connected for this many minutes, the server shuts itself down and the machine is destroyed.
 - `--max-hours`, default 12: the hard cap. The machine is destroyed at the cap no matter what, and invites expire with it.
+
+The app's host wizard shows both on its preview step, as "idle exit" and "hard cap", with the same defaults and the same meaning, so neither surface hides a timer the other exposes.
 
 There is no way to extend a running session; host a new one. The point of the caps is that a forgotten session costs a bounded, small amount, not a month of billing. [Understanding cost](cost.md) covers the other guardrails.
 

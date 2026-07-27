@@ -20,6 +20,7 @@ use jamstream_protocol::transport::{Responder, Session, Welcome};
 use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
 
 use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
+use crate::limits::{DEFAULT_MEMBER_TIMEOUT_MS, MAX_LISTENERS, MAX_MUSICIANS};
 
 /// Samples per mix tick: 2.5 ms at 48 kHz.
 const TICK_SAMPLES: usize = 120;
@@ -58,9 +59,50 @@ pub struct ServerConfig {
     /// version reject is MAC'd with it, so the core needs it explicitly.
     pub server_public: [u8; 32],
     pub issuer_pk: VerifyingKey,
+    /// Musicians admitted at once, the host's seat included. Defaults to
+    /// [`MAX_MUSICIANS`], the capacity every host surface offers.
     pub max_musicians: usize,
+    /// Listeners admitted at once. Defaults to [`MAX_LISTENERS`].
     pub max_listeners: usize,
     pub member_timeout_ms: u64,
+}
+
+impl ServerConfig {
+    /// Session identity plus the shipped session shape: [`MAX_MUSICIANS`]
+    /// musicians including the host, [`MAX_LISTENERS`] listeners, and the
+    /// default member timeout. Every production caller wants exactly this,
+    /// so the capacity the server enforces cannot drift from the capacity
+    /// the CLI and the desktop app offer.
+    pub fn new(
+        session_id: SessionId,
+        server_private: Vec<u8>,
+        server_public: [u8; 32],
+        issuer_pk: VerifyingKey,
+    ) -> ServerConfig {
+        ServerConfig {
+            session_id,
+            server_private,
+            server_public,
+            issuer_pk,
+            max_musicians: MAX_MUSICIANS,
+            max_listeners: MAX_LISTENERS,
+            member_timeout_ms: DEFAULT_MEMBER_TIMEOUT_MS,
+        }
+    }
+
+    /// Narrows (or widens) the admission caps. The simulation harness sizes
+    /// them to its scenario; production uses the defaults.
+    pub fn with_capacity(mut self, max_musicians: usize, max_listeners: usize) -> ServerConfig {
+        self.max_musicians = max_musicians;
+        self.max_listeners = max_listeners;
+        self
+    }
+
+    /// Overrides how long a silent member is held on the roster.
+    pub fn with_member_timeout_ms(mut self, member_timeout_ms: u64) -> ServerConfig {
+        self.member_timeout_ms = member_timeout_ms;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,6 +622,9 @@ impl ServerCore {
             // handshake before the full timeout. Tear down the old
             // connection state and admit fresh below.
         }
+        // Capacity counts everyone in the role, the host included: member 0
+        // is a musician like the rest, so `max_musicians` is the size of the
+        // band, not the number of guests.
         let connected_in_role = self
             .members
             .iter()
@@ -1088,15 +1133,12 @@ mod tests {
         let issuer = Issuer::generate();
         let kp = generate_keypair();
         let public = kp.public;
-        let core = ServerCore::new(ServerConfig {
-            session_id: SessionId([7u8; 16]),
-            server_private: kp.private.to_vec(),
-            server_public: public,
-            issuer_pk: issuer.public_key(),
-            max_musicians: 10,
-            max_listeners: 20,
-            member_timeout_ms: 10_000,
-        });
+        let core = ServerCore::new(ServerConfig::new(
+            SessionId([7u8; 16]),
+            kp.private.to_vec(),
+            public,
+            issuer.public_key(),
+        ));
         (core, issuer, public)
     }
 

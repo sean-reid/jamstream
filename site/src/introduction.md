@@ -7,7 +7,7 @@ JamStream lets a band play together over the internet with latency low enough to
 
 ## What it costs
 
-You pay your cloud provider directly, by the second, for one small virtual machine. For a three hour session with four musicians on the cheapest suitable machines:
+You pay your cloud provider directly, by the second, for one small virtual machine. For a three hour session with four musicians in it, host included, on the cheapest suitable machines:
 
 | Provider | Machine | Machine cost | Audio traffic (about 1.6 GB) | Total |
 |---|---|---|---|---|

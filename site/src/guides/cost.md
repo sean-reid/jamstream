@@ -19,7 +19,7 @@ Total (estimate)                                  $0.08037
 Line by line:
 
 - **VM** is the machine's hourly price times your expected length (`--hours`, default 3). The price is fetched live from the provider where possible (DigitalOcean's sizes API) and from a bundled snapshot of public pricing otherwise, so the preview tracks reality and the numbers in this documentation are the approximations.
-- **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Each musician's personal mix streams down at about 300 kbit/s, each listener at about 150 kbit/s. Four musicians for three hours is about 1.6 GB.
+- **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Each musician's personal mix streams down at about 300 kbit/s, each listener at about 150 kbit/s. Four musicians (you and three others, the default `--musicians 4`) for three hours is about 1.6 GB.
 - **Included egress credit** appears when the provider bundles free transfer that covers some or all of the estimate. DigitalOcean droplets include thousands of GiB; AWS accounts include 100 GB per month; GCP includes close to nothing.
 
 The expected length only shapes the estimate. The real bill is metered: elapsed time times the hourly rate, plus measured traffic. Play four hours after previewing three and you pay for four.
@@ -32,7 +32,7 @@ Cloud providers charge for data leaving their network, per gigabyte, and call it
 
 Ephemeral cloud machines have one classic failure: you forget one and it bills for a month. JamStream treats that as a design problem, in layers:
 
-- **The self-destruct timers.** Every server shuts itself down after `--idle-min` minutes with no musicians (default 10) and destroys itself at the `--max-hours` hard cap (default 12) no matter what. The cap is enforced on the machine itself, not by your laptop, so it works even if your laptop is in a lake.
+- **The self-destruct timers.** Every server shuts itself down after `--idle-min` minutes with no musicians (default 10) and destroys itself at the `--max-hours` hard cap (default 12) no matter what. Both are editable in the app's wizard too, as "idle exit" and "hard cap", with the same defaults. The cap is enforced on the machine itself, not by your laptop, so it works even if your laptop is in a lake.
 - **The cost ticker.** While a session runs, cost so far sits in the app's status bar next to latency, and `jamstream status` prints accrued and projected cost per session. You always know the meter's reading; nothing accrues silently.
 - **The sweeper.** Every machine JamStream launches is tagged. `jamstream sweep` finds everything with the tag across all configured providers and destroys it; `--dry-run` lists without destroying. `jamstream host` also warns you at launch if tagged machines already exist. When in doubt, sweep.
 

@@ -19,10 +19,16 @@ use jamstream_cloud::{
     BootConfig, CostPreview, InstanceClass, LaunchSpec, Price, ProbeMatrix, Provider, ProviderKind,
     Region, RegionId, SelfDestruct, rank, session_tag,
 };
-use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
-use jamstream_protocol::invite::{Invite, Issuer, Token};
+use jamstream_protocol::ids::SessionId;
+use jamstream_protocol::invite::{Invite, Issuer};
 use jamstream_protocol::transport::generate_keypair;
 use jamstream_session::client::{ClientCore, ClientState};
+// The session shape, defined once for the CLI and this wizard alike; see
+// jamstream_session::limits.
+use jamstream_session::{
+    DEFAULT_HOURS, DEFAULT_IDLE_MIN, DEFAULT_LISTENERS, DEFAULT_MAX_HOURS, DEFAULT_MUSICIANS,
+    MAX_LISTENERS, MAX_MUSICIANS,
+};
 
 use crate::creds::{self, CredStore, EnvReader};
 use crate::exec::{Executor, Job};
@@ -35,8 +41,6 @@ use crate::widgets::{PICK_INDENT, pick_row, row_cell};
 pub const WIZARD_PROVIDERS: &[&str] = &["local", "digitalocean", "aws", "gcp"];
 
 const SESSION_PORT: u16 = 43210;
-const MAX_HOURS: u64 = 12;
-const IDLE_MIN: u32 = 10;
 const IP_WAIT_CAP: Duration = Duration::from_secs(180);
 const IP_POLL_PERIOD: Duration = Duration::from_secs(2);
 const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
@@ -168,9 +172,18 @@ pub struct HostWizard {
     pub regions_error: Option<String>,
     pub selected_region: Option<usize>,
     pub hours: f32,
+    /// Musician seats including the host's own, exactly as `--musicians`
+    /// means it: 1 is a solo session, [`MAX_MUSICIANS`] is the cap the
+    /// server enforces.
     pub musicians: u8,
     pub listeners: u8,
     pub destinations: u8,
+    /// Minutes with no musicians connected before the server exits, and the
+    /// hard cap on session length. Both are shown and editable on the
+    /// preview step rather than baked in, because they are the guardrails
+    /// that decide what a forgotten session costs.
+    pub idle_min: u32,
+    pub max_hours: u32,
     /// The server artifact pinned into this build, read once at
     /// construction. When present (every release build) the wizard shows
     /// no artifact fields at all: cloud launches silently use the pinned
@@ -209,10 +222,12 @@ impl HostWizard {
             regions: Vec::new(),
             regions_error: None,
             selected_region: None,
-            hours: 2.0,
-            musicians: 3,
-            listeners: 2,
+            hours: DEFAULT_HOURS,
+            musicians: DEFAULT_MUSICIANS,
+            listeners: DEFAULT_LISTENERS,
             destinations: 0,
+            idle_min: DEFAULT_IDLE_MIN,
+            max_hours: DEFAULT_MAX_HOURS,
             pinned: jamstream_cloud::pinned(),
             advanced_open: false,
             artifact_url: String::new(),
@@ -502,6 +517,8 @@ impl HostWizard {
             hourly_microusd: row.price.hourly_microusd,
             musicians: self.musicians,
             listeners: self.listeners,
+            idle_min: self.idle_min,
+            max_hours: self.max_hours,
             // Explicit fields (development builds) outrank the pin, same
             // precedence as the CLI's override flags.
             artifact_url: non_empty(&self.artifact_url)
@@ -661,8 +678,11 @@ struct LaunchParams {
     provider_name: String,
     region: Region,
     hourly_microusd: u64,
+    /// Musician seats including the host's own; see [`HostWizard::musicians`].
     musicians: u8,
     listeners: u8,
+    idle_min: u32,
+    max_hours: u32,
     artifact_url: Option<String>,
     artifact_sha256: Option<String>,
     /// For the DigitalOcean self-destruct arm; read from the credential
@@ -695,7 +715,8 @@ async fn launch_session(
     let issuer = Issuer::generate();
     let server_keys = generate_keypair();
     let now_unix = unix_now();
-    let expires_unix = now_unix + MAX_HOURS * 3600;
+    // Invites expire with the session's hard cap, as the CLI mints them.
+    let expires_unix = now_unix + u64::from(params.max_hours) * 3600;
     // Local servers share one machine with everything else on it; an
     // ephemeral port avoids colliding with another session or service.
     let port = if is_local {
@@ -717,8 +738,8 @@ async fn launch_session(
         issuer_public_key_b64: base64(issuer.public_key().as_bytes()),
         session_id_hex: session_hex.clone(),
         port,
-        idle_shutdown_min: IDLE_MIN,
-        max_duration_min: (MAX_HOURS * 60) as u32,
+        idle_shutdown_min: params.idle_min,
+        max_duration_min: params.max_hours * 60,
         self_destruct: self_destruct_for(provider.kind(), params.do_token)?,
     };
     let user_data = if is_local {
@@ -740,7 +761,9 @@ async fn launch_session(
     let ip = instance.public_ip.ok_or("instance reported no public ip")?;
     let address = SocketAddr::new(ip, port);
 
-    let invites = mint_invites(
+    // The CLI's invite book, minted by the CLI's own function: same order,
+    // same labels, same "musicians counts the host" seat math.
+    let invites = jamstream_cli::host::mint_invites(
         &issuer,
         session_id,
         address,
@@ -775,41 +798,6 @@ async fn launch_session(
     };
     let state_path = jamstream_cli::state::save(&state).map_err(|e| e.to_string())?;
     Ok(LaunchOutcome { state, state_path })
-}
-
-/// Host invite first (member 0), then musicians 1..=N, then listeners;
-/// same order and labels as the CLI.
-fn mint_invites(
-    issuer: &Issuer,
-    session_id: SessionId,
-    address: SocketAddr,
-    server_pk: [u8; 32],
-    expires_unix: u64,
-    musicians: u8,
-    listeners: u8,
-) -> Vec<(String, Invite)> {
-    let mint = |member: u16, role: Role| {
-        let token = Token {
-            member_id: MemberId(member),
-            role,
-            name_hint: None,
-            expires_unix,
-            jti: TokenId::generate(),
-        };
-        let invite = issuer.mint(session_id, vec![address], server_pk, token);
-        (
-            jamstream_cli::host::invite_label(role, MemberId(member)),
-            invite,
-        )
-    };
-    let mut invites = vec![mint(HOST_MEMBER_ID.0, Role::Musician)];
-    for m in 1..=u16::from(musicians) {
-        invites.push(mint(m, Role::Musician));
-    }
-    for l in 0..u16::from(listeners) {
-        invites.push(mint(u16::from(musicians) + 1 + l, Role::Listener));
-    }
-    invites
 }
 
 /// Per-provider self-destruct, as the CLI arms it. DigitalOcean is the one
@@ -1341,20 +1329,31 @@ impl HostWizard {
             .min_col_width(230.0)
             .spacing(vec2(theme::SPACE_LG, 4.0))
             .show(ui, |ui| {
+                // Expected length shapes the estimate only, so it cannot
+                // usefully exceed the hard cap below.
+                let cap = self.max_hours as f32;
                 ui.label(theme::muted(ui, "hours"));
                 theme::mono_drag(
                     ui,
                     egui::DragValue::new(&mut self.hours)
-                        .range(0.5..=12.0)
+                        .range(0.5..=cap)
                         .speed(0.5)
                         .suffix(" h"),
                 );
                 ui.end_row();
-                ui.label(theme::muted(ui, "musicians"));
-                theme::mono_drag(ui, egui::DragValue::new(&mut self.musicians).range(1..=8));
+                // Seats, not guests: the count includes you, and the ceiling
+                // is the capacity the server enforces.
+                ui.label(theme::muted(ui, "musicians, including you"));
+                theme::mono_drag(
+                    ui,
+                    egui::DragValue::new(&mut self.musicians).range(1..=MAX_MUSICIANS),
+                );
                 ui.end_row();
                 ui.label(theme::muted(ui, "listeners"));
-                theme::mono_drag(ui, egui::DragValue::new(&mut self.listeners).range(0..=20));
+                theme::mono_drag(
+                    ui,
+                    egui::DragValue::new(&mut self.listeners).range(0..=MAX_LISTENERS),
+                );
                 ui.end_row();
                 ui.label(theme::muted(ui, "stream destinations"));
                 theme::mono_drag(
@@ -1362,7 +1361,34 @@ impl HostWizard {
                     egui::DragValue::new(&mut self.destinations).range(0..=2),
                 );
                 ui.end_row();
+                // The two self-limits the machine enforces on itself. Same
+                // meaning and same defaults as --idle-min and --max-hours.
+                ui.label(theme::muted(ui, "idle exit"));
+                theme::mono_drag(
+                    ui,
+                    egui::DragValue::new(&mut self.idle_min)
+                        .range(1..=120)
+                        .suffix(" min"),
+                );
+                ui.end_row();
+                ui.label(theme::muted(ui, "hard cap"));
+                theme::mono_drag(
+                    ui,
+                    egui::DragValue::new(&mut self.max_hours)
+                        .range(1..=24)
+                        .suffix(" h"),
+                );
+                ui.end_row();
             });
+        ui.add_space(theme::SPACE_XS);
+        ui.label(theme::muted(
+            ui,
+            format!(
+                "The server exits after {} minutes with nobody playing, and ends the session \
+                 at {} hours no matter what; invites expire then too.",
+                self.idle_min, self.max_hours
+            ),
+        ));
         ui.add_space(theme::SPACE_MD);
         if self.is_local() {
             ui.label("This session runs on this computer and costs nothing.");
@@ -1580,6 +1606,40 @@ mod tests {
             },
             worst_rtt_ms: rtt,
         }
+    }
+
+    // The wizard opens on the session shape `jamstream host` defaults to.
+    // Both surfaces read jamstream_session::limits, so this is a guard
+    // against someone reintroducing a local literal.
+    #[test]
+    fn wizard_opens_on_the_shared_session_defaults() {
+        let w = wizard();
+        assert_eq!(w.hours, DEFAULT_HOURS);
+        assert_eq!(w.musicians, DEFAULT_MUSICIANS);
+        assert_eq!(w.listeners, DEFAULT_LISTENERS);
+        assert_eq!(w.idle_min, DEFAULT_IDLE_MIN);
+        assert_eq!(w.max_hours, DEFAULT_MAX_HOURS);
+        assert!(usize::from(w.musicians) <= MAX_MUSICIANS);
+        assert!(usize::from(w.listeners) <= MAX_LISTENERS);
+    }
+
+    // The wizard's musician count is seats including the host, so a session
+    // of N seats mints N musician invites and the server admits all of them.
+    #[test]
+    fn wizard_seat_count_includes_the_host() {
+        let issuer = Issuer::generate();
+        let keys = generate_keypair();
+        let invites = jamstream_cli::host::mint_invites(
+            &issuer,
+            SessionId::generate(),
+            "203.0.113.10:43210".parse().expect("addr"),
+            keys.public,
+            4_000_000_000,
+            MAX_MUSICIANS as u8,
+            0,
+        );
+        assert_eq!(invites.len(), MAX_MUSICIANS);
+        assert_eq!(invites[0].0, "host");
     }
 
     #[test]

@@ -16,8 +16,8 @@ With `--provider local` (the default) there is nothing to rank or bill: the serv
 |---|---|---|
 | `--provider <PROVIDER>` | `local` | Provider to host on: `local`, `digitalocean`, `aws`, or `gcp`. Local runs the server on this computer, with no credentials and no cost. |
 | `--region <REGION>` | picked by ranking | Region id to use, skipping the latency ranking. Local has one region, `local`. |
-| `--musicians <MUSICIANS>` | `4` | Musician invites to mint, not counting the host. 1 to 10. |
-| `--listeners <LISTENERS>` | `0` | Listener invites to mint. 0 to 20. |
+| `--musicians <MUSICIANS>` | `4` | Musician seats in the session, **counting you**. 1 to 10, where 1 hosts alone and 10 is the server's capacity. `--musicians 4` mints your host invite plus 3 musician invites. |
+| `--listeners <LISTENERS>` | `0` | Listener seats in the session; one listener invite is minted per seat. 0 to 20. |
 | `--hours <HOURS>` | `3` | Expected session length in hours, for the cost preview. Does not limit the session. |
 | `--destinations <DESTINATIONS>` | `0` | Stream destination count, for the egress estimate. |
 | `--port <PORT>` | `43210` | UDP port the session server listens on. |
@@ -36,17 +36,17 @@ A session on this computer, for the people in the room:
 $ jamstream host --provider local --yes
 ```
 
-A two hour duo session with two spare listener seats, on DigitalOcean, unattended:
+A two hour duo session (you and one other player) with two spare listener seats, on DigitalOcean, unattended:
 
 ```console
-$ jamstream host --provider digitalocean --musicians 1 --listeners 2 \
+$ jamstream host --provider digitalocean --musicians 2 --listeners 2 \
     --hours 2 --yes
 ```
 
 The same launch from a source build, which has no pinned server artifact, names one explicitly:
 
 ```console
-$ jamstream host --provider digitalocean --musicians 1 --listeners 2 \
+$ jamstream host --provider digitalocean --musicians 2 --listeners 2 \
     --hours 2 --yes \
     --artifact-url https://your-host.example/jamstreamd \
     --artifact-sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
@@ -56,6 +56,7 @@ Full output of both is shown in the [quickstart](../quickstart.md).
 
 ## Notes
 
+- `--musicians` counts the host. A session of N musician seats is you plus N-1 guests, and N is also what the server admits: it refuses an eleventh musician, so there is never an invite in hand that cannot get in. The desktop app's host wizard offers the same range with the same meaning, and its "musicians, including you" dial defaults to the same 4.
 - If JamStream-tagged machines already exist on the provider, they are listed with a warning before anything launches; run [`jamstream sweep`](sweep.md) if they are strays.
 - `--json` prints the session id, address, invites, cost estimate, and state file path as one object, for scripts.
 - The state file lands under your platform's data directory in `jamstream/sessions/` and is what [`jamstream status`](status.md) and [`jamstream end`](end.md) read.

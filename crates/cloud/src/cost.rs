@@ -40,6 +40,9 @@ fn gb_display(bytes: u64) -> String {
 }
 
 impl CostPreview {
+    /// `musicians` is the number of musicians in the session, the host
+    /// included: the server sends every one of them a personal mix, so every
+    /// one of them costs egress.
     pub fn compute(
         price: &Price,
         expected_hours: f32,
