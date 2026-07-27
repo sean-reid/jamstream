@@ -66,7 +66,9 @@ pub async fn run<W: Write>(
     }
     if !report.is_clean() {
         return Err(CliError::Failed(
-            "sweep did not account for every provider; anything above is still billing".to_owned(),
+            "sweep could not account for everything tagged jamstream; anything above is still \
+             billing"
+                .to_owned(),
         ));
     }
     Ok(())
