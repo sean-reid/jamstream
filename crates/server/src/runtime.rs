@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
-use jamstream_protocol::control::StreamOp;
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
+use jamstream_protocol::control::StreamOp;
 use jamstream_protocol::transport::derive_public;
 use jamstream_session::server::{ServerConfig, ServerCore, ServerEvent};
 use jamstream_stream::pipeline::{Roster, StreamConfig, StreamMember};
