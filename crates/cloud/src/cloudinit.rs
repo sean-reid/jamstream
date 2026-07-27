@@ -19,6 +19,14 @@ const SERVICE_USER: &str = "jamstream";
 /// stream keys, and the guard's own uptime bookkeeping.
 const RUN_DIR: &str = "/run/jamstream";
 
+/// The jamstreamd download and the hash it must match, each in its own
+/// file so the bootstrap script takes them as data rather than as text
+/// pasted into it. The hash file is in `sha256sum -c` format.
+const ARTIFACT_URL_FILE: &str = "/etc/jamstream/artifact-url";
+const ARTIFACT_SHA_FILE: &str = "/etc/jamstream/artifact-sha256";
+/// Where the download lands, named in the hash file, so the two agree.
+const ARTIFACT_DOWNLOAD: &str = "/usr/local/bin/jamstreamd.download";
+
 /// The link-local metadata address. All three providers serve user-data
 /// here over plain HTTP: AWS at /latest/user-data, DigitalOcean at
 /// /metadata/v1/user-data, and GCP behind metadata.google.internal, which
@@ -314,7 +322,7 @@ rm -f \"$tmp/{name}.archive\" \"$tmp/{name}\"
     )
 }
 
-fn bootstrap_script(cfg: &BootConfig) -> String {
+fn bootstrap_script(_cfg: &BootConfig) -> String {
     format!(
         "#!/bin/sh
 set -eu
@@ -349,13 +357,15 @@ systemctl daemon-reload
 systemctl enable --now jamstream-firewall.service
 systemctl enable --now jamstream-guard.timer
 
-curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download \"{url}\"
-if ! echo \"{sha}  /usr/local/bin/jamstreamd.download\" | sha256sum -c -; then
+# The url and the expected hash are read from files rather than pasted
+# into this script, so neither can be anything but an argument.
+curl -fsSL --retry 5 -o {download} \"$(cat {artifact_url_file})\"
+if ! sha256sum -c {artifact_sha_file}; then
   echo \"jamstream: artifact sha256 mismatch, refusing to start\" >&2
-  rm -f /usr/local/bin/jamstreamd.download
+  rm -f {download}
   exit 1
 fi
-mv /usr/local/bin/jamstreamd.download /usr/local/bin/jamstreamd
+mv {download} /usr/local/bin/jamstreamd
 chmod 0755 /usr/local/bin/jamstreamd
 # The session server comes up first: musicians are waiting, and the broadcast
 # tooling is only needed once the host goes live.
@@ -369,8 +379,9 @@ else
   echo \"jamstream: broadcast tooling unavailable, session continues without it\" >&2
 fi
 ",
-        url = cfg.artifact_url,
-        sha = cfg.artifact_sha256,
+        artifact_url_file = ARTIFACT_URL_FILE,
+        artifact_sha_file = ARTIFACT_SHA_FILE,
+        download = ARTIFACT_DOWNLOAD,
         user = SERVICE_USER,
         run = RUN_DIR,
     )
@@ -556,6 +567,12 @@ pub fn render(cfg: &BootConfig) -> String {
         // Written root-only; the bootstrap hands the group to the service
         // account once that account exists.
         ("/etc/jamstream/config", "0600", cfg.render_flat_config()),
+        (ARTIFACT_URL_FILE, "0644", format!("{}\n", cfg.artifact_url)),
+        (
+            ARTIFACT_SHA_FILE,
+            "0644",
+            format!("{}  {ARTIFACT_DOWNLOAD}\n", cfg.artifact_sha256),
+        ),
         (
             "/usr/local/sbin/jamstream-self-destruct",
             "0700",
@@ -683,6 +700,36 @@ mod tests {
         assert!(out.contains("Metadata-Flavor: Google"));
     }
 
+    /// The bootstrap script runs as root, and the artifact pair is the one
+    /// part of it a caller supplies. Neither value is pasted into the
+    /// script now: both are written to files and read back, so the worst a
+    /// hostile pair can be is a url that does not resolve.
+    #[test]
+    fn the_artifact_pair_is_data_not_script() {
+        let mut cfg = base_config(SelfDestruct::AwsShutdown);
+        cfg.artifact_url = "https://example.invalid/a\";touch /tmp/pwned;\"".to_owned();
+        cfg.artifact_sha256 = "$(id > /tmp/pwned)".to_owned();
+        let script = bootstrap_script(&cfg);
+        assert!(
+            !script.contains("pwned"),
+            "the pair reached the script body: {script}"
+        );
+        assert!(script.contains(
+            "-o /usr/local/bin/jamstreamd.download \"$(cat /etc/jamstream/artifact-url)\""
+        ));
+        assert!(script.contains("sha256sum -c /etc/jamstream/artifact-sha256"));
+
+        // They travel as files instead, the hash in the format
+        // `sha256sum -c` reads, naming the path the download lands at.
+        let out = render(&base_config(SelfDestruct::AwsShutdown));
+        assert!(out.contains("path: /etc/jamstream/artifact-url"));
+        assert!(out.contains("path: /etc/jamstream/artifact-sha256"));
+        assert!(out.contains(
+            "0f2e5c1d3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d  \
+             /usr/local/bin/jamstreamd.download"
+        ));
+    }
+
     /// The three self-destruct variants, for tests that must hold for all
     /// of them.
     fn all_variants() -> [SelfDestruct; 3] {
@@ -716,7 +763,7 @@ mod tests {
             assert!(out.contains("chgrp jamstream /etc/jamstream/config"));
             assert!(out.contains("chmod 0640 /etc/jamstream/config"));
             // Refuses to start on artifact hash mismatch.
-            assert!(out.contains("sha256sum -c -"));
+            assert!(out.contains("sha256sum -c /etc/jamstream/artifact-sha256"));
             assert!(out.contains("refusing to start"));
             assert!(out.contains(&cfg.artifact_sha256));
             // Only the session UDP port is reachable, over both families.

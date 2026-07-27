@@ -39,7 +39,7 @@ pub mod storage;
 pub mod sweeper;
 pub mod types;
 
-pub use artifact::{PinnedServerArtifact, pinned};
+pub use artifact::{PinnedServerArtifact, pinned, validate_pair};
 pub use cloudinit::{BootConfig, MediaArtifact, MediaArtifacts, MediaTool, SelfDestruct};
 pub use contract::assert_provider_contract;
 pub use cost::{CostPreview, LineItem};
