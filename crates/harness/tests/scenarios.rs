@@ -1,7 +1,8 @@
 //! Scenario gates over the real session cores: the latency budget per
-//! network profile, loss resilience, clock drift, chaos, soak, and
-//! determinism. Every numeric threshold's derivation lives in a comment next
-//! to its assertion, and a failing gate prints the measured numbers.
+//! network profile, loss resilience, clock drift, chaos, soak, determinism,
+//! and a session at its shipped capacity. Every numeric threshold's
+//! derivation lives in a comment next to its assertion, and a failing gate
+//! prints the measured numbers.
 //!
 //! Timing model shared by the derivations below (2.5 ms frames, one master
 //! tick per frame): a capture sample waits up to one frame (2.5 ms) to be
@@ -15,7 +16,7 @@ use std::time::Instant;
 
 use jamstream_engine::JitterStats;
 use jamstream_harness::{ScenarioBuilder, Source, profiles};
-use jamstream_session::{ClientState, ServerEvent};
+use jamstream_session::{ClientState, MAX_LISTENERS, MAX_MUSICIANS, ServerEvent};
 
 fn median(mut v: Vec<f32>) -> f32 {
     assert!(!v.is_empty(), "no samples to take a median of");
@@ -830,6 +831,24 @@ fn listener_hears_broadcast() {
     );
 }
 
+/// Wall budget for the reference run below on a developer machine.
+const REFERENCE_LAPTOP_SECS: f64 = 30.0;
+
+/// A wall-clock budget in seconds, scaled for the machine running the suite.
+///
+/// `JAMSTREAM_PERF_BUDGET_SECS` states what the reference run below is
+/// allowed here: 30 s on a laptop, 120 s on a shared ci runner that is
+/// several times slower. Every wall-clock gate names its own laptop budget
+/// and takes the same multiplier from that one variable, so the runner is
+/// described once instead of per gate.
+fn perf_budget_secs(laptop_secs: f64) -> f64 {
+    let scale = std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS);
+    laptop_secs * scale
+}
+
 // Not a benchmark: a coarse guard that the simulation stays usable for
 // iteration. 60 virtual seconds with 4 musicians must finish inside 30 s of
 // wall time in a debug build (libopus itself is compiled optimized by its
@@ -874,16 +893,199 @@ fn perf_sanity_sixty_seconds_regional() {
     let wall = start.elapsed().as_secs_f64();
     println!("perf sanity: 60 s virtual, 4 musicians, regional-fiber: {wall:.2} s wall");
     assert_eq!(s.musicians_connected(), 4, "scenario did not even join");
-    // The default budget assumes a developer machine. Shared ci runners are
-    // several times slower, so the harness jobs raise it via the env var;
-    // the point of this gate is catching order-of-magnitude regressions,
-    // not benchmarking the runner.
-    let budget = std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(30.0);
+    let budget = perf_budget_secs(REFERENCE_LAPTOP_SECS);
     assert!(
         wall < budget,
         "60 s regional-fiber scenario took {wall:.2} s wall (budget {budget:.0} s)"
+    );
+}
+
+// --- A session at capacity.
+//
+// Every gate above runs 2 to 6 members, and that is exactly where a cost
+// paid per member hides: multiplied by 4 it is noise, multiplied by
+// MAX_MUSICIANS + MAX_LISTENERS it is the tick budget. The room here is
+// built from limits.rs, so raising a cap raises what is gated.
+
+/// Every seat taken, musician 0 emitting one impulse per 200 ms and the other
+/// nine silent (a second signal in the mix would trip impulse detection).
+/// Returns the median mouth-to-ear latency at musician 1 over 8 s of virtual
+/// time after a 2 s settle.
+fn capacity_latency_ms(profile_name: &str, seed: u64) -> f32 {
+    let mut s = ScenarioBuilder::new(seed)
+        .profile(profiles::profile(profile_name))
+        .musicians(MAX_MUSICIANS)
+        .listeners(MAX_LISTENERS)
+        .source(
+            0,
+            Source::ImpulseTrain {
+                period_samples: 9_600,
+            },
+        )
+        .build();
+    s.join_all_or_panic(4_000);
+    s.run_ms(2_000);
+    let mark = s.current_tick();
+    s.run_ms(8_000);
+    let latencies = s.impulse_latencies(0, 1, mark);
+    assert!(
+        latencies.len() >= 30,
+        "{profile_name} at capacity: expected ~40 impulses in 8 s, detected {}",
+        latencies.len()
+    );
+    median(latencies)
+}
+
+// Same three profiles and the same gates as the two-musician runs above, on
+// a full room. The medians come out bit-identical to those runs (9.67 /
+// 19.31 / 64.75 ms), which is the point: latency is set by the tick schedule
+// and the wire, not by how many people are in the session, so any movement
+// here is a finding rather than noise.
+#[test]
+fn latency_at_capacity() {
+    // Profile, seed, physical floor (2 x one-way), gate. Derivations sit with
+    // the two-musician gates above.
+    for (profile, seed, floor, gate) in [
+        ("lan-fiber", 0xA4u64, 1.0f32, 15.0f32),
+        ("regional-fiber", 0xA5, 12.0, 30.0),
+        ("dsl-cross-country", 0xA6, 45.0, 65.0),
+    ] {
+        let m = capacity_latency_ms(profile, seed);
+        println!(
+            "{profile} at capacity ({MAX_MUSICIANS} musicians, {MAX_LISTENERS} listeners) \
+             median mouth-to-ear: {m:.2} ms"
+        );
+        assert!(
+            m >= floor,
+            "{profile} at capacity: median {m:.2} ms is below the {floor:.0} ms physical \
+             floor; measurement is broken"
+        );
+        assert!(
+            m <= gate,
+            "{profile} at capacity: median mouth-to-ear {m:.2} ms exceeds the {gate:.0} ms gate"
+        );
+    }
+}
+
+// The server keeps up at capacity.
+//
+// A tick that overruns its 2.5 ms does not error. `MissedTickBehavior::Burst`
+// in the server binary means the runtime fires the ticks it missed back to
+// back, which reaches clients as arrival jitter their buffers absorb by
+// growing, so the symptom is latency creeping up over a session and no test
+// anywhere going red. That is how a 20x broadcast encode shipped.
+//
+// What is asserted is a ratio, not a duration: the median cost of a tick that
+// fans the broadcast frame out to every listener, over the median cost of an
+// ordinary tick. Both numbers move together with the machine, so a ci runner
+// three times slower than a laptop does not move the ratio, and the gate can
+// be tight without an env knob. It is a timing measurement underneath, but a
+// self-normalizing one; a genuinely deterministic version would need
+// ServerCore to count its own encodes, which is a change in another crate.
+//
+// Measured on an M4 Max, 10 musicians and 20 listeners, 20 s of virtual time:
+// broadcast 575 us, ordinary 296 us, ratio 1.95. With the pre-#78 per-listener
+// broadcast encode restored: 4357 us and 300 us, ratio 14.53. The gate at 5
+// sits 2.5x above what the fanout costs today and 2.9x below what one extra
+// per-listener encode costs, so it fails on a reintroduction and does not
+// fail on a runner having a bad minute.
+#[test]
+fn tick_budget_at_capacity() {
+    // 20 ms broadcast frame accumulated over 2.5 ms master ticks.
+    const TICKS_PER_BROADCAST: usize = 8;
+    const FANOUT_GATE: f64 = 5.0;
+    // Measured 5.6 s here; the same generosity the 60 s reference run takes.
+    const WALL_BUDGET_SECS: f64 = 35.0;
+
+    let start = Instant::now();
+    let mut b = ScenarioBuilder::new(0x92)
+        .profile(profiles::profile("regional-fiber"))
+        .musicians(MAX_MUSICIANS)
+        .listeners(MAX_LISTENERS)
+        .keep_audio(false)
+        .measure_tick_cost(true);
+    // Every musician playing: the mixer sums ten live sources and each
+    // personal mix is a distinct signal, so no encoder gets the easy job.
+    for i in 0..MAX_MUSICIANS {
+        b = b.source(
+            i,
+            Source::Sine {
+                hz: 110.0 * (i + 1) as f32,
+                amp: 0.2,
+            },
+        );
+    }
+    let mut s = b.build();
+    s.join_all_or_panic(4_000);
+    s.run_ms(2_000);
+    // Handshake and settle ticks do work no steady-state tick does.
+    s.reset_tick_cost();
+    let mark = s.current_tick();
+    s.run_ms(20_000);
+    let end = s.current_tick();
+    let wall = start.elapsed().as_secs_f64();
+    let cost = s.tick_cost();
+
+    println!(
+        "capacity tick cost ({MAX_MUSICIANS} musicians, {MAX_LISTENERS} listeners): \
+         broadcast {:.0} us over {} ticks, ordinary {:.0} us over {} ticks, ratio {:.2}, \
+         amortized {:.0} us of the 2500 us tick budget, {wall:.2} s wall",
+        cost.broadcast_median_us,
+        cost.broadcast_ticks,
+        cost.ordinary_median_us,
+        cost.ordinary_ticks,
+        cost.fanout_ratio(),
+        cost.amortized_mean_us,
+    );
+
+    // The room really was full for the whole measurement, and the listeners
+    // really were being fed: a silent broadcast path would make the tick
+    // being timed cheap and the ratio meaningless. Ten sines at 0.2 amp mix
+    // to ~0.3 rms under the broadcast limiter, so 0.05 is a wide margin.
+    assert_eq!(s.musicians_connected(), MAX_MUSICIANS);
+    let connected = s
+        .server_member_stats()
+        .iter()
+        .filter(|m| m.connected)
+        .count();
+    assert_eq!(connected, MAX_MUSICIANS + MAX_LISTENERS);
+    for listener in [MAX_MUSICIANS, MAX_MUSICIANS + MAX_LISTENERS - 1] {
+        let rms = s.rms_of(listener, mark, end);
+        assert!(
+            rms > 0.05,
+            "listener {listener} rms {rms:.4} at capacity (gate 0.05); \
+             the broadcast path being timed is not carrying audio"
+        );
+    }
+
+    // One broadcast per 20 ms and no more, give or take where the measurement
+    // window opened in the accumulator's cycle. Deterministic, and the cheap
+    // half of the same question: fanning out every tick would multiply both
+    // the encode work and the host's egress bill by eight.
+    let total = cost.broadcast_ticks + cost.ordinary_ticks;
+    let expected = total / TICKS_PER_BROADCAST;
+    assert!(
+        cost.broadcast_ticks.abs_diff(expected) <= 1,
+        "listeners were fed on {} of {total} ticks, expected one in {TICKS_PER_BROADCAST}",
+        cost.broadcast_ticks
+    );
+
+    assert!(
+        cost.fanout_ratio() <= FANOUT_GATE,
+        "a broadcast tick costs {:.2}x an ordinary tick at capacity (gate {FANOUT_GATE:.0}x): \
+         {:.0} us against {:.0} us. Work priced per listener has come back into the \
+         broadcast path.",
+        cost.fanout_ratio(),
+        cost.broadcast_median_us,
+        cost.ordinary_median_us,
+    );
+
+    // Backstop for a slowdown spread evenly across every tick, which the
+    // ratio cancels out by construction. Coarse on purpose: at ci generosity
+    // this catches an order of magnitude, not a doubling.
+    let budget = perf_budget_secs(WALL_BUDGET_SECS);
+    assert!(
+        wall < budget,
+        "22 s of virtual time at capacity took {wall:.2} s wall (budget {budget:.0} s)"
     );
 }

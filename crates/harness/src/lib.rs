@@ -11,4 +11,4 @@ pub mod scenario;
 
 pub use clock::{SkewedClock, VirtualClock};
 pub use net::{Delivery, EndpointId, LinkStats, Profile, SimNet};
-pub use scenario::{Scenario, ScenarioBuilder, Source, Traffic};
+pub use scenario::{Scenario, ScenarioBuilder, Source, TickCost, Traffic};
