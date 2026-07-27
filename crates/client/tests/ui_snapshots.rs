@@ -438,6 +438,12 @@ fn session_destinations_light() {
 fn session_destinations_key() {
     // The one surface where a key exists: masked, with its character count
     // standing in for reading it back, and the platform's own guidance above.
+    //
+    // Publishable: this is a host who clicked Add key and typed one. The
+    // keychain behind it is empty, which is a first-time host's real state,
+    // and it is why Twitch still reads "no key" and Go live is still off.
+    // Nothing else is stubbed: the status bar carries Invites, Stream mix,
+    // and Destinations, because the fixture is a real host.
     let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
     let mut app = host_app(rt, Theme::Dark);
     app.session.destinations = Some(DestinationsPanel::with_key_entry(
@@ -447,7 +453,7 @@ fn session_destinations_key() {
     ));
     app.session.destinations_open = true;
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_destinations_key");
+    snapshot_for_docs(&mut harness, "session_destinations_key");
 }
 
 #[test]
