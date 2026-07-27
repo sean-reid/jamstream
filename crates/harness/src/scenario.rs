@@ -210,16 +210,19 @@ impl ScenarioBuilder {
         let issuer = Issuer::generate();
         let kp = generate_keypair();
         let session_id = SessionId::generate();
-        let server = ServerCore::new(ServerConfig {
-            session_id,
-            server_private: kp.private.to_vec(),
-            server_public: kp.public,
-            issuer_pk: issuer.public_key(),
-            // Headroom so an out-of-band raw member can also be admitted.
-            max_musicians: self.musicians + 2,
-            max_listeners: self.listeners + 2,
-            member_timeout_ms: MEMBER_TIMEOUT_MS,
-        });
+        // Scenario-sized caps, with headroom so an out-of-band raw member can
+        // also be admitted; production capacity lives in
+        // jamstream_session::limits.
+        let server = ServerCore::new(
+            ServerConfig::new(
+                session_id,
+                kp.private.to_vec(),
+                kp.public,
+                issuer.public_key(),
+            )
+            .with_capacity(self.musicians + 2, self.listeners + 2)
+            .with_member_timeout_ms(MEMBER_TIMEOUT_MS),
+        );
         let server_addr: SocketAddr = "198.51.100.1:43210".parse().expect("server addr");
 
         let mut net = SimNet::new(self.seed);
