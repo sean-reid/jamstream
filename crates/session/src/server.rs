@@ -2,7 +2,7 @@
 //! 2.5 ms mix tick, and control-plane fanout. Sans-io: jamstreamd owns the
 //! socket and the clock and calls in with datagrams and timestamps.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::SocketAddr;
 
 use blake2::{Blake2s256, Digest};
@@ -12,12 +12,14 @@ use jamstream_engine::{
     Pull, mix_into,
 };
 use jamstream_protocol::PROTOCOL_VERSION;
-use jamstream_protocol::control::{ControlLink, ControlMsg, MemberInfo};
+use jamstream_protocol::control::{ControlLink, ControlMsg, MAX_AVATAR_BYTES, MemberInfo};
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::verify_token;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
 use jamstream_protocol::transport::{Responder, Session, Welcome};
 use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
+
+use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
 
 /// Samples per mix tick: 2.5 ms at 48 kHz.
 const TICK_SAMPLES: usize = 120;
@@ -39,6 +41,9 @@ const RESP_CACHE_MS: u64 = 5_000;
 /// A connected member silent this long may be replaced by a fresh init
 /// (fast rejoin) without waiting for the full member timeout.
 const REJOIN_SILENCE_MS: u64 = 2_000;
+/// Total avatar bytes the server keeps; roster-referenced hashes are
+/// pinned, the rest evict least-recently-referenced first.
+const AVATAR_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const LIMITER_CEILING_DB: f32 = -1.0;
 /// 1 ms of lookahead; broadcast listeners never notice.
 const LIMITER_LOOKAHEAD_SAMPLES: usize = 48;
@@ -109,6 +114,15 @@ struct Member {
     /// Jitter stats snapshot at the last Stats report; deltas against it
     /// give the per-window uplink numbers.
     stats_prev: JitterStats,
+    /// Announced avatar (content hash, declared length). Survives
+    /// disconnect and rejoin like the fader table.
+    avatar: Option<(AvatarHash, u32)>,
+    /// Inbound reassembly of this member's own avatar upload.
+    avatar_rx: Option<AvatarRx>,
+    /// Outbound trains for this member. Only the head streams, so each
+    /// link carries one train at a time and different members' transfers
+    /// progress independently.
+    avatar_tx: VecDeque<AvatarTx>,
 }
 
 pub struct ServerCore {
@@ -135,6 +149,12 @@ pub struct ServerCore {
     /// their personal mix. Connection-scoped: cleared whenever the host
     /// disconnects or is readmitted.
     audition: bool,
+    avatar_cache: AvatarCache,
+    /// Members waiting for avatar bytes the server is still fetching from
+    /// the owner; served when the upload completes and verifies. Entries
+    /// for waiters who disconnect or hashes never completed are skipped or
+    /// linger harmlessly (a few dozen bytes each).
+    avatar_waiters: BTreeMap<AvatarHash, Vec<MemberId>>,
     reject_last: BTreeMap<SocketAddr, u64>,
     events: Vec<ServerEvent>,
     last_musician_count: usize,
@@ -162,6 +182,8 @@ impl ServerCore {
             bcast_clock: 0,
             bcast_faders: BTreeMap::new(),
             audition: false,
+            avatar_cache: AvatarCache::new(AVATAR_CACHE_BYTES),
+            avatar_waiters: BTreeMap::new(),
             reject_last: BTreeMap::new(),
             events: Vec::new(),
             last_musician_count: 0,
@@ -370,10 +392,33 @@ impl ServerCore {
             }
         }
 
-        // Control-plane retransmits and acks.
+        // Control-plane retransmits and acks. Avatar trains are fed here,
+        // capped per tick, so bulk bytes never starve normal control
+        // traffic on the ordered link (see the avatar module comment).
         for (&id, m) in self.members.iter_mut() {
             if !m.connected {
                 continue;
+            }
+            let mut fed = 0;
+            while fed < AVATAR_CHUNKS_PER_POLL {
+                let Some(tx) = m.avatar_tx.front_mut() else {
+                    break;
+                };
+                match self
+                    .avatar_cache
+                    .get(tx.hash())
+                    .and_then(|bytes| tx.next_chunk(bytes))
+                {
+                    Some(chunk) => {
+                        let _ = m.link.send(chunk);
+                        fed += 1;
+                    }
+                    // Train finished (or its bytes were evicted mid-train,
+                    // which pinning prevents for roster hashes): drop it.
+                    None => {
+                        m.avatar_tx.pop_front();
+                    }
+                }
             }
             let dgs = m.link.poll(now_ms);
             if let (Some(s), Some(a)) = (m.session.as_mut(), m.addr) {
@@ -394,6 +439,9 @@ impl ServerCore {
                 m.addr = None;
                 m.session = None;
                 m.resp_cache = None;
+                // Transfers are connection-scoped; the announced hash stays.
+                m.avatar_rx = None;
+                m.avatar_tx.clear();
                 timed_out.push(id);
             }
         }
@@ -579,8 +627,9 @@ impl ServerCore {
             self.audition = false;
         }
         let prev = self.members.remove(&id);
-        let (faders, click_enabled) =
-            prev.map_or((BTreeMap::new(), true), |p| (p.faders, p.click_enabled));
+        let (faders, click_enabled, avatar) = prev.map_or((BTreeMap::new(), true, None), |p| {
+            (p.faders, p.click_enabled, p.avatar)
+        });
         self.members.insert(
             id,
             Member {
@@ -606,6 +655,9 @@ impl ServerCore {
                 send_seq: 0,
                 violations: 0,
                 stats_prev: JitterStats::default(),
+                avatar,
+                avatar_rx: None,
+                avatar_tx: VecDeque::new(),
             },
         );
         out.push((src, resp));
@@ -851,6 +903,8 @@ impl ServerCore {
                     m.addr = None;
                     m.session = None;
                     m.resp_cache = None;
+                    m.avatar_rx = None;
+                    m.avatar_tx.clear();
                     if from == HOST_MEMBER_ID {
                         self.audition = false;
                     }
@@ -858,6 +912,112 @@ impl ServerCore {
                         .push(ServerEvent::MemberDisconnected { id: from });
                     self.queue_roster();
                     self.note_musician_count();
+                }
+            }
+            ControlMsg::SetAvatar { hash, len } => {
+                if len == 0 || len as usize > MAX_AVATAR_BYTES {
+                    self.violation(from, "avatar length out of range");
+                    return;
+                }
+                let have_bytes = self.avatar_cache.contains(&hash);
+                if have_bytes {
+                    self.avatar_cache.touch(&hash);
+                }
+                let Some(m) = self.members.get_mut(&from) else {
+                    return;
+                };
+                let unchanged = m.avatar == Some((hash, len));
+                m.avatar = Some((hash, len));
+                if have_bytes {
+                    m.avatar_rx = None;
+                } else if !(unchanged && m.avatar_rx.as_ref().is_some_and(|rx| *rx.hash() == hash))
+                {
+                    // Pull the bytes from the owner; a replacement discards
+                    // any half-reassembled previous upload.
+                    m.avatar_rx = Some(AvatarRx::new(hash, Some(len)));
+                    let _ = m.link.send(ControlMsg::AvatarRequest { hash });
+                }
+                // An idempotent re-announce (rejoin) changes no roster state.
+                if !unchanged {
+                    self.queue_roster();
+                }
+            }
+            ControlMsg::AvatarChunk {
+                hash,
+                index,
+                total,
+                data,
+            } => {
+                let step = match self.members.get_mut(&from) {
+                    Some(m) => match m.avatar_rx.as_mut() {
+                        Some(rx) if *rx.hash() == hash => {
+                            let step = rx.push(index, total, &data);
+                            if !matches!(step, Ok(RxStep::More)) {
+                                m.avatar_rx = None;
+                            }
+                            step
+                        }
+                        Some(_) => {
+                            m.avatar_rx = None;
+                            Err("avatar chunk for wrong hash")
+                        }
+                        None => Err("unsolicited avatar chunk"),
+                    },
+                    None => return,
+                };
+                match step {
+                    Ok(RxStep::More) => {}
+                    Ok(RxStep::Done(bytes)) => {
+                        let pins: BTreeSet<AvatarHash> = self
+                            .members
+                            .values()
+                            .filter_map(|m| m.avatar.map(|(h, _)| h))
+                            .collect();
+                        self.avatar_cache.insert(hash, bytes, &pins);
+                        // Serve everyone who asked while the upload ran.
+                        for id in self.avatar_waiters.remove(&hash).unwrap_or_default() {
+                            if let Some(w) = self.members.get_mut(&id)
+                                && w.connected
+                            {
+                                w.avatar_tx.push_back(AvatarTx::new(hash));
+                            }
+                        }
+                    }
+                    Err(what) => self.violation(from, what),
+                }
+            }
+            ControlMsg::AvatarRequest { hash } => {
+                if self.avatar_cache.contains(&hash) {
+                    self.avatar_cache.touch(&hash);
+                    if let Some(m) = self.members.get_mut(&from)
+                        && !m.avatar_tx.iter().any(|t| *t.hash() == hash)
+                    {
+                        m.avatar_tx.push_back(AvatarTx::new(hash));
+                    }
+                    return;
+                }
+                let owner = self.members.iter().find_map(|(&id, m)| {
+                    m.avatar
+                        .and_then(|(h, len)| (h == hash).then_some((id, len)))
+                });
+                let Some((owner_id, len)) = owner else {
+                    // Unknown hash: almost certainly a race against a
+                    // member who just left; not worth a violation.
+                    return;
+                };
+                let waiters = self.avatar_waiters.entry(hash).or_default();
+                if !waiters.contains(&from) {
+                    waiters.push(from);
+                }
+                // Nudge the owner if no upload is running (say its first
+                // train failed validation); otherwise the in-flight upload
+                // will serve the waiter on completion.
+                if let Some(o) = self.members.get_mut(&owner_id)
+                    && o.connected
+                    && o.avatar_rx.is_none()
+                {
+                    o.avatar_rx = Some(AvatarRx::new(hash, Some(len)));
+                    let _ = o.link.send(ControlMsg::AvatarRequest { hash });
                 }
             }
             ControlMsg::Roster(_) => self.violation(from, "roster from client"),
@@ -889,6 +1049,7 @@ impl ServerCore {
                 role: m.role,
                 name: m.name.clone(),
                 connected: m.connected,
+                avatar_hash: m.avatar.map(|(h, _)| h),
             })
             .collect();
         for m in self.members.values_mut().filter(|m| m.connected) {

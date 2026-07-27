@@ -4,7 +4,10 @@
 
 use std::net::SocketAddr;
 
-use jamstream_protocol::control::{ControlLink, ControlMsg, MemberInfo};
+use blake2::{Blake2s256, Digest};
+use jamstream_protocol::control::{
+    AVATAR_CHUNK_BYTES, ControlLink, ControlMsg, MAX_AVATAR_BYTES, MemberInfo,
+};
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
@@ -16,6 +19,12 @@ use jamstream_session::{
 use proptest::prelude::*;
 
 const STEP_MS: f64 = 2.5;
+
+/// Datagrams at or above this size are counted as avatar chunk traffic by
+/// the shuttle: an AvatarChunk seals to a bit over its 8 KB payload while
+/// every other datagram (media, rosters, chat) stays under ~1.5 KB, so the
+/// count observes chunk transfers without unsealing anything.
+const BIG_DGRAM_BYTES: usize = 4_096;
 
 fn addr_of(n: u8) -> SocketAddr {
     format!("10.0.0.{n}:5000").parse().unwrap()
@@ -58,6 +67,8 @@ struct Harness {
     now_unix: u64,
     to_server: Vec<(SocketAddr, Vec<u8>)>,
     server_events: Vec<ServerEvent>,
+    /// Datagrams >= BIG_DGRAM_BYTES shuttled in either direction.
+    big_dgrams: u64,
 }
 
 impl Harness {
@@ -84,6 +95,7 @@ impl Harness {
             now_unix: 1_000,
             to_server: Vec::new(),
             server_events: Vec::new(),
+            big_dgrams: 0,
         }
     }
 
@@ -176,12 +188,18 @@ impl Harness {
         let batch = std::mem::take(&mut self.to_server);
         let mut to_clients = Vec::new();
         for (src, dg) in batch {
+            if dg.len() >= BIG_DGRAM_BYTES {
+                self.big_dgrams += 1;
+            }
             to_clients.extend(self.server.handle_datagram(now, self.now_unix, src, &dg));
         }
         to_clients.extend(self.server.tick(now));
         self.server_events.extend(self.server.events());
 
         for (addr, dg) in to_clients {
+            if dg.len() >= BIG_DGRAM_BYTES {
+                self.big_dgrams += 1;
+            }
             let Some(i) = self.clients.iter().position(|c| c.addr == addr) else {
                 continue;
             };
@@ -236,11 +254,17 @@ impl Harness {
             let batch = std::mem::take(&mut self.to_server);
             let mut to_clients = Vec::new();
             for (src, dg) in batch {
+                if dg.len() >= BIG_DGRAM_BYTES {
+                    self.big_dgrams += 1;
+                }
                 to_clients.extend(self.server.handle_datagram(now, self.now_unix, src, &dg));
             }
             to_clients.extend(self.server.tick(now));
             self.server_events.extend(self.server.events());
             for (addr, dg) in to_clients {
+                if dg.len() >= BIG_DGRAM_BYTES {
+                    self.big_dgrams += 1;
+                }
                 let Some(i) = self.clients.iter().position(|c| c.addr == addr) else {
                     continue;
                 };
@@ -1187,6 +1211,368 @@ fn replayed_init_against_active_member_yields_nothing() {
             .iter()
             .any(|e| matches!(e, ClientEvent::RttSample { .. }))
     );
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+fn has_avatar_ready(h: &Harness, i: usize, member: MemberId, hash: [u8; 32]) -> bool {
+    h.clients[i]
+        .events
+        .contains(&ClientEvent::AvatarReady { member, hash })
+}
+
+#[test]
+fn avatar_round_trip_and_late_joiner() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    h.run_ms(500);
+
+    // Not a multiple of the chunk size: exercises the short final chunk.
+    let bytes = pattern(20_000, 7);
+    let hash = h.clients[a].core.set_avatar(&bytes).unwrap();
+    h.run_ms(1_000);
+
+    let roster = h.last_roster(b).expect("roster after set_avatar");
+    assert_eq!(
+        roster
+            .iter()
+            .find(|m| m.id == MemberId(0))
+            .unwrap()
+            .avatar_hash,
+        Some(hash),
+        "roster must carry A's avatar hash"
+    );
+    assert!(has_avatar_ready(&h, b, MemberId(0), hash));
+    assert_eq!(
+        h.clients[b].core.avatar_bytes(&hash),
+        Some(bytes.as_slice())
+    );
+    // A's own copy is announced straight from its local cache.
+    assert!(has_avatar_ready(&h, a, MemberId(0), hash));
+
+    // Late joiner: the roster hash is unknown to C, so C requests it from
+    // the server's cache; the owner uploads nothing again.
+    let uploads_before = h.big_dgrams;
+    let inv_c = h.mint(2, Role::Musician);
+    let c = h.add_client(&inv_c, Some(0.0));
+    h.run_ms(1_000);
+    assert!(has_avatar_ready(&h, c, MemberId(0), hash));
+    assert_eq!(
+        h.clients[c].core.avatar_bytes(&hash),
+        Some(bytes.as_slice())
+    );
+    // Chunks did cross the wire for C (server to C), a cache-served train.
+    assert!(h.big_dgrams > uploads_before);
+}
+
+#[test]
+fn avatar_replacement_converges_on_the_new_hash() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    h.run_ms(500);
+
+    let first = pattern(10_000, 1);
+    let hash1 = h.clients[a].core.set_avatar(&first).unwrap();
+    h.run_ms(1_000);
+    assert!(has_avatar_ready(&h, b, MemberId(0), hash1));
+
+    let second = pattern(30_000, 2);
+    let hash2 = h.clients[a].core.set_avatar(&second).unwrap();
+    assert_ne!(hash1, hash2);
+    h.run_ms(1_000);
+
+    let roster = h.last_roster(b).expect("roster after replacement");
+    assert_eq!(
+        roster
+            .iter()
+            .find(|m| m.id == MemberId(0))
+            .unwrap()
+            .avatar_hash,
+        Some(hash2)
+    );
+    assert!(has_avatar_ready(&h, b, MemberId(0), hash2));
+    assert_eq!(
+        h.clients[b].core.avatar_bytes(&hash2),
+        Some(second.as_slice())
+    );
+}
+
+#[test]
+fn returning_member_avatar_transfers_zero_chunks() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    h.run_ms(500);
+
+    let bytes = pattern(40_000, 9);
+    let hash = h.clients[a].core.set_avatar(&bytes).unwrap();
+    h.run_ms(1_500);
+    assert!(has_avatar_ready(&h, b, MemberId(0), hash));
+    assert!(h.big_dgrams > 0, "the first transfer moved chunks");
+
+    // A falls off and times out; the announced hash survives server-side.
+    h.clients[a].blocked = true;
+    h.advance_quiet(11_000);
+    assert_eq!(*h.clients[a].core.state(), ClientState::TimedOut);
+
+    // Fresh handshake, same avatar: the re-announce hits the server cache
+    // and the counting shuttle must see no AvatarChunk in either direction.
+    h.big_dgrams = 0;
+    h.clients[a].blocked = false;
+    let now = h.now_ms();
+    let init = h.clients[a].core.reconnect(now).unwrap();
+    let aaddr = h.clients[a].addr;
+    h.to_server.push((aaddr, init));
+    h.run_ms(1_500);
+
+    assert_eq!(*h.clients[a].core.state(), ClientState::Joined);
+    let roster = h.last_roster(b).expect("roster after rejoin");
+    let ma = roster.iter().find(|m| m.id == MemberId(0)).unwrap();
+    assert!(ma.connected);
+    assert_eq!(ma.avatar_hash, Some(hash));
+    assert_eq!(
+        h.big_dgrams, 0,
+        "returning avatar must transfer zero chunks"
+    );
+    // And B saw exactly one AvatarReady for the pair across the whole run.
+    let readies = h.clients[b]
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ClientEvent::AvatarReady {
+                    member: MemberId(0),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(readies, 1);
+}
+
+#[test]
+fn tampered_avatar_train_is_a_violation_not_an_avatar() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    h.add_client(&inv_a, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    h.run_ms(500);
+
+    // A raw member announces the hash of X and then streams Y: sizes and
+    // train shape are valid, only the content lies.
+    let x = pattern(12_000, 3);
+    let y = pattern(12_000, 4);
+    let hash: [u8; 32] = Blake2s256::digest(&x).into();
+    let inv = h.mint(3, Role::Musician);
+    let mut raw = raw_join(&mut h, &inv, addr_of(99));
+    raw.send_control(
+        &mut h,
+        ControlMsg::SetAvatar {
+            hash,
+            len: x.len() as u32,
+        },
+    );
+    // Roster propagates; B requests the hash and becomes a waiter.
+    h.run_ms(250);
+    raw.send_control(
+        &mut h,
+        ControlMsg::AvatarChunk {
+            hash,
+            index: 0,
+            total: 2,
+            data: y[..AVATAR_CHUNK_BYTES].to_vec(),
+        },
+    );
+    raw.send_control(
+        &mut h,
+        ControlMsg::AvatarChunk {
+            hash,
+            index: 1,
+            total: 2,
+            data: y[AVATAR_CHUNK_BYTES..].to_vec(),
+        },
+    );
+    h.run_ms(500);
+
+    assert!(h.server_events.iter().any(|e| matches!(
+        e,
+        ServerEvent::ProtocolViolation {
+            id: MemberId(3),
+            what: "avatar hash mismatch"
+        }
+    )));
+    // Nobody got bytes for the announced hash.
+    for i in 0..2 {
+        assert!(!has_avatar_ready(&h, i, MemberId(3), hash));
+        assert!(h.clients[i].core.avatar_bytes(&hash).is_none());
+    }
+    // The member is flagged, not ejected: control traffic still works.
+    raw.send_control(
+        &mut h,
+        ControlMsg::Chat {
+            from: MemberId(3),
+            text: "still here".into(),
+        },
+    );
+    h.run_ms(100);
+    assert!(h.clients[b].events.contains(&ClientEvent::Chat {
+        from: MemberId(3),
+        text: "still here".into()
+    }));
+}
+
+#[test]
+fn oversize_set_avatar_is_rejected() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let a = h.add_client(&inv_a, Some(0.0));
+    h.run_ms(500);
+
+    // Client-side gate.
+    assert!(matches!(
+        h.clients[a]
+            .core
+            .set_avatar(&vec![0u8; MAX_AVATAR_BYTES + 1]),
+        Err(jamstream_session::SessionError::InvalidParam(_))
+    ));
+
+    // Server-side gate against a client that skips the local check.
+    let inv = h.mint(3, Role::Musician);
+    let mut raw = raw_join(&mut h, &inv, addr_of(97));
+    raw.send_control(
+        &mut h,
+        ControlMsg::SetAvatar {
+            hash: [1u8; 32],
+            len: (MAX_AVATAR_BYTES + 1) as u32,
+        },
+    );
+    h.run_ms(250);
+    assert!(h.server_events.iter().any(|e| matches!(
+        e,
+        ServerEvent::ProtocolViolation {
+            id: MemberId(3),
+            what: "avatar length out of range"
+        }
+    )));
+    let roster = h.last_roster(a).expect("roster including the raw member");
+    assert_eq!(
+        roster
+            .iter()
+            .find(|m| m.id == MemberId(3))
+            .unwrap()
+            .avatar_hash,
+        None,
+        "a refused announce must not reach the roster"
+    );
+}
+
+/// The starvation gate. Pacing feeds at most 2 chunks per 2.5 ms poll and
+/// the link flushes its whole queue every poll, so a chat is sequenced
+/// behind at most one allotment (2 x 8 KB) per hop and rides the next
+/// flush: one shuttle step per hop on a lossless loopback, two hops
+/// (sender uplink, receiver downlink). N = 4 steps (10 ms) doubles that
+/// for scheduling slack. A full 256 KB avatar still crosses one hop in
+/// 32 / 2 = 16 ticks (40 ms).
+#[test]
+fn chat_delivers_within_four_steps_while_a_max_avatar_streams() {
+    let mut h = Harness::new(10, 20);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_c = h.mint(2, Role::Musician);
+    let a = h.add_client(&inv_a, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    let c = h.add_client(&inv_c, Some(0.0));
+    h.run_ms(500);
+
+    let bytes = pattern(MAX_AVATAR_BYTES, 5);
+    let hash = h.clients[a].core.set_avatar(&bytes).unwrap();
+    let total_chunks = (MAX_AVATAR_BYTES / AVATAR_CHUNK_BYTES) as u64; // 32
+
+    // Wait for the upload to start, then inject a chat mid-train.
+    for _ in 0..40 {
+        if h.big_dgrams > 0 {
+            break;
+        }
+        h.step();
+    }
+    assert!(h.big_dgrams > 0, "upload never started");
+    assert!(
+        h.big_dgrams < total_chunks,
+        "upload finished too soon to test"
+    );
+    h.clients[a].core.send_chat("during upload").unwrap();
+    let before = h.big_dgrams;
+    let mut delivered_in = None;
+    for i in 1..=4 {
+        h.step();
+        if h.clients[b].events.contains(&ClientEvent::Chat {
+            from: MemberId(0),
+            text: "during upload".into(),
+        }) {
+            delivered_in = Some(i);
+            break;
+        }
+    }
+    assert!(
+        delivered_in.is_some_and(|n| n <= 4),
+        "chat starved by avatar upload: {delivered_in:?}"
+    );
+    assert!(
+        h.big_dgrams > before,
+        "avatar kept streaming around the chat"
+    );
+
+    // Same bound while the server fans trains out to B and C.
+    for _ in 0..80 {
+        if h.big_dgrams > total_chunks + 2 {
+            break;
+        }
+        h.step();
+    }
+    assert!(
+        h.big_dgrams > total_chunks + 2,
+        "downlink trains never started"
+    );
+    h.clients[b].core.send_chat("during download").unwrap();
+    let mut delivered_in = None;
+    for i in 1..=4 {
+        h.step();
+        if h.clients[c].events.contains(&ClientEvent::Chat {
+            from: MemberId(1),
+            text: "during download".into(),
+        }) {
+            delivered_in = Some(i);
+            break;
+        }
+    }
+    assert!(
+        delivered_in.is_some_and(|n| n <= 4),
+        "chat starved by avatar downlink: {delivered_in:?}"
+    );
+
+    // And the transfer itself completes end to end.
+    h.run_ms(2_000);
+    for i in [b, c] {
+        assert!(has_avatar_ready(&h, i, MemberId(0), hash));
+        assert_eq!(
+            h.clients[i].core.avatar_bytes(&hash),
+            Some(bytes.as_slice())
+        );
+    }
 }
 
 proptest! {

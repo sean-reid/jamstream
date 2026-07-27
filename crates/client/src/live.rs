@@ -44,6 +44,10 @@ const CHAT_LIMIT: usize = 500;
 const LEVEL_DECAY: f32 = 0.99;
 /// Backoff between attempts to reopen a lost or misconfigured stream.
 const REOPEN_INTERVAL: Duration = Duration::from_millis(500);
+/// Longest offline-pump stall replayed sample-for-sample; two seconds is
+/// comfortably past the server jitter buffer's 512-frame (1.28 s)
+/// stream-restart threshold, so an abandoned backlog always trips it.
+const PUMP_REPLAY_MAX: u64 = 2 * SAMPLE_RATE as u64;
 /// Synthetic sender id for system chat lines (device notices). Real member
 /// ids are assigned from zero, far below this.
 const SYSTEM_MEMBER: MemberId = MemberId(u16::MAX);
@@ -255,13 +259,24 @@ impl Driver {
             return false;
         };
         let due = (epoch.elapsed().as_secs_f64() * f64::from(SAMPLE_RATE)) as u64;
-        // Cap catch-up at one second so a debugger pause cannot flood.
-        *pumped_frames = (*pumped_frames).max(due.saturating_sub(u64::from(SAMPLE_RATE)));
-        let remaining = due.saturating_sub(*pumped_frames);
-        if remaining == 0 {
+        let backlog = due.saturating_sub(*pumped_frames);
+        if backlog == 0 {
             return false;
         }
-        let chunk = remaining.min(FRAME_FRAMES as u64);
+        // Catch-up is all or nothing. Replaying only part of a stall (the
+        // old one-second cap) compressed the uplink frame clock by the
+        // skipped amount, so every later frame reached the server a fixed
+        // few hundred frames late: under its jitter buffer's stream-restart
+        // threshold, and it can step back at most one frame, so the uplink
+        // stayed concealed for the rest of the session. Short stalls replay
+        // sample-for-sample; longer ones (a debugger pause) drop the whole
+        // backlog, a discontinuity big enough to trip that stream-restart
+        // reset and re-anchor cleanly.
+        if backlog > PUMP_REPLAY_MAX {
+            *pumped_frames = due;
+            return false;
+        }
+        let chunk = backlog.min(FRAME_FRAMES as u64);
         match stream.pump(chunk as usize) {
             Ok(()) => {
                 *pumped_frames += chunk;
@@ -705,6 +720,11 @@ impl Worker {
     /// side never pauses. On failure the periodic reopen path takes over
     /// with system defaults.
     fn reconfigure(&mut self, settings: AudioSettings) {
+        // Drain what the old ring already captured so those samples reach
+        // the core before the endpoints are dropped; orphaning them would
+        // shift our uplink frame clock behind the server's.
+        let now_ms = self.now_ms();
+        self.move_capture(now_ms);
         self.driver.close();
         self.engine = None;
         self.settings = settings;
@@ -743,9 +763,16 @@ impl Worker {
 
     fn try_open(&mut self) -> bool {
         match self.driver.open(&self.settings) {
-            Ok(engine) => {
-                self.capture_buf
-                    .resize(ring_capacity(self.settings.buffer_frames.max(32)), 0.0);
+            Ok(mut engine) => {
+                let capacity = ring_capacity(self.settings.buffer_frames.max(32));
+                self.capture_buf.resize(capacity, 0.0);
+                // Prefill the fresh playout ring (its steady-state depth) with
+                // silence. Refilling it from the core would burst-pull several
+                // frames in zero wall time, running the jitter consumer clock
+                // past the sender; the buffer can step back at most one frame,
+                // so every later packet would be dropped as late and playout
+                // would stay silent for the rest of the session.
+                engine.push_playout(&vec![0.0; capacity]);
                 self.engine = Some(engine);
                 self.carry_pos = 0;
                 self.carry_len = 0;
@@ -876,12 +903,8 @@ impl Worker {
                 }
                 // rtt_ms_last rides along in stats(); Ejected, Rejected,
                 // and TimedOut land through the state mapping below.
-                // Broadcast mix state has no UI surface yet (M2).
-                ClientEvent::RttSample { .. }
-                | ClientEvent::BroadcastMixChanged { .. }
-                | ClientEvent::Ejected { .. }
-                | ClientEvent::Rejected { .. }
-                | ClientEvent::TimedOut => {}
+                // Broadcast mix state and avatars have no UI surface yet.
+                _ => {}
             }
         }
     }

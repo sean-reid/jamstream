@@ -4,6 +4,7 @@
 //! in, getting datagrams and events out, so both cores run identically under
 //! the server binary, the desktop client, and the simulation harness.
 
+mod avatar;
 pub mod client;
 pub mod server;
 
