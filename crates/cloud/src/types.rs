@@ -163,15 +163,35 @@ pub enum InstanceClass {
     Standard,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchSpec {
     pub region: Region,
     pub instance_class: InstanceClass,
     /// Boot payload, interpreted per provider: cloud providers receive
     /// cloud-init YAML (`cloudinit::render`); the local provider receives
     /// the flat key=value server config (`BootConfig::render_flat_config`).
+    ///
+    /// Either way it carries the session server's private key, and on
+    /// DigitalOcean an account API token, so it stays out of `Debug`.
     pub user_data: String,
     pub tags: Vec<(String, String)>,
+}
+
+/// Hand-written, like every other type in this crate that holds a secret:
+/// one `tracing::debug!(?spec)` would otherwise print a private key into
+/// the host's terminal and whatever collects it.
+impl fmt::Debug for LaunchSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LaunchSpec")
+            .field("region", &self.region)
+            .field("instance_class", &self.instance_class)
+            .field(
+                "user_data",
+                &format_args!("<{} bytes>", self.user_data.len()),
+            )
+            .field("tags", &self.tags)
+            .finish()
+    }
 }
 
 impl LaunchSpec {
@@ -210,6 +230,31 @@ pub fn session_id_from_tags(tags: &[(String, String)]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// user_data is the server's private key on every provider and the
+    /// host's API token on DigitalOcean. It must not be printable by
+    /// accident.
+    #[test]
+    fn debug_never_reveals_the_boot_payload() {
+        let spec = LaunchSpec {
+            region: Region {
+                provider: ProviderKind::Aws,
+                id: RegionId::new("us-east-1"),
+                display: "N. Virginia".to_owned(),
+                country: "US".to_owned(),
+            },
+            instance_class: InstanceClass::Standard,
+            user_data: "server_private_key_b64 = c3VwZXJzZWNyZXQ=\n".to_owned(),
+            tags: vec![session_tag("deadbeef")],
+        };
+        let rendered = format!("{spec:?}");
+        assert!(!rendered.contains("c3VwZXJzZWNyZXQ="));
+        assert!(!rendered.contains("server_private_key"));
+        assert!(rendered.contains("<42 bytes>"), "was: {rendered}");
+        // The rest is what makes the line worth logging at all.
+        assert!(rendered.contains("us-east-1"));
+        assert!(rendered.contains("deadbeef"));
+    }
 
     #[test]
     fn format_microusd_examples() {

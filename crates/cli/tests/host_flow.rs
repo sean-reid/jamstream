@@ -120,6 +120,15 @@ async fn host_end_and_sweep_flow() {
     let ended = state::load(&path).unwrap();
     assert_eq!(ended.status, SessionStatus::Ended);
     assert!(ended.ended_unix.is_some());
+    // The issuer key mints and revokes invites to a server that no longer
+    // exists, so ending the session takes it off disk. The record stays for
+    // status and for the cost history.
+    assert!(
+        ended.issuer_private_key_b64.is_empty(),
+        "the issuer private key outlived the session"
+    );
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(!on_disk.contains(&session.issuer_private_key_b64));
 
     // Nothing running is left to select.
     assert!(

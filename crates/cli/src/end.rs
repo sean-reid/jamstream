@@ -100,6 +100,9 @@ pub async fn run<W: Write>(
     }
 
     session.status = SessionStatus::Ended;
+    // The server it authenticated against no longer exists, so the issuer
+    // key has nothing left to sign for and no reason to stay on disk.
+    session.forget_issuer_key();
     session.ended_unix = Some(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
