@@ -293,9 +293,11 @@ fn fixed_regions() -> Vec<RegionRow> {
             display: display.to_owned(),
             country: "US".to_owned(),
         },
+        // DigitalOcean's real numbers: $0.01 per GB with 3000 GB included, so
+        // the table and the preview in these snapshots say what the docs say.
         price: Price {
             hourly_microusd: hourly,
-            egress_microusd_per_gb: 0,
+            egress_microusd_per_gb: 10_000,
             included_egress_gb: 3000,
         },
         worst_rtt_ms: rtt,

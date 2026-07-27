@@ -1260,7 +1260,12 @@ impl HostWizard {
             }
             return;
         }
-        ui.label(theme::muted(ui, "Latency and price carry equal weight."));
+        // The solver sorts by coverage, then worst round trip bucketed to
+        // 5 ms, then hourly price, so price only decides inside a bucket.
+        ui.label(theme::muted(
+            ui,
+            "Sorted by worst round trip in 5 ms steps, with price breaking ties.",
+        ));
         ui.label(theme::muted(
             ui,
             "Latency is measured from this computer; bandmates elsewhere will differ.",
