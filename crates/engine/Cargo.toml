@@ -15,3 +15,16 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+criterion.workspace = true
+
+# test = false keeps `cargo test`/`cargo nextest` from building or running
+# these; harness = false hands main() to criterion.
+[[bench]]
+name = "tick"
+harness = false
+test = false
+
+[[bench]]
+name = "dsp"
+harness = false
+test = false
