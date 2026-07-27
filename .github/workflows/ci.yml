@@ -7,7 +7,7 @@
 #   test      ~6-8 min  unit + property + integration + E2E stories, per OS
 #   harness   ~4 min    simulation gate suite (~3 min of test runtime)
 #   musl      ~4 min    static server build + verification
-#   coverage  ~12 min   instrumented rebuild; runs on pushes to main only so
+#   coverage  ~16 min   instrumented rebuild; runs on pushes to main only so
 #                       the PR path never waits on it
 #
 # The harness gates run as their own parallel job so unit/integration
@@ -184,18 +184,52 @@ jobs:
           name: coverage-lcov
           path: lcov.info
           if-no-files-found: error
-      # Per-package line-coverage floors where correctness lives. llvm-cov
-      # has no per-package report filter, so each floor is its own small
-      # invocation (build artifacts are shared, only the tests re-run) with
-      # every other crate's files masked out of the report.
-      - name: Enforce 75 percent line coverage on protocol, engine, session
+      # Per-package line-coverage floors. llvm-cov has no per-package report
+      # filter, so each floor is its own small invocation with every other
+      # crate's files masked out of the report. The floors measure a crate
+      # against its OWN tests, which is the point: masking after a
+      # `report` over the whole workspace would let one crate's suite prop
+      # up another's number.
+      #
+      # The invocations are cheap because the workspace run above already
+      # built every instrumented artifact; each one only re-runs that
+      # crate's test binaries and re-merges its profraw. Measured warm on
+      # an M-series laptop: broadcast 5 s, cloud 24 s, server 27 s, cli
+      # 31 s, so the four crates added here cost about 90 s of the job.
+      # Nowhere near the point where the shared build would have to be
+      # split out of the floor loop.
+      #
+      # Floors: 75 for the crates whose suites are mature (protocol,
+      # engine, session, cloud at 93 percent measured, broadcast at 99),
+      # and a measured floor a few points under current coverage for the
+      # two newer ones so the gate is real without being brittle:
+      # server measures 89.5 (floor 85), cli measures 84.3-84.5 (floor 80;
+      # it moves by about 0.2 between runs).
+      #
+      # Still without a floor, deliberately: jamstream-client (kittest
+      # snapshot baselines are macOS renders, see the test job),
+      # jamstream-harness (its gates assert wall-clock budgets that
+      # instrumentation invalidates), and jamstream-audio-io (a thin cpal
+      # shim; a headless runner has no device to open). The first two are
+      # also excluded from the workspace lcov above.
+      - name: Enforce per-crate line-coverage floors
         run: |
-          cargo llvm-cov -p jamstream-protocol --summary-only --fail-under-lines 75 \
-            --ignore-filename-regex 'crates/(engine|session|audio-io|cloud|server|cli|client|harness)/|xtask/'
-          cargo llvm-cov -p jamstream-engine --summary-only --fail-under-lines 75 \
-            --ignore-filename-regex 'crates/(protocol|session|audio-io|cloud|server|cli|client|harness)/|xtask/'
-          cargo llvm-cov -p jamstream-session --summary-only --fail-under-lines 75 \
-            --ignore-filename-regex 'crates/(protocol|engine|audio-io|cloud|server|cli|client|harness)/|xtask/'
+          all='protocol engine session audio-io cloud server cli client harness broadcast'
+          for pair in protocol:75 engine:75 session:75 cloud:75 broadcast:75 server:85 cli:80; do
+            crate="${pair%:*}"
+            floor="${pair#*:}"
+            others=''
+            for other in $all; do
+              if [ "$other" != "$crate" ]; then
+                others="${others:+$others|}$other"
+              fi
+            done
+            echo "::group::jamstream-$crate (floor ${floor} percent)"
+            cargo llvm-cov -p "jamstream-$crate" --summary-only \
+              --fail-under-lines "$floor" \
+              --ignore-filename-regex "crates/($others)/|xtask/"
+            echo '::endgroup::'
+          done
 
   # Static musl build of the session server: this is the artifact a session
   # VM downloads at boot, so it must run on any Linux with no shared libs.

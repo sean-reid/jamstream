@@ -10,6 +10,13 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 jamstream-protocol = { path = ".." }
+# avatar_reassembly drives the session core, because the reassembler itself
+# is pub(crate) behind a private module and the only way in from outside the
+# crate is ServerCore::handle_datagram. blake2 lets the target announce a
+# content hash it can also produce chunks for; without that, everything past
+# the hash check is unreachable.
+jamstream-session = { path = "../../session" }
+blake2 = "0.10"
 
 [[bin]]
 name = "wire_parse"
@@ -35,6 +42,27 @@ bench = false
 [[bin]]
 name = "control_receive"
 path = "fuzz_targets/control_receive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_read_init"
+path = "fuzz_targets/handshake_read_init.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_open"
+path = "fuzz_targets/transport_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avatar_reassembly"
+path = "fuzz_targets/avatar_reassembly.rs"
 test = false
 doc = false
 bench = false
