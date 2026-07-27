@@ -385,8 +385,9 @@ pub fn mono_drag(ui: &mut Ui, drag: egui::DragValue<'_>) -> egui::Response {
 }
 
 /// "$0.14" from microdollars, always two decimals, trimmed beyond that.
+/// Rounded to four decimals first so tickers never show raw microdollars.
 pub fn microusd(micro: u64) -> String {
-    jamstream_cloud::format_microusd(micro)
+    jamstream_cloud::format_microusd((micro + 50) / 100 * 100)
 }
 
 /// WCAG relative luminance of an sRGB color.
