@@ -1,9 +1,10 @@
 //! End-to-end for local session mode: LocalProvider spawns the real
 //! jamstreamd binary (CARGO_BIN_EXE_jamstreamd), a genuine ClientCore joins
 //! it over loopback UDP, destroy kills it, and the on-disk registry
-//! survives a provider restart (the sweeper story). Plus the idle-exit dead
-//! man's switch: an unjoined server with --idle-exit-min set exits on its
-//! own.
+//! survives a provider restart (the sweeper story). Plus the two self-exit
+//! windows: an unjoined server with --idle-exit-min set exits on its own,
+//! and a server with --max-duration-min set exits at the cap even with a
+//! connected, actively sending musician.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -88,21 +89,10 @@ fn launch_spec(
     }
 }
 
-#[tokio::test]
-async fn launch_join_destroy_end_to_end() {
-    let dir = temp_dir("e2e");
-    let provider = LocalProvider::new(dir.clone()).with_server_binary(server_binary());
-    let mat = session_material(10);
-
-    let instance = provider
-        .launch(launch_spec(&provider, &mat, "e2e-session"))
-        .await
-        .expect("launch");
-    assert!(instance.public_ip.is_some(), "instance must carry an ip");
-    assert_eq!(instance.session_id(), Some("e2e-session"));
-
-    // A real client joins through loopback; the invite address is local
-    // regardless of the LAN ip the instance advertises.
+/// Joins a real ClientCore to a locally spawned server over loopback and
+/// returns it once Joined, together with its socket and the clock epoch
+/// its `now_ms` values are measured from.
+async fn join_musician(mat: &SessionMaterial, name: &str) -> (ClientCore, UdpSocket, Instant) {
     let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), mat.port);
     let invite = mat.issuer.mint(
         mat.session_id,
@@ -111,7 +101,7 @@ async fn launch_join_destroy_end_to_end() {
         Token {
             member_id: MemberId(1),
             role: Role::Musician,
-            name_hint: Some("local-e2e".into()),
+            name_hint: Some(name.into()),
             expires_unix: u64::MAX,
             jti: TokenId::generate(),
         },
@@ -145,6 +135,46 @@ async fn launch_join_destroy_end_to_end() {
         }
     }
     assert!(joined, "client never joined the locally spawned server");
+    (client, socket, start)
+}
+
+#[tokio::test]
+async fn launch_join_destroy_end_to_end() {
+    let dir = temp_dir("e2e");
+    let provider = LocalProvider::new(dir.clone()).with_server_binary(server_binary());
+    let mat = session_material(10);
+
+    let instance = provider
+        .launch(launch_spec(&provider, &mat, "e2e-session"))
+        .await
+        .expect("launch");
+    assert!(instance.public_ip.is_some(), "instance must carry an ip");
+    assert_eq!(instance.session_id(), Some("e2e-session"));
+
+    // The provider must forward both self-exit windows from the flat
+    // config to the spawned server's command line (session_material sets
+    // idle_shutdown_min = 10 and max_duration_min = 720).
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &instance.id, "-o", "command="])
+            .output()
+            .expect("ps");
+        let cmdline = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            cmdline.contains("--idle-exit-min 10"),
+            "idle window not forwarded: {cmdline}"
+        );
+        assert!(
+            cmdline.contains("--max-duration-min 720"),
+            "max duration not forwarded: {cmdline}"
+        );
+    }
+
+    // A real client joins through loopback; the invite address is local
+    // regardless of the LAN ip the instance advertises.
+    let (mut client, socket, start) = join_musician(&mat, "local-e2e").await;
+    let now = || start.elapsed().as_millis() as u64;
 
     client.leave("local e2e done").unwrap();
     for pkt in client.poll(now()) {
@@ -230,5 +260,89 @@ fn idle_exit_terminates_an_unjoined_server() {
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(status.success(), "idle exit must be a clean exit: {status}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole-session cap, unlike idle-exit, fires with musicians present:
+/// a server spawned with --max-duration-min 0.05 (3 s) and a joined,
+/// actively sending musician must still exit cleanly on its own, and the
+/// abandoned client then times out. The config's 10 minute idle window
+/// cannot be the cause, and no --idle-exit-min is passed.
+#[tokio::test]
+async fn max_duration_ends_an_occupied_session() {
+    let dir = temp_dir("maxdur");
+    let mat = session_material(10);
+    let config_path = dir.join("config");
+    std::fs::write(&config_path, &mat.flat_config).unwrap();
+
+    let mut child = std::process::Command::new(server_binary())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--activity-file")
+        .arg(dir.join("last-active"))
+        .arg("--max-duration-min")
+        .arg("0.05")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn jamstreamd");
+
+    let (mut client, socket, start) = join_musician(&mat, "capped").await;
+    let now = || start.elapsed().as_millis() as u64;
+
+    // Keep the musician pumping while the cap runs out; the server must
+    // exit anyway, which is exactly what idle-exit would never do here.
+    let mut buf = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("server never hit the max-duration cap within 15 s");
+        }
+        for pkt in client.poll(now()) {
+            let _ = socket.send(&pkt).await;
+        }
+        if let Ok(Ok(len)) =
+            tokio::time::timeout(Duration::from_millis(20), socket.recv(&mut buf)).await
+        {
+            for pkt in client.handle_datagram(now(), &buf[..len]) {
+                let _ = socket.send(&pkt).await;
+            }
+        }
+        let _ = client.events();
+    };
+    assert!(
+        status.success(),
+        "max-duration exit must be a clean exit: {status}"
+    );
+
+    // The abandoned musician notices the server is gone: its connection
+    // timeout (10 s of server silence) surfaces as TimedOut.
+    let mut timed_out = false;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !timed_out {
+        for pkt in client.poll(now()) {
+            let _ = socket.send(&pkt).await;
+        }
+        if let Ok(Ok(len)) =
+            tokio::time::timeout(Duration::from_millis(20), socket.recv(&mut buf)).await
+        {
+            let _ = client.handle_datagram(now(), &buf[..len]);
+        }
+        for event in client.events() {
+            if matches!(event, ClientEvent::TimedOut | ClientEvent::Ejected { .. }) {
+                timed_out = true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        timed_out,
+        "client never observed the capped server going away"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
