@@ -23,7 +23,7 @@ There are no accounts and no JamStream servers. Identity is the invite.
 
 When you host, your computer generates the session's keys locally and mints one invite per seat. Each invite is a signed statement: this person may occupy seat 3 of session `3f2a9c01` at this address until this time. The server, which received your public key at boot, admits only holders of statements you signed. Invites are individually revocable mid-session, and all of them expire at the session's hard cap.
 
-Every packet between every member and the server is encrypted and authenticated, from the first handshake byte; there is no plaintext mode. Keys are rotated hourly during long sessions, and replayed or tampered packets are dropped. The server itself knows nothing about anyone beyond what the host signed into their invite: a seat number, a role, an expiry.
+Every packet between every member and the server is encrypted and authenticated, from the first handshake byte; there is no plaintext mode. Replayed or tampered packets are dropped. The server itself knows nothing about anyone beyond what the host signed into their invite: a seat number, a role, an expiry.
 
 What this buys you concretely: strangers cannot join, listen in, or disrupt a session; a leaked invite is one revocation away from useless; and no third party, JamStream included, sits between your band and your machine.
 
