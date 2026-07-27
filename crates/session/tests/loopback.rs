@@ -74,6 +74,8 @@ struct Sniffer {
     session: Session,
     /// Every plaintext control or media payload delivered to this member.
     seen: Vec<Vec<u8>>,
+    /// Transport counter of each of those datagrams, which is the AEAD nonce.
+    counters: Vec<u64>,
 }
 
 struct Harness {
@@ -82,7 +84,7 @@ struct Harness {
     session_id: SessionId,
     server: ServerCore,
     clients: Vec<TestClient>,
-    sniffer: Option<Sniffer>,
+    sniffers: Vec<Sniffer>,
     t: f64,
     now_unix: u64,
     to_server: Vec<(SocketAddr, Vec<u8>)>,
@@ -92,6 +94,10 @@ struct Harness {
     /// Bytes the server has emitted, so a test can price one inbound packet
     /// in outbound bytes.
     server_out_bytes: u64,
+    /// Wall nanoseconds each `ServerCore::tick` in `step` took, for the CPU
+    /// budget measurement. Two clock reads per 2.5 ms step is nothing next to
+    /// the work they bracket.
+    tick_nanos: Vec<u64>,
 }
 
 impl Harness {
@@ -114,13 +120,14 @@ impl Harness {
             session_id,
             server,
             clients: Vec::new(),
-            sniffer: None,
+            sniffers: Vec::new(),
             t: 0.0,
             now_unix: 1_000,
             to_server: Vec::new(),
             server_events: Vec::new(),
             big_dgrams: 0,
             server_out_bytes: 0,
+            tick_nanos: Vec::new(),
         }
     }
 
@@ -218,7 +225,10 @@ impl Harness {
             }
             to_clients.extend(self.server.handle_datagram(now, self.now_unix, src, &dg));
         }
-        to_clients.extend(self.server.tick(now));
+        let started = std::time::Instant::now();
+        let ticked = self.server.tick(now);
+        self.tick_nanos.push(started.elapsed().as_nanos() as u64);
+        to_clients.extend(ticked);
         self.server_events.extend(self.server.events());
 
         for (addr, dg) in to_clients {
@@ -314,24 +324,29 @@ impl Harness {
     fn add_sniffer(&mut self, invite: &Invite, addr: SocketAddr) -> MemberId {
         let raw = raw_join(self, invite, addr);
         let id = raw.id;
-        self.sniffer = Some(Sniffer {
+        self.sniffers.push(Sniffer {
             id: raw.id,
             addr: raw.addr,
             session: raw.session,
             seen: Vec::new(),
+            counters: Vec::new(),
         });
         id
     }
 
-    /// True when the datagram belonged to the sniffer, whose plaintext is
+    fn sniffer(&self, id: MemberId) -> &Sniffer {
+        self.sniffers
+            .iter()
+            .find(|s| s.id == id)
+            .expect("no sniffer with that id")
+    }
+
+    /// True when the datagram belonged to a sniffer, whose plaintext is
     /// recorded instead of being handed to a client core.
     fn sniff(&mut self, addr: SocketAddr, dg: &[u8]) -> bool {
-        let Some(s) = self.sniffer.as_mut() else {
+        let Some(s) = self.sniffers.iter_mut().find(|s| s.addr == addr) else {
             return false;
         };
-        if s.addr != addr {
-            return false;
-        }
         if let Ok(Packet::Transport {
             member,
             counter,
@@ -341,6 +356,7 @@ impl Harness {
             && let Ok(plain) = s.session.open(counter, ciphertext)
         {
             s.seen.push(plain);
+            s.counters.push(counter);
         }
         true
     }
@@ -724,6 +740,100 @@ fn listener_receives_broadcast_and_cannot_send_media() {
             what: "media from listener"
         }
     )));
+}
+
+/// The broadcast frame is encoded once and handed to every listener, which
+/// is only safe if the per-member parts of the packet stay per member. A
+/// shared sequence number would make each listener's jitter buffer discard
+/// the others' frames as duplicates, and a repeated transport counter would
+/// be AEAD nonce reuse. Read off the wire, not off a client core.
+#[test]
+fn listeners_share_the_payload_but_not_seq_or_nonce() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    h.add_client(&inv_a, Some(440.0));
+    h.add_client(&inv_b, Some(660.0));
+    let early = h.add_sniffer(&h.mint(5, Role::Listener), addr_of(60));
+    h.run_ms(1_000);
+    // Joining later gives the two listeners different seq for the same
+    // broadcast frame, which is the whole point of the assertion below.
+    let late = h.add_sniffer(&h.mint(6, Role::Listener), addr_of(61));
+    h.run_ms(1_000);
+
+    let media = |s: &Sniffer| -> Vec<(u32, Vec<u8>)> {
+        s.seen
+            .iter()
+            .filter(|p| matches!(wire::split_channel(p), Ok((wire::CHANNEL_MEDIA, _))))
+            .map(|p| {
+                let f = MediaFrame::decode(p).expect("media frame");
+                assert_eq!(f.duration, FrameDuration::Ms20);
+                (f.seq, f.payload.to_vec())
+            })
+            .collect()
+    };
+    let a = media(h.sniffer(early));
+    let b = media(h.sniffer(late));
+    assert!(b.len() > 20, "late listener got {} frames", b.len());
+    assert!(a.len() > b.len(), "{} vs {}", a.len(), b.len());
+
+    // Each listener's seq counts its own frames from zero.
+    for (name, frames) in [("early", &a), ("late", &b)] {
+        let seqs: Vec<u32> = frames.iter().map(|(s, _)| *s).collect();
+        let expected: Vec<u32> = (0..frames.len() as u32).collect();
+        assert_eq!(seqs, expected, "{name} listener seq");
+    }
+    // Same broadcast frames, aligned at the tail: identical Opus payloads
+    // under different sequence numbers.
+    let skew = a.len() - b.len();
+    for (i, (seq_b, payload_b)) in b.iter().enumerate() {
+        let (seq_a, payload_a) = &a[i + skew];
+        assert_eq!(payload_a, payload_b, "frame {i} payload differs");
+        assert_ne!(seq_a, seq_b, "frame {i} shares a sequence number");
+    }
+
+    // No transport counter is ever reused within a member: that counter is
+    // the AEAD nonce, and the receiver's replay window rejects a repeat.
+    for id in [early, late] {
+        let c = &h.sniffer(id).counters;
+        assert!(
+            c.windows(2).all(|w| w[1] > w[0]),
+            "member {} counters not strictly increasing",
+            id.0
+        );
+    }
+}
+
+/// A listener admitted mid-session now meets an encoder that has been
+/// running since the first listener joined, instead of one built for them.
+/// Their decoder enters a stream in progress, which Opus handles, but it is
+/// a real behavioral change and worth an assertion: they must hear the room
+/// as clearly as the listener who was there from the start.
+#[test]
+fn a_listener_joining_mid_stream_hears_the_running_broadcast() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_early = h.mint(5, Role::Listener);
+    h.add_client(&inv_a, Some(440.0));
+    h.add_client(&inv_b, Some(660.0));
+    let early = h.add_client(&inv_early, None);
+    h.run_ms(3_000);
+
+    let inv_late = h.mint(6, Role::Listener);
+    let late = h.add_client(&inv_late, None);
+    h.run_ms(2_000);
+    assert_eq!(*h.clients[late].core.state(), ClientState::Joined);
+
+    let win = 48_000; // last 0.5 s
+    for hz in [440.0, 660.0] {
+        let (e, l) = (tail_tone(&h, early, win, hz), tail_tone(&h, late, win, hz));
+        assert!(l > 0.1, "late listener {hz} Hz amplitude {l}");
+        assert!(
+            (l - e).abs() < 0.25 * e,
+            "late listener {hz} Hz {l} against the early listener's {e}"
+        );
+    }
 }
 
 /// Fills the session: MAX_MUSICIANS musicians and MAX_LISTENERS - 1
@@ -1195,9 +1305,9 @@ fn stream_keys_never_appear_in_anything_the_server_relays() {
     let contains = |bytes: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
 
     // Every plaintext byte the server sealed to a member.
-    let sniffed = h.sniffer.as_ref().expect("sniffer").seen.len();
-    assert!(sniffed > 0, "the sniffer received nothing to scan");
-    for plain in &h.sniffer.as_ref().expect("sniffer").seen {
+    let snoop = h.sniffer(MemberId(7));
+    assert!(!snoop.seen.is_empty(), "the sniffer received nothing");
+    for plain in &snoop.seen {
         assert!(!contains(plain), "key found in a relayed datagram");
     }
     // And every message the honest clients decoded, serialized back to bytes.
@@ -1551,6 +1661,61 @@ fn musician_capacity_enforced() {
     assert_eq!(
         *h.clients[MAX_MUSICIANS].core.state(),
         ClientState::Connecting
+    );
+}
+
+/// Not a gate, a measurement:
+/// `cargo test -p jamstream-session --release --test loopback -- --ignored
+/// --nocapture tick_cost_at_capacity`. Release matters: the test profile's
+/// opt-level of 1 reaches libopus too, so a debug number says nothing about
+/// the shipped server. The deadline is 2500 us per tick, and the one tick in
+/// eight that also encodes the 20 ms broadcast frame is the one at risk.
+#[test]
+#[ignore = "measurement, not a gate"]
+fn tick_cost_at_capacity() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    for id in 0..MAX_MUSICIANS as u16 {
+        // Distinct tones, not silence: silence is the cheapest thing Opus
+        // ever encodes and would flatter the measurement.
+        let inv = h.mint(id, Role::Musician);
+        h.add_client(&inv, Some(110.0 * f32::from(id + 1)));
+    }
+    for i in 0..MAX_LISTENERS as u16 {
+        let inv = h.mint(100 + i, Role::Listener);
+        h.add_client(&inv, None);
+    }
+    h.run_ms(1_000);
+    assert_eq!(h.server.musicians_connected(), MAX_MUSICIANS);
+    assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
+
+    h.tick_nanos.clear();
+    h.run_ms(10_000);
+    let ticks = std::mem::take(&mut h.tick_nanos);
+
+    // The broadcast frame lands on one phase of the eight-tick cycle. Find
+    // which by mean rather than assuming where the warmup left the counter.
+    let group = |p: usize| -> Vec<u64> { ticks.iter().skip(p).step_by(8).copied().collect() };
+    let mean_us = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len() as f64 / 1_000.0;
+    let min_us = |v: &[u64]| *v.iter().min().unwrap() as f64 / 1_000.0;
+    let phase = (0..8)
+        .max_by(|&a, &b| mean_us(&group(a)).total_cmp(&mean_us(&group(b))))
+        .unwrap();
+    let bcast = group(phase);
+    let plain: Vec<u64> = (0..8).filter(|&p| p != phase).flat_map(group).collect();
+    println!(
+        "tick cost, {} musicians and {} listeners, {} ticks\n  \
+         broadcast tick: min {:.0} us, mean {:.0} us\n  \
+         other ticks:    min {:.0} us, mean {:.0} us\n  \
+         amortized:      {:.0} us per tick, {:.0}% of the 2500 us budget",
+        MAX_MUSICIANS,
+        MAX_LISTENERS,
+        ticks.len(),
+        min_us(&bcast),
+        mean_us(&bcast),
+        min_us(&plain),
+        mean_us(&plain),
+        mean_us(&ticks),
+        100.0 * mean_us(&ticks) / 2_500.0,
     );
 }
 
