@@ -833,16 +833,17 @@ fn chat_messages_share_one_left_edge_whatever_the_name() {
     }
 }
 
-/// The settings sheet: Load reads the file and sends its exact bytes,
-/// Remove sends the None variant.
+/// A picked file becomes a picture on the row and its bytes on the wire;
+/// Remove sends the None variant. The dialog itself cannot be driven from a
+/// test, so the pick enters through the same function its thread calls.
 #[test]
-fn settings_avatar_load_and_remove_send_the_right_commands() {
+fn settings_avatar_pick_and_remove_send_the_right_commands() {
     use jamstream_client::app::{JamApp, Screen};
 
-    // A real PNG on disk; Load must send exactly these bytes.
+    // Already at drawing size, so the fitter leaves it alone and these are
+    // the exact bytes that must reach the runtime.
     let png = png_bytes(6, 4);
-    let path = std::env::temp_dir().join(format!("jamstream-avatar-{}.png", std::process::id()));
-    std::fs::write(&path, &png).expect("write the avatar file");
+    let path = avatar_file("small.png", &png);
 
     let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
         FROZEN_FRAME,
@@ -853,7 +854,7 @@ fn settings_avatar_load_and_remove_send_the_right_commands() {
     app.runtime = Some(Box::new(rt.clone()));
     app.screen = Screen::Session;
     app.settings_open = true;
-    app.avatar_path = path.display().to_string();
+    app.load_avatar_from(&path);
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
         .build_ui(move |ui| {
@@ -862,10 +863,6 @@ fn settings_avatar_load_and_remove_send_the_right_commands() {
         });
     harness.run_steps(3);
 
-    harness
-        .get_by_role_and_label(AkRole::Button, "Load")
-        .click();
-    harness.run_steps(3);
     let sent: Vec<Command> = rt
         .commands()
         .into_iter()
@@ -874,8 +871,11 @@ fn settings_avatar_load_and_remove_send_the_right_commands() {
     assert_eq!(
         sent,
         vec![Command::SetOwnAvatar(Some(png.clone()))],
-        "Load must send the file's own bytes"
+        "a picture already at drawing size travels as the file itself"
     );
+    // And the row says what was picked, so nothing is sent blind.
+    assert!(harness.query_by_label_contains("small.png").is_some());
+    assert!(harness.query_by_label_contains("6x4").is_some());
 
     harness
         .get_by_role_and_label(AkRole::Button, "Remove")
@@ -898,9 +898,61 @@ fn settings_avatar_load_and_remove_send_the_right_commands() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A bad path says so, on the spot, and sends nothing.
+/// A photograph is fitted before it is announced: what reaches the runtime
+/// is inside the transfer layer's caps, and the row says what happened.
 #[test]
-fn settings_avatar_load_reports_a_bad_path_inline() {
+fn settings_avatar_sends_the_fitted_photo_not_the_file() {
+    use jamstream_client::app::{JamApp, Screen};
+    use jamstream_client::avatar;
+
+    let photo = jpeg_bytes(1600, 1200);
+    assert!(
+        photo.len() > avatar::MAX_BYTES,
+        "the fixture must be a file the caps would refuse"
+    );
+    let path = avatar_file("rehearsal.jpg", &photo);
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        false,
+    )));
+    let mut app = JamApp::new();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(rt.clone()));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    app.load_avatar_from(&path);
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(3);
+
+    let sent = rt
+        .commands()
+        .into_iter()
+        .find_map(|c| match c {
+            Command::SetOwnAvatar(Some(bytes)) => Some(bytes),
+            _ => None,
+        })
+        .expect("the picture must be announced");
+    assert_ne!(sent, photo, "the file itself is over the byte cap");
+    assert!(sent.len() <= avatar::MAX_BYTES);
+    assert!(
+        harness
+            .query_by_label_contains("1600x1200 fitted to 256x256")
+            .is_some(),
+        "the row must say what happened to the photo"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A file that cannot be read says so, on the spot, and sends nothing.
+#[test]
+fn settings_avatar_reports_an_unreadable_file_inline() {
     use jamstream_client::app::{JamApp, Screen};
 
     let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
@@ -912,17 +964,13 @@ fn settings_avatar_load_reports_a_bad_path_inline() {
     app.runtime = Some(Box::new(rt.clone()));
     app.screen = Screen::Session;
     app.settings_open = true;
-    app.avatar_path = "/nonexistent/not-an-avatar.png".to_owned();
+    app.load_avatar_from("/nonexistent/not-an-avatar.png");
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
         .build_ui(move |ui| {
             theme::apply(ui.ctx(), Theme::Dark);
             app.root_ui(ui);
         });
-    harness.run_steps(3);
-    harness
-        .get_by_role_and_label(AkRole::Button, "Load")
-        .click();
     harness.run_steps(3);
     assert!(
         harness
@@ -938,6 +986,15 @@ fn settings_avatar_load_reports_a_bad_path_inline() {
     );
 }
 
+/// A file on disk with a name of our choosing, since the row shows the name.
+fn avatar_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("jamstream-avatar-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write the avatar file");
+    path
+}
+
 /// A real PNG through the image encoder the client already depends on:
 /// `w`x`h` of warm diagonal bands.
 fn png_bytes(w: u32, h: u32) -> Vec<u8> {
@@ -948,5 +1005,19 @@ fn png_bytes(w: u32, h: u32) -> Vec<u8> {
     image::DynamicImage::ImageRgba8(img)
         .write_to(&mut buf, image::ImageFormat::Png)
         .expect("encode png");
+    buf.into_inner()
+}
+
+/// A camera-shaped file: `w`x`h` of JPEG with enough detail that it does not
+/// compress down to nothing.
+fn jpeg_bytes(w: u32, h: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        let ring = ((x * x + y * y) / 97 % 200) as u8;
+        image::Rgb([200 - ring / 2, 90 + ring / 3, 40 + ring / 4])
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 95)
+        .encode_image(&img)
+        .expect("encode jpeg");
     buf.into_inner()
 }

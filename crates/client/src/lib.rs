@@ -9,6 +9,7 @@ pub mod creds;
 pub mod demo;
 pub mod exec;
 pub mod live;
+pub mod picker;
 pub mod runtime;
 pub mod screens;
 pub mod theme;
