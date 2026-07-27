@@ -1,0 +1,65 @@
+{
+  "comment": "Object storage prices for session recordings, in integer microusd (1_000_000 per USD), snapshotted from public list pricing. Storage is per GB-month of the provider's default hot/standard class; egress is internet download of a recording, at the first-tier rate. Refresh cadence: quarterly, alongside data/aws_prices.json and data/gcp_prices.json, or immediately when a recording estimate is visibly wrong. Regions mirror the catalogs in src/providers/{aws,gcp,digitalocean}.rs; a region absent from a table falls back to that provider's default_* values, which are set to the most expensive listed region so the estimate never understates. Sources: AWS S3 https://aws.amazon.com/s3/pricing/ and https://aws.amazon.com/s3/pricing/#Data_transfer ; DigitalOcean Spaces https://docs.digitalocean.com/products/spaces/details/pricing/ and https://www.digitalocean.com/pricing/spaces-object-storage ; Google Cloud Storage https://cloud.google.com/storage/pricing#storage-pricing and https://cloud.google.com/storage/pricing#network-pricing . Request charges are deliberately absent: see the note field on each provider and src/recording.rs, which states the exclusion in the estimate itself.",
+  "providers": {
+    "aws": {
+      "class": "S3 Standard",
+      "base_monthly_microusd": 0,
+      "included_storage_gb": 0,
+      "included_egress_gb": 100,
+      "default_storage_microusd_per_gb_month": 40500,
+      "default_egress_microusd_per_gb": 150000,
+      "note": "S3 Standard, first 50 TB/month tier. The 100 GB/month free egress allowance is account-wide and shared with the session VM's own traffic. PUT requests cost $0.005 per 1,000 and GET $0.0004 per 1,000; a whole recording is about a hundred requests, so under $0.001.",
+      "regions": {
+        "us-east-1": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 90000 },
+        "us-east-2": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 90000 },
+        "us-west-1": { "storage_microusd_per_gb_month": 26000, "egress_microusd_per_gb": 90000 },
+        "us-west-2": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 90000 },
+        "eu-west-1": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 90000 },
+        "eu-central-1": { "storage_microusd_per_gb_month": 24500, "egress_microusd_per_gb": 90000 },
+        "ca-central-1": { "storage_microusd_per_gb_month": 25000, "egress_microusd_per_gb": 90000 },
+        "sa-east-1": { "storage_microusd_per_gb_month": 40500, "egress_microusd_per_gb": 150000 }
+      }
+    },
+    "digitalocean": {
+      "class": "Spaces Standard",
+      "base_monthly_microusd": 5000000,
+      "included_storage_gb": 250,
+      "included_egress_gb": 1024,
+      "default_storage_microusd_per_gb_month": 20000,
+      "default_egress_microusd_per_gb": 10000,
+      "note": "Spaces bills a flat $5.00/month subscription that includes 250 GiB of storage and 1,024 GiB of outbound transfer pooled across every bucket on the account; beyond that, storage is $0.02/GiB-month and transfer $0.01/GiB. There are no per-request charges. Prices do not vary by region, but Spaces is not offered in every droplet region, so spaces_regions below is the authoritative list.",
+      "spaces_regions": [
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "ams3",
+        "sgp1",
+        "fra1",
+        "syd1",
+        "blr1",
+        "tor1",
+        "lon1"
+      ]
+    },
+    "gcp": {
+      "class": "Cloud Storage Standard",
+      "base_monthly_microusd": 0,
+      "included_storage_gb": 0,
+      "included_egress_gb": 0,
+      "default_storage_microusd_per_gb_month": 23000,
+      "default_egress_microusd_per_gb": 120000,
+      "note": "Standard (hot) regional storage. Internet egress is the first-tier premium-network rate and matches the figure in data/gcp_prices.json. Class A operations (uploads, listings) cost $0.005 per 1,000 and Class B (reads) $0.0004 per 1,000; a whole recording is about a hundred operations, so under $0.001. There is no free egress allowance beyond the Always Free tier, which this estimate ignores.",
+      "regions": {
+        "us-central1": { "storage_microusd_per_gb_month": 20000, "egress_microusd_per_gb": 120000 },
+        "us-east1": { "storage_microusd_per_gb_month": 20000, "egress_microusd_per_gb": 120000 },
+        "us-east4": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 120000 },
+        "us-west1": { "storage_microusd_per_gb_month": 20000, "egress_microusd_per_gb": 120000 },
+        "us-west2": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 120000 },
+        "northamerica-northeast1": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 120000 },
+        "europe-west1": { "storage_microusd_per_gb_month": 20000, "egress_microusd_per_gb": 120000 },
+        "europe-west2": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 120000 },
+        "europe-west3": { "storage_microusd_per_gb_month": 23000, "egress_microusd_per_gb": 120000 }
+      }
+    }
+  }
+}

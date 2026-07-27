@@ -598,7 +598,7 @@ fn map_error_body(body: &str) -> ProviderError {
 /// RFC 3986 percent-encoding with AWS's unreserved set. Everything
 /// outside [A-Za-z0-9._~-], including space and '+', becomes %XX with
 /// uppercase hex, exactly as SigV4 expects.
-fn aws_encode(s: &str) -> String {
+pub(crate) fn aws_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -613,7 +613,7 @@ fn aws_encode(s: &str) -> String {
     out
 }
 
-fn amz_date_now() -> String {
+pub(crate) fn amz_date_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
@@ -653,13 +653,13 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// responses are small and predictable enough that targeted extraction
 /// beats an XML dependency; nested structures are handled by slicing the
 /// enclosing block first (see `instance_state`, `parse_tags`).
-fn xml_value<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+pub(crate) fn xml_value<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     take_tag(xml, tag).map(|(value, _)| value)
 }
 
 /// Like `xml_value` but also returns the remainder after the close tag,
 /// for iterating repeated elements.
-fn take_tag<'a>(xml: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn take_tag<'a>(xml: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
@@ -667,7 +667,7 @@ fn take_tag<'a>(xml: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
     Some((&xml[start..end], &xml[end + close.len()..]))
 }
 
-fn xml_unescape(s: &str) -> String {
+pub(crate) fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -731,10 +731,29 @@ fn parse_tags(chunk: &str) -> Vec<(String, String)> {
 /// because the workspace deliberately carries no AWS or hash crates.
 /// Verified in the unit tests against FIPS 180-4 SHA-256 vectors, RFC
 /// 4231 HMAC vectors, and the AWS SigV4 test-suite "get-vanilla" case.
-mod sigv4 {
+///
+/// Two entry points, deliberately layered so the EC2 and SSM callers cannot
+/// be broken by S3's extra requirements:
+///
+/// * [`authorization`] signs the fixed-shape `POST /` this module's own
+///   provider makes (EC2 Query form posts and SSM JSON posts). Its signed
+///   header set and canonical request are unchanged.
+/// * [`authorization_for`] signs an arbitrary method, canonical URI, query
+///   string, and header set against a caller-supplied payload hash. S3
+///   needs all four: it addresses objects by path, uses PUT/HEAD/DELETE,
+///   passes options in the query string (`?uploads`, `?uploadId=`,
+///   `?lifecycle`), and requires the payload hash to travel in a signed
+///   `x-amz-content-sha256` header. [`authorization`] is implemented in
+///   terms of it, so the exact-string tests below cover both.
+pub(crate) mod sigv4 {
     use data_encoding::HEXLOWER;
 
     const BLOCK: usize = 64;
+
+    /// Hex SHA-256 of the empty string: the payload hash for every request
+    /// with no body (HEAD, GET, DELETE).
+    pub const EMPTY_PAYLOAD_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     #[rustfmt::skip]
     const K: [u32; 64] = [
@@ -843,6 +862,20 @@ mod sigv4 {
         headers: &[(&str, &str)],
         payload: &[u8],
     ) -> (String, String) {
+        canonical_request_with_hash(method, path, query, headers, &hex_sha256(payload))
+    }
+
+    /// [`canonical_request`] against a payload hash the caller already has.
+    /// S3 always has one, because the same hex digest has to be sent in the
+    /// `x-amz-content-sha256` header, and hashing a 16 MiB part twice for
+    /// every retry would be wasteful.
+    pub fn canonical_request_with_hash(
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &[(&str, &str)],
+        payload_sha256: &str,
+    ) -> (String, String) {
         let signed = headers
             .iter()
             .map(|(name, _)| *name)
@@ -855,10 +888,8 @@ mod sigv4 {
             canonical_headers.push_str(value.trim());
             canonical_headers.push('\n');
         }
-        let request = format!(
-            "{method}\n{path}\n{query}\n{canonical_headers}\n{signed}\n{}",
-            hex_sha256(payload)
-        );
+        let request =
+            format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed}\n{payload_sha256}");
         (request, signed)
     }
 
@@ -911,7 +942,6 @@ mod sigv4 {
     /// headers are content-type, host, x-amz-date, plus x-amz-target when
     /// present (already in ascending order as SigV4 requires).
     pub fn authorization(req: &RequestToSign<'_>) -> String {
-        let date = &req.amz_date[..8];
         let mut headers = vec![
             ("content-type", req.content_type),
             ("host", req.host),
@@ -922,18 +952,89 @@ mod sigv4 {
         }
         let (canonical, signed) =
             canonical_request("POST", "/", req.query, &headers, req.body.as_bytes());
-        let scope = format!("{date}/{}/{}/aws4_request", req.region, req.service);
-        let to_sign = string_to_sign(req.amz_date, &scope, &canonical);
-        let sig = signature(
+        header_value(
+            req.access_key_id,
             req.secret_access_key,
-            date,
             req.region,
             req.service,
-            &to_sign,
+            req.amz_date,
+            &canonical,
+            &signed,
+        )
+    }
+
+    /// Everything needed to sign an arbitrary AWS request. Unlike
+    /// [`RequestToSign`] nothing here is fixed: the S3 object store needs
+    /// PUT/HEAD/DELETE/POST, keyed canonical URIs, sub-resource query
+    /// strings, and a header set that varies per operation.
+    pub struct SignedRequest<'a> {
+        pub access_key_id: &'a str,
+        pub secret_access_key: &'a str,
+        pub region: &'a str,
+        /// Signing service name: "ec2", "ssm", or "s3".
+        pub service: &'a str,
+        /// Uppercase HTTP method.
+        pub method: &'a str,
+        /// Canonical URI: absolute path, already percent-encoded, `/` for
+        /// the service root. S3 signs the path exactly as it appears in the
+        /// request line and, unlike other services, must not be
+        /// double-encoded, so the caller owns the encoding.
+        pub canonical_uri: &'a str,
+        /// Canonical query string: `key=value` pairs sorted by key, each
+        /// side percent-encoded, joined with `&`. Empty when there is none.
+        pub query: &'a str,
+        /// `YYYYMMDDTHHMMSSZ`.
+        pub amz_date: &'a str,
+        /// The complete signed header set: lowercase names in ascending
+        /// order, and it must include `host` and `x-amz-date`. Every header
+        /// listed here has to be sent on the wire with the same value.
+        pub headers: &'a [(&'a str, &'a str)],
+        /// Hex SHA-256 of the request body ([`EMPTY_PAYLOAD_SHA256`] when
+        /// there is none). S3 additionally requires this exact string in a
+        /// signed `x-amz-content-sha256` header.
+        pub payload_sha256: &'a str,
+    }
+
+    /// Authorization header value for the request described by `req`.
+    pub fn authorization_for(req: &SignedRequest<'_>) -> String {
+        let (canonical, signed) = canonical_request_with_hash(
+            req.method,
+            req.canonical_uri,
+            req.query,
+            req.headers,
+            req.payload_sha256,
         );
+        header_value(
+            req.access_key_id,
+            req.secret_access_key,
+            req.region,
+            req.service,
+            req.amz_date,
+            &canonical,
+            &signed,
+        )
+    }
+
+    /// The shared tail of both entry points: derive the scope, build the
+    /// string to sign, sign it, and render the header. Keeping it in one
+    /// place is what makes the two entry points provably equivalent for a
+    /// request they can both express.
+    fn header_value(
+        access_key_id: &str,
+        secret_access_key: &str,
+        region: &str,
+        service: &str,
+        amz_date: &str,
+        canonical_request: &str,
+        signed_headers: &str,
+    ) -> String {
+        let date = &amz_date[..8];
+        let scope = format!("{date}/{region}/{service}/aws4_request");
+        let to_sign = string_to_sign(amz_date, &scope, canonical_request);
+        let sig = signature(secret_access_key, date, region, service, &to_sign);
         format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={sig}",
-            req.access_key_id
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, \
+             SignedHeaders={signed_headers}, Signature={sig}"
         )
     }
 }
@@ -1073,6 +1174,104 @@ mod tests {
         assert!(
             auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature=")
         );
+    }
+
+    /// The AWS SigV4 test-suite "get-vanilla" case driven through the
+    /// generalized entry point, all the way to the published Authorization
+    /// header. This is the guard on the S3 extension: if `authorization_for`
+    /// ever drifts, this published vector breaks.
+    #[test]
+    fn authorization_for_matches_the_published_get_vanilla_vector() {
+        let auth = sigv4::authorization_for(&sigv4::SignedRequest {
+            access_key_id: "AKIDEXAMPLE",
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            region: "us-east-1",
+            service: "service",
+            method: "GET",
+            canonical_uri: "/",
+            query: "",
+            amz_date: "20150830T123600Z",
+            headers: &[
+                ("host", "example.amazonaws.com"),
+                ("x-amz-date", "20150830T123600Z"),
+            ],
+            payload_sha256: sigv4::EMPTY_PAYLOAD_SHA256,
+        });
+        assert_eq!(
+            auth,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
+             SignedHeaders=host;x-amz-date, \
+             Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        );
+    }
+
+    #[test]
+    fn empty_payload_constant_matches_the_hash_of_nothing() {
+        assert_eq!(sigv4::hex_sha256(b""), sigv4::EMPTY_PAYLOAD_SHA256);
+    }
+
+    /// The EC2/SSM entry point is now a thin wrapper; signing the same
+    /// request both ways must produce byte-identical headers, which is what
+    /// keeps the S3 extension from touching those callers.
+    #[test]
+    fn authorization_delegates_without_changing_its_output() {
+        let body = "Action=DescribeInstances&Version=2016-11-15";
+        let via_wrapper = sigv4::authorization(&sigv4::RequestToSign {
+            access_key_id: "AKIDEXAMPLE",
+            secret_access_key: "secret",
+            region: "us-east-1",
+            service: "ec2",
+            amz_date: "20150830T123600Z",
+            host: "ec2.us-east-1.amazonaws.com",
+            query: "region=us-east-1",
+            content_type: CONTENT_TYPE,
+            amz_target: None,
+            body,
+        });
+        let via_general = sigv4::authorization_for(&sigv4::SignedRequest {
+            access_key_id: "AKIDEXAMPLE",
+            secret_access_key: "secret",
+            region: "us-east-1",
+            service: "ec2",
+            method: "POST",
+            canonical_uri: "/",
+            query: "region=us-east-1",
+            amz_date: "20150830T123600Z",
+            headers: &[
+                ("content-type", CONTENT_TYPE),
+                ("host", "ec2.us-east-1.amazonaws.com"),
+                ("x-amz-date", "20150830T123600Z"),
+            ],
+            payload_sha256: &sigv4::hex_sha256(body.as_bytes()),
+        });
+        assert_eq!(via_wrapper, via_general);
+    }
+
+    /// An S3 PUT: keyed canonical URI, a sub-resource query string, and the
+    /// mandatory signed `x-amz-content-sha256` header.
+    #[test]
+    fn authorization_for_signs_the_s3_header_set() {
+        let payload = sigv4::hex_sha256(b"part bytes");
+        let auth = sigv4::authorization_for(&sigv4::SignedRequest {
+            access_key_id: "AKIDEXAMPLE",
+            secret_access_key: "secret",
+            region: "eu-west-1",
+            service: "s3",
+            method: "PUT",
+            canonical_uri: "/jamstream/recordings/abc/mix.wav",
+            query: "partNumber=2&uploadId=up-1",
+            amz_date: "20150830T123600Z",
+            headers: &[
+                ("host", "bucket.s3.eu-west-1.amazonaws.com"),
+                ("x-amz-content-sha256", &payload),
+                ("x-amz-date", "20150830T123600Z"),
+            ],
+            payload_sha256: &payload,
+        });
+        assert!(auth.starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/eu-west-1/s3/aws4_request, "
+        ));
+        assert!(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="));
     }
 
     // ---- Encoding and dates ----
