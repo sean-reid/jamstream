@@ -34,6 +34,10 @@ const TONE_HZ: f64 = 440.0;
 /// the analysis length below, as does the tone itself.
 const CONTROL_HZ: [f64; 2] = [300.0, 700.0];
 const TONE_AMPLITUDE: f32 = 0.25;
+/// Absolute floor the captured tone must clear. Well under the played
+/// amplitude because the output device's volume scales what comes back, and
+/// well over the noise a dead path produces.
+const SIGNAL_FLOOR: f64 = 0.005;
 
 /// Discarded before analysis: device startup, the loopback driver's own
 /// buffering, and the encoder reaching steady state.
@@ -235,20 +239,29 @@ fn a_tone_survives_the_round_trip_through_real_hardware() {
         .sqrt();
     println!(
         "440 Hz magnitude {tone:.5}, controls {controls:?}, rms {rms:.5}, \
-         expected tone amplitude {TONE_AMPLITUDE}"
+         played {TONE_AMPLITUDE}, device path gain {:.3}",
+        tone / f64::from(TONE_AMPLITUDE)
     );
 
-    // A silent or disconnected path is the failure this exists to catch, so
-    // check absolute level before the ratio: white noise would pass a ratio
-    // test at a low enough level.
+    // Deliberately not asserted against the played amplitude. The device path
+    // applies its own gain, which is the output device's volume and is not
+    // ours to control: measured 0.25 here, and confirmed linear by playing at
+    // 0.25 and 0.50 and getting 0.061 and 0.129 back. So the absolute floor
+    // only has to separate a working path from a dead or noise-only one, and
+    // the frequency checks below carry the real weight. The printed gain is
+    // there so a human notices if it ever moves a long way.
     assert!(
-        tone > f64::from(TONE_AMPLITUDE) * 0.25,
-        "440 Hz magnitude {tone:.5} is far below the {TONE_AMPLITUDE} tone that was played. \
-         Audio is not reaching the capture side."
+        tone > SIGNAL_FLOOR,
+        "440 Hz magnitude {tone:.5} is below the {SIGNAL_FLOOR} floor. Audio is reaching \
+         the capture side but is not recognisably the tone that was played."
     );
+    // The real check. A round trip that mangled the signal would put energy
+    // somewhere other than 440 Hz. Measured margin is about six orders of
+    // magnitude, so 100x is a wide floor that still fails if the capture is
+    // noise or a different tone.
     for (freq, mag) in CONTROL_HZ.iter().zip(&controls) {
         assert!(
-            tone > mag * 8.0,
+            tone > mag * 100.0,
             "440 Hz magnitude {tone:.5} is not dominant over {freq} Hz at {mag:.5}. \
              The captured signal is not the tone that was played."
         );
