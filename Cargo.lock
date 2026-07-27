@@ -2717,6 +2717,8 @@ version = "0.1.1-beta"
 dependencies = [
  "cpal",
  "hound",
+ "jamstream-engine",
+ "jamstream-protocol",
  "rtrb",
  "thiserror 2.0.19",
  "tracing",

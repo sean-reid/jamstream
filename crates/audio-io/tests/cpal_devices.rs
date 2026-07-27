@@ -1,5 +1,10 @@
 //! Real-device smoke test. Ignored by default: CI runners have no audio
 //! hardware. Run locally with `cargo test -p jamstream-audio-io -- --ignored`.
+//!
+//! This counts callbacks and samples rather than inspecting them, so it passes
+//! on a machine producing pure silence. That is deliberate, because it has to
+//! work on any pair of default devices. `hardware_loopback.rs` checks the
+//! audio content and needs a loopback device to do it.
 
 #![cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 
