@@ -1,8 +1,11 @@
-# Proves the signing secrets work before any release depends on them:
-# imports the Developer ID certificate into a throwaway keychain, signs a
-# freshly built app binary with the hardened runtime, and verifies the
-# signature. Notarization is exercised separately once its credentials
-# exist. Weekly cron doubles as an early warning for certificate problems.
+# A weekly canary for the whole trusted-distribution chain, not just for
+# the certificate. It exists because release.yml deliberately SKIPS
+# notarization with a warning when the ASC secrets are absent: a revoked,
+# deleted, or expired notary key would otherwise ship an un-notarized
+# release quietly, and users would meet Gatekeeper again with nothing
+# having failed. So this job signs a real binary and then actually
+# notarizes it, asserting Accepted, which is the only way to know the
+# credentials still work before a release depends on them.
 name: sign-smoke
 
 on:
@@ -68,6 +71,48 @@ jobs:
             --sign "$IDENTITY" --keychain smoke.keychain "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
           codesign --display --verbose=2 "$BIN" 2>&1 | grep -E "Authority|TeamIdentifier"
+      # The notary credentials are the half that can lapse without anything
+      # failing loudly, so exercise them for real: a signed binary in a zip
+      # is a valid submission and takes a couple of minutes to clear.
+      - if: steps.gate.outputs.configured == 'true'
+        name: Check notarization credentials
+        id: notary
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eu
+          if [ -n "$ASC_KEY_P8" ] && [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$ASC_KEY_P8" ] || [ -n "$ASC_KEY_ID" ] || [ -n "$ASC_ISSUER_ID" ]; then
+            echo "::error::Notarization secrets are PARTIALLY configured; a release would fail." >&2
+            exit 1
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::NOTARIZATION CREDENTIALS ABSENT: releases are shipping signed but not notarized, so first launch shows a Gatekeeper warning. Set ASC_KEY_P8, ASC_KEY_ID, and ASC_ISSUER_ID."
+          fi
+      - if: steps.notary.outputs.configured == 'true'
+        name: Notarize the signed binary
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eu
+          if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
+          else
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc-key.p8"
+          fi
+          ditto -c -k target/release/jamstream-app "$RUNNER_TEMP/smoke.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/smoke.zip" \
+            --key "$RUNNER_TEMP/asc-key.p8" \
+            --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" \
+            --wait | tee "$RUNNER_TEMP/notary.log"
+          rm -f "$RUNNER_TEMP/asc-key.p8"
+          grep -q "status: Accepted" "$RUNNER_TEMP/notary.log"
       - if: always() && steps.gate.outputs.configured == 'true'
         name: Remove the throwaway keychain
         run: security delete-keychain smoke.keychain || true
