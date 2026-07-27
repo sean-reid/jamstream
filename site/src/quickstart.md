@@ -4,7 +4,7 @@ Two paths from nothing to a running session, both in the desktop app. The local 
 
 ## 1. Get the app
 
-Download the desktop app for your platform from the [Download](download.md) page and open it. The app carries its own `jamstreamd` session server, so there is nothing else to install. On macOS the first launch takes one extra confirmation until notarized builds ship; the [Download](download.md#macos) page shows the two clicks.
+Download the desktop app for your platform from the [Download](download.md) page and open it. The app carries its own `jamstreamd` session server, so there is nothing else to install.
 
 ![JamStream home screen with a field to paste an invite and a button to host a session](images/home_empty.png)
 *The home screen: paste an invite to join, or host a session.*
