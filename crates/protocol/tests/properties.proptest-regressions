@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 7a437569bd959b282a460d5093e738b076e70f61b9c8131dac229c3efcb732b9 # shrinks to loss_seed = 15300806121209515896, loss_num = 6, count = 20
+cc 80afc44390a88528aeef4ea5700c0bc959acd6d26ee467da52d08f8437508445 # shrinks to loss_seed = 4896297390500780748, loss_num = 4, count = 38: no send window, so m35 to m37 were abandoned outside the receiver's
+cc 4946420ade3dac0bc422b4246c5add8774d8beae6b47b8ba36be08825a3c1028 # shrinks to loss_seed = 8269775501506396764, loss_num = 4, count = 35: a lone straggler ran MAX_SENDS out at 50% loss
