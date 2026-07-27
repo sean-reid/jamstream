@@ -236,8 +236,10 @@ struct Member {
     jitter: JitterBuffer,
     /// Mono uplink decoder; musicians only.
     decoder: Option<Decoder>,
-    /// Personal mix (musician) or broadcast (listener) downlink encoder.
-    encoder: Encoder,
+    /// Personal mix encoder; musicians only. Personal mixes genuinely differ
+    /// per member, so each needs its own encoder state. Listeners all get the
+    /// same broadcast frame and share [`ServerCore::bcast_encoder`].
+    encoder: Option<Encoder>,
     faders: BTreeMap<MemberId, Fader>,
     click_enabled: bool,
     connected: bool,
@@ -288,6 +290,11 @@ pub struct ServerCore {
     decoded: Vec<(MemberId, [f32; TICK_SAMPLES])>,
     /// 20 ms broadcast accumulator.
     bcast_accum: Vec<f32>,
+    /// The one encoder every listener's stream comes out of, built when the
+    /// first listener is admitted. Encoded-frame scratch beside it, kept
+    /// apart from `pkt_buf` so the payload survives the fanout loop.
+    bcast_encoder: Option<Encoder>,
+    bcast_pkt: Vec<u8>,
     bcast_clock: u64,
     /// Accumulator slot the last tick wrote; the broadcast tap reads it.
     bcast_slot: usize,
@@ -339,6 +346,8 @@ impl ServerCore {
             pkt_buf: Vec::new(),
             decoded: Vec::new(),
             bcast_accum: vec![0.0; BCAST_LEN],
+            bcast_encoder: None,
+            bcast_pkt: Vec::new(),
             bcast_clock: 0,
             bcast_slot: 0,
             bcast_tap: false,
@@ -496,7 +505,10 @@ impl ServerCore {
                     &self.mix_buf
                 }
             };
-            if m.encoder.encode(pcm, &mut self.pkt_buf).is_ok() {
+            let Some(enc) = m.encoder.as_mut() else {
+                continue;
+            };
+            if enc.encode(pcm, &mut self.pkt_buf).is_ok() {
                 let frame = MediaFrame {
                     seq: m.send_seq,
                     timestamp: clock,
@@ -515,32 +527,37 @@ impl ServerCore {
             }
         }
 
-        // The accumulator holds a full 20 ms broadcast frame: encode it for
-        // the listeners.
-        if idx as u64 == BCAST_TICKS - 1 {
+        // The accumulator holds a full 20 ms broadcast frame. Every listener
+        // gets byte-identical PCM, so it is encoded once here and only the
+        // sequence number and the seal differ per member: encoding it per
+        // listener measured 20 x 190 us inside one 2500 us tick.
+        let want_bcast = idx as u64 == BCAST_TICKS - 1
+            && self
+                .members
+                .values()
+                .any(|m| m.connected && m.role == Role::Listener);
+        if want_bcast
+            && let Some(enc) = self.bcast_encoder.as_mut()
+            && enc.encode(&self.bcast_accum, &mut self.bcast_pkt).is_ok()
+        {
             for (&id, m) in self.members.iter_mut() {
                 if !m.connected || m.role != Role::Listener {
                     continue;
                 }
-                if m.encoder
-                    .encode(&self.bcast_accum, &mut self.pkt_buf)
-                    .is_ok()
+                let frame = MediaFrame {
+                    seq: m.send_seq,
+                    timestamp: self.bcast_clock,
+                    duration: FrameDuration::Ms20,
+                    stereo: true,
+                    payload: &self.bcast_pkt,
+                    redundant: None,
+                }
+                .encode();
+                m.send_seq = m.send_seq.wrapping_add(1);
+                if let (Some(s), Some(a)) = (m.session.as_mut(), m.addr)
+                    && let Ok(dg) = s.seal(id, &frame)
                 {
-                    let frame = MediaFrame {
-                        seq: m.send_seq,
-                        timestamp: self.bcast_clock,
-                        duration: FrameDuration::Ms20,
-                        stereo: true,
-                        payload: &self.pkt_buf,
-                        redundant: None,
-                    }
-                    .encode();
-                    m.send_seq = m.send_seq.wrapping_add(1);
-                    if let (Some(s), Some(a)) = (m.session.as_mut(), m.addr)
-                        && let Ok(dg) = s.seal(id, &frame)
-                    {
-                        out.push((a, dg));
-                    }
+                    out.push((a, dg));
                 }
             }
         }
@@ -918,16 +935,26 @@ impl ServerCore {
             tracing::debug!(member = id.0, "admission refused: role at capacity");
             return;
         }
+        // One encoder serves every listener, built on the first one to join.
+        if token.role == Role::Listener && self.bcast_encoder.is_none() {
+            match Encoder::new(Channels::Stereo, FrameDuration::Ms20, BROADCAST_BITRATE) {
+                Ok(e) => self.bcast_encoder = Some(e),
+                Err(_) => {
+                    tracing::error!("broadcast encoder construction failed at admission");
+                    return;
+                }
+            }
+        }
         let media = match token.role {
             Role::Musician => {
                 Encoder::new(Channels::Stereo, FrameDuration::Ms2_5, PERSONAL_MIX_BITRATE).and_then(
-                    |e| Decoder::new(Channels::Mono, FrameDuration::Ms2_5).map(|d| (e, Some(d))),
+                    |e| {
+                        Decoder::new(Channels::Mono, FrameDuration::Ms2_5)
+                            .map(|d| (Some(e), Some(d)))
+                    },
                 )
             }
-            Role::Listener => {
-                Encoder::new(Channels::Stereo, FrameDuration::Ms20, BROADCAST_BITRATE)
-                    .map(|e| (e, None))
-            }
+            Role::Listener => Ok((None, None)),
         };
         let Ok((encoder, decoder)) = media else {
             tracing::error!("codec construction failed at admission");
