@@ -4,13 +4,12 @@
 //! trust-on-first-use. The client's own identity is the signed token it
 //! carries in the first message, not its (fresh per connection) keypair.
 
-use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use snow::{Builder, HandshakeState, StatelessTransportState};
 use zeroize::Zeroizing;
 
 use crate::ids::{MemberId, SessionId};
-use crate::invite::{Invite, Token};
+use crate::invite::{Invite, SignatureBytes, Token};
 use crate::replay::ReplayWindow;
 use crate::wire;
 use crate::{Error, PROTOCOL_VERSION};
@@ -46,7 +45,10 @@ pub fn derive_public(private: &[u8]) -> Result<[u8; 32], Error> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakePayload {
     pub token: Token,
-    pub signature: Signature,
+    /// Raw 64-byte Ed25519 signature; see [`SignatureBytes`] for why this is
+    /// an array and not `ed25519_dalek::Signature`.
+    #[serde(with = "crate::invite::sig_bytes")]
+    pub signature: SignatureBytes,
 }
 
 /// Server's reply payload in the second handshake message. `sample_clock`
@@ -384,6 +386,48 @@ mod tests {
         assert!(
             Responder::read_init(&imposter.private, &invite.session_id, version, noise).is_err()
         );
+    }
+
+    /// Pins the `HandshakePayload` encoding against the published beta. This
+    /// payload rides inside the encrypted Noise IK first message, so a change
+    /// here breaks the handshake itself, not just invite strings: a peer would
+    /// decrypt successfully and then fail to parse. Same fence as
+    /// `invite_wire_encoding_is_pinned`; fix the encoding, not the vector.
+    #[test]
+    fn handshake_payload_wire_encoding_is_pinned() {
+        // The exact 92 bytes produced by 0.1.1-beta (ed25519 2.2.3): a
+        // 28-byte token followed by 64 bare signature bytes, no length prefix.
+        #[rustfmt::skip]
+        const V2_HANDSHAKE_HEX: &str = "03000103616e6180d0acf30e09090909090909090909090909090909719eaeb59a4eac1698d844f7f649100f996eca2dffd9aa11d350ffaa08a26bf49f071be5d2902e70293c393fc28f96b1582321f19e8beaaf3e7970c0482d7801";
+
+        let issuer = Issuer::from_bytes(&[7u8; 32]);
+        let invite = issuer.mint(
+            SessionId([5u8; 16]),
+            vec!["203.0.113.10:43210".parse().unwrap()],
+            [7u8; 32],
+            Token {
+                member_id: MemberId(3),
+                role: Role::Musician,
+                name_hint: Some("ana".into()),
+                expires_unix: 4_000_000_000,
+                jti: TokenId([9u8; 16]),
+            },
+        );
+        let hp = HandshakePayload {
+            token: invite.token.clone(),
+            signature: invite.signature,
+        };
+        let bytes = postcard::to_stdvec(&hp).expect("serialize");
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&bytes),
+            V2_HANDSHAKE_HEX,
+            "handshake payload encoding drifted from the 0.1.1-beta bytes"
+        );
+        assert_eq!(bytes.len(), 92);
+        // Beta-encoded bytes still parse back.
+        let back: HandshakePayload = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.signature, hp.signature);
+        assert_eq!(back.token, hp.token);
     }
 
     #[test]

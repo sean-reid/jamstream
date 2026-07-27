@@ -366,6 +366,103 @@ fn fader_mute_silences_the_member() {
     }
 }
 
+/// An avatar the whole way: raw file bytes into one runtime's
+/// `SetOwnAvatar`, hashed and announced by the session core, requested and
+/// chunked by the server, decoded once on the far side, and attached to the
+/// matching member in the snapshot the UI paints. Also the other half of the
+/// contract: a decode failure never reaches a snapshot.
+#[test]
+fn an_avatar_crosses_between_runtimes_and_decodes_once() {
+    let server = TestServer::start();
+    let a = join_silent(&server, 1, "a");
+    let b = join_silent(&server, 2, "b");
+
+    for (rt, who) in [(&a, "a"), (&b, "b")] {
+        wait_for(rt, who, Duration::from_secs(10), |s| {
+            joined(s) && s.members.len() == 2
+        });
+    }
+    // Nobody has a picture yet: the roster carries no hash, so the UI gets
+    // None and draws initials.
+    assert!(b.snapshot().members.iter().all(|m| m.avatar.is_none()));
+
+    // Two chunks' worth, so the train is more than one message.
+    let png = wide_png(120, 60);
+    assert!(
+        png.len() > 8 * 1024,
+        "one chunk would not exercise the train"
+    );
+    a.send(Command::SetOwnAvatar(Some(png)));
+
+    let snap = wait_for(&b, "a's avatar", Duration::from_secs(10), |s| {
+        s.members
+            .iter()
+            .any(|m| m.id == MemberId(1) && m.avatar.is_some())
+    });
+    let member = snap
+        .members
+        .iter()
+        .find(|m| m.id == MemberId(1))
+        .expect("a on b's roster");
+    let handle = member.avatar.as_ref().expect("decoded avatar");
+    assert_eq!((handle.width, handle.height), (120, 60));
+    assert_eq!(handle.rgba.len(), 120 * 60 * 4);
+    // Content-addressed: the hash is the Blake2s hex the transfer used.
+    assert_eq!(handle.hash.len(), 64);
+    assert!(handle.hash.chars().all(|c| c.is_ascii_hexdigit()));
+    // Nobody else grew a picture.
+    assert!(
+        snap.members
+            .iter()
+            .filter(|m| m.id != MemberId(1))
+            .all(|m| m.avatar.is_none())
+    );
+    // Two frames of the same snapshot share the buffer: decoded once, and
+    // the UI's texture cache keys off that one hash.
+    let again = b.snapshot();
+    let second = again
+        .members
+        .iter()
+        .find(|m| m.id == MemberId(1))
+        .and_then(|m| m.avatar.clone())
+        .expect("still there");
+    assert!(
+        std::sync::Arc::ptr_eq(&handle.rgba, &second.rgba),
+        "each snapshot must hand out the same decode, not a new one"
+    );
+
+    // Bytes that are not an image travel exactly the same way and are
+    // dropped at the decoder: the member keeps their initials disc.
+    let garbage = vec![0x42u8; 9_000];
+    b.send(Command::SetOwnAvatar(Some(garbage)));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert!(
+            a.snapshot()
+                .members
+                .iter()
+                .filter(|m| m.id == MemberId(2))
+                .all(|m| m.avatar.is_none()),
+            "undecodable bytes must never reach a snapshot"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A landscape PNG large enough to need several 8 KB chunks: noise, so the
+/// encoder cannot compress it down to one.
+fn wide_png(w: u32, h: u32) -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let img = image::RgbaImage::from_fn(w, h, |x, y| {
+        let n = x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503);
+        image::Rgba([(n >> 3) as u8, (n >> 11) as u8, (n >> 19) as u8, 255])
+    });
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("encode png");
+    buf.into_inner()
+}
+
 #[test]
 fn leave_tears_down_and_shrinks_the_roster() {
     let server = TestServer::start();
