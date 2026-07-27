@@ -33,11 +33,28 @@ pub fn client() -> reqwest::Client {
 /// responses have up to 4 KB of body read and embedded in the returned
 /// error; [`error_body`] recovers the raw snippet.
 pub async fn send_retrying(build: impl Fn() -> RequestBuilder) -> Result<Response, ProviderError> {
+    send_retrying_accepting(&[], build).await
+}
+
+/// [`send_retrying`] with an allow-list of non-2xx statuses treated as
+/// success and handed back to the caller unclassified.
+///
+/// Needed by protocols that signal progress with a non-2xx code rather than
+/// an error: the GCS resumable upload answers every intermediate chunk with
+/// `308 Resume Incomplete` and a cancelled upload session with `499`.
+/// Callers that pass an allow-list must inspect [`Response::status`]
+/// themselves. Statuses outside the list keep the standard classification,
+/// including its retry behavior, so this is not an escape hatch from the
+/// politeness rules.
+pub async fn send_retrying_accepting(
+    accept: &[u16],
+    build: impl Fn() -> RequestBuilder,
+) -> Result<Response, ProviderError> {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         let outcome = match build().send().await {
-            Ok(resp) => classify(resp).await,
+            Ok(resp) => classify(resp, accept).await,
             Err(err) if err.is_connect() || err.is_timeout() => {
                 Outcome::Retry(ProviderError::Transient(err.to_string()), None)
             }
@@ -70,9 +87,9 @@ enum Outcome {
     Retry(ProviderError, Option<Duration>),
 }
 
-async fn classify(resp: Response) -> Outcome {
+async fn classify(resp: Response, accept: &[u16]) -> Outcome {
     let status = resp.status();
-    if status.is_success() {
+    if status.is_success() || accept.contains(&status.as_u16()) {
         return Outcome::Ok(resp);
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
@@ -281,6 +298,47 @@ mod tests {
             error_body(&ProviderError::RateLimited { retry_after: None }),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_statuses_pass_through_without_retrying() {
+        // The GCS resumable protocol answers intermediate chunks with 308,
+        // which is neither a success nor an error; the allow-list hands it
+        // back once, unretried.
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/chunk"))
+            .respond_with(ResponseTemplate::new(308).insert_header("range", "bytes=0-8388607"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client();
+        let resp = send_retrying_accepting(&[308], || c.put(format!("{}/chunk", server.uri())))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 308);
+        assert_eq!(
+            resp.headers().get("range").unwrap(),
+            "bytes=0-8388607",
+            "the raw response must reach the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn statuses_outside_the_allow_list_keep_their_classification() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/denied"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client();
+        let err =
+            send_retrying_accepting(&[308, 499], || c.put(format!("{}/denied", server.uri())))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, ProviderError::Auth(_)), "got {err:?}");
     }
 
     #[tokio::test]

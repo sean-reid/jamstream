@@ -1,0 +1,250 @@
+//! Generic behavioral suite every [`ObjectStore`] implementation must pass,
+//! mirroring [`crate::contract`] for providers. Run it from each
+//! implementation's tests; a new backend merges only if this passes
+//! unchanged.
+
+use crate::provider::ProviderError;
+use crate::retention::Retention;
+use crate::storage::{
+    BytesSource, ObjectStore, PartSource, WAV_CONTENT_TYPE, manifest_key, mix_key, session_prefix,
+    stem_key,
+};
+
+/// Panics on the first contract violation.
+///
+/// `bucket` must exist and hold nothing under
+/// [`crate::storage::RECORDING_PREFIX`]; the suite cleans up after itself and
+/// asserts that it did.
+pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str) {
+    let session = "contract-session";
+    let prefix = session_prefix(session);
+    let mix = mix_key(session);
+    let stem = stem_key(session, "contract-member");
+    let manifest = manifest_key(session);
+
+    // ---- Absent objects ----
+
+    match store.head(bucket, &mix).await {
+        Err(ProviderError::NotFound(_)) => {}
+        other => panic!("head of a missing object must be NotFound, got {other:?}"),
+    }
+    let listed = store
+        .list(bucket, &prefix)
+        .await
+        .expect("list of an empty prefix must succeed");
+    assert!(
+        listed.is_empty(),
+        "the suite requires a clean prefix, found {listed:?}"
+    );
+    // Idempotent delete: cleanup paths run after partial failures and must
+    // not have to know whether the object made it.
+    store
+        .delete(bucket, &mix)
+        .await
+        .expect("deleting a missing object must succeed");
+
+    // ---- Single-shot put ----
+
+    let manifest_body = br#"{"session":"contract-session"}"#;
+    let meta = store
+        .put(bucket, &manifest, "application/json", manifest_body)
+        .await
+        .expect("put must succeed");
+    assert_eq!(meta.key, manifest, "put must echo the key it wrote");
+    assert_eq!(meta.size, manifest_body.len() as u64);
+
+    let head = store.head(bucket, &manifest).await.expect("head after put");
+    assert_eq!(head.size, manifest_body.len() as u64, "head size mismatch");
+    if let Some(ct) = &head.content_type {
+        assert_eq!(ct, "application/json", "content type was not preserved");
+    }
+
+    // ---- put_stream: one part, so the plain PUT path ----
+
+    // Exactly one full part: the boundary case for the escalation decision,
+    // which must still take the single-PUT path because the lookahead read
+    // comes back empty.
+    let short_len = store.part_size().min(1024);
+    let short: Vec<u8> = (0..short_len).map(|i| (i % 251) as u8).collect();
+    let meta = store
+        .put_stream(
+            bucket,
+            &stem,
+            WAV_CONTENT_TYPE,
+            &mut BytesSource::new(short.clone()),
+        )
+        .await
+        .expect("single-part put_stream must succeed");
+    assert_eq!(meta.size, short.len() as u64);
+    assert_eq!(
+        store.head(bucket, &stem).await.expect("head stem").size,
+        short.len() as u64
+    );
+
+    // ---- put_stream: several parts, so the multipart path ----
+
+    // Two and a bit parts, so there is a first part, a middle part, and a
+    // short final part.
+    let big_len = store.part_size() * 2 + 7;
+    let meta = store
+        .put_stream(
+            bucket,
+            &mix,
+            WAV_CONTENT_TYPE,
+            &mut CountingSource::new(big_len),
+        )
+        .await
+        .expect("multipart put_stream must succeed");
+    assert_eq!(
+        meta.size, big_len as u64,
+        "the completed object must report the full body size"
+    );
+    let head = store.head(bucket, &mix).await.expect("head mix");
+    assert_eq!(
+        head.size, big_len as u64,
+        "the stored object is not the size that was uploaded"
+    );
+
+    // ---- Listing ----
+
+    let listed = store.list(bucket, &prefix).await.expect("list prefix");
+    let keys: Vec<&str> = listed.iter().map(|m| m.key.as_str()).collect();
+    for expected in [&mix, &stem, &manifest] {
+        assert!(
+            keys.contains(&expected.as_str()),
+            "list under {prefix} missed {expected}: {keys:?}"
+        );
+    }
+    assert!(
+        listed.windows(2).all(|w| w[0].key <= w[1].key),
+        "list must be sorted by key: {keys:?}"
+    );
+    let stems_only = store
+        .list(bucket, &format!("{prefix}stems/"))
+        .await
+        .expect("list stems");
+    assert_eq!(
+        stems_only.len(),
+        1,
+        "a narrower prefix must narrow the listing: {stems_only:?}"
+    );
+    assert_eq!(stems_only[0].key, stem);
+    let nothing = store
+        .list(bucket, "jamstream/recordings/no-such-session/")
+        .await
+        .expect("list of an unrelated prefix");
+    assert!(nothing.is_empty(), "prefix filter leaked: {nothing:?}");
+
+    // ---- Retention ----
+
+    for retention in Retention::ALL {
+        let applied = store
+            .set_retention(bucket, &prefix, retention)
+            .await
+            .unwrap_or_else(|e| panic!("set_retention({retention}) failed: {e}"));
+        assert_eq!(
+            applied.retention(),
+            retention,
+            "set_retention reported a different choice than it was given"
+        );
+        assert!(
+            !applied.describe().is_empty(),
+            "every enforcement outcome needs a line a host can read"
+        );
+    }
+
+    // ---- Cleanup ----
+
+    for key in [&mix, &stem, &manifest] {
+        store.delete(bucket, key).await.expect("delete");
+        match store.head(bucket, key).await {
+            Err(ProviderError::NotFound(_)) => {}
+            other => panic!("{key} survived delete: {other:?}"),
+        }
+        // Second delete is a no-op, not an error.
+        store.delete(bucket, key).await.expect("double delete");
+    }
+    let leftovers = store.list(bucket, &prefix).await.expect("final list");
+    assert!(
+        leftovers.is_empty(),
+        "the contract suite must leave nothing behind, found {leftovers:?}"
+    );
+}
+
+/// Generates `len` deterministic bytes without holding them all in memory
+/// twice, so the multipart leg of the suite stays cheap even at a realistic
+/// part size.
+struct CountingSource {
+    remaining: usize,
+    produced: usize,
+}
+
+impl CountingSource {
+    fn new(len: usize) -> Self {
+        CountingSource {
+            remaining: len,
+            produced: 0,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PartSource for CountingSource {
+    async fn next_part(&mut self, max: usize) -> crate::provider::Result<Vec<u8>> {
+        let take = self.remaining.min(max);
+        let part: Vec<u8> = (0..take)
+            .map(|i| ((self.produced + i) % 251) as u8)
+            .collect();
+        self.remaining -= take;
+        self.produced += take;
+        Ok(part)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::MockStore;
+    use crate::types::ProviderKind;
+
+    #[tokio::test]
+    async fn mock_store_passes_contract() {
+        for kind in [
+            ProviderKind::Aws,
+            ProviderKind::DigitalOcean,
+            ProviderKind::Gcp,
+        ] {
+            let store = MockStore::new(kind).with_part_size(32);
+            assert_object_store_contract(&store, "contract-bucket").await;
+            assert!(
+                store.pending_uploads().is_empty(),
+                "the contract suite left a multipart upload open on {kind}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_store_without_lifecycle_support_still_passes_contract() {
+        // The documented-note fallback is a legitimate outcome, not a
+        // contract violation.
+        let store = MockStore::new(ProviderKind::Local)
+            .with_part_size(32)
+            .without_lifecycle_support();
+        assert_object_store_contract(&store, "contract-bucket").await;
+    }
+
+    #[tokio::test]
+    async fn contract_exercises_a_real_multipart_upload() {
+        let store = MockStore::new(ProviderKind::Aws).with_part_size(32);
+        assert_object_store_contract(&store, "b").await;
+        let begins = store
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, crate::storage::mock::StoreCall::Begin { .. }))
+            .count();
+        assert_eq!(
+            begins, 1,
+            "the suite must open exactly one multipart upload"
+        );
+    }
+}

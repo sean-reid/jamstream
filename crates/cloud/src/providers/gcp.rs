@@ -217,6 +217,13 @@ impl GcpProvider {
         ))
     }
 
+    /// The provider's token source, so a recording upload can authenticate
+    /// as the same GCP identity that launched the VM instead of asking the
+    /// host for a second credential. See [`crate::storage::GcsStore`].
+    pub fn token_source(&self) -> Arc<dyn TokenSource> {
+        Arc::clone(&self.token)
+    }
+
     /// Overrides the API endpoint (tests point this at a mock server).
     pub fn with_base_url(mut self, url: String) -> Self {
         self.base_url = url.trim_end_matches('/').to_owned();

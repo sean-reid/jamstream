@@ -13,7 +13,7 @@ pub const STREAM_DEST_AUDIO_KBPS: u64 = 128;
 /// Per-listener Opus stream.
 pub const LISTENER_KBPS: u64 = 150;
 
-const BYTES_PER_GB: u128 = 1_000_000_000;
+pub(crate) const BYTES_PER_GB: u128 = 1_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineItem {
@@ -29,12 +29,12 @@ pub struct CostPreview {
     pub egress_bytes_estimate: u64,
 }
 
-fn div_round(num: u128, den: u128) -> u64 {
+pub(crate) fn div_round(num: u128, den: u128) -> u64 {
     ((num + den / 2) / den) as u64
 }
 
 /// GB with two decimals from bytes, deterministic.
-fn gb_display(bytes: u64) -> String {
+pub(crate) fn gb_display(bytes: u64) -> String {
     let centi_gb = div_round(bytes as u128, 10_000_000);
     format!("{}.{:02} GB", centi_gb / 100, centi_gb % 100)
 }
@@ -105,6 +105,18 @@ impl CostPreview {
             total_microusd,
             egress_bytes_estimate: egress_bytes,
         }
+    }
+
+    /// Folds a recording estimate into this preview: the recording's line
+    /// items are appended and its total added, so a host sees one number for
+    /// the session whether or not they turned recording on.
+    ///
+    /// Additive on purpose. [`CostPreview::compute`] keeps its signature, and
+    /// a caller that never records never mentions recording.
+    pub fn with_recording(mut self, recording: &crate::recording::RecordingEstimate) -> Self {
+        self.line_items.extend(recording.line_items.iter().cloned());
+        self.total_microusd += recording.total_microusd;
+        self
     }
 
     /// Plain aligned strings, one per line item plus the total row.
@@ -222,5 +234,39 @@ mod tests {
         };
         let rows = CostPreview::compute(&price, 2.0, 4, 2, 10).display_table();
         assert!(rows[2].ends_with("-$0.071604"), "row was {:?}", rows[2]);
+    }
+
+    #[test]
+    fn recording_folds_into_the_session_preview() {
+        use crate::recording::{RecordingEstimate, RecordingPlan};
+        use crate::types::{ProviderKind, RegionId};
+
+        let session = CostPreview::compute(&aws_like(), 2.0, 4, 2, 10);
+        let session_total = session.total_microusd;
+        let recording = RecordingEstimate::compute(
+            ProviderKind::Aws,
+            &RegionId::new("us-east-1"),
+            &RecordingPlan::with_stems(4),
+            2.0,
+        )
+        .unwrap();
+
+        let combined = session.with_recording(&recording);
+        // Two session rows plus the recording's two, and one total.
+        assert_eq!(combined.line_items.len(), 4);
+        assert_eq!(
+            combined.total_microusd,
+            session_total + recording.total_microusd
+        );
+        assert_eq!(combined.total_microusd, 678_036 + 468_634);
+        let rows = combined.display_table();
+        assert_eq!(rows.len(), 5);
+        assert!(rows[2].contains("Recording 4.15 GB (mix + 4 stems, 16-bit) for 30 days"));
+        assert!(rows[4].ends_with("$1.14667"), "row was {:?}", rows[4]);
+        // Turning recording off must leave the session preview untouched.
+        assert_eq!(
+            CostPreview::compute(&aws_like(), 2.0, 4, 2, 10).total_microusd,
+            session_total
+        );
     }
 }
