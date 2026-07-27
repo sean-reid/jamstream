@@ -47,6 +47,15 @@ name: release
 on:
   release:
     types: [published]
+  # Release-please publishes with the workflow token, whose events do not
+  # trigger workflows (recursion guard), so its workflow chains into this
+  # one by explicit dispatch, the sanctioned exception.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build artifacts for
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -54,7 +63,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GH_TOKEN: ${{ github.token }}
-  TAG: ${{ github.event.release.tag_name }}
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
   # Static musl server: the artifact session VMs download at boot. Runs
