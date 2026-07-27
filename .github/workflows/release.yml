@@ -251,7 +251,18 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           set -eu
-          printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
+          # The secret may hold the raw pkcs8 pem or a base64 wrapping of
+          # it; accept either so a correctly-set secret never fails on
+          # encoding alone.
+          if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
+          else
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc-key.p8"
+          fi
+          if ! grep -q 'BEGIN PRIVATE KEY' "$RUNNER_TEMP/asc-key.p8"; then
+            echo "::error::ASC_KEY_P8 is neither a pkcs8 pem nor base64 of one" >&2
+            exit 1
+          fi
           ditto -c -k --keepParent dist/JamStream.app "$RUNNER_TEMP/JamStream.zip"
           xcrun notarytool submit "$RUNNER_TEMP/JamStream.zip" \
             --key "$RUNNER_TEMP/asc-key.p8" \
