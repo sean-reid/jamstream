@@ -17,7 +17,7 @@
 
         <meta name="description" content="{{ description }}">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta name="theme-color" content="#121212">
+        <meta name="theme-color" content="#121314">
 
         {{#if favicon_svg}}
         <link rel="icon" href="{{ resource "favicon.svg" }}">
@@ -25,6 +25,13 @@
         {{#if favicon_png}}
         <link rel="shortcut icon" href="{{ resource "favicon.png" }}">
         {{/if}}
+        <!-- theme/css/palette.css holds the palette custom properties these
+             stylesheets resolve through. It is generated from
+             crates/client/src/theme.rs by scripts/render-palette.sh and is
+             linked through book.toml's additional-css (mdBook only copies
+             the theme files it knows by name), so it arrives in the
+             additional_css loop below. Custom property resolution does not
+             depend on declaration order, so loading it last is fine. -->
         <link rel="stylesheet" href="{{ resource "css/variables.css" }}">
         <link rel="stylesheet" href="{{ resource "css/general.css" }}">
         <link rel="stylesheet" href="{{ resource "css/chrome.css" }}">

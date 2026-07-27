@@ -27,6 +27,11 @@ preferred-dark-theme = "jamstream"
 # from "---" in text, so it stays off.
 smart-punctuation = false
 git-repository-url = "https://github.com/sean-reid/jamstream"
+# theme/css/palette.css is generated from the app's palette by
+# scripts/render-palette.sh (theme/css/variables.css consumes it). mdBook
+# only copies the theme files it knows by name, so it ships as additional
+# css; index.hbs explains the arrangement where the stylesheets are linked.
+additional-css = ["theme/css/palette.css"]
 # Unhashed resource filenames so the @font-face urls in theme/fonts/fonts.css
 # resolve as written (mdBook 0.5 does not rewrite urls inside custom theme
 # CSS). Cache busting matters less than working fonts.
