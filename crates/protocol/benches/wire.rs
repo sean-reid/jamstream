@@ -116,7 +116,10 @@ fn wire_bench(c: &mut Criterion) {
     let transport = wire::build_transport(MemberId(3), 9_001, &ciphertext);
     let noise = payload(96);
     let init = wire::build_handshake_init(1, &noise);
-    let server_pk = [7u8; 32];
+    // A reject is keyed on the secret one handshake shares with the server,
+    // so the key comes from an initiator rather than from an invite.
+    let (initiator, _) = Initiator::new(&invite().2).expect("initiator");
+    let reject_key = initiator.reject_key().expect("reject key").clone();
 
     g.bench_function("build/transport", |b| {
         b.iter(|| {
@@ -138,7 +141,7 @@ fn wire_bench(c: &mut Criterion) {
     g.bench_function("build/version_reject", |b| {
         b.iter(|| {
             black_box(wire::build_version_reject(
-                &server_pk,
+                &reject_key,
                 1,
                 black_box(2),
                 black_box(&init),
