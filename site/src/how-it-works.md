@@ -6,8 +6,8 @@ One honest page on what actually happens when you host and play. Deeper detail l
 
 When you host on a cloud provider, your computer asks it for one small Linux VM and hands it a boot script. (In [local mode](guides/local.md) there is no VM: the same server starts as a process on your machine, with the same keys and settings, and the story picks up at step 5.) The machine:
 
-1. downloads a pinned build of `jamstreamd`, the session server, from the artifact URL;
-2. verifies the download's sha256 checksum against the one baked in at launch, and refuses to start on a mismatch;
+1. downloads a pinned build of `jamstreamd`, the session server; release builds carry the URL of their release's own server build baked in, so host and server always match;
+2. verifies the download's sha256 checksum against the one pinned alongside the URL, and refuses to start on a mismatch;
 3. writes its keys and settings from launch data held in memory, never onto a disk image that outlives it;
 4. closes its firewall down to the one UDP session port and cuts off the cloud's metadata service;
 5. starts serving.

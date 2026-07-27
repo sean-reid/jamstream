@@ -13,7 +13,7 @@ $ jamstream --version
 
 The [Download](download.md) page has the desktop app, the Windows install script, and direct links to every artifact. If no release has been published yet, the script says so and exits; building from source works on every platform with a Rust toolchain ([rustup.rs](https://rustup.rs)): clone the repository, then `cargo install --path crates/cli`.
 
-The local path below also needs the `jamstreamd` server binary on this computer. On Linux x86_64, append `-s -- --with-server` to the install line to get it; elsewhere the desktop app ships it alongside the app, or `cargo install --path crates/server` builds it. The internet path does not need it locally; skip it if you are only hosting in the cloud.
+If you use the desktop app, that is the whole install: the app carries its own `jamstreamd` session server, so both paths on this page work from the app with nothing else. The local path with the CLI alone also needs `jamstreamd` on this computer: on Linux x86_64, append `-s -- --with-server` to the install line to get it; elsewhere `cargo install --path crates/server` builds it. The internet path does not need it locally; skip it if you are only hosting in the cloud.
 
 ## 2. Host on this computer
 
@@ -91,24 +91,15 @@ $ jamstream sweep --dry-run --provider digitalocean
 No jamstream-tagged instances found.
 ```
 
-### Point at a server build
-
-No `jamstreamd` release artifact is published yet. Until one is, hosting on a cloud provider needs two extra flags naming a Linux x86_64 musl build of `jamstreamd` that the new machine can download, plus its checksum:
-
-```console
-$ cargo build --release -p jamstream-server
-$ shasum -a 256 target/release/jamstreamd
-```
-
-Host the binary anywhere the new VM can reach over HTTPS, and note the sha256. When releases exist this step disappears.
-
 ### Host
 
+Every release build knows which server the new machine should run: the exact `jamstreamd` build published with that release, and its checksum, are pinned in at compile time, and the VM verifies the download at boot. There is no server URL to find and nothing extra to pass:
+
 ```console
-$ jamstream host --provider digitalocean \
-    --artifact-url https://your-host.example/jamstreamd \
-    --artifact-sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+$ jamstream host --provider digitalocean
 ```
+
+(Only if you built the CLI from source is there no pin; then `--artifact-url` and `--artifact-sha256` must name a Linux x86_64 musl build of `jamstreamd` the machine can download; see the flags in the [host reference](cli/host.md).)
 
 The CLI probes each region from your machine, ranks them, and shows a cost preview before anything launches. Example output; region timings and the session id will differ:
 

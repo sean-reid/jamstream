@@ -56,9 +56,10 @@ The two hashes must match; `Get-FileHash` prints uppercase and `SHA256SUMS` is l
 
 - Desktop app (x86_64): [jamstream-app-linux-x86_64.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-linux-x86_64.tar.gz)
 - CLI (x86_64): [jamstream-cli-linux-x86_64.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-linux-x86_64.tar.gz)
-- Session server, static musl build (x86_64): [jamstreamd-linux-x86_64-musl.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-x86_64-musl.tar.gz)
+- Session server, static musl build (x86_64), tarred: [jamstreamd-linux-x86_64-musl.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-x86_64-musl.tar.gz)
+- Session server, the same build as a bare binary: [jamstreamd-linux-x86_64-musl](https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-x86_64-musl)
 
-The server tarball is the same artifact the cloud session machines download at boot; installing it locally (the install script's `--with-server` flag does this) is only needed for [hosting on your own computer](guides/local.md). No arm64 Linux builds are published yet; build from source on that platform.
+The bare server binary is the exact artifact a release's clients tell cloud session machines to download and verify at boot; its URL and sha256 are pinned into that release's app and CLI at build time, so you never handle it yourself. The tarball packages the same binary for humans and the install script (the script's `--with-server` flag installs it), which is only needed for [hosting on your own computer](guides/local.md) with the CLI alone; the desktop app tarball already bundles `jamstreamd`. No arm64 Linux builds are published yet; build from source on that platform.
 
 Verify a download against the release checksums:
 

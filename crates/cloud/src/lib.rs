@@ -3,6 +3,7 @@
 //! and cloud-init rendering. Concrete AWS, DigitalOcean, and GCP
 //! implementations plug in behind the Provider trait.
 
+pub mod artifact;
 pub mod cloudinit;
 pub mod contract;
 pub mod cost;
@@ -15,6 +16,7 @@ pub mod solver;
 pub mod sweeper;
 pub mod types;
 
+pub use artifact::{PinnedServerArtifact, pinned};
 pub use cloudinit::{BootConfig, SelfDestruct};
 pub use contract::assert_provider_contract;
 pub use cost::{CostPreview, LineItem};
