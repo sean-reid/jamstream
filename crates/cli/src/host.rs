@@ -409,8 +409,17 @@ pub fn invite_label(role: Role, member: MemberId) -> String {
     }
 }
 
-/// Host invite first (member 0), then musicians 1..=N, then listeners.
-fn mint_invites(
+/// Mints the session's invite book: the host (member 0) first, then the
+/// remaining musician seats, then the listeners.
+///
+/// `musicians` is the total number of musician seats *including the host's
+/// own*, matching `--musicians` and [`jamstream_session::MAX_MUSICIANS`], so
+/// a value of N yields one host invite plus N-1 musician invites and the
+/// server admits exactly the seats that were minted. `musicians` of 0 is
+/// treated as 1 (the host alone); the flag's range makes that unreachable.
+///
+/// The desktop app calls this too, so both surfaces mint identically.
+pub fn mint_invites(
     issuer: &Issuer,
     session_id: SessionId,
     address: SocketAddr,
@@ -430,12 +439,13 @@ fn mint_invites(
         let invite = issuer.mint(session_id, vec![address], server_pk, token);
         (invite_label(role, MemberId(member)), invite)
     };
+    let seats = u16::from(musicians).max(1);
     let mut invites = vec![mint(HOST_MEMBER_ID.0, Role::Musician)];
-    for m in 1..=u16::from(musicians) {
+    for m in 1..seats {
         invites.push(mint(m, Role::Musician));
     }
     for l in 0..u16::from(listeners) {
-        invites.push(mint(u16::from(musicians) + 1 + l, Role::Listener));
+        invites.push(mint(seats + l, Role::Listener));
     }
     invites
 }
@@ -572,6 +582,7 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use jamstream_cloud::MockProvider;
+    use jamstream_session::MAX_MUSICIANS;
 
     #[test]
     fn fabricated_rtts_are_deterministic_and_in_range() {
@@ -690,19 +701,24 @@ mod tests {
         assert_eq!(invite_label(Role::Listener, MemberId(5)), "listener 5");
     }
 
-    #[test]
-    fn invites_cover_host_musicians_then_listeners() {
+    fn mint_seats(musicians: u8, listeners: u8) -> Vec<(String, Invite)> {
         let issuer = Issuer::generate();
         let keys = generate_keypair();
-        let invites = mint_invites(
+        mint_invites(
             &issuer,
             SessionId::generate(),
             "10.0.0.1:43210".parse().unwrap(),
             keys.public,
             9_999,
-            2,
-            2,
-        );
+            musicians,
+            listeners,
+        )
+    }
+
+    #[test]
+    fn invites_cover_host_musicians_then_listeners() {
+        // Three musician seats: the host's own plus two guests.
+        let invites = mint_seats(3, 2);
         let labels: Vec<&str> = invites.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(
             labels,
@@ -718,5 +734,52 @@ mod tests {
         assert_eq!(invites[0].1.token.member_id, MemberId(0));
         assert_eq!(invites[0].1.token.role, Role::Musician);
         assert_eq!(invites[4].1.token.role, Role::Listener);
+    }
+
+    // The seat count includes the host, so what gets minted is exactly what
+    // the server admits: at the cap, every minted musician invite has a seat,
+    // and one more would be refused (see the session crate's
+    // musician_capacity_enforced).
+    #[test]
+    fn minted_musician_seats_match_what_the_server_admits() {
+        let at_cap = mint_seats(MAX_MUSICIANS as u8, 0);
+        let musicians: Vec<&Invite> = at_cap
+            .iter()
+            .map(|(_, i)| i)
+            .filter(|i| i.token.role == Role::Musician)
+            .collect();
+        assert_eq!(
+            musicians.len(),
+            MAX_MUSICIANS,
+            "a session of MAX_MUSICIANS seats mints MAX_MUSICIANS musician invites, host included"
+        );
+        assert!(
+            musicians
+                .iter()
+                .any(|i| i.token.member_id == HOST_MEMBER_ID),
+            "the host holds one of those seats"
+        );
+        let mut ids: Vec<u16> = musicians.iter().map(|i| i.token.member_id.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), MAX_MUSICIANS, "seats are distinct members");
+
+        // Listener member ids start after the musician seats, so no listener
+        // ever collides with a musician seat.
+        let with_listeners = mint_seats(MAX_MUSICIANS as u8, 2);
+        assert_eq!(with_listeners.len(), MAX_MUSICIANS + 2);
+        assert_eq!(
+            with_listeners[MAX_MUSICIANS].1.token.member_id,
+            MemberId(MAX_MUSICIANS as u16)
+        );
+    }
+
+    // The floor: one seat is the host alone, and one invite is minted.
+    #[test]
+    fn a_solo_session_mints_only_the_host_invite() {
+        let solo = mint_seats(1, 0);
+        assert_eq!(solo.len(), 1);
+        assert_eq!(solo[0].0, "host");
+        assert_eq!(solo[0].1.token.member_id, HOST_MEMBER_ID);
     }
 }

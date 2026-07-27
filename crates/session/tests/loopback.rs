@@ -14,7 +14,8 @@ use jamstream_protocol::media::{FrameDuration, MediaFrame};
 use jamstream_protocol::transport::{Initiator, Session, generate_keypair};
 use jamstream_protocol::wire::{self, Packet};
 use jamstream_session::{
-    ClientCore, ClientEvent, ClientState, ServerConfig, ServerCore, ServerEvent,
+    ClientCore, ClientEvent, ClientState, MAX_LISTENERS, MAX_MUSICIANS, ServerConfig, ServerCore,
+    ServerEvent,
 };
 use proptest::prelude::*;
 
@@ -79,15 +80,15 @@ impl Harness {
         let issuer = Issuer::generate();
         let kp = generate_keypair();
         let session_id = SessionId::generate();
-        let server = ServerCore::new(ServerConfig {
-            session_id,
-            server_private: kp.private.to_vec(),
-            server_public: kp.public,
-            issuer_pk: issuer.public_key(),
-            max_musicians,
-            max_listeners,
-            member_timeout_ms: 10_000,
-        });
+        let server = ServerCore::new(
+            ServerConfig::new(
+                session_id,
+                kp.private.to_vec(),
+                kp.public,
+                issuer.public_key(),
+            )
+            .with_capacity(max_musicians, max_listeners),
+        );
         Self {
             issuer,
             server_pk: kp.public,
@@ -388,7 +389,7 @@ impl RawMember {
 
 #[test]
 fn three_musicians_join_and_roster() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     for id in 0..3u16 {
         let inv = h.mint(id, Role::Musician);
         h.add_client(&inv, Some(0.0));
@@ -438,7 +439,7 @@ fn three_musicians_join_and_roster() {
 
 #[test]
 fn audio_flows_and_excludes_self() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_c = h.mint(2, Role::Musician);
@@ -464,7 +465,7 @@ fn audio_flows_and_excludes_self() {
 
 #[test]
 fn fader_mute_applies_per_member() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_c = h.mint(2, Role::Musician);
@@ -496,7 +497,7 @@ fn fader_mute_applies_per_member() {
 
 #[test]
 fn chat_from_field_is_forced_by_server() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     h.add_client(&inv_a, Some(0.0));
@@ -538,7 +539,7 @@ fn chat_from_field_is_forced_by_server() {
 
 #[test]
 fn metronome_host_controls_and_clicks() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     for id in 0..3u16 {
         let inv = h.mint(id, Role::Musician);
         h.add_client(&inv, Some(0.0));
@@ -600,7 +601,7 @@ fn metronome_host_controls_and_clicks() {
 
 #[test]
 fn listener_receives_broadcast_and_cannot_send_media() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_l = h.mint(5, Role::Listener);
@@ -641,7 +642,7 @@ fn listener_receives_broadcast_and_cannot_send_media() {
 
 #[test]
 fn broadcast_fader_mute_reaches_listeners_not_monitors() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_host = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_c = h.mint(2, Role::Musician);
@@ -694,7 +695,7 @@ fn broadcast_fader_mute_reaches_listeners_not_monitors() {
 
 #[test]
 fn non_host_broadcast_controls_are_violations() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_host = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_l = h.mint(5, Role::Listener);
@@ -753,7 +754,7 @@ fn non_host_broadcast_controls_are_violations() {
 
 #[test]
 fn audition_swaps_host_playout_to_broadcast_and_back() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_host = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let host = h.add_client(&inv_host, Some(440.0));
@@ -798,7 +799,7 @@ fn audition_swaps_host_playout_to_broadcast_and_back() {
 
 #[test]
 fn broadcast_fader_changes_relay_to_all_members() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_host = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_l = h.mint(5, Role::Listener);
@@ -829,7 +830,7 @@ fn broadcast_fader_changes_relay_to_all_members() {
 
 #[test]
 fn revoke_ejects_and_blocks_rejoin() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_c = h.mint(2, Role::Musician);
@@ -873,7 +874,7 @@ fn revoke_ejects_and_blocks_rejoin() {
 
 #[test]
 fn timeout_then_rejoin_with_same_token() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_c = h.mint(2, Role::Musician);
@@ -911,7 +912,7 @@ fn timeout_then_rejoin_with_same_token() {
 
 #[test]
 fn version_reject_rate_limited_and_verified() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let src = addr_of(50);
     let fake_init = wire::build_handshake_init(3, &[0x5A; 64]);
     let now = h.now_ms();
@@ -952,29 +953,39 @@ fn version_reject_rate_limited_and_verified() {
     assert!(core.events().is_empty());
 }
 
+// The capacity every host surface offers seats against, enforced here.
+// MAX_MUSICIANS counts the host (member 0 joins as a musician like anyone
+// else), so a full band is MAX_MUSICIANS members and the next one is
+// refused.
 #[test]
 fn musician_capacity_enforced() {
-    let mut h = Harness::new(10, 20);
-    let invites: Vec<Invite> = (0..11u16).map(|i| h.mint(i, Role::Musician)).collect();
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let over_cap = MAX_MUSICIANS + 1;
+    let invites: Vec<Invite> = (0..over_cap as u16)
+        .map(|i| h.mint(i, Role::Musician))
+        .collect();
     for inv in &invites {
         h.add_client(inv, Some(0.0));
     }
     h.run_ms(500);
 
-    assert_eq!(h.server.musicians_connected(), 10);
+    assert_eq!(h.server.musicians_connected(), MAX_MUSICIANS);
     let joined = h
         .clients
         .iter()
         .filter(|c| *c.core.state() == ClientState::Joined)
         .count();
-    assert_eq!(joined, 10);
-    // Refusal is a silent drop: the 11th client keeps retrying until its
+    assert_eq!(joined, MAX_MUSICIANS);
+    // Refusal is a silent drop: the over-cap client keeps retrying until its
     // own connection timeout, indistinguishable from packet loss.
-    assert_eq!(*h.clients[10].core.state(), ClientState::Connecting);
+    assert_eq!(
+        *h.clients[MAX_MUSICIANS].core.state(),
+        ClientState::Connecting
+    );
 }
 
 fn run_media_scenario() -> (Vec<f32>, Vec<ServerEvent>, Vec<ClientEvent>) {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     h.add_client(&inv_a, Some(440.0));
@@ -1006,7 +1017,7 @@ fn media_path_is_deterministic_after_join() {
 
 #[test]
 fn garbage_datagrams_never_panic() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv = h.mint(0, Role::Musician);
     h.add_client(&inv, Some(0.0));
     h.run_ms(250);
@@ -1045,7 +1056,7 @@ fn redundancy_engages_on_server_reported_uplink_loss() {
     // Only client-to-server media drops; the client's own downlink is
     // clean, so the old downlink proxy would never have fired. The server's
     // Stats reports must turn redundancy on.
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let a = h.add_client(&inv_a, Some(440.0));
@@ -1083,7 +1094,7 @@ fn redundancy_stays_off_when_only_downlink_is_lossy() {
     // The reverse: server-to-client datagrams drop, uplink is clean. The
     // server reports a clean uplink, so redundancy must stay off even
     // though the client sees downlink loss locally.
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let a = h.add_client(&inv_a, Some(440.0));
@@ -1112,7 +1123,7 @@ fn redundancy_stays_off_when_only_downlink_is_lossy() {
 
 #[test]
 fn lost_handshake_resp_is_recovered_by_identical_retry() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv = h.mint(0, Role::Musician);
     let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
     let src = addr_of(40);
@@ -1155,7 +1166,7 @@ fn lost_handshake_resp_is_recovered_by_identical_retry() {
 
 #[test]
 fn fast_rejoin_after_silence_replaces_the_connection() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv = h.mint(0, Role::Musician);
     let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
     let src = addr_of(41);
@@ -1177,7 +1188,7 @@ fn fast_rejoin_after_silence_replaces_the_connection() {
 
 #[test]
 fn replayed_init_against_active_member_yields_nothing() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv = h.mint(0, Role::Musician);
     let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
     let src = addr_of(43);
@@ -1230,7 +1241,7 @@ fn has_avatar_ready(h: &Harness, i: usize, member: MemberId, hash: [u8; 32]) -> 
 
 #[test]
 fn avatar_round_trip_and_late_joiner() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let a = h.add_client(&inv_a, Some(0.0));
@@ -1277,7 +1288,7 @@ fn avatar_round_trip_and_late_joiner() {
 
 #[test]
 fn avatar_replacement_converges_on_the_new_hash() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let a = h.add_client(&inv_a, Some(0.0));
@@ -1312,7 +1323,7 @@ fn avatar_replacement_converges_on_the_new_hash() {
 
 #[test]
 fn returning_member_avatar_transfers_zero_chunks() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let a = h.add_client(&inv_a, Some(0.0));
@@ -1368,7 +1379,7 @@ fn returning_member_avatar_transfers_zero_chunks() {
 
 #[test]
 fn tampered_avatar_train_is_a_violation_not_an_avatar() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     h.add_client(&inv_a, Some(0.0));
@@ -1443,7 +1454,7 @@ fn tampered_avatar_train_is_a_violation_not_an_avatar() {
 
 #[test]
 fn oversize_set_avatar_is_rejected() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let a = h.add_client(&inv_a, Some(0.0));
     h.run_ms(500);
@@ -1495,7 +1506,7 @@ fn oversize_set_avatar_is_rejected() {
 /// 32 / 2 = 16 ticks (40 ms).
 #[test]
 fn chat_delivers_within_four_steps_while_a_max_avatar_streams() {
-    let mut h = Harness::new(10, 20);
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
     let inv_c = h.mint(2, Role::Musician);
@@ -1590,15 +1601,10 @@ proptest! {
         let issuer = Issuer::generate();
         let kp = generate_keypair();
         let sid = SessionId::generate();
-        let mut server = ServerCore::new(ServerConfig {
-            session_id: sid,
-            server_private: kp.private.to_vec(),
-            server_public: kp.public,
-            issuer_pk: issuer.public_key(),
-            max_musicians: 2,
-            max_listeners: 2,
-            member_timeout_ms: 10_000,
-        });
+        let mut server = ServerCore::new(
+            ServerConfig::new(sid, kp.private.to_vec(), kp.public, issuer.public_key())
+                .with_capacity(2, 2),
+        );
         let invite = issuer.mint(
             sid,
             vec![addr_of(1)],

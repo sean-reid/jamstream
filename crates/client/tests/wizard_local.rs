@@ -130,7 +130,9 @@ async fn wizard_hosts_a_real_local_session() {
         "local skips the region step"
     );
     assert_eq!(wizard.step, WizardStep::Preview);
-    wizard.musicians = 2;
+    // Three musician seats, the host's own included, plus one listener: the
+    // wizard's counts mean what --musicians and --listeners mean.
+    wizard.musicians = 3;
     wizard.listeners = 1;
     assert!(wizard.can_launch(), "local needs no artifact fields");
     assert!(wizard.begin_launch());
@@ -153,7 +155,7 @@ async fn wizard_hosts_a_real_local_session() {
 
     assert_eq!(outcome.state.provider, "local");
     assert_eq!(outcome.state.hourly_microusd, 0);
-    // host + 2 musicians + 1 listener.
+    // Three musician seats (host + 2 guests) and one listener.
     assert_eq!(outcome.state.invites.len(), 4);
     assert_eq!(outcome.state.invites[0].role, "host");
     assert!(outcome.state_path.is_file(), "state file must exist");

@@ -14,7 +14,8 @@ fn host_args() -> HostArgs {
     HostArgs {
         provider: "mock".to_owned(),
         region: None,
-        musicians: 2,
+        // Seats, host included: three musician seats is the host plus two.
+        musicians: 3,
         listeners: 1,
         hours: 2.0,
         destinations: 0,
@@ -59,7 +60,7 @@ async fn host_end_and_sweep_flow() {
     assert!(json["estimated_total_microusd"].as_u64().unwrap() > 0);
     assert_eq!(json["reachability"], "skipped");
     let invites = json["invites"].as_array().unwrap();
-    // Host + 2 musicians + 1 listener.
+    // Three musician seats (the host's own plus two) and one listener.
     assert_eq!(invites.len(), 4);
     assert_eq!(invites[0]["role"], "host");
     assert_eq!(invites[1]["role"], "musician 1");

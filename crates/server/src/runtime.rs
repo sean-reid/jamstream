@@ -97,15 +97,15 @@ impl Server {
         let issuer_pk = VerifyingKey::from_bytes(&cfg.issuer_public_key)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "issuer key is not valid"))?;
 
-        let core = ServerCore::new(ServerConfig {
-            session_id: cfg.session_id,
-            server_private: private.to_vec(),
+        // Capacity and member timeout come from jamstream_session's shared
+        // limits, the same numbers the CLI flags and the desktop wizard
+        // offer seats against.
+        let core = ServerCore::new(ServerConfig::new(
+            cfg.session_id,
+            private.to_vec(),
             server_public,
             issuer_pk,
-            max_musicians: 10,
-            max_listeners: 20,
-            member_timeout_ms: 10_000,
-        });
+        ));
         let socket = UdpSocket::bind(opts.bind).await?;
         Ok(Server {
             core,
