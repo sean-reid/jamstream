@@ -243,6 +243,128 @@ fn narrow_chat_toggle_is_symmetric_and_escape_closes() {
     );
 }
 
+fn broadcast_fader_commands(rt: &Recorder, member: u16) -> Vec<(f32, f32, bool)> {
+    rt.commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::SetBroadcastFader {
+                member: m,
+                gain_db,
+                pan,
+                muted,
+            } if m == MemberId(member) => Some((gain_db, pan, muted)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn audition_commands(rt: &Recorder) -> Vec<bool> {
+    rt.commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::SetBroadcastAudition(on) => Some(on),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn stream_mix_panel_opens_and_fader_sends_exact_values() {
+    let (rt, mut harness) = session_harness(true);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Ana stream gain").is_none(),
+        "the stream mix sheet must start closed"
+    );
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stream mix")
+        .click();
+    harness.run_steps(2);
+    // Focus the gain control, then one 0.5 dB arrow step from Ana's
+    // demo broadcast fader (-2.0 dB, pan -0.3, unmuted).
+    harness.get_by_label("Ana stream gain").click();
+    harness.run_steps(2);
+    harness.key_press(Key::ArrowUp);
+    harness.run_steps(2);
+
+    let faders = broadcast_fader_commands(&rt, 1);
+    assert!(!faders.is_empty(), "arrow key sent no SetBroadcastFader");
+    assert_eq!(
+        *faders.last().unwrap(),
+        (-1.5, -0.3, false),
+        "exactly one 0.5 dB step up, pan and mute untouched"
+    );
+    // The monitor mix must be untouched: no SetFader at all.
+    assert!(
+        !rt.commands()
+            .iter()
+            .any(|c| matches!(c, Command::SetFader { .. })),
+        "broadcast rows must never send monitor SetFader"
+    );
+
+    // The same stationary toggle closes the sheet again.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stream mix")
+        .click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Ana stream gain").is_none());
+}
+
+#[test]
+fn audition_round_trip_and_escape_leaves_it_on() {
+    let (rt, mut harness) = session_harness(true);
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stream mix")
+        .click();
+    harness.run_steps(2);
+
+    harness.get_by_label("audition stream mix").click();
+    harness.run_steps(2);
+    assert_eq!(audition_commands(&rt), vec![true]);
+    assert!(
+        harness.query_by_label("hearing stream mix").is_some(),
+        "the status bar must show the audition reminder"
+    );
+
+    // Escape closes the sheet; audition is a mix state, not navigation,
+    // so it stays on and the reminder stays visible.
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("audition stream mix").is_none());
+    assert_eq!(audition_commands(&rt), vec![true]);
+    assert!(
+        rt.snapshot()
+            .broadcast
+            .expect("host broadcast view")
+            .audition
+    );
+    assert!(
+        harness.query_by_label("hearing stream mix").is_some(),
+        "closing the sheet must not hide the audition reminder"
+    );
+
+    // Reopen and switch it off.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stream mix")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("audition stream mix").click();
+    harness.run_steps(2);
+    assert_eq!(audition_commands(&rt), vec![true, false]);
+    assert!(harness.query_by_label("hearing stream mix").is_none());
+}
+
+#[test]
+fn non_hosts_see_no_stream_mix() {
+    let (rt, mut harness) = session_harness(false);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Stream mix").is_none());
+    assert!(harness.query_by_label("hearing stream mix").is_none());
+    assert!(rt.snapshot().broadcast.is_none());
+}
+
 #[test]
 fn metronome_changes_send_commands() {
     let (rt, mut harness) = session_harness(true);
