@@ -2,11 +2,11 @@
 
 A session costs machine time plus network traffic, paid to your cloud provider. Both are small; this page explains how the preview is computed, what egress is, and the guardrails that keep a mistake from costing more than a coffee.
 
-Local sessions cost nothing: `--provider local` runs the server on your own computer, so there is no machine to rent and no egress to meter. The preview says so in one line, and the only guardrail a local session needs is the idle exit, since a forgotten process bills nobody. The rest of this page is about the cloud providers.
+Local sessions cost nothing: hosting on this computer (the wizard's local row, or `--provider local` in the CLI) rents no machine and meters no egress. The preview says so in one line, and the only guardrail a local session needs is the idle exit, since a forgotten process bills nobody. The rest of this page is about the cloud providers.
 
 ## The preview
 
-Before anything launches, `jamstream host` and the app's wizard show the same preview:
+Before anything launches, the app's wizard and `jamstream host` show the same preview:
 
 ```text
 Cost preview for digitalocean nyc3 over 3.0 hours:
@@ -18,8 +18,8 @@ Total (estimate)                                  $0.08037
 
 Line by line:
 
-- **VM** is the machine's hourly price times your expected length (`--hours`, default 3). The price is fetched live from the provider where possible (DigitalOcean's sizes API) and from a bundled snapshot of public pricing otherwise, so the preview tracks reality and the numbers in this documentation are the approximations.
-- **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Each musician's personal mix streams down at about 300 kbit/s, each listener at about 150 kbit/s. Four musicians (you and three others, the default `--musicians 4`) for three hours is about 1.6 GB.
+- **VM** is the machine's hourly price times your expected length, set on the preview step (`--hours` in the CLI). The price is fetched live from the provider where possible (DigitalOcean's sizes API) and from a bundled snapshot of public pricing otherwise, so the preview tracks reality and the numbers in this documentation are the approximations.
+- **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Each musician's personal mix streams down at about 300 kbit/s, each listener at about 150 kbit/s. Four musicians for three hours is about 1.6 GB.
 - **Included egress credit** appears when the provider bundles free transfer that covers some or all of the estimate. DigitalOcean droplets include thousands of GiB; AWS accounts include 100 GB per month; GCP includes close to nothing.
 
 The expected length only shapes the estimate. The real bill is metered: elapsed time times the hourly rate, plus measured traffic. Play four hours after previewing three and you pay for four.
@@ -32,7 +32,7 @@ Cloud providers charge for data leaving their network, per gigabyte, and call it
 
 Ephemeral cloud machines have one classic failure: you forget one and it bills for a month. JamStream treats that as a design problem, in layers:
 
-- **The self-destruct timers.** Every server shuts itself down after `--idle-min` minutes with no musicians (default 10) and destroys itself at the `--max-hours` hard cap (default 12) no matter what. Both are editable in the app's wizard too, as "idle exit" and "hard cap", with the same defaults. The cap is enforced on the machine itself, not by your laptop, so it works even if your laptop is in a lake.
+- **The self-destruct timers.** Every server shuts itself down after `--idle-min` minutes with no musicians (default 10) and destroys itself at the `--max-hours` hard cap (default 12) no matter what. The cap is enforced on the machine itself, not by your laptop, so it works even if your laptop is in a lake.
 - **The cost ticker.** While a session runs, cost so far sits in the app's status bar next to latency, and `jamstream status` prints accrued and projected cost per session. You always know the meter's reading; nothing accrues silently.
 - **The sweeper.** Every machine JamStream launches is tagged. `jamstream sweep` finds everything with the tag across all configured providers and destroys it; `--dry-run` lists without destroying. `jamstream host` also warns you at launch if tagged machines already exist. When in doubt, sweep.
 

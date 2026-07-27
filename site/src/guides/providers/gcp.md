@@ -31,26 +31,29 @@ Scoped this way, the key can manage Compute Engine instances in this one project
 1. Open the `jamstream` service account, go to the **Keys** tab, click **Add key**, then **Create new key**, choose **JSON**, and click **Create** ([key docs](https://docs.cloud.google.com/iam/docs/keys-create-delete)). The key file downloads once; store it like a password.
 2. If the create button is blocked with an organization policy error: organizations created since May 2024 disable service account key creation by default ([secure by default](https://docs.cloud.google.com/resource-manager/docs/secure-by-default-organizations)). Personal accounts without an organization are unaffected. An organization admin can lift `iam.disableServiceAccountKeyCreation` for the project; otherwise use a short-lived token instead, below.
 
-## 5. Put the key in your environment
+## 5. Connect the app
+
+In the host wizard, select **gcp**; while no credential is saved the row reads `setup needed` and the Connect Google Cloud pane opens, with **Open the service accounts page** landing in the right console section. Paste the downloaded key file's contents into the service account JSON field, or enter the file's path and click **Load file**, then click **Check credentials**. The app authenticates against the API with the pasted key, and only a passing check saves it: the pane says "Works. Saved to your keychain." and the row flips to `ready`. A failure is shown verbatim, and nothing is stored.
+
+The key lives in your system keychain from then on; the project id is read from the key itself. You are ready to host; continue with the [quickstart](../../quickstart.md#host-on-the-internet-with-digitalocean), picking gcp in the wizard instead.
+
+## For the CLI and automation
+
+The CLI reads the key from the environment instead:
 
 ```console
 $ export GOOGLE_APPLICATION_CREDENTIALS=$HOME/keys/jamstream-gcp.json
+$ jamstream sweep --dry-run --provider gcp
+No jamstream-tagged instances found.
 ```
 
-The project id is read from the key file. Set `GOOGLE_CLOUD_PROJECT` only if you need to override it.
+That output means the credential authenticates and can list instances. The project id is read from the key file; set `GOOGLE_CLOUD_PROJECT` only if you need to override it.
 
-No key file, or key creation blocked? JamStream also accepts a pre-minted token, which expires after about an hour:
+No key file, or key creation blocked? JamStream also accepts a pre-minted token, which expires after about an hour. This mode is environment-only, in the app and the CLI alike:
 
 ```console
 $ export GOOGLE_CLOUD_PROJECT=jamstream-123456
 $ export GCP_ACCESS_TOKEN=$(gcloud auth print-access-token)
 ```
 
-## 6. Verify
-
-```console
-$ jamstream sweep --dry-run --provider gcp
-No jamstream-tagged instances found.
-```
-
-That output means the credential authenticates and can list instances. Continue with the [quickstart](../../quickstart.md#host), swapping `--provider digitalocean` for `--provider gcp`.
+The app reads the same variables as a silent fallback, so a machine set up either way is `ready` in the wizard with nothing pasted.

@@ -28,8 +28,8 @@ use jamstream_session::SessionError;
 use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 
 use crate::runtime::{
-    ChatLine, Command, ConnState, CostView, FaderView, LevelsView, MemberId, MemberView,
-    MetronomeView, Runtime, Snapshot, StatsView, TokenId,
+    BroadcastView, ChatLine, Command, ConnState, CostView, FaderView, LevelsView, MemberId,
+    MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
 };
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -111,6 +111,11 @@ struct SharedState {
     /// Monitor-mix values the UI set, merged over the roster; the server
     /// does not echo MixerSet back.
     faders: HashMap<MemberId, FaderView>,
+    /// Broadcast-mix values, from our own optimistic sets and from
+    /// BroadcastMixChanged relays; merged over the roster for the host.
+    broadcast_faders: HashMap<MemberId, FaderView>,
+    /// Client-local optimistic audition state; the server sends no echo.
+    audition: bool,
     chat: VecDeque<ChatLine>,
     levels: LevelsView,
     metronome: MetronomeView,
@@ -136,6 +141,8 @@ impl SharedState {
             mouth_to_ear_ms: None,
             roster: Vec::new(),
             faders: HashMap::new(),
+            broadcast_faders: HashMap::new(),
+            audition: false,
             chat: VecDeque::new(),
             levels: LevelsView::default(),
             metronome: MetronomeView {
@@ -425,6 +432,25 @@ impl LiveRuntime {
                 token: None,
             })
             .collect();
+        let is_host = s.me == Some(HOST_MEMBER_ID);
+        let broadcast = is_host.then(|| BroadcastView {
+            faders: s
+                .roster
+                .iter()
+                .filter(|m| m.role == Role::Musician)
+                .map(|m| {
+                    (
+                        m.id,
+                        s.broadcast_faders.get(&m.id).copied().unwrap_or(FaderView {
+                            gain_db: 0.0,
+                            pan: 0.0,
+                            muted: false,
+                        }),
+                    )
+                })
+                .collect(),
+            audition: s.audition,
+        });
         Snapshot {
             stats: StatsView {
                 state: s.conn.clone(),
@@ -438,12 +464,13 @@ impl LiveRuntime {
             chat: s.chat.iter().cloned().collect(),
             levels: s.levels,
             metronome: s.metronome,
+            broadcast,
             // The wizard's [`CostedRuntime`] wrapper fills this for
             // sessions this app launched; plain joins have no meter.
             cost: None,
             session_short: s.session_short.clone(),
             server_addr: s.server_addr.clone(),
-            is_host: s.me == Some(HOST_MEMBER_ID),
+            is_host,
         }
     }
 
@@ -479,6 +506,22 @@ impl LiveRuntime {
                     s.metronome.beats_per_bar = *beats_per_bar;
                     s.metronome.enabled = *enabled;
                 }
+                Command::SetBroadcastFader {
+                    member,
+                    gain_db,
+                    pan,
+                    muted,
+                } => {
+                    s.broadcast_faders.insert(
+                        *member,
+                        FaderView {
+                            gain_db: *gain_db,
+                            pan: *pan,
+                            muted: *muted,
+                        },
+                    );
+                }
+                Command::SetBroadcastAudition(on) => s.audition = *on,
                 Command::SendChat(_) | Command::Leave | Command::Revoke(_) => {}
             }
         }
@@ -692,6 +735,13 @@ impl Worker {
                 beats_per_bar,
                 enabled,
             } => self.core.set_metronome(bpm, beats_per_bar, enabled),
+            Command::SetBroadcastFader {
+                member,
+                gain_db,
+                pan,
+                muted,
+            } => self.core.set_broadcast_fader(member, gain_db, pan, muted),
+            Command::SetBroadcastAudition(on) => self.core.set_broadcast_audition(on),
             Command::SendChat(text) => self.core.send_chat(&text),
             Command::Revoke(jti) => self.core.revoke(jti),
             Command::Leave => unreachable!("handled by step"),
@@ -901,9 +951,24 @@ impl Worker {
                     s.metronome.beats_per_bar = beats_per_bar;
                     s.metronome.enabled = enabled;
                 }
+                ClientEvent::BroadcastMixChanged {
+                    target,
+                    gain_db,
+                    pan,
+                    muted,
+                } => {
+                    s.broadcast_faders.insert(
+                        target,
+                        FaderView {
+                            gain_db,
+                            pan,
+                            muted,
+                        },
+                    );
+                }
                 // rtt_ms_last rides along in stats(); Ejected, Rejected,
                 // and TimedOut land through the state mapping below.
-                // Broadcast mix state and avatars have no UI surface yet.
+                // Avatars have no UI surface yet.
                 _ => {}
             }
         }

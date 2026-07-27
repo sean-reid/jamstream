@@ -14,7 +14,7 @@ JamStream launches an `s-2vcpu-2gb` Basic droplet: $0.02679 per hour as of July 
 
 Follow [DigitalOcean's token guide](https://docs.digitalocean.com/reference/api/create-personal-access-token/); the short form:
 
-1. Log in to the control panel at cloud.digitalocean.com.
+1. Log in to the control panel at cloud.digitalocean.com. In the app's Connect DigitalOcean pane, **Open the token page** lands you in the right place.
 2. In the main menu, open **Account**, then **API**. You land on the Applications & API page, Tokens tab.
 3. Under Personal access tokens, click **Generate New Token**.
 4. Name it something you will recognize later, like `jamstream`.
@@ -35,19 +35,25 @@ The scope names are from [DigitalOcean's scope reference](https://docs.digitaloc
 
 Scoped this way, the token can manage droplets and tags, and nothing else in your account: no storage, no DNS, no billing.
 
-## 3. Put the token in your environment
+## 3. Connect the app
+
+In the host wizard, select **digitalocean**; while no credential is saved the row reads `setup needed` and the Connect DigitalOcean pane opens:
+
+![The Connect DigitalOcean pane in the host wizard: numbered steps, a masked token field, and a check credentials button](../../images/wizard_setup_digitalocean.png)
+*The credential pane in the current build.*
+
+Paste the token into the API token field (Show reveals it if you need to compare) and click **Check credentials**. The app authenticates against the API with the pasted token, fetching a price and listing anything JamStream-tagged, and only a passing check saves it: the pane says "Works. Saved to your keychain." and the row flips to `ready`. A failure is shown verbatim, and nothing is stored.
+
+The token lives in your system keychain from then on; the pane does not appear again. You are ready to host; continue with the [quickstart](../../quickstart.md#host-on-the-internet-with-digitalocean).
+
+## For the CLI and automation
+
+The CLI reads the token from the environment instead:
 
 ```console
 $ export DIGITALOCEAN_TOKEN=dop_v1_your_token_here
-```
-
-Add that line to your shell profile if you host regularly, or keep the token in a password manager and export it per session.
-
-## 4. Verify
-
-```console
 $ jamstream sweep --dry-run --provider digitalocean
 No jamstream-tagged instances found.
 ```
 
-That output means the token authenticates and can list droplets. You are ready to host; continue with the [quickstart](../../quickstart.md#host).
+That output means the token authenticates and can list droplets. Add the export to your shell profile if you host from the terminal regularly, or keep the token in a password manager and export it per session. The app reads `DIGITALOCEAN_TOKEN` as a silent fallback too, so a machine set up this way is `ready` in the wizard with nothing pasted.

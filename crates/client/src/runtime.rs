@@ -32,6 +32,17 @@ pub enum Command {
     Leave,
     /// Host only: invalidates one invite and ejects its member.
     Revoke(TokenId),
+    /// Host only: shapes one member's fader in the broadcast mix, the one
+    /// listeners and the stream hear. Monitor mixes are unaffected.
+    SetBroadcastFader {
+        member: MemberId,
+        gain_db: f32,
+        pan: f32,
+        muted: bool,
+    },
+    /// Host only: while on, the host's monitor carries the exact
+    /// post-limiter listener signal, own voice included.
+    SetBroadcastAudition(bool),
 }
 
 /// Your monitor-mix settings for one member.
@@ -104,6 +115,16 @@ pub struct MetronomeView {
     pub you_hear_click: bool,
 }
 
+/// Host only: the broadcast mix, as the server applies it before the
+/// limiter. Fader entries follow roster order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BroadcastView {
+    pub faders: Vec<(MemberId, FaderView)>,
+    /// Whether the host is auditioning the stream mix in their monitor.
+    /// Client-local optimistic state: the server sends no audition echo.
+    pub audition: bool,
+}
+
 /// Host only: the running cost of the session VM.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostView {
@@ -119,6 +140,8 @@ pub struct Snapshot {
     pub chat: Vec<ChatLine>,
     pub levels: LevelsView,
     pub metronome: MetronomeView,
+    /// The broadcast mix; None for everyone but the host.
+    pub broadcast: Option<BroadcastView>,
     pub cost: Option<CostView>,
     /// First 8 hex characters of the session id.
     pub session_short: String,

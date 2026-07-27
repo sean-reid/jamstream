@@ -1,157 +1,104 @@
 # Quickstart: host your first session
 
-Two paths from nothing to a running session. The local path takes about five minutes, needs no cloud account, and works for musicians in the same room or on the same network. The internet path launches the server in your own DigitalOcean account so bandmates anywhere can join; expect 20 minutes the first time, most of it on the DigitalOcean account. Every command is copy-pasteable.
+Two paths from nothing to a running session, both in the desktop app. The local path takes about five minutes, needs no cloud account, and works for musicians in the same room or on the same network. The internet path launches the server in your own DigitalOcean account so bandmates anywhere can join; expect 20 minutes the first time, most of it on the DigitalOcean account.
 
-## 1. Install
+## 1. Get the app
 
-One line downloads the `jamstream` CLI from the latest release, verifies its checksum, and installs it:
+Download the desktop app for your platform from the [Download](download.md) page and open it. The app carries its own `jamstreamd` session server, so there is nothing else to install. On macOS the first launch takes one extra confirmation until notarized builds ship; the [Download](download.md#macos) page shows the two clicks.
 
-```console
-$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
-$ jamstream --version
-```
-
-The [Download](download.md) page has the desktop app, the Windows install script, and direct links to every artifact. If no release has been published yet, the script says so and exits; building from source works on every platform with a Rust toolchain ([rustup.rs](https://rustup.rs)): clone the repository, then `cargo install --path crates/cli`.
-
-If you use the desktop app, that is the whole install: the app carries its own `jamstreamd` session server, so both paths on this page work from the app with nothing else. The local path with the CLI alone also needs `jamstreamd` on this computer: on Linux x86_64, append `-s -- --with-server` to the install line to get it; elsewhere `cargo install --path crates/server` builds it. The internet path does not need it locally; skip it if you are only hosting in the cloud.
+![JamStream home screen with a field to paste an invite and a button to host a session](images/home_empty.png)
+*The home screen: paste an invite to join, or host a session.*
 
 ## 2. Host on this computer
 
-`local` is the default provider, so the flag is optional:
+Click **Host a session**. The wizard's first step asks where the session server should run:
 
-```console
-$ jamstream host --provider local
+![Wizard step 1 of 4 listing local, digitalocean, aws, and gcp with their setup status](images/wizard_provider.png)
+*Step 1 of 4. Local needs no account; a cloud shows ready once credentials are saved.*
 
-Local sessions cost nothing.
-Launch this session? [y/N] y
+Pick **local** and click Continue. Local has no region to pick, so the wizard jumps to a "Before you start" step where you set the number of musician and listener seats and it confirms the session costs nothing. Click **Start the session**.
 
-Starting the server on this computer.
+The app starts a real `jamstreamd` process on your machine, completes a full encrypted handshake with it before showing you anything, joins you automatically, and opens the invites panel.
 
-Session 10c79bc1 is running.
-server       192.168.1.12:43210
-host         jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgF...
-musician 1   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgG...
-musician 2   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgH...
-musician 3   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgI...
+## 3. Share the invites
 
-State written to /Users/you/Library/Application Support/jamstream/sessions/10c79bc1....json.
-End the session with: jamstream end 10c79bc1
-```
+![Invites panel listing per-person invite links with copy and revoke buttons](images/session_invites.png)
+*The invites panel, open the moment you are hosting. Each link admits one person.*
 
-Four musician seats is the default, and the count includes you: your own `host` invite plus three to hand out. `--musicians 6` would print five, `--musicians 1` none at all. The cap is 10 seats, the same number the server admits.
+Each row is one seat. Click **Copy link** on a row and send that link to exactly one person, over any channel you trust. Rows read `not joined`, `connected`, or `revoked` as people come and go, and **Mint invite** adds seats mid-session. Details in [Hosting a session](guides/hosting.md).
 
-The invite strings are shortened here; real ones are about 220 characters. This starts a real `jamstreamd` process on your machine and completes a full encrypted handshake with it before printing anything, so a printed invite is a working invite.
+## 4. Bandmates join
 
-The invites carry your machine's network address (192.168.1.12 above), so they work from this computer and from any other machine on the same network. They do not work across the internet; bandmates elsewhere need the DigitalOcean path below, or router port forwarding, which [Playing on the same network](guides/local.md) explains honestly.
+Everyone else opens the app on their own machine, pastes their invite into the **Join a session** field on the home screen, and clicks Join or presses Enter. A malformed or expired invite shows the reason under the field instead of joining.
 
-## 3. Join
+Local invites carry your machine's network address (192.168.1.12 style), so they work from any machine on the same network. They do not work across the internet; bandmates elsewhere need the DigitalOcean path below, or router port forwarding, which [Playing on the same network](guides/local.md) explains honestly.
 
-From the desktop app: paste your invite into the field labeled "paste an invite, jamstream://join/..." on the home screen and click Join.
+## 5. End it
 
-Without the app, for testing or for a machine without a display, the headless client joins with a WAV file as its instrument:
-
-```console
-$ jamstream join 'jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgF...' \
-    --headless --input take.wav --output mix.wav --duration-secs 60
-joined
-roster: 2 members
-left after 60 s; wrote mix.wav
-```
-
-The input WAV must be 48 kHz, mono or stereo.
-
-## 4. End it
-
-```console
-$ jamstream end 10c79bc1
-Session 10c79bc1 ended. Instance 67706 is destroyed.
-```
-
-For a local session the instance id is the server's process id, and ending it kills the process. A forgotten local session costs nothing, and the server also exits on its own after 10 minutes with no musicians connected (`--idle-min`).
+In the invites panel, click **End session for everyone**. The server process is killed and every invite is dead from that moment. A forgotten local session costs nothing, and the server also exits on its own after 10 minutes with no musicians connected.
 
 That is the whole local loop. The rest of this page is the internet path.
 
 ## Host on the internet with DigitalOcean
 
-The flow is the same; the server runs on a small droplet in your DigitalOcean account instead of your machine, and the invites work from anywhere.
+The flow is the same wizard; the server runs on a small droplet in your own DigitalOcean account instead of on your machine, and the invites work from anywhere.
 
-### Create an account and token
+### Connect your account
 
-Short version; the [DigitalOcean setup page](guides/providers/digitalocean.md) has every step from zero, including the exact token scopes.
+In the wizard's first step, pick **digitalocean**. With no saved credentials the row reads `setup needed` and the Connect DigitalOcean pane opens under it:
 
-1. Sign up at digitalocean.com and add a payment method.
-2. In the control panel, open Account, then API, and click Generate New Token.
-3. Choose Custom Scopes and grant the droplet, tag, and read scopes listed on the [setup page](guides/providers/digitalocean.md#2-create-an-api-token).
-4. Copy the token; it is shown once.
+![Wizard step 1 with the Connect DigitalOcean pane open: numbered steps, a token field, and a check credentials button](images/wizard_setup_digitalocean.png)
+*The in-app credential pane. The token is checked with a real API call before it is saved.*
 
-Put the token in your environment and verify it works:
+1. Sign up at digitalocean.com and add a payment method. The [DigitalOcean setup page](guides/providers/digitalocean.md) has every step from zero, including the exact token scopes.
+2. Click **Open the token page** and generate a token scoped to droplet and tag operations only; copy it, it is shown once.
+3. Paste it into the API token field and click **Check credentials**. On success the pane says "Works. Saved to your keychain." and the row flips to `ready`.
+
+The token lands in your system keychain, so this is a one-time step; next session the row is `ready` from the start.
+
+### Pick a region and launch
+
+Click Continue. The app fetches live prices and times the network from your computer to each of the provider's regions, then lists them best first; the ranking weighs latency and price equally. Take the top row unless you know your bandmates sit far from you; [Hosting a session](guides/hosting.md#the-region-table) explains how to pick fairly.
+
+The next step is the cost preview: set the expected hours and seats, read the estimate (a three hour four musician session on DigitalOcean is about $0.08), and click **Launch**. The wizard boots the machine, waits for its address, proves the server answers a real encrypted handshake, joins you, and opens the invites panel. There is no server to find or upload: release builds carry their release's own `jamstreamd` build pinned in, and the machine verifies the download at boot.
+
+The meter is now running. The droplet bills by the second until you end the session, and it shuts itself down after 10 minutes with no musicians connected, or at the 12 hour hard cap, whichever comes first.
+
+### Share, check, end
+
+The invites panel works exactly as in the local path; the links now work from anywhere. While the session runs, cost so far sits in the status bar next to latency. **End session for everyone** destroys the droplet and confirms with DigitalOcean that nothing tagged with the session is still listed. If you ever doubt that everything is gone, [Understanding cost](guides/cost.md#the-guardrails) covers the sweeper.
+
+## From the terminal
+
+The `jamstream` CLI hosts, monitors, and ends the same sessions, for scripts, automation, and machines without a display. One line installs it on macOS and Linux (the [Download](download.md) page has the Windows line and every artifact):
 
 ```console
-$ export DIGITALOCEAN_TOKEN=dop_v1_your_token_here
-$ jamstream sweep --dry-run --provider digitalocean
-No jamstream-tagged instances found.
+$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
 ```
 
-### Host
-
-Every release build knows which server the new machine should run: the exact `jamstreamd` build published with that release, and its checksum, are pinned in at compile time, and the VM verifies the download at boot. There is no server URL to find and nothing extra to pass:
+Cloud credentials come from the environment (for example `DIGITALOCEAN_TOKEN`); local hosting with the CLI alone also needs a `jamstreamd` on this computer, which the install script's `--with-server` flag provides on Linux. `host` shows the region table and the cost preview, asks for confirmation, and prints one invite per seat once the server answers a real handshake:
 
 ```console
 $ jamstream host --provider digitalocean
-```
-
-(Only if you built the CLI from source is there no pin; then `--artifact-url` and `--artifact-sha256` must name a Linux x86_64 musl build of `jamstreamd` the machine can download; see the flags in the [host reference](cli/host.md).)
-
-The CLI probes each region from your machine, ranks them, and shows a cost preview before anything launches. Example output; region timings and the session id will differ:
-
-```text
-REGION              WORST RTT         HOURLY       EGRESS
-nyc3                    14 ms    $0.02679/hr     $0.01/GB
-tor1                    27 ms    $0.02679/hr     $0.01/GB
-atl1                    31 ms    $0.02679/hr     $0.01/GB
-sfo3                    72 ms    $0.02679/hr     $0.01/GB
-fra1                    93 ms    $0.02679/hr     $0.01/GB
 ...
-
-Cost preview for digitalocean nyc3 over 3.0 hours:
-VM $0.02679/hr x 3.0 h                            $0.08037
-Egress estimate 1.62 GB at $0.01/GB                $0.0162
-Included egress credit (3000 GB free)             -$0.0162
-Total (estimate)                                  $0.08037
 Launch this session? [y/N] y
-
-Launching in nyc3.
 
 Session 3f2a9c01 is running.
 server       203.0.113.10:43210
 host         jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiV...
 musician 1   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiW...
 ...
-
-State written to /Users/you/Library/Application Support/jamstream/sessions/3f2a9c01....json.
 End the session with: jamstream end 3f2a9c01
-```
 
-The meter is now running. The droplet bills by the second until you end the session, and it shuts itself down after 10 minutes with no musicians connected, or at the 12 hour hard cap, whichever comes first.
-
-### Share, join, check, end
-
-Send each `jamstream://join/...` line to exactly one person, over any channel you trust. Each invite admits one member; the `host` line is yours. Details in [Joining a session](guides/joining.md). Joining works exactly as in the local path above.
-
-```console
 $ jamstream status
 SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
 3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.08037 at 3.0 h
 
 $ jamstream end 3f2a9c01
 Session 3f2a9c01 ended. Instance 512190713 is destroyed.
-```
 
-`jamstream end --last` ends the most recent running session without the id. The CLI confirms with the provider that nothing with this session's tag is still listed before marking it ended. If you ever doubt that everything is gone:
-
-```console
 $ jamstream sweep --dry-run
 No jamstream-tagged instances found.
 ```
 
-That line is the whole point of the design: nothing left behind, nothing still billing.
+The invite strings are shortened here; real ones are about 220 characters. A headless client can even join with a WAV file as its instrument; see [jamstream join](cli/join.md). Sessions live in shared state files, so the CLI sees sessions the app hosted and can end them, and the app can end sessions the CLI hosted. Every command and flag is in the [CLI reference](cli/index.md).
