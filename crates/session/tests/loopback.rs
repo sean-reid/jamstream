@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 
 use blake2::{Blake2s256, Digest};
+use jamstream_protocol::Error as ProtocolError;
 use jamstream_protocol::control::{
     AVATAR_CHUNK_BYTES, ControlLink, ControlMsg, DestinationState, DestinationStatus,
     MAX_AVATAR_BYTES, MemberInfo, StreamKey, StreamOp, StreamPlatform,
@@ -17,7 +18,7 @@ use jamstream_protocol::transport::{Initiator, Session, generate_keypair};
 use jamstream_protocol::wire::{self, Packet};
 use jamstream_session::{
     ClientCore, ClientEvent, ClientState, MAX_LISTENERS, MAX_MUSICIANS, ServerConfig, ServerCore,
-    ServerEvent,
+    ServerEvent, VIOLATION_BURST,
 };
 use proptest::prelude::*;
 
@@ -88,6 +89,9 @@ struct Harness {
     server_events: Vec<ServerEvent>,
     /// Datagrams >= BIG_DGRAM_BYTES shuttled in either direction.
     big_dgrams: u64,
+    /// Bytes the server has emitted, so a test can price one inbound packet
+    /// in outbound bytes.
+    server_out_bytes: u64,
 }
 
 impl Harness {
@@ -116,6 +120,7 @@ impl Harness {
             to_server: Vec::new(),
             server_events: Vec::new(),
             big_dgrams: 0,
+            server_out_bytes: 0,
         }
     }
 
@@ -217,6 +222,7 @@ impl Harness {
         self.server_events.extend(self.server.events());
 
         for (addr, dg) in to_clients {
+            self.server_out_bytes += dg.len() as u64;
             if dg.len() >= BIG_DGRAM_BYTES {
                 self.big_dgrams += 1;
             }
@@ -400,36 +406,62 @@ struct RawMember {
 }
 
 fn raw_join(h: &mut Harness, invite: &Invite, addr: SocketAddr) -> RawMember {
+    raw_join_attempt(h, invite, addr).expect("handshake response")
+}
+
+/// `raw_join` for the cases where refusal is the expected outcome. Admission
+/// refusals are silent by design, so None means the server dropped the init.
+fn raw_join_attempt(h: &mut Harness, invite: &Invite, addr: SocketAddr) -> Option<RawMember> {
     let (init, pkt) = Initiator::new(invite).unwrap();
     let now = h.now_ms();
     let replies = h.server.handle_datagram(now, h.now_unix, addr, &pkt);
-    let (_, resp) = replies
-        .into_iter()
-        .find(|(a, _)| *a == addr)
-        .expect("handshake response");
+    let (_, resp) = replies.into_iter().find(|(a, _)| *a == addr)?;
     let Packet::HandshakeResp { noise } = wire::parse(&resp).unwrap() else {
         panic!("expected handshake response");
     };
     let (session, welcome) = init.finish(noise).unwrap();
-    RawMember {
+    Some(RawMember {
         id: welcome.member_id,
         addr,
         session,
         link: ControlLink::new(),
-    }
+    })
 }
 
 impl RawMember {
-    fn send_control(&mut self, h: &mut Harness, msg: ControlMsg) {
-        self.link.send(msg).unwrap();
+    /// Returns the bytes this member put on the wire. Whatever the server
+    /// answers is priced into `h.server_out_bytes`; acks are fed back to this
+    /// member's own link so its queue drains, everything else is dropped.
+    fn send_control(&mut self, h: &mut Harness, msg: ControlMsg) -> u64 {
+        if let Err(err) = self.link.send(msg) {
+            // The server stops acking a member it has dropped, so this
+            // member's own queue backs up and nothing more goes out.
+            assert!(matches!(err, ProtocolError::LinkFull), "{err}");
+            return 0;
+        }
         let now = h.now_ms();
+        let mut sent = 0;
         for dg in self.link.poll(now) {
             let sealed = self.session.seal(self.id, &dg).unwrap();
-            // Replies (acks) are dropped; this member never listens.
-            let _ = h
+            sent += sealed.len() as u64;
+            for (_, reply) in h
                 .server
-                .handle_datagram(now, h.now_unix, self.addr, &sealed);
+                .handle_datagram(now, h.now_unix, self.addr, &sealed)
+            {
+                h.server_out_bytes += reply.len() as u64;
+                if let Ok(Packet::Transport {
+                    member,
+                    counter,
+                    ciphertext,
+                }) = wire::parse(&reply)
+                    && member == self.id
+                    && let Ok(plain) = self.session.open(counter, ciphertext)
+                {
+                    let _ = self.link.receive(&plain);
+                }
+            }
         }
+        sent
     }
 
     fn send_media(&mut self, h: &mut Harness, frame: &[u8]) {
@@ -692,6 +724,153 @@ fn listener_receives_broadcast_and_cannot_send_media() {
             what: "media from listener"
         }
     )));
+}
+
+/// Fills the session: MAX_MUSICIANS musicians and MAX_LISTENERS - 1
+/// listeners, all silent so tick output is control traffic plus the personal
+/// mixes, and leaves one listener seat for a raw member the test drives.
+fn full_session() -> (Harness, Invite) {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    for id in 0..MAX_MUSICIANS as u16 {
+        let inv = h.mint(id, Role::Musician);
+        h.add_client(&inv, Some(0.0));
+    }
+    for i in 0..MAX_LISTENERS as u16 - 1 {
+        let inv = h.mint(100 + i, Role::Listener);
+        h.add_client(&inv, None);
+    }
+    h.run_ms(500);
+    assert_eq!(h.server.musicians_connected(), MAX_MUSICIANS);
+    let spare = h.mint(200, Role::Listener);
+    (h, spare)
+}
+
+fn set_avatar(nonce: u8) -> ControlMsg {
+    ControlMsg::SetAvatar {
+        hash: [nonce; 32],
+        len: 4_096,
+    }
+}
+
+/// A member sending SetAvatar with a fresh hash made the server clone the
+/// whole roster into all 30 links plus send an AvatarRequest back, for one
+/// small inbound packet: measured at 67 bytes in and about 15 KB out, 224
+/// times, sustained for as long as the member kept sending. At 400 packets a
+/// second that is 6 MB/s of egress on the host's bill, a flood against every
+/// other member, and unbounded queue growth on 30 links.
+///
+/// The honest cost of one avatar change really is one roster to everyone, so
+/// the gate is on the sustained total rather than the per-packet ratio: the
+/// burst is paid once, then the flood is metered and its sender ejected.
+#[test]
+fn a_set_avatar_flood_is_not_an_egress_amplifier() {
+    let (mut h, spare) = full_session();
+    let mut raw = raw_join(&mut h, &spare, addr_of(95));
+    h.run_ms(200);
+
+    // One second of this session with nobody misbehaving.
+    let steps = 400;
+    h.server_out_bytes = 0;
+    h.run(steps);
+    let baseline = h.server_out_bytes;
+
+    h.server_out_bytes = 0;
+    let mut inbound = 0;
+    for i in 0..steps {
+        inbound += raw.send_control(&mut h, set_avatar((i % 250) as u8 + 1));
+        h.step();
+    }
+    let extra = h.server_out_bytes.saturating_sub(baseline);
+    println!(
+        "SetAvatar flood: {steps} packets, {inbound} bytes in, {extra} extra bytes out, \
+         {:.0}x (baseline {baseline})",
+        extra as f64 / inbound as f64
+    );
+    // 400 unmetered fanouts cost about 6 MB. The metered burst costs about
+    // 12 rosters to 30 members, well under 300 KB.
+    assert!(
+        extra < 300_000,
+        "one second of SetAvatar flood cost {extra} bytes of egress"
+    );
+    // And it ends: the flood runs the sender's violation budget out.
+    assert!(
+        h.server_events.iter().any(|e| matches!(
+            e,
+            ServerEvent::MemberEjected {
+                id: MemberId(200),
+                ..
+            }
+        )),
+        "the flooder was never ejected"
+    );
+}
+
+/// The violation counter was incremented in five places and read in none, so
+/// a listener invite, the cheapest credential a host hands out, bought the
+/// right to send illegal packets at line rate forever. Now it buys
+/// VIOLATION_BURST of them.
+#[test]
+fn a_violation_flood_ejects_the_member_and_holds_the_rejoin() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_host = h.mint(0, Role::Musician);
+    h.add_client(&inv_host, Some(440.0));
+    h.run_ms(200);
+
+    // A listener sending media: one violation per packet, no rate limit of
+    // its own, so it is the cheapest way to exhaust the budget.
+    let inv_l = h.mint(7, Role::Listener);
+    let mut raw = raw_join(&mut h, &inv_l, addr_of(97));
+    let frame = MediaFrame {
+        seq: 0,
+        timestamp: 0,
+        duration: FrameDuration::Ms2_5,
+        stereo: false,
+        payload: &[1, 2, 3],
+        redundant: None,
+    }
+    .encode();
+    for _ in 0..VIOLATION_BURST + 8 {
+        raw.send_media(&mut h, &frame);
+    }
+    h.run(1);
+
+    let ejected: Vec<&ServerEvent> = h
+        .server_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ServerEvent::MemberEjected {
+                    id: MemberId(7),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(ejected.len(), 1, "{:?}", h.server_events);
+    // Exactly the budget was spent: the packets after ejection are dropped by
+    // the disconnected check, not counted again.
+    let violations = h
+        .server
+        .stats()
+        .into_iter()
+        .find(|s| s.id == MemberId(7))
+        .expect("ejected member stays on the roster")
+        .violations;
+    // The budget tolerates VIOLATION_BURST; the next one ejects.
+    assert_eq!(violations, u64::from(VIOLATION_BURST) + 1);
+    assert_eq!(h.server.musicians_connected(), 1, "the band plays on");
+
+    // A fresh handshake does not buy a fresh reputation: readmission waits
+    // for the budget to refill.
+    let mut rejected = raw_join_attempt(&mut h, &inv_l, addr_of(96));
+    assert!(rejected.is_none(), "ejected member was readmitted at once");
+    h.advance_quiet(2_000);
+    rejected = raw_join_attempt(&mut h, &inv_l, addr_of(96));
+    assert!(
+        rejected.is_some(),
+        "the budget refills, so an ejected member can come back"
+    );
 }
 
 #[test]
@@ -1211,6 +1390,58 @@ fn revoke_ejects_and_blocks_rejoin() {
     assert_eq!(h.server.musicians_connected(), 2);
 }
 
+/// What jamstreamd does with a panic it caught partway through a datagram:
+/// drop that one peer, whose state is what stopped being trustworthy, and keep
+/// serving everyone else. Before this the unwind left the run loop and took the
+/// whole session down.
+#[test]
+fn dropping_one_peer_leaves_the_rest_of_the_session_playing() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_c = h.mint(2, Role::Musician);
+    let a = h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    let c = h.add_client(&inv_c, Some(0.0));
+    h.run_ms(1_000);
+    assert_eq!(h.server.musicians_connected(), 3);
+
+    let baddr = h.clients[b].addr;
+    assert_eq!(h.server.drop_peer(baddr), Some(MemberId(1)));
+    // An address nobody holds is not an error: an admission that panicked
+    // before it created a member leaves nothing to drop.
+    assert_eq!(h.server.drop_peer(addr_of(210)), None);
+    h.run_ms(250);
+    assert_eq!(h.server.musicians_connected(), 2);
+    assert!(
+        h.server_events
+            .contains(&ServerEvent::MemberDisconnected { id: MemberId(1) })
+    );
+
+    // A and C keep hearing each other; B's tone is gone from A's mix.
+    h.clear_playouts();
+    h.run_ms(1_000);
+    let win = 48_000;
+    assert!(
+        tail_tone(&h, c, win, 440.0) > 0.1,
+        "C lost A's tone: {}",
+        tail_tone(&h, c, win, 440.0)
+    );
+    assert!(
+        tail_tone(&h, a, win, 660.0) < 0.02,
+        "dropped peer still in the mix: {}",
+        tail_tone(&h, a, win, 660.0)
+    );
+
+    // B's token is untouched: a fresh handshake gets them back in.
+    let now = h.now_ms();
+    let init = h.clients[b].core.reconnect(now).unwrap();
+    h.to_server.push((baddr, init));
+    h.run_ms(500);
+    assert_eq!(*h.clients[b].core.state(), ClientState::Joined);
+    assert_eq!(h.server.musicians_connected(), 3);
+}
+
 #[test]
 fn timeout_then_rejoin_with_same_token() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
@@ -1623,6 +1854,61 @@ fn avatar_round_trip_and_late_joiner() {
     );
     // Chunks did cross the wire for C (server to C), a cache-served train.
     assert!(h.big_dgrams > uploads_before);
+}
+
+/// The bounds and rate limits added for #43 must not touch normal load. Full
+/// house, 10 musicians and 20 listeners, a 256 KB avatar (the largest legal
+/// one, a train of 256 chunks) and a burst of chat: every member ends up with
+/// the avatar bytes and every chat line.
+#[test]
+fn a_full_session_still_moves_a_max_avatar_and_a_chat_burst() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let mut musicians = Vec::new();
+    for id in 0..MAX_MUSICIANS as u16 {
+        let inv = h.mint(id, Role::Musician);
+        musicians.push(h.add_client(&inv, Some(0.0)));
+    }
+    let mut listeners = Vec::new();
+    for i in 0..MAX_LISTENERS as u16 {
+        let inv = h.mint(100 + i, Role::Listener);
+        listeners.push(h.add_client(&inv, None));
+    }
+    h.run_ms(500);
+    assert_eq!(h.server.musicians_connected(), MAX_MUSICIANS);
+
+    let bytes = pattern(MAX_AVATAR_BYTES, 5);
+    let hash = h.clients[musicians[0]].core.set_avatar(&bytes).unwrap();
+    // A fast typist's burst, right at the fanout allowance.
+    for n in 0..12 {
+        h.clients[musicians[1]]
+            .core
+            .send_chat(&format!("line {n}"))
+            .unwrap();
+    }
+    // A 256 KB train is 256 chunks at two chunks per tick per hop, so 320 ms
+    // to reach the server and 320 ms out to each member, whose links run in
+    // parallel. 3 s is ample and keeps the test off the slow list.
+    h.run_ms(3_000);
+
+    for &i in musicians.iter().chain(listeners.iter()) {
+        assert!(
+            has_avatar_ready(&h, i, MemberId(0), hash),
+            "member index {i} never got the avatar"
+        );
+        assert_eq!(
+            h.clients[i].core.avatar_bytes(&hash),
+            Some(bytes.as_slice()),
+            "member index {i} got the wrong bytes"
+        );
+        let chats = h.clients[i]
+            .events
+            .iter()
+            .filter(|e| matches!(e, ClientEvent::Chat { from, .. } if *from == MemberId(1)))
+            .count();
+        assert_eq!(chats, 12, "member index {i} saw {chats} of 12 chat lines");
+    }
+    let violations: u64 = h.server.stats().iter().map(|s| s.violations).sum();
+    assert_eq!(violations, 0, "{:?}", h.server_events);
 }
 
 #[test]

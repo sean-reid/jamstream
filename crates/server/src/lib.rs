@@ -2,4 +2,5 @@
 //! `ServerCore` from jamstream-session, plus the boot config it reads.
 
 pub mod config;
+pub mod revocations;
 pub mod runtime;

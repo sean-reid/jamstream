@@ -43,6 +43,21 @@ const RTO_INITIAL_MS: u64 = 100;
 const RTO_MAX_MS: u64 = 2_000;
 const MAX_SENDS: u32 = 20;
 
+/// Sequence numbers past the cumulative ack that a receiver will hold while
+/// waiting for the gap to fill. `ack_bits` advertises exactly 32 entries, so
+/// anything further out cannot be selectively acked and gets retransmitted
+/// whether or not it was buffered: holding it buys nothing and, before this
+/// bound existed, cost about 2 KB of permanently live heap per packet from
+/// any peer that simply never sent `recv_next`.
+pub const RECV_WINDOW: u64 = 32;
+
+/// Messages one link will hold queued or unacknowledged before refusing more.
+/// The avatar pacer feeds two chunks per 2.5 ms tick and the queue drains on
+/// ack, so the widest legitimate backlog is a round trip's worth: about 36 on
+/// a 45 ms path. 128 is over three times that, and at a kilobyte per avatar
+/// chunk it caps one link's queue at roughly 128 KB.
+pub const MAX_PENDING: usize = 128;
+
 /// Where a broadcast goes. V1 ships the two landscape platforms with
 /// persistent, ungated keys; the requirements behind each one (ingest URL,
 /// aspect, keyframe cadence) live as data in jamstream-stream, not here, so
@@ -310,31 +325,9 @@ impl ControlLink {
     /// Queues a message for reliable delivery. It goes on the wire at the
     /// next `poll`.
     pub fn send(&mut self, msg: ControlMsg) -> Result<(), Error> {
-        match &msg {
-            ControlMsg::Chat { text, .. } if text.len() > MAX_CHAT_LEN => {
-                return Err(Error::Malformed);
-            }
-            ControlMsg::Bye { reason } if reason.len() > MAX_CHAT_LEN => {
-                return Err(Error::Malformed);
-            }
-            ControlMsg::AvatarChunk { data, .. } if data.len() > AVATAR_CHUNK_BYTES => {
-                return Err(Error::Malformed);
-            }
-            ControlMsg::StreamCtl {
-                op: StreamOp::AddDestination { key, .. },
-            } if key.is_empty() || key.len() > MAX_STREAM_KEY_LEN => {
-                return Err(Error::Malformed);
-            }
-            ControlMsg::StreamStatus { destinations } => {
-                let bad_reason = destinations.iter().any(|d| match &d.state {
-                    DestinationState::Failed { reason } => reason.len() > MAX_STREAM_REASON_LEN,
-                    _ => false,
-                });
-                if bad_reason {
-                    return Err(Error::Malformed);
-                }
-            }
-            _ => {}
+        check_lengths(&msg)?;
+        if self.pending.len() >= MAX_PENDING {
+            return Err(Error::LinkFull);
         }
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -409,7 +402,16 @@ impl ControlLink {
         let mut delivered = Vec::new();
         if let Some((seq, msg)) = pkt.frame {
             self.need_ack = true;
-            if seq >= self.recv_next && !self.out_of_order.contains_key(&seq) {
+            // The same length rules `send` applies. Enforcing them only on
+            // the sending side left the receiver willing to buffer anything
+            // that fit in a datagram.
+            check_lengths(&msg)?;
+            // Beyond the window the frame is unusable rather than malformed,
+            // which is what an honest peer produces when the frame that
+            // would open the window was lost, so it is dropped as quietly as
+            // a duplicate and the ack still goes back.
+            let in_window = seq >= self.recv_next && seq < self.recv_next + RECV_WINDOW;
+            if in_window && !self.out_of_order.contains_key(&seq) {
                 self.out_of_order.insert(seq, msg);
                 while let Some(next) = self.out_of_order.remove(&self.recv_next) {
                     delivered.push(next);
@@ -431,6 +433,17 @@ impl ControlLink {
         !self.pending.is_empty()
     }
 
+    /// Messages queued for delivery or awaiting acknowledgment.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Frames held out of order, waiting for the gap ahead of them to fill.
+    /// Bounded by [`RECV_WINDOW`].
+    pub fn buffered(&self) -> usize {
+        self.out_of_order.len()
+    }
+
     fn ack_bits(&self) -> u32 {
         let mut bits = 0u32;
         for i in 0..32u64 {
@@ -439,6 +452,36 @@ impl ControlLink {
             }
         }
         bits
+    }
+}
+
+/// Every variable-length field a control message carries, against its cap.
+/// Both directions run it: a sender must not build an illegal message, and a
+/// receiver must not hold one.
+fn check_lengths(msg: &ControlMsg) -> Result<(), Error> {
+    match msg {
+        ControlMsg::Chat { text, .. } if text.len() > MAX_CHAT_LEN => Err(Error::Malformed),
+        ControlMsg::Bye { reason } if reason.len() > MAX_CHAT_LEN => Err(Error::Malformed),
+        ControlMsg::AvatarChunk { data, .. } if data.len() > AVATAR_CHUNK_BYTES => {
+            Err(Error::Malformed)
+        }
+        ControlMsg::StreamCtl {
+            op: StreamOp::AddDestination { key, .. },
+        } if key.is_empty() || key.len() > MAX_STREAM_KEY_LEN => Err(Error::Malformed),
+        ControlMsg::StreamStatus { destinations } => {
+            let bad_reason = destinations.iter().any(|d| match &d.state {
+                DestinationState::Failed { reason } => reason.len() > MAX_STREAM_REASON_LEN,
+                _ => false,
+            });
+            if bad_reason {
+                return Err(Error::Malformed);
+            }
+            Ok(())
+        }
+        ControlMsg::Roster(members) if members.iter().any(|m| m.name.len() > MAX_NAME_LEN) => {
+            Err(Error::Malformed)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -827,6 +870,118 @@ mod tests {
         };
         let bytes = postcard::to_allocvec(&set).unwrap();
         assert_eq!(postcard::from_bytes::<MemberInfo>(&bytes).unwrap(), set);
+    }
+
+    /// The reassembly buffer used to grow without limit for any peer that
+    /// simply never sent the sequence number the receiver was waiting for.
+    /// Each frame can carry a 1 KB avatar chunk, so 2,000 packets, one home
+    /// connection's worth at 2,000 pps, pinned megabytes per second.
+    #[test]
+    fn out_of_order_growth_is_bounded_by_the_window() {
+        let mut b = ControlLink::new();
+        for seq in 1..2_001u64 {
+            let dgram = encode(&CtlPacket {
+                ack: 0,
+                ack_bits: 0,
+                frame: Some((
+                    seq,
+                    ControlMsg::AvatarChunk {
+                        hash: [0x11; 32],
+                        index: 0,
+                        total: 256,
+                        data: vec![0x22; AVATAR_CHUNK_BYTES],
+                    },
+                )),
+            });
+            // Nothing is deliverable while seq 0 is missing.
+            assert!(b.receive(&dgram).unwrap().is_empty());
+            assert!(
+                b.buffered() <= RECV_WINDOW as usize,
+                "buffered {} frames after seq {seq}",
+                b.buffered()
+            );
+        }
+        // The window's worth that was kept is genuinely usable: the frame
+        // that opens it releases all of them at once.
+        let open = encode(&CtlPacket {
+            ack: 0,
+            ack_bits: 0,
+            frame: Some((0, chat(0))),
+        });
+        assert_eq!(b.receive(&open).unwrap().len(), RECV_WINDOW as usize);
+        assert_eq!(b.buffered(), 0);
+    }
+
+    /// The window bound only holds if `ack_bits` cannot advertise past it,
+    /// otherwise the sender would ask for frames the receiver threw away.
+    #[test]
+    fn ack_bits_never_advertises_past_the_window() {
+        let mut b = ControlLink::new();
+        for seq in 1..=RECV_WINDOW + 8 {
+            let dgram = encode(&CtlPacket {
+                ack: 0,
+                ack_bits: 0,
+                frame: Some((seq, chat(seq))),
+            });
+            b.receive(&dgram).unwrap();
+        }
+        // Bits 0..30 cover seq 1..31, all buffered; seq 32 and beyond were
+        // refused, so the top bit stays clear.
+        assert_eq!(b.ack_bits(), u32::MAX >> 1);
+    }
+
+    /// `send` refused oversized payloads and `receive` did not, so the caps
+    /// bound only well-behaved peers. Crafted frames go straight to the
+    /// encoder here because `send` is exactly what an attacker skips.
+    #[test]
+    fn receive_refuses_payloads_send_would_refuse() {
+        let oversized = [
+            ControlMsg::Chat {
+                from: MemberId(1),
+                text: "x".repeat(MAX_CHAT_LEN + 1),
+            },
+            ControlMsg::Bye {
+                reason: "x".repeat(MAX_CHAT_LEN + 1),
+            },
+            ControlMsg::AvatarChunk {
+                hash: [0; 32],
+                index: 0,
+                total: 1,
+                data: vec![0; AVATAR_CHUNK_BYTES + 1],
+            },
+            ControlMsg::StreamStatus {
+                destinations: vec![DestinationStatus {
+                    id: DestinationId(1),
+                    platform: StreamPlatform::Twitch,
+                    state: DestinationState::Failed {
+                        reason: "x".repeat(MAX_STREAM_REASON_LEN + 1),
+                    },
+                    bitrate_kbps: 0,
+                    dropped_frames: 0,
+                }],
+            },
+            ControlMsg::Roster(vec![MemberInfo {
+                id: MemberId(1),
+                role: Role::Musician,
+                name: "n".repeat(MAX_NAME_LEN + 1),
+                connected: true,
+                avatar_hash: None,
+            }]),
+        ];
+        for msg in oversized {
+            let mut link = ControlLink::new();
+            assert!(link.send(msg.clone()).is_err(), "send accepted {msg:?}");
+            let dgram = encode(&CtlPacket {
+                ack: 0,
+                ack_bits: 0,
+                frame: Some((0, msg.clone())),
+            });
+            assert!(
+                link.receive(&dgram).is_err(),
+                "receive accepted {msg:?} that send refused"
+            );
+            assert_eq!(link.buffered(), 0);
+        }
     }
 
     #[test]

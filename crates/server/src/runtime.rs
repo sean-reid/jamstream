@@ -12,6 +12,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::Config;
+use crate::revocations::Revocations;
 
 const TICK: Duration = Duration::from_micros(2_500);
 const ACTIVITY_PERIOD: Duration = Duration::from_secs(1);
@@ -105,6 +107,13 @@ pub struct Server {
     stream_cfg: StreamConfig,
     /// Roster generation last handed to the pipeline.
     stream_roster_epoch: u64,
+    /// Durable revocation list. None keeps revocations in memory only, which
+    /// is fine for a test and wrong for a deployment.
+    revocations: Option<Revocations>,
+    /// Sentinel path whose appearance requests a clean exit.
+    shutdown_path: Option<PathBuf>,
+    /// Panics caught in the datagram path since startup.
+    panics: u64,
 }
 
 impl Server {
@@ -140,7 +149,46 @@ impl Server {
             stream: None,
             stream_cfg,
             stream_roster_epoch: 0,
+            revocations: None,
+            shutdown_path: None,
+            panics: 0,
         })
+    }
+
+    /// Points the server at a durable revocation list: the file is read now,
+    /// so revocations from before this process survive, and appended to on
+    /// every new revocation. Without it revocation lasts exactly as long as
+    /// the process, which `Restart=on-failure` makes a very short time.
+    /// Builder-style so `Options` stays stable for existing constructors.
+    pub fn with_revocations(mut self, store: Revocations) -> Self {
+        let known = store.load();
+        if !known.is_empty() {
+            tracing::info!(
+                revoked = known.len(),
+                path = %store.path().display(),
+                "restored revoked invites"
+            );
+            self.core.restore_revoked(known);
+        }
+        self.revocations = Some(store);
+        self
+    }
+
+    /// Watches a sentinel path: once it exists, the server shuts down
+    /// cleanly. This is how the local provider asks on Windows, which has no
+    /// cross-process SIGTERM for a console process; on unix the signal gets
+    /// there first and this is a second door to the same exit. Creates the
+    /// marker beside it that tells the provider the door is there at all.
+    pub fn with_shutdown_file(mut self, path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let marker = shutdown_supported_path(&path);
+        if let Err(err) = std::fs::write(&marker, b"") {
+            tracing::warn!(error = %err, path = %marker.display(), "cannot write the shutdown marker");
+        }
+        self.shutdown_path = Some(path);
+        self
     }
 
     /// Arms the idle self-exit: the server exits cleanly once no musicians
@@ -249,13 +297,44 @@ impl Server {
         self.core.set_stream_status(now_ms, status);
     }
 
-    /// Logs the core's events and routes the one kind that needs an actuator.
+    /// Logs the core's events and routes the two kinds that need an actuator.
     fn drain_events(&mut self, now_ms: u64) {
         for event in self.core.events() {
             log_event(&event);
-            if let ServerEvent::StreamCtl(op) = event {
-                self.route_stream_ctl(now_ms, op);
+            match event {
+                ServerEvent::StreamCtl(op) => self.route_stream_ctl(now_ms, op),
+                // Written through before this call returns, so the revocation
+                // survives whatever exit comes next. Nothing is buffered:
+                // a revocation the host has been told about must already be
+                // on disk, not waiting for a flush that a crash skips.
+                ServerEvent::TokenRevoked { jti } => {
+                    if let Some(store) = self.revocations.as_ref()
+                        && let Err(err) = store.append(jti)
+                    {
+                        tracing::error!(
+                            error = %err,
+                            path = %store.path().display(),
+                            "cannot persist a revocation: it will not survive a restart"
+                        );
+                    }
+                }
+                _ => {}
             }
+        }
+    }
+
+    /// Tells every connected member the session is ending, one flight each,
+    /// then returns. No retransmit: the process is going away. Before this
+    /// existed, every client discovered a stop by ten-second timeout.
+    async fn say_goodbye(&mut self, now_ms: u64, reason: &str) {
+        let farewells = self.core.shutdown(now_ms, reason);
+        let members = farewells.len();
+        for (addr, pkt) in farewells {
+            let _ = self.socket.send_to(&pkt, addr).await;
+        }
+        self.drain_events(now_ms);
+        if members > 0 {
+            tracing::info!(members, reason, "told members the session is ending");
         }
     }
 
@@ -275,11 +354,10 @@ impl Server {
         // failing, and the avatar would never reach the cache.
         let mut buf = [0u8; MAX_DATAGRAM_BYTES];
         tokio::pin!(shutdown);
-
-        loop {
+        let reason = loop {
             tokio::select! {
                 biased;
-                _ = &mut shutdown => break,
+                _ = &mut shutdown => break "session ended",
                 _ = tick.tick() => {
                     let now_ms = start.elapsed().as_millis() as u64;
                     for (addr, pkt) in self.core.tick(now_ms) {
@@ -297,12 +375,16 @@ impl Server {
                     if musicians > 0 {
                         touch(self.activity_path.as_deref());
                     }
+                    if self.shutdown_requested() {
+                        tracing::info!("shutdown requested on the sentinel file, exiting");
+                        break "session ended";
+                    }
                     if idle_exit.observe(start.elapsed(), musicians) {
                         tracing::info!(
                             idle_secs = self.idle_exit.as_secs_f64(),
                             "no musicians for the idle window, exiting"
                         );
-                        break;
+                        break "session idle";
                     }
                     if max_duration.observe(start.elapsed()) {
                         tracing::info!(
@@ -310,7 +392,7 @@ impl Server {
                             musicians,
                             "session reached its maximum duration, exiting"
                         );
-                        break;
+                        break "session time limit reached";
                     }
                 }
                 received = self.socket.recv_from(&mut buf) => {
@@ -329,7 +411,17 @@ impl Server {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    for (addr, pkt) in self.core.handle_datagram(now_ms, now_unix, src, &buf[..len]) {
+                    // One peer's datagram must not be able to take the session
+                    // with it. The core is one struct in one task, so an
+                    // unwind from here used to leave run(), block_on, and
+                    // main, dropping every member.
+                    let core = &mut self.core;
+                    let replies = guard(|| core.handle_datagram(now_ms, now_unix, src, &buf[..len]));
+                    let Some(replies) = replies else {
+                        self.after_panic(now_ms, src);
+                        continue;
+                    };
+                    for (addr, pkt) in replies {
                         let _ = self.socket.send_to(&pkt, addr).await;
                     }
                     // A StreamCtl arrives on this path, not the tick, and the
@@ -337,10 +429,67 @@ impl Server {
                     self.drain_events(now_ms);
                 }
             }
-        }
-        tracing::info!("shutting down");
+        };
+        let now_ms = start.elapsed().as_millis() as u64;
+        self.say_goodbye(now_ms, reason).await;
+        tracing::info!(reason, "shutting down");
         Ok(())
     }
+
+    /// A panic in the core is a bug, not an input to keep feeding: the member
+    /// whose datagram provoked it is dropped, because their half-updated state
+    /// is exactly what we stopped trusting, and everyone else plays on. Their
+    /// token stays valid, so a client on the receiving end of someone else's
+    /// bug reconnects with a fresh handshake.
+    fn after_panic(&mut self, now_ms: u64, src: SocketAddr) {
+        self.panics += 1;
+        // A peer that can provoke this can provoke it at line rate, and the
+        // journal shares a small VM's disk with the recording.
+        if self.panics <= 10 || self.panics % 100 == 0 {
+            tracing::error!(
+                panics = self.panics,
+                peer = %src,
+                "panic while handling a datagram; dropping the peer and continuing"
+            );
+        }
+        if let Some(id) = self.core.drop_peer(src) {
+            tracing::warn!(member = id.0, "dropped after a panic on its datagram");
+        }
+        self.drain_events(now_ms);
+    }
+
+    /// Panics caught since startup, for a test or an operator asking whether
+    /// the session has been limping.
+    pub fn panics(&self) -> u64 {
+        self.panics
+    }
+
+    /// True once the sentinel path exists. Checked on the one-second
+    /// heartbeat, not per tick: 400 stats a second for a file that appears
+    /// once is not a trade worth making on the audio path.
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_path
+            .as_deref()
+            .is_some_and(std::path::Path::exists)
+    }
+}
+
+/// Runs one call to the core, answering None if it panicked. `AssertUnwindSafe`
+/// is a claim, not a proof: the caller has to drop whatever state the unwind
+/// may have left half written, which for a datagram means the peer that sent
+/// it. The panic hook has already logged the payload and location by the time
+/// this returns.
+fn guard<T>(f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(f)).ok()
+}
+
+/// The marker jamstreamd leaves beside its shutdown sentinel, telling whoever
+/// spawned it that the sentinel has a reader. The local provider skips the
+/// graceful wait when it is absent, which is what an older build gets.
+fn shutdown_supported_path(shutdown: &std::path::Path) -> PathBuf {
+    let mut name = shutdown.file_name().unwrap_or_default().to_owned();
+    name.push(".supported");
+    shutdown.with_file_name(name)
 }
 
 fn log_event(event: &ServerEvent) {
@@ -354,6 +503,10 @@ fn log_event(event: &ServerEvent) {
         ServerEvent::ProtocolViolation { id, what } => {
             tracing::warn!(member = id.0, what, "protocol violation");
         }
+        ServerEvent::MemberEjected { id, violations } => {
+            tracing::warn!(member = id.0, violations, "ejected for protocol violations");
+        }
+        ServerEvent::TokenRevoked { jti } => tracing::info!(jti = ?jti, "token revoked"),
         // The op's Debug redacts the stream key by construction.
         ServerEvent::StreamCtl(op) => tracing::info!(op = ?op, "stream control"),
     }
@@ -377,8 +530,37 @@ fn touch(path: Option<&std::path::Path>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{IdleExit, MaxDuration};
+    use super::{IdleExit, MaxDuration, guard, shutdown_supported_path};
+    use std::path::Path;
     use std::time::Duration;
+
+    /// The whole point of #47: an unwind out of the core stops here instead of
+    /// leaving run(), block_on, and main, which took every member with it.
+    #[test]
+    fn guard_turns_an_unwind_into_a_value_the_loop_can_handle() {
+        assert_eq!(guard(|| 7), Some(7));
+        // The default hook would print this; the test only cares that the
+        // unwind is contained.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught: Option<()> = guard(|| panic!("indexing bug in a 2,400-line network path"));
+        let caught_string: Option<()> = guard(|| panic!("{}", String::from("owned payload")));
+        std::panic::set_hook(previous);
+        assert!(caught.is_none());
+        assert!(caught_string.is_none());
+        // And the loop keeps working afterwards.
+        assert_eq!(guard(|| 8), Some(8));
+    }
+
+    /// The local provider looks for this exact name beside the sentinel; a
+    /// mismatch means it silently skips the graceful wait forever.
+    #[test]
+    fn the_shutdown_marker_sits_beside_the_sentinel() {
+        assert_eq!(
+            shutdown_supported_path(Path::new("/tmp/session-abc/shutdown")),
+            Path::new("/tmp/session-abc/shutdown.supported")
+        );
+    }
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
