@@ -52,6 +52,15 @@ fn enumerate_and_open_default_duplex() {
         .open_duplex(None, None, config, handler)
         .expect("open default duplex stream");
     println!("latency_frames={:?}", handle.latency_frames());
+    // On Windows this is the only way to see whether the WASAPI exclusive path
+    // or the cpal shared-mode fallback won, and roughly what each costs; on the
+    // other platforms there is no such distinction to report.
+    println!("mode={:?}", jamstream_audio_io::active_device_mode());
+    #[cfg(target_os = "windows")]
+    assert!(
+        jamstream_audio_io::active_device_mode().is_some(),
+        "the windows backend must report the sharing mode it opened"
+    );
 
     std::thread::sleep(Duration::from_millis(200));
 

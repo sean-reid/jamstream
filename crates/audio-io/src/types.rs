@@ -98,6 +98,15 @@ impl DuplexHandler {
     pub(crate) fn into_parts(self) -> (CaptureFn, PlaybackFn) {
         (self.capture, self.playback)
     }
+
+    /// Reassemble halves from [`into_parts`](Self::into_parts). A backend that
+    /// splits a handler and then fails to open needs to hand it back so
+    /// another backend can try, which is what the Windows exclusive-mode path
+    /// does before falling back to shared mode.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn from_parts(capture: CaptureFn, playback: PlaybackFn) -> Self {
+        Self { capture, playback }
+    }
 }
 
 impl std::fmt::Debug for DuplexHandler {
