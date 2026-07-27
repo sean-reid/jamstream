@@ -7,7 +7,9 @@
     display: block;
     overflow-x: auto;
     padding: 0.5em;
-    background: var(--js-well, #0e0f10);
+    /* The well step, from the generated palette; no hex fallback, so a
+     * palette change cannot leave a stale one behind. */
+    background: var(--js-well);
     color: #d8d5d0;
 }
 
