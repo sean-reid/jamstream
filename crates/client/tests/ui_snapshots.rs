@@ -422,7 +422,7 @@ fn session_destinations_key() {
     ));
     app.session.destinations_open = true;
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_destinations_key");
+    snapshot_for_docs(&mut harness, "session_destinations_key");
 }
 
 #[test]
