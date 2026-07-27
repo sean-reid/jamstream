@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=JamStream
+Comment=Host a short-lived jam server in your own cloud account and play together
+Exec=jamstream-app
+Icon=jamstream
+Terminal=false
+Categories=Audio;AudioVideo;Music;

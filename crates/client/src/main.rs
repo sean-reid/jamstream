@@ -3,13 +3,20 @@
 
 use jamstream_client::app::JamApp;
 
+/// The committed 512px render of the app icon (source of record:
+/// assets/icon/jamstream.svg; regenerate with scripts/render-icon.sh).
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon/jamstream-512.png");
+
 fn main() -> eframe::Result {
     let demo = std::env::args().any(|a| a == "--demo");
+    let icon = eframe::icon_data::from_png_bytes(ICON_PNG)
+        .expect("assets/icon/jamstream-512.png is a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title("jamstream"),
+            .with_title("jamstream")
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
