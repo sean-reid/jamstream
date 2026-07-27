@@ -7,7 +7,7 @@ use egui::accesskit::Role as AkRole;
 use egui::{Event, Key, Modifiers, PointerButton, vec2};
 use egui_kittest::{Harness, kittest::Queryable};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME, RecordingRuntime};
-use jamstream_client::runtime::{Command, MemberId, Runtime};
+use jamstream_client::runtime::{Command, MemberId, Runtime, Snapshot};
 use jamstream_client::screens::session::SessionScreen;
 use jamstream_client::theme::{self, Theme};
 
@@ -372,4 +372,232 @@ fn metronome_changes_send_commands() {
     harness.get_by_label("hear the click").click();
     harness.run_steps(2);
     assert!(rt.commands().contains(&Command::SetClick(false)));
+}
+
+// Avatars. Two invariants and one round trip: an arriving picture may not
+// move anything in a strip, the chat message column may not move with the
+// name beside it, and the settings sheet must send the file's own bytes.
+
+/// A runtime that replays one fixed snapshot, so a test can hold two
+/// snapshots that differ in exactly one field.
+struct StaticRuntime(Snapshot);
+
+impl Runtime for StaticRuntime {
+    fn snapshot(&self) -> Snapshot {
+        self.0.clone()
+    }
+
+    fn send(&self, _cmd: Command) {}
+}
+
+fn static_harness(snap: Snapshot) -> Harness<'static> {
+    let rt = StaticRuntime(snap);
+    let mut screen = SessionScreen::default();
+    Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt.snapshot();
+            screen.ui(ui, &snap, &rt);
+        })
+}
+
+/// The reserve-space invariant: the strip's slot for an avatar is allocated
+/// whether or not one has arrived, so every control in the strip sits at the
+/// same place either way. The demo gives Ana a picture; stripping it must
+/// move nothing.
+#[test]
+fn a_strip_lays_out_identically_with_and_without_an_avatar() {
+    let with = DemoRuntime::frozen(FROZEN_FRAME, true).snapshot();
+    assert!(
+        with.members.iter().any(|m| m.avatar.is_some()),
+        "the demo must provide at least one avatar"
+    );
+    let mut without = with.clone();
+    for member in &mut without.members {
+        member.avatar = None;
+    }
+
+    // Every labelled control in the mixer, in both states.
+    let probes = [
+        "Ana fader",
+        "Ana pan",
+        "Ben fader",
+        "Ben pan",
+        "Mira fader",
+        "Sam fader",
+    ];
+    let mut with_rects = Vec::new();
+    let mut harness = static_harness(with);
+    harness.run_steps(3);
+    for probe in probes {
+        with_rects.push(harness.get_by_label(probe).rect());
+    }
+    let mut harness = static_harness(without);
+    harness.run_steps(3);
+    for (probe, expected) in probes.iter().zip(with_rects) {
+        assert_eq!(
+            harness.get_by_label(probe).rect(),
+            expected,
+            "{probe} moved when the avatar went away"
+        );
+    }
+}
+
+/// The chat alignment invariant: message text starts at one x for every
+/// line, whatever the name beside it is. The long-names demo carries a
+/// 64-character name and the short scripted ones together.
+#[test]
+fn chat_messages_share_one_left_edge_whatever_the_name() {
+    for size in [vec2(1280.0, 800.0), vec2(800.0, 600.0)] {
+        let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::long_names(
+            FROZEN_FRAME,
+            false,
+        )));
+        let rt_ui = rt.clone();
+        // The narrow layout shows chat instead of the mixer.
+        let mut screen = SessionScreen {
+            chat_open: true,
+            ..Default::default()
+        };
+        let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        });
+        harness.run_steps(3);
+        let short = harness.get_by_label("tuning up, one minute").rect().left();
+        let long = harness
+            .get_all_by_label_contains("the monitor mix on my end")
+            .next()
+            .expect("the long-name chat line")
+            .rect()
+            .left();
+        assert_eq!(
+            short, long,
+            "message column moved with the name at {size:?}"
+        );
+        // And it is a column, not the panel edge: the clock and the name
+        // gutter sit to its left.
+        let clock = harness.get_by_label("00:12").rect().left();
+        assert!(clock < short, "the clock must precede the message column");
+    }
+}
+
+/// The settings sheet: Load reads the file and sends its exact bytes,
+/// Remove sends the None variant.
+#[test]
+fn settings_avatar_load_and_remove_send_the_right_commands() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    // A real PNG on disk; Load must send exactly these bytes.
+    let png = png_bytes(6, 4);
+    let path = std::env::temp_dir().join(format!("jamstream-avatar-{}.png", std::process::id()));
+    std::fs::write(&path, &png).expect("write the avatar file");
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        false,
+    )));
+    let mut app = JamApp::new();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(rt.clone()));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    app.avatar_path = path.display().to_string();
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(3);
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Load")
+        .click();
+    harness.run_steps(3);
+    let sent: Vec<Command> = rt
+        .commands()
+        .into_iter()
+        .filter(|c| matches!(c, Command::SetOwnAvatar(_)))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![Command::SetOwnAvatar(Some(png.clone()))],
+        "Load must send the file's own bytes"
+    );
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Remove")
+        .click();
+    harness.run_steps(3);
+    let sent: Vec<Command> = rt
+        .commands()
+        .into_iter()
+        .filter(|c| matches!(c, Command::SetOwnAvatar(_)))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            Command::SetOwnAvatar(Some(png)),
+            Command::SetOwnAvatar(None)
+        ],
+        "Remove must send the None variant"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A bad path says so, on the spot, and sends nothing.
+#[test]
+fn settings_avatar_load_reports_a_bad_path_inline() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        false,
+    )));
+    let mut app = JamApp::new();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(rt.clone()));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    app.avatar_path = "/nonexistent/not-an-avatar.png".to_owned();
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(3);
+    harness
+        .get_by_role_and_label(AkRole::Button, "Load")
+        .click();
+    harness.run_steps(3);
+    assert!(
+        harness
+            .query_by_label_contains("not-an-avatar.png could not be read")
+            .is_some(),
+        "the specific failure must show inline"
+    );
+    assert!(
+        !rt.commands()
+            .iter()
+            .any(|c| matches!(c, Command::SetOwnAvatar(_))),
+        "a refused file must send nothing"
+    );
+}
+
+/// A real PNG through the image encoder the client already depends on:
+/// `w`x`h` of warm diagonal bands.
+fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let img = image::RgbaImage::from_fn(w, h, |x, y| {
+        image::Rgba([((x + y) * 7) as u8, (y * 5) as u8, 40, 255])
+    });
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("encode png");
+    buf.into_inner()
 }

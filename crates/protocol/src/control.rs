@@ -22,8 +22,22 @@ pub const MAX_STREAM_REASON_LEN: usize = 200;
 /// Avatars are capped at 256 KB and identified by the Blake2s-256 of their
 /// bytes; the hash is the cache key on both ends.
 pub const MAX_AVATAR_BYTES: usize = 256 * 1024;
-/// Payload bytes per `AvatarChunk`. 32 chunks cover the largest avatar.
-pub const AVATAR_CHUNK_BYTES: usize = 8 * 1024;
+/// Payload bytes per `AvatarChunk`, sized so a sealed chunk datagram never
+/// fragments: a 1500-byte ethernet MTU less 20 (IPv4) and 8 (UDP) leaves
+/// 1472, of which our transport header takes 11, the AEAD tag 16, and the
+/// channel byte plus postcard framing for the variant, 32-byte hash, two
+/// indices, and the length prefix roughly 45. 1024 of payload leaves over
+/// 300 bytes of headroom, which also covers IPv6 and light tunneling.
+/// Fragmented UDP survives loopback and most LANs but is routinely
+/// dropped across the internet, which is exactly where avatars have to
+/// work. 256 chunks cover the largest avatar.
+pub const AVATAR_CHUNK_BYTES: usize = 1024;
+/// Every socket read buffer in the workspace is this size, so no legal
+/// datagram is ever truncated. Nothing legitimate approaches it now that
+/// chunks fit the MTU; the margin exists because the failure is silent
+/// rather than loud: `recv` truncates and the receiver drops the datagram
+/// as malformed, so an oversized message simply never arrives.
+pub const MAX_DATAGRAM_BYTES: usize = 2 * 1024;
 
 const RTO_INITIAL_MS: u64 = 100;
 const RTO_MAX_MS: u64 = 2_000;
@@ -435,6 +449,33 @@ fn encode(pkt: &CtlPacket) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// The reason AVATAR_CHUNK_BYTES is what it is: a sealed chunk must fit
+    /// one unfragmented datagram. This pins the property rather than the
+    /// constant, so any change to chunk size, hashing, or framing that
+    /// would reintroduce ip fragmentation fails here.
+    #[test]
+    fn a_sealed_avatar_chunk_never_fragments() {
+        use crate::ids::MemberId;
+        let msg = super::ControlMsg::AvatarChunk {
+            hash: [0xAB; 32],
+            index: u16::MAX,
+            total: u16::MAX,
+            data: vec![0xCD; super::AVATAR_CHUNK_BYTES],
+        };
+        let mut link = super::ControlLink::new();
+        link.send(msg)
+            .expect("largest legal chunk must be sendable");
+        for plain in link.poll(0) {
+            // The transport adds an 11-byte header and a 16-byte aead tag.
+            let sealed = plain.len() + 11 + 16;
+            assert!(
+                sealed < 1200,
+                "sealed avatar chunk is {sealed} bytes, which fragments on a 1500 byte mtu"
+            );
+            let _ = MemberId(0);
+        }
+    }
+
     use super::*;
 
     fn chat(n: u64) -> ControlMsg {

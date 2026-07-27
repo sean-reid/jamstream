@@ -28,7 +28,7 @@ A region under 30 ms from everyone keeps the network's share of latency in singl
 Step 3 shows the expected hours, the seat counts, and the resulting estimate, all editable in place:
 
 - **hours** shapes the estimate only; the real bill is metered. Play longer and you pay for the time played.
-- **musicians** is the number of players you are inviting, not counting yourself; **listeners** are people who only hear the mix.
+- **musicians** is the number of playing seats, counting you: 4 means your own seat plus three invites to hand out. The cap is 10, which is also what the server admits. **listeners** are people who only hear the mix.
 - **stream destinations** counts toward the egress estimate; broadcasting itself is designed but not shipped.
 
 Under the numbers, release builds show one line naming the exact `jamstreamd` build the machine will download and verify at boot; there is nothing to configure. [Understanding cost](cost.md) explains every line of the estimate. Clicking **Launch** boots the machine, waits for its address, proves the server answers a real encrypted handshake, and joins you.
@@ -44,7 +44,7 @@ One invite per seat is minted up front, on your machine, and the wizard opens th
 - **Revoke** ejects that member and kills their invite, with a confirmation step. The host also sees a Revoke button on each mixer strip.
 - **Mint invite** adds a musician or listener seat mid-session, up to 10 musicians (you included) and 20 listeners. Unused invites cost nothing.
 
-See [Joining a session](joining.md) for how invites behave on the other end. The CLI mints its seats with `--musicians` (default 4, not counting you) and `--listeners` (default 0) and cannot add seats to a running session; the app's panel can, even for sessions the CLI hosted.
+See [Joining a session](joining.md) for how invites behave on the other end. The CLI mints its seats with `--musicians` (default 4, counting you) and `--listeners` (default 0) and cannot add seats to a running session; the app's panel can, even for sessions the CLI hosted.
 
 ## The safety knobs
 

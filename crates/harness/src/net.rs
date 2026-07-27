@@ -8,7 +8,9 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+// rand 0.10 renamed the `Rng` extension trait to `RngExt`; the name `Rng` is
+// now `rand_core`'s old `RngCore`. `random::<T>()` lives on `RngExt`.
+use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 /// Small integer id for a simulated endpoint (a client or the server).

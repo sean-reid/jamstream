@@ -39,11 +39,11 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 thiserror = "2"
 tracing = "0.1"
-rand = "0.9"
+rand = "0.10"
 proptest = "1"
 snow = "0.10"
-ed25519-dalek = { version = "2", features = ["serde"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "3", features = ["serde"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 data-encoding = "2"
 aws-lc-rs = "1"
 blake2 = "0.10"

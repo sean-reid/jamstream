@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
 use jamstream_protocol::control::StreamOp;
+use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::transport::derive_public;
 use jamstream_session::server::{ServerConfig, ServerCore, ServerEvent};
 use jamstream_stream::pipeline::{Roster, StreamConfig, StreamMember};
@@ -116,15 +117,15 @@ impl Server {
         let issuer_pk = VerifyingKey::from_bytes(&cfg.issuer_public_key)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "issuer key is not valid"))?;
 
-        let core = ServerCore::new(ServerConfig {
-            session_id: cfg.session_id,
-            server_private: private.to_vec(),
+        // Capacity and member timeout come from jamstream_session's shared
+        // limits, the same numbers the CLI flags and the desktop wizard
+        // offer seats against.
+        let core = ServerCore::new(ServerConfig::new(
+            cfg.session_id,
+            private.to_vec(),
             server_public,
             issuer_pk,
-            max_musicians: 10,
-            max_listeners: 20,
-            member_timeout_ms: 10_000,
-        });
+        ));
         let socket = UdpSocket::bind(opts.bind).await?;
         // The card title. The wire protocol carries no session name, so
         // jamstreamd takes it as a flag (see with_stream_config); this is the
@@ -269,7 +270,10 @@ impl Server {
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut idle_exit = IdleExit::new(self.idle_exit);
         let max_duration = MaxDuration::new(self.max_duration);
-        let mut buf = [0u8; 2048];
+        // Sized for the largest datagram a client can send: an avatar
+        // chunk. A short buffer would truncate the upload instead of
+        // failing, and the avatar would never reach the cache.
+        let mut buf = [0u8; MAX_DATAGRAM_BYTES];
         tokio::pin!(shutdown);
 
         loop {

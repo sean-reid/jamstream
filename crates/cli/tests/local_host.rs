@@ -104,7 +104,10 @@ async fn local_host_join_and_end_story() {
     let args = HostArgs {
         provider: "local".to_owned(),
         region: None,
-        musicians: 1,
+        // Two musician seats: this host plus one guest. --musicians counts
+        // the host, so this is the smallest session with someone to jam
+        // with, and the server admits exactly these two.
+        musicians: 2,
         listeners: 0,
         hours: 1.0,
         destinations: 0,
@@ -130,9 +133,23 @@ async fn local_host_join_and_end_story() {
     assert_eq!(json["hourly_microusd"], 0);
     assert_eq!(json["estimated_total_microusd"], 0);
     assert_eq!(json["reachability"], "ok");
+    // One invite per seat, the host's included: --musicians 2 mints exactly
+    // two musician invites, never three, so no invite exists that the
+    // server's capacity check would refuse.
     let invites = json["invites"].as_array().unwrap();
-    assert_eq!(invites.len(), 2, "host + 1 musician");
+    assert_eq!(invites.len(), 2, "two musician seats: host + 1 guest");
     assert_eq!(invites[0]["role"], "host");
+    assert_eq!(invites[1]["role"], "musician 1");
+    let musician_seats = invites
+        .iter()
+        .filter(|i| {
+            let encoded = i["invite"].as_str().unwrap();
+            let invite = jamstream_protocol::invite::Invite::decode(encoded).unwrap();
+            invite.token.role == jamstream_protocol::ids::Role::Musician
+        })
+        .count();
+    assert_eq!(musician_seats, usize::from(args.musicians));
+    assert!(musician_seats <= jamstream_session::MAX_MUSICIANS);
 
     // The state file records provider "local".
     let session_id = json["session_id"].as_str().unwrap();

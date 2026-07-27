@@ -17,10 +17,12 @@ use jamstream_protocol::invite::{Invite, Issuer, Token};
 use crate::runtime::{Command, Runtime, Snapshot};
 use crate::screens::host::{base64_decode, unix_now};
 use crate::theme;
+use crate::widgets::{AVATAR_D_ROW, avatar_disc};
 
-/// Session capacity, host included on the musician side.
-pub const MAX_MUSICIANS: usize = 10;
-pub const MAX_LISTENERS: usize = 20;
+/// Session capacity, host included on the musician side: the same
+/// constants the server enforces admission with and the host wizard offers
+/// seats against. Re-exported so this panel's callers keep one import.
+pub use jamstream_session::{MAX_LISTENERS, MAX_MUSICIANS};
 
 /// One invite from the state file, with its token id decoded so revocation
 /// and roster matching work.
@@ -120,8 +122,10 @@ impl InvitesPanel {
 
     /// Mints one more invite with the issuer key from the state file and
     /// appends it to the same file, so `jamstream status` sees it too.
-    /// Refuses past capacity (10 musicians including the host, 20
-    /// listeners).
+    /// Refuses past capacity ([`MAX_MUSICIANS`] musicians including the
+    /// host, [`MAX_LISTENERS`] listeners); the count below includes the
+    /// host's own invite, which is why the cap can be compared to it
+    /// directly.
     pub fn mint(&mut self, role: Role) -> Result<(), String> {
         match role {
             Role::Musician if self.count(Role::Musician) >= MAX_MUSICIANS => {
@@ -314,7 +318,28 @@ impl InvitesPanel {
             .spacing(vec2(theme::SPACE_LG, 4.0))
             .show(ui, |ui| {
                 for entry in &rows {
-                    ui.label(entry.label.clone());
+                    ui.horizontal(|ui| {
+                        // The disc slot is reserved on every row, drawn only
+                        // for whoever is actually here, so someone joining
+                        // never shoves the labels sideways.
+                        let member = snap
+                            .members
+                            .iter()
+                            .find(|m| m.id == entry.member && m.connected);
+                        match member {
+                            Some(m) => {
+                                avatar_disc(ui, &m.name, m.avatar.as_ref(), AVATAR_D_ROW, false)
+                                    .on_hover_text(m.name.clone());
+                            }
+                            None => {
+                                ui.allocate_exact_size(
+                                    vec2(AVATAR_D_ROW, AVATAR_D_ROW),
+                                    egui::Sense::hover(),
+                                );
+                            }
+                        }
+                        ui.label(entry.label.clone());
+                    });
                     let status = self.status_of(entry, snap);
                     match status {
                         "connected" => ui.label(status),
@@ -510,18 +535,26 @@ mod tests {
         assert_eq!(reloaded.invites.len(), 5);
         assert_eq!(reloaded.invites[4].role, "listener 4");
 
-        // Fill musicians to capacity (host + 2 exist, cap 10).
-        for _ in 0..7 {
+        // Fill musicians to capacity. The host holds one of the MAX_MUSICIANS
+        // seats, so the fixture's host + 2 musicians leaves MAX_MUSICIANS - 3
+        // to mint before the panel refuses.
+        for _ in 0..MAX_MUSICIANS - 3 {
             panel.mint(Role::Musician).expect("mint musician");
         }
         let err = panel.mint(Role::Musician).expect_err("over musician cap");
-        assert!(err.contains("10 musicians"), "error was {err:?}");
-        // Listeners: 2 exist, cap 20.
-        for _ in 0..18 {
+        assert!(
+            err.contains(&format!("{MAX_MUSICIANS} musicians")),
+            "error was {err:?}"
+        );
+        // Listeners: the fixture's one plus the one minted above.
+        for _ in 0..MAX_LISTENERS - 2 {
             panel.mint(Role::Listener).expect("mint listener");
         }
         let err = panel.mint(Role::Listener).expect_err("over listener cap");
-        assert!(err.contains("20 listeners"), "error was {err:?}");
+        assert!(
+            err.contains(&format!("{MAX_LISTENERS} listeners")),
+            "error was {err:?}"
+        );
 
         std::fs::remove_file(&path).ok();
     }

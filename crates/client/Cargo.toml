@@ -24,6 +24,7 @@ jamstream-cli.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
+image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -33,5 +34,10 @@ tokio.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true
+# Test-only: the initials disc must hash a name to the same hue here and on
+# the stream card, and the only honest way to assert that is against the
+# broadcast renderer itself. The app never draws stream frames, so this is
+# not a runtime dependency.
+jamstream-broadcast.workspace = true
 jamstream-server.workspace = true
 hound.workspace = true

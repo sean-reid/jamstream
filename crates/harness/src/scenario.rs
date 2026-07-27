@@ -103,6 +103,9 @@ struct SimClient {
     /// While set, every outgoing datagram is replaced by seeded garbage of
     /// the same length (a client gone haywire, from the server's view).
     garbage: bool,
+    /// While set, this client's audio driver is frozen: no capture is
+    /// delivered and no playout is asked for. See `set_driver_stalled`.
+    stalled: bool,
 }
 
 pub struct ScenarioBuilder {
@@ -207,16 +210,19 @@ impl ScenarioBuilder {
         let issuer = Issuer::generate();
         let kp = generate_keypair();
         let session_id = SessionId::generate();
-        let server = ServerCore::new(ServerConfig {
-            session_id,
-            server_private: kp.private.to_vec(),
-            server_public: kp.public,
-            issuer_pk: issuer.public_key(),
-            // Headroom so an out-of-band raw member can also be admitted.
-            max_musicians: self.musicians + 2,
-            max_listeners: self.listeners + 2,
-            member_timeout_ms: MEMBER_TIMEOUT_MS,
-        });
+        // Scenario-sized caps, with headroom so an out-of-band raw member can
+        // also be admitted; production capacity lives in
+        // jamstream_session::limits.
+        let server = ServerCore::new(
+            ServerConfig::new(
+                session_id,
+                kp.private.to_vec(),
+                kp.public,
+                issuer.public_key(),
+            )
+            .with_capacity(self.musicians + 2, self.listeners + 2)
+            .with_member_timeout_ms(MEMBER_TIMEOUT_MS),
+        );
         let server_addr: SocketAddr = "198.51.100.1:43210".parse().expect("server addr");
 
         let mut net = SimNet::new(self.seed);
@@ -268,6 +274,7 @@ impl ScenarioBuilder {
                 meter: Vec::new(),
                 events: Vec::new(),
                 garbage: false,
+                stalled: false,
             });
         }
 
@@ -338,7 +345,9 @@ impl Scenario {
         self.server_events.extend(self.server.events());
 
         for idx in 0..self.clients.len() {
-            if self.raw_audio {
+            if self.clients[idx].stalled {
+                self.step_client_stalled(now_us, now_ms, idx);
+            } else if self.raw_audio {
                 self.step_client_raw(now_us, now_ms, idx);
             } else {
                 self.step_client_exact(now_us, now_ms, idx);
@@ -406,6 +415,40 @@ impl Scenario {
         let mut buf = [0.0f32; 4 * FRAME_SAMPLES];
         self.clients[idx].core.pull_playout_raw(&mut buf[..m * 2]);
         self.record(idx, &buf[..m * 2]);
+    }
+
+    /// A frozen audio driver. The device thread delivers no capture and asks
+    /// for no playout, so this tick's frames simply never happen: the
+    /// swallowed capture is dropped rather than replayed, leaving the resumed
+    /// uplink with a hole in its frame clock and contiguous sequence numbers
+    /// (exactly what a partial pump catch-up used to produce), and the
+    /// downlink jitter buffer filling with nobody reading it. The socket side
+    /// keeps running, because a stalled device thread does not stop the
+    /// network thread: the member stays joined and keeps answering pings.
+    fn step_client_stalled(&mut self, now_us: u64, now_ms: u64, idx: usize) {
+        if self.raw_audio {
+            let ppm = self.clients[idx].skew.map_or(0, |sk| sk.skew_ppm());
+            let rate = FRAME_SAMPLES as f64 * (1.0 + f64::from(ppm) * 1e-6);
+            self.clients[idx].capture_acc += rate;
+            let n = self.clients[idx].capture_acc as usize;
+            self.clients[idx].capture_acc -= n as f64;
+            self.clients[idx].capture_samples += n as u64;
+            self.clients[idx].playout_acc += rate;
+            let m = self.clients[idx].playout_acc as usize;
+            self.clients[idx].playout_acc -= m as f64;
+        } else {
+            self.clients[idx].frames_emitted = match self.clients[idx].skew {
+                Some(sk) => sk.map(now_us) / TICK_US,
+                None => now_us / TICK_US,
+            };
+        }
+
+        let dgs = self.clients[idx].core.poll(now_ms);
+        self.forward_client(now_us, idx, dgs);
+
+        // A dead device plays nothing, and the meter must stay tick-aligned
+        // for `rms_of` and `longest_silence_ms` to index by tick.
+        self.record(idx, &[0.0; STEREO_FRAME]);
     }
 
     /// One per-tick meter entry (peak, energy) over this tick's playout,
@@ -515,6 +558,15 @@ impl Scenario {
 
     pub fn set_garbage(&mut self, client: usize, garbage: bool) {
         self.clients[client].garbage = garbage;
+    }
+
+    /// Freezes or thaws one client's audio driver, the way a multi-second
+    /// process stall under load freezes a real one. While stalled the harness
+    /// skips that client's capture and playout entirely (see
+    /// `step_client_stalled`); everything else about the session keeps
+    /// running, so the member neither leaves nor times out.
+    pub fn set_driver_stalled(&mut self, client: usize, stalled: bool) {
+        self.clients[client].stalled = stalled;
     }
 
     /// Clean Bye from a joined client; the server drops it from the roster,

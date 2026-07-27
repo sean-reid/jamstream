@@ -8,7 +8,43 @@
 //! follow-up); v1 shows your input and the room output only, which is why
 //! [`LevelsView`] has exactly those four values.
 
+use std::sync::Arc;
+
 pub use jamstream_protocol::ids::{MemberId, Role, TokenId};
+
+/// One member's avatar, decoded. The UI needs pixels, not a file: the
+/// runtime decodes each content hash exactly once and hands out clones of
+/// this handle, and the UI uploads one egui texture per `hash`.
+///
+/// `rgba` is straight (non-premultiplied) RGBA, `width * height * 4` bytes.
+#[derive(Clone)]
+pub struct AvatarHandle {
+    /// Lowercase hex of the avatar's Blake2s-256, its identity everywhere:
+    /// the decode cache key and the egui texture key.
+    pub hash: String,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<[u8]>,
+}
+
+/// Content-addressed: equal hashes are the same pixels, so snapshot
+/// comparison never walks the buffers.
+impl PartialEq for AvatarHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.width == other.width && self.height == other.height
+    }
+}
+
+impl std::fmt::Debug for AvatarHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvatarHandle")
+            .field("hash", &self.hash)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("rgba", &format_args!("{} bytes", self.rgba.len()))
+            .finish()
+    }
+}
 
 /// Everything the UI can ask the runtime to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +79,11 @@ pub enum Command {
     /// Host only: while on, the host's monitor carries the exact
     /// post-limiter listener signal, own voice included.
     SetBroadcastAudition(bool),
+    /// Your own avatar: raw file bytes as read from disk, or None to drop
+    /// it. The runtime hashes, validates, and announces; the UI never sees
+    /// a hash. Bytes past the transfer cap are refused with a log line, the
+    /// same way the settings sheet refuses them before sending.
+    SetOwnAvatar(Option<Vec<u8>>),
 }
 
 /// Your monitor-mix settings for one member.
@@ -65,6 +106,11 @@ pub struct MemberView {
     /// The invite token admitting this member; what [`Command::Revoke`]
     /// takes. Present only in host snapshots.
     pub token: Option<TokenId>,
+    /// Decoded avatar, once its bytes have arrived and decoded. None covers
+    /// both "no avatar set" and "the roster announced a hash whose bytes are
+    /// still in flight"; the UI shows the initials disc for both, and
+    /// swapping in the picture must not move anything.
+    pub avatar: Option<AvatarHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
