@@ -200,6 +200,40 @@ fn session_settings() {
     snapshot(&mut harness, "session_settings");
 }
 
+// The stream mix sheet over the host session: the frozen demo carries
+// distinct broadcast fader values, so rows show gain, pan, and a mute.
+
+fn stream_mix_app(theme: Theme, audition: bool) -> JamApp {
+    use jamstream_client::runtime::{Command, Runtime};
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    if audition {
+        rt.send(Command::SetBroadcastAudition(true));
+    }
+    let mut app = session_app(rt, theme);
+    app.session.broadcast_open = true;
+    app
+}
+
+#[test]
+fn session_stream_mix() {
+    let mut harness = app_harness(stream_mix_app(Theme::Dark, false), WIDE);
+    snapshot(&mut harness, "session_stream_mix");
+}
+
+#[test]
+fn session_stream_mix_light() {
+    let mut harness = app_harness(stream_mix_app(Theme::Light, false), WIDE);
+    snapshot(&mut harness, "session_stream_mix_light");
+}
+
+#[test]
+fn session_stream_mix_audition() {
+    // Audition on: the lamp toggle lit and the persistent reminder beside
+    // the mouth-to-ear readout.
+    let mut harness = app_harness(stream_mix_app(Theme::Dark, true), WIDE);
+    snapshot(&mut harness, "session_stream_mix_audition");
+}
+
 // Wizard states are constructed through the real transitions with a
 // MemStore and a pinned (empty) environment, so snapshots stay independent
 // of the machine's credentials; region rows are fixture data fed through
