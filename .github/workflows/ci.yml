@@ -43,6 +43,55 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # We squash-merge, so the PR title becomes the commit message on main, and
+  # release-please builds the changelog from those. A title that is not a
+  # conventional commit is not an error anywhere: the PR merges, CI is green,
+  # and the change is silently absent from the next release notes. That is
+  # exactly what happened before v0.1.2, where nine PRs including the session
+  # firewall and the broadcast pipeline were dropped from the changelog and
+  # had to be restored by hand. Hence a gate rather than a convention.
+  #
+  # Seconds to run, so it is not worth its own workflow, and it fails fast
+  # while the compile jobs are still warming up.
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Passed through env, never interpolated into the script body: a PR
+      # title is attacker-controlled text and `${{ }}` inside run: is a shell
+      # injection.
+      - name: Check the title is a conventional commit
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -eu
+          # Types accepted by release-please's default config, plus the ones
+          # this repo already uses in its history (deps).
+          TYPES='feat|fix|perf|refactor|docs|chore|test|ci|build|style|revert|deps'
+          if printf '%s' "$TITLE" | grep -qE "^($TYPES)(\([a-z0-9,./ -]+\))?!?: .+"; then
+            echo "ok: $TITLE"
+            exit 0
+          fi
+          cat >&2 <<MSG
+          PR title is not a conventional commit:
+
+            $TITLE
+
+          Because this repo squash-merges, the title becomes the commit
+          message on main, and release-please builds the changelog from it.
+          A non-conforming title merges fine and then vanishes from the
+          release notes, which is why this is enforced rather than asked for.
+
+          Use:  <type>[optional scope][!]: <description>
+          Types: $TYPES
+          Example: feat: a firewall per session
+                   fix(cloud): make the VM bootstrap fail closed
+
+          feat and fix appear in the changelog. Use ! for a breaking change.
+          MSG
+          exit 1
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
