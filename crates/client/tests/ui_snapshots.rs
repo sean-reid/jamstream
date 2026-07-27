@@ -33,6 +33,47 @@ fn preview_dir() -> PathBuf {
 /// Runs a fixed number of steps (animated widgets never settle), writes the
 /// preview copy, then asserts against the baseline.
 fn snapshot(harness: &mut Harness<'_>, name: &str) {
+    render_and_compare(harness, name);
+}
+
+/// Like [`snapshot`], and additionally declares the baseline fit to publish
+/// on the docs site. `site/copy-previews.sh` refuses to copy any image whose
+/// name this did not record.
+///
+/// Use it only when the fixture renders what someone running a RELEASE build
+/// would see: nothing stubbed to `None` that a real user has, nothing
+/// disabled that would be enabled, no placeholder value that contradicts what
+/// the product would really show.
+///
+/// The gate exists because three published screenshots misrepresented the
+/// product in one day and nothing failed. The wizard preview showed the
+/// development fallback, with artifact url and sha256 fields and a dead
+/// Launch button, directly above prose saying there was nothing to configure;
+/// its fixture set `pinned = None` deliberately, to stop the baseline rotting
+/// on version bumps, and nobody connected that to the same file being the
+/// screenshot on the hosting guide. Every destinations baseline showed a host
+/// with no Invites button. The wizard region step showed DigitalOcean egress
+/// at $0.00/GB, contradicting the cost guide.
+///
+/// A snapshot test cannot catch any of that: once a baseline is accepted it
+/// passes forever, whatever it depicts. So the judgement has to be made where
+/// the author knows what they stubbed, and this is that place.
+fn snapshot_for_docs(harness: &mut Harness<'_>, name: &str) {
+    let dir = preview_dir();
+    std::fs::create_dir_all(&dir).expect("create preview dir");
+    // Append rather than rewrite: nextest runs each test in its own process,
+    // so there is no single point that could own the whole list.
+    let mut manifest = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("publishable.txt"))
+        .expect("open publishable manifest");
+    use std::io::Write as _;
+    writeln!(manifest, "{name}.png").expect("record publishable name");
+    render_and_compare(harness, name);
+}
+
+fn render_and_compare(harness: &mut Harness<'_>, name: &str) {
     harness.run_steps(4);
     let image = harness.render().expect("harness render");
     let dir = preview_dir();
@@ -118,7 +159,7 @@ fn host_invites() -> InvitesPanel {
 #[test]
 fn home_empty() {
     let mut harness = app_harness(test_app(Theme::Dark), WIDE);
-    snapshot(&mut harness, "home_empty");
+    snapshot_for_docs(&mut harness, "home_empty");
 }
 
 #[test]
@@ -159,7 +200,7 @@ fn devices() {
 fn session_demo() {
     let app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_demo");
+    snapshot_for_docs(&mut harness, "session_demo");
 }
 
 #[test]
@@ -212,7 +253,7 @@ fn session_full() {
     // scrolls sideways like a console; the listener line stays one line.
     let app = session_app(DemoRuntime::full(FROZEN_FRAME, false, true), Theme::Dark);
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_full");
+    snapshot_for_docs(&mut harness, "session_full");
 }
 
 #[test]
@@ -239,7 +280,7 @@ fn session_settings() {
     let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
     app.settings_open = true;
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_settings");
+    snapshot_for_docs(&mut harness, "session_settings");
 }
 
 #[test]
@@ -414,7 +455,7 @@ fn session_destinations_live_two() {
         &[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)],
     );
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_destinations_live_two");
+    snapshot_for_docs(&mut harness, "session_destinations_live_two");
 }
 
 #[test]
@@ -436,7 +477,7 @@ fn session_destinations_failed() {
         ],
     );
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_destinations_failed");
+    snapshot_for_docs(&mut harness, "session_destinations_failed");
 }
 
 #[test]
@@ -589,9 +630,16 @@ fn wizard_snapshot(app: JamApp, name: &str) {
     snapshot(&mut harness, name);
 }
 
+/// [`wizard_snapshot`] for a baseline the docs site publishes. See
+/// [`snapshot_for_docs`] for what that claims.
+fn wizard_snapshot_for_docs(app: JamApp, name: &str) {
+    let mut harness = app_harness(app, WIDE);
+    snapshot_for_docs(&mut harness, name);
+}
+
 #[test]
 fn wizard_provider() {
-    wizard_snapshot(wizard_provider_app(Theme::Dark), "wizard_provider");
+    wizard_snapshot_for_docs(wizard_provider_app(Theme::Dark), "wizard_provider");
 }
 
 #[test]
@@ -601,7 +649,7 @@ fn wizard_provider_light() {
 
 #[test]
 fn wizard_setup_digitalocean() {
-    wizard_snapshot(wizard_setup_app(Theme::Dark), "wizard_setup_digitalocean");
+    wizard_snapshot_for_docs(wizard_setup_app(Theme::Dark), "wizard_setup_digitalocean");
 }
 
 #[test]
@@ -614,7 +662,7 @@ fn wizard_setup_digitalocean_light() {
 
 #[test]
 fn wizard_region() {
-    wizard_snapshot(wizard_region_app(Theme::Dark), "wizard_region");
+    wizard_snapshot_for_docs(wizard_region_app(Theme::Dark), "wizard_region");
 }
 
 #[test]
@@ -624,7 +672,7 @@ fn wizard_region_light() {
 
 #[test]
 fn wizard_preview() {
-    wizard_snapshot(wizard_preview_app(Theme::Dark), "wizard_preview");
+    wizard_snapshot_for_docs(wizard_preview_app(Theme::Dark), "wizard_preview");
 }
 
 #[test]
@@ -721,7 +769,7 @@ fn session_invites_app(theme: Theme) -> JamApp {
 #[test]
 fn session_invites() {
     let mut harness = app_harness(session_invites_app(Theme::Dark), WIDE);
-    snapshot(&mut harness, "session_invites");
+    snapshot_for_docs(&mut harness, "session_invites");
 }
 
 #[test]
