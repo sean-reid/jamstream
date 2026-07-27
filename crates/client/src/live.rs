@@ -28,8 +28,8 @@ use jamstream_session::SessionError;
 use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 
 use crate::runtime::{
-    ChatLine, Command, ConnState, FaderView, LevelsView, MemberId, MemberView, MetronomeView,
-    Runtime, Snapshot, StatsView,
+    ChatLine, Command, ConnState, CostView, FaderView, LevelsView, MemberId, MemberView,
+    MetronomeView, Runtime, Snapshot, StatsView, TokenId,
 };
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -404,9 +404,9 @@ impl LiveRuntime {
                     pan: 0.0,
                     muted: false,
                 }),
-                // The wire roster carries no token ids; revocation needs
-                // the host's invite book, which lands with the wizard's
-                // real-provider pass. None hides the revoke buttons.
+                // The wire roster carries no token ids; the wizard's
+                // [`CostedRuntime`] wrapper injects them from the host's
+                // invite book. None hides the revoke buttons.
                 token: None,
             })
             .collect();
@@ -423,7 +423,8 @@ impl LiveRuntime {
             chat: s.chat.iter().cloned().collect(),
             levels: s.levels,
             metronome: s.metronome,
-            // Host cost readout is wired with the provisioning pass.
+            // The wizard's [`CostedRuntime`] wrapper fills this for
+            // sessions this app launched; plain joins have no meter.
             cost: None,
             session_short: s.session_short.clone(),
             server_addr: s.server_addr.clone(),
@@ -487,6 +488,61 @@ impl Runtime for Arc<LiveRuntime> {
 
     fn send(&self, cmd: Command) {
         self.send_cmd(cmd);
+    }
+}
+
+/// The host-session view over a [`LiveRuntime`] the wizard launched:
+/// injects the running cost (hourly rate from the state file, elapsed from
+/// its creation time) and the invite book's token ids into every snapshot.
+/// The wire roster carries no token ids, so revocation targeting can only
+/// come from the host's own records; this closes that gap without touching
+/// the [`Runtime`] contract or the wire protocol.
+pub struct CostedRuntime {
+    inner: Arc<LiveRuntime>,
+    hourly_microusd: u64,
+    created_unix: u64,
+    tokens: HashMap<MemberId, TokenId>,
+}
+
+impl CostedRuntime {
+    pub fn new(
+        inner: Arc<LiveRuntime>,
+        hourly_microusd: u64,
+        created_unix: u64,
+        tokens: HashMap<MemberId, TokenId>,
+    ) -> CostedRuntime {
+        CostedRuntime {
+            inner,
+            hourly_microusd,
+            created_unix,
+            tokens,
+        }
+    }
+}
+
+impl Runtime for CostedRuntime {
+    fn snapshot(&self) -> Snapshot {
+        let mut snap = self.inner.snapshot_now();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(self.created_unix);
+        let elapsed_secs = now.saturating_sub(self.created_unix);
+        snap.cost = Some(CostView {
+            hourly_microusd: self.hourly_microusd,
+            accrued_microusd: self.hourly_microusd * elapsed_secs / 3600,
+            elapsed_secs,
+        });
+        for member in &mut snap.members {
+            if member.token.is_none() {
+                member.token = self.tokens.get(&member.id).copied();
+            }
+        }
+        snap
+    }
+
+    fn send(&self, cmd: Command) {
+        self.inner.send_cmd(cmd);
     }
 }
 

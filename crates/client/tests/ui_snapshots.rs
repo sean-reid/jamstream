@@ -4,13 +4,17 @@
 //! human-reviewable copy of each render under target/ui-previews/.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use egui::vec2;
 use egui_kittest::Harness;
 use jamstream_client::app::{JamApp, Screen};
+use jamstream_client::creds::{EnvReader, MemStore};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
+use jamstream_client::exec::Executor;
 use jamstream_client::screens::home::RecentSession;
-use jamstream_client::screens::host::{HostWizard, LaunchOutcome, ProviderRow, RegionRow};
+use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow};
+use jamstream_client::screens::invites::InvitesPanel;
 use jamstream_client::theme::{self, Theme};
 use jamstream_cloud::{Price, ProviderKind, Region, RegionId};
 
@@ -196,126 +200,226 @@ fn session_settings() {
     snapshot(&mut harness, "session_settings");
 }
 
-// Wizard states are constructed through the real transitions with fixed
-// rows, so snapshots stay independent of environment credentials.
+// Wizard states are constructed through the real transitions with a
+// MemStore and a pinned (empty) environment, so snapshots stay independent
+// of the machine's credentials; region rows are fixture data fed through
+// the same pure transition the probe job uses.
 
-fn fixed_providers() -> Vec<ProviderRow> {
-    vec![
-        ProviderRow {
-            name: "mock".to_owned(),
-            available: true,
-            detail: "runs locally, no credentials needed".to_owned(),
-        },
-        ProviderRow {
-            name: "aws".to_owned(),
-            available: false,
-            detail: "provider aws: AWS_ACCESS_KEY_ID is not set".to_owned(),
-        },
-        ProviderRow {
-            name: "digitalocean".to_owned(),
-            available: false,
-            detail: "provider digitalocean: DIGITALOCEAN_TOKEN is not set".to_owned(),
-        },
-        ProviderRow {
-            name: "gcp".to_owned(),
-            available: false,
-            detail: "provider gcp: GOOGLE_APPLICATION_CREDENTIALS is not set".to_owned(),
-        },
-    ]
+fn fixed_wizard() -> HostWizard {
+    let env: EnvReader = Arc::new(|_| None);
+    HostWizard::new(
+        Arc::new(MemStore::default()),
+        env,
+        Arc::new(Executor::new()),
+    )
 }
 
 fn fixed_regions() -> Vec<RegionRow> {
-    let row = |id: &str, hourly: u64, rtt: f32| RegionRow {
+    let row = |id: &str, display: &str, hourly: u64, rtt: f32| RegionRow {
         region: Region {
-            provider: ProviderKind::Aws,
+            provider: ProviderKind::DigitalOcean,
             id: RegionId::new(id),
-            display: id.to_owned(),
+            display: display.to_owned(),
             country: "US".to_owned(),
         },
         price: Price {
             hourly_microusd: hourly,
-            egress_microusd_per_gb: 90_000,
-            included_egress_gb: 0,
+            egress_microusd_per_gb: 0,
+            included_egress_gb: 3000,
         },
         worst_rtt_ms: rtt,
-        fabricated: true,
     };
     vec![
-        row("mock-east", 16_800, 21.0),
-        row("mock-west", 12_000, 34.0),
+        row("nyc3", "New York 3", 26_790, 21.0),
+        row("sfo3", "San Francisco 3", 26_790, 74.0),
     ]
 }
 
-fn wizard_at(step: &str) -> HostWizard {
-    let mut w = HostWizard::new(fixed_providers());
-    if step == "provider" {
-        return w;
-    }
-    w.select_provider(0);
-    w.continue_to_region(fixed_regions());
-    if step == "region" {
-        return w;
-    }
-    w.continue_to_preview();
-    if step == "preview" {
-        return w;
-    }
-    w.begin_launch();
-    if step == "launching" {
-        return w;
-    }
-    w.finish_launch(LaunchOutcome {
-        session_short: "a3f29c41".to_owned(),
-        server_addr: "203.0.113.10:43210".to_owned(),
-        invites: vec![
-            (
-                "host".to_owned(),
-                "jamstream://join/AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJ".to_owned(),
-            ),
-            (
-                "musician 1".to_owned(),
-                "jamstream://join/KKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSSTTTT".to_owned(),
-            ),
-            (
-                "listener 4".to_owned(),
-                "jamstream://join/UUUUVVVVWWWWXXXXYYYYZZZZ0000111122223333".to_owned(),
-            ),
-        ],
-        state_path: Some("/home/you/.local/share/jamstream/sessions/a3f29c41.json".to_owned()),
-        error: None,
-    });
-    w
+/// Provider step with all three statuses on screen: local needs no
+/// account, DigitalOcean reads ready, the rest need setup.
+fn wizard_provider_app(theme: Theme) -> JamApp {
+    let mut app = test_app(theme);
+    let mut w = fixed_wizard();
+    w.providers[1].status = ProviderStatus::Ready;
+    w.select_provider(1);
+    app.wizard = w;
+    app.screen = Screen::HostWizard;
+    app
 }
 
-fn wizard_snapshot(step: &'static str, name: &str) {
-    let mut app = test_app(Theme::Dark);
-    app.wizard = wizard_at(step);
+fn wizard_region_app(theme: Theme) -> JamApp {
+    let mut app = test_app(theme);
+    let mut w = fixed_wizard();
+    w.providers[1].status = ProviderStatus::Ready;
+    w.select_provider(1);
+    w.continue_to_region(fixed_regions());
+    app.wizard = w;
     app.screen = Screen::HostWizard;
+    app
+}
+
+/// The DigitalOcean setup pane, open inline with a masked token typed.
+fn wizard_setup_app(theme: Theme) -> JamApp {
+    let mut app = test_app(theme);
+    let mut w = fixed_wizard();
+    w.select_provider(1);
+    w.setup.do_token = "dop_v1_0000000000000000".to_owned();
+    app.wizard = w;
+    app.screen = Screen::HostWizard;
+    app
+}
+
+fn wizard_preview_app(theme: Theme) -> JamApp {
+    let mut app = test_app(theme);
+    let mut w = fixed_wizard();
+    w.providers[1].status = ProviderStatus::Ready;
+    w.select_provider(1);
+    w.continue_to_region(fixed_regions());
+    w.continue_to_preview();
+    w.advanced_open = true;
+    app.wizard = w;
+    app.screen = Screen::HostWizard;
+    app
+}
+
+/// Launch progress: the model enters Launching without spawning a job, so
+/// the phase readout is frozen on the first phase.
+fn wizard_launching_app(theme: Theme) -> JamApp {
+    let mut app = test_app(theme);
+    let mut w = fixed_wizard();
+    w.select_provider(0); // local
+    w.advance_from_provider();
+    w.step = jamstream_client::screens::host::WizardStep::Launching;
+    app.wizard = w;
+    app.screen = Screen::HostWizard;
+    app
+}
+
+fn wizard_snapshot(app: JamApp, name: &str) {
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, name);
 }
 
 #[test]
 fn wizard_provider() {
-    wizard_snapshot("provider", "wizard_provider");
+    wizard_snapshot(wizard_provider_app(Theme::Dark), "wizard_provider");
+}
+
+#[test]
+fn wizard_provider_light() {
+    wizard_snapshot(wizard_provider_app(Theme::Light), "wizard_provider_light");
+}
+
+#[test]
+fn wizard_setup_digitalocean() {
+    wizard_snapshot(wizard_setup_app(Theme::Dark), "wizard_setup_digitalocean");
+}
+
+#[test]
+fn wizard_setup_digitalocean_light() {
+    wizard_snapshot(
+        wizard_setup_app(Theme::Light),
+        "wizard_setup_digitalocean_light",
+    );
 }
 
 #[test]
 fn wizard_region() {
-    wizard_snapshot("region", "wizard_region");
+    wizard_snapshot(wizard_region_app(Theme::Dark), "wizard_region");
+}
+
+#[test]
+fn wizard_region_light() {
+    wizard_snapshot(wizard_region_app(Theme::Light), "wizard_region_light");
 }
 
 #[test]
 fn wizard_preview() {
-    wizard_snapshot("preview", "wizard_preview");
+    wizard_snapshot(wizard_preview_app(Theme::Dark), "wizard_preview");
 }
 
 #[test]
 fn wizard_launching() {
-    wizard_snapshot("launching", "wizard_launching");
+    wizard_snapshot(wizard_launching_app(Theme::Dark), "wizard_launching");
 }
 
 #[test]
-fn wizard_done() {
-    wizard_snapshot("done", "wizard_done");
+fn wizard_launching_light() {
+    wizard_snapshot(wizard_launching_app(Theme::Light), "wizard_launching_light");
+}
+
+// The invites panel over the host session, fed from a real decodable state
+// record so labels and statuses come through the production path.
+
+fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {
+    use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
+    use jamstream_protocol::invite::{Issuer, Token};
+
+    let issuer = Issuer::from_bytes(&[7u8; 32]);
+    let server_pk = [9u8; 32];
+    let session_id = SessionId([0xa3; 16]);
+    let address: std::net::SocketAddr = "203.0.113.10:43210".parse().expect("addr");
+    let mint = |member: u16, role: Role, label: &str| {
+        let token = Token {
+            member_id: MemberId(member),
+            role,
+            name_hint: None,
+            expires_unix: 4_000_000_000,
+            jti: TokenId([member as u8 + 1; 16]),
+        };
+        jamstream_cli::state::InviteRecord {
+            role: label.to_owned(),
+            invite: issuer
+                .mint(session_id, vec![address], server_pk, token)
+                .encode(),
+        }
+    };
+    let state = jamstream_cli::state::SessionState {
+        session_id_hex: "a3".repeat(16),
+        provider: "local".to_owned(),
+        region: "local".to_owned(),
+        instance_id: "12345".to_owned(),
+        address: address.to_string(),
+        created_unix: 1_784_000_000,
+        hourly_microusd: 0,
+        issuer_private_key_b64: String::new(),
+        server_public_key_b64: String::new(),
+        invites: vec![
+            mint(0, Role::Musician, "host"),
+            mint(1, Role::Musician, "musician 1"),
+            mint(2, Role::Musician, "musician 2"),
+            mint(3, Role::Musician, "musician 3"),
+            mint(4, Role::Listener, "listener 4"),
+            mint(5, Role::Listener, "listener 5"),
+        ],
+        status: jamstream_cli::state::SessionStatus::Running,
+        ended_unix: None,
+    };
+    let path = std::env::temp_dir().join("jamstream-snapshot-invites.json");
+    (state, path)
+}
+
+fn session_invites_app(theme: Theme) -> JamApp {
+    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, true), theme);
+    let (state, path) = invites_state();
+    let mut panel = InvitesPanel::new(state, path);
+    // One revoked row so all three statuses render: the demo roster has
+    // members 1..4 connected and member 5 absent.
+    let revoked = panel.token_map()[&jamstream_protocol::ids::MemberId(2)];
+    panel.mark_revoked(revoked);
+    app.session.invites = Some(panel);
+    app.session.invites_open = true;
+    app
+}
+
+#[test]
+fn session_invites() {
+    let mut harness = app_harness(session_invites_app(Theme::Dark), WIDE);
+    snapshot(&mut harness, "session_invites");
+}
+
+#[test]
+fn session_invites_light() {
+    let mut harness = app_harness(session_invites_app(Theme::Light), WIDE);
+    snapshot(&mut harness, "session_invites_light");
 }

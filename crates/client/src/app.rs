@@ -6,12 +6,15 @@ use std::sync::Arc;
 
 use egui::{Context, Frame, Ui};
 
+use crate::creds::{self, CredStore, EnvReader, KeyringStore};
 use crate::demo::DemoRuntime;
-use crate::live::{AudioSettings, LiveRuntime};
-use crate::runtime::{ConnState, LevelsView, Runtime};
+use crate::exec::{Executor, Job};
+use crate::live::{AudioSettings, CostedRuntime, LiveRuntime};
+use crate::runtime::{Command, ConnState, LevelsView, Runtime};
 use crate::screens::devices::{DeviceCatalog, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
-use crate::screens::host::{self, HostWizard, WizardEvent, WizardStep};
+use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
+use crate::screens::invites::{self, InvitesPanel};
 use crate::screens::session::{SessionEvent, SessionScreen};
 use crate::theme::{self, Theme};
 
@@ -50,12 +53,15 @@ pub struct JamApp {
     /// state).
     pub live: Option<Arc<LiveRuntime>>,
     pub settings_open: bool,
-    /// A launch was requested; execute it on the next frame so the
-    /// launching step paints first.
-    launch_pending: bool,
     /// Device selection last applied to the live runtime, as
     /// (capture_idx, playback_idx, buffer_frames).
     applied_audio: (usize, usize, u32),
+    /// End-session teardown in flight; a progress sheet shows until the
+    /// provider confirms the instance is gone.
+    ending: Option<Job<Result<(), String>>>,
+    creds: Arc<dyn CredStore>,
+    env: EnvReader,
+    exec: Arc<Executor>,
 }
 
 impl JamApp {
@@ -66,6 +72,9 @@ impl JamApp {
             devices.playback_idx,
             devices.buffer_frames,
         );
+        let creds: Arc<dyn CredStore> = Arc::new(KeyringStore);
+        let env = creds::system_env();
+        let exec = Arc::new(Executor::new());
         JamApp {
             theme: Theme::Dark,
             screen: Screen::Home,
@@ -73,13 +82,16 @@ impl JamApp {
             recent: RecentSession::load(),
             devices,
             catalog: DeviceCatalog::demo(),
-            wizard: HostWizard::new(host::provider_rows_from_env()),
+            wizard: HostWizard::new(Arc::clone(&creds), Arc::clone(&env), Arc::clone(&exec)),
             session: SessionScreen::default(),
             runtime: None,
             live: None,
             settings_open: false,
-            launch_pending: false,
             applied_audio,
+            ending: None,
+            creds,
+            env,
+            exec,
         }
     }
 
@@ -124,6 +136,97 @@ impl JamApp {
                 .and_then(|d| d.id.clone()),
             buffer_frames: self.devices.buffer_frames,
         }
+    }
+
+    /// The wizard finished a real launch: auto-join with the host invite
+    /// (member 0, never rendered anywhere), wrap the runtime so snapshots
+    /// carry the cost meter and the invite book's token ids, and land on
+    /// the session screen with the invites panel already open so the next
+    /// act is sharing the links.
+    fn enter_hosted_session(&mut self, outcome: LaunchOutcome) {
+        let invite = outcome
+            .state
+            .invites
+            .first()
+            .and_then(|record| jamstream_protocol::invite::Invite::decode(&record.invite).ok());
+        let Some(invite) = invite else {
+            self.wizard.launch_error =
+                Some("the session launched but its host invite does not decode".to_owned());
+            return;
+        };
+        let settings = self.audio_settings();
+        match LiveRuntime::join(&invite, settings, jamstream_audio_io::backend()) {
+            Ok(rt) => {
+                let rt = Arc::new(rt);
+                self.live = Some(Arc::clone(&rt));
+                let panel = InvitesPanel::new(outcome.state.clone(), outcome.state_path.clone());
+                let costed = CostedRuntime::new(
+                    rt,
+                    outcome.state.hourly_microusd,
+                    outcome.state.created_unix,
+                    panel.token_map(),
+                );
+                self.runtime = Some(Box::new(costed));
+                self.session = SessionScreen::default();
+                self.session.invites = Some(panel);
+                self.session.invites_open = true;
+                self.recent = RecentSession::load();
+                self.screen = Screen::Session;
+            }
+            Err(err) => {
+                self.wizard.launch_error = Some(format!(
+                    "the server is running but joining it failed: {err}. \
+                     End it with: jamstream end --last"
+                ));
+            }
+        }
+    }
+
+    /// Host chose "end session for everyone": leave the session, then
+    /// destroy the instance and mark the state file ended on the executor.
+    fn end_session(&mut self) {
+        if let Some(rt) = self.runtime.as_deref() {
+            rt.send(Command::Leave);
+        }
+        if let Some(panel) = self.session.invites.take() {
+            let provider = creds::build_provider(&panel.state.provider, &*self.creds, &self.env);
+            let state = panel.state;
+            let path = panel.path;
+            self.ending = Some(
+                self.exec
+                    .run(async move { invites::end_session(provider?, state, path).await }),
+            );
+        }
+        self.runtime = None;
+        self.live = None;
+        self.recent = RecentSession::load();
+        self.screen = Screen::Home;
+    }
+
+    /// Progress sheet for the teardown; a failure lands on the home screen
+    /// with the provider's error.
+    fn ending_progress(&mut self, ctx: &Context) {
+        let Some(job) = &mut self.ending else {
+            return;
+        };
+        if let Some(result) = job.poll() {
+            self.ending = None;
+            if let Err(err) = result {
+                self.home.error = Some(format!("ending the session failed: {err}"));
+            }
+            self.recent = RecentSession::load();
+            return;
+        }
+        egui::Window::new("Ending session")
+            .title_bar(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 120.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().color(theme::palette_of(ui).text_muted));
+                    ui.label("Ending the session; the server is being destroyed.");
+                });
+            });
     }
 
     pub fn root_ui(&mut self, ui: &mut Ui) {
@@ -173,7 +276,11 @@ impl JamApp {
                             }
                         }
                         HomeAction::Host => {
-                            self.wizard = HostWizard::new(host::provider_rows_from_env());
+                            self.wizard = HostWizard::new(
+                                Arc::clone(&self.creds),
+                                Arc::clone(&self.env),
+                                Arc::clone(&self.exec),
+                            );
                             self.screen = Screen::HostWizard;
                         }
                     }
@@ -184,35 +291,31 @@ impl JamApp {
                 self.devices.ui(ui, &self.catalog, &levels);
             }
             Screen::HostWizard => {
-                if self.launch_pending && self.wizard.step == WizardStep::Launching {
-                    let outcome = host::launch(&self.wizard);
-                    self.wizard.finish_launch(outcome);
-                    self.launch_pending = false;
-                }
-                match self.wizard.ui(ui) {
-                    Some(WizardEvent::LaunchRequested) => self.launch_pending = true,
-                    Some(WizardEvent::Close) => {
-                        self.recent = RecentSession::load();
-                        self.screen = Screen::Home;
-                    }
-                    None => {}
+                if let Some(WizardEvent::Launched(outcome)) = self.wizard.ui(ui) {
+                    self.enter_hosted_session(*outcome);
                 }
             }
             Screen::Session => {
                 if let Some(rt) = self.runtime.as_deref() {
                     // One snapshot pull per frame; screens never call back in.
                     let snap = rt.snapshot();
-                    if let Some(SessionEvent::Left) = self.session.ui(ui, &snap, rt) {
-                        self.runtime = None;
-                        self.live = None;
-                        self.recent = RecentSession::load();
-                        self.screen = Screen::Home;
+                    match self.session.ui(ui, &snap, rt) {
+                        Some(SessionEvent::Left) => {
+                            self.runtime = None;
+                            self.live = None;
+                            self.recent = RecentSession::load();
+                            self.screen = Screen::Home;
+                        }
+                        Some(SessionEvent::EndSession) => self.end_session(),
+                        None => {}
                     }
                 } else {
                     self.screen = Screen::Home;
                 }
             }
         }
+
+        self.ending_progress(ui.ctx());
 
         // Device picks apply immediately: mid-session the live runtime
         // reopens its stream, otherwise the selection just waits for the
@@ -304,10 +407,12 @@ impl eframe::App for JamApp {
         theme::apply(ctx, self.theme);
         // Meters, the cost ticker, and connection quality move while a
         // session or the input meter is on screen.
-        let animating = match self.screen {
-            Screen::Session | Screen::Devices => true,
-            _ => self.settings_open,
-        };
+        let animating = self.ending.is_some()
+            || match self.screen {
+                Screen::Session | Screen::Devices => true,
+                Screen::HostWizard => self.wizard.busy() || self.settings_open,
+                _ => self.settings_open,
+            };
         if animating {
             ctx.request_repaint();
         }

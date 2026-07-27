@@ -1,45 +1,145 @@
-//! The host wizard: provider, region, cost preview, launch, invites. The
-//! state machine is plain data with function-per-transition so it tests
-//! without a Ui. The mock provider runs the full flow today; real provider
-//! launching arrives with the networking pass.
+//! The host wizard: provider (with credential setup), region, cost
+//! preview, launch, then straight into the session. The state machine is
+//! plain data with function-per-transition so it tests without a Ui; all
+//! network work runs on the app's background executor and the UI polls the
+//! results once per frame.
+//!
+//! Providers are the real ones: local (this computer, free, no account)
+//! and the three clouds. The host's own invite is minted but never shown
+//! anywhere; the app auto-joins with it and the invites panel on the
+//! session screen carries everyone else's.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui, vec2};
 use jamstream_cloud::{
-    BootConfig, CostPreview, InstanceClass, LaunchSpec, Price, Region, SelfDestruct, rank,
-    session_tag,
+    BootConfig, CostPreview, InstanceClass, LaunchSpec, Price, ProbeMatrix, Provider, ProviderKind,
+    Region, RegionId, SelfDestruct, rank, session_tag,
 };
-use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
-use jamstream_protocol::invite::{Issuer, Token};
+use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
+use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
+use jamstream_session::client::{ClientCore, ClientState};
 
+use crate::creds::{self, CredStore, EnvReader};
+use crate::exec::{Executor, Job};
 use crate::theme;
 use crate::widgets::{PICK_INDENT, pick_row, row_cell};
+
+/// Wizard providers in presentation order: local first (no account), then
+/// DigitalOcean as the recommended cloud, then the rest. The mock provider
+/// is deliberately absent; `--demo` exercises the fake session elsewhere.
+pub const WIZARD_PROVIDERS: &[&str] = &["local", "digitalocean", "aws", "gcp"];
+
+const SESSION_PORT: u16 = 43210;
+const MAX_HOURS: u64 = 12;
+const IDLE_MIN: u32 = 10;
+const IP_WAIT_CAP: Duration = Duration::from_secs(180);
+const IP_POLL_PERIOD: Duration = Duration::from_secs(2);
+const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
+
+/// The local provider consumes the flat config, which carries no artifact
+/// fields; these placeholders fill the BootConfig struct for it. Cloud
+/// launches require the real artifact url and hash from the advanced
+/// fields, because the VM downloads and verifies the binary at boot.
+const PLACEHOLDER_ARTIFACT_URL: &str = "https://artifacts.invalid/jamstreamd";
+const PLACEHOLDER_ARTIFACT_SHA256: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStatus {
+    /// Local: works with zero setup.
+    NoAccountNeeded,
+    /// Credentials found in the keychain or the environment.
+    Ready,
+    /// Selecting the row opens the inline setup pane.
+    SetupNeeded,
+}
+
+impl ProviderStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProviderStatus::NoAccountNeeded => "no account needed",
+            ProviderStatus::Ready => "ready",
+            ProviderStatus::SetupNeeded => "setup needed",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRow {
     pub name: String,
-    pub available: bool,
-    /// Which env credentials were found, or why the provider is unusable.
-    pub detail: String,
+    pub status: ProviderStatus,
+    /// One factual clause about what picking this means.
+    pub hint: String,
+}
+
+/// Provider rows from the credential store with the environment fallback.
+pub fn provider_rows(creds: &dyn CredStore, env: &EnvReader) -> Vec<ProviderRow> {
+    WIZARD_PROVIDERS
+        .iter()
+        .map(|name| {
+            let status = if *name == "local" {
+                ProviderStatus::NoAccountNeeded
+            } else if creds::build_provider(name, creds, env).is_ok() {
+                ProviderStatus::Ready
+            } else {
+                ProviderStatus::SetupNeeded
+            };
+            let hint = match *name {
+                "local" => "this computer; free, LAN or port-forwarded guests",
+                "digitalocean" => "recommended cloud: one token, transfer included",
+                "aws" => "more setup; fine if you already use AWS",
+                "gcp" => "most setup steps; egress billed on top",
+                _ => "",
+            };
+            ProviderRow {
+                name: (*name).to_owned(),
+                status,
+                hint: hint.to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// Typed-but-unsaved credentials for the inline setup panes. Saved to the
+/// keychain only after a successful check.
+#[derive(Default)]
+pub struct SetupFields {
+    pub do_token: String,
+    pub aws_access_key_id: String,
+    pub aws_secret_access_key: String,
+    pub gcp_json: String,
+    pub gcp_path: String,
+    /// Text fields render masked; this is the explicit reveal.
+    pub reveal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegionRow {
     pub region: Region,
     pub price: Price,
+    /// Probed from this computer; infinite when the region never answered.
     pub worst_rtt_ms: f32,
-    /// True when the latency figure is fabricated rather than probed.
-    pub fabricated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchPhase {
+    Launching,
+    WaitingForAddress,
+    CheckingReachability,
+}
+
+/// What a successful launch hands the app: the exact state record the CLI
+/// writes (shared schema, shared directory) and where it landed. The host
+/// invite is `state.invites[0]`; the app joins with it and never shows it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaunchOutcome {
-    pub session_short: String,
-    pub server_addr: String,
-    /// (label, encoded invite) pairs, host first.
-    pub invites: Vec<(String, String)>,
-    pub state_path: Option<String>,
-    pub error: Option<String>,
+    pub state: jamstream_cli::state::SessionState,
+    pub state_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,45 +148,73 @@ pub enum WizardStep {
     Region,
     Preview,
     Launching,
-    Done,
+}
+
+/// What the wizard asks the app to do this frame.
+pub enum WizardEvent {
+    /// The session is up and recorded; join with the host invite.
+    Launched(Box<LaunchOutcome>),
 }
 
 pub struct HostWizard {
     pub step: WizardStep,
     pub providers: Vec<ProviderRow>,
     pub selected_provider: Option<usize>,
+    pub setup: SetupFields,
+    pub setup_open: bool,
+    pub check_result: Option<Result<(), String>>,
     pub regions: Vec<RegionRow>,
+    pub regions_error: Option<String>,
     pub selected_region: Option<usize>,
     pub hours: f32,
     pub musicians: u8,
     pub listeners: u8,
     pub destinations: u8,
-    pub outcome: Option<LaunchOutcome>,
-}
-
-/// What the wizard asks the app to do this frame.
-pub enum WizardEvent {
-    /// Perform the launch (next frame) and call [`HostWizard::finish_launch`].
-    LaunchRequested,
-    /// The user is done; go back to the home screen.
-    Close,
+    pub advanced_open: bool,
+    pub artifact_url: String,
+    pub artifact_sha256: String,
+    pub launch_error: Option<String>,
+    check_job: Option<Job<Result<(), String>>>,
+    regions_job: Option<Job<Result<Vec<RegionRow>, String>>>,
+    launch_job: Option<Job<Result<LaunchOutcome, String>>>,
+    launch_phase: Arc<Mutex<LaunchPhase>>,
+    creds: Arc<dyn CredStore>,
+    env: EnvReader,
+    exec: Arc<Executor>,
 }
 
 // Pure state machine. Each transition validates its precondition and
-// returns whether it happened, so tests can assert both directions.
+// returns whether it happened, so tests can assert both directions; the
+// job-spawning methods delegate to these same transitions when results
+// arrive.
 impl HostWizard {
-    pub fn new(providers: Vec<ProviderRow>) -> Self {
+    pub fn new(creds: Arc<dyn CredStore>, env: EnvReader, exec: Arc<Executor>) -> Self {
+        let providers = provider_rows(creds.as_ref(), &env);
         HostWizard {
             step: WizardStep::Provider,
             providers,
             selected_provider: None,
+            setup: SetupFields::default(),
+            setup_open: false,
+            check_result: None,
             regions: Vec::new(),
+            regions_error: None,
             selected_region: None,
             hours: 2.0,
             musicians: 3,
             listeners: 2,
             destinations: 0,
-            outcome: None,
+            advanced_open: false,
+            artifact_url: String::new(),
+            artifact_sha256: String::new(),
+            launch_error: None,
+            check_job: None,
+            regions_job: None,
+            launch_job: None,
+            launch_phase: Arc::new(Mutex::new(LaunchPhase::Launching)),
+            creds,
+            env,
+            exec,
         }
     }
 
@@ -96,30 +224,203 @@ impl HostWizard {
             .map(|p| p.name.as_str())
     }
 
-    /// Selecting an unavailable provider is refused.
+    fn selected_row(&self) -> Option<&ProviderRow> {
+        self.selected_provider.and_then(|i| self.providers.get(i))
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.selected_provider_name() == Some("local")
+    }
+
+    /// True while any background job is in flight; the app keeps repainting.
+    pub fn busy(&self) -> bool {
+        self.check_job.is_some() || self.regions_job.is_some() || self.launch_job.is_some()
+    }
+
+    pub fn launch_phase(&self) -> LaunchPhase {
+        *self.launch_phase.lock().expect("launch phase")
+    }
+
+    /// Any provider is selectable; one that still needs credentials opens
+    /// its setup pane instead of unlocking Continue.
     pub fn select_provider(&mut self, idx: usize) -> bool {
-        if self.providers.get(idx).is_some_and(|p| p.available) {
-            self.selected_provider = Some(idx);
+        let Some(row) = self.providers.get(idx) else {
+            return false;
+        };
+        self.setup_open = row.status == ProviderStatus::SetupNeeded;
+        if self.selected_provider != Some(idx) {
+            self.check_result = None;
+        }
+        self.selected_provider = Some(idx);
+        true
+    }
+
+    pub fn provider_ready(&self) -> bool {
+        self.selected_row()
+            .is_some_and(|row| row.status != ProviderStatus::SetupNeeded)
+    }
+
+    /// Recomputes one row's status from the store and environment.
+    pub fn refresh_provider_status(&mut self, idx: usize) {
+        let Some(row) = self.providers.get_mut(idx) else {
+            return;
+        };
+        if row.name != "local" {
+            row.status = if creds::build_provider(&row.name, self.creds.as_ref(), &self.env).is_ok()
+            {
+                ProviderStatus::Ready
+            } else {
+                ProviderStatus::SetupNeeded
+            };
+        }
+    }
+
+    /// A provider built from the setup pane's unsaved fields, for the
+    /// credential check.
+    pub fn provider_from_setup(&self) -> Result<Box<dyn Provider>, String> {
+        match self.selected_provider_name() {
+            Some("digitalocean") => {
+                let token = self.setup.do_token.trim();
+                if token.is_empty() {
+                    return Err("paste the token first".to_owned());
+                }
+                Ok(Box::new(
+                    jamstream_cloud::providers::digitalocean::DigitalOceanProvider::new(
+                        token.to_owned(),
+                    ),
+                ))
+            }
+            Some("aws") => {
+                let id = self.setup.aws_access_key_id.trim();
+                let secret = self.setup.aws_secret_access_key.trim();
+                if id.is_empty() || secret.is_empty() {
+                    return Err("paste both values first".to_owned());
+                }
+                Ok(Box::new(jamstream_cloud::providers::aws::AwsProvider::new(
+                    id.to_owned(),
+                    secret.to_owned(),
+                )))
+            }
+            Some("gcp") => {
+                let json = self.setup.gcp_json.trim();
+                if json.is_empty() {
+                    return Err("paste the service account JSON first".to_owned());
+                }
+                creds::gcp_from_json(json, &self.env)
+            }
+            other => Err(format!("no setup pane for {other:?}")),
+        }
+    }
+
+    /// Runs the credential check on the executor. Field errors surface
+    /// immediately without spawning anything.
+    pub fn begin_check(&mut self) -> bool {
+        if self.check_job.is_some() {
+            return false;
+        }
+        match self.provider_from_setup() {
+            Ok(provider) => {
+                self.check_result = None;
+                self.check_job = Some(self.exec.run(check_provider(provider)));
+                true
+            }
+            Err(err) => {
+                self.check_result = Some(Err(err));
+                false
+            }
+        }
+    }
+
+    /// A successful check saves the typed fields to the credential store
+    /// and flips the row to ready; a failure is shown verbatim.
+    pub fn apply_check_result(&mut self, result: Result<(), String>) {
+        if result.is_ok()
+            && let Some(idx) = self.selected_provider
+        {
+            let saves: &[((&str, &str), &str)] = match self.selected_provider_name() {
+                Some("digitalocean") => &[(creds::DO_TOKEN, &self.setup.do_token)],
+                Some("aws") => &[
+                    (creds::AWS_ACCESS_KEY_ID, &self.setup.aws_access_key_id),
+                    (
+                        creds::AWS_SECRET_ACCESS_KEY,
+                        &self.setup.aws_secret_access_key,
+                    ),
+                ],
+                Some("gcp") => &[(creds::GCP_SERVICE_ACCOUNT_JSON, &self.setup.gcp_json)],
+                _ => &[],
+            };
+            let mut save_err = None;
+            for ((provider, field), value) in saves {
+                if let Err(err) = self.creds.set(provider, field, value.trim()) {
+                    save_err = Some(err);
+                }
+            }
+            self.refresh_provider_status(idx);
+            if let Some(err) = save_err {
+                // The credentials work but did not persist; say so rather
+                // than pretending they were saved.
+                self.check_result = Some(Err(format!(
+                    "the credentials work but saving them failed: {err}"
+                )));
+                return;
+            }
+        }
+        self.check_result = Some(result);
+    }
+
+    /// Provider -> next step. Local has exactly one region (this computer,
+    /// zero price) so it skips straight to the preview; clouds start the
+    /// real probe job and land on the region step's progress state.
+    pub fn advance_from_provider(&mut self) -> bool {
+        if self.step != WizardStep::Provider || !self.provider_ready() {
+            return false;
+        }
+        if self.is_local() {
+            self.regions = vec![local_region_row()];
+            self.selected_region = Some(0);
+            self.step = WizardStep::Preview;
+            return true;
+        }
+        let Some(name) = self.selected_provider_name().map(str::to_owned) else {
+            return false;
+        };
+        match creds::build_provider(&name, self.creds.as_ref(), &self.env) {
+            Ok(provider) => {
+                self.regions = Vec::new();
+                self.selected_region = None;
+                self.regions_error = None;
+                self.step = WizardStep::Region;
+                self.regions_job = Some(self.exec.run(probe_regions(provider)));
+                true
+            }
+            Err(err) => {
+                // The row claimed ready but the build failed (for example a
+                // keychain entry vanished); re-gate it.
+                self.check_result = Some(Err(err));
+                if let Some(idx) = self.selected_provider {
+                    self.refresh_provider_status(idx);
+                }
+                self.setup_open = true;
+                false
+            }
+        }
+    }
+
+    /// Provider -> Region with rows supplied directly; the pure transition
+    /// tests and snapshot fixtures feed this, bypassing the probe job.
+    pub fn continue_to_region(&mut self, rows: Vec<RegionRow>) -> bool {
+        if self.step == WizardStep::Provider && self.selected_provider.is_some() {
+            self.step = WizardStep::Region;
+            self.set_regions(rows);
             true
         } else {
             false
         }
     }
 
-    /// Provider -> Region, fed with the ranked region rows.
-    pub fn continue_to_region(&mut self, rows: Vec<RegionRow>) -> bool {
-        if self.step == WizardStep::Provider && self.selected_provider.is_some() {
-            self.regions = rows;
-            self.selected_region = if self.regions.is_empty() {
-                None
-            } else {
-                Some(0)
-            };
-            self.step = WizardStep::Region;
-            true
-        } else {
-            false
-        }
+    fn set_regions(&mut self, rows: Vec<RegionRow>) {
+        self.selected_region = if rows.is_empty() { None } else { Some(0) };
+        self.regions = rows;
     }
 
     pub fn select_region(&mut self, idx: usize) -> bool {
@@ -152,159 +453,325 @@ impl HostWizard {
         ))
     }
 
-    /// Preview -> Launching. Only the mock is wired end to end in this pass.
-    pub fn begin_launch(&mut self) -> bool {
-        if self.step == WizardStep::Preview
+    /// Launch preconditions: a region, and for clouds the verified artifact
+    /// (the VM downloads and checks the server binary; local runs one that
+    /// is already on this machine).
+    pub fn can_launch(&self) -> bool {
+        self.step == WizardStep::Preview
             && self.selected_region.is_some()
-            && self.selected_provider_name() == Some("mock")
-        {
-            self.step = WizardStep::Launching;
-            true
-        } else {
-            false
-        }
+            && (self.is_local()
+                || (!self.artifact_url.trim().is_empty()
+                    && !self.artifact_sha256.trim().is_empty()))
     }
 
-    /// Launching -> Done.
-    pub fn finish_launch(&mut self, outcome: LaunchOutcome) -> bool {
-        if self.step == WizardStep::Launching {
-            self.outcome = Some(outcome);
-            self.step = WizardStep::Done;
-            true
-        } else {
-            false
+    /// Preview -> Launching: starts the real launch on the executor.
+    pub fn begin_launch(&mut self) -> bool {
+        if !self.can_launch() || self.launch_job.is_some() {
+            return false;
         }
+        let Some(name) = self.selected_provider_name().map(str::to_owned) else {
+            return false;
+        };
+        let Some(row) = self.selected_region.and_then(|i| self.regions.get(i)) else {
+            return false;
+        };
+        let provider = match creds::build_provider(&name, self.creds.as_ref(), &self.env) {
+            Ok(p) => p,
+            Err(err) => {
+                self.launch_error = Some(err);
+                self.step = WizardStep::Launching;
+                return true;
+            }
+        };
+        let params = LaunchParams {
+            provider_name: name,
+            region: row.region.clone(),
+            hourly_microusd: row.price.hourly_microusd,
+            musicians: self.musicians,
+            listeners: self.listeners,
+            artifact_url: non_empty(&self.artifact_url),
+            artifact_sha256: non_empty(&self.artifact_sha256),
+            do_token: creds::lookup(
+                self.creds.as_ref(),
+                &self.env,
+                creds::DO_TOKEN,
+                "DIGITALOCEAN_TOKEN",
+            ),
+        };
+        *self.launch_phase.lock().expect("launch phase") = LaunchPhase::Launching;
+        self.launch_error = None;
+        self.step = WizardStep::Launching;
+        let phase = Arc::clone(&self.launch_phase);
+        self.launch_job = Some(self.exec.run(launch_session(provider, params, phase)));
+        true
     }
 
-    /// One step back; Launching and Done do not go back.
+    /// One step back; Launching only goes back after a failure.
     pub fn back(&mut self) -> bool {
         match self.step {
-            WizardStep::Region => {
+            // While the probe job runs there is nothing to go back from;
+            // once it lands (rows or an error) back is available again.
+            WizardStep::Region if self.regions_job.is_none() => {
+                self.regions_error = None;
                 self.step = WizardStep::Provider;
                 true
             }
             WizardStep::Preview => {
-                self.step = WizardStep::Region;
+                if self.is_local() {
+                    self.step = WizardStep::Provider;
+                } else {
+                    self.step = WizardStep::Region;
+                }
+                true
+            }
+            WizardStep::Launching if self.launch_error.is_some() => {
+                self.launch_error = None;
+                self.step = WizardStep::Preview;
                 true
             }
             _ => false,
         }
     }
+
+    /// Applies finished background jobs. Returns the launch event when the
+    /// session comes up.
+    pub fn poll(&mut self) -> Option<WizardEvent> {
+        if let Some(job) = &mut self.check_job
+            && let Some(result) = job.poll()
+        {
+            self.check_job = None;
+            self.apply_check_result(result);
+        }
+        if let Some(job) = &mut self.regions_job
+            && let Some(result) = job.poll()
+        {
+            self.regions_job = None;
+            match result {
+                Ok(rows) => self.set_regions(rows),
+                Err(err) => self.regions_error = Some(err),
+            }
+        }
+        if let Some(job) = &mut self.launch_job
+            && let Some(result) = job.poll()
+        {
+            self.launch_job = None;
+            match result {
+                Ok(outcome) => return Some(WizardEvent::Launched(Box::new(outcome))),
+                Err(err) => self.launch_error = Some(err),
+            }
+        }
+        None
+    }
 }
 
-/// Provider availability from the process environment, via the same
-/// `resolve` seam the CLI uses.
-pub fn provider_rows_from_env() -> Vec<ProviderRow> {
-    jamstream_cli::providers::KNOWN_PROVIDERS
-        .iter()
-        .map(|name| match jamstream_cli::providers::resolve(name) {
-            Ok(_) => ProviderRow {
-                name: (*name).to_owned(),
-                available: true,
-                detail: match *name {
-                    "mock" => "runs locally, no credentials needed".to_owned(),
-                    "aws" => "credentials found (AWS_ACCESS_KEY_ID)".to_owned(),
-                    "digitalocean" => "credentials found (DIGITALOCEAN_TOKEN)".to_owned(),
-                    "gcp" => "credentials found in environment".to_owned(),
-                    _ => "credentials found".to_owned(),
-                },
-            },
-            Err(err) => ProviderRow {
-                name: (*name).to_owned(),
-                available: false,
-                detail: err.to_string(),
-            },
-        })
-        .collect()
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_owned())
 }
 
-/// Region rows for a provider, ranked by the shared solver. Latency is
-/// fabricated in this pass (the deterministic per-region figure the CLI
-/// uses for the mock); real probes arrive with networking.
-pub fn region_rows(provider_name: &str) -> Result<Vec<RegionRow>, String> {
-    let provider = jamstream_cli::providers::resolve(provider_name).map_err(|e| e.to_string())?;
+/// The local provider's single region, priced at zero, without a network
+/// round trip.
+fn local_region_row() -> RegionRow {
+    RegionRow {
+        region: Region {
+            provider: ProviderKind::Local,
+            id: RegionId::new("local"),
+            display: "This computer".to_owned(),
+            country: String::new(),
+        },
+        price: Price {
+            hourly_microusd: 0,
+            egress_microusd_per_gb: 0,
+            included_egress_gb: 0,
+        },
+        worst_rtt_ms: 0.0,
+    }
+}
+
+/// The credential check: the static catalog, one live price call, and one
+/// authenticated list of jamstream-tagged instances (the same call the
+/// docs' `jamstream sweep --dry-run` verification makes; price alone would
+/// not exercise authentication on providers with bundled price data).
+/// Errors are returned verbatim for the pane to show.
+pub async fn check_provider(provider: Box<dyn Provider>) -> Result<(), String> {
     let regions = provider.regions();
+    let first = regions
+        .first()
+        .ok_or("provider offers no regions")?
+        .id
+        .clone();
+    provider.price(&first).await.map_err(|e| e.to_string())?;
+    provider
+        .list_tagged(None)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Real probes: live price per region plus TCP connect timing from this
+/// machine against the provider's catalog endpoints, ranked by the shared
+/// solver (worst RTT in 5 ms buckets, price breaking ties).
+async fn probe_regions(provider: Box<dyn Provider>) -> Result<Vec<RegionRow>, String> {
+    let regions = provider.regions();
+    if regions.is_empty() {
+        return Err("provider offers no regions".to_owned());
+    }
     let mut candidates: Vec<(Region, Price)> = Vec::with_capacity(regions.len());
     for region in &regions {
-        let price = block_on(provider.price(&region.id)).map_err(|e| e.to_string())?;
+        let price = provider
+            .price(&region.id)
+            .await
+            .map_err(|e| e.to_string())?;
         candidates.push((region.clone(), price));
     }
-    let matrix = jamstream_cli::host::mock_matrix(&regions);
+    let targets = jamstream_cli::host::catalog_targets(provider.kind(), &regions);
+    let rtts = jamstream_cloud::probe_all(&targets).await;
+    let mut matrix = ProbeMatrix::new();
+    for (region, rtt_ms) in rtts {
+        matrix.insert(0, region, rtt_ms);
+    }
     Ok(rank(&matrix, &candidates)
         .into_iter()
         .map(|score| RegionRow {
             region: score.region,
             price: score.price,
             worst_rtt_ms: score.worst_rtt_ms,
-            fabricated: true,
         })
         .collect())
 }
 
-const SESSION_PORT: u16 = 43210;
-const MAX_HOURS: u64 = 12;
-// The mock accepts placeholders; a real provider requires the verified
-// artifact, which is why only the mock launches in this pass.
-const PLACEHOLDER_ARTIFACT_URL: &str = "https://artifacts.invalid/jamstreamd";
-const PLACEHOLDER_ARTIFACT_SHA256: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// Launches the selected (mock) provider, mints invites, and records the
-/// session in the CLI state directory so it shows under recent sessions.
-pub fn launch(wiz: &HostWizard) -> LaunchOutcome {
-    match try_launch(wiz) {
-        Ok(outcome) => outcome,
-        Err(err) => LaunchOutcome {
-            session_short: String::new(),
-            server_addr: String::new(),
-            invites: Vec::new(),
-            state_path: None,
-            error: Some(err),
-        },
-    }
+struct LaunchParams {
+    provider_name: String,
+    region: Region,
+    hourly_microusd: u64,
+    musicians: u8,
+    listeners: u8,
+    artifact_url: Option<String>,
+    artifact_sha256: Option<String>,
+    /// For the DigitalOcean self-destruct arm; read from the credential
+    /// store or environment before the job leaves the UI thread.
+    do_token: Option<String>,
 }
 
-fn try_launch(wiz: &HostWizard) -> Result<LaunchOutcome, String> {
-    let provider_name = wiz.selected_provider_name().ok_or("no provider selected")?;
-    let row = wiz
-        .selected_region
-        .and_then(|i| wiz.regions.get(i))
-        .ok_or("no region selected")?;
-    let provider = jamstream_cli::providers::resolve(provider_name).map_err(|e| e.to_string())?;
+/// The launch itself, mirroring `jamstream host`: boot config, flat config
+/// for local versus cloud-init for clouds, launch, wait for the address,
+/// mint invites, prove the server answers a real handshake, and write the
+/// same state file the CLI writes.
+async fn launch_session(
+    provider: Box<dyn Provider>,
+    params: LaunchParams,
+    phase: Arc<Mutex<LaunchPhase>>,
+) -> Result<LaunchOutcome, String> {
+    let set_phase = |p: LaunchPhase| *phase.lock().expect("launch phase") = p;
+    let is_local = provider.kind() == ProviderKind::Local;
+
+    if !is_local && (params.artifact_url.is_none() || params.artifact_sha256.is_none()) {
+        return Err(
+            "a cloud launch needs the server binary url and sha256; open the advanced \
+             section of the preview step"
+                .to_owned(),
+        );
+    }
 
     let session_id = SessionId::generate();
-    let session_hex: String = session_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let session_hex = hex_encode(&session_id.0);
     let issuer = Issuer::generate();
     let server_keys = generate_keypair();
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now_unix = unix_now();
     let expires_unix = now_unix + MAX_HOURS * 3600;
+    // Local servers share one machine with everything else on it; an
+    // ephemeral port avoids colliding with another session or service.
+    let port = if is_local {
+        free_udp_port()?
+    } else {
+        SESSION_PORT
+    };
 
     let boot = BootConfig {
-        artifact_url: PLACEHOLDER_ARTIFACT_URL.to_owned(),
-        artifact_sha256: PLACEHOLDER_ARTIFACT_SHA256.to_owned(),
+        artifact_url: params
+            .artifact_url
+            .clone()
+            .unwrap_or_else(|| PLACEHOLDER_ARTIFACT_URL.to_owned()),
+        artifact_sha256: params
+            .artifact_sha256
+            .clone()
+            .unwrap_or_else(|| PLACEHOLDER_ARTIFACT_SHA256.to_owned()),
         server_private_key_b64: base64(&server_keys.private),
         issuer_public_key_b64: base64(issuer.public_key().as_bytes()),
         session_id_hex: session_hex.clone(),
-        port: SESSION_PORT,
-        idle_shutdown_min: 10,
+        port,
+        idle_shutdown_min: IDLE_MIN,
         max_duration_min: (MAX_HOURS * 60) as u32,
-        self_destruct: SelfDestruct::AwsShutdown,
+        self_destruct: self_destruct_for(provider.kind(), params.do_token)?,
+    };
+    let user_data = if is_local {
+        boot.render_flat_config()
+    } else {
+        jamstream_cloud::cloudinit::render(&boot)
     };
     let spec = LaunchSpec {
-        region: row.region.clone(),
+        region: params.region.clone(),
         instance_class: InstanceClass::Standard,
-        user_data: jamstream_cloud::cloudinit::render(&boot),
+        user_data,
         tags: vec![session_tag(&session_hex)],
     };
-    let instance = block_on(provider.launch(spec)).map_err(|e| e.to_string())?;
-    let ip = instance.public_ip.ok_or("instance reported no public ip")?;
-    let address = std::net::SocketAddr::new(ip, SESSION_PORT);
 
-    let mut invites: Vec<(String, String)> = Vec::new();
-    let mut mint = |member: u16, role: Role| {
+    set_phase(LaunchPhase::Launching);
+    let instance = provider.launch(spec).await.map_err(|e| e.to_string())?;
+    set_phase(LaunchPhase::WaitingForAddress);
+    let instance = wait_for_ip(provider.as_ref(), &session_hex, instance).await?;
+    let ip = instance.public_ip.ok_or("instance reported no public ip")?;
+    let address = SocketAddr::new(ip, port);
+
+    let invites = mint_invites(
+        &issuer,
+        session_id,
+        address,
+        server_keys.public,
+        expires_unix,
+        params.musicians,
+        params.listeners,
+    );
+
+    set_phase(LaunchPhase::CheckingReachability);
+    verify_reachable(&invites[0].1, HANDSHAKE_CAP).await?;
+
+    let state = jamstream_cli::state::SessionState {
+        session_id_hex: session_hex,
+        provider: params.provider_name,
+        region: params.region.id.to_string(),
+        instance_id: instance.id,
+        address: address.to_string(),
+        created_unix: now_unix,
+        hourly_microusd: params.hourly_microusd,
+        issuer_private_key_b64: base64(&issuer.to_bytes()),
+        server_public_key_b64: base64(&server_keys.public),
+        invites: invites
+            .iter()
+            .map(|(label, invite)| jamstream_cli::state::InviteRecord {
+                role: label.clone(),
+                invite: invite.encode(),
+            })
+            .collect(),
+        status: jamstream_cli::state::SessionStatus::Running,
+        ended_unix: None,
+    };
+    let state_path = jamstream_cli::state::save(&state).map_err(|e| e.to_string())?;
+    Ok(LaunchOutcome { state, state_path })
+}
+
+/// Host invite first (member 0), then musicians 1..=N, then listeners;
+/// same order and labels as the CLI.
+fn mint_invites(
+    issuer: &Issuer,
+    session_id: SessionId,
+    address: SocketAddr,
+    server_pk: [u8; 32],
+    expires_unix: u64,
+    musicians: u8,
+    listeners: u8,
+) -> Vec<(String, Invite)> {
+    let mint = |member: u16, role: Role| {
         let token = Token {
             member_id: MemberId(member),
             role,
@@ -312,56 +779,161 @@ fn try_launch(wiz: &HostWizard) -> Result<LaunchOutcome, String> {
             expires_unix,
             jti: TokenId::generate(),
         };
-        let invite = issuer.mint(session_id, vec![address], server_keys.public, token);
-        invites.push((
+        let invite = issuer.mint(session_id, vec![address], server_pk, token);
+        (
             jamstream_cli::host::invite_label(role, MemberId(member)),
-            invite.encode(),
-        ));
+            invite,
+        )
     };
-    mint(0, Role::Musician);
-    for m in 1..=u16::from(wiz.musicians) {
-        mint(m, Role::Musician);
+    let mut invites = vec![mint(HOST_MEMBER_ID.0, Role::Musician)];
+    for m in 1..=u16::from(musicians) {
+        invites.push(mint(m, Role::Musician));
     }
-    for l in 0..u16::from(wiz.listeners) {
-        mint(u16::from(wiz.musicians) + 1 + l, Role::Listener);
+    for l in 0..u16::from(listeners) {
+        invites.push(mint(u16::from(musicians) + 1 + l, Role::Listener));
     }
+    invites
+}
 
-    let state = jamstream_cli::state::SessionState {
-        session_id_hex: session_hex.clone(),
-        provider: provider_name.to_owned(),
-        region: row.region.id.to_string(),
-        instance_id: instance.id.clone(),
-        address: address.to_string(),
-        created_unix: now_unix,
-        hourly_microusd: row.price.hourly_microusd,
-        issuer_private_key_b64: base64(&issuer.to_bytes()),
-        server_public_key_b64: base64(&server_keys.public),
-        invites: invites
-            .iter()
-            .map(|(label, invite)| jamstream_cli::state::InviteRecord {
-                role: label.clone(),
-                invite: invite.clone(),
+/// Per-provider self-destruct, as the CLI arms it. DigitalOcean is the one
+/// that needs a credential on the box, because powered-off droplets still
+/// bill; the token comes from the credential store or environment.
+fn self_destruct_for(kind: ProviderKind, do_token: Option<String>) -> Result<SelfDestruct, String> {
+    match kind {
+        ProviderKind::Aws => Ok(SelfDestruct::AwsShutdown),
+        ProviderKind::Gcp => Ok(SelfDestruct::GcpMaxRunDuration),
+        ProviderKind::DigitalOcean => {
+            let token = do_token.filter(|t| !t.is_empty()).ok_or(
+                "a DigitalOcean token is required to arm the droplet's self-destruct; \
+                 refusing to launch a machine that cannot delete itself",
+            )?;
+            Ok(SelfDestruct::ApiToken {
+                endpoint: "https://api.digitalocean.com/v2/droplets".to_owned(),
+                token,
             })
-            .collect(),
-        status: jamstream_cli::state::SessionStatus::Running,
-        ended_unix: None,
-    };
-    let state_path = jamstream_cli::state::save(&state)
-        .map(|p| p.display().to_string())
-        .ok();
+        }
+        // Local sessions never render cloud-init: the flat config carries
+        // no self-destruct and the spawned server self-limits through its
+        // own --idle-exit-min. This variant is inert here.
+        ProviderKind::Local => Ok(SelfDestruct::AwsShutdown),
+    }
+}
 
-    Ok(LaunchOutcome {
-        session_short: session_hex.chars().take(8).collect(),
-        server_addr: address.to_string(),
-        invites,
-        state_path,
-        error: None,
-    })
+/// Polls list_tagged until the instance reports a public IP; the local
+/// provider returns one at launch, so this is a single pass there.
+async fn wait_for_ip(
+    provider: &dyn Provider,
+    session_hex: &str,
+    mut instance: jamstream_cloud::Instance,
+) -> Result<jamstream_cloud::Instance, String> {
+    let deadline = Instant::now() + IP_WAIT_CAP;
+    while instance.public_ip.is_none() {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "instance {} did not report an ip within {} s",
+                instance.id,
+                IP_WAIT_CAP.as_secs()
+            ));
+        }
+        tokio::time::sleep(IP_POLL_PERIOD).await;
+        let listed = provider
+            .list_tagged(Some(session_hex))
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(found) = listed.into_iter().find(|i| i.id == instance.id) {
+            instance = found;
+        }
+    }
+    Ok(instance)
+}
+
+/// Proves the server is actually serving: a genuine ClientCore handshake
+/// with the host invite over UDP, driven until Joined, exactly like the
+/// CLI's reachability check.
+async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), String> {
+    let bind: SocketAddr = if invite.addresses[0].is_ipv4() {
+        "0.0.0.0:0".parse().expect("static addr")
+    } else {
+        "[::]:0".parse().expect("static addr")
+    };
+    let socket = tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(|e| e.to_string())?;
+    socket
+        .connect(invite.addresses[0])
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let start = Instant::now();
+    let now = || start.elapsed().as_millis() as u64;
+    let (mut core, init) = ClientCore::connect(invite, now()).map_err(|e| e.to_string())?;
+    socket.send(&init).await.map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 2048];
+    while start.elapsed() < cap {
+        for pkt in core.poll(now()) {
+            socket.send(&pkt).await.map_err(|e| e.to_string())?;
+        }
+        if let Ok(Ok(len)) =
+            tokio::time::timeout(Duration::from_millis(50), socket.recv(&mut buf)).await
+        {
+            for pkt in core.handle_datagram(now(), &buf[..len]) {
+                socket.send(&pkt).await.map_err(|e| e.to_string())?;
+            }
+        }
+        match core.state().clone() {
+            ClientState::Joined => {
+                let _ = core.leave("host reachability check");
+                for pkt in core.poll(now()) {
+                    socket.send(&pkt).await.map_err(|e| e.to_string())?;
+                }
+                return Ok(());
+            }
+            ClientState::Rejected { ours, theirs } => {
+                return Err(format!(
+                    "server rejected the handshake: this client speaks protocol {ours}, \
+                     the server speaks {theirs}"
+                ));
+            }
+            ClientState::Ejected { reason } => {
+                return Err(format!("server ejected the reachability check: {reason}"));
+            }
+            // The core gives up after its own 10 s window; keep trying
+            // fresh handshakes until our cap, the VM may still be booting.
+            ClientState::TimedOut => {
+                let init = core.reconnect(now()).map_err(|e| e.to_string())?;
+                socket.send(&init).await.map_err(|e| e.to_string())?;
+            }
+            ClientState::Connecting => {}
+        }
+    }
+    Err(format!(
+        "server did not complete a handshake within {} s",
+        cap.as_secs()
+    ))
+}
+
+/// Bind-then-drop; racy in principle, unique enough in practice.
+fn free_udp_port() -> Result<u16, String> {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .map(|a| a.port())
+        .map_err(|e| format!("cannot pick a local port: {e}"))
+}
+
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Standard base64 with padding; enough to fill the CLI state schema
 /// without pulling an encoding crate into the client.
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -382,30 +954,36 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// Minimal executor for provider futures. The mock resolves without real
-/// io, so this never actually parks; it exists so the UI thread can call
-/// async provider methods without a runtime dependency.
-fn block_on<F: Future>(fut: F) -> F::Output {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn noop_raw_waker() -> RawWaker {
-        fn clone(_: *const ()) -> RawWaker {
-            noop_raw_waker()
-        }
-        fn noop(_: *const ()) {}
-        RawWaker::new(
-            std::ptr::null(),
-            &RawWakerVTable::new(clone, noop, noop, noop),
-        )
-    }
-    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = Box::pin(fut);
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(out) => return out,
-            Poll::Pending => std::thread::yield_now(),
+/// Inverse of [`base64`]; the invites panel reads the issuer key back out
+/// of the state file with it.
+pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
+    fn value(c: u8) -> Result<u32, String> {
+        match c {
+            b'A'..=b'Z' => Ok(u32::from(c - b'A')),
+            b'a'..=b'z' => Ok(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Ok(u32::from(c - b'0') + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(format!("invalid base64 byte 0x{c:02x}")),
         }
     }
+    let stripped: Vec<u8> = text
+        .bytes()
+        .filter(|b| !matches!(b, b'=' | b'\n' | b'\r' | b' '))
+        .collect();
+    let mut out = Vec::with_capacity(stripped.len() * 3 / 4);
+    for chunk in stripped.chunks(4) {
+        if chunk.len() == 1 {
+            return Err("truncated base64".to_owned());
+        }
+        let mut n = 0u32;
+        for (i, &b) in chunk.iter().enumerate() {
+            n |= value(b)? << (18 - 6 * i);
+        }
+        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&bytes[..chunk.len() - 1]);
+    }
+    Ok(out)
 }
 
 // Rendering. One focused card per step: the step counter and title live
@@ -414,8 +992,8 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 
 impl HostWizard {
     pub fn ui(&mut self, ui: &mut Ui) -> Option<WizardEvent> {
-        let mut event = None;
-        theme::focused_column(ui, 600.0, |ui| {
+        let event = self.poll();
+        theme::focused_column(ui, 620.0, |ui| {
             theme::panel(ui)
                 .inner_margin(egui::Margin::same(16))
                 .show(ui, |ui| {
@@ -423,7 +1001,11 @@ impl HostWizard {
                     let title = match self.step {
                         WizardStep::Provider => "Where should the session server run?".to_owned(),
                         WizardStep::Region => "Pick a region".to_owned(),
+                        WizardStep::Preview if self.is_local() => "Before you start".to_owned(),
                         WizardStep::Preview => "Cost preview".to_owned(),
+                        WizardStep::Launching if self.is_local() => {
+                            "Starting on this computer".to_owned()
+                        }
                         WizardStep::Launching => format!(
                             "Launching in {}",
                             self.selected_region
@@ -431,18 +1013,12 @@ impl HostWizard {
                                 .map(|r| r.region.id.to_string())
                                 .unwrap_or_default()
                         ),
-                        WizardStep::Done => match &self.outcome {
-                            Some(o) if o.error.is_none() => {
-                                format!("Session {} is running", o.session_short)
-                            }
-                            _ => "Launch failed".to_owned(),
-                        },
                     };
                     let num = match self.step {
                         WizardStep::Provider => 1,
                         WizardStep::Region => 2,
                         WizardStep::Preview => 3,
-                        WizardStep::Launching | WizardStep::Done => 4,
+                        WizardStep::Launching => 4,
                     };
                     ui.label(theme::muted(ui, format!("Step {num} of 4")).small());
                     ui.add_space(theme::SPACE_XS);
@@ -452,17 +1028,8 @@ impl HostWizard {
                     match self.step {
                         WizardStep::Provider => self.provider_ui(ui),
                         WizardStep::Region => self.region_ui(ui),
-                        WizardStep::Preview => {
-                            if let Some(e) = self.preview_ui(ui) {
-                                event = Some(e);
-                            }
-                        }
+                        WizardStep::Preview => self.preview_ui(ui),
                         WizardStep::Launching => self.launching_ui(ui),
-                        WizardStep::Done => {
-                            if let Some(e) = self.done_ui(ui) {
-                                event = Some(e);
-                            }
-                        }
                     }
                 });
         });
@@ -476,46 +1043,223 @@ impl HostWizard {
                 ui,
                 &row.name,
                 self.selected_provider == Some(i),
-                row.available,
+                true,
                 |ui| {
                     row_cell(ui, 110.0, |ui| {
                         ui.label(row.name.clone());
                     });
-                    ui.label(theme::muted(ui, row.detail.clone()));
+                    row_cell(ui, 130.0, |ui| {
+                        ui.label(theme::muted(ui, row.status.label()));
+                    });
+                    ui.add(egui::Label::new(theme::muted(ui, row.hint.clone()).small()).truncate());
                 },
             );
             if response.clicked() {
                 self.select_provider(i);
             }
         }
+        if self.setup_open
+            && self
+                .selected_row()
+                .is_some_and(|r| r.status == ProviderStatus::SetupNeeded)
+        {
+            ui.add_space(theme::SPACE_MD);
+            self.setup_ui(ui);
+        }
         ui.add_space(theme::SPACE_LG);
         ui.horizontal(|ui| {
-            let can_continue = self.selected_provider.is_some();
+            let can_continue = self.provider_ready();
             if ui
                 .add_enabled(can_continue, egui::Button::new("Continue"))
                 .clicked()
-                && let Some(name) = self.selected_provider_name().map(str::to_owned)
             {
-                match region_rows(&name) {
-                    Ok(rows) => {
-                        self.continue_to_region(rows);
+                self.advance_from_provider();
+            }
+            if !can_continue && self.selected_provider.is_some() {
+                ui.label(theme::muted(
+                    ui,
+                    "Add credentials above, or pick local to host without an account.",
+                ));
+            }
+        });
+    }
+
+    /// Inline credential setup for the selected cloud. Guidance matches
+    /// the docs site's provider pages; the check runs a real API call and
+    /// only a passing check writes the keychain.
+    fn setup_ui(&mut self, ui: &mut Ui) {
+        let Some(name) = self.selected_provider_name().map(str::to_owned) else {
+            return;
+        };
+        theme::panel(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match name.as_str() {
+                "digitalocean" => {
+                    ui.label(theme::title(ui, "Connect DigitalOcean"));
+                    ui.add_space(theme::SPACE_XS);
+                    guidance(
+                        ui,
+                        &[
+                            "1. Sign up at digitalocean.com and add a payment method.",
+                            "2. Generate a personal access token named jamstream.",
+                            "3. Scope it to droplet and tag operations only; the docs \
+                             list the exact scopes.",
+                        ],
+                    );
+                    if ui.button("Open the token page").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://cloud.digitalocean.com/account/api/tokens",
+                        ));
                     }
-                    Err(err) => {
-                        ui.label(RichText::new(err).color(theme::palette_of(ui).danger));
-                    }
+                    ui.add_space(theme::SPACE_SM);
+                    let reveal = self.setup.reveal;
+                    secret_field(ui, "API token", &mut self.setup.do_token, reveal);
                 }
+                "aws" => {
+                    ui.label(theme::title(ui, "Connect AWS"));
+                    ui.add_space(theme::SPACE_XS);
+                    guidance(
+                        ui,
+                        &[
+                            "1. Create an IAM user named jamstream with the minimal \
+                             policy from the docs; no console access.",
+                            "2. Create an access key for it (use case: CLI).",
+                            "3. Paste both values; the secret is shown once by AWS.",
+                        ],
+                    );
+                    if ui.button("Open the IAM console").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://console.aws.amazon.com/iam/home#/users",
+                        ));
+                    }
+                    ui.add_space(theme::SPACE_SM);
+                    let reveal = self.setup.reveal;
+                    secret_field(
+                        ui,
+                        "Access key id",
+                        &mut self.setup.aws_access_key_id,
+                        reveal,
+                    );
+                    secret_field(
+                        ui,
+                        "Secret access key",
+                        &mut self.setup.aws_secret_access_key,
+                        reveal,
+                    );
+                }
+                "gcp" => {
+                    ui.label(theme::title(ui, "Connect Google Cloud"));
+                    ui.add_space(theme::SPACE_XS);
+                    guidance(
+                        ui,
+                        &[
+                            "1. Create a project, enable the Compute Engine API.",
+                            "2. Create a service account with the Compute Instance \
+                             Admin (v1) role and add a JSON key to it.",
+                            "3. Paste the key file's contents below, or enter its \
+                             path and load it.",
+                        ],
+                    );
+                    if ui.button("Open the service accounts page").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://console.cloud.google.com/iam-admin/serviceaccounts",
+                        ));
+                    }
+                    ui.add_space(theme::SPACE_SM);
+                    // There is no file-picker dependency in this build, so
+                    // the key file arrives pasted or by path; both feed the
+                    // same field.
+                    ui.horizontal(|ui| {
+                        ui.label(theme::muted(ui, "key file path"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.setup.gcp_path)
+                                .desired_width(300.0)
+                                .hint_text("/path/to/jamstream-key.json"),
+                        );
+                        if ui.button("Load file").clicked() {
+                            match std::fs::read_to_string(self.setup.gcp_path.trim()) {
+                                Ok(json) => {
+                                    self.setup.gcp_json = json;
+                                    self.check_result = None;
+                                }
+                                Err(err) => {
+                                    self.check_result =
+                                        Some(Err(format!("cannot read the key file: {err}")));
+                                }
+                            }
+                        }
+                    });
+                    ui.label(theme::muted(ui, "service account JSON"));
+                    let mask = !self.setup.reveal;
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.setup.gcp_json)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(4)
+                            .password(mask)
+                            .hint_text("paste the downloaded key file's contents"),
+                    );
+                }
+                _ => {}
+            }
+            ui.add_space(theme::SPACE_SM);
+            ui.horizontal(|ui| {
+                let checking = self.check_job.is_some();
+                if ui
+                    .add_enabled(!checking, egui::Button::new("Check credentials"))
+                    .clicked()
+                {
+                    self.begin_check();
+                }
+                if ui
+                    .button(if self.setup.reveal { "Hide" } else { "Show" })
+                    .clicked()
+                {
+                    self.setup.reveal = !self.setup.reveal;
+                }
+                if checking {
+                    ui.add(egui::Spinner::new().color(theme::palette_of(ui).text_muted));
+                    ui.label(theme::muted(ui, "asking the provider"));
+                }
+            });
+            match &self.check_result {
+                Some(Ok(())) => {
+                    let p = theme::palette_of(ui);
+                    ui.label(RichText::new("Works. Saved to your keychain.").color(p.meter_green));
+                }
+                Some(Err(err)) => {
+                    let p = theme::palette_of(ui);
+                    ui.label(RichText::new(err.clone()).color(p.danger));
+                }
+                None => {}
             }
         });
     }
 
     fn region_ui(&mut self, ui: &mut Ui) {
-        ui.label(theme::muted(ui, "Latency and price carry equal weight."));
-        if self.regions.iter().any(|r| r.fabricated) {
-            ui.label(theme::muted(
-                ui,
-                "Latency figures are fabricated; real network probes arrive with the networking pass.",
-            ));
+        if self.regions_job.is_some() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().color(theme::palette_of(ui).text_muted));
+                ui.label(theme::muted(
+                    ui,
+                    "Fetching prices and timing the network from this computer to each region.",
+                ));
+            });
+            return;
         }
+        if let Some(err) = self.regions_error.clone() {
+            let p = theme::palette_of(ui);
+            ui.label(RichText::new(err).color(p.danger));
+            ui.add_space(theme::SPACE_LG);
+            if ui.button("Back").clicked() {
+                self.back();
+            }
+            return;
+        }
+        ui.label(theme::muted(ui, "Latency and price carry equal weight."));
+        ui.label(theme::muted(
+            ui,
+            "Latency is measured from this computer; bandmates elsewhere will differ.",
+        ));
         ui.add_space(theme::SPACE_MD);
         let cols = [130.0, 90.0, 110.0, 90.0];
         ui.horizontal(|ui| {
@@ -574,8 +1318,7 @@ impl HostWizard {
         });
     }
 
-    fn preview_ui(&mut self, ui: &mut Ui) -> Option<WizardEvent> {
-        let mut event = None;
+    fn preview_ui(&mut self, ui: &mut Ui) {
         egui::Grid::new("preview-params")
             .num_columns(2)
             .min_col_width(230.0)
@@ -594,7 +1337,7 @@ impl HostWizard {
                 theme::mono_drag(ui, egui::DragValue::new(&mut self.musicians).range(1..=8));
                 ui.end_row();
                 ui.label(theme::muted(ui, "listeners"));
-                theme::mono_drag(ui, egui::DragValue::new(&mut self.listeners).range(0..=30));
+                theme::mono_drag(ui, egui::DragValue::new(&mut self.listeners).range(0..=20));
                 ui.end_row();
                 ui.label(theme::muted(ui, "stream destinations"));
                 theme::mono_drag(
@@ -604,7 +1347,13 @@ impl HostWizard {
                 ui.end_row();
             });
         ui.add_space(theme::SPACE_MD);
-        if let Some(preview) = self.preview() {
+        if self.is_local() {
+            ui.label("This session runs on this computer and costs nothing.");
+            ui.label(theme::muted(
+                ui,
+                "Invites carry your LAN address; guests outside it need router port forwarding.",
+            ));
+        } else if let Some(preview) = self.preview() {
             egui::Grid::new("preview-grid")
                 .num_columns(2)
                 .min_col_width(230.0)
@@ -630,115 +1379,160 @@ impl HostWizard {
                 "The meter runs until you end the session; this is an estimate, not a cap.",
             ));
         }
-        ui.add_space(theme::SPACE_SM);
-        let is_mock = self.selected_provider_name() == Some("mock");
-        if !is_mock {
-            ui.label(theme::muted(
-                ui,
-                "Launching on a real provider arrives with the networking pass; the mock runs the full flow.",
-            ));
+        if !self.is_local() {
+            ui.add_space(theme::SPACE_SM);
+            let arrow = if self.advanced_open { "v" } else { ">" };
+            if ui
+                .button(format!("{arrow} Server binary (advanced)"))
+                .clicked()
+            {
+                self.advanced_open = !self.advanced_open;
+            }
+            if self.advanced_open {
+                ui.label(theme::muted(
+                    ui,
+                    "JamStream does not publish server binaries yet. Point these at a \
+                     jamstreamd build you host; the machine downloads and verifies it at boot.",
+                ));
+                egui::Grid::new("artifact-grid")
+                    .num_columns(2)
+                    .spacing(vec2(theme::SPACE_LG, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(theme::muted(ui, "artifact url"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.artifact_url)
+                                .desired_width(340.0)
+                                .hint_text("https://..."),
+                        );
+                        ui.end_row();
+                        ui.label(theme::muted(ui, "artifact sha256"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.artifact_sha256)
+                                .desired_width(340.0)
+                                .hint_text("64 hex characters"),
+                        );
+                        ui.end_row();
+                    });
+            }
+            if !self.can_launch() {
+                ui.label(theme::muted(
+                    ui,
+                    "A cloud launch needs the server binary fields above.",
+                ));
+            }
         }
         ui.add_space(theme::SPACE_SM);
         ui.horizontal(|ui| {
             if ui.button("Back").clicked() {
                 self.back();
             }
+            let label = if self.is_local() {
+                "Start the session"
+            } else {
+                "Launch"
+            };
             if ui
-                .add_enabled(is_mock, egui::Button::new("Launch"))
+                .add_enabled(self.can_launch(), egui::Button::new(label))
                 .clicked()
-                && self.begin_launch()
             {
-                event = Some(WizardEvent::LaunchRequested);
+                self.begin_launch();
             }
         });
-        event
     }
 
     fn launching_ui(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().color(theme::palette_of(ui).text_muted));
-            ui.label(theme::muted(
-                ui,
-                "Booting the VM, verifying the server artifact, opening the session port.",
-            ));
-        });
-    }
-
-    fn done_ui(&mut self, ui: &mut Ui) -> Option<WizardEvent> {
-        let mut event = None;
-        let outcome = self.outcome.clone()?;
-        if let Some(err) = &outcome.error {
-            ui.label(RichText::new(err.clone()).color(theme::palette_of(ui).danger));
-            ui.add_space(theme::SPACE_LG);
-            if ui.button("Back to home").clicked() {
-                event = Some(WizardEvent::Close);
+        if let Some(err) = self.launch_error.clone() {
+            let p = theme::palette_of(ui);
+            ui.label(RichText::new(err).color(p.danger));
+            if !self.is_local() {
+                ui.add_space(theme::SPACE_XS);
+                ui.label(theme::muted(
+                    ui,
+                    "If a machine was launched before the failure, jamstream sweep finds \
+                     and removes it.",
+                ));
             }
-            return event;
+            ui.add_space(theme::SPACE_LG);
+            if ui.button("Back").clicked() {
+                self.back();
+            }
+            return;
         }
-        ui.horizontal(|ui| {
-            ui.label(theme::muted(ui, "server"));
-            ui.label(theme::mono(ui, outcome.server_addr.clone()));
-        });
-        ui.add_space(theme::SPACE_SM);
-        ui.label("Invites, one per person; send each to exactly one player.");
-        egui::Grid::new("invite-grid")
-            .num_columns(3)
-            .spacing(vec2(theme::SPACE_LG, 4.0))
-            .show(ui, |ui| {
-                for (label, invite) in &outcome.invites {
-                    ui.label(label.clone());
-                    let shown: String = if invite.len() > 40 {
-                        format!("{}...", &invite[..40])
-                    } else {
-                        invite.clone()
-                    };
-                    ui.label(theme::mono_muted(ui, shown));
-                    if ui
-                        .add_sized(
-                            vec2(160.0, 22.0),
-                            egui::Button::new(format!("Copy {label} invite")),
-                        )
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(invite.clone());
-                    }
-                    ui.end_row();
+        let phase = self.launch_phase();
+        let steps: [(&str, LaunchPhase); 3] = [
+            (
+                if self.is_local() {
+                    "starting the server process"
+                } else {
+                    "booting the machine"
+                },
+                LaunchPhase::Launching,
+            ),
+            ("waiting for its address", LaunchPhase::WaitingForAddress),
+            (
+                "checking the server answers",
+                LaunchPhase::CheckingReachability,
+            ),
+        ];
+        let active = steps.iter().position(|(_, p)| *p == phase).unwrap_or(0);
+        for (i, (label, _)) in steps.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if i == active {
+                    ui.add(egui::Spinner::new().color(theme::palette_of(ui).text_muted));
+                    ui.label(*label);
+                } else if i < active {
+                    ui.label(theme::mono_muted(ui, "done"));
+                    ui.label(theme::muted(ui, *label));
+                } else {
+                    ui.add_space(22.0);
+                    ui.label(theme::muted(ui, *label));
                 }
             });
-        ui.add_space(theme::SPACE_SM);
-        if let Some(path) = &outcome.state_path {
-            ui.label(theme::muted(ui, format!("Session recorded at {path}.")));
         }
+        ui.add_space(theme::SPACE_SM);
         ui.label(theme::muted(
             ui,
-            "Cost accrues per second from now; end the session to stop the meter.",
+            "You join automatically the moment the server answers.",
         ));
-        ui.add_space(theme::SPACE_LG);
-        if ui.button("Back to home").clicked() {
-            event = Some(WizardEvent::Close);
-        }
-        event
     }
+}
+
+fn guidance(ui: &mut Ui, lines: &[&str]) {
+    for line in lines {
+        ui.label(theme::muted(ui, *line));
+    }
+}
+
+/// One labeled secret input; masked unless revealed, never logged.
+fn secret_field(ui: &mut Ui, label: &str, value: &mut String, reveal: bool) {
+    ui.horizontal(|ui| {
+        row_cell(ui, 130.0, |ui| {
+            ui.label(theme::muted(ui, label));
+        });
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(300.0)
+                .password(!reveal),
+        );
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jamstream_cloud::{ProviderKind, RegionId};
+    use crate::creds::MemStore;
+    use jamstream_cloud::MockProvider;
 
-    fn providers() -> Vec<ProviderRow> {
-        vec![
-            ProviderRow {
-                name: "mock".to_owned(),
-                available: true,
-                detail: "runs locally, no credentials needed".to_owned(),
-            },
-            ProviderRow {
-                name: "aws".to_owned(),
-                available: false,
-                detail: "AWS_ACCESS_KEY_ID is not set".to_owned(),
-            },
-        ]
+    fn no_env() -> EnvReader {
+        Arc::new(|_| None)
+    }
+
+    fn wizard() -> HostWizard {
+        HostWizard::new(Arc::new(MemStore::default()), no_env(), test_exec())
+    }
+
+    fn test_exec() -> Arc<Executor> {
+        Arc::new(Executor::new())
     }
 
     fn region_row(id: &str, hourly: u64, rtt: f32) -> RegionRow {
@@ -755,33 +1549,75 @@ mod tests {
                 included_egress_gb: 0,
             },
             worst_rtt_ms: rtt,
-            fabricated: true,
         }
     }
 
     #[test]
+    fn provider_rows_order_and_statuses() {
+        let rows = provider_rows(&MemStore::default(), &no_env());
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["local", "digitalocean", "aws", "gcp"]);
+        assert_eq!(rows[0].status, ProviderStatus::NoAccountNeeded);
+        for row in &rows[1..] {
+            assert_eq!(row.status, ProviderStatus::SetupNeeded, "{}", row.name);
+        }
+    }
+
+    #[test]
+    fn environment_credentials_make_a_provider_ready() {
+        let env: EnvReader =
+            Arc::new(|key| (key == "DIGITALOCEAN_TOKEN").then(|| "dop_v1_x".to_owned()));
+        let rows = provider_rows(&MemStore::default(), &env);
+        assert_eq!(rows[1].name, "digitalocean");
+        assert_eq!(rows[1].status, ProviderStatus::Ready);
+        assert_eq!(rows[2].status, ProviderStatus::SetupNeeded);
+    }
+
+    #[test]
+    fn selecting_a_setup_needed_cloud_opens_the_pane_and_gates_continue() {
+        let mut w = wizard();
+        assert!(w.select_provider(1)); // digitalocean, no creds
+        assert!(w.setup_open);
+        assert!(!w.provider_ready());
+        assert!(!w.advance_from_provider());
+        assert_eq!(w.step, WizardStep::Provider);
+        // Local closes the pane and is immediately ready.
+        assert!(w.select_provider(0));
+        assert!(!w.setup_open);
+        assert!(w.provider_ready());
+    }
+
+    #[test]
+    fn local_skips_the_region_step() {
+        let mut w = wizard();
+        w.select_provider(0);
+        assert!(w.advance_from_provider());
+        assert_eq!(w.step, WizardStep::Preview);
+        assert_eq!(w.regions.len(), 1);
+        assert_eq!(w.regions[0].region.id.as_str(), "local");
+        assert_eq!(w.regions[0].price.hourly_microusd, 0);
+        assert_eq!(w.selected_region, Some(0));
+        // No artifact needed: local launches a binary already on this machine.
+        assert!(w.can_launch());
+    }
+
+    #[test]
     fn cannot_continue_without_a_provider() {
-        let mut w = HostWizard::new(providers());
-        assert!(!w.continue_to_region(vec![region_row("mock-east", 16_800, 21.0)]));
+        let mut w = wizard();
+        assert!(!w.continue_to_region(vec![region_row("us-east-1", 16_800, 21.0)]));
+        assert!(!w.advance_from_provider());
         assert_eq!(w.step, WizardStep::Provider);
     }
 
     #[test]
-    fn unavailable_provider_is_refused() {
-        let mut w = HostWizard::new(providers());
-        assert!(!w.select_provider(1));
-        assert!(w.selected_provider.is_none());
-        assert!(w.select_provider(0));
-        assert_eq!(w.selected_provider_name(), Some("mock"));
-    }
-
-    #[test]
-    fn happy_path_walks_all_steps() {
-        let mut w = HostWizard::new(providers());
-        assert!(w.select_provider(0));
+    fn cloud_happy_path_with_fed_rows() {
+        let mut w = wizard();
+        // Pretend DO creds are present so the row is selectable and ready.
+        w.providers[1].status = ProviderStatus::Ready;
+        assert!(w.select_provider(1));
         assert!(w.continue_to_region(vec![
-            region_row("mock-east", 16_800, 21.0),
-            region_row("mock-west", 12_000, 34.0),
+            region_row("nyc3", 26_790, 21.0),
+            region_row("sfo3", 26_790, 74.0),
         ]));
         assert_eq!(w.step, WizardStep::Region);
         // The top-ranked region is preselected.
@@ -791,101 +1627,134 @@ mod tests {
         assert_eq!(w.step, WizardStep::Preview);
         let preview = w.preview().expect("preview");
         assert!(preview.total_microusd > 0);
-        assert!(w.begin_launch());
-        assert_eq!(w.step, WizardStep::Launching);
-        assert!(w.finish_launch(LaunchOutcome {
-            session_short: "a3f29c41".to_owned(),
-            server_addr: "10.0.0.1:43210".to_owned(),
-            invites: vec![("host".to_owned(), "jamstream://join/AAAA".to_owned())],
-            state_path: None,
-            error: None,
-        }));
-        assert_eq!(w.step, WizardStep::Done);
     }
 
     #[test]
-    fn back_walks_but_never_from_launch() {
-        let mut w = HostWizard::new(providers());
+    fn cloud_launch_requires_the_artifact_fields() {
+        let mut w = wizard();
+        w.providers[1].status = ProviderStatus::Ready;
+        w.select_provider(1);
+        w.continue_to_region(vec![region_row("nyc3", 26_790, 21.0)]);
+        w.continue_to_preview();
+        assert!(!w.can_launch());
+        w.artifact_url = "https://example.invalid/jamstreamd".to_owned();
+        assert!(!w.can_launch());
+        w.artifact_sha256 = "a".repeat(64);
+        assert!(w.can_launch());
+    }
+
+    #[test]
+    fn back_walks_and_local_back_skips_region() {
+        let mut w = wizard();
         assert!(!w.back());
-        w.select_provider(0);
-        w.continue_to_region(vec![region_row("mock-east", 16_800, 21.0)]);
+        w.providers[1].status = ProviderStatus::Ready;
+        w.select_provider(1);
+        w.continue_to_region(vec![region_row("nyc3", 26_790, 21.0)]);
         w.continue_to_preview();
         assert!(w.back());
         assert_eq!(w.step, WizardStep::Region);
         assert!(w.back());
         assert_eq!(w.step, WizardStep::Provider);
         // Selections survive going back.
-        assert_eq!(w.selected_provider_name(), Some("mock"));
-    }
+        assert_eq!(w.selected_provider_name(), Some("digitalocean"));
 
-    #[test]
-    fn launch_requires_the_mock_provider() {
-        let mut w = HostWizard::new(vec![ProviderRow {
-            name: "aws".to_owned(),
-            available: true,
-            detail: "credentials found (AWS_ACCESS_KEY_ID)".to_owned(),
-        }]);
+        // Local's preview goes back to the provider step directly.
         w.select_provider(0);
-        w.continue_to_region(vec![region_row("us-east-1", 16_800, 21.0)]);
-        w.continue_to_preview();
-        assert!(!w.begin_launch());
+        w.advance_from_provider();
         assert_eq!(w.step, WizardStep::Preview);
-    }
-
-    #[test]
-    fn finish_launch_only_applies_while_launching() {
-        let mut w = HostWizard::new(providers());
-        assert!(!w.finish_launch(LaunchOutcome {
-            session_short: String::new(),
-            server_addr: String::new(),
-            invites: Vec::new(),
-            state_path: None,
-            error: None,
-        }));
+        assert!(w.back());
         assert_eq!(w.step, WizardStep::Provider);
     }
 
-    #[test]
-    fn mock_launch_end_to_end() {
-        // Redirect the CLI state dir so the test leaves nothing behind.
-        let dir =
-            std::env::temp_dir().join(format!("jamstream-client-wizard-{}", std::process::id()));
-        // Serialize access to the env var across test threads.
-        unsafe { std::env::set_var(jamstream_cli::state::STATE_DIR_ENV, &dir) };
+    #[tokio::test]
+    async fn check_provider_passes_with_a_working_provider() {
+        let provider = MockProvider::with_default_regions(ProviderKind::Aws);
+        assert_eq!(check_provider(Box::new(provider)).await, Ok(()));
+    }
 
-        let mut w = HostWizard::new(providers());
-        w.select_provider(0);
-        let rows = region_rows("mock").expect("mock regions");
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.fabricated));
-        w.continue_to_region(rows);
-        w.continue_to_preview();
-        w.begin_launch();
-        let outcome = launch(&w);
-        assert_eq!(outcome.error, None);
-        assert_eq!(outcome.session_short.len(), 8);
-        // host + 3 musicians + 2 listeners.
-        assert_eq!(outcome.invites.len(), 6);
-        assert_eq!(outcome.invites[0].0, "host");
-        // Every invite decodes.
-        for (_, encoded) in &outcome.invites {
-            jamstream_protocol::invite::Invite::decode(encoded).expect("invite decodes");
-        }
-        assert!(outcome.state_path.is_some());
-        w.finish_launch(outcome);
-        assert_eq!(w.step, WizardStep::Done);
-
-        std::fs::remove_dir_all(&dir).ok();
-        unsafe { std::env::remove_var(jamstream_cli::state::STATE_DIR_ENV) };
+    #[tokio::test]
+    async fn check_provider_reports_failures_verbatim() {
+        // A provider with no regions cannot even quote a price.
+        let provider = MockProvider::new(ProviderKind::Aws);
+        let err = check_provider(Box::new(provider))
+            .await
+            .expect_err("no regions must fail");
+        assert!(err.contains("no regions"), "error was {err:?}");
     }
 
     #[test]
-    fn base64_matches_reference() {
+    fn a_passing_check_saves_credentials_and_readies_the_row() {
+        let store = Arc::new(MemStore::default());
+        let mut w = HostWizard::new(store.clone(), no_env(), test_exec());
+        w.select_provider(1); // digitalocean
+        w.setup.do_token = "dop_v1_secret".to_owned();
+        w.apply_check_result(Ok(()));
+        assert_eq!(
+            store.get("digitalocean", "token").as_deref(),
+            Some("dop_v1_secret")
+        );
+        assert_eq!(w.providers[1].status, ProviderStatus::Ready);
+        assert!(w.provider_ready());
+        assert_eq!(w.check_result, Some(Ok(())));
+    }
+
+    #[test]
+    fn a_failing_check_saves_nothing() {
+        let store = Arc::new(MemStore::default());
+        let mut w = HostWizard::new(store.clone(), no_env(), test_exec());
+        w.select_provider(1);
+        w.setup.do_token = "dop_v1_wrong".to_owned();
+        w.apply_check_result(Err("authentication failed: 401".to_owned()));
+        assert_eq!(store.get("digitalocean", "token"), None);
+        assert_eq!(w.providers[1].status, ProviderStatus::SetupNeeded);
+        assert!(matches!(w.check_result, Some(Err(ref e)) if e.contains("401")));
+    }
+
+    #[test]
+    fn begin_check_refuses_empty_fields_without_spawning() {
+        let mut w = wizard();
+        w.select_provider(1);
+        assert!(!w.begin_check());
+        assert!(matches!(w.check_result, Some(Err(_))));
+        assert!(!w.busy());
+    }
+
+    #[test]
+    fn base64_matches_reference_and_round_trips() {
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64(&[0xfb, 0xff, 0x00]), "+/8A");
+        for sample in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foobar",
+            &[0xfb, 0xff, 0x00],
+        ] {
+            assert_eq!(base64_decode(&base64(sample)).unwrap(), sample.to_vec());
+        }
+        assert!(base64_decode("!!!!").is_err());
+    }
+
+    #[test]
+    fn self_destruct_needs_the_do_token() {
+        assert!(matches!(
+            self_destruct_for(ProviderKind::Aws, None),
+            Ok(SelfDestruct::AwsShutdown)
+        ));
+        assert!(matches!(
+            self_destruct_for(ProviderKind::Gcp, None),
+            Ok(SelfDestruct::GcpMaxRunDuration)
+        ));
+        let err = self_destruct_for(ProviderKind::DigitalOcean, None).unwrap_err();
+        assert!(err.contains("self-destruct"));
+        assert!(matches!(
+            self_destruct_for(ProviderKind::DigitalOcean, Some("t".to_owned())),
+            Ok(SelfDestruct::ApiToken { .. })
+        ));
     }
 }
