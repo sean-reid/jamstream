@@ -39,6 +39,19 @@ pub struct Palette {
     pub border: Color32,
 }
 
+// The two palettes below are the single source of truth for JamStream's
+// colors, including the ones outside this crate: scripts/render-palette.sh
+// parses them out of this file and generates the documentation site's CSS
+// custom properties (site/theme/css/palette.css), the docs theme-color
+// meta tag, and the app icon's fill values. CI (the palette job in
+// .github/workflows/docs-check.yml) runs that script with --check and
+// fails when a change here has not been propagated.
+//
+// The parse is a small awk over these two blocks, so keep the format
+// exactly what rustfmt produces: one field per line, spelled
+// `name: Color32::from_rgb(0x.., 0x.., 0x..),`, inside a
+// `pub const NAME: Palette = Palette {` ... `};` block. Computed or
+// aliased entries would be invisible to the generator.
 pub const DARK: Palette = Palette {
     well: Color32::from_rgb(0x0b, 0x0c, 0x0d),
     surface0: Color32::from_rgb(0x12, 0x13, 0x14),
