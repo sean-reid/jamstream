@@ -30,14 +30,21 @@ fn main() -> ExitCode {
         }
     };
 
-    // Fractional minutes are accepted (0.05 = 3 s) so tests and impatient
-    // hosts get short windows; 0 (the default) disables. Local mode passes
-    // this; cloud deployments rely on the external guard instead.
-    let idle_exit = match arg_value("--idle-exit-min").map(|v| v.parse::<f64>()) {
-        None => Duration::ZERO,
-        Some(Ok(min)) if min.is_finite() && min >= 0.0 => Duration::from_secs_f64(min * 60.0),
-        Some(_) => {
-            tracing::error!("--idle-exit-min must be a nonnegative number of minutes");
+    // Both self-exit windows take fractional minutes (0.05 = 3 s) so tests
+    // and impatient hosts get short windows; 0 (the default) disables.
+    // Local mode passes these; cloud deployments rely on the external
+    // guard instead.
+    let idle_exit = match minutes_arg("--idle-exit-min") {
+        Ok(window) => window,
+        Err(err) => {
+            tracing::error!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let max_duration = match minutes_arg("--max-duration-min") {
+        Ok(window) => window,
+        Err(err) => {
+            tracing::error!("{err}");
             return ExitCode::FAILURE;
         }
     };
@@ -64,7 +71,9 @@ fn main() -> ExitCode {
 
     runtime.block_on(async {
         let server = match Server::bind(&cfg, opts).await {
-            Ok(server) => server.with_idle_exit(idle_exit),
+            Ok(server) => server
+                .with_idle_exit(idle_exit)
+                .with_max_duration(max_duration),
             Err(err) => {
                 tracing::error!(%err, "bind failed");
                 return ExitCode::FAILURE;
@@ -82,6 +91,16 @@ fn main() -> ExitCode {
             }
         }
     })
+}
+
+/// Parses a fractional-minutes window flag; an absent flag or 0 means
+/// disabled (Duration::ZERO).
+fn minutes_arg(flag: &str) -> Result<Duration, String> {
+    match arg_value(flag).map(|v| v.parse::<f64>()) {
+        None => Ok(Duration::ZERO),
+        Some(Ok(min)) if min.is_finite() && min >= 0.0 => Ok(Duration::from_secs_f64(min * 60.0)),
+        Some(_) => Err(format!("{flag} must be a nonnegative number of minutes")),
+    }
 }
 
 fn arg_value(flag: &str) -> Option<String> {
