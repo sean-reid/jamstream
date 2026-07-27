@@ -41,6 +41,14 @@ thiserror = "2"
 tracing = "0.1"
 rand = "0.10"
 proptest = "1"
+# Pinned to 0.7: criterion 0.8 raises its own rust-version to 1.86, above this
+# workspace's MSRV, and `cargo clippy --all-targets` would fail to resolve it.
+# default-features off drops plotters and rayon, neither of which a text
+# report needs; cargo_bench_support is not default-off-able, `cargo bench`
+# refuses to run without it.
+criterion = { version = "0.7", default-features = false, features = [
+    "cargo_bench_support",
+] }
 # default-features = false drops snow's `std` feature, whose feature list uses
 # the legacy `ring/std` syntax (no `?`), which implicitly turns on snow's
 # optional `ring` dependency. Nothing can reach ring: `RingResolver` is gated
