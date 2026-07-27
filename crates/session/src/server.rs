@@ -52,6 +52,22 @@ const _: () = assert!(REJECT_SLOTS.is_power_of_two());
 /// reflected volume at roughly 16 * 49 = 784 bytes per second on the wire.
 const REJECT_RATE_PER_SEC: u32 = 16;
 const REJECT_BURST: u32 = 16;
+/// Handshake inits the server will pay a Diffie-Hellman for per second, and
+/// the burst it allows. `Responder::read_init` performs an X25519 before
+/// anything about the sender is known, on the same task that runs the 2.5 ms
+/// mix tick, so an unbudgeted flood is a tick overrun for everyone already
+/// playing. A full session is 30 members, each sending one init and resending
+/// at most twice a second while connecting, so a whole band arriving at once
+/// and retrying sits inside the burst; past that, joining degrades and the
+/// session keeps playing, which is the trade the budget exists to make.
+const INIT_RATE_PER_SEC: u32 = 32;
+const INIT_BURST: u32 = 64;
+/// Per source network share of that budget, so one host flooding from a real
+/// address cannot spend the whole allowance. Sized for a rehearsal room: a
+/// band behind one NAT is one network here, and ten musicians arriving
+/// together with a resend each is 20 inits.
+const INIT_SLOT_RATE_PER_SEC: u32 = 8;
+const INIT_SLOT_BURST: u32 = 24;
 /// Shortest handshake init that earns a reject. A reject is 21 bytes and a
 /// real Noise IK first message is over 90, so answering anything shorter
 /// would make the server an amplifier by size: `[1, 9, 0]` in, 21 bytes out.
@@ -321,6 +337,15 @@ pub struct ServerCore {
     /// [`REJECT_SLOTS`], never resized.
     reject_seen: Vec<Option<u64>>,
     reject_budget: TokenBucket,
+    /// What an unauthenticated peer may spend of the handshake's asymmetric
+    /// crypto, globally and per source network. Same fixed table and same
+    /// slot function as the reject limiter: a source port is attacker-chosen,
+    /// so anything keyed finer than a network limits nothing.
+    init_slot_budget: Vec<TokenBucket>,
+    init_budget: TokenBucket,
+    /// Inits this core has paid a Diffie-Hellman for. The quantity the budget
+    /// exists to bound, so a test can assert it rather than infer it.
+    init_reads: u64,
     events: Vec<ServerEvent>,
     last_musician_count: usize,
     last_stats_ms: u64,
@@ -363,6 +388,12 @@ impl ServerCore {
             avatar_waiters: BTreeMap::new(),
             reject_seen: vec![None; REJECT_SLOTS],
             reject_budget: TokenBucket::new(REJECT_BURST, REJECT_RATE_PER_SEC),
+            init_slot_budget: vec![
+                TokenBucket::new(INIT_SLOT_BURST, INIT_SLOT_RATE_PER_SEC);
+                REJECT_SLOTS
+            ],
+            init_budget: TokenBucket::new(INIT_BURST, INIT_RATE_PER_SEC),
+            init_reads: 0,
             events: Vec::new(),
             last_musician_count: 0,
             last_stats_ms: 0,
@@ -869,6 +900,24 @@ impl ServerCore {
         ));
     }
 
+    /// Spends one unauthenticated peer's share of the handshake budget. The
+    /// per-network bucket goes first so a single flooding host cannot empty
+    /// the global one, and neither is charged when the other refuses.
+    fn init_budget_take(&mut self, now_ms: u64, src: SocketAddr) -> bool {
+        let slot = reject_slot(src.ip());
+        if !self.init_slot_budget[slot].available(now_ms) || !self.init_budget.available(now_ms) {
+            return false;
+        }
+        self.init_slot_budget[slot].take(now_ms) && self.init_budget.take(now_ms)
+    }
+
+    /// Handshake inits this core has paid a Diffie-Hellman for. Bounded per
+    /// second by construction; the tick has to survive whatever an
+    /// unauthenticated flood asks for.
+    pub fn handshake_reads(&self) -> u64 {
+        self.init_reads
+    }
+
     /// Full admission path for a version-matched handshake init. Every
     /// refusal is silent: to an unauthenticated peer the server looks like
     /// packet loss.
@@ -880,6 +929,14 @@ impl ServerCore {
         noise: &[u8],
         out: &mut Outgoing,
     ) {
+        // Everything below this line costs asymmetric crypto, so the budget
+        // is spent first and a refusal is silent. An honest client resends
+        // its init, so a drop here is packet loss to it; the flood it is
+        // sharing the server with is what made the difference.
+        if !self.init_budget_take(now_ms, src) {
+            return;
+        }
+        self.init_reads += 1;
         let Ok((hp, responder)) = Responder::read_init(
             &self.cfg.server_private,
             &self.cfg.session_id,
@@ -1749,6 +1806,59 @@ mod tests {
         );
         // The budget refills, so honest mismatched clients still get told.
         assert_eq!(core.handle_datagram(1_000, 0, addr(9), &init).len(), 1);
+    }
+
+    /// `Responder::read_init` performs an X25519 before anything about the
+    /// sender is known, on the task that also runs the 2.5 ms mix tick. A
+    /// flood must not be able to buy more of that than the budget allows,
+    /// however widely it spreads its source addresses.
+    #[test]
+    fn an_init_flood_cannot_buy_unbounded_asymmetric_crypto() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        // 40,000 distinct sources at one instant, far more than the table has
+        // slots, so only the global budget can hold this down.
+        for a in 0..160u16 {
+            for b in 0..250u16 {
+                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
+                core.handle_datagram(0, 0, src, &init);
+            }
+        }
+        assert_eq!(core.handshake_reads(), u64::from(INIT_BURST));
+        // A second later the allowance is back, so an honest client that
+        // resent through the flood is read: 8 from one source, inside both
+        // the refilled global budget and that source's own.
+        for _ in 0..8 {
+            core.handle_datagram(1_000, 0, addr(9), &init);
+        }
+        assert_eq!(core.handshake_reads(), u64::from(INIT_BURST) + 8);
+        // And no faster than the rate: the flood cannot buy more by waiting.
+        for a in 0..160u16 {
+            for b in 0..250u16 {
+                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
+                core.handle_datagram(1_000, 0, src, &init);
+            }
+        }
+        assert_eq!(
+            core.handshake_reads(),
+            u64::from(INIT_BURST) + u64::from(INIT_RATE_PER_SEC)
+        );
+    }
+
+    /// A single host cannot spend the whole allowance and leave a band
+    /// arriving from anywhere else with nothing.
+    #[test]
+    fn one_source_cannot_spend_the_whole_handshake_budget() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        for port in 1_024..3_024u16 {
+            let src: SocketAddr = format!("203.0.113.7:{port}").parse().unwrap();
+            core.handle_datagram(0, 0, src, &init);
+        }
+        assert_eq!(core.handshake_reads(), u64::from(INIT_SLOT_BURST));
+        // And the rest of the budget is still there for everybody else.
+        core.handle_datagram(0, 0, addr(9), &init);
+        assert_eq!(core.handshake_reads(), u64::from(INIT_SLOT_BURST) + 1);
     }
 
     /// The reject is 21 bytes. Answering a 3-byte `[1, 9, 0]` would make the
