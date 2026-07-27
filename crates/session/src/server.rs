@@ -643,18 +643,27 @@ impl ServerCore {
             }
         }
 
-        // Timeout scan: keep state so the same token can rejoin, free the
+        // Reap scan: keep state so the same token can rejoin, free the
         // address binding and transport.
-        let timed_out: Vec<MemberId> = self
+        //
+        // Silence for the member timeout is the usual path. A control link
+        // that has given up retransmitting is the other one, and the timeout
+        // never catches it: a peer that keeps media flowing while acking
+        // nothing stays "heard from" forever, and the server can no longer
+        // tell it anything. It reaches that state 65 s after a frame first
+        // went unacked, so nothing on a merely bad link gets here.
+        let gone: Vec<MemberId> = self
             .members
             .iter()
             .filter(|(_, m)| {
-                m.connected && now_ms.saturating_sub(m.last_heard_ms) >= self.cfg.member_timeout_ms
+                m.connected
+                    && (now_ms.saturating_sub(m.last_heard_ms) >= self.cfg.member_timeout_ms
+                        || m.link.is_dead())
             })
             .map(|(&id, _)| id)
             .collect();
-        if !timed_out.is_empty() {
-            for id in timed_out {
+        if !gone.is_empty() {
+            for id in gone {
                 self.disconnect_member(id);
                 self.events.push(ServerEvent::MemberDisconnected { id });
             }

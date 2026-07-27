@@ -1579,6 +1579,69 @@ fn dropping_one_peer_leaves_the_rest_of_the_session_playing() {
     assert_eq!(h.server.musicians_connected(), 3);
 }
 
+/// A peer that keeps media flowing while acking nothing is heard from
+/// constantly, so the 10 s member timeout never reaps it and the client's own
+/// silence timeout never fires either. Both links give up retransmitting
+/// after their 36 attempts, and that is what ends it: the server frees the
+/// seat and the client stops pretending it is in a session. Before, the
+/// give-up flag was set and read by nobody.
+#[test]
+fn a_control_link_that_gives_up_ends_the_connection_at_both_ends() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv = h.mint(0, Role::Musician);
+    let idx = h.add_client(&inv, Some(0.0));
+    h.run_ms(250);
+    assert_eq!(*h.clients[idx].core.state(), ClientState::Joined);
+    let addr = h.clients[idx].addr;
+
+    // 100 ms hops carrying one media frame each way and no control at all:
+    // the client's acks and pings are dropped on the way out, so nothing
+    // either side sends is ever acknowledged.
+    let mut server_reaped = None;
+    let mut client_gave_up = None;
+    for _ in 0..800 {
+        h.t += 100.0;
+        let now = h.now_ms();
+        let media = h.clients[idx].core.push_capture(now, &[0.0; 120]);
+        let _ = h.clients[idx].core.poll(now);
+        let mut to_client = Vec::new();
+        for dg in media {
+            to_client.extend(h.server.handle_datagram(now, h.now_unix, addr, &dg));
+        }
+        to_client.extend(h.server.tick(now));
+        for (a, dg) in to_client {
+            if a == addr {
+                let _ = h.clients[idx].core.handle_datagram(now, &dg);
+            }
+        }
+        if server_reaped.is_none()
+            && h.server
+                .events()
+                .iter()
+                .any(|e| matches!(e, ServerEvent::MemberDisconnected { id } if *id == MemberId(0)))
+        {
+            server_reaped = Some(now);
+        }
+        if client_gave_up.is_none() && *h.clients[idx].core.state() == ClientState::TimedOut {
+            client_gave_up = Some(now);
+        }
+    }
+
+    // The give-up horizon is 65 s. Well past the member timeout, which is
+    // the point: this reaps something the timeout cannot see.
+    let reaped = server_reaped.expect("server never reaped the member");
+    let gave_up = client_gave_up.expect("client never gave up");
+    assert!(
+        (64_000..70_000).contains(&reaped),
+        "server reaped at {reaped} ms"
+    );
+    assert!(
+        (64_000..70_000).contains(&gave_up),
+        "client gave up at {gave_up} ms"
+    );
+    assert_eq!(h.server.musicians_connected(), 0);
+}
+
 #[test]
 fn timeout_then_rejoin_with_same_token() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);

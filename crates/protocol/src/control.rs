@@ -450,15 +450,13 @@ impl ControlLink {
         Ok(delivered)
     }
 
-    /// True once a message has been retransmitted past the give-up limit;
-    /// the peer is unreachable and the caller should drop the connection.
+    /// True once a message has been retransmitted past the give-up limit.
+    /// The peer is not reachable with anything that has to arrive, so both
+    /// cores drop the connection on it: the server reaps the member, the
+    /// client reports a timeout. Nothing else reaches this state, because a
+    /// peer that has simply vanished is reaped by the member timeout first.
     pub fn is_dead(&self) -> bool {
         self.dead
-    }
-
-    /// Anything still awaiting acknowledgment?
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
     }
 
     /// Messages queued for delivery or awaiting acknowledgment.
@@ -585,7 +583,7 @@ mod tests {
         assert_eq!(got, (0..5).map(chat).collect::<Vec<_>>());
         // Acks flow back and clear the pending queue.
         shuttle(&mut b, &mut a, 1, &[]);
-        assert!(!a.has_pending());
+        assert_eq!(a.pending_len(), 0);
     }
 
     #[test]
@@ -630,7 +628,7 @@ mod tests {
         let acks = b.poll(1);
         assert_eq!(acks.len(), 1);
         a.receive(&acks[0]).unwrap();
-        assert!(!a.has_pending());
+        assert_eq!(a.pending_len(), 0);
         // Nothing further owed.
         assert!(b.poll(2).is_empty());
     }
