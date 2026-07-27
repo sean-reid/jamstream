@@ -9,11 +9,14 @@ use egui::{
 };
 
 use crate::runtime::{
-    BroadcastView, Command, ConnState, FaderView, MemberView, Role, Runtime, Snapshot,
+    BroadcastView, ChatLine, Command, ConnState, FaderView, MemberView, Role, Runtime, Snapshot,
 };
 use crate::screens::invites::{InvitesEvent, InvitesPanel};
 use crate::theme;
-use crate::widgets::{Meter, db_drag, fader, lamp_toggle, meter, on_air, pan_slider, status_dot};
+use crate::widgets::{
+    AVATAR_D_STRIP, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, on_air, pan_slider,
+    status_dot,
+};
 
 const NARROW_BELOW_PX: f32 = 900.0;
 
@@ -26,6 +29,14 @@ const DB_H: f32 = 16.0;
 const PAN_H: f32 = 14.0;
 const METER_SLOT_H: f32 = 12.0;
 const MIN_FADER_H: f32 = 120.0;
+
+// Chat columns: a monospace clock, a name gutter, then the message. The
+// message column is the one thing that must never move: every line of a
+// message, wrapped continuations included, shares its left edge, in both
+// the wide and the narrow layout. Names past the gutter ellipsize with the
+// full name one hover away, the same treatment as a strip's name.
+const CHAT_TIME_W: f32 = 38.0;
+const CHAT_NAME_W: f32 = 64.0;
 
 pub enum SessionEvent {
     /// The user confirmed leaving; the app should drop the runtime.
@@ -237,6 +248,23 @@ impl SessionScreen {
     }
 
     fn strip_body(&mut self, ui: &mut Ui, member: &MemberView, snap: &Snapshot, rt: &dyn Runtime) {
+        // The portrait sits above the name row, centered in the strip. Its
+        // slot is allocated whether or not an avatar has arrived, so a
+        // picture landing mid-session moves nothing below it.
+        ui.allocate_ui_with_layout(
+            vec2(STRIP_INNER_W, AVATAR_D_STRIP),
+            Layout::top_down(Align::Center),
+            |ui| {
+                avatar_disc(
+                    ui,
+                    &member.name,
+                    member.avatar.as_ref(),
+                    AVATAR_D_STRIP,
+                    !member.connected,
+                )
+                .on_hover_text(member.name.clone());
+            },
+        );
         ui.horizontal(|ui| {
             status_dot(ui, member.connected, snap.stats.rtt_ms, snap.stats.loss_pct);
             // Long names truncate inside the fixed strip; the full name is
@@ -461,15 +489,7 @@ impl SessionScreen {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for line in &snap.chat {
-                    ui.horizontal_wrapped(|ui| {
-                        let secs = line.at_ms / 1000;
-                        ui.label(theme::mono_muted(
-                            ui,
-                            format!("{:02}:{:02}", secs / 60, secs % 60),
-                        ));
-                        ui.label(RichText::new(line.from_name.clone()).strong());
-                        ui.label(line.text.clone());
-                    });
+                    chat_line(ui, line);
                 }
             });
         let field = ui.add(
@@ -756,6 +776,39 @@ fn stream_mix_row(ui: &mut Ui, member: &MemberView, broadcast: &BroadcastView, r
             muted,
         });
     }
+}
+
+/// One chat line in three columns: clock, name gutter, message. The message
+/// is a wrapping label in the width that remains, so its continuation lines
+/// hang to the same left edge instead of sliding under the clock.
+fn chat_line(ui: &mut Ui, line: &ChatLine) {
+    ui.horizontal_top(|ui| {
+        let secs = line.at_ms / 1000;
+        ui.add_sized(
+            vec2(CHAT_TIME_W, 18.0),
+            egui::Label::new(theme::mono_muted(
+                ui,
+                format!("{:02}:{:02}", secs / 60, secs % 60),
+            ))
+            .selectable(false),
+        );
+        let name = ui
+            .allocate_ui_with_layout(
+                vec2(CHAT_NAME_W, 18.0),
+                Layout::left_to_right(Align::Min),
+                |ui| {
+                    ui.set_min_width(CHAT_NAME_W);
+                    ui.add(
+                        egui::Label::new(RichText::new(line.from_name.clone()).strong()).truncate(),
+                    )
+                },
+            )
+            .inner;
+        if line.from_name.chars().count() > 8 {
+            name.on_hover_text(line.from_name.clone());
+        }
+        ui.add(egui::Label::new(line.text.clone()).wrap());
+    });
 }
 
 /// The persistent audition reminder: a lit lamp and its sentence, beside

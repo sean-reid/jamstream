@@ -2,12 +2,14 @@
 //! function of a frame counter, so snapshot tests freeze the counter and
 //! `jamstream-app --demo` lets it run. No randomness, no wall clock.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::avatar::disc_color;
 use crate::runtime::{
-    BroadcastView, ChatLine, Command, ConnState, CostView, FaderView, LevelsView, MemberId,
-    MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
+    AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, FaderView, LevelsView,
+    MemberId, MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
 };
+use crate::theme;
 
 /// The frame snapshot tests freeze at; chosen so meters sit mid-scale.
 pub const FROZEN_FRAME: u64 = 1234;
@@ -38,6 +40,50 @@ struct Member {
     fader: FaderView,
     /// The member's fader in the broadcast mix; host snapshots only.
     bcast: FaderView,
+    /// Decoded pixels, as the live runtime would hand them over. Two demo
+    /// members carry one so snapshots exercise both the picture and the
+    /// initials fallback.
+    avatar: Option<AvatarHandle>,
+}
+
+/// A procedural stand-in portrait: a tinted field with a head-and-shoulders
+/// silhouette in the member's own hashed hue. Deterministic, no asset files,
+/// and deliberately not a photograph. One demo avatar is wide and one is
+/// square, so the cover crop is visible in the snapshots rather than assumed.
+///
+/// The hash is a synthetic key: nothing transfers in the demo, and the UI
+/// only needs it to be stable per member for the texture cache.
+fn demo_avatar(name: &str, w: u32, h: u32) -> AvatarHandle {
+    let base = disc_color(name);
+    let top = theme::blend(base, theme::DARK.well, 0.35);
+    let bottom = theme::blend(base, theme::DARK.text_primary, 0.18);
+    let head = theme::blend(base, theme::DARK.text_primary, 0.62);
+    let shoulders = theme::blend(base, theme::DARK.well, 0.15);
+    let short = w.min(h) as f32 / 2.0;
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // Centered on the short side, so the square crop keeps the
+            // whole silhouette whatever the aspect is.
+            let cx = (x as f32 + 0.5 - w as f32 / 2.0) / short;
+            let cy = (y as f32 + 0.5 - h as f32 / 2.0) / short;
+            let field = theme::blend(top, bottom, (cy + 1.0) / 2.0);
+            let color = if cx * cx + (cy + 0.28) * (cy + 0.28) < 0.40 * 0.40 {
+                head
+            } else if cx * cx + (cy - 1.05) * (cy - 1.05) < 0.80 * 0.80 {
+                shoulders
+            } else {
+                field
+            };
+            rgba.extend_from_slice(&[color.r(), color.g(), color.b(), 255]);
+        }
+    }
+    AvatarHandle {
+        hash: format!("demo-{name}-{w}x{h}"),
+        width: w,
+        height: h,
+        rgba: Arc::from(rgba.into_boxed_slice()),
+    }
 }
 
 struct DemoState {
@@ -98,6 +144,7 @@ impl DemoRuntime {
                     role: Role::Musician,
                     fader: fv(gain_db, pan, muted),
                     bcast: FLAT,
+                    avatar: None,
                 },
             );
             id += 1;
@@ -109,6 +156,7 @@ impl DemoRuntime {
                 role: Role::Listener,
                 fader: FLAT,
                 bcast: FLAT,
+                avatar: None,
             });
             id += 1;
         }
@@ -146,6 +194,7 @@ impl DemoRuntime {
                 role: Role::Musician,
                 fader: FLAT,
                 bcast: fv(-1.0, 0.0, false),
+                avatar: None,
             },
             Member {
                 id: 1,
@@ -153,6 +202,8 @@ impl DemoRuntime {
                 role: Role::Musician,
                 fader: fv(-3.0, -0.4, false),
                 bcast: fv(-2.0, -0.3, false),
+                // Wide: the cover crop takes a centered square of it.
+                avatar: Some(demo_avatar("Ana", 96, 48)),
             },
             Member {
                 id: 2,
@@ -160,6 +211,7 @@ impl DemoRuntime {
                 role: Role::Musician,
                 fader: fv(-1.5, 0.3, false),
                 bcast: fv(-4.5, 0.35, false),
+                avatar: Some(demo_avatar("Ben", 64, 64)),
             },
             Member {
                 id: 3,
@@ -167,6 +219,7 @@ impl DemoRuntime {
                 role: Role::Musician,
                 fader: fv(-6.0, 0.0, true),
                 bcast: fv(-12.0, 0.0, true),
+                avatar: None,
             },
             Member {
                 id: 4,
@@ -174,6 +227,7 @@ impl DemoRuntime {
                 role: Role::Listener,
                 fader: FLAT,
                 bcast: FLAT,
+                avatar: None,
             },
         ];
         DemoRuntime {
@@ -270,6 +324,7 @@ impl Runtime for DemoRuntime {
                 is_you: m.id == 0,
                 fader: m.fader,
                 token: self.is_host.then_some(TokenId([m.id as u8; 16])),
+                avatar: m.avatar.clone(),
             })
             .collect();
 
@@ -351,6 +406,19 @@ impl Runtime for DemoRuntime {
                 }
             }
             Command::SetBroadcastAudition(on) => s.audition = on,
+            // The demo stands in for the runtime's decode step: raw file
+            // bytes in, pixels on your own strip out, or the initials disc
+            // back when they are dropped.
+            Command::SetOwnAvatar(bytes) => {
+                let decoded = bytes.and_then(|bytes| {
+                    crate::avatar::decode(format!("own-{}", bytes.len()), &bytes)
+                        .inspect_err(|err| tracing::warn!(%err, "demo avatar did not decode"))
+                        .ok()
+                });
+                if let Some(me) = s.members.iter_mut().find(|m| m.id == 0) {
+                    me.avatar = decoded;
+                }
+            }
             Command::Leave => s.left = true,
             Command::Revoke(jti) => {
                 // The demo token is the member id repeated; reverse it.
@@ -391,6 +459,19 @@ impl<R: Runtime> Runtime for RecordingRuntime<R> {
     fn send(&self, cmd: Command) {
         self.log.lock().expect("command log").push(cmd.clone());
         self.inner.send(cmd);
+    }
+}
+
+/// So a test can hold the recorder and hand the same instance to
+/// [`crate::app::JamApp`] as its boxed runtime, the way `Arc<LiveRuntime>`
+/// serves the real app.
+impl<R: Runtime + Sync> Runtime for Arc<RecordingRuntime<R>> {
+    fn snapshot(&self) -> Snapshot {
+        (**self).snapshot()
+    }
+
+    fn send(&self, cmd: Command) {
+        (**self).send(cmd);
     }
 }
 

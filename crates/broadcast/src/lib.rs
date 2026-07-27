@@ -6,12 +6,15 @@
 //! no randomness beyond a stable hash of member names.
 
 mod avatar;
-mod palette;
+/// The stage palette and the initials-disc hue rule. Public so the desktop
+/// client can assert its own copy still agrees: a member must look the same
+/// in the app and on the stream card.
+pub mod palette;
 mod render;
 mod text;
 
 pub use avatar::{AvatarError, AvatarImage};
-pub use render::Renderer;
+pub use render::{Renderer, initials};
 
 /// Fixed per-stream scene parameters. Everything sized off these is
 /// preallocated in [`Renderer::new`].
