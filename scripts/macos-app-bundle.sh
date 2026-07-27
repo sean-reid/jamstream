@@ -7,8 +7,11 @@
 #
 # <version> is the release tag with or without the leading "v", e.g.
 # v0.1.3-beta.2. Produces <out-dir>/JamStream.app and lints the generated
-# Info.plist with plutil. No icon yet; release.yml has the named
-# placeholder step for the icns.
+# Info.plist with plutil. The app icon is the COMMITTED
+# crates/client/assets/icon/jamstream.icns (derived from jamstream.svg by
+# scripts/render-icon.sh), copied into Contents/Resources and referenced
+# by CFBundleIconFile; nothing is rendered here, so CI needs no icon
+# tooling.
 #
 # [jamstreamd-binary], when given, is bundled at Contents/MacOS/jamstreamd
 # beside the app executable (a legal home for helper executables under
@@ -34,6 +37,13 @@ fi
 
 if [ -n "$SERVER_BINARY" ] && [ ! -f "$SERVER_BINARY" ]; then
   echo "error: jamstreamd binary not found: $SERVER_BINARY" >&2
+  exit 1
+fi
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ICNS="$REPO_ROOT/crates/client/assets/icon/jamstream.icns"
+if [ ! -f "$ICNS" ]; then
+  echo "error: app icon not found: $ICNS (it is committed; regenerate with scripts/render-icon.sh)" >&2
   exit 1
 fi
 
@@ -65,6 +75,7 @@ install -m 0755 "$BINARY" "$APP/Contents/MacOS/jamstream-app"
 if [ -n "$SERVER_BINARY" ]; then
   install -m 0755 "$SERVER_BINARY" "$APP/Contents/MacOS/jamstreamd"
 fi
+install -m 0644 "$ICNS" "$APP/Contents/Resources/JamStream.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -77,6 +88,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<string>JamStream</string>
 	<key>CFBundleExecutable</key>
 	<string>jamstream-app</string>
+	<key>CFBundleIconFile</key>
+	<string>JamStream</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.seanreid.jamstream</string>
 	<key>CFBundleInfoDictionaryVersion</key>
