@@ -79,10 +79,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - if: runner.os == 'macOS'
-        run: cargo test --workspace --exclude jamstream-harness
+        run: cargo nextest run --workspace --exclude jamstream-harness
       - if: runner.os != 'macOS'
-        run: cargo test --workspace --exclude jamstream-harness --exclude jamstream-client
+        run: cargo nextest run --workspace --exclude jamstream-harness --exclude jamstream-client
       # The snapshot tests drop a human-reviewable PNG of every screen under
       # target/ui-previews/; upload them even when a pixel diff fails, since
       # a failing run is exactly when a human wants to look.
@@ -92,6 +95,23 @@ jobs:
           name: ui-previews
           path: target/ui-previews/
           if-no-files-found: error
+
+  # Thin-lto release compilation is minutes per os; proving it belongs on
+  # main, not on every pr iteration. Breakage here is rare and self-locates.
+  release-build:
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - run: cargo build --workspace --release
 
   # Simulation harness gates: latency budgets, loss resilience, drift, chaos.
@@ -108,7 +128,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p jamstream-harness
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run -p jamstream-harness
+        env:
+          # Shared runners are several times slower than a developer
+          # machine; the gate catches order-of-magnitude regressions.
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
+
 
   # Coverage is the slowest job (fully instrumented rebuild), so it runs on
   # pushes to main only; PRs get their signal from the jobs above. The
