@@ -1,12 +1,14 @@
 //! Real devices via cpal: CoreAudio on macOS, WASAPI shared mode on
-//! Windows, PipeWire/ALSA on Linux. Windows exclusive mode is a planned
-//! separate backend behind the same trait; see `backend()` in lib.rs.
+//! Windows, PipeWire/ALSA on Linux. On Windows this is the fallback half of
+//! `WindowsBackend`, which prefers the direct WASAPI exclusive-mode path; see
+//! `backend()` in lib.rs.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use crate::format::map_frames;
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, Result, StreamConfig,
     StreamHandle,
@@ -198,17 +200,6 @@ fn make_error_callback(errored: &Arc<AtomicBool>) -> impl FnMut(cpal::Error) + S
     }
 }
 
-/// Map one interleaved frame layout onto another: destination channel i
-/// takes source channel min(i, src_channels - 1), so a mono source fans out
-/// to every destination channel and extra source channels are dropped.
-fn convert_frames(src: &[f32], src_ch: usize, dst: &mut [f32], dst_ch: usize) {
-    for (s, d) in src.chunks_exact(src_ch).zip(dst.chunks_exact_mut(dst_ch)) {
-        for (i, slot) in d.iter_mut().enumerate() {
-            *slot = s[i.min(src_ch - 1)];
-        }
-    }
-}
-
 fn build_input(
     device: &cpal::Device,
     native: &cpal::SupportedStreamConfig,
@@ -232,7 +223,7 @@ fn build_input(
                 for chunk in data.chunks(MAX_CHUNK_FRAMES * device_ch) {
                     let frames = chunk.len() / device_ch;
                     let dst = &mut scratch[..frames * handler_ch];
-                    convert_frames(chunk, device_ch, dst, handler_ch);
+                    map_frames(chunk, device_ch, dst, handler_ch);
                     on_capture(dst);
                 }
             },
@@ -267,7 +258,7 @@ fn build_output(
                     let src = &mut scratch[..frames * handler_ch];
                     src.fill(0.0);
                     on_playback(src);
-                    convert_frames(src, handler_ch, chunk, device_ch);
+                    map_frames(src, handler_ch, chunk, device_ch);
                 }
             },
             make_error_callback(errored),

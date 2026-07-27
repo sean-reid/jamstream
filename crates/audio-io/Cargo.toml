@@ -13,13 +13,25 @@ rtrb.workspace = true
 hound.workspace = true
 
 # Target-gated so server/wasm builds never pull platform audio stacks.
-# macOS: CoreAudio. Windows: WASAPI shared mode for bring-up; exclusive mode
-# is a tracked follow-up behind the same trait (see backend() in lib.rs).
+# macOS: CoreAudio. Windows: WASAPI exclusive mode driven directly through
+# the `wasapi` crate, with cpal kept as the shared-mode fallback path (see
+# backend() in lib.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal.workspace = true
 
+# wasapi: HEnquist's IAudioClient wrapper, the CamillaDSP precedent, used for
+# exclusive-mode streams. windows: MMCSS thread promotion and the AUDCLNT
+# HRESULT constants the fallback table keys on; the version matches the one
+# wasapi itself depends on so the graph stays single-version.
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal.workspace = true
+tracing.workspace = true
+wasapi = "0.23"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Threading",
+] }
 
 # Linux gets cpal's native PipeWire host plus dbus-based realtime thread
 # promotion, per the pinned stack. Resolver v3 keeps these features from

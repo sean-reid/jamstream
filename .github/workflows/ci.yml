@@ -76,6 +76,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
@@ -86,6 +88,13 @@ jobs:
         run: cargo nextest run --workspace --exclude jamstream-harness
       - if: runner.os != 'macOS'
         run: cargo nextest run --workspace --exclude jamstream-harness --exclude jamstream-client
+      # The nextest run above already compiles the cfg(windows) WASAPI
+      # exclusive-mode backend (lib and tests, with RUSTFLAGS=-D warnings), so
+      # it is the Windows compile gate. Clippy, though, only runs on Linux in
+      # the lint job, where that whole module is cfg'd out; lint it here, scoped
+      # to the one crate that has Windows-only code.
+      - if: runner.os == 'Windows'
+        run: cargo clippy -p jamstream-audio-io --all-targets -- -D warnings
       # The snapshot tests drop a human-reviewable PNG of every screen under
       # target/ui-previews/; upload them even when a pixel diff fails, since
       # a failing run is exactly when a human wants to look.
