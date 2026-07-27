@@ -12,6 +12,14 @@ thiserror.workspace = true
 rtrb.workspace = true
 hound.workspace = true
 
+# The hardware loopback test codes its tone with the session's real Opus
+# settings, so a format or scaling bug shows up as a frequency-domain failure
+# rather than as plausible-looking samples. Neither crate depends on this one,
+# so there is no cycle.
+[dev-dependencies]
+jamstream-engine.workspace = true
+jamstream-protocol.workspace = true
+
 # Target-gated so server/wasm builds never pull platform audio stacks.
 # macOS: CoreAudio. Windows: WASAPI exclusive mode driven directly through
 # the `wasapi` crate, with cpal kept as the shared-mode fallback path (see
