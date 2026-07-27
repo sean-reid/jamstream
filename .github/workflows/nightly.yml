@@ -109,9 +109,18 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      # The harness has two wall-clock gates, and their budgets are
+      # calibrated on a developer laptop. ci.yml scales them for shared
+      # runners; this job runs the same tests and did not, so both were
+      # running at unscaled budgets here and would flake before they ever
+      # told us anything true. Same multiplier as ci.yml.
       - if: runner.os == 'macOS'
+        env:
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
         run: cargo test --locked --workspace
       - if: runner.os != 'macOS'
+        env:
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
         run: cargo test --locked --workspace --exclude jamstream-client
       - if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@v7
