@@ -2,9 +2,12 @@
 //! lives in `root_ui` on a plain `Ui` so egui_kittest drives the exact code
 //! the eframe window runs.
 
+use std::sync::Arc;
+
 use egui::{Context, Frame, Ui};
 
 use crate::demo::DemoRuntime;
+use crate::live::{AudioSettings, LiveRuntime};
 use crate::runtime::{ConnState, LevelsView, Runtime};
 use crate::screens::devices::{DeviceCatalog, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
@@ -41,27 +44,61 @@ pub struct JamApp {
     pub wizard: HostWizard,
     pub session: SessionScreen,
     pub runtime: Option<Box<dyn Runtime>>,
+    /// Concrete handle to the live runtime when one is active; device
+    /// changes go through it (the [`Runtime`] contract has no device
+    /// commands, by design: device setup is app plumbing, not session
+    /// state).
+    pub live: Option<Arc<LiveRuntime>>,
     pub settings_open: bool,
     /// A launch was requested; execute it on the next frame so the
     /// launching step paints first.
     launch_pending: bool,
+    /// Device selection last applied to the live runtime, as
+    /// (capture_idx, playback_idx, buffer_frames).
+    applied_audio: (usize, usize, u32),
 }
 
 impl JamApp {
     pub fn new() -> Self {
+        let devices = DevicesScreen::default();
+        let applied_audio = (
+            devices.capture_idx,
+            devices.playback_idx,
+            devices.buffer_frames,
+        );
         JamApp {
             theme: Theme::Dark,
             screen: Screen::Home,
             home: HomeScreen::default(),
             recent: RecentSession::load(),
-            devices: DevicesScreen::default(),
+            devices,
             catalog: DeviceCatalog::demo(),
             wizard: HostWizard::new(host::provider_rows_from_env()),
             session: SessionScreen::default(),
             runtime: None,
+            live: None,
             settings_open: false,
             launch_pending: false,
+            applied_audio,
         }
+    }
+
+    /// The production entry point: like [`new`](Self::new) but with the
+    /// device pickers fed from the platform audio backend instead of the
+    /// demo catalog.
+    pub fn with_system_devices() -> Self {
+        let mut app = Self::new();
+        match jamstream_audio_io::backend().devices() {
+            Ok(devices) => app.catalog = DeviceCatalog::from_backend(&devices),
+            Err(err) => {
+                tracing::warn!(%err, "device enumeration failed");
+                app.catalog = DeviceCatalog {
+                    capture: Vec::new(),
+                    playback: Vec::new(),
+                };
+            }
+        }
+        app
     }
 
     /// `--demo`: straight into a live fake session as the host.
@@ -70,6 +107,23 @@ impl JamApp {
         app.runtime = Some(Box::new(DemoRuntime::host()));
         app.screen = Screen::Session;
         app
+    }
+
+    /// The device and buffer selection as the live runtime consumes it.
+    fn audio_settings(&self) -> AudioSettings {
+        AudioSettings {
+            capture_id: self
+                .catalog
+                .capture
+                .get(self.devices.capture_idx)
+                .and_then(|d| d.id.clone()),
+            playback_id: self
+                .catalog
+                .playback
+                .get(self.devices.playback_idx)
+                .and_then(|d| d.id.clone()),
+            buffer_frames: self.devices.buffer_frames,
+        }
     }
 
     pub fn root_ui(&mut self, ui: &mut Ui) {
@@ -101,13 +155,22 @@ impl JamApp {
             Screen::Home => {
                 if let Some(action) = self.home.ui(ui, &self.recent) {
                     match action {
-                        HomeAction::Join(_invite) => {
-                            // Real joining lands with the networking pass;
-                            // a valid invite opens the demo session so the
-                            // whole surface is walkable today.
-                            self.runtime = Some(Box::new(DemoRuntime::musician()));
-                            self.session = SessionScreen::default();
-                            self.screen = Screen::Session;
+                        HomeAction::Join(invite) => {
+                            let settings = self.audio_settings();
+                            match LiveRuntime::join(
+                                &invite,
+                                settings,
+                                jamstream_audio_io::backend(),
+                            ) {
+                                Ok(rt) => {
+                                    let rt = Arc::new(rt);
+                                    self.live = Some(Arc::clone(&rt));
+                                    self.runtime = Some(Box::new(rt));
+                                    self.session = SessionScreen::default();
+                                    self.screen = Screen::Session;
+                                }
+                                Err(err) => self.home.error = Some(err.to_string()),
+                            }
                         }
                         HomeAction::Host => {
                             self.wizard = HostWizard::new(host::provider_rows_from_env());
@@ -141,12 +204,28 @@ impl JamApp {
                     let snap = rt.snapshot();
                     if let Some(SessionEvent::Left) = self.session.ui(ui, &snap, rt) {
                         self.runtime = None;
+                        self.live = None;
                         self.recent = RecentSession::load();
                         self.screen = Screen::Home;
                     }
                 } else {
                     self.screen = Screen::Home;
                 }
+            }
+        }
+
+        // Device picks apply immediately: mid-session the live runtime
+        // reopens its stream, otherwise the selection just waits for the
+        // next join.
+        let selected = (
+            self.devices.capture_idx,
+            self.devices.playback_idx,
+            self.devices.buffer_frames,
+        );
+        if selected != self.applied_audio {
+            self.applied_audio = selected;
+            if let Some(live) = &self.live {
+                live.reconfigure_audio(self.audio_settings());
             }
         }
     }
@@ -238,6 +317,7 @@ impl eframe::App for JamApp {
             && matches!(rt.snapshot().stats.state, ConnState::Idle)
         {
             self.runtime = None;
+            self.live = None;
             self.screen = Screen::Home;
         }
     }

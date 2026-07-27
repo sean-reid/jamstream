@@ -2681,12 +2681,16 @@ dependencies = [
  "egui",
  "egui_extras",
  "egui_kittest",
+ "hound",
+ "jamstream-audio-io",
  "jamstream-cli",
  "jamstream-cloud",
  "jamstream-protocol",
+ "jamstream-server",
  "jamstream-session",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 

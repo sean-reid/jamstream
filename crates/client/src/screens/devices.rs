@@ -1,6 +1,6 @@
-//! Audio device setup. Enumeration is fed in through [`DeviceCatalog`];
-//! real device discovery arrives with the audio pass, the demo lists two
-//! fake devices per direction.
+//! Audio device setup. Enumeration is fed in through [`DeviceCatalog`]:
+//! the production app fills it from the platform backend, the demo and
+//! the UI tests list two fake devices per direction.
 
 use egui::{ComboBox, Ui, vec2};
 
@@ -11,6 +11,8 @@ use crate::widgets::{Meter, meter, pick_row};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub name: String,
+    /// Backend device id; `None` means the system default (demo entries).
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,10 +25,33 @@ impl DeviceCatalog {
     pub fn demo() -> Self {
         let dev = |name: &str| DeviceInfo {
             name: name.to_owned(),
+            id: None,
         };
         DeviceCatalog {
             capture: vec![dev("Scarlett 2i2 input"), dev("Built-in microphone")],
             playback: vec![dev("Scarlett 2i2 output"), dev("Built-in speakers")],
+        }
+    }
+
+    /// Real enumeration, defaults listed first so index 0 is the device a
+    /// fresh install uses.
+    pub fn from_backend(devices: &[jamstream_audio_io::DeviceInfo]) -> Self {
+        let pick = |direction| {
+            let mut rows: Vec<&jamstream_audio_io::DeviceInfo> = devices
+                .iter()
+                .filter(|d| d.direction == direction)
+                .collect();
+            rows.sort_by_key(|d| !d.is_default);
+            rows.into_iter()
+                .map(|d| DeviceInfo {
+                    name: d.name.clone(),
+                    id: Some(d.id.clone()),
+                })
+                .collect()
+        };
+        DeviceCatalog {
+            capture: pick(jamstream_audio_io::Direction::Capture),
+            playback: pick(jamstream_audio_io::Direction::Playback),
         }
     }
 }

@@ -16,7 +16,11 @@ fn main() -> eframe::Result {
         "jamstream",
         options,
         Box::new(move |_cc| {
-            let app = if demo { JamApp::demo() } else { JamApp::new() };
+            let app = if demo {
+                JamApp::demo()
+            } else {
+                JamApp::with_system_devices()
+            };
             Ok(Box::new(app))
         }),
     )

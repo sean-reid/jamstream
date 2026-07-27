@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 jamstream-protocol.workspace = true
 jamstream-session.workspace = true
+jamstream-audio-io.workspace = true
 jamstream-cloud.workspace = true
 jamstream-cli.workspace = true
 eframe.workspace = true
@@ -30,3 +31,6 @@ dirs.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true
+jamstream-server.workspace = true
+hound.workspace = true
+tokio.workspace = true
