@@ -2,7 +2,7 @@
 //! every configured provider on every app and CLI launch.
 
 use crate::provider::{Provider, ProviderError};
-use crate::types::Instance;
+use crate::types::{Instance, ProviderKind};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum SweepFilter {
@@ -30,6 +30,11 @@ pub struct SweepReport {
     pub found: Vec<Instance>,
     pub destroyed: Vec<Instance>,
     pub failed: Vec<(Instance, ProviderError)>,
+    /// Providers that could not be listed at all. Nothing can be attached
+    /// to an instance here, and that is exactly why it is reported: a
+    /// provider whose listing fails is a provider whose strays were never
+    /// looked for, and a sweep that says nothing about it reads as clean.
+    pub unswept: Vec<(ProviderKind, ProviderError)>,
     /// Per-session firewalls with no instance left behind them, deleted on
     /// the way past. AWS will not delete a security group until the
     /// terminating instance's network interface is gone, so a group that was
@@ -39,7 +44,7 @@ pub struct SweepReport {
 
 impl SweepReport {
     pub fn is_clean(&self) -> bool {
-        self.failed.is_empty()
+        self.failed.is_empty() && self.unswept.is_empty()
     }
 }
 
@@ -53,9 +58,12 @@ pub async fn sweep(
         let instances = match p.list_tagged(None).await {
             Ok(v) => v,
             Err(e) => {
-                // Nothing to attach a failure to; surface it and move on so
-                // one broken provider never blocks sweeping the others.
+                // Carry on with the others, but say so: the promise at the
+                // top of this file is that nothing tagged jamstream keeps
+                // billing, and a provider that could not be listed is one
+                // this sweep cannot make that promise about.
                 tracing::warn!(provider = p.kind().as_str(), error = %e, "sweep list failed");
+                report.unswept.push((p.kind(), e));
                 continue;
             }
         };
@@ -98,7 +106,7 @@ pub async fn sweep(
 mod tests {
     use super::*;
     use crate::mock::MockProvider;
-    use crate::types::{InstanceClass, LaunchSpec, ProviderKind, session_tag};
+    use crate::types::{InstanceClass, LaunchSpec, session_tag};
 
     fn seeded(kind: ProviderKind, sessions: &[&str]) -> MockProvider {
         let p = MockProvider::with_default_regions(kind);
@@ -182,6 +190,27 @@ mod tests {
         let left = providers[0].list_tagged(None).await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].session_id(), Some("live"));
+    }
+
+    /// A provider whose listing fails was never searched, so a report that
+    /// called that clean would tell a host their account is empty when
+    /// nobody looked. The other providers are still swept.
+    #[tokio::test]
+    async fn a_provider_that_cannot_be_listed_is_reported_not_skipped() {
+        let broken = seeded(ProviderKind::Local, &["s1"]);
+        broken.fail_next_lists(1, ProviderError::Other("registry is corrupt".to_owned()));
+        let working = seeded(ProviderKind::Aws, &["s2"]);
+        let providers: Vec<Box<dyn Provider>> = vec![Box::new(broken), Box::new(working)];
+
+        let report = sweep(&providers, SweepFilter::All, false).await;
+        assert_eq!(report.destroyed.len(), 1, "the working provider is swept");
+        assert_eq!(report.destroyed[0].session_id(), Some("s2"));
+        assert_eq!(report.unswept.len(), 1);
+        assert_eq!(report.unswept[0].0, ProviderKind::Local);
+        assert!(
+            !report.is_clean(),
+            "a sweep that missed a provider is not clean"
+        );
     }
 
     #[tokio::test]
