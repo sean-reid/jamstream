@@ -19,7 +19,7 @@ Total (estimate)                                  $0.08037
 Line by line:
 
 - **VM** is the machine's hourly price times your expected length, set on the preview step (`--hours` in the CLI). The price is fetched live from the provider where possible (DigitalOcean's sizes API) and from a bundled snapshot of public pricing otherwise, so the preview tracks reality and the numbers in this documentation are the approximations.
-- **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Each musician's personal mix streams down at about 300 kbit/s, each listener at about 150 kbit/s. Four musicians for three hours is about 1.6 GB.
+- **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Each musician's personal mix streams down at about 300 kbit/s, each listener at about 150 kbit/s, and each broadcast destination at 2628 kbit/s. Four musicians for three hours is about 1.6 GB; add a Twitch or YouTube destination and it is about 5.2 GB.
 - **Included egress credit** appears when the provider bundles free transfer that covers some or all of the estimate. DigitalOcean droplets include thousands of GiB; AWS accounts include 100 GB per month; GCP includes close to nothing.
 
 The expected length only shapes the estimate. The real bill is metered: elapsed time times the hourly rate, plus measured traffic. Play four hours after previewing three and you pay for four.
@@ -27,6 +27,8 @@ The expected length only shapes the estimate. The real bill is metered: elapsed 
 ## What egress is
 
 Cloud providers charge for data leaving their network, per gigabyte, and call it egress. Inbound is free. For JamStream that outbound data is the mixes the server sends to each member, so egress scales with people and hours, not with how loud you play. At DigitalOcean and AWS the included allowances mean a normal session's egress costs $0. On GCP it is real money but small: about $0.06 per musician per three hours.
+
+Broadcasting is the exception: one Twitch or YouTube destination is about 1.2 GB per hour, more than four musicians' audio combined. Two of them for three hours is about 7 GB, still inside DigitalOcean's and AWS's allowances, and about $0.80 on GCP. See [Streaming to Twitch and YouTube](streaming.md).
 
 ## The guardrails
 
