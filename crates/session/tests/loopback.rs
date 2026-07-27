@@ -1664,6 +1664,47 @@ fn musician_capacity_enforced() {
     );
 }
 
+/// The listener half of the same rule, which the server enforced with
+/// nothing holding it to it. It also pins the two caps as separate counters:
+/// a sold-out gallery must not cost the band a seat, which is the failure a
+/// single shared count would produce.
+#[test]
+fn listener_capacity_enforced() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let host = h.mint(0, Role::Musician);
+    h.add_client(&host, Some(0.0));
+    let over_cap = MAX_LISTENERS + 1;
+    let invites: Vec<Invite> = (0..over_cap as u16)
+        .map(|i| h.mint(100 + i, Role::Listener))
+        .collect();
+    for inv in &invites {
+        h.add_client(inv, None);
+    }
+    h.run_ms(500);
+
+    assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
+    let joined = h
+        .clients
+        .iter()
+        .filter(|c| c.role == Role::Listener && *c.core.state() == ClientState::Joined)
+        .count();
+    assert_eq!(joined, MAX_LISTENERS);
+    // Silent refusal, as for musicians: the over-cap listener keeps retrying
+    // until its own connection timeout, indistinguishable from packet loss.
+    assert_eq!(
+        *h.clients[1 + MAX_LISTENERS].core.state(),
+        ClientState::Connecting
+    );
+
+    // A full gallery leaves the band's seats alone.
+    let late = h.mint(1, Role::Musician);
+    let i = h.add_client(&late, Some(0.0));
+    h.run_ms(500);
+    assert_eq!(*h.clients[i].core.state(), ClientState::Joined);
+    assert_eq!(h.server.musicians_connected(), 2);
+    assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
+}
+
 /// Not a gate, a measurement:
 /// `cargo test -p jamstream-session --release --test loopback -- --ignored
 /// --nocapture tick_cost_at_capacity`. Release matters: the test profile's
