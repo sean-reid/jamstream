@@ -267,8 +267,8 @@ fn print_event<W: Write>(out: &mut W, event: &ClientEvent) -> std::io::Result<()
         ClientEvent::TimedOut => writeln!(out, "timed out"),
         // Once a second; too chatty for line output.
         ClientEvent::RttSample { .. } => Ok(()),
-        // Mixer mirroring is a UI concern; line output ignores it.
-        ClientEvent::BroadcastMixChanged { .. } => Ok(()),
+        // Mixer mirroring and avatars are UI concerns; line output ignores them.
+        ClientEvent::BroadcastMixChanged { .. } | ClientEvent::AvatarReady { .. } => Ok(()),
     }
 }
 
