@@ -12,7 +12,7 @@ When you host on a cloud provider, your computer asks it for one small Linux VM 
 4. closes its firewall down to the one UDP session port and cuts off the cloud's metadata service;
 5. starts serving.
 
-Your CLI then performs a full encrypted handshake against it before printing invites, so a session is never announced that cannot actually be joined.
+The hosting app or CLI then performs a full encrypted handshake against it before showing any invite, so a session is never announced that cannot actually be joined.
 
 From its first second the machine is under a dead man's switch: with no musicians connected for the idle window (default 10 minutes) it destroys itself, and at the hard cap (default 12 hours) it is destroyed regardless, enforced by the machine and the provider rather than by your laptop. Ending the session destroys it immediately. Every machine is tagged, and `jamstream sweep` destroys anything tagged that somehow survives. Nothing about a session persists in the cloud after it ends.
 

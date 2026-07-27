@@ -1,23 +1,9 @@
 # Download
 
 
+Most people want the desktop app: pick your platform below, download it, open it, and you can host and join sessions with nothing else installed, because every app build bundles its own `jamstreamd` session server. The `jamstream` CLI, for terminals and automation, installs in one line at the [bottom of this page](#install-the-cli-in-one-line).
+
 Every link on this page points at the latest release by a stable name, so a new release updates them all in place. All artifacts are listed on the [releases page](https://github.com/sean-reid/jamstream/releases/latest), and each release includes a [SHA256SUMS](https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS) file for verifying downloads. Building from source also works on every platform: clone [the repository](https://github.com/sean-reid/jamstream) and run `cargo install --path crates/cli`.
-
-## Install the CLI in one line
-
-On macOS and Linux:
-
-```console
-$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
-```
-
-The script detects your platform, downloads the matching archive, verifies its sha256 against `SHA256SUMS`, and installs `jamstream` to `/usr/local/bin` when that is writable, otherwise to `~/.local/bin`. Set `JAMSTREAM_INSTALL_DIR` to pick the directory yourself. Appending `-s -- --with-server` also installs the `jamstreamd` session server on Linux x86_64, which [local mode](guides/local.md) uses.
-
-On Windows:
-
-```console
-> powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
-```
 
 ## macOS
 
@@ -66,4 +52,20 @@ Verify a download against the release checksums:
 $ curl -fsSLO https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS
 $ sha256sum --check --ignore-missing SHA256SUMS
 jamstream-cli-linux-x86_64.tar.gz: OK
+```
+
+## Install the CLI in one line
+
+The CLI suits scripts, automation, and machines without a display; the [CLI reference](cli/index.md) documents every command. On macOS and Linux:
+
+```console
+$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
+```
+
+The script detects your platform, downloads the matching archive, verifies its sha256 against `SHA256SUMS`, and installs `jamstream` to `/usr/local/bin` when that is writable, otherwise to `~/.local/bin`. Set `JAMSTREAM_INSTALL_DIR` to pick the directory yourself. Appending `-s -- --with-server` also installs the `jamstreamd` session server on Linux x86_64, which [local mode](guides/local.md) with the CLI alone uses.
+
+On Windows:
+
+```console
+> powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
 ```

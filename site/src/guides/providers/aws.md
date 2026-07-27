@@ -65,20 +65,21 @@ A key with this policy can manage EC2 instances and read one public parameter, a
 2. When asked for a use case, choose **Command Line Interface (CLI)** and confirm.
 3. On the final page, copy both values or download the CSV; the secret is shown once.
 
-## 4. Put the keys in your environment
+## 4. Connect the app
+
+In the host wizard, select **aws**; while no credentials are saved the row reads `setup needed` and the Connect AWS pane opens, with **Open the IAM console** landing on the users page. Paste both values, the access key id and the secret access key, and click **Check credentials**. The app authenticates against the API with the pasted keys, and only a passing check saves them: the pane says "Works. Saved to your keychain." and the row flips to `ready`. A failure is shown verbatim, and nothing is stored.
+
+The keys live in your system keychain from then on. You are ready to host; continue with the [quickstart](../../quickstart.md#host-on-the-internet-with-digitalocean), picking aws in the wizard instead.
+
+## For the CLI and automation
+
+The CLI reads the keys from the environment instead:
 
 ```console
 $ export AWS_ACCESS_KEY_ID=AKIA...
 $ export AWS_SECRET_ACCESS_KEY=your_secret_here
-```
-
-JamStream reads exactly these two variables; it does not read `~/.aws/config` profiles in the current build.
-
-## 5. Verify
-
-```console
 $ jamstream sweep --dry-run --provider aws
 No jamstream-tagged instances found.
 ```
 
-That output means the key authenticates and can list instances. Continue with the [quickstart](../../quickstart.md#host), swapping `--provider digitalocean` for `--provider aws`.
+That output means the key authenticates and can list instances. JamStream reads exactly these two variables; it does not read `~/.aws/config` profiles in the current build. The app reads the same variables as a silent fallback, so a machine set up this way is `ready` in the wizard with nothing pasted.
