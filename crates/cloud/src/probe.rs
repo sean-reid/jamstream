@@ -75,7 +75,7 @@ pub async fn probe_all(targets: &[ProbeTarget]) -> HashMap<RegionId, f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpSocket};
 
     #[test]
     fn catalog_parses_and_covers_all_providers() {
@@ -123,13 +123,41 @@ mod tests {
         assert!((0.0..1000.0).contains(&rtt), "loopback rtt was {rtt} ms");
     }
 
+    /// A port that refuses connections for as long as the returned socket is
+    /// held. Bound but never listened on, so a SYN draws RST while the port
+    /// stays reserved.
+    ///
+    /// Binding a listener and dropping it, which is what this used to do,
+    /// hands the port straight back to the kernel, and a sibling test in the
+    /// same binary can be given it before the probe runs. That is not
+    /// hypothetical: it failed exactly that way on main in run 30302091971,
+    /// reporting Some(0.039103) where the closed port should have been None.
+    fn reserved_closed_port() -> (TcpSocket, u16) {
+        let socket = TcpSocket::new_v4().expect("v4 socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("loopback addr"))
+            .expect("bind ephemeral");
+        let port = socket.local_addr().expect("local addr").port();
+        (socket, port)
+    }
+
     #[tokio::test]
     async fn probe_closed_port_returns_none() {
-        // Bind then drop to get a port that is very likely closed.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let (_held, port) = reserved_closed_port();
         assert_eq!(probe_target("127.0.0.1", port).await, None);
+    }
+
+    /// The property the fix rests on, asserted rather than assumed: while the
+    /// socket is held the kernel will not hand that port to anyone else, so a
+    /// sibling test cannot take it and start answering.
+    #[tokio::test]
+    async fn a_reserved_closed_port_cannot_be_taken_by_anyone_else() {
+        let (_held, port) = reserved_closed_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        assert!(
+            TcpListener::bind(addr).await.is_err(),
+            "port {port} was rebindable while held, so the probe could race a listener"
+        );
     }
 
     #[tokio::test]
@@ -141,9 +169,7 @@ mod tests {
                 let _ = listener.accept().await;
             }
         });
-        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_port = closed.local_addr().unwrap().port();
-        drop(closed);
+        let (_closed_held, closed_port) = reserved_closed_port();
 
         let targets = vec![
             ProbeTarget {
