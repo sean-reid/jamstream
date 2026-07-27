@@ -92,18 +92,9 @@
 //!
 //! # File permissions
 //!
-//! The per-session config carries the server's private key, so unix writes
-//! it (and the registry) 0600. Windows has no mode bits: a new file gets
-//! the inheritable ACEs of the directory it lands in. Under the default
-//! state dir (`%LOCALAPPDATA%\jamstream`) those come from the user profile
-//! and are the user, SYSTEM, and Administrators, so no other account can
-//! read the key - but that is the default, not a guarantee.
-//! `JAMSTREAM_STATE_DIR` can point anywhere, and a directory created under
-//! `C:\` inherits `Authenticated Users: Modify` from the volume root,
-//! which would leave the key readable by every account on the machine.
-//! Every directory this provider creates is therefore tightened once, at
-//! creation, with `icacls` (`harden_new_dir`); pre-existing directories
-//! are left alone.
+//! The per-session config carries the server's private key and the registry
+//! decides what gets signalled, so both go through [`crate::private`],
+//! which is also what the CLI writes its own session records with.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -115,6 +106,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::private::{create_private_dir, write_private};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
     IngressRule, Instance, LaunchSpec, Price, ProviderKind, Region, RegionId, session_tag,
@@ -636,128 +628,6 @@ fn clear_shutdown_files(session_dir: &Path) {
             }
         }
     }
-}
-
-/// Creates or truncates `path` with owner-only permissions: 0600 on unix.
-/// Windows has no mode bits, so the file takes the inheritable ACEs of its
-/// directory instead, which is why the directories this provider creates
-/// are hardened at creation (see [`harden_new_dir`]).
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(bytes)
-}
-
-/// `create_dir_all` that hands every directory it actually creates to
-/// [`harden_new_dir`]. Directories that already exist are untouched: the
-/// state dir may be a path the user chose and shares on purpose, and
-/// silently rewriting an existing ACL is not ours to do.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    if dir.as_os_str().is_empty() || dir.is_dir() {
-        return Ok(());
-    }
-    if let Some(parent) = dir.parent() {
-        create_private_dir(parent)?;
-    }
-    match std::fs::create_dir(dir) {
-        Ok(()) => {
-            harden_new_dir(dir);
-            Ok(())
-        }
-        // Lost a race with another process; its directory is fine.
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(not(windows))]
-fn harden_new_dir(_dir: &Path) {}
-
-/// Drops the multi-account groups from a freshly created directory, so the
-/// per-session config (which carries the server's private key) is not
-/// readable by every account on the machine just because the state dir was
-/// pointed somewhere permissive. Under the default `%LOCALAPPDATA%` path
-/// there is nothing to remove and this is a no-op in effect; it earns its
-/// keep for a `JAMSTREAM_STATE_DIR` under `C:\` or another shared root.
-///
-/// Two `icacls` passes, because `/remove:g` cannot touch an inherited ACE:
-///
-/// 1. `/inheritance:d` copies the inherited ACEs into the directory's own
-///    ACL, and `/grant:r` pins this account's full control so pass 2 can
-///    never delete the last entry that lets us read our own state.
-/// 2. `/remove:g` drops the multi-account groups a directory outside the
-///    user profile can inherit (Everyone, Authenticated Users, Users,
-///    Anonymous), addressed by well-known SID because the display names
-///    are localized.
-///
-/// Limits, deliberately:
-///
-/// * SYSTEM and Administrators keep their access, which is not a boundary
-///   anyone can enforce anyway (an administrator can take ownership);
-/// * an individual *other* account explicitly granted access on the parent
-///   keeps it - only the four groups above are removed;
-/// * the `(OI)(CI)` grant covers files created here afterwards, which is
-///   all of them, since the directory is new;
-/// * a volume without ACLs (FAT/exFAT) has nothing to tighten, `icacls`
-///   fails there, and we only log it;
-/// * the registry (`local.json`) sits in the state dir, so it is only
-///   covered when the state dir is one we created - it holds pids and
-///   session ids, no key material;
-/// * and this is an external command rather than a DACL passed to
-///   CreateFile, which is the correct fix and needs a windows-sys
-///   dependency we are not taking on for this.
-#[cfg(windows)]
-fn harden_new_dir(dir: &Path) {
-    let Some(user) = std::env::var_os("USERNAME").filter(|u| !u.is_empty()) else {
-        tracing::warn!(
-            dir = %dir.display(),
-            "USERNAME is unset, leaving the directory ACL inherited: a state dir outside \
-             the user profile may be readable by other accounts"
-        );
-        return;
-    };
-    let grant = format!("{}:(OI)(CI)F", user.to_string_lossy());
-    let icacls = |args: &[&std::ffi::OsStr]| -> bool {
-        match Command::new("icacls").args(args).output() {
-            Ok(out) if out.status.success() => true,
-            Ok(out) => {
-                tracing::warn!(
-                    dir = %dir.display(),
-                    status = ?out.status.code(),
-                    output = %String::from_utf8_lossy(&out.stderr).trim(),
-                    "icacls did not tighten the directory ACL"
-                );
-                false
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "cannot run icacls; directory ACL left inherited");
-                false
-            }
-        }
-    };
-    let o = std::ffi::OsStr::new;
-    let target = dir.as_os_str();
-    if !icacls(&[target, o("/inheritance:d"), o("/grant:r"), o(&grant)]) {
-        return;
-    }
-    icacls(&[
-        target,
-        o("/remove:g"),
-        o("*S-1-1-0"), // Everyone
-        o("/remove:g"),
-        o("*S-1-5-11"), // Authenticated Users
-        o("/remove:g"),
-        o("*S-1-5-32-545"), // Users
-        o("/remove:g"),
-        o("*S-1-5-7"), // Anonymous Logon
-    ]);
 }
 
 fn find_on_path(bin: &str) -> Option<PathBuf> {
@@ -1580,21 +1450,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn private_dirs_are_created_recursively_and_idempotently() {
-        let root = temp_dir("privdir");
-        let nested = root.join("a").join("b").join("c");
-        create_private_dir(&nested).unwrap();
-        assert!(nested.is_dir());
-        // Second call is a no-op, not an error.
-        create_private_dir(&nested).unwrap();
-        // And the point of it all: a file written inside is ours to read.
-        let f = nested.join("config");
-        write_private(&f, b"server_private_key=...").unwrap();
-        assert_eq!(std::fs::read(&f).unwrap(), b"server_private_key=...");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// Unix liveness against the one process we know everything about:
     /// this test binary.
     #[cfg(unix)]
@@ -1778,34 +1633,6 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         assert!(!process::alive(pid, spawned(Some("cmd.exe"), 0)));
-    }
-
-    /// The ACL tightening must leave the directory usable by us: the worst
-    /// outcome of getting icacls wrong is locking the host out of its own
-    /// state. Also asserts inheritance is really broken, which is
-    /// locale-independent: icacls marks inherited entries `(I)`.
-    #[cfg(windows)]
-    #[test]
-    fn windows_new_dirs_lose_inherited_aces_and_stay_writable() {
-        let root = temp_dir("acl");
-        let dir = root.join("state").join("sessions").join("abc");
-        create_private_dir(&dir).unwrap();
-
-        let config = dir.join("config");
-        write_private(&config, b"server_private_key=secret").unwrap();
-        assert_eq!(
-            std::fs::read(&config).unwrap(),
-            b"server_private_key=secret"
-        );
-
-        let out = Command::new("icacls").arg(&dir).output().unwrap();
-        assert!(out.status.success(), "icacls query failed");
-        let acl = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(
-            !acl.contains("(I)"),
-            "inherited ACEs survived on a directory we created: {acl}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

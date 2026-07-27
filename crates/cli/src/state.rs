@@ -1,8 +1,10 @@
 //! On-disk session records. One JSON file per session under the state
-//! directory, mode 0600 on unix because it holds the issuer private key.
+//! directory, written through [`jamstream_cloud::private`] because it holds
+//! the issuer private key.
 
 use std::path::{Path, PathBuf};
 
+use jamstream_cloud::private::{create_private_dir, write_private};
 use serde::{Deserialize, Serialize};
 
 use crate::CliError;
@@ -42,48 +44,57 @@ pub struct SessionState {
     pub ended_unix: Option<u64>,
 }
 
-pub fn state_dir() -> PathBuf {
+/// Where session records live: [`STATE_DIR_ENV`] when set, else a
+/// `sessions` directory under the platform data directory.
+pub fn state_dir() -> Result<PathBuf, CliError> {
     if let Some(dir) = std::env::var_os(STATE_DIR_ENV) {
-        return PathBuf::from(dir);
+        return Ok(PathBuf::from(dir));
     }
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("jamstream")
-        .join("sessions")
+    Ok(data_dir()?.join("sessions"))
 }
 
-pub fn path_for(session_id_hex: &str) -> PathBuf {
-    state_dir().join(format!("{session_id_hex}.json"))
+/// `<platform data dir>/jamstream`, the root of everything this machine
+/// keeps about its sessions. The local provider's registry and per-session
+/// server configs live here too.
+///
+/// There is no fallback: these files hold the issuer private key and the
+/// server's, and the temp directory is somewhere every account on the
+/// machine can write.
+pub fn data_dir() -> Result<PathBuf, CliError> {
+    resolve_data_dir(dirs::data_local_dir())
+}
+
+fn resolve_data_dir(platform: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    platform.map(|dir| dir.join("jamstream")).ok_or_else(|| {
+        CliError::Usage(format!(
+            "no private directory to keep session keys in: this environment has no \
+             platform data directory (on unix that means HOME is unset or not absolute, \
+             which is common under systemd, cron, and some sudo configurations). \
+             Set HOME, or set {STATE_DIR_ENV} to a directory only you can write."
+        ))
+    })
+}
+
+pub fn path_for(session_id_hex: &str) -> Result<PathBuf, CliError> {
+    Ok(state_dir()?.join(format!("{session_id_hex}.json")))
 }
 
 /// Writes to the canonical location for the session id. Returns the path.
 pub fn save(state: &SessionState) -> Result<PathBuf, CliError> {
-    let path = path_for(&state.session_id_hex);
+    let path = path_for(&state.session_id_hex)?;
     write_to(&path, state)?;
     Ok(path)
 }
 
 pub fn write_to(path: &Path, state: &SessionState) -> Result<(), CliError> {
-    use std::io::Write as _;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
     }
     let json = serde_json::to_string_pretty(state)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    // mode() only applies at create time; enforce on rewrites too.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(json.as_bytes())?;
+    // Replaces the file rather than truncating it: a torn write here loses
+    // the issuer key and the session with it, while `list` silently skips
+    // what it cannot decode and the VM keeps billing.
+    write_private(path, json.as_bytes())?;
     Ok(())
 }
 
@@ -94,7 +105,7 @@ pub fn load(path: &Path) -> Result<SessionState, CliError> {
 /// Every readable state file, oldest first. A missing directory is an
 /// empty list, not an error.
 pub fn list() -> Result<Vec<(PathBuf, SessionState)>, CliError> {
-    let dir = state_dir();
+    let dir = state_dir()?;
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -183,6 +194,26 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The whole point of #49: with no platform data directory the records
+    /// used to land in the temp directory, so the issuer private key sat at
+    /// a fully predictable path in a place every account can write.
+    #[test]
+    fn no_data_directory_is_an_error_not_a_detour_through_tmp() {
+        let err = resolve_data_dir(None).unwrap_err().to_string();
+        assert!(err.contains(STATE_DIR_ENV), "error was: {err}");
+        let tmp = std::env::temp_dir();
+        assert!(
+            !err.contains(&tmp.display().to_string()),
+            "the temp directory must not be offered as a fallback: {err}"
+        );
+        // And with one, it is that directory and nothing invented.
+        let home = PathBuf::from("/home/someone/.local/share");
+        assert_eq!(
+            resolve_data_dir(Some(home.clone())).unwrap(),
+            home.join("jamstream")
+        );
     }
 
     #[test]
