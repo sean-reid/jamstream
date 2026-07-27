@@ -45,6 +45,9 @@ fn resolve_artifact(
     pinned: Option<jamstream_cloud::PinnedServerArtifact>,
 ) -> Result<(String, String), CliError> {
     if let (Some(url), Some(sha)) = (url_flag, sha_flag) {
+        // Checked here rather than on the VM, where a bad pair costs a
+        // launch, a boot, and a self-destruct before anyone hears about it.
+        jamstream_cloud::validate_pair(url, sha).map_err(CliError::Usage)?;
         return Ok((url.to_owned(), sha.to_owned()));
     }
     if !needs_download {
@@ -675,6 +678,36 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("not a release build"), "error was: {text}");
         assert!(text.contains("--artifact-url"), "error was: {text}");
+    }
+
+    /// The overrides are the one part of the VM's root bootstrap a user
+    /// types, so they are checked before a machine is paid for.
+    #[test]
+    fn artifact_overrides_are_validated_before_anything_launches() {
+        let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        for (url, sha, what) in [
+            ("http://own.example/jamstreamd", sha, "https"),
+            ("https://own.example/a\";id;\"", sha, "url"),
+            ("https://own.example/jamstreamd", "abcd", "64 hex digits"),
+        ] {
+            let err = resolve_artifact(true, Some(url), Some(sha), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(what), "{url} {sha} was rejected as {err:?}");
+        }
+        // A valid pair still passes through untouched, on a local launch
+        // as well as a cloud one.
+        for needs_download in [true, false] {
+            let (url, out_sha) = resolve_artifact(
+                needs_download,
+                Some("https://own.example/d"),
+                Some(sha),
+                None,
+            )
+            .unwrap();
+            assert_eq!(url, "https://own.example/d");
+            assert_eq!(out_sha, sha);
+        }
     }
 
     #[test]

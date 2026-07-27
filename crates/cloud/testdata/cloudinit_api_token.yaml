@@ -10,6 +10,16 @@ write_files:
       issuer_public_key_b64 = aXNzdWVyLXB1YmxpYy1rZXk=
       idle_shutdown_min = 10
       max_duration_min = 720
+  - path: /etc/jamstream/artifact-url
+    owner: root:root
+    permissions: "0644"
+    content: |
+      https://github.com/sean-reid/jamstream/releases/download/v0.1.0/jamstreamd-x86_64-unknown-linux-musl
+  - path: /etc/jamstream/artifact-sha256
+    owner: root:root
+    permissions: "0644"
+    content: |
+      0f2e5c1d3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d  /usr/local/bin/jamstreamd.download
   - path: /usr/local/sbin/jamstream-self-destruct
     owner: root:root
     permissions: "0700"
@@ -174,8 +184,10 @@ write_files:
       systemctl enable --now jamstream-firewall.service
       systemctl enable --now jamstream-guard.timer
 
-      curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download "https://github.com/sean-reid/jamstream/releases/download/v0.1.0/jamstreamd-x86_64-unknown-linux-musl"
-      if ! echo "0f2e5c1d3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d  /usr/local/bin/jamstreamd.download" | sha256sum -c -; then
+      # The url and the expected hash are read from files rather than pasted
+      # into this script, so neither can be anything but an argument.
+      curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download "$(cat /etc/jamstream/artifact-url)"
+      if ! sha256sum -c /etc/jamstream/artifact-sha256; then
         echo "jamstream: artifact sha256 mismatch, refusing to start" >&2
         rm -f /usr/local/bin/jamstreamd.download
         exit 1

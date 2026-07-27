@@ -52,9 +52,51 @@ pub fn pinned() -> Option<PinnedServerArtifact> {
     }
 }
 
-/// A usable pair: a non-empty URL and a sha256 of exactly 64 hex digits.
 fn is_valid_pair(url: &str, sha256: &str) -> bool {
-    !url.is_empty() && sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())
+    validate_pair(url, sha256).is_ok()
+}
+
+/// Checks an artifact pair, whether it came from the compile-time pin or
+/// from a caller. The error names the problem, because the CLI hands it
+/// straight to the user.
+///
+/// A sha256 is exactly 64 hex digits: anything else fails on the VM at
+/// `sha256sum -c`, an hour of nobody's time after the launch was paid for.
+///
+/// The URL must be https and must be made of URL characters. That rules
+/// out `"`, `$`, a backtick, and a backslash, which are the four a shell
+/// still reads inside a double-quoted string, and it leaves the query
+/// syntax a presigned URL needs. The bootstrap script no longer
+/// interpolates either value, but refusing the characters costs nothing
+/// and does not depend on that staying true. Plain http is refused as
+/// well: the hash would catch a rewritten download, but it catches it by
+/// destroying the VM, and nothing is gained by fetching the server over a
+/// channel anyone on the path can rewrite.
+pub fn validate_pair(url: &str, sha256: &str) -> Result<(), String> {
+    if !url.starts_with("https://") || url.len() <= "https://".len() {
+        return Err(format!(
+            "artifact url {url:?} must be an https:// address of a jamstreamd build"
+        ));
+    }
+    if let Some(bad) = url.chars().find(|c| !is_url_safe(*c)) {
+        return Err(format!(
+            "artifact url {url:?} contains {bad:?}, which is not valid in a url"
+        ));
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "artifact sha256 {sha256:?} must be 64 hex digits, and this one is {}",
+            sha256.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The unreserved and reserved characters a URL is made of (RFC 3986),
+/// which between them exclude quotes, backslashes, backticks, `$`, and
+/// every space and control character.
+fn is_url_safe(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~:/?#[]@!&'()*+,;=%".contains(c)
 }
 
 #[cfg(test)]
@@ -93,5 +135,39 @@ mod tests {
             "https://example.com/jamstreamd",
             &sha[..63] // one digit short
         ));
+    }
+
+    /// The pair is the one part of a root bootstrap script a caller
+    /// supplies, so it is checked before it goes anywhere near the VM. The
+    /// message is what the user sees.
+    #[test]
+    fn a_url_must_be_https_and_made_of_url_characters() {
+        let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        for bad in [
+            "http://example.com/jamstreamd",
+            "https://",
+            "file:///etc/passwd",
+            "example.com/jamstreamd",
+            // The shell characters that survive a double-quoted string.
+            "https://example.com/a\";id;\"",
+            "https://example.com/$(id)",
+            "https://example.com/`id`",
+            "https://example.com/a\\b",
+            "https://example.com/two words",
+            "https://example.com/a\nb",
+        ] {
+            let err = validate_pair(bad, sha).unwrap_err();
+            assert!(err.contains("url"), "{bad:?} was rejected as {err:?}");
+        }
+        // A presigned download is a normal thing to point this at, and its
+        // query syntax must survive.
+        validate_pair(
+            "https://bucket.s3.amazonaws.com/jamstreamd?X-Amz-Signature=ab%2Fcd&X-Amz-Expires=60",
+            sha,
+        )
+        .unwrap();
+        // The hash message says what was wrong with it.
+        let err = validate_pair("https://example.com/jamstreamd", "abc").unwrap_err();
+        assert!(err.contains("64 hex digits") && err.contains('3'), "{err}");
     }
 }
