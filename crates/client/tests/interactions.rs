@@ -39,6 +39,120 @@ fn session_harness(is_host: bool) -> (Recorder, Harness<'static>) {
     session_harness_sized(is_host, vec2(1280.0, 800.0))
 }
 
+/// A host with everything a host has: the invite book, the destinations
+/// sheet, and the broadcast view the runtime gives a host. All three status
+/// bar toggles come from those, so this is the widest the bar ever gets.
+fn host_harness_sized(size: egui::Vec2) -> Harness<'static> {
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    let rt_ui = rt.clone();
+    let mut screen = SessionScreen {
+        invites: Some(empty_invites()),
+        destinations: Some(DestinationsPanel::new(Arc::new(MemStore::default()))),
+        ..Default::default()
+    };
+    Harness::builder()
+        .with_size(size)
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        })
+}
+
+/// An invite book with no invites in it: enough for the toggle to render,
+/// which is all these layout tests need from it.
+fn empty_invites() -> jamstream_client::screens::invites::InvitesPanel {
+    let state = jamstream_cli::state::SessionState {
+        session_id_hex: "a3".repeat(16),
+        provider: "local".to_owned(),
+        region: "local".to_owned(),
+        instance_id: "12345".to_owned(),
+        address: "203.0.113.10:43210".to_owned(),
+        created_unix: 1_784_000_000,
+        hourly_microusd: 0,
+        issuer_private_key_b64: String::new(),
+        server_public_key_b64: String::new(),
+        invites: Vec::new(),
+        status: jamstream_cli::state::SessionStatus::Running,
+        ended_unix: None,
+    };
+    let path = std::env::temp_dir().join("jamstream-interaction-invites.json");
+    jamstream_client::screens::invites::InvitesPanel::new(state, path)
+}
+
+/// Every window size the app can be in: its 800x600 minimum, its default,
+/// and the widths on either side of the point where a host's status bar
+/// stops fitting on one row. The two short ones stand in for the minimum
+/// window less the shell these tests do not draw, the top bar and the
+/// window margins, so the mixer here gets what it gets in the app.
+const SIZES: [egui::Vec2; 8] = [
+    vec2(800.0, 600.0),
+    vec2(800.0, 540.0),
+    vec2(900.0, 470.0),
+    vec2(900.0, 600.0),
+    vec2(1000.0, 700.0),
+    vec2(1100.0, 700.0),
+    vec2(1150.0, 700.0),
+    vec2(1280.0, 800.0),
+];
+
+/// The bar may never overlap itself. A host's carries three sheet toggles,
+/// the lamp, the session id, the timer, the cost, and Leave beside the
+/// readouts, and the readouts drop their meters or move to a row of their
+/// own to keep clear of them.
+#[test]
+fn the_host_status_bar_never_runs_into_its_readouts() {
+    for size in SIZES {
+        let mut harness = host_harness_sized(size);
+        harness.run_steps(3);
+        let readout = harness
+            .get_all_by_label_contains("loss ")
+            .next()
+            .expect("the loss readout")
+            .rect();
+        for control in ["Stream mix", "Destinations", "Invites", "Leave"] {
+            let rect = harness.get_by_label(control).rect();
+            let clear = rect.left() >= readout.right() || rect.top() >= readout.bottom();
+            assert!(
+                clear,
+                "{control} at {rect:?} runs into the readouts at {readout:?}, window {size:?}"
+            );
+        }
+    }
+}
+
+/// The strip invariant behind #70: a fader's track and handle may never be
+/// drawn across the name or the portrait above it. The rows below a fader
+/// stack from the bottom edge upward, so a fader handed less room than it
+/// asked for used to take the difference out of the header.
+#[test]
+fn a_fader_never_crosses_the_name_above_it() {
+    for size in SIZES {
+        for host in [false, true] {
+            let mut harness = if host {
+                host_harness_sized(size)
+            } else {
+                session_harness_sized(false, size).1
+            };
+            harness.run_steps(3);
+            for member in ["Ana", "Ben", "Mira"] {
+                let fader = harness.get_by_label(&format!("{member} fader")).rect();
+                for name in harness.get_all_by_label(member) {
+                    let rect = name.rect();
+                    assert!(
+                        !rect.intersects(fader),
+                        "{member}'s name at {rect:?} sits inside its fader at {fader:?},                          window {size:?}, host {host}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn set_fader_commands(rt: &Recorder, member: u16) -> Vec<(f32, f32, bool)> {
     rt.commands()
         .into_iter()
