@@ -13,6 +13,11 @@ use crate::wire::CHANNEL_CONTROL;
 
 pub const MAX_CHAT_LEN: usize = 1_000;
 pub const MAX_NAME_LEN: usize = 64;
+/// Avatars are capped at 256 KB and identified by the Blake2s-256 of their
+/// bytes; the hash is the cache key on both ends.
+pub const MAX_AVATAR_BYTES: usize = 256 * 1024;
+/// Payload bytes per `AvatarChunk`. 32 chunks cover the largest avatar.
+pub const AVATAR_CHUNK_BYTES: usize = 8 * 1024;
 
 const RTO_INITIAL_MS: u64 = 100;
 const RTO_MAX_MS: u64 = 2_000;
@@ -24,6 +29,13 @@ pub struct MemberInfo {
     pub role: Role,
     pub name: String,
     pub connected: bool,
+    /// Blake2s-256 of the member's avatar bytes; None when unset. Trailing
+    /// field, but postcard encodes struct fields in order with no framing,
+    /// so old roster bytes lack the Option tag byte and fail to decode
+    /// (UnexpectedEnd) rather than misreading. That makes this a breaking
+    /// change to the roster encoding, accepted deliberately while protocol
+    /// version 1 is unreleased; no compat fixtures reference roster bytes.
+    pub avatar_hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,6 +109,28 @@ pub enum ControlMsg {
     BroadcastAudition {
         enabled: bool,
     },
+    /// Client to server: announce or replace this member's avatar by
+    /// content hash. The bytes follow only if the server asks for them.
+    /// Trailing variant, same postcard append-safety rule as Stats.
+    SetAvatar {
+        hash: [u8; 32],
+        len: u32,
+    },
+    /// One slice of avatar bytes, either direction. The control link is
+    /// ordered and reliable, so a train arrives as index 0..total in order;
+    /// every chunk except the last carries exactly `AVATAR_CHUNK_BYTES`.
+    AvatarChunk {
+        hash: [u8; 32],
+        index: u16,
+        total: u16,
+        data: Vec<u8>,
+    },
+    /// Ask the other side for avatar bytes: the server asks the owning
+    /// client when it lacks them, a client asks the server when a roster
+    /// entry carries an unknown hash.
+    AvatarRequest {
+        hash: [u8; 32],
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,6 +175,9 @@ impl ControlLink {
                 return Err(Error::Malformed);
             }
             ControlMsg::Bye { reason } if reason.len() > MAX_CHAT_LEN => {
+                return Err(Error::Malformed);
+            }
+            ControlMsg::AvatarChunk { data, .. } if data.len() > AVATAR_CHUNK_BYTES => {
                 return Err(Error::Malformed);
             }
             _ => {}
@@ -392,6 +429,87 @@ mod tests {
             a.send(m.clone()).unwrap();
         }
         assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
+    }
+
+    #[test]
+    fn avatar_messages_round_trip() {
+        let msgs = [
+            ControlMsg::SetAvatar {
+                hash: [7u8; 32],
+                len: 1_234,
+            },
+            ControlMsg::AvatarChunk {
+                hash: [7u8; 32],
+                index: 3,
+                total: 5,
+                data: vec![0xAB; AVATAR_CHUNK_BYTES],
+            },
+            ControlMsg::AvatarRequest { hash: [7u8; 32] },
+        ];
+        for m in &msgs {
+            let bytes = postcard::to_allocvec(m).unwrap();
+            let back: ControlMsg = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(&back, m);
+        }
+        let mut a = ControlLink::new();
+        let mut b = ControlLink::new();
+        for m in &msgs {
+            a.send(m.clone()).unwrap();
+        }
+        assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
+    }
+
+    #[test]
+    fn rejects_oversized_avatar_chunk() {
+        let mut a = ControlLink::new();
+        let big = ControlMsg::AvatarChunk {
+            hash: [0u8; 32],
+            index: 0,
+            total: 1,
+            data: vec![0; AVATAR_CHUNK_BYTES + 1],
+        };
+        assert!(a.send(big).is_err());
+    }
+
+    /// Pins what postcard actually does with the trailing Option added to
+    /// MemberInfo: old bytes are one byte short of the Option tag and fail
+    /// to decode instead of misreading. Breaking pre-release, by decision.
+    #[test]
+    fn member_info_trailing_option_changed_the_roster_encoding() {
+        #[derive(Serialize)]
+        struct OldMemberInfo {
+            id: MemberId,
+            role: Role,
+            name: String,
+            connected: bool,
+        }
+        let old = postcard::to_allocvec(&OldMemberInfo {
+            id: MemberId(3),
+            role: Role::Musician,
+            name: "ana".into(),
+            connected: true,
+        })
+        .unwrap();
+        assert!(postcard::from_bytes::<MemberInfo>(&old).is_err());
+
+        let unset = MemberInfo {
+            id: MemberId(3),
+            role: Role::Musician,
+            name: "ana".into(),
+            connected: true,
+            avatar_hash: None,
+        };
+        let bytes = postcard::to_allocvec(&unset).unwrap();
+        // None costs exactly the one tag byte the old encoding lacked.
+        assert_eq!(bytes.len(), old.len() + 1);
+        assert_eq!(postcard::from_bytes::<MemberInfo>(&bytes).unwrap(), unset);
+
+        let set = MemberInfo {
+            avatar_hash: Some([9u8; 32]),
+            ..unset
+        };
+        let bytes = postcard::to_allocvec(&set).unwrap();
+        assert_eq!(postcard::from_bytes::<MemberInfo>(&bytes).unwrap(), set);
     }
 
     #[test]

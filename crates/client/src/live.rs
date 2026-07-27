@@ -879,6 +879,7 @@ impl Worker {
                 // Broadcast mix state has no UI surface yet (M2).
                 ClientEvent::RttSample { .. }
                 | ClientEvent::BroadcastMixChanged { .. }
+                | ClientEvent::AvatarReady { .. }
                 | ClientEvent::Ejected { .. }
                 | ClientEvent::Rejected { .. }
                 | ClientEvent::TimedOut => {}
