@@ -59,11 +59,31 @@ impl IdleExit {
     }
 }
 
+/// The whole-session cap, pure like [`IdleExit`]: feed it elapsed-since-start
+/// once per heartbeat, it answers whether the server should exit. Occupancy
+/// is deliberately not an input: the cap ends the session even mid-jam.
+#[derive(Debug)]
+pub struct MaxDuration {
+    window: Duration,
+}
+
+impl MaxDuration {
+    pub fn new(window: Duration) -> Self {
+        MaxDuration { window }
+    }
+
+    /// True means exit now. A zero window never fires.
+    pub fn observe(&self, now: Duration) -> bool {
+        !self.window.is_zero() && now >= self.window
+    }
+}
+
 pub struct Server {
     core: ServerCore,
     socket: UdpSocket,
     activity_path: Option<PathBuf>,
     idle_exit: Duration,
+    max_duration: Duration,
 }
 
 impl Server {
@@ -91,6 +111,7 @@ impl Server {
             socket,
             activity_path: opts.activity_path,
             idle_exit: Duration::ZERO,
+            max_duration: Duration::ZERO,
         })
     }
 
@@ -102,6 +123,16 @@ impl Server {
     /// existing constructors.
     pub fn with_idle_exit(mut self, window: Duration) -> Self {
         self.idle_exit = window;
+        self
+    }
+
+    /// Arms the whole-session cap: the server exits cleanly once `window`
+    /// has elapsed since startup, whether or not musicians are connected.
+    /// Zero (the default) disables. Local mode passes this so the cap the
+    /// host chose ends the session for real; cloud deployments keep the
+    /// external guard and leave it off.
+    pub fn with_max_duration(mut self, window: Duration) -> Self {
+        self.max_duration = window;
         self
     }
 
@@ -119,6 +150,7 @@ impl Server {
         let mut heartbeat = tokio::time::interval(ACTIVITY_PERIOD);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut idle_exit = IdleExit::new(self.idle_exit);
+        let max_duration = MaxDuration::new(self.max_duration);
         let mut buf = [0u8; 2048];
         tokio::pin!(shutdown);
 
@@ -144,6 +176,14 @@ impl Server {
                         tracing::info!(
                             idle_secs = self.idle_exit.as_secs_f64(),
                             "no musicians for the idle window, exiting"
+                        );
+                        break;
+                    }
+                    if max_duration.observe(start.elapsed()) {
+                        tracing::info!(
+                            max_duration_secs = self.max_duration.as_secs_f64(),
+                            musicians,
+                            "session reached its maximum duration, exiting"
                         );
                         break;
                     }
@@ -207,7 +247,7 @@ fn touch(path: Option<&std::path::Path>) {
 
 #[cfg(test)]
 mod tests {
-    use super::IdleExit;
+    use super::{IdleExit, MaxDuration};
     use std::time::Duration;
 
     fn secs(s: u64) -> Duration {
@@ -240,6 +280,34 @@ mod tests {
         assert!(!ie.observe(secs(501), 0));
         assert!(!ie.observe(secs(559), 0));
         assert!(ie.observe(secs(561), 0));
+    }
+
+    #[test]
+    fn zero_cap_never_fires() {
+        let md = MaxDuration::new(Duration::ZERO);
+        for t in 0..10_000 {
+            assert!(!md.observe(secs(t)));
+        }
+    }
+
+    #[test]
+    fn cap_fires_at_the_window_and_stays_fired() {
+        let md = MaxDuration::new(secs(60));
+        assert!(!md.observe(secs(0)));
+        assert!(!md.observe(secs(59)));
+        assert!(md.observe(secs(60)));
+        assert!(md.observe(secs(61)));
+        assert!(md.observe(secs(10_000)));
+    }
+
+    #[test]
+    fn cap_ignores_going_backwards_in_its_own_history() {
+        // Pure function of elapsed time: earlier observations after later
+        // ones (heartbeat reordering cannot happen, but the type must not
+        // care) still answer purely from the input.
+        let md = MaxDuration::new(secs(60));
+        assert!(md.observe(secs(60)));
+        assert!(!md.observe(secs(59)));
     }
 
     #[test]

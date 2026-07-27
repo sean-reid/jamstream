@@ -36,11 +36,13 @@
 //! forwarding. Multi-address invites and UPnP are future work. With no
 //! network at all this falls back to 127.0.0.1 with a warning.
 //!
-//! # Idle teardown
+//! # Idle teardown and the session cap
 //!
 //! There is no systemd guard on a laptop, so the spawned server gets
 //! `--idle-exit-min` from the config's `idle_shutdown_min` and exits on its
-//! own once no musicians have been connected for that long.
+//! own once no musicians have been connected for that long. It likewise
+//! gets `--max-duration-min` from the config's `max_duration_min` and
+//! exits when the session has run that long, connected musicians or not.
 //!
 //! # Platform notes
 //!
@@ -283,10 +285,14 @@ impl Provider for LocalProvider {
         })?;
 
         // The flat config is the source of truth; the port feeds the
-        // reachability probe and idle_shutdown_min becomes the spawned
-        // server's own dead man's switch (no external guard on a laptop).
+        // reachability probe, and idle_shutdown_min / max_duration_min
+        // become the spawned server's own dead man's switch and session
+        // cap (no external guard on a laptop).
         let port = flat_config_value(&spec.user_data, "port").and_then(|v| v.parse::<u16>().ok());
         let idle_min = flat_config_value(&spec.user_data, "idle_shutdown_min")
+            .unwrap_or("0")
+            .to_owned();
+        let max_duration_min = flat_config_value(&spec.user_data, "max_duration_min")
             .unwrap_or("0")
             .to_owned();
 
@@ -299,6 +305,8 @@ impl Provider for LocalProvider {
             .arg(dir.join("last-active"))
             .arg("--idle-exit-min")
             .arg(&idle_min)
+            .arg("--max-duration-min")
+            .arg(&max_duration_min)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().map_err(|e| {
                 ProviderError::Other(format!("cannot clone server log handle: {e}"))
@@ -615,9 +623,10 @@ mod tests {
 
     #[test]
     fn flat_config_values_parse() {
-        let text = "# comment\nport = 43210\nidle_shutdown_min = 10\n";
+        let text = "# comment\nport = 43210\nidle_shutdown_min = 10\nmax_duration_min = 720\n";
         assert_eq!(flat_config_value(text, "port"), Some("43210"));
         assert_eq!(flat_config_value(text, "idle_shutdown_min"), Some("10"));
+        assert_eq!(flat_config_value(text, "max_duration_min"), Some("720"));
         assert_eq!(flat_config_value(text, "missing"), None);
         assert_eq!(flat_config_value("#cloud-config\n", "port"), None);
     }
