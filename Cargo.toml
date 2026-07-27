@@ -36,15 +36,15 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 thiserror = "2"
 tracing = "0.1"
-rand = "0.9"
+rand = "0.10"
 proptest = "1"
 snow = "0.10"
-ed25519-dalek = { version = "2", features = ["serde"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "3", features = ["serde"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 data-encoding = "2"
 aws-lc-rs = "1"
 blake2 = "0.10"
-getrandom = "0.3"
+getrandom = "0.4"
 zeroize = "1"
 # opus 0.3 (audiopus_sys) fails to build with CMake >= 4; opusic-c bundles a current libopus.
 opus = { package = "opusic-c", version = "1" }
@@ -61,7 +61,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 mimalloc = "0.1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
-tiny-skia = "0.11"
+tiny-skia = "0.12"
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service"] }
