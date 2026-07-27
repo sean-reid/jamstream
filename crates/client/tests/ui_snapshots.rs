@@ -276,6 +276,12 @@ fn wizard_preview_app(theme: Theme) -> JamApp {
     w.select_provider(1);
     w.continue_to_region(fixed_regions());
     w.continue_to_preview();
+    // The development-build state, pinned explicitly: the advanced
+    // artifact fields are only rendered when no server artifact is pinned
+    // into the binary. The pinned state renders a version string instead,
+    // which would rot the baseline on every release bump, so it is covered
+    // by the pure-transition tests rather than a snapshot.
+    w.pinned = None;
     w.advanced_open = true;
     app.wizard = w;
     app.screen = Screen::HostWizard;

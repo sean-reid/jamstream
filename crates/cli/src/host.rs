@@ -25,11 +25,43 @@ const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
 
 /// Placeholders the mock and local providers accept: the mock launches
 /// nothing, and the flat config the local provider consumes carries no
-/// artifact fields. A cloud provider requires the artifact flags because
-/// the VM downloads and verifies this for real.
+/// artifact fields. A cloud provider needs a real url and hash because the
+/// VM downloads and verifies this at boot; see [`resolve_artifact`].
 const PLACEHOLDER_ARTIFACT_URL: &str = "https://artifacts.invalid/jamstreamd";
 const PLACEHOLDER_ARTIFACT_SHA256: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The artifact the boot config carries, by precedence: the explicit
+/// --artifact-url/--artifact-sha256 overrides first, then the download
+/// pinned into this build at compile time (every release build carries
+/// one), and otherwise a usage error, because a cloud VM cannot boot
+/// without something verifiable to download. Local and mock launches
+/// download nothing, so without overrides they get the inert placeholders.
+fn resolve_artifact(
+    needs_download: bool,
+    url_flag: Option<&str>,
+    sha_flag: Option<&str>,
+    pinned: Option<jamstream_cloud::PinnedServerArtifact>,
+) -> Result<(String, String), CliError> {
+    if let (Some(url), Some(sha)) = (url_flag, sha_flag) {
+        return Ok((url.to_owned(), sha.to_owned()));
+    }
+    if !needs_download {
+        return Ok((
+            PLACEHOLDER_ARTIFACT_URL.to_owned(),
+            PLACEHOLDER_ARTIFACT_SHA256.to_owned(),
+        ));
+    }
+    match pinned {
+        Some(p) => Ok((p.url.to_owned(), p.sha256.to_owned())),
+        None => Err(CliError::Usage(
+            "this build has no pinned server artifact because it is not a release build; \
+             pass --artifact-url and --artifact-sha256 naming a jamstreamd build the VM \
+             can download and verify, or host with a release build, which pins its own"
+                .to_owned(),
+        )),
+    }
+}
 
 pub async fn run<W: Write>(
     args: &HostArgs,
@@ -113,24 +145,17 @@ pub async fn run<W: Write>(
     let now_unix = unix_now();
     let expires_unix = now_unix + u64::from(args.max_hours) * 3600;
 
-    // Local mode runs a binary already on this machine, so no artifact is
-    // downloaded and the flags are not required.
-    if !is_mock && !is_local && (args.artifact_url.is_none() || args.artifact_sha256.is_none()) {
-        return Err(CliError::Usage(
-            "pass --artifact-url and --artifact-sha256; the VM downloads and verifies \
-             jamstreamd at boot"
-                .to_owned(),
-        ));
-    }
+    // Local mode runs a binary already on this machine and the mock
+    // launches nothing; only a cloud VM downloads the artifact for real.
+    let (artifact_url, artifact_sha256) = resolve_artifact(
+        !is_mock && !is_local,
+        args.artifact_url.as_deref(),
+        args.artifact_sha256.as_deref(),
+        jamstream_cloud::pinned(),
+    )?;
     let boot = BootConfig {
-        artifact_url: args
-            .artifact_url
-            .clone()
-            .unwrap_or_else(|| PLACEHOLDER_ARTIFACT_URL.to_owned()),
-        artifact_sha256: args
-            .artifact_sha256
-            .clone()
-            .unwrap_or_else(|| PLACEHOLDER_ARTIFACT_SHA256.to_owned()),
+        artifact_url,
+        artifact_sha256,
         server_private_key_b64: BASE64.encode(&server_keys.private),
         issuer_public_key_b64: BASE64.encode(issuer.public_key().as_bytes()),
         session_id_hex: session_hex.clone(),
@@ -610,6 +635,51 @@ mod tests {
         for row in &rows[1..] {
             assert!(row.contains('$'));
         }
+    }
+
+    #[test]
+    fn artifact_precedence_is_flags_then_pinned_then_error() {
+        let pinned = jamstream_cloud::PinnedServerArtifact {
+            url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-x86_64-musl",
+            sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        };
+        // Explicit flags outrank the pin.
+        let (url, sha) = resolve_artifact(
+            true,
+            Some("https://own.example/jamstreamd"),
+            Some("1111111111111111111111111111111111111111111111111111111111111111"),
+            Some(pinned),
+        )
+        .unwrap();
+        assert_eq!(url, "https://own.example/jamstreamd");
+        assert_eq!(sha, "1".repeat(64));
+        // No flags: the pin fills in.
+        let (url, sha) = resolve_artifact(true, None, None, Some(pinned)).unwrap();
+        assert_eq!(url, pinned.url);
+        assert_eq!(sha, pinned.sha256);
+        // No flags, no pin, cloud launch: the error explains why and both
+        // ways out.
+        let err = resolve_artifact(true, None, None, None).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("not a release build"), "error was: {text}");
+        assert!(text.contains("--artifact-url"), "error was: {text}");
+    }
+
+    #[test]
+    fn local_and_mock_launches_use_placeholders_unless_overridden() {
+        // No download happens, so no flags and no pin is fine.
+        let (url, sha) = resolve_artifact(false, None, None, None).unwrap();
+        assert_eq!(url, PLACEHOLDER_ARTIFACT_URL);
+        assert_eq!(sha, PLACEHOLDER_ARTIFACT_SHA256);
+        // Explicit flags still win everywhere.
+        let (url, _) = resolve_artifact(
+            false,
+            Some("https://own.example/jamstreamd"),
+            Some("2222222222222222222222222222222222222222222222222222222222222222"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(url, "https://own.example/jamstreamd");
     }
 
     #[test]

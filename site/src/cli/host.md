@@ -23,8 +23,8 @@ With `--provider local` (the default) there is nothing to rank or bill: the serv
 | `--port <PORT>` | `43210` | UDP port the session server listens on. |
 | `--idle-min <IDLE_MIN>` | `10` | Minutes without musicians before the server shuts itself down. |
 | `--max-hours <MAX_HOURS>` | `12` | Hard cap on session length in hours. Invites expire at the cap. |
-| `--artifact-url <ARTIFACT_URL>` | none | URL of the `jamstreamd` artifact the VM downloads at boot. Required for cloud providers until releases are published; local mode runs a binary already on this machine and ignores it. |
-| `--artifact-sha256 <ARTIFACT_SHA256>` | none | Expected sha256 of the `jamstreamd` artifact. Required alongside `--artifact-url`. |
+| `--artifact-url <ARTIFACT_URL>` | pinned into release builds | Override the URL of the `jamstreamd` artifact the VM downloads at boot. Release builds carry the release's own server build pinned in, so cloud hosting normally needs no flag; a source build has no pin and must pass both artifact flags to host on a cloud provider. Local mode runs a binary already on this machine and downloads nothing. |
+| `--artifact-sha256 <ARTIFACT_SHA256>` | pinned into release builds | Override the expected sha256 of the `jamstreamd` artifact. Must be passed together with `--artifact-url`; the VM refuses to start on a mismatch. |
 | `--yes` | off | Skip the launch confirmation. |
 | `--json` | off | Emit one JSON object instead of human-readable output. |
 
@@ -37,6 +37,13 @@ $ jamstream host --provider local --yes
 ```
 
 A two hour duo session with two spare listener seats, on DigitalOcean, unattended:
+
+```console
+$ jamstream host --provider digitalocean --musicians 1 --listeners 2 \
+    --hours 2 --yes
+```
+
+The same launch from a source build, which has no pinned server artifact, names one explicitly:
 
 ```console
 $ jamstream host --provider digitalocean --musicians 1 --listeners 2 \

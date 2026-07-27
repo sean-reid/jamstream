@@ -621,6 +621,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The app-bundling story: release artifacts place jamstreamd beside
+    /// the app/CLI binary, and resolution must find it there with no
+    /// override, no env var, and no PATH entry. The test binary stands in
+    /// for the app executable.
+    #[cfg(unix)]
+    #[test]
+    fn resolves_the_binary_beside_the_current_executable() {
+        if std::env::var_os("JAMSTREAMD_PATH").is_some_and(|v| !v.is_empty()) {
+            // The env var outranks the sibling by design; this test is
+            // about the sibling step, so a preconfigured env skips it.
+            eprintln!("skipping: JAMSTREAMD_PATH is set in this environment");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let sibling = exe.parent().unwrap().join(BIN_NAME);
+        std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
+        let provider = LocalProvider::new(temp_dir("adjacent").join("state"));
+        let resolved = provider.resolve_server_binary().unwrap();
+        assert_eq!(resolved, sibling);
+        let _ = std::fs::remove_file(&sibling);
+    }
+
     #[test]
     fn flat_config_values_parse() {
         let text = "# comment\nport = 43210\nidle_shutdown_min = 10\nmax_duration_min = 720\n";

@@ -43,8 +43,9 @@ const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
 
 /// The local provider consumes the flat config, which carries no artifact
 /// fields; these placeholders fill the BootConfig struct for it. Cloud
-/// launches require the real artifact url and hash from the advanced
-/// fields, because the VM downloads and verifies the binary at boot.
+/// launches need the real artifact url and hash, because the VM downloads
+/// and verifies the binary at boot: release builds carry them pinned at
+/// compile time, development builds take them from the advanced fields.
 const PLACEHOLDER_ARTIFACT_URL: &str = "https://artifacts.invalid/jamstreamd";
 const PLACEHOLDER_ARTIFACT_SHA256: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -170,6 +171,14 @@ pub struct HostWizard {
     pub musicians: u8,
     pub listeners: u8,
     pub destinations: u8,
+    /// The server artifact pinned into this build, read once at
+    /// construction. When present (every release build) the wizard shows
+    /// no artifact fields at all: cloud launches silently use the pinned
+    /// pair, and the preview step carries one quiet line saying the server
+    /// download is verified. When absent (development builds) the advanced
+    /// fields below are shown and required for cloud launches. Public so
+    /// tests can pin or unpin regardless of how the test binary was built.
+    pub pinned: Option<jamstream_cloud::PinnedServerArtifact>,
     pub advanced_open: bool,
     pub artifact_url: String,
     pub artifact_sha256: String,
@@ -204,6 +213,7 @@ impl HostWizard {
             musicians: 3,
             listeners: 2,
             destinations: 0,
+            pinned: jamstream_cloud::pinned(),
             advanced_open: false,
             artifact_url: String::new(),
             artifact_sha256: String::new(),
@@ -453,13 +463,16 @@ impl HostWizard {
         ))
     }
 
-    /// Launch preconditions: a region, and for clouds the verified artifact
+    /// Launch preconditions: a region, and for clouds a verified artifact
     /// (the VM downloads and checks the server binary; local runs one that
-    /// is already on this machine).
+    /// is already on this machine). Release builds carry the artifact
+    /// pinned, so there is nothing to validate; only development builds
+    /// gate on the advanced fields.
     pub fn can_launch(&self) -> bool {
         self.step == WizardStep::Preview
             && self.selected_region.is_some()
             && (self.is_local()
+                || self.pinned.is_some()
                 || (!self.artifact_url.trim().is_empty()
                     && !self.artifact_sha256.trim().is_empty()))
     }
@@ -489,8 +502,12 @@ impl HostWizard {
             hourly_microusd: row.price.hourly_microusd,
             musicians: self.musicians,
             listeners: self.listeners,
-            artifact_url: non_empty(&self.artifact_url),
-            artifact_sha256: non_empty(&self.artifact_sha256),
+            // Explicit fields (development builds) outrank the pin, same
+            // precedence as the CLI's override flags.
+            artifact_url: non_empty(&self.artifact_url)
+                .or_else(|| self.pinned.map(|p| p.url.to_owned())),
+            artifact_sha256: non_empty(&self.artifact_sha256)
+                .or_else(|| self.pinned.map(|p| p.sha256.to_owned())),
             do_token: creds::lookup(
                 self.creds.as_ref(),
                 &self.env,
@@ -1381,44 +1398,57 @@ impl HostWizard {
         }
         if !self.is_local() {
             ui.add_space(theme::SPACE_SM);
-            let arrow = if self.advanced_open { "v" } else { ">" };
-            if ui
-                .button(format!("{arrow} Server binary (advanced)"))
-                .clicked()
-            {
-                self.advanced_open = !self.advanced_open;
-            }
-            if self.advanced_open {
+            if self.pinned.is_some() {
+                // Release builds: the server download is pinned into the
+                // binary and verified by the machine at boot. One quiet
+                // factual line; no URL, no hash, nothing to interact with.
                 ui.label(theme::muted(
                     ui,
-                    "JamStream does not publish server binaries yet. Point these at a \
-                     jamstreamd build you host; the machine downloads and verifies it at boot.",
+                    format!("Server {}, verified download.", env!("CARGO_PKG_VERSION")),
                 ));
-                egui::Grid::new("artifact-grid")
-                    .num_columns(2)
-                    .spacing(vec2(theme::SPACE_LG, 4.0))
-                    .show(ui, |ui| {
-                        ui.label(theme::muted(ui, "artifact url"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.artifact_url)
-                                .desired_width(340.0)
-                                .hint_text("https://..."),
-                        );
-                        ui.end_row();
-                        ui.label(theme::muted(ui, "artifact sha256"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.artifact_sha256)
-                                .desired_width(340.0)
-                                .hint_text("64 hex characters"),
-                        );
-                        ui.end_row();
-                    });
-            }
-            if !self.can_launch() {
-                ui.label(theme::muted(
-                    ui,
-                    "A cloud launch needs the server binary fields above.",
-                ));
+            } else {
+                // Development builds only: no pinned artifact exists, so
+                // the launch needs one named by hand.
+                let arrow = if self.advanced_open { "v" } else { ">" };
+                if ui
+                    .button(format!("{arrow} Server binary (advanced)"))
+                    .clicked()
+                {
+                    self.advanced_open = !self.advanced_open;
+                }
+                if self.advanced_open {
+                    ui.label(theme::muted(
+                        ui,
+                        "This build has no pinned server binary; release builds do. Point \
+                         these at a jamstreamd build you host; the machine downloads and \
+                         verifies it at boot.",
+                    ));
+                    egui::Grid::new("artifact-grid")
+                        .num_columns(2)
+                        .spacing(vec2(theme::SPACE_LG, 4.0))
+                        .show(ui, |ui| {
+                            ui.label(theme::muted(ui, "artifact url"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.artifact_url)
+                                    .desired_width(340.0)
+                                    .hint_text("https://..."),
+                            );
+                            ui.end_row();
+                            ui.label(theme::muted(ui, "artifact sha256"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.artifact_sha256)
+                                    .desired_width(340.0)
+                                    .hint_text("64 hex characters"),
+                            );
+                            ui.end_row();
+                        });
+                }
+                if !self.can_launch() {
+                    ui.label(theme::muted(
+                        ui,
+                        "A cloud launch needs the server binary fields above.",
+                    ));
+                }
             }
         }
         ui.add_space(theme::SPACE_SM);
@@ -1630,8 +1660,11 @@ mod tests {
     }
 
     #[test]
-    fn cloud_launch_requires_the_artifact_fields() {
+    fn unpinned_cloud_launch_requires_the_artifact_fields() {
         let mut w = wizard();
+        // Force the development-build state regardless of how this test
+        // binary was compiled.
+        w.pinned = None;
         w.providers[1].status = ProviderStatus::Ready;
         w.select_provider(1);
         w.continue_to_region(vec![region_row("nyc3", 26_790, 21.0)]);
@@ -1640,6 +1673,23 @@ mod tests {
         w.artifact_url = "https://example.invalid/jamstreamd".to_owned();
         assert!(!w.can_launch());
         w.artifact_sha256 = "a".repeat(64);
+        assert!(w.can_launch());
+    }
+
+    #[test]
+    fn pinned_cloud_launch_has_nothing_to_validate() {
+        let mut w = wizard();
+        w.pinned = Some(jamstream_cloud::PinnedServerArtifact {
+            url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-x86_64-musl",
+            sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        });
+        w.providers[1].status = ProviderStatus::Ready;
+        w.select_provider(1);
+        w.continue_to_region(vec![region_row("nyc3", 26_790, 21.0)]);
+        w.continue_to_preview();
+        // The artifact fields stay empty (a pinned build never shows them)
+        // and the launch is ready anyway.
+        assert!(w.artifact_url.is_empty() && w.artifact_sha256.is_empty());
         assert!(w.can_launch());
     }
 
