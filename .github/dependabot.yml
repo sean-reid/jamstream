@@ -8,6 +8,11 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # Semver-major bumps break apis by definition; they are taken
+      # deliberately as tracked work, never in the monthly sweep.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       cargo-deps:
         patterns: ["*"]
