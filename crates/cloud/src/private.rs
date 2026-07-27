@@ -93,13 +93,7 @@ fn create_all(dir: &Path) -> io::Result<()> {
     if let Some(parent) = dir.parent() {
         create_all(parent)?;
     }
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    match builder.create(dir) {
+    match private_dir_builder().create(dir) {
         Ok(()) => {
             harden_new_dir(dir);
             Ok(())
@@ -108,6 +102,21 @@ fn create_all(dir: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+#[cfg(unix)]
+fn private_dir_builder() -> std::fs::DirBuilder {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+}
+
+/// Windows takes its permissions from the ACL, which [`harden_new_dir`]
+/// sets on the way past.
+#[cfg(not(unix))]
+fn private_dir_builder() -> std::fs::DirBuilder {
+    std::fs::DirBuilder::new()
 }
 
 /// Refuses a directory every account on the machine can write to, which is
