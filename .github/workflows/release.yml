@@ -1,8 +1,27 @@
 # Builds and attaches release artifacts when release-please publishes a
 # release (beta prereleases included; see release-please.yml for the
-# channel design). Plain archives only for now: installers (MSI, notarized
-# DMG, deb/rpm/AppImage) and code signing are a later milestone, with named
-# placeholder steps below marking where they land.
+# channel design; nothing here inspects the prerelease flag, so betas and
+# stable releases build identically).
+#
+# Trusted distribution status:
+#   - macOS: Developer ID signed (hardened runtime + timestamp) using the
+#     keychain pattern proven by sign-smoke.yml. Notarization runs when the
+#     ASC_* secrets exist and skips loudly when they do not, so the first
+#     release ships signed either way and becomes notarized the moment the
+#     secrets land. No rebuild or workflow change needed.
+#   - Windows: unsigned; named placeholder step until a cert exists.
+#   - Linux: plain tarballs; AppImage/deb/rpm are named placeholders.
+#
+# Asset names are STABLE (no version embedded) so
+# /releases/latest/download/<name> always resolves:
+#   jamstream-app-macos.dmg              universal app in a signed DMG
+#   jamstream-cli-macos-universal.tar.gz universal CLI binary
+#   jamstream-cli-windows-x86_64.zip     CLI
+#   jamstream-app-windows-x86_64.zip     app
+#   jamstream-cli-linux-x86_64.tar.gz    CLI (gnu)
+#   jamstream-app-linux-x86_64.tar.gz    app (gnu)
+#   jamstreamd-linux-x86_64-musl.tar.gz  static session server
+#   SHA256SUMS                           checksums of all of the above
 name: release
 
 on:
@@ -40,7 +59,7 @@ jobs:
           fi
       - name: Package and upload tarball
         run: |
-          ARCHIVE="jamstream-server-${TAG}-x86_64-unknown-linux-musl.tar.gz"
+          ARCHIVE="jamstreamd-linux-x86_64-musl.tar.gz"
           tar -C target/x86_64-unknown-linux-musl/release -czf "$ARCHIVE" jamstreamd
           gh release upload "$TAG" "$ARCHIVE" --clobber
       # Placeholder: artifact signing (signature published beside the
@@ -49,46 +68,217 @@ jobs:
       - name: Sign server artifact (not yet implemented)
         run: echo 'Placeholder; detached signature for cloud-init verification lands with the signing milestone.'
 
-  # Desktop app + CLI for each OS, as plain archives.
-  desktop:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            triple: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            triple: aarch64-apple-darwin
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
+  # Universal (arm64 + x86_64) app bundle in a signed DMG, plus a universal
+  # CLI tarball. Signing follows the keychain pattern sign-smoke.yml proved
+  # against the same APPLE_* secrets.
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --release -p jamstream-client -p jamstream-cli --target aarch64-apple-darwin
+          cargo build --release -p jamstream-client -p jamstream-cli --target x86_64-apple-darwin
+      - name: Lipo into universal binaries
+        run: |
+          mkdir -p target/universal
+          for BIN in jamstream-app jamstream; do
+            lipo -create \
+              "target/aarch64-apple-darwin/release/$BIN" \
+              "target/x86_64-apple-darwin/release/$BIN" \
+              -output "target/universal/$BIN"
+            ARCHS=$(lipo -archs "target/universal/$BIN")
+            echo "$BIN: $ARCHS"
+            echo "$ARCHS" | grep -q x86_64
+            echo "$ARCHS" | grep -q arm64
+          done
+      - name: Assemble JamStream.app
+        run: ./scripts/macos-app-bundle.sh target/universal/jamstream-app "$TAG" dist
+      # Placeholder: generate/copy the icns into Contents/Resources and set
+      # CFBundleIconFile once the icon exists.
+      - name: Add app icon (not yet implemented)
+        run: echo 'Placeholder; JamStream.icns lands with the branding milestone.'
+      - name: Import certificate into a throwaway keychain
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "$APPLE_CERT_P12" ]; then
+            echo "APPLE_CERT_P12 secret is missing; a release must be signed" >&2
+            exit 1
+          fi
+          KEYCHAIN_PW=$(uuidgen)
+          echo "KEYCHAIN_PW=$KEYCHAIN_PW" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PW" release.keychain
+          security set-keychain-settings -lut 3600 release.keychain
+          security unlock-keychain -p "$KEYCHAIN_PW" release.keychain
+          printf '%s' "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k release.keychain \
+            -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PW" release.keychain > /dev/null
+          security list-keychains -d user -s release.keychain login.keychain
+      - name: Codesign app bundle and CLI (hardened runtime + timestamp)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -eu
+          IDENTITY=$(security find-identity -v -p codesigning release.keychain \
+            | grep -oE '"[^"]+"' | head -1 | tr -d '"')
+          if [ -z "$IDENTITY" ]; then
+            echo "no valid signing identity in the imported certificate" >&2
+            exit 1
+          fi
+          echo "signing with: $IDENTITY"
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          # The app gets the audio-input entitlement (hardened runtime
+          # denies microphone capture without it); the CLI does no capture.
+          codesign --force --options runtime --timestamp \
+            --entitlements scripts/jamstream-app.entitlements \
+            --sign "$IDENTITY" --keychain release.keychain dist/JamStream.app
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY" --keychain release.keychain target/universal/jamstream
+          for ARTIFACT in dist/JamStream.app target/universal/jamstream; do
+            codesign --verify --strict --verbose=2 "$ARTIFACT"
+            codesign --display --verbose=2 "$ARTIFACT" 2>&1 \
+              | grep -E "Authority|TeamIdentifier"
+            codesign --display --verbose=2 "$ARTIFACT" 2>&1 \
+              | grep -q "TeamIdentifier=$APPLE_TEAM_ID"
+          done
+      # Notarization gate: the ASC_* secrets do not exist yet. When all
+      # three land, the steps below start running on the next release with
+      # no workflow change; until then they skip with a loud warning so the
+      # release is still signed, just not notarized.
+      - name: Check notarization credentials
+        id: notary
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eu
+          if [ -n "$ASC_KEY_P8" ] && [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "notarization credentials present; app will be notarized"
+          elif [ -n "$ASC_KEY_P8" ] || [ -n "$ASC_KEY_ID" ] || [ -n "$ASC_ISSUER_ID" ]; then
+            echo "::error::Notarization secrets are PARTIALLY configured; set all of ASC_KEY_P8, ASC_KEY_ID, ASC_ISSUER_ID or none."
+            exit 1
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::NOTARIZATION SKIPPED: ASC_KEY_P8/ASC_KEY_ID/ASC_ISSUER_ID are not configured. This release is Developer ID SIGNED but NOT notarized; Gatekeeper will warn on first launch. Add the three secrets and the next release notarizes automatically."
+          fi
+      - name: Notarize and staple the app
+        if: steps.notary.outputs.configured == 'true'
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eu
+          printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
+          ditto -c -k --keepParent dist/JamStream.app "$RUNNER_TEMP/JamStream.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/JamStream.zip" \
+            --key "$RUNNER_TEMP/asc-key.p8" \
+            --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" \
+            --wait
+          rm -f "$RUNNER_TEMP/asc-key.p8" "$RUNNER_TEMP/JamStream.zip"
+          xcrun stapler staple dist/JamStream.app
+          xcrun stapler validate dist/JamStream.app
+      # The DMG is built after stapling so it carries the notarized app.
+      # (Notarizing the DMG itself as well can be added inside the gated
+      # step above once the ASC secrets exist, if we want Gatekeeper to
+      # bless the mount too.)
+      - name: Build and sign the DMG
+        run: |
+          set -eu
+          ./scripts/macos-dmg.sh dist/JamStream.app jamstream-app-macos.dmg
+          codesign --force --timestamp \
+            --sign "$SIGN_IDENTITY" --keychain release.keychain jamstream-app-macos.dmg
+          codesign --verify --strict --verbose=2 jamstream-app-macos.dmg
+      - name: Package CLI tarball and upload assets
+        run: |
+          set -eu
+          tar -C target/universal -czf jamstream-cli-macos-universal.tar.gz jamstream
+          gh release upload "$TAG" \
+            jamstream-app-macos.dmg \
+            jamstream-cli-macos-universal.tar.gz \
+            --clobber
+      - name: Remove the throwaway keychain
+        if: always()
+        run: security delete-keychain release.keychain || true
+
+  windows:
+    runs-on: windows-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
       - run: cargo build --release -p jamstream-client -p jamstream-cli
-      - name: Package and upload archive
+      # Placeholder: Authenticode signing of both .exe files lands once a
+      # Windows code-signing certificate exists.
+      - name: Sign Windows binaries (not yet implemented)
+        run: echo 'Placeholder; Authenticode signing lands once a Windows certificate exists.'
+      - name: Package and upload archives
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            ARCHIVE="jamstream-${TAG}-${{ matrix.triple }}.zip"
-            7z a "$ARCHIVE" ./target/release/jamstream-app.exe ./target/release/jamstream.exe
-          else
-            ARCHIVE="jamstream-${TAG}-${{ matrix.triple }}.tar.gz"
-            tar -C target/release -czf "$ARCHIVE" jamstream-app jamstream
-          fi
-          gh release upload "$TAG" "$ARCHIVE" --clobber
-      # Placeholders for the installer/signing milestone, one per OS so the
-      # eventual steps have named homes:
+          7z a jamstream-cli-windows-x86_64.zip ./target/release/jamstream.exe
+          7z a jamstream-app-windows-x86_64.zip ./target/release/jamstream-app.exe
+          gh release upload "$TAG" \
+            jamstream-cli-windows-x86_64.zip \
+            jamstream-app-windows-x86_64.zip \
+            --clobber
       - name: Build signed MSI (not yet implemented)
-        if: runner.os == 'Windows'
         run: echo 'Placeholder; signed MSI plus winget manifest lands with the installer milestone.'
-      - name: Build notarized DMG (not yet implemented)
-        if: runner.os == 'macOS'
-        run: echo 'Placeholder; notarized DMG plus Homebrew tap lands with the installer milestone.'
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Same desktop build deps ci.yml uses (alsa, wayland/xkb for eframe,
+      # pipewire + dbus).
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      - run: cargo build --release -p jamstream-client -p jamstream-cli
+      - name: Package and upload tarballs
+        run: |
+          tar -C target/release -czf jamstream-cli-linux-x86_64.tar.gz jamstream
+          tar -C target/release -czf jamstream-app-linux-x86_64.tar.gz jamstream-app
+          gh release upload "$TAG" \
+            jamstream-cli-linux-x86_64.tar.gz \
+            jamstream-app-linux-x86_64.tar.gz \
+            --clobber
       - name: Build deb/rpm/AppImage (not yet implemented)
-        if: runner.os == 'Linux'
         run: echo 'Placeholder; deb, rpm, AppImage, and AUR packaging lands with the installer milestone.'
+
+  # SHA256SUMS covers every asset uploaded above and is the verification
+  # anchor for downstream consumers: the future install script and the
+  # downloads page both fetch /releases/latest/download/SHA256SUMS and
+  # check downloaded artifacts against it. It must therefore be generated
+  # LAST, from the assets as they actually exist on the release.
+  checksums:
+    needs: [server-musl, macos, windows, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all release assets, checksum, upload SHA256SUMS
+        run: |
+          set -eu
+          mkdir assets
+          gh release download "$TAG" --dir assets --pattern '*'
+          rm -f assets/SHA256SUMS # ignore a previous run's sums file
+          cd assets
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
