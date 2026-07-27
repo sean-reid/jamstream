@@ -8,6 +8,9 @@
 #   the UI snapshot previews. A change that regenerates the snapshot
 #   baselines must run site/copy-previews.sh in the same change or this
 #   job fails on the byte-for-byte comparison.
+# - install-scripts: the installer scripts the site serves at /install.sh
+#   and /install.ps1 (they live in site/src/, which mdBook copies into the
+#   built site verbatim) must stay shellcheck-clean and parseable.
 
 name: docs-check
 
@@ -41,3 +44,21 @@ jobs:
         run: cargo test -p jamstream-client --test ui_snapshots
       - name: Check committed docs images against fresh previews
         run: site/copy-previews.sh --check
+
+  install-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck the POSIX installer
+        run: shellcheck site/src/install.sh
+      - name: Parse the PowerShell installer
+        run: |
+          pwsh -NoProfile -Command '
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              "site/src/install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Output $_.ToString() }
+              exit 1
+            }
+            Write-Output "install.ps1 parses cleanly"'

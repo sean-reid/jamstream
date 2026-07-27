@@ -4,17 +4,16 @@ Two paths from nothing to a running session. The local path takes about five min
 
 ## 1. Install
 
-No packaged releases exist yet, so build from source. You need a Rust toolchain ([rustup.rs](https://rustup.rs)).
+One line downloads the `jamstream` CLI from the latest release, verifies its checksum, and installs it:
 
 ```console
-$ git clone https://github.com/sean-reid/jamstream
-$ cd jamstream
-$ cargo install --path crates/cli
-$ cargo install --path crates/server
+$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
 $ jamstream --version
 ```
 
-The second install puts the `jamstreamd` server binary on your PATH, which is where local mode looks for it. The internet path does not need it locally; skip it if you are only hosting in the cloud.
+The [Download](download.md) page has the desktop app, the Windows install script, and direct links to every artifact. If no release has been published yet, the script says so and exits; building from source works on every platform with a Rust toolchain ([rustup.rs](https://rustup.rs)): clone the repository, then `cargo install --path crates/cli`.
+
+The local path below also needs the `jamstreamd` server binary on this computer. On Linux x86_64, append `-s -- --with-server` to the install line to get it; elsewhere the desktop app ships it alongside the app, or `cargo install --path crates/server` builds it. The internet path does not need it locally; skip it if you are only hosting in the cloud.
 
 ## 2. Host on this computer
 
