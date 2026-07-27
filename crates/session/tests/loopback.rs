@@ -701,6 +701,33 @@ fn metronome_host_controls_and_clicks() {
     )));
 }
 
+/// Every listener receives byte-identical broadcast audio, so the frame is
+/// encoded once per 20 ms whatever the audience size and only the seal
+/// differs per member. Encoding it per listener measured 20 x 190 us inside
+/// one 2500 us tick, which is a tick overrun at capacity.
+#[test]
+fn a_broadcast_frame_is_encoded_once_per_fanout_tick() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let musician = h.mint(0, Role::Musician);
+    h.add_client(&musician, Some(440.0));
+    for i in 0..MAX_LISTENERS as u16 {
+        let invite = h.mint(100 + i, Role::Listener);
+        h.add_client(&invite, None);
+    }
+    h.run_ms(200);
+    let listeners = h
+        .clients
+        .iter()
+        .filter(|c| c.role == Role::Listener && *c.core.state() == ClientState::Joined)
+        .count();
+    assert_eq!(listeners, MAX_LISTENERS);
+
+    // 400 ms is 160 ticks, which is 20 broadcast frames at 20 ms each.
+    let before = h.server.broadcast_encodes();
+    h.run_ms(400);
+    assert_eq!(h.server.broadcast_encodes() - before, 20);
+}
+
 #[test]
 fn listener_receives_broadcast_and_cannot_send_media() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);

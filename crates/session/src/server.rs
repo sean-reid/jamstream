@@ -296,6 +296,11 @@ pub struct ServerCore {
     bcast_encoder: Option<Encoder>,
     bcast_pkt: Vec<u8>,
     bcast_clock: u64,
+    /// Broadcast frames encoded since the core was built. Every listener gets
+    /// byte-identical audio, so this must advance by exactly one per fan-out
+    /// tick however many listeners are connected; encoding per listener once
+    /// cost 20 x 190 us inside a 2500 us tick.
+    bcast_encodes: u64,
     /// Accumulator slot the last tick wrote; the broadcast tap reads it.
     bcast_slot: usize,
     /// While set, per-member card meters are maintained. Off costs nothing.
@@ -349,6 +354,7 @@ impl ServerCore {
             bcast_encoder: None,
             bcast_pkt: Vec::new(),
             bcast_clock: 0,
+            bcast_encodes: 0,
             bcast_slot: 0,
             bcast_tap: false,
             bcast_faders: BTreeMap::new(),
@@ -540,6 +546,7 @@ impl ServerCore {
             && let Some(enc) = self.bcast_encoder.as_mut()
             && enc.encode(&self.bcast_accum, &mut self.bcast_pkt).is_ok()
         {
+            self.bcast_encodes += 1;
             for (&id, m) in self.members.iter_mut() {
                 if !m.connected || m.role != Role::Listener {
                     continue;
@@ -783,6 +790,13 @@ impl ServerCore {
 
     pub fn stream_status(&self) -> &[DestinationStatus] {
         &self.stream_status
+    }
+
+    /// Broadcast frames encoded since this core was built. The listener
+    /// stream is encoded once per 20 ms and sealed per member, so this is the
+    /// count a caller compares against ticks rather than against listeners.
+    pub fn broadcast_encodes(&self) -> u64 {
+        self.bcast_encodes
     }
 
     pub fn musicians_connected(&self) -> usize {
