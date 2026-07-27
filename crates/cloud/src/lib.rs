@@ -56,6 +56,7 @@ pub use storage::{
 };
 pub use sweeper::{SweepFilter, SweepReport, sweep};
 pub use types::{
-    Instance, InstanceClass, LaunchSpec, Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
-    format_microusd, session_id_from_tags, session_tag,
+    ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec,
+    Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY, format_microusd, session_id_from_tags,
+    session_tag,
 };

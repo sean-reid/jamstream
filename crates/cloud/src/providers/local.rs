@@ -103,7 +103,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::{Provider, ProviderError, Result};
-use crate::types::{Instance, LaunchSpec, Price, ProviderKind, Region, RegionId, session_tag};
+use crate::types::{
+    IngressRule, Instance, LaunchSpec, Price, ProviderKind, Region, RegionId, session_tag,
+};
 
 const REGION_ID: &str = "local";
 const REGISTRY_FILE: &str = "local.json";
@@ -489,6 +491,17 @@ impl Provider for LocalProvider {
             .filter(|e| session_tag.is_none_or(|want| e.session == want))
             .map(|e| Self::instance_for(e, ip))
             .collect())
+    }
+
+    /// There is no cloud network here. The host's own firewall and router are
+    /// the host's business, which is why local invites carry a LAN address
+    /// and guests outside it need port forwarding.
+    async fn session_ingress(&self, _session: &str) -> Result<Vec<IngressRule>> {
+        Ok(Vec::new())
+    }
+
+    async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 

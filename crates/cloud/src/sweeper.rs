@@ -30,6 +30,11 @@ pub struct SweepReport {
     pub found: Vec<Instance>,
     pub destroyed: Vec<Instance>,
     pub failed: Vec<(Instance, ProviderError)>,
+    /// Per-session firewalls with no instance left behind them, deleted on
+    /// the way past. AWS will not delete a security group until the
+    /// terminating instance's network interface is gone, so a group that was
+    /// still attached during one sweep is collected by the next.
+    pub firewalls_removed: Vec<String>,
 }
 
 impl SweepReport {
@@ -72,6 +77,19 @@ pub async fn sweep(
                 }
             }
         }
+        if dry_run {
+            continue;
+        }
+        // Firewalls cost nothing and cannot be swept by instance id, so they
+        // are collected here rather than reported as strays. A live session's
+        // firewall is never touched, including the one a filtered sweep is
+        // deliberately sparing.
+        match p.destroy_orphan_firewalls().await {
+            Ok(names) => report.firewalls_removed.extend(names),
+            Err(e) => {
+                tracing::warn!(provider = p.kind().as_str(), error = %e, "firewall cleanup failed");
+            }
+        }
     }
     report
 }
@@ -80,7 +98,7 @@ pub async fn sweep(
 mod tests {
     use super::*;
     use crate::mock::MockProvider;
-    use crate::types::{ProviderKind, session_tag};
+    use crate::types::{InstanceClass, LaunchSpec, ProviderKind, session_tag};
 
     fn seeded(kind: ProviderKind, sessions: &[&str]) -> MockProvider {
         let p = MockProvider::with_default_regions(kind);
@@ -112,7 +130,46 @@ mod tests {
         let report = sweep(&providers, SweepFilter::All, true).await;
         assert_eq!(report.found.len(), 1);
         assert!(report.destroyed.is_empty());
+        assert!(report.firewalls_removed.is_empty());
         assert_eq!(providers[0].list_tagged(None).await.unwrap().len(), 1);
+    }
+
+    /// A stray instance leaves a stray firewall, and a sweep that took down
+    /// the firewall of the session it is deliberately sparing would end that
+    /// session.
+    #[tokio::test]
+    async fn sweep_collects_stray_firewalls_and_spares_the_live_one() {
+        let p = MockProvider::with_default_regions(ProviderKind::Aws);
+        let region = p.regions()[0].clone();
+        for session in ["live", "leaked"] {
+            p.launch(LaunchSpec {
+                region: region.clone(),
+                instance_class: InstanceClass::Small,
+                user_data: String::new(),
+                tags: vec![session_tag(session)],
+            })
+            .await
+            .unwrap();
+        }
+        let providers: Vec<Box<dyn Provider>> = vec![Box::new(p)];
+        let report = sweep(&providers, SweepFilter::Excluding("live".into()), false).await;
+        assert_eq!(report.destroyed.len(), 1);
+        assert_eq!(report.firewalls_removed, vec!["leaked".to_owned()]);
+        assert!(
+            !providers[0]
+                .session_ingress("live")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the live session must still be reachable after a sweep"
+        );
+        assert!(
+            providers[0]
+                .session_ingress("leaked")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

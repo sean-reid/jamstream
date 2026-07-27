@@ -30,6 +30,50 @@ fn region(p: &DigitalOceanProvider, slug: &str) -> Region {
         .expect("slug in static catalog")
 }
 
+/// Mounts the two calls a launch makes before the droplet exists: the
+/// session tag, which a firewall may only reference once it exists, and the
+/// cloud firewall attached to it.
+async fn mount_firewall(server: &MockServer, session: &str) {
+    Mock::given(method("POST"))
+        .and(path("/v2/tags"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "tag": { "name": format!("jamstream-session:{session}"), "resources": {} },
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/firewalls"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "firewall": firewall_json(&format!("jamstream-{session}"), &[]),
+        })))
+        .mount(server)
+        .await;
+}
+
+/// A firewall object as the v2 API returns it, with the one inbound rule a
+/// session gets and blanket outbound.
+fn firewall_json(name: &str, droplet_ids: &[u64]) -> serde_json::Value {
+    json!({
+        "id": format!("fw-{name}"),
+        "name": name,
+        "status": "succeeded",
+        "created_at": "2026-07-27T12:00:00Z",
+        "pending_changes": [],
+        "inbound_rules": [{
+            "protocol": "udp",
+            "ports": "43210",
+            "sources": { "addresses": ["0.0.0.0/0", "::/0"] },
+        }],
+        "outbound_rules": [{
+            "protocol": "tcp",
+            "ports": "0",
+            "destinations": { "addresses": ["0.0.0.0/0", "::/0"] },
+        }],
+        "droplet_ids": droplet_ids,
+        "tags": ["jamstream-session:sess1"],
+    })
+}
+
 /// A realistic droplet object as the v2 API returns it.
 fn droplet_json(
     id: u64,
@@ -93,6 +137,37 @@ async fn create_happy_path_sends_full_body_and_parses_response() {
         .mount(&server)
         .await;
 
+    Mock::given(method("POST"))
+        .and(path("/v2/tags"))
+        .and(body_partial_json(
+            json!({ "name": "jamstream-session:sess1" }),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "tag": { "name": "jamstream-session:sess1", "resources": {} },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Inbound is the session port and nothing else; outbound has to be open
+    // or the droplet cannot fetch jamstreamd or delete itself.
+    Mock::given(method("POST"))
+        .and(path("/v2/firewalls"))
+        .and(body_partial_json(json!({
+            "name": "jamstream-sess1",
+            "inbound_rules": [{
+                "protocol": "udp",
+                "ports": "43210",
+                "sources": { "addresses": ["0.0.0.0/0", "::/0"] },
+            }],
+            "tags": ["jamstream-session:sess1"],
+        })))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "firewall": firewall_json("jamstream-sess1", &[]),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
     let p = provider(&server);
     let inst = p
         .launch(LaunchSpec {
@@ -126,6 +201,8 @@ async fn create_422_surfaces_the_api_message() {
         .expect(1) // a 422 is a hard rejection; no retry
         .mount(&server)
         .await;
+
+    mount_firewall(&server, "sess1").await;
 
     let p = provider(&server);
     let err = p
@@ -478,4 +555,150 @@ fn tag_mapping_round_trips_for_realistic_session_ids() {
         };
         assert_eq!(inst.session_id(), Some(id));
     }
+}
+
+// ---- Cloud firewalls ----
+
+#[tokio::test]
+async fn session_ingress_reports_only_the_session_port() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/firewalls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "firewalls": [
+                // Somebody else's firewall on the same account.
+                json!({
+                    "id": "fw-other",
+                    "name": "web-servers",
+                    "inbound_rules": [{
+                        "protocol": "tcp",
+                        "ports": "443",
+                        "sources": { "addresses": ["0.0.0.0/0"] },
+                    }],
+                    "droplet_ids": [999],
+                    "tags": [],
+                }),
+                firewall_json("jamstream-sess1", &[101]),
+            ],
+            "links": {},
+        })))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let rules = p.session_ingress("sess1").await.expect("ingress");
+    assert_eq!(rules.len(), 1, "one rule, and not the other firewall's");
+    assert_eq!(rules[0].protocol, "udp");
+    assert!(rules[0].is_only_port(43210));
+    assert!(rules[0].is_open_to_the_internet());
+    assert!(
+        p.session_ingress("nosuch").await.unwrap().is_empty(),
+        "a session with no firewall reports no ingress"
+    );
+}
+
+#[tokio::test]
+async fn orphan_cleanup_spares_live_sessions_and_foreign_firewalls() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/firewalls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "firewalls": [
+                // Live: a droplet is still behind it.
+                firewall_json("jamstream-live", &[101]),
+                // Orphan: the session's droplet is gone.
+                firewall_json("jamstream-gone", &[]),
+                // Not ours, and also empty. Must be left alone.
+                json!({
+                    "id": "fw-other",
+                    "name": "web-servers",
+                    "inbound_rules": [],
+                    "droplet_ids": [],
+                    "tags": [],
+                }),
+            ],
+            "links": {},
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v2/firewalls/fw-jamstream-gone"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let deleted = p.destroy_orphan_firewalls().await.expect("cleanup");
+    assert_eq!(deleted, vec!["jamstream-gone".to_owned()]);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn launch_reuses_the_firewall_a_previous_attempt_created() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/tags"))
+        // A tag that already exists answers 422, which is not an error here.
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "id": "unprocessable_entity",
+            "message": "Tag already exists",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/firewalls"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "id": "unprocessable_entity",
+            "message": "duplicate name",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/firewalls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "firewalls": [firewall_json("jamstream-sess1", &[])],
+            "links": {},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/droplets"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "droplet": droplet_json(7, "nyc1", &["jamstream", "jamstream-session:sess1"], None),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let inst = p
+        .launch(LaunchSpec {
+            region: region(&p, "nyc1"),
+            instance_class: InstanceClass::Small,
+            user_data: String::new(),
+            tags: vec![session_tag("sess1")],
+        })
+        .await
+        .expect("launch survives a firewall that already exists");
+    assert_eq!(inst.id, "7");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn launch_without_a_session_tag_creates_nothing() {
+    let server = MockServer::start().await;
+    let p = provider(&server);
+    let err = p
+        .launch(LaunchSpec {
+            region: region(&p, "nyc1"),
+            instance_class: InstanceClass::Small,
+            user_data: String::new(),
+            tags: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Other(_)));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

@@ -31,7 +31,8 @@ use serde::Deserialize;
 use crate::http;
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
-    Instance, InstanceClass, LaunchSpec, Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
+    ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec,
+    Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
 };
 
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -107,6 +108,8 @@ pub struct AwsProvider {
     /// Test override: one base URL used for every region instead of the
     /// per-region `https://{service}.{region}.amazonaws.com` endpoint.
     base_url: Option<String>,
+    /// The one port the per-session security group opens.
+    session_port: u16,
     http: reqwest::Client,
     /// SSM-resolved AMI id per region, shared across clones so one
     /// resolution serves every launch this provider instance makes.
@@ -131,9 +134,17 @@ impl AwsProvider {
             access_key_id,
             secret_access_key,
             base_url: None,
+            session_port: DEFAULT_SESSION_PORT,
             http: http::client(),
             ami_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Session UDP port the security group opens; see
+    /// [`Provider::session_port`].
+    pub fn with_session_port(mut self, port: u16) -> Self {
+        self.session_port = port;
+        self
     }
 
     /// Credentials from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
@@ -331,6 +342,116 @@ impl AwsProvider {
         Ok(ami)
     }
 
+    /// Name of the session's security group. Up to 255 characters, and the
+    /// EC2 charset is wide enough that a session id never needs escaping.
+    fn group_name(session: &str) -> String {
+        format!("jamstream-{session}")
+    }
+
+    /// Group id of the session's security group, or None when it does not
+    /// exist. Looked up by name rather than by tag so a group created by a
+    /// launch that failed halfway is found and reused.
+    async fn find_group(&self, region: &str, session: &str) -> Result<Option<String>> {
+        let params = vec![
+            ("Filter.1.Name".to_owned(), "group-name".to_owned()),
+            ("Filter.1.Value.1".to_owned(), Self::group_name(session)),
+        ];
+        let body = self
+            .ec2_call(region, "DescribeSecurityGroups", &params)
+            .await?;
+        Ok(xml_value(&body, "groupId").map(xml_unescape))
+    }
+
+    /// Creates the session's security group and opens exactly one port in
+    /// it. Returns the group id, which `launch` passes to RunInstances so
+    /// the instance never exists without it.
+    ///
+    /// Nothing ambient is relied on: without this the instance lands in the
+    /// VPC default security group, which permits inbound only from itself,
+    /// so the session port is unreachable unless the account holder had
+    /// previously widened that group for something else.
+    async fn ensure_group(
+        &self,
+        region: &str,
+        session: &str,
+        tags: &[(String, String)],
+    ) -> Result<String> {
+        let name = Self::group_name(session);
+        let mut params = vec![
+            ("GroupName".to_owned(), name.clone()),
+            (
+                "GroupDescription".to_owned(),
+                format!("JamStream session {session}"),
+            ),
+            (
+                "TagSpecification.1.ResourceType".to_owned(),
+                "security-group".to_owned(),
+            ),
+        ];
+        for (i, (key, value)) in tags.iter().enumerate() {
+            params.push((format!("TagSpecification.1.Tag.{}.Key", i + 1), key.clone()));
+            params.push((
+                format!("TagSpecification.1.Tag.{}.Value", i + 1),
+                value.clone(),
+            ));
+        }
+        let group_id = match self.ec2_call(region, "CreateSecurityGroup", &params).await {
+            Ok(body) => xml_value(&body, "groupId")
+                .map(xml_unescape)
+                .ok_or_else(|| {
+                    ProviderError::Other(
+                        "CreateSecurityGroup response contained no groupId".to_owned(),
+                    )
+                })?,
+            // A retried launch finds its own group from the previous
+            // attempt. EC2 calls that InvalidGroup.Duplicate.
+            Err(err) if error_code(&err).as_deref() == Some("InvalidGroup.Duplicate") => {
+                self.find_group(region, session).await?.ok_or_else(|| {
+                    ProviderError::Other(format!(
+                        "security group {name} exists but cannot be found"
+                    ))
+                })?
+            }
+            Err(err) => return Err(err),
+        };
+
+        let port = self.session_port.to_string();
+        let authorize = vec![
+            ("GroupId".to_owned(), group_id.clone()),
+            ("IpPermissions.1.IpProtocol".to_owned(), "udp".to_owned()),
+            ("IpPermissions.1.FromPort".to_owned(), port.clone()),
+            ("IpPermissions.1.ToPort".to_owned(), port),
+            (
+                "IpPermissions.1.IpRanges.1.CidrIp".to_owned(),
+                ANY_IPV4.to_owned(),
+            ),
+            (
+                "IpPermissions.1.IpRanges.1.Description".to_owned(),
+                "JamStream session traffic".to_owned(),
+            ),
+            // A dual-stack subnet hands out a v6 address too, and a rule
+            // that covers only v4 is not the rule the session needs.
+            (
+                "IpPermissions.1.Ipv6Ranges.1.CidrIpv6".to_owned(),
+                ANY_IPV6.to_owned(),
+            ),
+            (
+                "IpPermissions.1.Ipv6Ranges.1.Description".to_owned(),
+                "JamStream session traffic".to_owned(),
+            ),
+        ];
+        match self
+            .ec2_call(region, "AuthorizeSecurityGroupIngress", &authorize)
+            .await
+        {
+            Ok(_) => {}
+            // Already open, which is the reused-group case.
+            Err(err) if error_code(&err).as_deref() == Some("InvalidPermission.Duplicate") => {}
+            Err(err) => return Err(err),
+        }
+        Ok(group_id)
+    }
+
     /// DescribeInstances with nextToken pagination, parsed into instances.
     async fn describe_instances(
         &self,
@@ -426,11 +547,11 @@ impl Provider for AwsProvider {
 
     async fn launch(&self, spec: LaunchSpec) -> Result<Instance> {
         let region = self.catalog_region(&spec.region.id)?;
-        if spec.session_id().is_none() {
+        let Some(session) = spec.session_id().map(str::to_owned) else {
             return Err(ProviderError::Other(format!(
                 "launch spec has no {SESSION_TAG_KEY} tag; refusing to create an instance the sweeper cannot find"
             )));
-        }
+        };
         let rd = data().regions.get(region.id.as_str()).ok_or_else(|| {
             ProviderError::NotFound(format!("no aws image data for region {}", region.id))
         })?;
@@ -448,6 +569,12 @@ impl Provider for AwsProvider {
             }
         };
 
+        // The security group exists before the instance does, so there is no
+        // window in which the instance is up on VPC defaults.
+        let group_id = self
+            .ensure_group(region.id.as_str(), &session, &spec.tags)
+            .await?;
+
         let mut params = vec![
             ("ImageId".to_owned(), ami),
             (
@@ -456,11 +583,26 @@ impl Provider for AwsProvider {
             ),
             ("MinCount".to_owned(), "1".to_owned()),
             ("MaxCount".to_owned(), "1".to_owned()),
+            ("SecurityGroupId.1".to_owned(), group_id),
             // Plain `shutdown -h now` in the guest terminates the VM, so
             // the cloud-init self-destruct path needs no credentials.
             (
                 "InstanceInitiatedShutdownBehavior".to_owned(),
                 "terminate".to_owned(),
+            ),
+            // IMDSv2 only. user-data carries the server private key, and
+            // IMDSv1 hands it to anything that can make an outbound GET,
+            // including through an SSRF in something else on the box.
+            // HttpEndpoint stays enabled: cloud-init reads user-data from
+            // IMDS and nowhere else, so disabling it would boot a VM with
+            // no configuration at all.
+            (
+                "MetadataOptions.HttpTokens".to_owned(),
+                "required".to_owned(),
+            ),
+            (
+                "MetadataOptions.HttpPutResponseHopLimit".to_owned(),
+                "1".to_owned(),
             ),
             (
                 "UserData".to_owned(),
@@ -565,6 +707,140 @@ impl Provider for AwsProvider {
         });
         Ok(out)
     }
+
+    fn session_port(&self) -> u16 {
+        self.session_port
+    }
+
+    async fn session_ingress(&self, session: &str) -> Result<Vec<IngressRule>> {
+        let params = vec![
+            ("Filter.1.Name".to_owned(), "group-name".to_owned()),
+            ("Filter.1.Value.1".to_owned(), Self::group_name(session)),
+        ];
+        let mut set = tokio::task::JoinSet::new();
+        for region in self.regions() {
+            let provider = self.clone();
+            let params = params.clone();
+            set.spawn(async move {
+                provider
+                    .ec2_call(region.id.as_str(), "DescribeSecurityGroups", &params)
+                    .await
+            });
+        }
+        let mut out = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Ok(body)) = joined {
+                out.extend(parse_ingress(&body));
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>> {
+        // Every group JamStream created carries the session tag, so this
+        // finds them without depending on the naming convention.
+        let params = vec![
+            ("Filter.1.Name".to_owned(), "tag-key".to_owned()),
+            ("Filter.1.Value.1".to_owned(), SESSION_TAG_KEY.to_owned()),
+        ];
+        let mut set = tokio::task::JoinSet::new();
+        for region in self.regions() {
+            let provider = self.clone();
+            let params = params.clone();
+            set.spawn(async move {
+                let listed = provider
+                    .ec2_call(region.id.as_str(), "DescribeSecurityGroups", &params)
+                    .await;
+                (region, listed)
+            });
+        }
+
+        let mut deleted = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            let Ok((region, Ok(body))) = joined else {
+                continue;
+            };
+            for (group_id, group_name) in parse_security_groups(&body) {
+                let params = vec![("GroupId".to_owned(), group_id.clone())];
+                match self
+                    .ec2_call(region.id.as_str(), "DeleteSecurityGroup", &params)
+                    .await
+                {
+                    Ok(_) => deleted.push(group_name),
+                    // The group still has a network interface behind it,
+                    // which is either a live session or an instance that is
+                    // still terminating. Either way it is not an orphan yet;
+                    // the next sweep gets it.
+                    Err(err) if error_code(&err).as_deref() == Some("DependencyViolation") => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            region = %region.id,
+                            group = group_name,
+                            error = %err,
+                            "could not delete security group"
+                        );
+                    }
+                }
+            }
+        }
+        deleted.sort();
+        Ok(deleted)
+    }
+}
+
+/// (groupId, groupName) for every group in a DescribeSecurityGroups body.
+fn parse_security_groups(xml: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some((id, after_id)) = take_tag(rest, "groupId") {
+        let Some((name, after_name)) = take_tag(after_id, "groupName") else {
+            break;
+        };
+        out.push((xml_unescape(id), xml_unescape(name)));
+        rest = after_name;
+    }
+    out
+}
+
+/// The ingress permissions of a DescribeSecurityGroups body. Only the
+/// `ipPermissions` block counts: `ipPermissionsEgress` is the allow-all
+/// outbound rule every new group starts with, which is what lets the VM
+/// download jamstreamd.
+fn parse_ingress(xml: &str) -> Vec<IngressRule> {
+    let Some(block) = xml_value(xml, "ipPermissions") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut rest = block;
+    while let Some((protocol, after)) = take_tag(rest, "ipProtocol") {
+        // A permission ends where the next one's protocol begins.
+        let end = after.find("<ipProtocol>").unwrap_or(after.len());
+        let item = &after[..end];
+        let port = |tag: &str| {
+            xml_value(item, tag)
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(0)
+        };
+        let mut cidrs = Vec::new();
+        for tag in ["cidrIp", "cidrIpv6"] {
+            let mut ranges = item;
+            while let Some((cidr, after_cidr)) = take_tag(ranges, tag) {
+                cidrs.push(xml_unescape(cidr));
+                ranges = after_cidr;
+            }
+        }
+        cidrs.sort();
+        out.push(IngressRule {
+            protocol: xml_unescape(protocol),
+            from_port: port("fromPort"),
+            to_port: port("toPort"),
+            cidrs,
+        });
+        rest = &after[end..];
+    }
+    out
 }
 
 /// Maps an EC2 error body (`<Response><Errors><Error><Code>...`) to a
@@ -593,6 +869,32 @@ fn map_error_body(body: &str) -> ProviderError {
     } else {
         ProviderError::Other(detail)
     }
+}
+
+/// EC2 error code behind an error returned by [`AwsProvider::ec2_call`].
+/// Codes that call names, `InvalidGroup.Duplicate` and
+/// `DependencyViolation`, are the difference between a retryable launch and
+/// a real failure, so they have to survive the trip through ProviderError.
+/// `map_error_body` renders what it remapped as "{code}: {message}"; an
+/// error it left alone still carries the raw XML.
+fn error_code(err: &ProviderError) -> Option<String> {
+    if let Some(code) = http::error_body(err)
+        .and_then(|body| xml_value(body, "Code"))
+        .map(xml_unescape)
+    {
+        return Some(code);
+    }
+    let msg = match err {
+        ProviderError::Auth(m)
+        | ProviderError::QuotaExceeded(m)
+        | ProviderError::NotFound(m)
+        | ProviderError::Transient(m)
+        | ProviderError::Other(m) => m,
+        ProviderError::RateLimited { .. } => return None,
+    };
+    let (code, _) = msg.split_once(": ")?;
+    // Codes are dotted CamelCase with no spaces; anything else is prose.
+    (!code.contains(' ') && !code.is_empty()).then(|| code.to_owned())
 }
 
 /// RFC 3986 percent-encoding with AWS's unreserved set. Everything
