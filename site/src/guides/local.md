@@ -16,7 +16,7 @@ An invite that names 192.168.1.12 means nothing outside your network. Reaching a
 
 ## Ending and the idle exit
 
-`jamstream end` kills the server process; for local sessions the instance id shown in `status` and `end` output is the process id. If you forget, the server watches its own activity and exits on its own after `--idle-min` minutes (default 10) with no musicians connected. There is no bill either way. `--max-hours` is a hard cap: invites expire at it, and the server exits on its own once the session has run that long, even with musicians still connected.
+`jamstream end` kills the server process; for local sessions the instance id shown in `status` and `end` output is the process id. If you forget, the server watches its own activity and exits on its own after `--idle-min` minutes (default 10) with no musicians connected. There is no bill either way. `--max-hours` still shapes the invites: they expire at the cap, so nobody new can join after it.
 
 If a laptop dies mid-session or a state file is lost, `jamstream sweep` finds local strays the same way it finds cloud ones: the local provider keeps an on-disk registry of the processes it spawned, so a later sweep from a fresh shell still sees and kills them.
 
@@ -28,7 +28,7 @@ Local mode runs a `jamstreamd` binary already on your machine; nothing is downlo
 2. A `jamstreamd` sitting next to the `jamstream` executable itself.
 3. `jamstreamd` on your PATH.
 
-`cargo install --path crates/server` satisfies the last one. If none resolves, `host` fails before starting anything, with an error naming all three places it looked.
+On Linux x86_64, the [install script's](../download.md) `--with-server` flag puts `jamstreamd` next to the `jamstream` CLI, satisfying the second. The desktop app ships `jamstreamd` alongside the app binary, which is how hosting from the app works everywhere. Building from source with `cargo install --path crates/server` satisfies the last one. If none resolves, `host` fails before starting anything, with an error naming all three places it looked.
 
 ## What lands on disk
 

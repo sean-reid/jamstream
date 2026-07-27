@@ -187,17 +187,62 @@
 </ul>
 <p>If something here does not match what the software does, that is a bug in one of them. <a href="#about">Report it.</a></p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="download"><a class="header" href="#download">Download</a></h1>
+<p>The first release has not been published yet; these links go live with it.</p>
+<p>Every link on this page points at the latest release by a stable name, so a new release updates them all in place. All artifacts are listed on the <a href="https://github.com/sean-reid/jamstream/releases/latest">releases page</a>, and each release includes a <a href="https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS">SHA256SUMS</a> file for verifying downloads. Building from source also works on every platform: clone <a href="https://github.com/sean-reid/jamstream">the repository</a> and run <code>cargo install --path crates/cli</code>.</p>
+<h2 id="install-the-cli-in-one-line"><a class="header" href="#install-the-cli-in-one-line">Install the CLI in one line</a></h2>
+<p>On macOS and Linux:</p>
+<pre><code class="language-console">$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
+</code></pre>
+<p>The script detects your platform, downloads the matching archive, verifies its sha256 against <code>SHA256SUMS</code>, and installs <code>jamstream</code> to <code>/usr/local/bin</code> when that is writable, otherwise to <code>~/.local/bin</code>. Set <code>JAMSTREAM_INSTALL_DIR</code> to pick the directory yourself. Appending <code>-s -- --with-server</code> also installs the <code>jamstreamd</code> session server on Linux x86_64, which <a href="#playing-on-the-same-network">local mode</a> uses.</p>
+<p>On Windows:</p>
+<pre><code class="language-console">&gt; powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
+</code></pre>
+<h2 id="macos"><a class="header" href="#macos">macOS</a></h2>
+<ul>
+<li>Desktop app: <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-macos.dmg">jamstream-app-macos.dmg</a></li>
+<li>CLI, one universal binary for Apple silicon and Intel: <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-macos-universal.tar.gz">jamstream-cli-macos-universal.tar.gz</a></li>
+</ul>
+<p>The app in the DMG is signed with a Developer ID certificate but not yet notarized by Apple. Until notarization ships, the first launch is blocked with a message that the app could not be verified: open System Settings, Privacy &amp; Security, and click Open Anyway next to the JamStream entry, or Control-click the app in Finder and choose Open. Once notarized builds ship, the app opens without any of that.</p>
+<p>Verify a download against the release checksums:</p>
+<pre><code class="language-console">$ curl -fsSLO https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS
+$ shasum -a 256 --check --ignore-missing SHA256SUMS
+jamstream-app-macos.dmg: OK
+</code></pre>
+<h2 id="windows"><a class="header" href="#windows">Windows</a></h2>
+<ul>
+<li>Desktop app: <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-windows-x86_64.zip">jamstream-app-windows-x86_64.zip</a></li>
+<li>CLI: <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-windows-x86_64.zip">jamstream-cli-windows-x86_64.zip</a></li>
+</ul>
+<p>The Windows binaries are plain zips and are not code signed. SmartScreen will show "Windows protected your PC" the first time you run them: click More info, then Run anyway. The warning is expected and the checksum below is the way to confirm you have the real file; a winget package, which verifies downloads by hash, is planned.</p>
+<p>Verify a download in PowerShell:</p>
+<pre><code class="language-console">&gt; irm https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS -OutFile SHA256SUMS
+&gt; (Get-FileHash jamstream-cli-windows-x86_64.zip).Hash
+&gt; Select-String jamstream-cli-windows-x86_64.zip SHA256SUMS
+</code></pre>
+<p>The two hashes must match; <code>Get-FileHash</code> prints uppercase and <code>SHA256SUMS</code> is lowercase, which does not matter.</p>
+<h2 id="linux"><a class="header" href="#linux">Linux</a></h2>
+<ul>
+<li>Desktop app (x86_64): <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-linux-x86_64.tar.gz">jamstream-app-linux-x86_64.tar.gz</a></li>
+<li>CLI (x86_64): <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-linux-x86_64.tar.gz">jamstream-cli-linux-x86_64.tar.gz</a></li>
+<li>Session server, static musl build (x86_64): <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-x86_64-musl.tar.gz">jamstreamd-linux-x86_64-musl.tar.gz</a></li>
+</ul>
+<p>The server tarball is the same artifact the cloud session machines download at boot; installing it locally (the install script's <code>--with-server</code> flag does this) is only needed for <a href="#playing-on-the-same-network">hosting on your own computer</a>. No arm64 Linux builds are published yet; build from source on that platform.</p>
+<p>Verify a download against the release checksums:</p>
+<pre><code class="language-console">$ curl -fsSLO https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS
+$ sha256sum --check --ignore-missing SHA256SUMS
+jamstream-cli-linux-x86_64.tar.gz: OK
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="quickstart-host-your-first-session"><a class="header" href="#quickstart-host-your-first-session">Quickstart: host your first session</a></h1>
 <p>Two paths from nothing to a running session. The local path takes about five minutes, needs no cloud account, and works for musicians in the same room or on the same network. The internet path launches the server in your own DigitalOcean account so bandmates anywhere can join; expect 20 minutes the first time, most of it on the DigitalOcean account. Every command is copy-pasteable.</p>
 <h2 id="1-install"><a class="header" href="#1-install">1. Install</a></h2>
-<p>No packaged releases exist yet, so build from source. You need a Rust toolchain (<a href="https://rustup.rs">rustup.rs</a>).</p>
-<pre><code class="language-console">$ git clone https://github.com/sean-reid/jamstream
-$ cd jamstream
-$ cargo install --path crates/cli
-$ cargo install --path crates/server
+<p>One line downloads the <code>jamstream</code> CLI from the latest release, verifies its checksum, and installs it:</p>
+<pre><code class="language-console">$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
 $ jamstream --version
 </code></pre>
-<p>The second install puts the <code>jamstreamd</code> server binary on your PATH, which is where local mode looks for it. The internet path does not need it locally; skip it if you are only hosting in the cloud.</p>
+<p>The <a href="#download">Download</a> page has the desktop app, the Windows install script, and direct links to every artifact. If no release has been published yet, the script says so and exits; building from source works on every platform with a Rust toolchain (<a href="https://rustup.rs">rustup.rs</a>): clone the repository, then <code>cargo install --path crates/cli</code>.</p>
+<p>The local path below also needs the <code>jamstreamd</code> server binary on this computer. On Linux x86_64, append <code>-s -- --with-server</code> to the install line to get it; elsewhere the desktop app ships it alongside the app, or <code>cargo install --path crates/server</code> builds it. The internet path does not need it locally; skip it if you are only hosting in the cloud.</p>
 <h2 id="2-host-on-this-computer"><a class="header" href="#2-host-on-this-computer">2. Host on this computer</a></h2>
 <p><code>local</code> is the default provider, so the flag is optional:</p>
 <pre><code class="language-console">$ jamstream host --provider local
@@ -409,7 +454,7 @@ left after 120 s; wrote mix.wav
 <li>A <code>jamstreamd</code> sitting next to the <code>jamstream</code> executable itself.</li>
 <li><code>jamstreamd</code> on your PATH.</li>
 </ol>
-<p><code>cargo install --path crates/server</code> satisfies the last one. If none resolves, <code>host</code> fails before starting anything, with an error naming all three places it looked.</p>
+<p>On Linux x86_64, the <a href="#download">install script's</a> <code>--with-server</code> flag puts <code>jamstreamd</code> next to the <code>jamstream</code> CLI, satisfying the second. The desktop app ships <code>jamstreamd</code> alongside the app binary, which is how hosting from the app works everywhere. Building from source with <code>cargo install --path crates/server</code> satisfies the last one. If none resolves, <code>host</code> fails before starting anything, with an error naming all three places it looked.</p>
 <h2 id="what-lands-on-disk"><a class="header" href="#what-lands-on-disk">What lands on disk</a></h2>
 <p>Under your platform's data directory in <code>jamstream/</code>: a <code>local.json</code> registry of running server processes, and one directory per session holding the server's config and its log (<code>server.log</code>, the first place to look if a local server exits at startup). The session state files that <code>status</code> and <code>end</code> read live in <code>jamstream/sessions/</code> as for any provider.</p>
 <div style="break-before: page; page-break-before: always;"></div>

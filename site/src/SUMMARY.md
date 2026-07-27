@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](introduction.md)
+[Download](download.md)
 
 - [Quickstart: host your first session](quickstart.md)
 

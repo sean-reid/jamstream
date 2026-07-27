@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Playing on the same network - JamStream</title>
+        <title>Download - JamStream</title>
 
 
         <!-- Custom HTML head -->
@@ -12,31 +12,31 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#121212">
 
-        <link rel="icon" href="../favicon.svg">
-        <link rel="shortcut icon" href="../favicon.png">
-        <link rel="stylesheet" href="../css/variables.css">
-        <link rel="stylesheet" href="../css/general.css">
-        <link rel="stylesheet" href="../css/chrome.css">
-        <link rel="stylesheet" href="../css/print.css" media="print">
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="../fonts/fonts.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
 
         <!-- Highlight.js stylesheet: one scheme, matching the one theme. -->
-        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "../";
+            const path_to_root = "";
             const default_light_theme = "jamstream";
             const default_dark_theme = "jamstream";
-            window.path_to_searchindex_js = "../searchindex.js";
+            window.path_to_searchindex_js = "searchindex.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc.js"></script>
+        <script src="toc.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -94,7 +94,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
             </noscript>
             <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -119,7 +119,7 @@
                     <h1 class="menu-title">JamStream</h1>
 
                     <div class="right-buttons">
-                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
                             <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
                         </a>
                         <a href="https://github.com/sean-reid/jamstream" title="Git repository" aria-label="Git repository">
@@ -156,40 +156,62 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="playing-on-the-same-network"><a class="header" href="#playing-on-the-same-network">Playing on the same network</a></h1>
-<p><code>jamstream host --provider local</code> runs the session server as a process on your own computer instead of a cloud machine. Everything else is the same flow: invites are minted up front, the CLI completes a real encrypted handshake with the server before printing them, <code>jamstream status</code> lists the session, and <code>jamstream end</code> tears it down.</p>
-<h2 id="when-local-is-the-right-choice"><a class="header" href="#when-local-is-the-right-choice">When local is the right choice</a></h2>
+                        <h1 id="download"><a class="header" href="#download">Download</a></h1>
+<p>The first release has not been published yet; these links go live with it.</p>
+<p>Every link on this page points at the latest release by a stable name, so a new release updates them all in place. All artifacts are listed on the <a href="https://github.com/sean-reid/jamstream/releases/latest">releases page</a>, and each release includes a <a href="https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS">SHA256SUMS</a> file for verifying downloads. Building from source also works on every platform: clone <a href="https://github.com/sean-reid/jamstream">the repository</a> and run <code>cargo install --path crates/cli</code>.</p>
+<h2 id="install-the-cli-in-one-line"><a class="header" href="#install-the-cli-in-one-line">Install the CLI in one line</a></h2>
+<p>On macOS and Linux:</p>
+<pre><code class="language-console">$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
+</code></pre>
+<p>The script detects your platform, downloads the matching archive, verifies its sha256 against <code>SHA256SUMS</code>, and installs <code>jamstream</code> to <code>/usr/local/bin</code> when that is writable, otherwise to <code>~/.local/bin</code>. Set <code>JAMSTREAM_INSTALL_DIR</code> to pick the directory yourself. Appending <code>-s -- --with-server</code> also installs the <code>jamstreamd</code> session server on Linux x86_64, which <a href="guides/local.html">local mode</a> uses.</p>
+<p>On Windows:</p>
+<pre><code class="language-console">&gt; powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
+</code></pre>
+<h2 id="macos"><a class="header" href="#macos">macOS</a></h2>
 <ul>
-<li>Everyone is in the same room or on the same network. The invites carry your machine's network address (for example 192.168.1.12), so any machine on the same network can join.</li>
-<li>You want the lowest possible latency. The audio path is one hop across your own network, with no internet in it.</li>
-<li>You want to try JamStream before creating a cloud account. Local sessions need no credentials and cost nothing.</li>
+<li>Desktop app: <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-macos.dmg">jamstream-app-macos.dmg</a></li>
+<li>CLI, one universal binary for Apple silicon and Intel: <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-macos-universal.tar.gz">jamstream-cli-macos-universal.tar.gz</a></li>
 </ul>
-<p>Playing alone on one machine also works: joining from the hosting computer goes over the loopback interface.</p>
-<h2 id="the-limits-honestly"><a class="header" href="#the-limits-honestly">The limits, honestly</a></h2>
-<p>An invite that names 192.168.1.12 means nothing outside your network. Reaching a local session across the internet would take router port forwarding: forwarding the session's UDP port (default 43210) to this computer in your router's admin pages, a public IP that many home connections behind carrier NAT do not have, and an invite carrying that public address, which the current build cannot mint (invites carry the network address it discovers, and multi-address invites are future work). JamStream automates none of that. If anyone is joining from outside your network, host in the cloud instead; see <a href="providers.html">Provider setup</a>.</p>
-<h2 id="ending-and-the-idle-exit"><a class="header" href="#ending-and-the-idle-exit">Ending and the idle exit</a></h2>
-<p><code>jamstream end</code> kills the server process; for local sessions the instance id shown in <code>status</code> and <code>end</code> output is the process id. If you forget, the server watches its own activity and exits on its own after <code>--idle-min</code> minutes (default 10) with no musicians connected. There is no bill either way. <code>--max-hours</code> still shapes the invites: they expire at the cap, so nobody new can join after it.</p>
-<p>If a laptop dies mid-session or a state file is lost, <code>jamstream sweep</code> finds local strays the same way it finds cloud ones: the local provider keeps an on-disk registry of the processes it spawned, so a later sweep from a fresh shell still sees and kills them.</p>
-<h2 id="where-the-server-binary-comes-from"><a class="header" href="#where-the-server-binary-comes-from">Where the server binary comes from</a></h2>
-<p>Local mode runs a <code>jamstreamd</code> binary already on your machine; nothing is downloaded, and the <code>--artifact-url</code> and <code>--artifact-sha256</code> flags are not needed. The binary is found in this order:</p>
-<ol>
-<li>The <code>JAMSTREAMD_PATH</code> environment variable, if set, is used as the path.</li>
-<li>A <code>jamstreamd</code> sitting next to the <code>jamstream</code> executable itself.</li>
-<li><code>jamstreamd</code> on your PATH.</li>
-</ol>
-<p>On Linux x86_64, the <a href="../download.html">install script's</a> <code>--with-server</code> flag puts <code>jamstreamd</code> next to the <code>jamstream</code> CLI, satisfying the second. The desktop app ships <code>jamstreamd</code> alongside the app binary, which is how hosting from the app works everywhere. Building from source with <code>cargo install --path crates/server</code> satisfies the last one. If none resolves, <code>host</code> fails before starting anything, with an error naming all three places it looked.</p>
-<h2 id="what-lands-on-disk"><a class="header" href="#what-lands-on-disk">What lands on disk</a></h2>
-<p>Under your platform's data directory in <code>jamstream/</code>: a <code>local.json</code> registry of running server processes, and one directory per session holding the server's config and its log (<code>server.log</code>, the first place to look if a local server exits at startup). The session state files that <code>status</code> and <code>end</code> read live in <code>jamstream/sessions/</code> as for any provider.</p>
+<p>The app in the DMG is signed with a Developer ID certificate but not yet notarized by Apple. Until notarization ships, the first launch is blocked with a message that the app could not be verified: open System Settings, Privacy &amp; Security, and click Open Anyway next to the JamStream entry, or Control-click the app in Finder and choose Open. Once notarized builds ship, the app opens without any of that.</p>
+<p>Verify a download against the release checksums:</p>
+<pre><code class="language-console">$ curl -fsSLO https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS
+$ shasum -a 256 --check --ignore-missing SHA256SUMS
+jamstream-app-macos.dmg: OK
+</code></pre>
+<h2 id="windows"><a class="header" href="#windows">Windows</a></h2>
+<ul>
+<li>Desktop app: <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-windows-x86_64.zip">jamstream-app-windows-x86_64.zip</a></li>
+<li>CLI: <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-windows-x86_64.zip">jamstream-cli-windows-x86_64.zip</a></li>
+</ul>
+<p>The Windows binaries are plain zips and are not code signed. SmartScreen will show "Windows protected your PC" the first time you run them: click More info, then Run anyway. The warning is expected and the checksum below is the way to confirm you have the real file; a winget package, which verifies downloads by hash, is planned.</p>
+<p>Verify a download in PowerShell:</p>
+<pre><code class="language-console">&gt; irm https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS -OutFile SHA256SUMS
+&gt; (Get-FileHash jamstream-cli-windows-x86_64.zip).Hash
+&gt; Select-String jamstream-cli-windows-x86_64.zip SHA256SUMS
+</code></pre>
+<p>The two hashes must match; <code>Get-FileHash</code> prints uppercase and <code>SHA256SUMS</code> is lowercase, which does not matter.</p>
+<h2 id="linux"><a class="header" href="#linux">Linux</a></h2>
+<ul>
+<li>Desktop app (x86_64): <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-linux-x86_64.tar.gz">jamstream-app-linux-x86_64.tar.gz</a></li>
+<li>CLI (x86_64): <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-linux-x86_64.tar.gz">jamstream-cli-linux-x86_64.tar.gz</a></li>
+<li>Session server, static musl build (x86_64): <a href="https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-x86_64-musl.tar.gz">jamstreamd-linux-x86_64-musl.tar.gz</a></li>
+</ul>
+<p>The server tarball is the same artifact the cloud session machines download at boot; installing it locally (the install script's <code>--with-server</code> flag does this) is only needed for <a href="guides/local.html">hosting on your own computer</a>. No arm64 Linux builds are published yet; build from source on that platform.</p>
+<p>Verify a download against the release checksums:</p>
+<pre><code class="language-console">$ curl -fsSLO https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS
+$ sha256sum --check --ignore-missing SHA256SUMS
+jamstream-cli-linux-x86_64.tar.gz: OK
+</code></pre>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../guides/joining.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="introduction.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../guides/providers.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="quickstart.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -199,11 +221,11 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../guides/joining.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="introduction.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../guides/providers.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="quickstart.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -223,13 +245,13 @@
         </script>
 
 
-        <script src="../elasticlunr.min.js"></script>
-        <script src="../mark.min.js"></script>
-        <script src="../searcher.js"></script>
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
 
-        <script src="../clipboard.min.js"></script>
-        <script src="../highlight.js"></script>
-        <script src="../book.js"></script>
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
 
         <!-- Custom JS scripts -->
 

@@ -159,14 +159,12 @@
                         <h1 id="quickstart-host-your-first-session"><a class="header" href="#quickstart-host-your-first-session">Quickstart: host your first session</a></h1>
 <p>Two paths from nothing to a running session. The local path takes about five minutes, needs no cloud account, and works for musicians in the same room or on the same network. The internet path launches the server in your own DigitalOcean account so bandmates anywhere can join; expect 20 minutes the first time, most of it on the DigitalOcean account. Every command is copy-pasteable.</p>
 <h2 id="1-install"><a class="header" href="#1-install">1. Install</a></h2>
-<p>No packaged releases exist yet, so build from source. You need a Rust toolchain (<a href="https://rustup.rs">rustup.rs</a>).</p>
-<pre><code class="language-console">$ git clone https://github.com/sean-reid/jamstream
-$ cd jamstream
-$ cargo install --path crates/cli
-$ cargo install --path crates/server
+<p>One line downloads the <code>jamstream</code> CLI from the latest release, verifies its checksum, and installs it:</p>
+<pre><code class="language-console">$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
 $ jamstream --version
 </code></pre>
-<p>The second install puts the <code>jamstreamd</code> server binary on your PATH, which is where local mode looks for it. The internet path does not need it locally; skip it if you are only hosting in the cloud.</p>
+<p>The <a href="download.html">Download</a> page has the desktop app, the Windows install script, and direct links to every artifact. If no release has been published yet, the script says so and exits; building from source works on every platform with a Rust toolchain (<a href="https://rustup.rs">rustup.rs</a>): clone the repository, then <code>cargo install --path crates/cli</code>.</p>
+<p>The local path below also needs the <code>jamstreamd</code> server binary on this computer. On Linux x86_64, append <code>-s -- --with-server</code> to the install line to get it; elsewhere the desktop app ships it alongside the app, or <code>cargo install --path crates/server</code> builds it. The internet path does not need it locally; skip it if you are only hosting in the cloud.</p>
 <h2 id="2-host-on-this-computer"><a class="header" href="#2-host-on-this-computer">2. Host on this computer</a></h2>
 <p><code>local</code> is the default provider, so the flag is optional:</p>
 <pre><code class="language-console">$ jamstream host --provider local
@@ -278,7 +276,7 @@ No jamstream-tagged instances found.
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="introduction.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="download.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -292,7 +290,7 @@ No jamstream-tagged instances found.
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="introduction.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="download.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
