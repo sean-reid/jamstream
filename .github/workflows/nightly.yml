@@ -23,7 +23,7 @@ jobs:
       matrix:
         target: [wire_parse, invite_decode, media_decode, control_receive]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -32,7 +32,7 @@ jobs:
       # The key includes the run id so every night saves its grown corpus;
       # restore-keys picks up the most recent previous night. The restore
       # unpacks on top of the committed seeds, never replacing them.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: crates/protocol/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -43,7 +43,7 @@ jobs:
       # cargo-fuzz needs nightly for its sanitizer flags.
       - run: cargo +nightly fuzz run ${{ matrix.target }} --fuzz-dir crates/protocol/fuzz -- -max_total_time=600
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: crates/protocol/fuzz/artifacts/
@@ -62,7 +62,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
@@ -72,7 +72,7 @@ jobs:
       - if: runner.os != 'macOS'
         run: cargo test --workspace --exclude jamstream-client
       - if: always() && runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-ui-previews
           path: target/ui-previews/
@@ -99,7 +99,7 @@ jobs:
             echo 'No cloud credentials configured; live smoke skipped.' >> "$GITHUB_STEP_SUMMARY"
           fi
       - if: steps.creds.outputs.available == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - if: steps.creds.outputs.available == 'true'
         uses: dtolnay/rust-toolchain@stable
       - if: steps.creds.outputs.available == 'true'
