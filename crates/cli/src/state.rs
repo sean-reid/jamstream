@@ -26,7 +26,7 @@ pub enum SessionStatus {
     Ended,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id_hex: String,
     pub provider: String,
@@ -42,6 +42,38 @@ pub struct SessionState {
     pub status: SessionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_unix: Option<u64>,
+}
+
+/// Redacts the issuer private key, which mints and revokes every invite to
+/// the session. Nothing formats a `SessionState` today; the point is that
+/// the first thing that does cannot leak it.
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionState")
+            .field("session_id_hex", &self.session_id_hex)
+            .field("provider", &self.provider)
+            .field("region", &self.region)
+            .field("instance_id", &self.instance_id)
+            .field("address", &self.address)
+            .field("created_unix", &self.created_unix)
+            .field("hourly_microusd", &self.hourly_microusd)
+            .field("issuer_private_key_b64", &"<redacted>")
+            .field("server_public_key_b64", &self.server_public_key_b64)
+            .field("invites", &self.invites)
+            .field("status", &self.status)
+            .field("ended_unix", &self.ended_unix)
+            .finish()
+    }
+}
+
+impl SessionState {
+    /// Drops the issuer private key. Nothing can be minted or revoked for a
+    /// session whose server is destroyed, so the key stops being useful at
+    /// exactly the moment `end` succeeds, while the record itself is worth
+    /// keeping for `status` and for the cost history.
+    pub fn forget_issuer_key(&mut self) {
+        self.issuer_private_key_b64 = String::new();
+    }
 }
 
 /// Where session records live: [`STATE_DIR_ENV`] when set, else a
@@ -214,6 +246,37 @@ mod tests {
             resolve_data_dir(Some(home.clone())).unwrap(),
             home.join("jamstream")
         );
+    }
+
+    /// The issuer key mints and revokes every invite to the session, so it
+    /// is not something a stray `{:?}` may print.
+    #[test]
+    fn debug_never_reveals_the_issuer_key() {
+        let rendered = format!("{:?}", sample());
+        assert!(!rendered.contains("aXNzdWVy"));
+        assert!(rendered.contains("<redacted>"));
+        // The public half and the identity stay visible.
+        assert!(rendered.contains("c2VydmVy"));
+        assert!(rendered.contains("deadbeefcafef00d"));
+    }
+
+    #[test]
+    fn ending_a_session_forgets_the_issuer_key() {
+        let path = temp_path("forget");
+        let mut state = sample();
+        write_to(&path, &state).unwrap();
+        state.status = SessionStatus::Ended;
+        state.forget_issuer_key();
+        write_to(&path, &state).unwrap();
+
+        let reloaded = load(&path).unwrap();
+        assert!(reloaded.issuer_private_key_b64.is_empty());
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("aXNzdWVy"));
+        // Everything the record is kept for survives.
+        assert_eq!(reloaded.session_id_hex, state.session_id_hex);
+        assert_eq!(reloaded.hourly_microusd, state.hourly_microusd);
+        assert_eq!(reloaded.invites.len(), 2);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

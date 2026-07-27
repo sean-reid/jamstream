@@ -3,7 +3,7 @@
 //! variant; change the output and the snapshots must change with it.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
@@ -71,7 +71,7 @@ pub fn media_artifacts() -> &'static MediaArtifacts {
 }
 
 /// How the VM guarantees its own death, per provider capability.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SelfDestruct {
     /// AWS: instance-initiated shutdown behavior is set to terminate at
     /// launch, so plain shutdown terminates with no credentials on the box.
@@ -85,7 +85,23 @@ pub enum SelfDestruct {
     GcpMaxRunDuration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The DigitalOcean token is the host's account credential, so it never
+/// reaches a formatter, only the rendered script that needs it.
+impl fmt::Debug for SelfDestruct {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SelfDestruct::AwsShutdown => f.write_str("AwsShutdown"),
+            SelfDestruct::GcpMaxRunDuration => f.write_str("GcpMaxRunDuration"),
+            SelfDestruct::ApiToken { endpoint, .. } => f
+                .debug_struct("ApiToken")
+                .field("endpoint", endpoint)
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct BootConfig {
     pub artifact_url: String,
     pub artifact_sha256: String,
@@ -96,6 +112,24 @@ pub struct BootConfig {
     pub idle_shutdown_min: u32,
     pub max_duration_min: u32,
     pub self_destruct: SelfDestruct,
+}
+
+/// Redacts the server's private key. Everything else here is either
+/// public or a number, and the fields are worth seeing in a log.
+impl fmt::Debug for BootConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BootConfig")
+            .field("artifact_url", &self.artifact_url)
+            .field("artifact_sha256", &self.artifact_sha256)
+            .field("server_private_key_b64", &"<redacted>")
+            .field("issuer_public_key_b64", &self.issuer_public_key_b64)
+            .field("session_id_hex", &self.session_id_hex)
+            .field("port", &self.port)
+            .field("idle_shutdown_min", &self.idle_shutdown_min)
+            .field("max_duration_min", &self.max_duration_min)
+            .field("self_destruct", &self.self_destruct)
+            .finish()
+    }
 }
 
 impl BootConfig {
@@ -728,6 +762,34 @@ mod tests {
             "0f2e5c1d3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d  \
              /usr/local/bin/jamstreamd.download"
         ));
+    }
+
+    /// The three providers all redact their credentials from Debug and
+    /// have a test saying so; the boot config and the self-destruct spec
+    /// hold the same class of secret and were missed.
+    #[test]
+    fn debug_never_reveals_a_key_or_a_token() {
+        let cfg = BootConfig {
+            self_destruct: SelfDestruct::ApiToken {
+                endpoint: "https://api.digitalocean.com/v2/droplets".to_owned(),
+                token: "dop_v1_supersecret".to_owned(),
+            },
+            ..base_config(SelfDestruct::AwsShutdown)
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("dop_v1_supersecret"));
+        assert!(!rendered.contains(&cfg.server_private_key_b64));
+        assert_eq!(rendered.matches("<redacted>").count(), 2);
+        // What is left is the part worth having in a log.
+        assert!(rendered.contains("api.digitalocean.com"));
+        assert!(rendered.contains("deadbeefcafef00d"));
+        assert!(rendered.contains("43210"));
+        // The variants with nothing to hide print plainly.
+        assert_eq!(format!("{:?}", SelfDestruct::AwsShutdown), "AwsShutdown");
+        assert_eq!(
+            format!("{:?}", SelfDestruct::GcpMaxRunDuration),
+            "GcpMaxRunDuration"
+        );
     }
 
     /// The three self-destruct variants, for tests that must hold for all
