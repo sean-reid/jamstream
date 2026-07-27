@@ -4,7 +4,9 @@
 //! The second pass plugs the real session core in without touching screens.
 
 pub mod app;
+pub mod creds;
 pub mod demo;
+pub mod exec;
 pub mod live;
 pub mod runtime;
 pub mod screens;

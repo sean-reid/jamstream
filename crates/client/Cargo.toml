@@ -28,9 +28,10 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 dirs.workspace = true
+keyring.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true
 jamstream-server.workspace = true
 hound.workspace = true
-tokio.workspace = true
