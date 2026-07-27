@@ -1590,6 +1590,30 @@ fn timeout_then_rejoin_with_same_token() {
     assert!(roster.iter().all(|m| m.connected));
 }
 
+/// An attacker on the same wifi sees the init leave and answers it with
+/// garbage before the server can. The join must still happen: snow restores
+/// its symmetric state on a failed read, so the client keeps the handshake it
+/// started and the server's real response completes it.
+#[test]
+fn a_sprayed_handshake_response_cannot_keep_a_client_out() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv = h.mint(0, Role::Musician);
+    let idx = h.add_client(&inv, Some(0.0));
+    let victim = h.clients[idx].addr;
+
+    // One forged response per step for the first 100 ms, arriving ahead of
+    // the server's own answer in every step.
+    for _ in 0..40 {
+        let now = h.now_ms();
+        let forged = wire::build_handshake_resp(&[0xA5; 96]);
+        h.clients[idx].core.handle_datagram(now, &forged);
+        h.step();
+    }
+    assert_eq!(*h.clients[idx].core.state(), ClientState::Joined);
+    assert_eq!(h.server.musicians_connected(), 1);
+    assert_eq!(h.clients[idx].addr, victim);
+}
+
 #[test]
 fn version_reject_rate_limited_and_verified() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);

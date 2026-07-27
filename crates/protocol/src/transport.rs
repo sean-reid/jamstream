@@ -67,9 +67,43 @@ fn prologue(version: u16, session_id: &SessionId) -> Vec<u8> {
     p
 }
 
-/// Client side. `new` produces the full wire datagram to send.
+/// A failed [`Initiator::finish`], carrying the initiator back to the caller.
+///
+/// snow checkpoints its symmetric state before a `read_message` and restores
+/// it on failure without advancing the handshake pattern, so a response that
+/// does not authenticate costs the handshake nothing. Handing the initiator
+/// back is what lets a client ignore forged responses: anyone who can see a
+/// connecting client's address can spray them, and starting over on each one
+/// means the genuine response, computed against the init already sent, no
+/// longer fits.
+pub struct HandshakeRetry {
+    pub error: Error,
+    initiator: Option<Initiator>,
+}
+
+impl HandshakeRetry {
+    /// The handshake state when it is still usable, which is every failure
+    /// an attacker can cause. `None` means the response authenticated and
+    /// then turned out to be unusable, which spends the state.
+    pub fn into_initiator(self) -> Option<Initiator> {
+        self.initiator
+    }
+}
+
+impl std::fmt::Debug for HandshakeRetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeRetry")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Client side. `new` produces the full wire datagram to send. The handshake
+/// state is boxed because it is most of a kilobyte and travels back through
+/// [`HandshakeRetry`] on every response that does not verify, which an
+/// attacker sets the rate of.
 pub struct Initiator {
-    hs: HandshakeState,
+    hs: Box<HandshakeState>,
 }
 
 impl Initiator {
@@ -89,17 +123,40 @@ impl Initiator {
         let mut msg = vec![0u8; payload.len() + 160];
         let len = hs.write_message(&payload, &mut msg)?;
         Ok((
-            Self { hs },
+            Self { hs: Box::new(hs) },
             wire::build_handshake_init(PROTOCOL_VERSION, &msg[..len]),
         ))
     }
 
     /// Consumes the server's handshake response and yields the transport.
-    pub fn finish(mut self, resp_noise: &[u8]) -> Result<(Session, Welcome), Error> {
+    /// On failure the initiator comes back in the error so the caller can
+    /// wait for a response that does verify; see [`HandshakeRetry`].
+    pub fn finish(mut self, resp_noise: &[u8]) -> Result<(Session, Welcome), HandshakeRetry> {
         let mut payload = vec![0u8; resp_noise.len()];
-        let len = self.hs.read_message(resp_noise, &mut payload)?;
-        let welcome: Welcome = postcard::from_bytes(&payload[..len])?;
-        let ts = self.hs.into_stateless_transport_mode()?;
+        let len = match self.hs.read_message(resp_noise, &mut payload) {
+            Ok(len) => len,
+            Err(e) => {
+                return Err(HandshakeRetry {
+                    error: e.into(),
+                    initiator: Some(self),
+                });
+            }
+        };
+        // Past here the response authenticated, so it came from the server
+        // and the handshake state has advanced: nothing else can be read
+        // with it, and the caller has no retry to make.
+        let welcome: Welcome =
+            postcard::from_bytes(&payload[..len]).map_err(|e| HandshakeRetry {
+                error: e.into(),
+                initiator: None,
+            })?;
+        let ts = self
+            .hs
+            .into_stateless_transport_mode()
+            .map_err(|e| HandshakeRetry {
+                error: e.into(),
+                initiator: None,
+            })?;
         Ok((Session::new(ts), welcome))
     }
 }

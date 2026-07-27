@@ -323,15 +323,15 @@ impl ClientCore {
                             let _ = self.link.send(ControlMsg::SetAvatar { hash, len });
                         }
                     }
-                    Err(_) => {
-                        // A forged or corrupt response consumed the handshake
-                        // state; rebuild so poll() keeps retrying. The server
-                        // may hold a half-open admission until its timeout.
-                        tracing::warn!("handshake response failed to verify");
-                        if let Ok((initiator, init_packet)) = Initiator::new(&self.invite) {
-                            self.initiator = Some(initiator);
-                            self.init_packet = init_packet;
-                        }
+                    Err(retry) => {
+                        // Keep the handshake state and the init bytes. A
+                        // forged response is free to send for anyone who can
+                        // see this client's address, and starting over on
+                        // each one meant the genuine response, computed
+                        // against the init already sent, no longer fitted.
+                        // Logged at debug because an attacker sets the rate.
+                        tracing::debug!("handshake response failed to verify");
+                        self.initiator = retry.into_initiator();
                     }
                 }
             }
@@ -1042,6 +1042,23 @@ mod tests {
             core.events(),
             vec![ClientEvent::Rejected { ours: 1, theirs: 2 }]
         );
+    }
+
+    /// Anyone who can see a connecting client's address can spray handshake
+    /// responses. Each one used to consume the handshake state and mint a
+    /// fresh init, which left the server's answer to the init already sent
+    /// unreadable, so the spray alone kept the client out of the session.
+    #[test]
+    fn forged_handshake_responses_do_not_disturb_the_handshake() {
+        let (mut core, first) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
+        for i in 0..64u8 {
+            let forged = wire::build_handshake_resp(&[i; 96]);
+            assert!(core.handle_datagram(1, &forged).is_empty());
+            assert_eq!(*core.state(), ClientState::Connecting);
+        }
+        // Same init bytes on the wire, so the server's cached response and
+        // its transport state still pair with what this client sent.
+        assert_eq!(core.poll(500), vec![first]);
     }
 
     #[test]
