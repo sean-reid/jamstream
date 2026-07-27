@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use jamstream_cloud::providers::gcp::{GcpProvider, ServiceAccountTokenSource};
 use jamstream_cloud::{
-    InstanceClass, LaunchSpec, Provider, ProviderError, ProviderKind, Region, RegionId, session_tag,
+    BootConfig, InstanceClass, LaunchSpec, Provider, ProviderError, ProviderKind, Region, RegionId,
+    SelfDestruct, session_tag,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{
@@ -150,6 +151,52 @@ async fn launch_inserts_instance_with_expected_body() {
         "block-project-ssh-keys"
     );
     assert_eq!(body["metadata"]["items"][1]["value"], "TRUE");
+    // Nothing on the instance may hold a credential.
+    assert_eq!(body["serviceAccounts"], json!([]));
+}
+
+/// #51 end to end: `--max-hours` used to reach the API nowhere, so every
+/// GCP session was capped at the 12 h default however long the host asked
+/// for. The cap travels in the cloud-init the VM boots from, which is the
+/// only channel a `LaunchSpec` has for it.
+#[tokio::test]
+async fn the_run_cap_on_the_wire_is_the_session_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(zone_path("us-central1-b")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "name": "operation-1", "status": "RUNNING" })),
+        )
+        .mount(&server)
+        .await;
+    mount_firewalls(&server).await;
+
+    let p = provider(&server);
+    let boot = BootConfig {
+        artifact_url: "https://example.invalid/jamstreamd".to_owned(),
+        artifact_sha256: "0".repeat(64),
+        server_private_key_b64: "c2s=".to_owned(),
+        issuer_public_key_b64: "aXA=".to_owned(),
+        session_id_hex: "deadbeefcafef00d".to_owned(),
+        port: 43210,
+        idle_shutdown_min: 10,
+        // The host asked for two hours.
+        max_duration_min: 120,
+        self_destruct: SelfDestruct::GcpMaxRunDuration,
+    };
+    let mut spec = spec(&p);
+    spec.user_data = jamstream_cloud::cloudinit::render(&boot);
+    p.launch(spec).await.expect("launch");
+
+    let requests = server.received_requests().await.unwrap();
+    let insert = requests
+        .iter()
+        .find(|r| r.url.path() != firewalls_path())
+        .expect("instance insert");
+    let body: Value = serde_json::from_slice(&insert.body).unwrap();
+    assert_eq!(body["scheduling"]["maxRunDuration"]["seconds"], "7200");
+    assert_eq!(body["scheduling"]["instanceTerminationAction"], "DELETE");
 }
 
 #[tokio::test]

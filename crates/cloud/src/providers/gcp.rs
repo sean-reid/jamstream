@@ -4,6 +4,17 @@
 //! (see [`crate::cloudinit::SelfDestruct::GcpMaxRunDuration`]), labels
 //! everything it creates, lists by label, and destroys by name.
 //!
+//! # How a GCP session ends
+//!
+//! The instance carries no service account, so nothing on it can call the
+//! API, which leaves three ways out and no fourth: `jamstream end`, the
+//! sweeper on the next app or CLI launch, or `maxRunDuration` expiring.
+//! That last one is why the cap is set from the session's own
+//! `max_duration_min` rather than a constant, and why the in-guest guard
+//! stops the server instead of powering the VM off: Compute Engine clears
+//! a VM's pending termination timestamp when the VM stops, so a
+//! powered-off instance outlives its own cap.
+//!
 //! # Authentication
 //!
 //! GCP service-account keys require an RS256-signed JWT to mint an OAuth2
@@ -248,9 +259,9 @@ impl GcpProvider {
         self
     }
 
-    /// Overrides the `scheduling.maxRunDuration` hard cap (default 12h).
-    /// GCP deletes the instance when the cap elapses
-    /// (`instanceTerminationAction=DELETE`).
+    /// Overrides the `scheduling.maxRunDuration` hard cap for every launch,
+    /// ahead of the session's own cap. Ordinarily the cap comes from the
+    /// launch spec: see [`GcpProvider::launch_body`].
     pub fn with_max_run_seconds(mut self, seconds: u64) -> Self {
         self.max_run_seconds = Some(seconds);
         self
@@ -316,6 +327,13 @@ impl GcpProvider {
 
     /// Builds the instance insert body. Factored out so the shape is unit
     /// testable without a server.
+    ///
+    /// `maxRunDuration` is the session's own hard cap, read back out of the
+    /// user-data that carries it. It reaches this call no other way:
+    /// `LaunchSpec` has no field for the cap, and a builder on this type
+    /// would only ever be set by the CLI, while the desktop app constructs
+    /// its provider itself. Getting it wrong is not cosmetic: it is the one
+    /// mechanism that ends a GCP session.
     fn launch_body(&self, spec: &LaunchSpec, name: &str) -> Result<Value> {
         let zone = default_zone(spec.region.id.as_str());
         let mut labels = serde_json::Map::new();
@@ -326,7 +344,10 @@ impl GcpProvider {
             MARKER_LABEL_KEY.to_owned(),
             Value::String("true".to_owned()),
         );
-        let seconds = self.max_run_seconds.unwrap_or(DEFAULT_MAX_RUN_SECONDS);
+        let seconds = self
+            .max_run_seconds
+            .or_else(|| session_max_run_seconds(&spec.user_data))
+            .unwrap_or(DEFAULT_MAX_RUN_SECONDS);
         let session = spec.session_id().ok_or_else(|| {
             ProviderError::Other(format!(
                 "launch spec has no {SESSION_TAG_KEY} tag; refusing to create an instance the sweeper cannot find"
@@ -357,6 +378,14 @@ impl GcpProvider {
                 { "key": "block-project-ssh-keys", "value": "TRUE" },
             ] },
             "labels": labels,
+            // Empty on purpose, and stated rather than left out. The raw
+            // Compute API attaches no service account when the field is
+            // absent, unlike gcloud and the console, which default one in
+            // on the client side; anyone reading this should see the
+            // decision instead of inferring it from an omission. A session
+            // VM parses unauthenticated UDP from the internet and has no
+            // call of its own to make, so it carries no credential.
+            "serviceAccounts": [],
             "scheduling": {
                 // Duration fields serialize int64 seconds as a JSON string.
                 "maxRunDuration": { "seconds": seconds.to_string() },
@@ -656,6 +685,17 @@ impl Provider for GcpProvider {
         deleted.sort();
         Ok(deleted)
     }
+}
+
+/// The session's hard cap in seconds, from the `max_duration_min` the boot
+/// config carries. None when the payload has no such key or the cap is
+/// zero, which leaves [`DEFAULT_MAX_RUN_SECONDS`] in place: a GCP instance
+/// with no cap at all is one nothing on the box can end.
+fn session_max_run_seconds(user_data: &str) -> Option<u64> {
+    crate::cloudinit::flat_config_value(user_data, "max_duration_min")
+        .and_then(|minutes| minutes.parse::<u64>().ok())
+        .filter(|minutes| *minutes > 0)
+        .map(|minutes| minutes * 60)
 }
 
 /// Default zone per catalog region: the region id plus "-b". Zone b exists
@@ -973,6 +1013,7 @@ mod tests {
             body["machineType"],
             "zones/us-central1-b/machineTypes/e2-small"
         );
+        // No cap in this payload, so the 12 h default stands.
         assert_eq!(body["scheduling"]["maxRunDuration"]["seconds"], "43200");
         assert_eq!(body["scheduling"]["instanceTerminationAction"], "DELETE");
         assert_eq!(body["labels"]["jamstream-session"], "deadbeef");
@@ -981,6 +1022,89 @@ mod tests {
         assert_eq!(body["labels"]["x--4f776e6572"], "x--5365616e2052656964");
         assert_eq!(body["metadata"]["items"][0]["key"], "user-data");
         assert_eq!(body["metadata"]["items"][0]["value"], "#cloud-config\n");
+    }
+
+    /// #51: `--max-hours` reached the launch body nowhere, so a session
+    /// asked to live one hour was capped at twelve, and one asked for
+    /// twenty-four was deleted mid-jam.
+    #[test]
+    fn the_run_cap_is_the_session_cap() {
+        let p = provider();
+        let region = p.regions().into_iter().next().unwrap();
+        let boot = |max_hours: u32| crate::cloudinit::BootConfig {
+            artifact_url: "https://example.invalid/jamstreamd".to_owned(),
+            artifact_sha256: "0".repeat(64),
+            server_private_key_b64: "c2s=".to_owned(),
+            issuer_public_key_b64: "aXA=".to_owned(),
+            session_id_hex: "deadbeef".to_owned(),
+            port: 43210,
+            idle_shutdown_min: 10,
+            max_duration_min: max_hours * 60,
+            self_destruct: crate::cloudinit::SelfDestruct::GcpMaxRunDuration,
+        };
+        let spec = |user_data: String| LaunchSpec {
+            region: region.clone(),
+            instance_class: InstanceClass::Small,
+            user_data,
+            tags: vec![session_tag("deadbeef")],
+        };
+        let seconds = |p: &GcpProvider, user_data: String| {
+            p.launch_body(&spec(user_data), "jamstream-test").unwrap()["scheduling"]
+                ["maxRunDuration"]["seconds"]
+                .as_str()
+                .expect("maxRunDuration is a string of seconds")
+                .to_owned()
+        };
+
+        // The cap the host asked for, read out of the rendered cloud-init
+        // the VM boots from, which is the only place it travels.
+        assert_eq!(
+            seconds(&p, crate::cloudinit::render(&boot(1))),
+            (3600).to_string()
+        );
+        assert_eq!(
+            seconds(&p, crate::cloudinit::render(&boot(24))),
+            (24 * 3600).to_string()
+        );
+        // And out of the flat config, which is the same key undecorated.
+        assert_eq!(
+            seconds(&p, boot(6).render_flat_config()),
+            (6 * 3600).to_string()
+        );
+        // A payload with no cap, or a nonsense one, keeps the default
+        // rather than launching an instance nothing can end.
+        assert_eq!(seconds(&p, "#cloud-config\n".to_owned()), "43200");
+        assert_eq!(seconds(&p, "max_duration_min = 0\n".to_owned()), "43200");
+        assert_eq!(seconds(&p, "max_duration_min = soon\n".to_owned()), "43200");
+        // An explicit override still outranks everything.
+        let pinned = GcpProvider::with_access_token("p".to_owned(), "t".to_owned())
+            .with_max_run_seconds(7_200);
+        assert_eq!(
+            seconds(&pinned, crate::cloudinit::render(&boot(24))),
+            "7200"
+        );
+    }
+
+    /// A session VM parses unauthenticated UDP and has no API call of its
+    /// own to make, so it gets no service account. The API attaches nothing
+    /// when the field is absent, but absence is not a decision anyone can
+    /// read.
+    #[test]
+    fn no_service_account_is_attached() {
+        let p = provider();
+        let region = p.regions().into_iter().next().unwrap();
+        let spec = LaunchSpec {
+            region,
+            instance_class: InstanceClass::Small,
+            user_data: "#cloud-config\n".to_owned(),
+            tags: vec![session_tag("deadbeef")],
+        };
+        let body = p.launch_body(&spec, "jamstream-test").unwrap();
+        assert_eq!(
+            body["serviceAccounts"],
+            serde_json::json!([]),
+            "a session VM must carry no credential"
+        );
     }
 
     /// Path of the committed throwaway service-account key fixture.

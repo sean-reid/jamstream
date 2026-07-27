@@ -15,19 +15,17 @@ write_files:
     permissions: "0700"
     content: |
       #!/bin/sh
-      # The hard cap is provider-enforced (maxRunDuration with
-      # instanceTerminationAction=DELETE). This script is the idle path: delete
-      # the instance with the scoped service account token from metadata.
+      # No credential is attached to this instance, so it cannot delete itself.
+      # What ends it is maxRunDuration with instanceTerminationAction=DELETE,
+      # set at launch to the session's own hard cap, plus the host's sweeper,
+      # which runs on every app and CLI launch and gets there sooner.
+      #
+      # So this stops serving and nothing more. It must not power the VM off:
+      # Compute Engine clears the pending termination timestamp whenever a VM
+      # stops, so a powered-off instance outlives the cap that was supposed to
+      # collect it and keeps billing its disk until a human notices.
       echo "jamstream self-destruct: $1" > /dev/console 2>/dev/null || true
-      md=http://metadata.google.internal/computeMetadata/v1
-      name=$(curl -fsS -H 'Metadata-Flavor: Google' "$md/instance/name")
-      zone=$(curl -fsS -H 'Metadata-Flavor: Google' "$md/instance/zone")
-      token=$(curl -fsS -H 'Metadata-Flavor: Google' \
-        "$md/instance/service-accounts/default/token" \
-        | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
-      curl -fsS -X DELETE -H "Authorization: Bearer $token" \
-        "https://compute.googleapis.com/compute/v1/$zone/instances/$name" \
-        || poweroff
+      systemctl stop jamstreamd.service mediamtx.service 2>/dev/null || true
   - path: /usr/local/sbin/jamstream-guard
     owner: root:root
     permissions: "0700"
