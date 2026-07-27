@@ -51,6 +51,13 @@ const MAX_SENDS: u32 = 20;
 /// any peer that simply never sent `recv_next`.
 pub const RECV_WINDOW: u64 = 32;
 
+/// Messages one link will hold queued or unacknowledged before refusing more.
+/// The avatar pacer feeds two chunks per 2.5 ms tick and the queue drains on
+/// ack, so the widest legitimate backlog is a round trip's worth: about 36 on
+/// a 45 ms path. 128 is over three times that, and at a kilobyte per avatar
+/// chunk it caps one link's queue at roughly 128 KB.
+pub const MAX_PENDING: usize = 128;
+
 /// Where a broadcast goes. V1 ships the two landscape platforms with
 /// persistent, ungated keys; the requirements behind each one (ingest URL,
 /// aspect, keyframe cadence) live as data in jamstream-stream, not here, so
@@ -319,6 +326,9 @@ impl ControlLink {
     /// next `poll`.
     pub fn send(&mut self, msg: ControlMsg) -> Result<(), Error> {
         check_lengths(&msg)?;
+        if self.pending.len() >= MAX_PENDING {
+            return Err(Error::LinkFull);
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
         self.pending.push_back(Pending {

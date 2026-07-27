@@ -116,14 +116,15 @@ proptest! {
     /// stays inside the window `ack_bits` can advertise.
     #[test]
     fn control_reassembly_stays_inside_the_window(
-        seqs in prop::collection::vec(0u64..4_000, 1..500),
+        seqs in prop::collection::vec(0u64..100, 1..500),
     ) {
         let mut sender = ControlLink::new();
         let mut link = ControlLink::new();
         // One legal datagram per sequence number, built by a real sender so
-        // only the ordering is adversarial.
-        for &seq in &seqs {
-            sender.send(ControlMsg::Chat { from: MemberId(1), text: format!("m{seq}") }).unwrap();
+        // only the ordering is adversarial. 100 of them is three times the
+        // window and inside the link's queue cap.
+        for n in 0..100u64 {
+            sender.send(ControlMsg::Chat { from: MemberId(1), text: format!("m{n}") }).unwrap();
         }
         let dgrams = sender.poll(0);
         for &seq in &seqs {

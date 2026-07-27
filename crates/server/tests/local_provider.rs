@@ -266,8 +266,12 @@ fn idle_exit_terminates_an_unjoined_server() {
 /// The whole-session cap, unlike idle-exit, fires with musicians present:
 /// a server spawned with --max-duration-min 0.05 (3 s) and a joined,
 /// actively sending musician must still exit cleanly on its own, and the
-/// abandoned client then times out. The config's 10 minute idle window
+/// client must learn the session is over. The config's 10 minute idle window
 /// cannot be the cause, and no --idle-exit-min is passed.
+///
+/// The client now learns by Bye on the way out rather than by timeout ten
+/// seconds later, so the event is watched for from the moment the cap could
+/// fire; either way of finding out counts.
 #[tokio::test]
 async fn max_duration_ends_an_occupied_session() {
     let dir = temp_dir("maxdur");
@@ -293,6 +297,7 @@ async fn max_duration_ends_an_occupied_session() {
     // Keep the musician pumping while the cap runs out; the server must
     // exit anyway, which is exactly what idle-exit would never do here.
     let mut buf = [0u8; 2048];
+    let mut told = false;
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
@@ -313,18 +318,20 @@ async fn max_duration_ends_an_occupied_session() {
                 let _ = socket.send(&pkt).await;
             }
         }
-        let _ = client.events();
+        told |= client
+            .events()
+            .iter()
+            .any(|e| matches!(e, ClientEvent::TimedOut | ClientEvent::Ejected { .. }));
     };
     assert!(
         status.success(),
         "max-duration exit must be a clean exit: {status}"
     );
 
-    // The abandoned musician notices the server is gone: its connection
-    // timeout (10 s of server silence) surfaces as TimedOut.
-    let mut timed_out = false;
+    // The Bye may still be in the socket buffer, and a client that missed it
+    // falls back to its 10 s connection timeout.
     let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline && !timed_out {
+    while Instant::now() < deadline && !told {
         for pkt in client.poll(now()) {
             let _ = socket.send(&pkt).await;
         }
@@ -333,16 +340,12 @@ async fn max_duration_ends_an_occupied_session() {
         {
             let _ = client.handle_datagram(now(), &buf[..len]);
         }
-        for event in client.events() {
-            if matches!(event, ClientEvent::TimedOut | ClientEvent::Ejected { .. }) {
-                timed_out = true;
-            }
-        }
+        told |= client
+            .events()
+            .iter()
+            .any(|e| matches!(e, ClientEvent::TimedOut | ClientEvent::Ejected { .. }));
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        timed_out,
-        "client never observed the capped server going away"
-    );
+    assert!(told, "client never observed the capped server going away");
     let _ = std::fs::remove_dir_all(&dir);
 }
