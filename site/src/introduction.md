@@ -7,15 +7,7 @@ JamStream is a desktop app that lets a band play together over the internet with
 
 ## What it costs
 
-Sessions hosted on your own computer cost nothing. For cloud sessions you pay your cloud provider directly, by the second, for one small virtual machine. For a three hour session with four musicians on the cheapest suitable machines:
-
-| Provider | Machine | Machine cost | Audio traffic (about 1.6 GB) | Total |
-|---|---|---|---|---|
-| DigitalOcean | s-2vcpu-2gb, $0.02679/hr | $0.080 | inside the included transfer | about $0.08 |
-| AWS | t4g.medium, about $0.034/hr | $0.101 | inside the free 100 GB/month | about $0.10 |
-| GCP | e2-medium, about $0.034/hr | $0.101 | about $0.19 at $0.12/GiB | about $0.30 |
-
-These are public on-demand prices as of July 2026 and they drift. The cost preview shown before every launch pulls current pricing and is the number to trust; see [Understanding cost](guides/cost.md).
+Sessions hosted on your own computer cost nothing. A three hour cloud session with four musicians costs about $0.08 on DigitalOcean, paid to your provider by the second. The preview shown before every launch pulls current pricing and is the number to trust; see [Understanding cost](guides/cost.md).
 
 ## Streaming
 
@@ -23,10 +15,9 @@ The host can put a session on air to Twitch and YouTube Live, either one or both
 
 ## Project status
 
-JamStream is in beta; the current release is v0.1.1-beta, downloadable for macOS, Windows, and Linux from the [Download](download.md) page.
+JamStream is in beta. Download it for macOS, Windows, and Linux from the [Download](download.md) page.
 
 - The desktop app is the product: its wizard hosts real sessions on your own computer or in your cloud account, joins you automatically, and manages the invites while the session runs. Every app build bundles its own `jamstreamd` session server, so hosting locally needs nothing else installed. Screenshots on this site are from the current build and will change.
 - The `jamstream` command line tool hosts, monitors, and ends the same sessions for automation, scripting, and headless use; see the [CLI reference](cli/index.md).
-- Release builds carry their own `jamstreamd` server build pinned in: hosting on a cloud provider downloads and verifies that exact build with no configuration. Only source builds still point at a server build hosted elsewhere; the [host reference](cli/host.md) shows where those flags go.
 
 If something here does not match what the software does, that is a bug in one of them. [Report it.](about.md)

@@ -35,7 +35,6 @@ Members need only outbound UDP. The client opens one UDP socket to the server's 
 
 - If joining times out after about 10 seconds, something between you and the server is dropping UDP. Corporate and campus networks sometimes block outbound UDP on unusual ports; a phone hotspot is a quick way to confirm that is the cause.
 - The server side needs nothing from you: only the session port is reachable on the machine, and nothing else is.
-- IPv4 is required; IPv6 is used opportunistically when available.
 
 ## Session ends unexpectedly
 

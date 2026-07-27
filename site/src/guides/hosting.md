@@ -19,7 +19,7 @@ Before launching, JamStream measures the round trip from your machine to each of
 - **hourly** is the machine's current price per hour, fetched live where the provider offers it.
 - **egress** is what the provider charges per GB of outbound audio.
 
-The ranking weighs worst round trip and hourly price equally, and the table is listed in that order, best first. The top row is preselected; click another to override it (`--region` in the CLI).
+Regions are sorted by worst round trip in 5 ms steps, with price breaking ties inside a step, best first. The top row is preselected; click another to override it (`--region` in the CLI).
 
 A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable. If the band spans a continent, pick the region that is mediocre for everyone over the one that is perfect for you; the person with the worst round trip sets the feel. See [Troubleshooting](troubleshooting.md) for what the numbers mean in the ear.
 

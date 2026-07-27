@@ -51,7 +51,7 @@ Do not use your root account's credentials. Create a user that can do exactly wh
 
 What each block is for:
 
-- The five actions are the complete list of AWS calls JamStream makes. Action names are from the [EC2](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html) and [SSM](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ssm.html) authorization references.
+- Action names are from the [EC2](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html) and [SSM](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ssm.html) authorization references.
 - The `ec2:CreateTags` block is condition-scoped so the user can tag instances only while launching them, which is the only time JamStream tags anything ([tagging at launch](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html)).
 - The SSM resource has an empty account field because `/aws/service/debian/...` is a public parameter published by AWS; that ARN form is per [the SSM IAM docs](https://docs.aws.amazon.com/systems-manager/latest/userguide/security_iam_service-with-iam.html). JamStream reads it to find the current Debian 12 arm64 image per region.
 

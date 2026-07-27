@@ -6,8 +6,6 @@ You need exactly two things: the app, from the [Download](../download.md) page, 
 
 Each invite admits one person to one seat in one session. It carries, signed by the host's key: the server's address, the session id, your seat and role (musician or listener), and an expiry matching the session's hard cap. The server accepts only invites signed by the host who launched it, so an invite cannot be forged, and a stolen one can be revoked without ending the session.
 
-Practical consequences:
-
 - Do not share your invite; two people cannot use the same one. If someone else needs in, the host mints another seat from the invites panel.
 - Losing your connection does not burn the invite. Close the app, move to another machine, rejoin with the same string; the seat is yours until the session ends or the host revokes it.
 - Invites die with the session. There is nothing to clean up or keep secret afterward.

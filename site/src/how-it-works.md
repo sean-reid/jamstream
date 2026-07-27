@@ -1,42 +1,31 @@
 # How it works
 
-One honest page on what actually happens when you host and play. Deeper detail lives in the source.
+## The machine
 
-## The machine's life
+When you host, your computer asks a cloud provider for one small Linux VM, hands it a boot script, and completes an encrypted handshake with it before showing you any invite, so a session is never announced that cannot be joined. In [local mode](guides/local.md) there is no VM: the same server runs as a process on your own machine.
 
-When you host on a cloud provider, your computer asks it for one small Linux VM and hands it a boot script. (In [local mode](guides/local.md) there is no VM: the same server starts as a process on your machine, with the same keys and settings, and the story picks up at step 4.) The machine:
+Only the one UDP session port is reachable from outside. Nothing about a session persists in the cloud after it ends.
 
-1. writes its keys and settings from launch data held in memory, never onto a disk image that outlives it;
-2. arms its dead man's switch and closes its firewall down to the one UDP session port, before anything that can fail has run;
-3. downloads a pinned build of `jamstreamd`, the session server, and refuses to start unless its sha256 checksum matches the one pinned alongside the URL; release builds carry the URL of their release's own server build baked in, so host and server always match;
-4. starts serving.
+The machine destroys itself three ways: when you end the session, when no musician has been connected for the idle window (default 10 minutes), and at the hard cap (default 12 hours) regardless. The provider and the machine enforce those, not your laptop, so quitting the app does not leave anything running and billing. `jamstream sweep` destroys anything tagged that somehow survives.
 
-The hosting app or CLI then performs a full encrypted handshake against it before showing any invite, so a session is never announced that cannot actually be joined.
+One exception worth knowing: on GCP the idle window does not currently work, so the hard cap is the only thing that ends a session. End GCP sessions explicitly.
 
-From its first second the machine is under a dead man's switch: with no musicians connected for the idle window (default 10 minutes) it destroys itself, and at the hard cap (default 12 hours) it is destroyed regardless, enforced by the machine and the provider rather than by your laptop. Ending the session destroys it immediately. Every machine is tagged, and `jamstream sweep` destroys anything tagged that somehow survives. Nothing about a session persists in the cloud after it ends.
-
-## Invites and encryption, in plain language
+## Invites
 
 There are no accounts and no JamStream servers. Identity is the invite.
 
-When you host, your computer generates the session's keys locally and mints one invite per seat. Each invite is a signed statement: this person may occupy seat 3 of session `3f2a9c01` at this address until this time. The server, which received your public key at boot, admits only holders of statements you signed. Invites are individually revocable mid-session, and all of them expire at the session's hard cap.
+Hosting generates the session's keys on your computer and mints one invite per seat, each naming one person, one seat, and an expiry. Invites are revocable mid-session and all of them expire at the hard cap. Every packet is encrypted and authenticated from the first handshake byte. There is no plaintext mode.
 
-Every packet between every member and the server is encrypted and authenticated, from the first handshake byte; there is no plaintext mode. Replayed or tampered packets are dropped. The server itself knows nothing about anyone beyond what the host signed into their invite: a seat number, a role, an expiry.
+What that buys you: strangers cannot join, listen in, or disrupt a session, a leaked invite is one revocation away from useless, and no third party, JamStream included, sits between your band and your machine.
 
-What this buys you concretely: strangers cannot join, listen in, or disrupt a session; a leaked invite is one revocation away from useless; and no third party, JamStream included, sits between your band and your machine.
+## Latency
 
-## Where the milliseconds go
+The target is under 30 ms mouth to ear. Measured with real Opus and real encryption over a simulated network:
 
-The design target is mouth to ear under 30 ms when everyone's round trip to the server is under 20 ms, which is why region choice gets its own [table](guides/hosting.md#the-region-table). The budget, simplified from the protocol's accounting at 2.5 ms audio frames:
-
-| Stage | Typical |
+| Round trip to the server | Mouth to ear |
 |---|---|
-| Your capture buffer | 2.5 to 5 ms |
-| Encode | under 1 ms |
-| Network to the server | 3 to 10 ms |
-| Server buffer and mix | 5 to 7.5 ms |
-| Network back to a bandmate | 3 to 10 ms |
-| Their buffer, decode, and playout | 5.5 to 10 ms |
-| Total mouth to ear | 21 to 34 ms |
+| Same city | 9.7 ms |
+| Same region | 19.3 ms |
+| Cross country over DSL | 64.8 ms |
 
-The two network legs are the only stages not under JamStream's control, and the only ones that grow with distance. Everything else is fixed small: audio is cut into 2.5 ms frames, buffers adapt to measured jitter and report their depth in the status bar, and the mix runs on a 2.5 ms tick. The `7.9 ms mouth to ear` readout in the session screenshots is a same-city case; across a region expect the mid-20s, which still feels like a stage, not a phone call.
+The two network legs are the only parts that grow with distance, which is why [region choice](guides/hosting.md#the-region-table) is the decision that matters. Under about 30 ms it feels like standing on a stage together. At 65 ms it feels like a phone call.

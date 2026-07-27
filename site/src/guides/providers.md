@@ -12,7 +12,7 @@ JamStream hosts on three cloud providers. Each needs a one-time setup: an accoun
 
 ## Least privilege, and why it matters here
 
-Each page shows how to grant JamStream only what it uses: create, list, tag, and destroy one class of machine. Set up this way, the credential on your laptop can manage jam servers and nothing else. If it ever leaks, the blast radius is a few small VMs, not your storage, your DNS, or your bill. It costs five extra minutes once. Do not hand JamStream an account-wide admin credential to save those minutes.
+Each page shows how to grant JamStream only what it uses: create, list, tag, and destroy one class of machine. Set up this way, the credential on your laptop can manage jam servers and nothing else. If it ever leaks, the blast radius is a few small VMs, not your storage, your DNS, or your bill.
 
 ## Verifying any provider
 
