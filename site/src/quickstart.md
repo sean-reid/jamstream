@@ -1,16 +1,8 @@
 # Quickstart: host your first session
 
-This page walks the DigitalOcean path from nothing to a running session and back to nothing. Expect 20 minutes the first time, most of it on the DigitalOcean account. Every command is copy-pasteable.
+Two paths from nothing to a running session. The local path takes about five minutes, needs no cloud account, and works for musicians in the same room or on the same network. The internet path launches the server in your own DigitalOcean account so bandmates anywhere can join; expect 20 minutes the first time, most of it on the DigitalOcean account. Every command is copy-pasteable.
 
-If you want to see the flow before touching a cloud account, run it against the built-in mock provider first:
-
-```console
-$ jamstream host --provider mock --yes
-```
-
-The mock launches no real machine, costs nothing, and prints the same output shape you will see below.
-
-## 1. Install the CLI
+## 1. Install
 
 No packaged releases exist yet, so build from source. You need a Rust toolchain ([rustup.rs](https://rustup.rs)).
 
@@ -18,10 +10,72 @@ No packaged releases exist yet, so build from source. You need a Rust toolchain 
 $ git clone https://github.com/sean-reid/jamstream
 $ cd jamstream
 $ cargo install --path crates/cli
+$ cargo install --path crates/server
 $ jamstream --version
 ```
 
-## 2. Create a DigitalOcean account and token
+The second install puts the `jamstreamd` server binary on your PATH, which is where local mode looks for it. The internet path does not need it locally; skip it if you are only hosting in the cloud.
+
+## 2. Host on this computer
+
+`local` is the default provider, so the flag is optional:
+
+```console
+$ jamstream host --provider local
+
+Local sessions cost nothing.
+Launch this session? [y/N] y
+
+Starting the server on this computer.
+
+Session 10c79bc1 is running.
+server       192.168.1.12:43210
+host         jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgF...
+musician 1   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgG...
+musician 2   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgH...
+musician 3   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgI...
+musician 4   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgJ...
+
+State written to /Users/you/Library/Application Support/jamstream/sessions/10c79bc1....json.
+End the session with: jamstream end 10c79bc1
+```
+
+The invite strings are shortened here; real ones are about 220 characters. This starts a real `jamstreamd` process on your machine and completes a full encrypted handshake with it before printing anything, so a printed invite is a working invite.
+
+The invites carry your machine's network address (192.168.1.12 above), so they work from this computer and from any other machine on the same network. They do not work across the internet; bandmates elsewhere need the DigitalOcean path below, or router port forwarding, which [Playing on the same network](guides/local.md) explains honestly.
+
+## 3. Join
+
+From the desktop app: paste your invite into the field labeled "paste an invite, jamstream://join/..." on the home screen and click Join.
+
+Without the app, for testing or for a machine without a display, the headless client joins with a WAV file as its instrument:
+
+```console
+$ jamstream join 'jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgF...' \
+    --headless --input take.wav --output mix.wav --duration-secs 60
+joined
+roster: 2 members
+left after 60 s; wrote mix.wav
+```
+
+The input WAV must be 48 kHz, mono or stereo.
+
+## 4. End it
+
+```console
+$ jamstream end 10c79bc1
+Session 10c79bc1 ended. Instance 67706 is destroyed.
+```
+
+For a local session the instance id is the server's process id, and ending it kills the process. A forgotten local session costs nothing, and the server also exits on its own after 10 minutes with no musicians connected (`--idle-min`).
+
+That is the whole local loop. The rest of this page is the internet path.
+
+## Host on the internet with DigitalOcean
+
+The flow is the same; the server runs on a small droplet in your DigitalOcean account instead of your machine, and the invites work from anywhere.
+
+### Create an account and token
 
 Short version; the [DigitalOcean setup page](guides/providers/digitalocean.md) has every step from zero, including the exact token scopes.
 
@@ -30,22 +84,17 @@ Short version; the [DigitalOcean setup page](guides/providers/digitalocean.md) h
 3. Choose Custom Scopes and grant the droplet, tag, and read scopes listed on the [setup page](guides/providers/digitalocean.md#2-create-an-api-token).
 4. Copy the token; it is shown once.
 
-Put the token in your environment:
+Put the token in your environment and verify it works:
 
 ```console
 $ export DIGITALOCEAN_TOKEN=dop_v1_your_token_here
-```
-
-Verify it works. This lists anything JamStream-tagged in your account without touching it, so a fresh account prints one line:
-
-```console
 $ jamstream sweep --dry-run --provider digitalocean
 No jamstream-tagged instances found.
 ```
 
-## 3. Point at a server build
+### Point at a server build
 
-No `jamstreamd` release artifact is published yet. Until one is, hosting on a real provider needs two extra flags naming a Linux x86_64 musl build of `jamstreamd` that the new machine can download, plus its checksum:
+No `jamstreamd` release artifact is published yet. Until one is, hosting on a cloud provider needs two extra flags naming a Linux x86_64 musl build of `jamstreamd` that the new machine can download, plus its checksum:
 
 ```console
 $ cargo build --release -p jamstream-server
@@ -54,7 +103,7 @@ $ shasum -a 256 target/release/jamstreamd
 
 Host the binary anywhere the new VM can reach over HTTPS, and note the sha256. When releases exist this step disappears.
 
-## 4. Host
+### Host
 
 ```console
 $ jamstream host --provider digitalocean \
@@ -86,49 +135,23 @@ Session 3f2a9c01 is running.
 server       203.0.113.10:43210
 host         jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiV...
 musician 1   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiW...
-musician 2   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiX...
-musician 3   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiY...
-musician 4   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiZ...
+...
 
 State written to /Users/you/Library/Application Support/jamstream/sessions/3f2a9c01....json.
 End the session with: jamstream end 3f2a9c01
 ```
 
-The invite strings are shortened here; real ones are about 220 characters. Before printing this, the CLI has already completed a full encrypted handshake with the new server, so a printed invite is a working invite.
-
 The meter is now running. The droplet bills by the second until you end the session, and it shuts itself down after 10 minutes with no musicians connected, or at the 12 hour hard cap, whichever comes first.
 
-## 5. Share the invites
+### Share, join, check, end
 
-Send each `jamstream://join/...` line to exactly one person, over any channel you trust. Each invite admits one member; the `host` line is yours. Details in [Joining a session](guides/joining.md).
-
-## 6. Join
-
-From the desktop app: paste your invite into the field labeled "paste an invite, jamstream://join/..." on the home screen and click Join.
-
-Without the app, for testing or for a machine without a display, the headless client joins with a WAV file as its instrument:
-
-```console
-$ jamstream join 'jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiV...' \
-    --headless --input take.wav --output mix.wav --duration-secs 60
-joined
-roster: 2 members
-left after 60 s; wrote mix.wav
-```
-
-The input WAV must be 48 kHz, mono or stereo.
-
-## 7. Check on it
+Send each `jamstream://join/...` line to exactly one person, over any channel you trust. Each invite admits one member; the `host` line is yours. Details in [Joining a session](guides/joining.md). Joining works exactly as in the local path above.
 
 ```console
 $ jamstream status
 SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
 3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.08037 at 3.0 h
-```
 
-## 8. End it
-
-```console
 $ jamstream end 3f2a9c01
 Session 3f2a9c01 ended. Instance 512190713 is destroyed.
 ```

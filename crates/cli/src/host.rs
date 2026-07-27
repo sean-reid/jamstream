@@ -23,8 +23,10 @@ const IP_WAIT_CAP: Duration = Duration::from_secs(180);
 const IP_POLL_PERIOD: Duration = Duration::from_secs(2);
 const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
 
-/// Placeholders the mock provider accepts; a real provider requires the
-/// artifact flags because the VM would download and verify this for real.
+/// Placeholders the mock and local providers accept: the mock launches
+/// nothing, and the flat config the local provider consumes carries no
+/// artifact fields. A cloud provider requires the artifact flags because
+/// the VM downloads and verifies this for real.
 const PLACEHOLDER_ARTIFACT_URL: &str = "https://artifacts.invalid/jamstreamd";
 const PLACEHOLDER_ARTIFACT_SHA256: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -35,6 +37,7 @@ pub async fn run<W: Write>(
     out: &mut W,
 ) -> Result<(), CliError> {
     let is_mock = args.provider == "mock";
+    let is_local = provider.kind() == ProviderKind::Local;
     let regions = provider.regions();
     if regions.is_empty() {
         return Err(CliError::Failed(format!(
@@ -80,13 +83,19 @@ pub async fn run<W: Write>(
     );
     if !args.json {
         writeln!(out)?;
-        writeln!(
-            out,
-            "Cost preview for {} {} over {:.1} hours:",
-            args.provider, region.id, args.hours
-        )?;
-        for row in preview.display_table() {
-            writeln!(out, "{row}")?;
+        if is_local {
+            // One region, this computer, zero price; a cost table would
+            // dress that up.
+            writeln!(out, "Local sessions cost nothing.")?;
+        } else {
+            writeln!(
+                out,
+                "Cost preview for {} {} over {:.1} hours:",
+                args.provider, region.id, args.hours
+            )?;
+            for row in preview.display_table() {
+                writeln!(out, "{row}")?;
+            }
         }
     }
 
@@ -104,7 +113,9 @@ pub async fn run<W: Write>(
     let now_unix = unix_now();
     let expires_unix = now_unix + u64::from(args.max_hours) * 3600;
 
-    if !is_mock && (args.artifact_url.is_none() || args.artifact_sha256.is_none()) {
+    // Local mode runs a binary already on this machine, so no artifact is
+    // downloaded and the flags are not required.
+    if !is_mock && !is_local && (args.artifact_url.is_none() || args.artifact_sha256.is_none()) {
         return Err(CliError::Usage(
             "pass --artifact-url and --artifact-sha256; the VM downloads and verifies \
              jamstreamd at boot"
@@ -129,15 +140,27 @@ pub async fn run<W: Write>(
         self_destruct: self_destruct_for(provider.kind())?,
     };
 
+    // The local provider consumes the flat key=value server config
+    // directly; cloud providers get cloud-init YAML that writes the same
+    // config on the VM. See the user_data contract in the local provider.
+    let user_data = if is_local {
+        boot.render_flat_config()
+    } else {
+        jamstream_cloud::cloudinit::render(&boot)
+    };
     let spec = LaunchSpec {
         region: region.clone(),
         instance_class: InstanceClass::Standard,
-        user_data: jamstream_cloud::cloudinit::render(&boot),
+        user_data,
         tags: vec![session_tag(&session_hex)],
     };
     if !args.json {
         writeln!(out)?;
-        writeln!(out, "Launching in {}.", region.id)?;
+        if is_local {
+            writeln!(out, "Starting the server on this computer.")?;
+        } else {
+            writeln!(out, "Launching in {}.", region.id)?;
+        }
     }
     let instance = provider.launch(spec).await?;
     let instance = wait_for_ip(provider, &session_hex, instance).await?;
@@ -252,6 +275,11 @@ async fn choose_region<W: Write>(
                     args.provider
                 ))
             });
+    }
+    // Local offers exactly one region, this computer: nothing to probe,
+    // nothing to rank, no table worth printing.
+    if provider.kind() == ProviderKind::Local {
+        return Ok(candidates[0].clone());
     }
     let regions: Vec<Region> = candidates.iter().map(|(r, _)| r.clone()).collect();
     let matrix = if is_mock {
@@ -412,11 +440,11 @@ fn self_destruct_for(kind: ProviderKind) -> Result<SelfDestruct, CliError> {
                 token,
             })
         }
-        // Local sessions self-limit via the server's own idle-exit flag;
-        // the cli wiring for them lands with the local provider.
-        ProviderKind::Local => Err(CliError::Usage(
-            "local sessions are not wired into the cli yet".to_owned(),
-        )),
+        // Local sessions never render cloud-init: the flat config carries
+        // no self-destruct and the spawned server self-limits through its
+        // own --idle-exit-min. Any variant satisfies the struct; this one
+        // is inert here.
+        ProviderKind::Local => Ok(SelfDestruct::AwsShutdown),
     }
 }
 

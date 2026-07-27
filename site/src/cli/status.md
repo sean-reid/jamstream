@@ -21,7 +21,7 @@ Reads the local state files written by [`jamstream host`](host.md) and prints on
 $ jamstream status --hours 4
 SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
 3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.10716 at 4.0 h
-b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              -
+b7e5c9b6   local/local          ended      2 h 13 min        $0.00              -
 ```
 
 ## Notes

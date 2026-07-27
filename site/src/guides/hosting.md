@@ -1,6 +1,8 @@
 # Hosting a session
 
-Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three; the desktop app's host wizard runs the same flow but currently launches only the built-in mock provider, so real sessions are hosted from the CLI.
+Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three; the desktop app's host wizard walks the same steps but does not launch real machines yet, so real sessions are hosted from the CLI.
+
+Hosting does not have to involve a cloud at all: `jamstream host --provider local` runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; [Playing on the same network](local.md) covers local mode.
 
 ## The region table
 
@@ -26,7 +28,7 @@ $ jamstream host --provider digitalocean --region tor1 ...
 A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable. If the band spans a continent, pick the region that is mediocre for everyone over the one that is perfect for you; the person with the worst round trip sets the feel. See [Troubleshooting](troubleshooting.md) for what the numbers mean in the ear.
 
 ![Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns](../images/wizard_region.png)
-*The same table in the app's host wizard, step 2 of 4. Current build, mock provider, fabricated latencies.*
+*The same table in the app's host wizard, step 2 of 4. Current build, demo data, fabricated latencies.*
 
 ## Invites are minted at launch
 

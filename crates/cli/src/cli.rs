@@ -32,8 +32,8 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct HostArgs {
-    /// Cloud provider to host on.
-    #[arg(long, default_value = "mock")]
+    /// Provider to host on: local, digitalocean, aws, or gcp.
+    #[arg(long, default_value = "local")]
     pub provider: String,
 
     /// Region id to use, skipping the latency ranking.
@@ -176,7 +176,7 @@ mod tests {
         let Command::Host(args) = cli.command else {
             panic!("expected host");
         };
-        assert_eq!(args.provider, "mock");
+        assert_eq!(args.provider, "local");
         assert_eq!(args.musicians, 4);
         assert_eq!(args.listeners, 0);
         assert_eq!(args.hours, 3.0);
@@ -230,6 +230,24 @@ mod tests {
         assert_eq!(args.idle_min, 5);
         assert_eq!(args.max_hours, 6);
         assert!(args.yes && args.json);
+    }
+
+    // The mock provider stays accepted for tests but out of user surfaces:
+    // help names the real providers and never mentions it.
+    #[test]
+    fn host_help_lists_local_and_hides_the_mock() {
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("host")
+            .expect("host subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("local, digitalocean, aws, or gcp"),
+            "help must name the real providers: {help}"
+        );
+        assert!(help.contains("[default: local]"), "help was: {help}");
+        assert!(!help.contains("mock"), "help must not mention the mock");
     }
 
     #[test]

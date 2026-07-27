@@ -50,4 +50,4 @@ $ jamstream sweep --dry-run --provider digitalocean
 No jamstream-tagged instances found.
 ```
 
-That output means the token authenticates and can list droplets. You are ready to host; continue with the [quickstart](../../quickstart.md#4-host).
+That output means the token authenticates and can list droplets. You are ready to host; continue with the [quickstart](../../quickstart.md#host).

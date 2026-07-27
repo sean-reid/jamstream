@@ -8,6 +8,7 @@
 
 - [Hosting a session](guides/hosting.md)
 - [Joining a session](guides/joining.md)
+- [Playing on the same network](guides/local.md)
 - [Provider setup](guides/providers.md)
   - [DigitalOcean](guides/providers/digitalocean.md)
   - [AWS](guides/providers/aws.md)

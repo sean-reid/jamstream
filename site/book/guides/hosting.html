@@ -157,7 +157,8 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="hosting-a-session"><a class="header" href="#hosting-a-session">Hosting a session</a></h1>
-<p>Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three; the desktop app's host wizard runs the same flow but currently launches only the built-in mock provider, so real sessions are hosted from the CLI.</p>
+<p>Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three; the desktop app's host wizard walks the same steps but does not launch real machines yet, so real sessions are hosted from the CLI.</p>
+<p>Hosting does not have to involve a cloud at all: <code>jamstream host --provider local</code> runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; <a href="local.html">Playing on the same network</a> covers local mode.</p>
 <h2 id="the-region-table"><a class="header" href="#the-region-table">The region table</a></h2>
 <p>Before launching, JamStream measures the round trip from your machine to each of the provider's regions and prints a table:</p>
 <pre><code class="language-text">REGION              WORST RTT         HOURLY       EGRESS
@@ -175,7 +176,7 @@ sfo3                    72 ms    $0.02679/hr     $0.01/GB
 </code></pre>
 <p>A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable. If the band spans a continent, pick the region that is mediocre for everyone over the one that is perfect for you; the person with the worst round trip sets the feel. See <a href="troubleshooting.html">Troubleshooting</a> for what the numbers mean in the ear.</p>
 <p><label class="checkbox-label"><input class="checkbox-img" type="checkbox"><img src="../images/wizard_region.png" alt="Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns"><span class="img-wrapper"><img src="../images/wizard_region.png" alt="Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns"></span></label>
-<em>The same table in the app's host wizard, step 2 of 4. Current build, mock provider, fabricated latencies.</em></p>
+<em>The same table in the app's host wizard, step 2 of 4. Current build, demo data, fabricated latencies.</em></p>
 <h2 id="invites-are-minted-at-launch"><a class="header" href="#invites-are-minted-at-launch">Invites are minted at launch</a></h2>
 <p><code>host</code> mints one invite per seat, up front, on your machine:</p>
 <ul>

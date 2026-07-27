@@ -2,18 +2,37 @@
 //! place the CLI maps a provider name to an implementation. Tests bypass
 //! this and inject a provider directly into the command functions.
 
+use std::path::PathBuf;
+
 use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::providers::digitalocean::DigitalOceanProvider;
 use jamstream_cloud::providers::gcp::GcpProvider;
+use jamstream_cloud::providers::local::LocalProvider;
 use jamstream_cloud::{MockProvider, Provider, ProviderKind};
 
 use crate::CliError;
+use crate::state;
 
-/// Every provider name this build recognizes.
-pub const KNOWN_PROVIDERS: &[&str] = &["mock", "aws", "digitalocean", "gcp"];
+/// Every provider name this build recognizes. The mock is last and stays
+/// out of help text and error messages; it exists for tests and launches
+/// nothing real.
+pub const KNOWN_PROVIDERS: &[&str] = &["local", "digitalocean", "aws", "gcp", "mock"];
+
+/// Where the local provider keeps its process registry and per-session
+/// server configs: the same JAMSTREAM_STATE_DIR override the session state
+/// files honor (see state.rs), else the platform data directory.
+fn local_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(state::STATE_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("jamstream")
+}
 
 pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
     match name {
+        "local" => Ok(Box::new(LocalProvider::new(local_state_dir()))),
         // The mock needs some underlying kind for its instances; Aws is
         // arbitrary and never leaves the process.
         "mock" => Ok(Box::new(MockProvider::with_default_regions(
@@ -29,13 +48,14 @@ pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
             .map(boxed)
             .map_err(|err| creds_error("gcp", &err.to_string())),
         other => Err(CliError::Usage(format!(
-            "unknown provider {other:?}; known providers are mock, aws, digitalocean, gcp"
+            "unknown provider {other:?}; known providers are local, digitalocean, aws, gcp"
         ))),
     }
 }
 
 /// Every provider whose credentials are present in the environment, plus
-/// the mock. Sweep runs across all of them.
+/// local and the mock, which need none. Sweep runs across all of them, so
+/// stray local servers are found like any cloud stray.
 pub fn resolve_all() -> Vec<Box<dyn Provider>> {
     KNOWN_PROVIDERS
         .iter()
@@ -49,7 +69,8 @@ fn boxed<P: Provider + 'static>(p: P) -> Box<dyn Provider> {
 
 fn creds_error(name: &str, detail: &str) -> CliError {
     CliError::Usage(format!(
-        "provider {name}: {detail}. Use --provider mock to try the flow without credentials."
+        "provider {name}: {detail}. Use --provider local to host on this computer \
+         without credentials."
     ))
 }
 
@@ -61,6 +82,27 @@ mod tests {
     fn mock_resolves() {
         let p = resolve("mock").unwrap();
         assert_eq!(p.regions().len(), 2);
+    }
+
+    // Local needs no credentials: it must resolve unconditionally, with
+    // exactly one region, this computer.
+    #[test]
+    fn local_resolves_without_credentials() {
+        let p = resolve("local").unwrap();
+        assert_eq!(p.kind(), ProviderKind::Local);
+        let regions = p.regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].id.as_str(), "local");
+    }
+
+    #[test]
+    fn local_state_dir_honors_the_env_override() {
+        // Read-only consistency check against the live environment, like
+        // real_providers_track_env_credentials below.
+        match std::env::var_os(state::STATE_DIR_ENV) {
+            Some(dir) => assert_eq!(local_state_dir(), PathBuf::from(dir)),
+            None => assert!(local_state_dir().ends_with("jamstream")),
+        }
     }
 
     // These read the real process environment, so they assert consistency
@@ -77,11 +119,13 @@ mod tests {
             } else {
                 let err = resolved.err().expect("must not resolve").to_string();
                 assert!(err.contains(var), "error for {name} was {err:?}");
-                assert!(err.contains("mock"));
+                assert!(err.contains("local"));
             }
         }
     }
 
+    // The error names the user-facing providers and keeps quiet about the
+    // test-only mock.
     #[test]
     fn unknown_provider_lists_the_known_ones() {
         let err = resolve("azure")
@@ -89,11 +133,14 @@ mod tests {
             .expect("must not resolve")
             .to_string();
         assert!(err.contains("azure"));
-        assert!(err.contains("mock, aws, digitalocean, gcp"));
+        assert!(err.contains("local, digitalocean, aws, gcp"));
+        assert!(!err.contains("mock"));
     }
 
     #[test]
-    fn resolve_all_always_includes_the_mock() {
-        assert!(!resolve_all().is_empty());
+    fn resolve_all_always_includes_local_and_the_mock() {
+        let all = resolve_all();
+        assert!(all.iter().any(|p| p.kind() == ProviderKind::Local));
+        assert!(all.len() >= 2, "local and the mock resolve with no creds");
     }
 }

@@ -159,7 +159,7 @@
                         <h1 id="how-it-works"><a class="header" href="#how-it-works">How it works</a></h1>
 <p>One honest page on what actually happens when you host and play. Deeper detail lives in the source.</p>
 <h2 id="the-machines-life"><a class="header" href="#the-machines-life">The machine's life</a></h2>
-<p>When you run <code>jamstream host</code>, your computer asks your cloud provider for one small Linux VM and hands it a boot script. The machine:</p>
+<p>When you host on a cloud provider, your computer asks it for one small Linux VM and hands it a boot script. (In <a href="guides/local.html">local mode</a> there is no VM: the same server starts as a process on your machine, with the same keys and settings, and the story picks up at step 5.) The machine:</p>
 <ol>
 <li>downloads a pinned build of <code>jamstreamd</code>, the session server, from the artifact URL;</li>
 <li>verifies the download's sha256 checksum against the one baked in at launch, and refuses to start on a mismatch;</li>

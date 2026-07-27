@@ -4,7 +4,7 @@ One honest page on what actually happens when you host and play. Deeper detail l
 
 ## The machine's life
 
-When you run `jamstream host`, your computer asks your cloud provider for one small Linux VM and hands it a boot script. The machine:
+When you host on a cloud provider, your computer asks it for one small Linux VM and hands it a boot script. (In [local mode](guides/local.md) there is no VM: the same server starts as a process on your machine, with the same keys and settings, and the story picks up at step 5.) The machine:
 
 1. downloads a pinned build of `jamstreamd`, the session server, from the artifact URL;
 2. verifies the download's sha256 checksum against the one baked in at launch, and refuses to start on a mismatch;

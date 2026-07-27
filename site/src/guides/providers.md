@@ -1,6 +1,6 @@
 # Provider setup
 
-JamStream hosts on three providers. Each needs a one-time setup: an account, a credential with the narrowest permissions that still work, and a check that the credential works. One page per provider walks it from zero.
+JamStream hosts on three cloud providers. Each needs a one-time setup: an account, a credential with the narrowest permissions that still work, and a check that the credential works. One page per provider walks it from zero. Hosting on your own computer needs none of this; see [Playing on the same network](local.md).
 
 | Provider | Setup effort | Machine used | Credential |
 |---|---|---|---|

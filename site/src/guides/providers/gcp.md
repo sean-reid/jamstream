@@ -53,4 +53,4 @@ $ jamstream sweep --dry-run --provider gcp
 No jamstream-tagged instances found.
 ```
 
-That output means the credential authenticates and can list instances. Continue with the [quickstart](../../quickstart.md#4-host), swapping `--provider digitalocean` for `--provider gcp`.
+That output means the credential authenticates and can list instances. Continue with the [quickstart](../../quickstart.md#host), swapping `--provider digitalocean` for `--provider gcp`.

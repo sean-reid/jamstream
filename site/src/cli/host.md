@@ -8,12 +8,14 @@ Usage: jamstream host [OPTIONS]
 
 Ranks the provider's regions by measured latency and price, shows a cost preview, asks for confirmation, launches the machine, verifies it answers a real encrypted handshake, prints one invite per seat, and records the session in a local state file.
 
+With `--provider local` (the default) there is nothing to rank or bill: the server starts as a process on this computer, the cost line reads that local sessions cost nothing, and the handshake check still runs against the real server. See [Playing on the same network](../guides/local.md).
+
 ## Options
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--provider <PROVIDER>` | `mock` | Cloud provider to host on: `mock`, `aws`, `digitalocean`, or `gcp`. The mock runs the whole flow with no credentials and no real machine. |
-| `--region <REGION>` | picked by ranking | Region id to use, skipping the latency ranking. |
+| `--provider <PROVIDER>` | `local` | Provider to host on: `local`, `digitalocean`, `aws`, or `gcp`. Local runs the server on this computer, with no credentials and no cost. |
+| `--region <REGION>` | picked by ranking | Region id to use, skipping the latency ranking. Local has one region, `local`. |
 | `--musicians <MUSICIANS>` | `4` | Musician invites to mint, not counting the host. 1 to 10. |
 | `--listeners <LISTENERS>` | `0` | Listener invites to mint. 0 to 20. |
 | `--hours <HOURS>` | `3` | Expected session length in hours, for the cost preview. Does not limit the session. |
@@ -21,12 +23,18 @@ Ranks the provider's regions by measured latency and price, shows a cost preview
 | `--port <PORT>` | `43210` | UDP port the session server listens on. |
 | `--idle-min <IDLE_MIN>` | `10` | Minutes without musicians before the server shuts itself down. |
 | `--max-hours <MAX_HOURS>` | `12` | Hard cap on session length in hours. Invites expire at the cap. |
-| `--artifact-url <ARTIFACT_URL>` | none | URL of the `jamstreamd` artifact the VM downloads at boot. Required for real providers until releases are published. |
+| `--artifact-url <ARTIFACT_URL>` | none | URL of the `jamstreamd` artifact the VM downloads at boot. Required for cloud providers until releases are published; local mode runs a binary already on this machine and ignores it. |
 | `--artifact-sha256 <ARTIFACT_SHA256>` | none | Expected sha256 of the `jamstreamd` artifact. Required alongside `--artifact-url`. |
 | `--yes` | off | Skip the launch confirmation. |
 | `--json` | off | Emit one JSON object instead of human-readable output. |
 
-## Example
+## Examples
+
+A session on this computer, for the people in the room:
+
+```console
+$ jamstream host --provider local --yes
+```
 
 A two hour duo session with two spare listener seats, on DigitalOcean, unattended:
 
@@ -37,7 +45,7 @@ $ jamstream host --provider digitalocean --musicians 1 --listeners 2 \
     --artifact-sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 ```
 
-Full output of a host run is shown in the [quickstart](../quickstart.md#4-host).
+Full output of both is shown in the [quickstart](../quickstart.md).
 
 ## Notes
 

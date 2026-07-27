@@ -181,26 +181,64 @@
 <h2 id="project-status"><a class="header" href="#project-status">Project status</a></h2>
 <p>JamStream is under active development and not yet at a first release.</p>
 <ul>
-<li>The command line tool hosts, monitors, and ends real sessions. It also runs the whole flow against a built-in mock provider, so you can try everything without a cloud account.</li>
-<li>The desktop app is usable but unfinished. Its host wizard currently launches only the mock provider; real sessions are hosted from the CLI. Screenshots on this site are from the current build and will change.</li>
-<li>No release artifacts are published yet, so hosting on a real provider means pointing the CLI at a <code>jamstreamd</code> server build you host yourself. The <a href="#quickstart-host-your-first-session">quickstart</a> shows where those flags go.</li>
+<li>The command line tool hosts, monitors, and ends real sessions. It can also host a session on your own computer with no cloud account at all; see <a href="#playing-on-the-same-network">Playing on the same network</a>.</li>
+<li>The desktop app is usable but unfinished. Its host wizard does not launch real machines yet; real sessions are hosted from the CLI. Screenshots on this site are from the current build and will change.</li>
+<li>No release artifacts are published yet, so hosting on a cloud provider means pointing the CLI at a <code>jamstreamd</code> server build you host yourself. The <a href="#quickstart-host-your-first-session">quickstart</a> shows where those flags go.</li>
 </ul>
 <p>If something here does not match what the software does, that is a bug in one of them. <a href="#about">Report it.</a></p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="quickstart-host-your-first-session"><a class="header" href="#quickstart-host-your-first-session">Quickstart: host your first session</a></h1>
-<p>This page walks the DigitalOcean path from nothing to a running session and back to nothing. Expect 20 minutes the first time, most of it on the DigitalOcean account. Every command is copy-pasteable.</p>
-<p>If you want to see the flow before touching a cloud account, run it against the built-in mock provider first:</p>
-<pre><code class="language-console">$ jamstream host --provider mock --yes
-</code></pre>
-<p>The mock launches no real machine, costs nothing, and prints the same output shape you will see below.</p>
-<h2 id="1-install-the-cli"><a class="header" href="#1-install-the-cli">1. Install the CLI</a></h2>
+<p>Two paths from nothing to a running session. The local path takes about five minutes, needs no cloud account, and works for musicians in the same room or on the same network. The internet path launches the server in your own DigitalOcean account so bandmates anywhere can join; expect 20 minutes the first time, most of it on the DigitalOcean account. Every command is copy-pasteable.</p>
+<h2 id="1-install"><a class="header" href="#1-install">1. Install</a></h2>
 <p>No packaged releases exist yet, so build from source. You need a Rust toolchain (<a href="https://rustup.rs">rustup.rs</a>).</p>
 <pre><code class="language-console">$ git clone https://github.com/sean-reid/jamstream
 $ cd jamstream
 $ cargo install --path crates/cli
+$ cargo install --path crates/server
 $ jamstream --version
 </code></pre>
-<h2 id="2-create-a-digitalocean-account-and-token"><a class="header" href="#2-create-a-digitalocean-account-and-token">2. Create a DigitalOcean account and token</a></h2>
+<p>The second install puts the <code>jamstreamd</code> server binary on your PATH, which is where local mode looks for it. The internet path does not need it locally; skip it if you are only hosting in the cloud.</p>
+<h2 id="2-host-on-this-computer"><a class="header" href="#2-host-on-this-computer">2. Host on this computer</a></h2>
+<p><code>local</code> is the default provider, so the flag is optional:</p>
+<pre><code class="language-console">$ jamstream host --provider local
+
+Local sessions cost nothing.
+Launch this session? [y/N] y
+
+Starting the server on this computer.
+
+Session 10c79bc1 is running.
+server       192.168.1.12:43210
+host         jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgF...
+musician 1   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgG...
+musician 2   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgH...
+musician 3   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgI...
+musician 4   jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgJ...
+
+State written to /Users/you/Library/Application Support/jamstream/sessions/10c79bc1....json.
+End the session with: jamstream end 10c79bc1
+</code></pre>
+<p>The invite strings are shortened here; real ones are about 220 characters. This starts a real <code>jamstreamd</code> process on your machine and completes a full encrypted handshake with it before printing anything, so a printed invite is a working invite.</p>
+<p>The invites carry your machine's network address (192.168.1.12 above), so they work from this computer and from any other machine on the same network. They do not work across the internet; bandmates elsewhere need the DigitalOcean path below, or router port forwarding, which <a href="#playing-on-the-same-network">Playing on the same network</a> explains honestly.</p>
+<h2 id="3-join"><a class="header" href="#3-join">3. Join</a></h2>
+<p>From the desktop app: paste your invite into the field labeled "paste an invite, jamstream://join/..." on the home screen and click Join.</p>
+<p>Without the app, for testing or for a machine without a display, the headless client joins with a WAV file as its instrument:</p>
+<pre><code class="language-console">$ jamstream join 'jamstream://join/EMebwaHOL2MhApakencB7QEAwKgBDMrRAjgF...' \
+    --headless --input take.wav --output mix.wav --duration-secs 60
+joined
+roster: 2 members
+left after 60 s; wrote mix.wav
+</code></pre>
+<p>The input WAV must be 48 kHz, mono or stereo.</p>
+<h2 id="4-end-it"><a class="header" href="#4-end-it">4. End it</a></h2>
+<pre><code class="language-console">$ jamstream end 10c79bc1
+Session 10c79bc1 ended. Instance 67706 is destroyed.
+</code></pre>
+<p>For a local session the instance id is the server's process id, and ending it kills the process. A forgotten local session costs nothing, and the server also exits on its own after 10 minutes with no musicians connected (<code>--idle-min</code>).</p>
+<p>That is the whole local loop. The rest of this page is the internet path.</p>
+<h2 id="host-on-the-internet-with-digitalocean"><a class="header" href="#host-on-the-internet-with-digitalocean">Host on the internet with DigitalOcean</a></h2>
+<p>The flow is the same; the server runs on a small droplet in your DigitalOcean account instead of your machine, and the invites work from anywhere.</p>
+<h3 id="create-an-account-and-token"><a class="header" href="#create-an-account-and-token">Create an account and token</a></h3>
 <p>Short version; the <a href="#digitalocean">DigitalOcean setup page</a> has every step from zero, including the exact token scopes.</p>
 <ol>
 <li>Sign up at digitalocean.com and add a payment method.</li>
@@ -208,20 +246,18 @@ $ jamstream --version
 <li>Choose Custom Scopes and grant the droplet, tag, and read scopes listed on the <a href="#2-create-an-api-token">setup page</a>.</li>
 <li>Copy the token; it is shown once.</li>
 </ol>
-<p>Put the token in your environment:</p>
+<p>Put the token in your environment and verify it works:</p>
 <pre><code class="language-console">$ export DIGITALOCEAN_TOKEN=dop_v1_your_token_here
-</code></pre>
-<p>Verify it works. This lists anything JamStream-tagged in your account without touching it, so a fresh account prints one line:</p>
-<pre><code class="language-console">$ jamstream sweep --dry-run --provider digitalocean
+$ jamstream sweep --dry-run --provider digitalocean
 No jamstream-tagged instances found.
 </code></pre>
-<h2 id="3-point-at-a-server-build"><a class="header" href="#3-point-at-a-server-build">3. Point at a server build</a></h2>
-<p>No <code>jamstreamd</code> release artifact is published yet. Until one is, hosting on a real provider needs two extra flags naming a Linux x86_64 musl build of <code>jamstreamd</code> that the new machine can download, plus its checksum:</p>
+<h3 id="point-at-a-server-build"><a class="header" href="#point-at-a-server-build">Point at a server build</a></h3>
+<p>No <code>jamstreamd</code> release artifact is published yet. Until one is, hosting on a cloud provider needs two extra flags naming a Linux x86_64 musl build of <code>jamstreamd</code> that the new machine can download, plus its checksum:</p>
 <pre><code class="language-console">$ cargo build --release -p jamstream-server
 $ shasum -a 256 target/release/jamstreamd
 </code></pre>
 <p>Host the binary anywhere the new VM can reach over HTTPS, and note the sha256. When releases exist this step disappears.</p>
-<h2 id="4-host"><a class="header" href="#4-host">4. Host</a></h2>
+<h3 id="host"><a class="header" href="#host">Host</a></h3>
 <pre><code class="language-console">$ jamstream host --provider digitalocean \
     --artifact-url https://your-host.example/jamstreamd \
     --artifact-sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
@@ -248,34 +284,19 @@ Session 3f2a9c01 is running.
 server       203.0.113.10:43210
 host         jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiV...
 musician 1   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiW...
-musician 2   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiX...
-musician 3   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiY...
-musician 4   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiZ...
+...
 
 State written to /Users/you/Library/Application Support/jamstream/sessions/3f2a9c01....json.
 End the session with: jamstream end 3f2a9c01
 </code></pre>
-<p>The invite strings are shortened here; real ones are about 220 characters. Before printing this, the CLI has already completed a full encrypted handshake with the new server, so a printed invite is a working invite.</p>
 <p>The meter is now running. The droplet bills by the second until you end the session, and it shuts itself down after 10 minutes with no musicians connected, or at the 12 hour hard cap, whichever comes first.</p>
-<h2 id="5-share-the-invites"><a class="header" href="#5-share-the-invites">5. Share the invites</a></h2>
-<p>Send each <code>jamstream://join/...</code> line to exactly one person, over any channel you trust. Each invite admits one member; the <code>host</code> line is yours. Details in <a href="#joining-a-session">Joining a session</a>.</p>
-<h2 id="6-join"><a class="header" href="#6-join">6. Join</a></h2>
-<p>From the desktop app: paste your invite into the field labeled "paste an invite, jamstream://join/..." on the home screen and click Join.</p>
-<p>Without the app, for testing or for a machine without a display, the headless client joins with a WAV file as its instrument:</p>
-<pre><code class="language-console">$ jamstream join 'jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiV...' \
-    --headless --input take.wav --output mix.wav --duration-secs 60
-joined
-roster: 2 members
-left after 60 s; wrote mix.wav
-</code></pre>
-<p>The input WAV must be 48 kHz, mono or stereo.</p>
-<h2 id="7-check-on-it"><a class="header" href="#7-check-on-it">7. Check on it</a></h2>
+<h3 id="share-join-check-end"><a class="header" href="#share-join-check-end">Share, join, check, end</a></h3>
+<p>Send each <code>jamstream://join/...</code> line to exactly one person, over any channel you trust. Each invite admits one member; the <code>host</code> line is yours. Details in <a href="#joining-a-session">Joining a session</a>. Joining works exactly as in the local path above.</p>
 <pre><code class="language-console">$ jamstream status
 SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
 3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.08037 at 3.0 h
-</code></pre>
-<h2 id="8-end-it"><a class="header" href="#8-end-it">8. End it</a></h2>
-<pre><code class="language-console">$ jamstream end 3f2a9c01
+
+$ jamstream end 3f2a9c01
 Session 3f2a9c01 ended. Instance 512190713 is destroyed.
 </code></pre>
 <p><code>jamstream end --last</code> ends the most recent running session without the id. The CLI confirms with the provider that nothing with this session's tag is still listed before marking it ended. If you ever doubt that everything is gone:</p>
@@ -285,7 +306,8 @@ No jamstream-tagged instances found.
 <p>That line is the whole point of the design: nothing left behind, nothing still billing.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="hosting-a-session"><a class="header" href="#hosting-a-session">Hosting a session</a></h1>
-<p>Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three; the desktop app's host wizard runs the same flow but currently launches only the built-in mock provider, so real sessions are hosted from the CLI.</p>
+<p>Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three; the desktop app's host wizard walks the same steps but does not launch real machines yet, so real sessions are hosted from the CLI.</p>
+<p>Hosting does not have to involve a cloud at all: <code>jamstream host --provider local</code> runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; <a href="#playing-on-the-same-network">Playing on the same network</a> covers local mode.</p>
 <h2 id="the-region-table"><a class="header" href="#the-region-table">The region table</a></h2>
 <p>Before launching, JamStream measures the round trip from your machine to each of the provider's regions and prints a table:</p>
 <pre><code class="language-text">REGION              WORST RTT         HOURLY       EGRESS
@@ -303,7 +325,7 @@ sfo3                    72 ms    $0.02679/hr     $0.01/GB
 </code></pre>
 <p>A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable. If the band spans a continent, pick the region that is mediocre for everyone over the one that is perfect for you; the person with the worst round trip sets the feel. See <a href="#troubleshooting">Troubleshooting</a> for what the numbers mean in the ear.</p>
 <p><label class="checkbox-label"><input class="checkbox-img" type="checkbox"><img src="images/wizard_region.png" alt="Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns"><span class="img-wrapper"><img src="images/wizard_region.png" alt="Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns"></span></label>
-<em>The same table in the app's host wizard, step 2 of 4. Current build, mock provider, fabricated latencies.</em></p>
+<em>The same table in the app's host wizard, step 2 of 4. Current build, demo data, fabricated latencies.</em></p>
 <h2 id="invites-are-minted-at-launch"><a class="header" href="#invites-are-minted-at-launch">Invites are minted at launch</a></h2>
 <p><code>host</code> mints one invite per seat, up front, on your machine:</p>
 <ul>
@@ -366,8 +388,33 @@ left after 120 s; wrote mix.wav
 </code></pre>
 <p>Input must be a 48 kHz WAV, mono or stereo; after the file ends, the client sends silence. The received stereo mix lands in <code>--output</code>. Flags and details in the <a href="#jamstream-join">CLI reference</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="playing-on-the-same-network"><a class="header" href="#playing-on-the-same-network">Playing on the same network</a></h1>
+<p><code>jamstream host --provider local</code> runs the session server as a process on your own computer instead of a cloud machine. Everything else is the same flow: invites are minted up front, the CLI completes a real encrypted handshake with the server before printing them, <code>jamstream status</code> lists the session, and <code>jamstream end</code> tears it down.</p>
+<h2 id="when-local-is-the-right-choice"><a class="header" href="#when-local-is-the-right-choice">When local is the right choice</a></h2>
+<ul>
+<li>Everyone is in the same room or on the same network. The invites carry your machine's network address (for example 192.168.1.12), so any machine on the same network can join.</li>
+<li>You want the lowest possible latency. The audio path is one hop across your own network, with no internet in it.</li>
+<li>You want to try JamStream before creating a cloud account. Local sessions need no credentials and cost nothing.</li>
+</ul>
+<p>Playing alone on one machine also works: joining from the hosting computer goes over the loopback interface.</p>
+<h2 id="the-limits-honestly"><a class="header" href="#the-limits-honestly">The limits, honestly</a></h2>
+<p>An invite that names 192.168.1.12 means nothing outside your network. Reaching a local session across the internet would take router port forwarding: forwarding the session's UDP port (default 43210) to this computer in your router's admin pages, a public IP that many home connections behind carrier NAT do not have, and an invite carrying that public address, which the current build cannot mint (invites carry the network address it discovers, and multi-address invites are future work). JamStream automates none of that. If anyone is joining from outside your network, host in the cloud instead; see <a href="#provider-setup">Provider setup</a>.</p>
+<h2 id="ending-and-the-idle-exit"><a class="header" href="#ending-and-the-idle-exit">Ending and the idle exit</a></h2>
+<p><code>jamstream end</code> kills the server process; for local sessions the instance id shown in <code>status</code> and <code>end</code> output is the process id. If you forget, the server watches its own activity and exits on its own after <code>--idle-min</code> minutes (default 10) with no musicians connected. There is no bill either way. <code>--max-hours</code> still shapes the invites: they expire at the cap, so nobody new can join after it.</p>
+<p>If a laptop dies mid-session or a state file is lost, <code>jamstream sweep</code> finds local strays the same way it finds cloud ones: the local provider keeps an on-disk registry of the processes it spawned, so a later sweep from a fresh shell still sees and kills them.</p>
+<h2 id="where-the-server-binary-comes-from"><a class="header" href="#where-the-server-binary-comes-from">Where the server binary comes from</a></h2>
+<p>Local mode runs a <code>jamstreamd</code> binary already on your machine; nothing is downloaded, and the <code>--artifact-url</code> and <code>--artifact-sha256</code> flags are not needed. The binary is found in this order:</p>
+<ol>
+<li>The <code>JAMSTREAMD_PATH</code> environment variable, if set, is used as the path.</li>
+<li>A <code>jamstreamd</code> sitting next to the <code>jamstream</code> executable itself.</li>
+<li><code>jamstreamd</code> on your PATH.</li>
+</ol>
+<p><code>cargo install --path crates/server</code> satisfies the last one. If none resolves, <code>host</code> fails before starting anything, with an error naming all three places it looked.</p>
+<h2 id="what-lands-on-disk"><a class="header" href="#what-lands-on-disk">What lands on disk</a></h2>
+<p>Under your platform's data directory in <code>jamstream/</code>: a <code>local.json</code> registry of running server processes, and one directory per session holding the server's config and its log (<code>server.log</code>, the first place to look if a local server exits at startup). The session state files that <code>status</code> and <code>end</code> read live in <code>jamstream/sessions/</code> as for any provider.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="provider-setup"><a class="header" href="#provider-setup">Provider setup</a></h1>
-<p>JamStream hosts on three providers. Each needs a one-time setup: an account, a credential with the narrowest permissions that still work, and a check that the credential works. One page per provider walks it from zero.</p>
+<p>JamStream hosts on three cloud providers. Each needs a one-time setup: an account, a credential with the narrowest permissions that still work, and a check that the credential works. One page per provider walks it from zero. Hosting on your own computer needs none of this; see <a href="#playing-on-the-same-network">Playing on the same network</a>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -437,7 +484,7 @@ No jamstream-tagged instances found.
 <pre><code class="language-console">$ jamstream sweep --dry-run --provider digitalocean
 No jamstream-tagged instances found.
 </code></pre>
-<p>That output means the token authenticates and can list droplets. You are ready to host; continue with the <a href="#4-host">quickstart</a>.</p>
+<p>That output means the token authenticates and can list droplets. You are ready to host; continue with the <a href="#host">quickstart</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="aws"><a class="header" href="#aws">AWS</a></h1>
 <p>AWS works well and is priced fine; the setup is more involved than DigitalOcean's because IAM is built for companies. Budget 30 minutes the first time. If you are not already an AWS user, <a href="#digitalocean">DigitalOcean</a> is less work.</p>
@@ -509,7 +556,7 @@ $ export AWS_SECRET_ACCESS_KEY=your_secret_here
 <pre><code class="language-console">$ jamstream sweep --dry-run --provider aws
 No jamstream-tagged instances found.
 </code></pre>
-<p>That output means the key authenticates and can list instances. Continue with the <a href="#4-host">quickstart</a>, swapping <code>--provider digitalocean</code> for <code>--provider aws</code>.</p>
+<p>That output means the key authenticates and can list instances. Continue with the <a href="#host">quickstart</a>, swapping <code>--provider digitalocean</code> for <code>--provider aws</code>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="gcp"><a class="header" href="#gcp">GCP</a></h1>
 <p>Google Cloud works well; the setup has the most moving parts of the three providers: a project, an API to enable, a service account, and a key file. Budget 30 minutes. If you are starting from nothing, <a href="#digitalocean">DigitalOcean</a> is less work, and GCP is the only one of the three that bills the session's audio traffic on top of the machine.</p>
@@ -550,10 +597,11 @@ $ export GCP_ACCESS_TOKEN=$(gcloud auth print-access-token)
 <pre><code class="language-console">$ jamstream sweep --dry-run --provider gcp
 No jamstream-tagged instances found.
 </code></pre>
-<p>That output means the credential authenticates and can list instances. Continue with the <a href="#4-host">quickstart</a>, swapping <code>--provider digitalocean</code> for <code>--provider gcp</code>.</p>
+<p>That output means the credential authenticates and can list instances. Continue with the <a href="#host">quickstart</a>, swapping <code>--provider digitalocean</code> for <code>--provider gcp</code>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="understanding-cost"><a class="header" href="#understanding-cost">Understanding cost</a></h1>
 <p>A session costs machine time plus network traffic, paid to your cloud provider. Both are small; this page explains how the preview is computed, what egress is, and the guardrails that keep a mistake from costing more than a coffee.</p>
+<p>Local sessions cost nothing: <code>--provider local</code> runs the server on your own computer, so there is no machine to rent and no egress to meter. The preview says so in one line, and the only guardrail a local session needs is the idle exit, since a forgotten process bills nobody. The rest of this page is about the cloud providers.</p>
 <h2 id="the-preview"><a class="header" href="#the-preview">The preview</a></h2>
 <p>Before anything launches, <code>jamstream host</code> and the app's wizard show the same preview:</p>
 <pre><code class="language-text">Cost preview for digitalocean nyc3 over 3.0 hours:
@@ -583,7 +631,7 @@ Total (estimate)                                  $0.08037
 <pre><code class="language-console">$ jamstream status
 SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
 3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.08037 at 3.0 h
-b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              -
+b7e5c9b6   local/local          ended      2 h 13 min        $0.00              -
 </code></pre>
 <p>Accrued is hourly rate times elapsed time; it stops when the session ends. The state files behind this table live on your machine, one JSON file per session, under your platform's data directory in <code>jamstream/sessions/</code>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -643,6 +691,7 @@ b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              
 <pre><code class="language-text">Usage: jamstream host [OPTIONS]
 </code></pre>
 <p>Ranks the provider's regions by measured latency and price, shows a cost preview, asks for confirmation, launches the machine, verifies it answers a real encrypted handshake, prints one invite per seat, and records the session in a local state file.</p>
+<p>With <code>--provider local</code> (the default) there is nothing to rank or bill: the server starts as a process on this computer, the cost line reads that local sessions cost nothing, and the handshake check still runs against the real server. See <a href="#playing-on-the-same-network">Playing on the same network</a>.</p>
 <h2 id="options"><a class="header" href="#options">Options</a></h2>
 <div class="table-wrapper">
 <table>
@@ -650,8 +699,8 @@ b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              
 <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--provider &lt;PROVIDER&gt;</code></td><td><code>mock</code></td><td>Cloud provider to host on: <code>mock</code>, <code>aws</code>, <code>digitalocean</code>, or <code>gcp</code>. The mock runs the whole flow with no credentials and no real machine.</td></tr>
-<tr><td><code>--region &lt;REGION&gt;</code></td><td>picked by ranking</td><td>Region id to use, skipping the latency ranking.</td></tr>
+<tr><td><code>--provider &lt;PROVIDER&gt;</code></td><td><code>local</code></td><td>Provider to host on: <code>local</code>, <code>digitalocean</code>, <code>aws</code>, or <code>gcp</code>. Local runs the server on this computer, with no credentials and no cost.</td></tr>
+<tr><td><code>--region &lt;REGION&gt;</code></td><td>picked by ranking</td><td>Region id to use, skipping the latency ranking. Local has one region, <code>local</code>.</td></tr>
 <tr><td><code>--musicians &lt;MUSICIANS&gt;</code></td><td><code>4</code></td><td>Musician invites to mint, not counting the host. 1 to 10.</td></tr>
 <tr><td><code>--listeners &lt;LISTENERS&gt;</code></td><td><code>0</code></td><td>Listener invites to mint. 0 to 20.</td></tr>
 <tr><td><code>--hours &lt;HOURS&gt;</code></td><td><code>3</code></td><td>Expected session length in hours, for the cost preview. Does not limit the session.</td></tr>
@@ -659,21 +708,24 @@ b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              
 <tr><td><code>--port &lt;PORT&gt;</code></td><td><code>43210</code></td><td>UDP port the session server listens on.</td></tr>
 <tr><td><code>--idle-min &lt;IDLE_MIN&gt;</code></td><td><code>10</code></td><td>Minutes without musicians before the server shuts itself down.</td></tr>
 <tr><td><code>--max-hours &lt;MAX_HOURS&gt;</code></td><td><code>12</code></td><td>Hard cap on session length in hours. Invites expire at the cap.</td></tr>
-<tr><td><code>--artifact-url &lt;ARTIFACT_URL&gt;</code></td><td>none</td><td>URL of the <code>jamstreamd</code> artifact the VM downloads at boot. Required for real providers until releases are published.</td></tr>
+<tr><td><code>--artifact-url &lt;ARTIFACT_URL&gt;</code></td><td>none</td><td>URL of the <code>jamstreamd</code> artifact the VM downloads at boot. Required for cloud providers until releases are published; local mode runs a binary already on this machine and ignores it.</td></tr>
 <tr><td><code>--artifact-sha256 &lt;ARTIFACT_SHA256&gt;</code></td><td>none</td><td>Expected sha256 of the <code>jamstreamd</code> artifact. Required alongside <code>--artifact-url</code>.</td></tr>
 <tr><td><code>--yes</code></td><td>off</td><td>Skip the launch confirmation.</td></tr>
 <tr><td><code>--json</code></td><td>off</td><td>Emit one JSON object instead of human-readable output.</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="example"><a class="header" href="#example">Example</a></h2>
+<h2 id="examples"><a class="header" href="#examples">Examples</a></h2>
+<p>A session on this computer, for the people in the room:</p>
+<pre><code class="language-console">$ jamstream host --provider local --yes
+</code></pre>
 <p>A two hour duo session with two spare listener seats, on DigitalOcean, unattended:</p>
 <pre><code class="language-console">$ jamstream host --provider digitalocean --musicians 1 --listeners 2 \
     --hours 2 --yes \
     --artifact-url https://your-host.example/jamstreamd \
     --artifact-sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 </code></pre>
-<p>Full output of a host run is shown in the <a href="#4-host">quickstart</a>.</p>
+<p>Full output of both is shown in the <a href="#quickstart-host-your-first-session">quickstart</a>.</p>
 <h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
 <ul>
 <li>If JamStream-tagged machines already exist on the provider, they are listed with a warning before anything launches; run <a href="#jamstream-sweep"><code>jamstream sweep</code></a> if they are strays.</li>
@@ -698,11 +750,11 @@ b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              
 </tbody>
 </table>
 </div>
-<h2 id="example-1"><a class="header" href="#example-1">Example</a></h2>
+<h2 id="example"><a class="header" href="#example">Example</a></h2>
 <pre><code class="language-console">$ jamstream status --hours 4
 SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
 3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.10716 at 4.0 h
-b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              -
+b7e5c9b6   local/local          ended      2 h 13 min        $0.00              -
 </code></pre>
 <h2 id="notes-1"><a class="header" href="#notes-1">Notes</a></h2>
 <ul>
@@ -728,7 +780,7 @@ b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              
 </tbody>
 </table>
 </div>
-<h2 id="example-2"><a class="header" href="#example-2">Example</a></h2>
+<h2 id="example-1"><a class="header" href="#example-1">Example</a></h2>
 <pre><code class="language-console">$ jamstream end 3f2a9c01
 Session 3f2a9c01 ended. Instance 512190713 is destroyed.
 </code></pre>
@@ -754,7 +806,7 @@ Session 3f2a9c01 ended. Instance 512190713 is destroyed.
 <p>Find and destroy orphaned jamstream instances.</p>
 <pre><code class="language-text">Usage: jamstream sweep [OPTIONS]
 </code></pre>
-<p>Every machine JamStream launches carries a <code>jamstream</code> tag with its session id. Sweep lists everything with that tag, across every provider whose credentials are in the environment, and destroys it. This is the backstop for crashed sessions, lost laptops, and anything else that slipped past <a href="#jamstream-end"><code>jamstream end</code></a>.</p>
+<p>Every machine JamStream launches carries a <code>jamstream</code> tag with its session id. Sweep lists everything with that tag, across every provider whose credentials are in the environment, and destroys it. Local sessions need no credentials and are always included, so a stray server process on this computer is found the same way. This is the backstop for crashed sessions, lost laptops, and anything else that slipped past <a href="#jamstream-end"><code>jamstream end</code></a>.</p>
 <h2 id="options-2"><a class="header" href="#options-2">Options</a></h2>
 <div class="table-wrapper">
 <table>
@@ -767,7 +819,7 @@ Session 3f2a9c01 ended. Instance 512190713 is destroyed.
 </tbody>
 </table>
 </div>
-<h2 id="example-3"><a class="header" href="#example-3">Example</a></h2>
+<h2 id="example-2"><a class="header" href="#example-2">Example</a></h2>
 <pre><code class="language-console">$ jamstream sweep --dry-run
 PROVIDER       REGION         INSTANCE         RESULT
 digitalocean   nyc3           512190713        would destroy
@@ -811,7 +863,7 @@ No jamstream-tagged instances found.
 </tbody>
 </table>
 </div>
-<h2 id="example-4"><a class="header" href="#example-4">Example</a></h2>
+<h2 id="example-3"><a class="header" href="#example-3">Example</a></h2>
 <p>Hold a seat for two minutes, contribute a pre-recorded take, and keep what came back:</p>
 <pre><code class="language-console">$ jamstream join 'jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiV...' \
     --headless --input take.wav --output mix.wav --duration-secs 120 \
@@ -833,7 +885,7 @@ left after 120 s; wrote mix.wav
 <h1 id="how-it-works"><a class="header" href="#how-it-works">How it works</a></h1>
 <p>One honest page on what actually happens when you host and play. Deeper detail lives in the source.</p>
 <h2 id="the-machines-life"><a class="header" href="#the-machines-life">The machine's life</a></h2>
-<p>When you run <code>jamstream host</code>, your computer asks your cloud provider for one small Linux VM and hands it a boot script. The machine:</p>
+<p>When you host on a cloud provider, your computer asks it for one small Linux VM and hands it a boot script. (In <a href="#playing-on-the-same-network">local mode</a> there is no VM: the same server starts as a process on your machine, with the same keys and settings, and the story picks up at step 5.) The machine:</p>
 <ol>
 <li>downloads a pinned build of <code>jamstreamd</code>, the session server, from the artifact URL;</li>
 <li>verifies the download's sha256 checksum against the one baked in at launch, and refuses to start on a mismatch;</li>

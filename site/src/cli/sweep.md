@@ -6,7 +6,7 @@ Find and destroy orphaned jamstream instances.
 Usage: jamstream sweep [OPTIONS]
 ```
 
-Every machine JamStream launches carries a `jamstream` tag with its session id. Sweep lists everything with that tag, across every provider whose credentials are in the environment, and destroys it. This is the backstop for crashed sessions, lost laptops, and anything else that slipped past [`jamstream end`](end.md).
+Every machine JamStream launches carries a `jamstream` tag with its session id. Sweep lists everything with that tag, across every provider whose credentials are in the environment, and destroys it. Local sessions need no credentials and are always included, so a stray server process on this computer is found the same way. This is the backstop for crashed sessions, lost laptops, and anything else that slipped past [`jamstream end`](end.md).
 
 ## Options
 

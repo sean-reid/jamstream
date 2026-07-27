@@ -2,6 +2,8 @@
 
 A session costs machine time plus network traffic, paid to your cloud provider. Both are small; this page explains how the preview is computed, what egress is, and the guardrails that keep a mistake from costing more than a coffee.
 
+Local sessions cost nothing: `--provider local` runs the server on your own computer, so there is no machine to rent and no egress to meter. The preview says so in one line, and the only guardrail a local session needs is the idle exit, since a forgotten process bills nobody. The rest of this page is about the cloud providers.
+
 ## The preview
 
 Before anything launches, `jamstream host` and the app's wizard show the same preview:
@@ -42,7 +44,7 @@ The worst case, all guardrails ignored and a session forgotten mid-jam, is 12 ho
 $ jamstream status
 SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
 3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.08037 at 3.0 h
-b7e5c9b6   mock/mock-west       ended      2 h 13 min    $0.053426              -
+b7e5c9b6   local/local          ended      2 h 13 min        $0.00              -
 ```
 
 Accrued is hourly rate times elapsed time; it stops when the session ends. The state files behind this table live on your machine, one JSON file per session, under your platform's data directory in `jamstream/sessions/`.

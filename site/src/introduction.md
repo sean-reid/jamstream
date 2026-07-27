@@ -25,8 +25,8 @@ Broadcasting a session to platforms like Twitch and YouTube is designed but not 
 
 JamStream is under active development and not yet at a first release.
 
-- The command line tool hosts, monitors, and ends real sessions. It also runs the whole flow against a built-in mock provider, so you can try everything without a cloud account.
-- The desktop app is usable but unfinished. Its host wizard currently launches only the mock provider; real sessions are hosted from the CLI. Screenshots on this site are from the current build and will change.
-- No release artifacts are published yet, so hosting on a real provider means pointing the CLI at a `jamstreamd` server build you host yourself. The [quickstart](quickstart.md) shows where those flags go.
+- The command line tool hosts, monitors, and ends real sessions. It can also host a session on your own computer with no cloud account at all; see [Playing on the same network](guides/local.md).
+- The desktop app is usable but unfinished. Its host wizard does not launch real machines yet; real sessions are hosted from the CLI. Screenshots on this site are from the current build and will change.
+- No release artifacts are published yet, so hosting on a cloud provider means pointing the CLI at a `jamstreamd` server build you host yourself. The [quickstart](quickstart.md) shows where those flags go.
 
 If something here does not match what the software does, that is a bug in one of them. [Report it.](about.md)
