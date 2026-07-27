@@ -41,7 +41,19 @@ thiserror = "2"
 tracing = "0.1"
 rand = "0.10"
 proptest = "1"
-snow = "0.10"
+# default-features = false drops snow's `std` feature, whose feature list uses
+# the legacy `ring/std` syntax (no `?`), which implicitly turns on snow's
+# optional `ring` dependency. Nothing can reach ring: `RingResolver` is gated
+# behind `ring-resolver`, which we do not enable. All it did was compile ring's
+# C and per-architecture assembly into jamstreamd and drag in a third getrandom
+# major. snow's `std` feature only swaps `no_std` + `alloc` imports for `std`
+# ones; `snow::Error` implements `core::error::Error` either way, so `#[from]`
+# in crates/protocol keeps working. Restore std if snow ever needs it, or drop
+# the override once upstream writes `ring?/std`.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "default-resolver-crypto",
+] }
 ed25519-dalek = { version = "3", features = ["serde"] }
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 data-encoding = "2"

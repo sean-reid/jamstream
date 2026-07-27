@@ -13,6 +13,12 @@ on:
   schedule:
     - cron: "41 5 * * 1"
 
+# This job holds the Developer ID certificate and the notary key, so its
+# GITHUB_TOKEN should be able to do as little as possible. It only needs to
+# check out the tree it signs.
+permissions:
+  contents: read
+
 jobs:
   sign:
     runs-on: macos-latest
@@ -30,12 +36,22 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+      # Commit pins, per the policy documented in ci.yml. It matters most
+      # here: this job holds the Developer ID certificate and the notary key,
+      # so anything a retargeted @stable branch or @v2 tag ran could read both
+      # out of the environment.
       - if: steps.gate.outputs.configured == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
       - if: steps.gate.outputs.configured == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      # The same fetch-then-build-offline shape release.yml uses, so this
+      # canary exercises that too, not just the certificate.
       - if: steps.gate.outputs.configured == 'true'
-        run: cargo build -p jamstream-client --release
+        run: cargo fetch --locked
+      - if: steps.gate.outputs.configured == 'true'
+        run: cargo build --locked --offline -p jamstream-client --release
       - if: steps.gate.outputs.configured == 'true'
         name: Import certificate into a throwaway keychain
         env:
@@ -43,8 +59,10 @@ jobs:
           APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
         run: |
           set -eu
+          # KEYCHAIN_PW stays a shell local. It used to be written to
+          # $GITHUB_ENV, which is not log-masked, and no later step ever read
+          # it back.
           KEYCHAIN_PW=$(uuidgen)
-          echo "KEYCHAIN_PW=$KEYCHAIN_PW" >> "$GITHUB_ENV"
           security create-keychain -p "$KEYCHAIN_PW" smoke.keychain
           security set-keychain-settings -lut 1800 smoke.keychain
           security unlock-keychain -p "$KEYCHAIN_PW" smoke.keychain
@@ -100,6 +118,9 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           set -eu
+          # Shell redirection creates 0666 & ~umask, and the runner umask is
+          # 022, so without this the notary private key lands 0644.
+          umask 077
           if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
             printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
           else
@@ -113,6 +134,12 @@ jobs:
             --wait | tee "$RUNNER_TEMP/notary.log"
           rm -f "$RUNNER_TEMP/asc-key.p8"
           grep -q "status: Accepted" "$RUNNER_TEMP/notary.log"
+      # The step above removes the key on its happy path only, so a notarytool
+      # failure would leave the notary private key sitting in RUNNER_TEMP for
+      # the rest of the job. Unconditional scrub.
+      - if: always()
+        name: Scrub the notarization key
+        run: rm -f "$RUNNER_TEMP/asc-key.p8" "$RUNNER_TEMP/smoke.zip"
       - if: always() && steps.gate.outputs.configured == 'true'
         name: Remove the throwaway keychain
         run: security delete-keychain smoke.keychain || true

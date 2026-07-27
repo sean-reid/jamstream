@@ -1,13 +1,62 @@
+# cargo-deny is deliberately run with no [graph] targets. With the key unset
+# every target's dependencies are in the graph, so one Linux run in ci.yml
+# already audits the Windows and macOS crates too. Setting targets here would
+# NARROW that, not widen it: verified by running this file on macOS and getting
+# the Linux-and-Wayland-only sctk-adwaita path reported below.
 [advisories]
 version = 2
 yanked = "deny"
 ignore = [
-    # ttf-parser is unmaintained; it reaches us only through egui's font
-    # stack, which pins it. Revisit at the next egui upgrade.
+    # ttf-parser is unmaintained (informational, patched = [], so there is no
+    # version to move to). Two paths reach it, both through
+    # owned_ttf_parser -> ab_glyph:
+    #
+    #   crates/broadcast (our workspace ab_glyph dependency) -> crates/stream
+    #   -> crates/server, on every target. This one SHIPS: the card renderer
+    #   is server-side, so ttf-parser is in the jamstreamd musl binary a
+    #   session VM downloads at boot.
+    #
+    #   sctk-adwaita -> winit -> eframe, Linux and Wayland only, so the
+    #   desktop client's window decorations.
+    #
+    # egui itself is not involved. Its font stack is fontations
+    # (font-types/read-fonts/skrifa), so an egui bump cannot clear this.
+    #
+    # Accepted because the parser's input is fixed at compile time: the only
+    # calls into it are three FontRef::try_from_slice on include_bytes! fonts
+    # (crates/broadcast/src/text.rs:18-22). Session data reaches glyph lookup
+    # on an already-parsed font, never the parse.
+    #
+    # Triggers, in the order they are likely to fire: crates/broadcast moving
+    # to skrifa deletes the shipped path and this entry; the [[bans.deny]]
+    # entries below fail the build if any other crate starts reaching
+    # ttf-parser or ab_glyph, which is the case where the fixed-input argument
+    # stops holding; and broadcast ever parsing a font it did not
+    # include_bytes! invalidates the argument outright.
     "RUSTSEC-2026-0192",
-    # quick-xml quadratic-time start-tag check. Reaches us through the
-    # platform audio stack (plist parsing of local system files), never
-    # attacker-supplied input. Revisit when the stack bumps its pin.
+    # quick-xml denial of service: quadratic duplicate-attribute check (0194)
+    # and unbounded namespace-declaration allocation in NsReader (0195). Both
+    # are patched in >= 0.41.0. Two copies resolve:
+    #
+    #   0.41.0 is already patched and is build-time only anyway
+    #   (wayland-scanner, a proc macro).
+    #
+    #   0.38.4 is the affected one, via zbus_xml -> zbus-lockstep ->
+    #   atspi-common, the Linux AT-SPI accessibility stack under the desktop
+    #   client. Nothing here parses XML at run time: every zbus_lockstep::
+    #   call in atspi-common 0.13.0 sits inside #[cfg(test)]
+    #   (src/action.rs:15-19, src/lib.rs:203-209,
+    #   src/object_match.rs:236-241), and the non-test use is the
+    #   zbus_lockstep_macros::validate proc macro, which reads committed
+    #   interface XML at compile time. No NsReader sees untrusted bytes, and
+    #   neither copy is in jamstreamd's closure on any target.
+    #
+    # Triggers: this clears when accesskit's atspi-common bumps zbus-lockstep
+    # far enough to resolve quick-xml >= 0.41, which deletes the 0.38.4 copy
+    # and makes cargo-deny fail on the unused ignore. Before that, the
+    # quick-xml [[bans.deny]] entry below fails the build the moment a
+    # pre-0.41 copy arrives through anything other than zbus_xml, which is
+    # the case where the compile-time-only argument stops holding.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]
@@ -40,6 +89,37 @@ wildcards = "deny"
 # Internal path dependencies carry no version field; only registry
 # wildcards are worth denying.
 allow-wildcard-paths = true
+
+# These three exist to give the [advisories] ignores above a trigger that can
+# actually fire. Each ignore rests on an argument about WHICH crate reaches the
+# vulnerable one; a new path is exactly what invalidates the argument, and
+# without these the ignore would just keep suppressing it silently.
+
+# The 0.38.4 copy is accepted only because its one consumer, zbus_xml, is a
+# compile-time proc-macro input. A pre-0.41 copy arriving through anything else
+# is a possible run-time XML parser and must be looked at.
+#
+# name + version, not the newer crate = "name@req": cargo-deny 0.20.2 accepts
+# `crate = "quick-xml@<0.41.0"` and then matches every version, so the patched
+# 0.41.0 copy under wayland-scanner fails the build. Verified both ways.
+[[bans.deny]]
+name = "quick-xml"
+version = "<0.41.0"
+wrappers = ["zbus_xml"]
+
+# ttf-parser is unmaintained with no patched version, so the argument for
+# keeping it is that its only parse input is fonts we compile in. Both of these
+# fail the build if a new crate joins that path, which is when that argument
+# needs re-checking. ab_glyph is listed because it is our own workspace
+# dependency: a second workspace crate picking it up widens the shipped
+# surface without touching deny.toml.
+[[bans.deny]]
+name = "ttf-parser"
+wrappers = ["owned_ttf_parser"]
+
+[[bans.deny]]
+name = "ab_glyph"
+wrappers = ["jamstream-broadcast", "sctk-adwaita"]
 
 [sources]
 unknown-registry = "deny"

@@ -13,6 +13,12 @@
 # The harness gates run as their own parallel job so unit/integration
 # feedback lands before the ~3 minute simulation suite finishes. Anything
 # that cannot fit the budget lives in nightly.yml, which has none.
+#
+# Every cargo invocation here passes --locked. cargo-deny audits Cargo.lock,
+# so without it the graph that was audited and the graph that was built are
+# not provably the same: cargo would quietly resolve a newer version and fix
+# the lockfile up in CI instead of failing the pull request. --locked costs
+# nothing (it only forbids writing Cargo.lock) and does not affect caching.
 name: ci
 
 # A newer push supersedes any still-running ci for the same ref; finishing
@@ -26,6 +32,12 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repository. Without an explicit block the jobs
+# inherit the repository default, and the artifact uploads use the runner's
+# own token rather than GITHUB_TOKEN, so read is all that is ever needed.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -36,15 +48,33 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Third-party actions are pinned to commits repo-wide, not to tags or
+      # branches, and dependabot bumps the pins weekly. The reason starts with
+      # the jobs that hold signing secrets (release.yml, sign-smoke.yml) but
+      # applies here too: a retargeted ref in this workflow could make a
+      # malicious pull request look green on the branch that auto-merges.
+      # dtolnay/rust-toolchain is pinned to master, which is append-only, with
+      # an explicit `toolchain: stable`; the @stable branch is only master
+      # plus that default and it gets force-pushed.
+      # Re-pin from: gh api repos/dtolnay/rust-toolchain/git/ref/heads/master
+      #              gh api repos/Swatinem/rust-cache/git/ref/tags/v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      # Staleness gate. cargo-deny audits Cargo.lock and every cargo
+      # invocation in this repo passes --locked, so a lockfile that does not
+      # match Cargo.toml turns into a build failure minutes into some other
+      # job. This fails in seconds and names the offending dependency. It
+      # needs no system libraries, so it runs before the apt step.
+      - name: Cargo.lock is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
       # libasound2-dev: cpal/alsa-sys. libxkbcommon-dev + libwayland-dev:
       # eframe 0.35 (winit/wayland) build-time requirements on Linux.
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
       # release.yml's shell helpers live in scripts/; keep them
       # shellcheck-clean (shellcheck is preinstalled on ubuntu runners).
@@ -75,26 +105,27 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
       - if: runner.os == 'macOS'
-        run: cargo nextest run --workspace --exclude jamstream-harness
+        run: cargo nextest run --locked --workspace --exclude jamstream-harness
       - if: runner.os != 'macOS'
-        run: cargo nextest run --workspace --exclude jamstream-harness --exclude jamstream-client
+        run: cargo nextest run --locked --workspace --exclude jamstream-harness --exclude jamstream-client
       # The nextest run above already compiles the cfg(windows) WASAPI
       # exclusive-mode backend (lib and tests, with RUSTFLAGS=-D warnings), so
       # it is the Windows compile gate. Clippy, though, only runs on Linux in
       # the lint job, where that whole module is cfg'd out; lint it here, scoped
       # to the one crate that has Windows-only code.
       - if: runner.os == 'Windows'
-        run: cargo clippy -p jamstream-audio-io --all-targets -- -D warnings
+        run: cargo clippy --locked -p jamstream-audio-io --all-targets -- -D warnings
       # The snapshot tests drop a human-reviewable PNG of every screen under
       # target/ui-previews/; upload them even when a pixel diff fails, since
       # a failing run is exactly when a human wants to look.
@@ -117,11 +148,13 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
-      - run: cargo build --workspace --release
+      - run: cargo build --locked --workspace --release
 
   # Simulation harness gates: latency budgets, loss resilience, drift, chaos.
   # ~3 minutes of pure test runtime, and no audio/UI system deps (the harness
@@ -135,12 +168,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run -p jamstream-harness
+      - run: cargo nextest run --locked -p jamstream-harness
         env:
           # Shared runners are several times slower than a developer
           # machine; the gate catches order-of-magnitude regressions.
@@ -157,10 +192,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
@@ -170,7 +206,7 @@ jobs:
       # coverage contribution is redundant with the direct suites the
       # floors below measure.
       - name: Workspace coverage (lcov)
-        run: cargo llvm-cov --workspace --exclude jamstream-client --exclude jamstream-harness --lcov --output-path lcov.info
+        run: cargo llvm-cov --locked --workspace --exclude jamstream-client --exclude jamstream-harness --lcov --output-path lcov.info
       - name: Coverage summary
         run: |
           {
@@ -225,7 +261,7 @@ jobs:
               fi
             done
             echo "::group::jamstream-$crate (floor ${floor} percent)"
-            cargo llvm-cov -p "jamstream-$crate" --summary-only \
+            cargo llvm-cov --locked -p "jamstream-$crate" --summary-only \
               --fail-under-lines "$floor" \
               --ignore-filename-regex "crates/($others)/|xtask/"
             echo '::endgroup::'
@@ -238,12 +274,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build -p jamstream-server --release --target x86_64-unknown-linux-musl
+      - run: cargo build --locked -p jamstream-server --release --target x86_64-unknown-linux-musl
       - name: Verify the binary is fully static
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/jamstreamd

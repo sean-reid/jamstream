@@ -25,6 +25,11 @@ on:
     branches: [main]
   pull_request:
 
+# Every job here only reads the tree and compares generated output against
+# what is committed. Nothing writes to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
         with:
           shared-key: docs-check-cli
       - name: Check CLI reference pages against --help
@@ -43,11 +48,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
         with:
           shared-key: docs-check-previews
       - name: Render UI previews
-        run: cargo test -p jamstream-client --test ui_snapshots
+        run: cargo test --locked -p jamstream-client --test ui_snapshots
       - name: Check committed docs images against fresh previews
         run: site/copy-previews.sh --check
 
