@@ -558,7 +558,14 @@ impl ClientCore {
                 }
             }
             ClientState::Joined => {
-                if now_ms.saturating_sub(self.last_server_ms) >= CONNECTION_TIMEOUT_MS {
+                // Silence for the timeout, or a control link that has given
+                // up retransmitting. The second never follows from the first:
+                // any authenticated packet, media included, counts as being
+                // heard from, so a server that keeps mixing while acking
+                // nothing would otherwise hold this client forever.
+                if now_ms.saturating_sub(self.last_server_ms) >= CONNECTION_TIMEOUT_MS
+                    || self.link.is_dead()
+                {
                     self.state = ClientState::TimedOut;
                     self.events.push(ClientEvent::TimedOut);
                     return out;
