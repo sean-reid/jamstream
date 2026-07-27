@@ -6,17 +6,19 @@ use std::sync::Arc;
 
 use egui::{Context, Frame, Ui};
 
+use crate::avatar;
 use crate::creds::{self, CredStore, EnvReader, KeyringStore};
 use crate::demo::DemoRuntime;
 use crate::exec::{Executor, Job};
 use crate::live::{AudioSettings, CostedRuntime, LiveRuntime};
-use crate::runtime::{Command, ConnState, LevelsView, Runtime};
+use crate::runtime::{AvatarHandle, Command, ConnState, LevelsView, Runtime, Snapshot};
 use crate::screens::devices::{DeviceCatalog, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
 use crate::screens::session::{SessionEvent, SessionScreen};
 use crate::theme::{self, Theme};
+use crate::widgets::{AVATAR_D_STRIP, avatar_disc, sweep_avatar_textures};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -53,6 +55,16 @@ pub struct JamApp {
     /// state).
     pub live: Option<Arc<LiveRuntime>>,
     pub settings_open: bool,
+    /// The path typed into the settings sheet's avatar row. There is no
+    /// application settings store to keep it in, so a chosen avatar lasts
+    /// for this run of the app; joining a session announces it.
+    pub avatar_path: String,
+    /// Why the last avatar load failed, shown inline under the row.
+    pub avatar_error: Option<String>,
+    /// The avatar you picked, decoded for the settings disc.
+    pub own_avatar: Option<AvatarHandle>,
+    /// The same avatar's file bytes, kept so a join can announce it.
+    own_avatar_bytes: Option<Vec<u8>>,
     /// Device selection last applied to the live runtime, as
     /// (capture_idx, playback_idx, buffer_frames).
     applied_audio: (usize, usize, u32),
@@ -87,6 +99,10 @@ impl JamApp {
             runtime: None,
             live: None,
             settings_open: false,
+            avatar_path: String::new(),
+            avatar_error: None,
+            own_avatar: None,
+            own_avatar_bytes: None,
             applied_audio,
             ending: None,
             creds,
@@ -172,6 +188,7 @@ impl JamApp {
                 self.session.invites_open = true;
                 self.recent = RecentSession::load();
                 self.screen = Screen::Session;
+                self.announce_own_avatar();
             }
             Err(err) => {
                 self.wizard.launch_error = Some(format!(
@@ -271,6 +288,7 @@ impl JamApp {
                                     self.runtime = Some(Box::new(rt));
                                     self.session = SessionScreen::default();
                                     self.screen = Screen::Session;
+                                    self.announce_own_avatar();
                                 }
                                 Err(err) => self.home.error = Some(err.to_string()),
                             }
@@ -331,6 +349,11 @@ impl JamApp {
                 live.reconfigure_audio(self.audio_settings());
             }
         }
+
+        // Every surface has had its turn: whatever avatar texture nothing
+        // drew this frame belongs to a member who left, or to a picture that
+        // was replaced. Free it.
+        sweep_avatar_textures(ui.ctx());
     }
 
     fn current_levels(&self) -> LevelsView {
@@ -386,13 +409,112 @@ impl JamApp {
                     }
                 }
                 ui.add_space(theme::SPACE_SM);
-                let levels = self
-                    .runtime
-                    .as_deref()
-                    .map(|rt| rt.snapshot().levels)
-                    .unwrap_or_default();
+                let snap = self.runtime.as_deref().map(|rt| rt.snapshot());
+                self.avatar_ui(ui, snap.as_ref());
+                ui.add_space(theme::SPACE_SM);
+                let levels = snap.map(|s| s.levels).unwrap_or_default();
                 self.devices.panels_ui(ui, &self.catalog, &levels);
             });
+    }
+
+    /// "Your avatar": the disc as everyone else sees it, a path field, and
+    /// the two actions. There is no file dialog in this app, so the path is
+    /// pasted; every refusal names its own reason on the spot.
+    fn avatar_ui(&mut self, ui: &mut Ui, snap: Option<&Snapshot>) {
+        ui.label(theme::title(ui, "Your avatar"));
+        let me = snap.and_then(|s| s.members.iter().find(|m| m.is_you));
+        // Outside a session there is no name to hash a hue from; "you" is
+        // the honest placeholder rather than a fake initial.
+        let name = me.map_or("you".to_owned(), |m| m.name.clone());
+        // The local pick wins while it is in hand: it is what the session
+        // will carry, and it shows before any roster round trip.
+        let handle = self
+            .own_avatar
+            .clone()
+            .or_else(|| me.and_then(|m| m.avatar.clone()));
+        let mut load = false;
+        let mut remove = false;
+        ui.horizontal(|ui| {
+            avatar_disc(ui, &name, handle.as_ref(), AVATAR_D_STRIP, false);
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.avatar_path)
+                        .desired_width(206.0)
+                        .hint_text("path to a PNG or JPEG"),
+                );
+                ui.horizontal(|ui| {
+                    load = ui.button("Load").clicked();
+                    remove = ui
+                        .add_enabled(handle.is_some(), egui::Button::new("Remove"))
+                        .clicked();
+                });
+            });
+        });
+        if let Some(err) = &self.avatar_error {
+            let p = theme::palette_of(ui);
+            ui.label(egui::RichText::new(err.clone()).color(p.danger));
+        }
+        ui.label(theme::muted(
+            ui,
+            format!(
+                "PNG or JPEG up to {} KB. Removing applies here and on your next join; \
+                 the session keeps the picture you already sent.",
+                avatar::MAX_BYTES / 1024
+            ),
+        ));
+        if load {
+            self.load_avatar();
+        }
+        if remove {
+            self.remove_avatar();
+        }
+    }
+
+    /// Reads the pasted path and validates it against the same caps the
+    /// transfer layer enforces, so a refusal happens here with a specific
+    /// message instead of silently on the wire.
+    fn load_avatar(&mut self) {
+        self.avatar_error = None;
+        let path = self.avatar_path.trim().to_owned();
+        if path.is_empty() {
+            self.avatar_error = Some("type or paste the path to a PNG or JPEG file".to_owned());
+            return;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.avatar_error = Some(format!("{path} could not be read: {err}"));
+                return;
+            }
+        };
+        match avatar::decode(avatar::local_key(&bytes), &bytes) {
+            Ok(handle) => {
+                self.own_avatar = Some(handle);
+                if let Some(rt) = self.runtime.as_deref() {
+                    rt.send(Command::SetOwnAvatar(Some(bytes.clone())));
+                }
+                self.own_avatar_bytes = Some(bytes);
+            }
+            Err(err) => self.avatar_error = Some(err.to_string()),
+        }
+    }
+
+    fn remove_avatar(&mut self) {
+        self.avatar_error = None;
+        self.avatar_path.clear();
+        self.own_avatar = None;
+        self.own_avatar_bytes = None;
+        if let Some(rt) = self.runtime.as_deref() {
+            rt.send(Command::SetOwnAvatar(None));
+        }
+    }
+
+    /// Announces the avatar picked before this session started. Called right
+    /// after a join, the one moment the runtime is new and knows nothing.
+    fn announce_own_avatar(&self) {
+        if let (Some(bytes), Some(rt)) = (&self.own_avatar_bytes, self.runtime.as_deref()) {
+            rt.send(Command::SetOwnAvatar(Some(bytes.clone())));
+        }
     }
 }
 

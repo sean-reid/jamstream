@@ -4,9 +4,7 @@
   "include-component-in-tag": false,
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": true,
-  "versioning": "prerelease",
   "prerelease": false,
-  "prerelease-type": "beta",
   "packages": {
     ".": {
       "package-name": "jamstream",

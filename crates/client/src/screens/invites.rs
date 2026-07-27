@@ -17,6 +17,7 @@ use jamstream_protocol::invite::{Invite, Issuer, Token};
 use crate::runtime::{Command, Runtime, Snapshot};
 use crate::screens::host::{base64_decode, unix_now};
 use crate::theme;
+use crate::widgets::{AVATAR_D_ROW, avatar_disc};
 
 /// Session capacity, host included on the musician side: the same
 /// constants the server enforces admission with and the host wizard offers
@@ -317,7 +318,28 @@ impl InvitesPanel {
             .spacing(vec2(theme::SPACE_LG, 4.0))
             .show(ui, |ui| {
                 for entry in &rows {
-                    ui.label(entry.label.clone());
+                    ui.horizontal(|ui| {
+                        // The disc slot is reserved on every row, drawn only
+                        // for whoever is actually here, so someone joining
+                        // never shoves the labels sideways.
+                        let member = snap
+                            .members
+                            .iter()
+                            .find(|m| m.id == entry.member && m.connected);
+                        match member {
+                            Some(m) => {
+                                avatar_disc(ui, &m.name, m.avatar.as_ref(), AVATAR_D_ROW, false)
+                                    .on_hover_text(m.name.clone());
+                            }
+                            None => {
+                                ui.allocate_exact_size(
+                                    vec2(AVATAR_D_ROW, AVATAR_D_ROW),
+                                    egui::Sense::hover(),
+                                );
+                            }
+                        }
+                        ui.label(entry.label.clone());
+                    });
                     let status = self.status_of(entry, snap);
                     match status {
                         "connected" => ui.label(status),

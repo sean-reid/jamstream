@@ -193,11 +193,48 @@ fn session_long_names() {
 #[test]
 fn session_settings() {
     // The settings sheet anchors top right and must leave the strips and
-    // the status readout visible.
+    // the status readout visible. Sam has no picture, so the avatar row
+    // shows the initials disc and the empty path field.
     let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
     app.settings_open = true;
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings");
+}
+
+#[test]
+fn session_settings_avatar() {
+    // The other half of the avatar row: a picture chosen this run, shown
+    // cover-cropped, with Remove enabled. Wide and short, so the crop is
+    // visible rather than assumed.
+    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Light);
+    app.settings_open = true;
+    app.own_avatar = Some(test_avatar());
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_avatar");
+}
+
+/// A deterministic 80x40 picture built through the public contract: warm
+/// diagonal bands, no image encoder and no file involved.
+fn test_avatar() -> jamstream_client::runtime::AvatarHandle {
+    let (w, h) = (80u32, 40u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let band = ((x + y * 2) / 8) % 3;
+            let px = match band {
+                0 => [0xc0, 0x6a, 0x28, 255],
+                1 => [0x8f, 0x4f, 0x1e, 255],
+                _ => [0xe0, 0x94, 0x40, 255],
+            };
+            rgba.extend_from_slice(&px);
+        }
+    }
+    jamstream_client::runtime::AvatarHandle {
+        hash: "snapshot-avatar".to_owned(),
+        width: w,
+        height: h,
+        rgba: std::sync::Arc::from(rgba.into_boxed_slice()),
+    }
 }
 
 // The stream mix sheet over the host session: the frozen demo carries

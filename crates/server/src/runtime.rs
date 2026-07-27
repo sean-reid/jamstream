@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
+use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::transport::derive_public;
 use jamstream_session::server::{ServerConfig, ServerCore, ServerEvent};
 use tokio::net::UdpSocket;
@@ -151,7 +152,10 @@ impl Server {
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut idle_exit = IdleExit::new(self.idle_exit);
         let max_duration = MaxDuration::new(self.max_duration);
-        let mut buf = [0u8; 2048];
+        // Sized for the largest datagram a client can send: an avatar
+        // chunk. A short buffer would truncate the upload instead of
+        // failing, and the avatar would never reach the cache.
+        let mut buf = [0u8; MAX_DATAGRAM_BYTES];
         tokio::pin!(shutdown);
 
         loop {

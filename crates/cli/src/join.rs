@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
@@ -124,7 +125,7 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
     let mut capture = [0.0f32; FRAME_MONO];
     let mut playout = [0.0f32; FRAME_STEREO];
     let mut received: Vec<f32> = Vec::new();
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; MAX_DATAGRAM_BYTES];
     let mut joined_at: Option<Instant> = None;
     let mut roster_size = 1usize;
     let mut chat_sent = false;

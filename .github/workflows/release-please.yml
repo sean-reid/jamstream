@@ -2,19 +2,13 @@
 # with the changelog and version bump, and cuts a tag + GitHub Release when
 # that PR merges. release.yml then attaches the build artifacts.
 #
-# Channel design: the workspace versions as a single root package
-# ("jamstream", manifest at 0.1.0). While we are in beta, the config pins
-# the prerelease versioning strategy with the "beta" label, so releases
-# from main come out as v0.1.x-beta.N; the beta channel lives in the
-# version string. The GitHub prerelease flag stays OFF because
-# /releases/latest excludes prereleases, which would break the installer
-# and download links for the whole beta period.
-#
-# Promote path to stable: in release-please-config.json set
-# "prerelease": false and drop "versioning": "prerelease" and
-# "prerelease-type". The next release PR then graduates the version to a
-# plain SemVer release (the stable channel) and GitHub Releases stop being
-# flagged prerelease. Nothing in this workflow file needs to change.
+# Versioning: plain semver from 0.x. A major version of zero already says
+# pre-1.0, expect changes, so a -beta label alongside it was redundant and
+# it cost us the standard /releases/latest/download endpoint that the
+# installer, the download page, and every package manifest rely on
+# (GitHub's latest-release excludes prereleases). Releases are therefore
+# normal releases, not GitHub prereleases, and 1.0 will be a deliberate
+# decision rather than a label falling off.
 name: release-please
 
 on:
