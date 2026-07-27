@@ -14,7 +14,7 @@ use jamstream_protocol::ids::DestinationId;
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
-use jamstream_protocol::transport::{Initiator, Session, generate_keypair};
+use jamstream_protocol::transport::{Initiator, Session, generate_keypair, reject_key_for_init};
 use jamstream_protocol::wire::{self, Packet};
 use jamstream_session::{
     ClientCore, ClientEvent, ClientState, MAX_LISTENERS, MAX_MUSICIANS, ServerConfig, ServerCore,
@@ -81,6 +81,9 @@ struct Sniffer {
 struct Harness {
     issuer: Issuer,
     server_pk: [u8; 32],
+    /// The server's static private key, so a test can build the one thing
+    /// only the server can build: an authenticated version reject.
+    server_private: Vec<u8>,
     session_id: SessionId,
     server: ServerCore,
     clients: Vec<TestClient>,
@@ -117,6 +120,7 @@ impl Harness {
         Self {
             issuer,
             server_pk: kp.public,
+            server_private: kp.private.to_vec(),
             session_id,
             server,
             clients: Vec::new(),
@@ -1704,11 +1708,25 @@ fn a_sprayed_handshake_response_cannot_keep_a_client_out() {
     assert_eq!(h.clients[idx].addr, victim);
 }
 
+/// The reject this server would send in answer to `init`, which is the only
+/// party that can build one: the key is a secret between it and the client
+/// that sent the init.
+fn reject_for(h: &Harness, init: &[u8], theirs: u16) -> Vec<u8> {
+    let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(init) else {
+        panic!("expected an init");
+    };
+    let key = reject_key_for_init(&h.server_private, &h.session_id, version, noise)
+        .expect("server derives the reject key");
+    wire::build_version_reject(&key, theirs, version, init)
+}
+
 #[test]
 fn version_reject_rate_limited_and_verified() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let src = addr_of(50);
-    let fake_init = wire::build_handshake_init(3, &[0x5A; 64]);
+    let inv = h.mint(0, Role::Musician);
+    // A client from the future: readable by this server, refused by it.
+    let (future, fake_init) = Initiator::new_claiming_version(&inv, 3).unwrap();
     let now = h.now_ms();
 
     let out = h.server.handle_datagram(now, h.now_unix, src, &fake_init);
@@ -1718,7 +1736,7 @@ fn version_reject_rate_limited_and_verified() {
     };
     assert_eq!((ours, theirs), (1, 3));
     assert!(wire::verify_version_reject(
-        &h.server_pk,
+        future.reject_key().unwrap(),
         ours,
         theirs,
         &mac,
@@ -1737,14 +1755,45 @@ fn version_reject_rate_limited_and_verified() {
             .len(),
         1
     );
+    // An init nobody could have written against this session is answered
+    // with silence, because there is nobody to authenticate a reject to.
+    let garbage = wire::build_handshake_init(3, &[0x5A; 96]);
+    assert!(
+        h.server
+            .handle_datagram(now + 3_000, h.now_unix, addr_of(51), &garbage)
+            .is_empty()
+    );
 
-    // A client presented with a forged reject (wrong MAC key) ignores it.
-    let inv = h.mint(0, Role::Musician);
+    // A reject forged by another invite holder is ignored. Holding an invite
+    // is holding the server's public key, which the MAC is no longer keyed on.
     let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
-    let forged = wire::build_version_reject(&[0xEE; 32], 1, 1, &init);
+    let (other, _) = Initiator::new(&inv).unwrap();
+    let forged = wire::build_version_reject(other.reject_key().unwrap(), 1, 1, &init);
     assert!(core.handle_datagram(1, &forged).is_empty());
     assert_eq!(*core.state(), ClientState::Connecting);
     assert!(core.events().is_empty());
+}
+
+/// A reject is a report, not an ending. The client keeps handing the same
+/// init back at a widening interval, so a session that migrates or is
+/// redeployed onto a build it can talk to is joined without a restart. This
+/// used to be terminal: `poll` did nothing at all in the rejected state.
+#[test]
+fn a_rejected_client_joins_when_the_server_starts_answering() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv = h.mint(0, Role::Musician);
+    let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+    core.handle_datagram(1, &reject_for(&h, &init, 2));
+    assert_eq!(*core.state(), ClientState::Rejected { ours: 1, theirs: 2 });
+
+    let retry = core.poll(6_000);
+    assert_eq!(retry, vec![init]);
+    let replies = h
+        .server
+        .handle_datagram(6_000, h.now_unix, addr_of(60), &retry[0]);
+    assert_eq!(replies.len(), 1);
+    core.handle_datagram(6_001, &replies[0].1);
+    assert_eq!(*core.state(), ClientState::Joined);
 }
 
 // The capacity every host surface offers seats against, enforced here.

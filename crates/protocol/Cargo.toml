@@ -19,5 +19,11 @@ blake2.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
 
+[features]
+# Constructors no shipped client has a use for, needed by tests in other
+# crates: a first flight claiming a protocol version this build does not
+# speak, which is the only way to exercise the version reject end to end.
+testing = []
+
 [dev-dependencies]
 proptest.workspace = true
