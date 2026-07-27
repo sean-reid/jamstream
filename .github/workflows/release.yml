@@ -12,15 +12,35 @@
 #   - Windows: unsigned; named placeholder step until a cert exists.
 #   - Linux: plain tarballs; AppImage/deb/rpm are named placeholders.
 #
+# Server artifact pinning: server-musl runs FIRST, uploads the static
+# jamstreamd, and exports its tag-pinned download URL and sha256 as job
+# outputs. Every client/CLI build below compiles with those in the
+# environment (JAMSTREAM_SERVER_URL / JAMSTREAM_SERVER_SHA256, read by
+# option_env! in jamstream-cloud), so release binaries carry their own
+# server download baked in and cloud hosting needs no artifact flags.
+# The bare binary asset exists exactly for this: cloud-init curls the URL
+# straight to /usr/local/bin and sha256sums the file, no tar step on the
+# VM. The tarball stays for humans and the install script.
+#
+# Desktop bundling: each app artifact ships a platform-native jamstreamd
+# beside the app binary (inside JamStream.app/Contents/MacOS on macOS, in
+# the zip/tarball on Windows/Linux), which the local provider resolves
+# app-adjacent, so hosting on this computer works with no extra install.
+#
 # Asset names are STABLE (no version embedded) so
 # /releases/latest/download/<name> always resolves:
 #   jamstream-app-macos.dmg              universal app in a signed DMG
+#                                        (bundles jamstreamd)
 #   jamstream-cli-macos-universal.tar.gz universal CLI binary
 #   jamstream-cli-windows-x86_64.zip     CLI
-#   jamstream-app-windows-x86_64.zip     app
+#   jamstream-app-windows-x86_64.zip     app (bundles jamstreamd.exe)
 #   jamstream-cli-linux-x86_64.tar.gz    CLI (gnu)
-#   jamstream-app-linux-x86_64.tar.gz    app (gnu)
-#   jamstreamd-linux-x86_64-musl.tar.gz  static session server
+#   jamstream-app-linux-x86_64.tar.gz    app (gnu; bundles jamstreamd)
+#   jamstreamd-linux-x86_64-musl         static session server, bare
+#                                        binary; what pinned clients tell
+#                                        cloud VMs to download at boot
+#   jamstreamd-linux-x86_64-musl.tar.gz  the same server, tarred for
+#                                        humans and the install script
 #   SHA256SUMS                           checksums of all of the above
 name: release
 
@@ -37,12 +57,17 @@ env:
   TAG: ${{ github.event.release.tag_name }}
 
 jobs:
-  # Static musl server tarball: the artifact session VMs download at boot.
+  # Static musl server: the artifact session VMs download at boot. Runs
+  # first because its URL and sha256 are compiled into every client and
+  # CLI build below.
   server-musl:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      server_url: ${{ steps.pin.outputs.url }}
+      server_sha256: ${{ steps.pin.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -57,11 +82,24 @@ jobs:
             echo "jamstreamd is dynamically linked" >&2
             exit 1
           fi
-      - name: Package and upload tarball
+      # Two shapes of the same binary: the BARE binary is what cloud-init
+      # downloads (curl to /usr/local/bin, sha256sum of the file itself, no
+      # tar on the VM) and is the asset the clients pin; the tarball is for
+      # humans and the install script. The pinned URL names the release TAG,
+      # not "latest", so a client always launches the server it shipped with.
+      - name: Package, upload, and pin the server artifact
+        id: pin
         run: |
+          set -eu
+          BIN=target/x86_64-unknown-linux-musl/release/jamstreamd
+          BARE="jamstreamd-linux-x86_64-musl"
           ARCHIVE="jamstreamd-linux-x86_64-musl.tar.gz"
+          cp "$BIN" "$BARE"
           tar -C target/x86_64-unknown-linux-musl/release -czf "$ARCHIVE" jamstreamd
-          gh release upload "$TAG" "$ARCHIVE" --clobber
+          gh release upload "$TAG" "$BARE" "$ARCHIVE" --clobber
+          SHA=$(sha256sum "$BARE" | cut -d' ' -f1)
+          echo "url=https://github.com/${{ github.repository }}/releases/download/$TAG/$BARE" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
       # Placeholder: artifact signing (signature published beside the
       # tarball; cloud-init verifies it before boot) lands with the
       # signing milestone.
@@ -70,24 +108,35 @@ jobs:
 
   # Universal (arm64 + x86_64) app bundle in a signed DMG, plus a universal
   # CLI tarball. Signing follows the keychain pattern sign-smoke.yml proved
-  # against the same APPLE_* secrets.
+  # against the same APPLE_* secrets. The app bundle carries a universal
+  # native jamstreamd beside the app executable so local hosting works with
+  # no extra install.
   macos:
+    needs: server-musl
     runs-on: macos-latest
     timeout-minutes: 60
+    env:
+      JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
+      JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+      - name: Verify the pinned server artifact reached this job
+        run: |
+          set -eu
+          printf '%s\n' "$JAMSTREAM_SERVER_URL" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256" | grep -qE '^[0-9a-f]{64}$'
       - name: Build both architectures
         run: |
-          cargo build --release -p jamstream-client -p jamstream-cli --target aarch64-apple-darwin
-          cargo build --release -p jamstream-client -p jamstream-cli --target x86_64-apple-darwin
+          cargo build --release -p jamstream-client -p jamstream-cli -p jamstream-server --target aarch64-apple-darwin
+          cargo build --release -p jamstream-client -p jamstream-cli -p jamstream-server --target x86_64-apple-darwin
       - name: Lipo into universal binaries
         run: |
           mkdir -p target/universal
-          for BIN in jamstream-app jamstream; do
+          for BIN in jamstream-app jamstream jamstreamd; do
             lipo -create \
               "target/aarch64-apple-darwin/release/$BIN" \
               "target/x86_64-apple-darwin/release/$BIN" \
@@ -98,7 +147,7 @@ jobs:
             echo "$ARCHS" | grep -q arm64
           done
       - name: Assemble JamStream.app
-        run: ./scripts/macos-app-bundle.sh target/universal/jamstream-app "$TAG" dist
+        run: ./scripts/macos-app-bundle.sh target/universal/jamstream-app "$TAG" dist target/universal/jamstreamd
       # Placeholder: generate/copy the icns into Contents/Resources and set
       # CFBundleIconFile once the icon exists.
       - name: Add app icon (not yet implemented)
@@ -138,14 +187,22 @@ jobs:
           fi
           echo "signing with: $IDENTITY"
           echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
-          # The app gets the audio-input entitlement (hardened runtime
-          # denies microphone capture without it); the CLI does no capture.
+          # Nested code first, per Apple's inside-out signing rule: the
+          # bundled jamstreamd helper (plain executable at Contents/MacOS,
+          # a legal place for helpers) gets its own hardened-runtime
+          # signature before the bundle signature seals it in. It captures
+          # no audio, so no entitlements. Then the app, which gets the
+          # audio-input entitlement (hardened runtime denies microphone
+          # capture without it), then the standalone CLI.
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY" --keychain release.keychain \
+            dist/JamStream.app/Contents/MacOS/jamstreamd
           codesign --force --options runtime --timestamp \
             --entitlements scripts/jamstream-app.entitlements \
             --sign "$IDENTITY" --keychain release.keychain dist/JamStream.app
           codesign --force --options runtime --timestamp \
             --sign "$IDENTITY" --keychain release.keychain target/universal/jamstream
-          for ARTIFACT in dist/JamStream.app target/universal/jamstream; do
+          for ARTIFACT in dist/JamStream.app dist/JamStream.app/Contents/MacOS/jamstreamd target/universal/jamstream; do
             codesign --verify --strict --verbose=2 "$ARTIFACT"
             codesign --display --verbose=2 "$ARTIFACT" 2>&1 \
               | grep -E "Authority|TeamIdentifier"
@@ -216,22 +273,35 @@ jobs:
         run: security delete-keychain release.keychain || true
 
   windows:
+    needs: server-musl
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
+      JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p jamstream-client -p jamstream-cli
+      - name: Verify the pinned server artifact reached this job
+        shell: bash
+        run: |
+          set -eu
+          printf '%s\n' "$JAMSTREAM_SERVER_URL" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256" | grep -qE '^[0-9a-f]{64}$'
+      - run: cargo build --release -p jamstream-client -p jamstream-cli -p jamstream-server
       # Placeholder: Authenticode signing of both .exe files lands once a
       # Windows code-signing certificate exists.
       - name: Sign Windows binaries (not yet implemented)
         run: echo 'Placeholder; Authenticode signing lands once a Windows certificate exists.'
+      # The app zip carries jamstreamd.exe beside jamstream-app.exe; the
+      # local provider resolves the app-adjacent helper, so hosting on this
+      # computer works straight from the unzipped folder.
       - name: Package and upload archives
         shell: bash
         run: |
           7z a jamstream-cli-windows-x86_64.zip ./target/release/jamstream.exe
-          7z a jamstream-app-windows-x86_64.zip ./target/release/jamstream-app.exe
+          7z a jamstream-app-windows-x86_64.zip ./target/release/jamstream-app.exe ./target/release/jamstreamd.exe
           gh release upload "$TAG" \
             jamstream-cli-windows-x86_64.zip \
             jamstream-app-windows-x86_64.zip \
@@ -240,20 +310,33 @@ jobs:
         run: echo 'Placeholder; signed MSI plus winget manifest lands with the installer milestone.'
 
   linux:
+    needs: server-musl
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
+      JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Verify the pinned server artifact reached this job
+        run: |
+          set -eu
+          printf '%s\n' "$JAMSTREAM_SERVER_URL" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256" | grep -qE '^[0-9a-f]{64}$'
       # Same desktop build deps ci.yml uses (alsa, wayland/xkb for eframe,
       # pipewire + dbus).
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
-      - run: cargo build --release -p jamstream-client -p jamstream-cli
+      - run: cargo build --release -p jamstream-client -p jamstream-cli -p jamstream-server
+      # The app tarball carries jamstreamd (the gnu build, same as the app)
+      # beside jamstream-app; the local provider resolves the app-adjacent
+      # helper, so hosting on this computer works straight from the
+      # extracted folder.
       - name: Package and upload tarballs
         run: |
           tar -C target/release -czf jamstream-cli-linux-x86_64.tar.gz jamstream
-          tar -C target/release -czf jamstream-app-linux-x86_64.tar.gz jamstream-app
+          tar -C target/release -czf jamstream-app-linux-x86_64.tar.gz jamstream-app jamstreamd
           gh release upload "$TAG" \
             jamstream-cli-linux-x86_64.tar.gz \
             jamstream-app-linux-x86_64.tar.gz \
@@ -271,7 +354,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download all release assets, checksum, upload SHA256SUMS
         run: |
           set -eu

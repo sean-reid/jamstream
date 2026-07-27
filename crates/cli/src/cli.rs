@@ -68,12 +68,15 @@ pub struct HostArgs {
     #[arg(long = "max-hours", default_value_t = 12)]
     pub max_hours: u32,
 
-    /// URL of the jamstreamd artifact the VM downloads at boot.
-    #[arg(long = "artifact-url")]
+    /// Override the URL of the jamstreamd artifact the VM downloads at
+    /// boot. Release builds pin the release's own server build; without
+    /// that pin (a source build) cloud providers require this flag.
+    #[arg(long = "artifact-url", requires = "artifact_sha256")]
     pub artifact_url: Option<String>,
 
-    /// Expected sha256 of the jamstreamd artifact.
-    #[arg(long = "artifact-sha256")]
+    /// Override the expected sha256 of the jamstreamd artifact. Must be
+    /// passed together with --artifact-url.
+    #[arg(long = "artifact-sha256", requires = "artifact_url")]
     pub artifact_sha256: Option<String>,
 
     /// Skip the launch confirmation.
@@ -248,6 +251,23 @@ mod tests {
         );
         assert!(help.contains("[default: local]"), "help was: {help}");
         assert!(!help.contains("mock"), "help must not mention the mock");
+    }
+
+    // The artifact overrides only make sense as a pair: a URL with no
+    // checksum could never be verified, a checksum with no URL checks
+    // nothing.
+    #[test]
+    fn artifact_overrides_come_as_a_pair() {
+        assert!(
+            Cli::try_parse_from([
+                "jamstream",
+                "host",
+                "--artifact-url",
+                "https://x/jamstreamd"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["jamstream", "host", "--artifact-sha256", "abc"]).is_err());
     }
 
     #[test]
