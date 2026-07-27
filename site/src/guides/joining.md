@@ -1,6 +1,6 @@
 # Joining a session
 
-You need exactly one thing: your invite, a string starting with `jamstream://join/`, sent to you by the host.
+You need exactly two things: the app, from the [Download](../download.md) page, and your invite, a string starting with `jamstream://join/`, sent to you by the host.
 
 ## What an invite is
 
@@ -8,14 +8,16 @@ Each invite admits one person to one seat in one session. It carries, signed by 
 
 Practical consequences:
 
-- Do not share your invite; two people cannot use the same one. If someone else needs in, the host has spare invites or hosts again with more seats.
+- Do not share your invite; two people cannot use the same one. If someone else needs in, the host mints another seat from the invites panel.
 - Losing your connection does not burn the invite. Close the app, move to another machine, rejoin with the same string; the seat is yours until the session ends or the host revokes it.
 - Invites die with the session. There is nothing to clean up or keep secret afterward.
 - Send invites over a channel you trust. Anyone holding your invite can join as you until it is revoked.
 
-## Joining from the app
+## Joining
 
-Paste the invite into the field on the home screen (hint text: "paste an invite, jamstream://join/...") and click Join, or press Enter. A malformed or expired invite shows the reason under the field instead of joining.
+Paste the invite into the **Join a session** field on the home screen (hint text: "paste an invite, jamstream://join/...") and click Join, or press Enter. A malformed or expired invite shows the reason under the field instead of joining.
+
+## The session screen
 
 Once connected you are in the session screen:
 
@@ -28,7 +30,7 @@ What you are looking at:
 - Your own strip is dimmed with a "you" tag. Self monitoring is local, on your interface, not through the server, so your own channel has no fader in the mix.
 - The host additionally sees a Revoke button on every other strip. Revoking ejects that member and kills their invite, with a confirmation step.
 - Chat, with timestamps. The metronome panel shows tempo, beats per bar, and click state; the host sets them, and "hear the click" is your own choice.
-- The status bar, in the same place every session: mouth to ear latency in ms as the headline number, then round trip, jitter buffer depth, packet loss, and input and output meters. Hosts also see elapsed time and cost so far. Leave is on the right, with a confirmation.
+- The status bar, in the same place every session. Leave is on the right, with a confirmation; leaving does not end the session, and your seat is kept.
 
 A member who stops responding grays out after 10 seconds and their fader freezes; when they reconnect with their invite, they come back in the same seat.
 
@@ -37,7 +39,22 @@ At ten musicians the strips extend past the window and scroll horizontally:
 ![Session screen at capacity, ten mixer strips with a horizontal scrollbar and ten listeners named below](../images/session_full.png)
 *A session at the 10 musician cap in the current build, with 10 listeners connected.*
 
-## Joining without the app
+## The latency readout
+
+The headline number in the status bar is mouth to ear latency in milliseconds: from sound entering your interface to a bandmate's sound leaving theirs, measured, not estimated. Under 20 ms most people stop noticing; under 30 ms feels like playing across a large stage. Next to it: `rtt`, your round trip to the server; `buffer`, the jitter buffer depth in 2.5 ms frames, which climbs when your network jitters; `loss`, the packet loss percentage, which should sit near 0.0%; and your input and output meters. Hosts also see elapsed time and cost so far. [Troubleshooting](troubleshooting.md#latency-feels-high) turns each number into an action.
+
+## Devices and buffer size, mid-session
+
+Settings in the top bar opens over the session without covering the strips or the status bar:
+
+![Settings sheet over the session screen with capture and playback pickers, buffer size choices, and an input level meter](../images/session_settings.png)
+*Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*
+
+- **Capture** and **Playback** list your machine's real audio devices, system default first. Changing one mid-session reopens the audio stream on the new device without leaving the session.
+- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that plays clean; crackles mean one step up.
+- The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.
+
+## From the terminal
 
 For test rigs and machines without a display, the CLI joins headlessly with a WAV file as its instrument and writes what it heard:
 

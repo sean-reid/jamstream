@@ -19,11 +19,12 @@
 
 # CLI reference
 
-- [jamstream host](cli/host.md)
-- [jamstream status](cli/status.md)
-- [jamstream end](cli/end.md)
-- [jamstream sweep](cli/sweep.md)
-- [jamstream join](cli/join.md)
+- [CLI reference](cli/index.md)
+  - [jamstream host](cli/host.md)
+  - [jamstream status](cli/status.md)
+  - [jamstream end](cli/end.md)
+  - [jamstream sweep](cli/sweep.md)
+  - [jamstream join](cli/join.md)
 
 # Project
 

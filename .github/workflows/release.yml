@@ -29,7 +29,7 @@
 #
 # Asset names are STABLE (no version embedded) so
 # /releases/latest/download/<name> always resolves:
-#   jamstream-app-macos.dmg              universal app in a signed DMG
+#   jamstream-app-macos.dmg              universal app in a notarized DMG
 #                                        (bundles jamstreamd)
 #   jamstream-cli-macos-universal.tar.gz universal CLI binary
 #   jamstream-cli-windows-x86_64.zip     CLI
@@ -158,12 +158,13 @@ jobs:
             echo "$ARCHS" | grep -q x86_64
             echo "$ARCHS" | grep -q arm64
           done
+      # The bundle script copies the COMMITTED
+      # crates/client/assets/icon/jamstream.icns into Contents/Resources
+      # and sets CFBundleIconFile; no icon rendering happens in CI
+      # (scripts/render-icon.sh regenerates the committed asset from the
+      # source SVG when the design changes).
       - name: Assemble JamStream.app
         run: ./scripts/macos-app-bundle.sh target/universal/jamstream-app "$TAG" dist target/universal/jamstreamd
-      # Placeholder: generate/copy the icns into Contents/Resources and set
-      # CFBundleIconFile once the icon exists.
-      - name: Add app icon (not yet implemented)
-        run: echo 'Placeholder; JamStream.icns lands with the branding milestone.'
       - name: Import certificate into a throwaway keychain
         env:
           APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
@@ -272,10 +273,7 @@ jobs:
           rm -f "$RUNNER_TEMP/asc-key.p8" "$RUNNER_TEMP/JamStream.zip"
           xcrun stapler staple dist/JamStream.app
           xcrun stapler validate dist/JamStream.app
-      # The DMG is built after stapling so it carries the notarized app.
-      # (Notarizing the DMG itself as well can be added inside the gated
-      # step above once the ASC secrets exist, if we want Gatekeeper to
-      # bless the mount too.)
+      # Built after stapling so it carries the notarized app.
       - name: Build and sign the DMG
         run: |
           set -eu
@@ -283,6 +281,32 @@ jobs:
           codesign --force --timestamp \
             --sign "$SIGN_IDENTITY" --keychain release.keychain jamstream-app-macos.dmg
           codesign --verify --strict --verbose=2 jamstream-app-macos.dmg
+      # Gatekeeper evaluates the disk image a user double-clicks, not just
+      # the app inside it, so the dmg needs its own ticket. Without this,
+      # spctl reports the dmg as an unnotarized developer id even when the
+      # enclosed app is stapled.
+      - name: Notarize and staple the DMG
+        if: steps.notary.outputs.configured == 'true'
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eu
+          if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
+          else
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc-key.p8"
+          fi
+          xcrun notarytool submit jamstream-app-macos.dmg \
+            --key "$RUNNER_TEMP/asc-key.p8" \
+            --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" \
+            --wait
+          rm -f "$RUNNER_TEMP/asc-key.p8"
+          xcrun stapler staple jamstream-app-macos.dmg
+          xcrun stapler validate jamstream-app-macos.dmg
+          spctl -a -t open --context context:primary-signature -v jamstream-app-macos.dmg
       - name: Package CLI tarball and upload assets
         run: |
           set -eu
@@ -319,12 +343,14 @@ jobs:
         run: echo 'Placeholder; Authenticode signing lands once a Windows certificate exists.'
       # The app zip carries jamstreamd.exe beside jamstream-app.exe; the
       # local provider resolves the app-adjacent helper, so hosting on this
-      # computer works straight from the unzipped folder.
+      # computer works straight from the unzipped folder. The committed
+      # jamstream.ico rides along for shortcuts; embedding it in the exe
+      # itself needs a build-script resource compiler and is a follow-up.
       - name: Package and upload archives
         shell: bash
         run: |
           7z a jamstream-cli-windows-x86_64.zip ./target/release/jamstream.exe
-          7z a jamstream-app-windows-x86_64.zip ./target/release/jamstream-app.exe ./target/release/jamstreamd.exe
+          7z a jamstream-app-windows-x86_64.zip ./target/release/jamstream-app.exe ./target/release/jamstreamd.exe ./crates/client/assets/icon/jamstream.ico
           gh release upload "$TAG" \
             jamstream-cli-windows-x86_64.zip \
             jamstream-app-windows-x86_64.zip \
@@ -355,11 +381,18 @@ jobs:
       # The app tarball carries jamstreamd (the gnu build, same as the app)
       # beside jamstream-app; the local provider resolves the app-adjacent
       # helper, so hosting on this computer works straight from the
-      # extracted folder.
+      # extracted folder. It also carries the committed 512px icon (named
+      # jamstream.png so the .desktop Icon=jamstream key matches when both
+      # are installed under the XDG hicolor/applications dirs) and the
+      # .desktop entry.
       - name: Package and upload tarballs
         run: |
           tar -C target/release -czf jamstream-cli-linux-x86_64.tar.gz jamstream
-          tar -C target/release -czf jamstream-app-linux-x86_64.tar.gz jamstream-app jamstreamd
+          mkdir -p dist/linux
+          cp target/release/jamstream-app target/release/jamstreamd dist/linux/
+          cp crates/client/assets/icon/jamstream-512.png dist/linux/jamstream.png
+          cp scripts/jamstream.desktop dist/linux/
+          tar -C dist/linux -czf jamstream-app-linux-x86_64.tar.gz jamstream-app jamstreamd jamstream.png jamstream.desktop
           gh release upload "$TAG" \
             jamstream-cli-linux-x86_64.tar.gz \
             jamstream-app-linux-x86_64.tar.gz \

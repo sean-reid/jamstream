@@ -52,7 +52,7 @@ $ jamstream host --provider digitalocean --musicians 1 --listeners 2 \
     --artifact-sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 ```
 
-Full output of both is shown in the [quickstart](../quickstart.md).
+The [quickstart](../quickstart.md#from-the-terminal) shows a full run end to end.
 
 ## Notes
 

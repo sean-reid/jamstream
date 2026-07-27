@@ -5,8 +5,8 @@
 use std::sync::Mutex;
 
 use crate::runtime::{
-    ChatLine, Command, ConnState, CostView, FaderView, LevelsView, MemberId, MemberView,
-    MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
+    BroadcastView, ChatLine, Command, ConnState, CostView, FaderView, LevelsView, MemberId,
+    MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
 };
 
 /// The frame snapshot tests freeze at; chosen so meters sit mid-scale.
@@ -16,11 +16,28 @@ const HOURLY_MICROUSD: u64 = 16_800;
 /// Elapsed time the demo session pretends to have before frame zero.
 const BASE_ELAPSED_SECS: u64 = 47 * 60 + 12;
 
+/// Unity gain, centered, unmuted: the state every fader starts from.
+const FLAT: FaderView = FaderView {
+    gain_db: 0.0,
+    pan: 0.0,
+    muted: false,
+};
+
+fn fv(gain_db: f32, pan: f32, muted: bool) -> FaderView {
+    FaderView {
+        gain_db,
+        pan,
+        muted,
+    }
+}
+
 struct Member {
     id: u16,
     name: &'static str,
     role: Role,
     fader: FaderView,
+    /// The member's fader in the broadcast mix; host snapshots only.
+    bcast: FaderView,
 }
 
 struct DemoState {
@@ -30,6 +47,7 @@ struct DemoState {
     metronome: MetronomeView,
     revoked: Vec<u16>,
     left: bool,
+    audition: bool,
 }
 
 pub struct DemoRuntime {
@@ -78,11 +96,8 @@ impl DemoRuntime {
                     id,
                     name,
                     role: Role::Musician,
-                    fader: FaderView {
-                        gain_db,
-                        pan,
-                        muted,
-                    },
+                    fader: fv(gain_db, pan, muted),
+                    bcast: FLAT,
                 },
             );
             id += 1;
@@ -92,11 +107,8 @@ impl DemoRuntime {
                 id,
                 name,
                 role: Role::Listener,
-                fader: FaderView {
-                    gain_db: 0.0,
-                    pan: 0.0,
-                    muted: false,
-                },
+                fader: FLAT,
+                bcast: FLAT,
             });
             id += 1;
         }
@@ -132,51 +144,36 @@ impl DemoRuntime {
                 id: 0,
                 name: "Sam",
                 role: Role::Musician,
-                fader: FaderView {
-                    gain_db: 0.0,
-                    pan: 0.0,
-                    muted: false,
-                },
+                fader: FLAT,
+                bcast: fv(-1.0, 0.0, false),
             },
             Member {
                 id: 1,
                 name: "Ana",
                 role: Role::Musician,
-                fader: FaderView {
-                    gain_db: -3.0,
-                    pan: -0.4,
-                    muted: false,
-                },
+                fader: fv(-3.0, -0.4, false),
+                bcast: fv(-2.0, -0.3, false),
             },
             Member {
                 id: 2,
                 name: "Ben",
                 role: Role::Musician,
-                fader: FaderView {
-                    gain_db: -1.5,
-                    pan: 0.3,
-                    muted: false,
-                },
+                fader: fv(-1.5, 0.3, false),
+                bcast: fv(-4.5, 0.35, false),
             },
             Member {
                 id: 3,
                 name: "Mira",
                 role: Role::Musician,
-                fader: FaderView {
-                    gain_db: -6.0,
-                    pan: 0.0,
-                    muted: true,
-                },
+                fader: fv(-6.0, 0.0, true),
+                bcast: fv(-12.0, 0.0, true),
             },
             Member {
                 id: 4,
                 name: "Lea",
                 role: Role::Listener,
-                fader: FaderView {
-                    gain_db: 0.0,
-                    pan: 0.0,
-                    muted: false,
-                },
+                fader: FLAT,
+                bcast: FLAT,
             },
         ];
         DemoRuntime {
@@ -192,6 +189,7 @@ impl DemoRuntime {
                 },
                 revoked: Vec::new(),
                 left: false,
+                audition: false,
             }),
             is_host,
             frozen,
@@ -278,12 +276,23 @@ impl Runtime for DemoRuntime {
         let mut chat = Self::scripted_chat();
         chat.extend(s.extra_chat.iter().cloned());
 
+        let broadcast = self.is_host.then(|| BroadcastView {
+            faders: s
+                .members
+                .iter()
+                .filter(|m| m.role == Role::Musician)
+                .map(|m| (MemberId(m.id), m.bcast))
+                .collect(),
+            audition: s.audition,
+        });
+
         Snapshot {
             stats,
             members,
             chat,
             levels,
             metronome: s.metronome,
+            broadcast,
             cost: self.is_host.then_some(CostView {
                 hourly_microusd: HOURLY_MICROUSD,
                 accrued_microusd: HOURLY_MICROUSD * elapsed_secs / 3600,
@@ -331,6 +340,17 @@ impl Runtime for DemoRuntime {
                     at_ms,
                 });
             }
+            Command::SetBroadcastFader {
+                member,
+                gain_db,
+                pan,
+                muted,
+            } => {
+                if let Some(m) = s.members.iter_mut().find(|m| m.id == member.0) {
+                    m.bcast = fv(gain_db, pan, muted);
+                }
+            }
+            Command::SetBroadcastAudition(on) => s.audition = on,
             Command::Leave => s.left = true,
             Command::Revoke(jti) => {
                 // The demo token is the member id repeated; reverse it.
@@ -426,6 +446,29 @@ mod tests {
         let snap = DemoRuntime::musician().snapshot();
         assert!(snap.cost.is_none());
         assert!(snap.members.iter().all(|m| m.token.is_none()));
+        assert!(snap.broadcast.is_none());
         assert!(!snap.is_host);
+    }
+
+    #[test]
+    fn broadcast_commands_are_reflected_in_the_next_snapshot() {
+        let rt = DemoRuntime::host();
+        rt.send(Command::SetBroadcastFader {
+            member: MemberId(2),
+            gain_db: -7.5,
+            pan: -0.25,
+            muted: true,
+        });
+        rt.send(Command::SetBroadcastAudition(true));
+        let broadcast = rt.snapshot().broadcast.expect("host broadcast view");
+        assert!(broadcast.audition);
+        let (_, ben) = broadcast
+            .faders
+            .iter()
+            .find(|(id, _)| *id == MemberId(2))
+            .expect("Ben in broadcast faders");
+        assert_eq!((ben.gain_db, ben.pan, ben.muted), (-7.5, -0.25, true));
+        // Only musicians have broadcast faders; Lea the listener does not.
+        assert!(broadcast.faders.iter().all(|(id, _)| *id != MemberId(4)));
     }
 }
