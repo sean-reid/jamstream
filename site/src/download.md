@@ -10,7 +10,7 @@ Every link on this page points at the latest release by a stable name, so a new 
 - Desktop app: [jamstream-app-macos.dmg](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-macos.dmg)
 - CLI, one universal binary for Apple silicon and Intel: [jamstream-cli-macos-universal.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-macos-universal.tar.gz)
 
-The app in the DMG is signed with a Developer ID certificate but not yet notarized by Apple. Until notarization ships, the first launch is blocked with a message that the app could not be verified: open System Settings, Privacy & Security, and click Open Anyway next to the JamStream entry, or Control-click the app in Finder and choose Open. Once notarized builds ship, the app opens without any of that.
+The disk image and the app inside it are both signed with a Developer ID certificate and notarized by Apple, and the notarization ticket is stapled to each, so the app opens on first launch with no warning and without needing a network check.
 
 Verify a download against the release checksums:
 
