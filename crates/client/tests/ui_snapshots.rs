@@ -88,6 +88,33 @@ fn session_app(rt: DemoRuntime, theme: Theme) -> JamApp {
     app
 }
 
+/// A host as the app actually builds one: the invite book from the launch,
+/// the destinations sheet with the keychain behind it, and the broadcast
+/// view the runtime hands a host. The three status bar toggles hang off
+/// exactly those, so a host fixture missing any of them renders a bar no
+/// host ever sees, which is how the crowded bar went unreviewed until it
+/// overlapped itself.
+fn host_app(rt: DemoRuntime, theme: Theme) -> JamApp {
+    {
+        use jamstream_client::runtime::Runtime;
+        let snap = rt.snapshot();
+        assert!(
+            snap.is_host && snap.broadcast.is_some(),
+            "a host fixture needs a host runtime"
+        );
+    }
+    let mut app = session_app(rt, theme);
+    app.session.invites = Some(host_invites());
+    app.session.destinations = Some(DestinationsPanel::new(saved_keys(&[])));
+    app
+}
+
+/// The invite book a launched session carries, for the toggle to hang off.
+fn host_invites() -> InvitesPanel {
+    let (state, path) = invites_state();
+    InvitesPanel::new(state, path)
+}
+
 #[test]
 fn home_empty() {
     let mut harness = app_harness(test_app(Theme::Dark), WIDE);
@@ -137,9 +164,21 @@ fn session_demo() {
 
 #[test]
 fn session_host() {
-    let app = session_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
+    // The full host bar: three sheet toggles, the lamp, the session id, the
+    // timer, the cost, and Leave, beside the readouts on one row.
+    let app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_host");
+}
+
+#[test]
+fn session_host_narrow() {
+    // The same bar with 480 fewer pixels to put it in: the readouts keep
+    // the first row, the controls take the second, and the strips below
+    // still show a fader, a name, and a portrait that do not touch.
+    let app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_host_narrow");
 }
 
 #[test]
@@ -248,7 +287,7 @@ fn stream_mix_app(theme: Theme, audition: bool) -> JamApp {
     if audition {
         rt.send(Command::SetBroadcastAudition(true));
     }
-    let mut app = session_app(rt, theme);
+    let mut app = host_app(rt, theme);
     app.session.broadcast_open = true;
     app
 }
@@ -303,7 +342,7 @@ fn destinations_app(
 ) -> JamApp {
     let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
     rt.set_destinations(reported);
-    let mut app = session_app(rt, theme);
+    let mut app = host_app(rt, theme);
     app.session.destinations = Some(DestinationsPanel::new(saved_keys(saved)));
     app.session.destinations_open = true;
     app
@@ -334,7 +373,7 @@ fn session_destinations_key() {
     // The one surface where a key exists: masked, with its character count
     // standing in for reading it back, and the platform's own guidance above.
     let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
-    let mut app = session_app(rt, Theme::Dark);
+    let mut app = host_app(rt, Theme::Dark);
     app.session.destinations = Some(DestinationsPanel::with_key_entry(
         Arc::new(MemStore::default()),
         StreamPlatform::Twitch,
@@ -495,18 +534,36 @@ fn wizard_setup_app(theme: Theme) -> JamApp {
     app
 }
 
+/// A server artifact that could not exist: a reserved domain and a sha of
+/// nothing but zeros. The fixture supplies it rather than the real
+/// `option_env!` pin, so the baseline shows what a release build shows
+/// without depending on how this build was compiled.
+const FAKE_PIN: jamstream_cloud::PinnedServerArtifact = jamstream_cloud::PinnedServerArtifact {
+    url: "https://example.invalid/jamstream/jamstreamd-linux-x86_64-musl",
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+};
+
+/// The cost preview as a release build shows it: the server binary is
+/// pinned, so there is one line about it and nothing to configure. This is
+/// the path every user of a release is on, and the published screenshot.
 fn wizard_preview_app(theme: Theme) -> JamApp {
+    let mut app = wizard_preview_unpinned_app(theme);
+    app.wizard.pinned = Some(FAKE_PIN);
+    app.wizard.advanced_open = false;
+    app
+}
+
+/// The other half: a build with no artifact pinned into it, which is
+/// development only. The advanced fields appear and Launch stays disabled
+/// until they are filled in. Not published anywhere; a release build never
+/// shows this.
+fn wizard_preview_unpinned_app(theme: Theme) -> JamApp {
     let mut app = test_app(theme);
     let mut w = fixed_wizard();
     w.providers[1].status = ProviderStatus::Ready;
     w.select_provider(1);
     w.continue_to_region(fixed_regions());
     w.continue_to_preview();
-    // The development-build state, pinned explicitly: the advanced
-    // artifact fields are only rendered when no server artifact is pinned
-    // into the binary. The pinned state renders a version string instead,
-    // which would rot the baseline on every release bump, so it is covered
-    // by the pure-transition tests rather than a snapshot.
     w.pinned = None;
     w.advanced_open = true;
     app.wizard = w;
@@ -571,6 +628,23 @@ fn wizard_preview() {
 }
 
 #[test]
+fn wizard_preview_unpinned() {
+    wizard_snapshot(
+        wizard_preview_unpinned_app(Theme::Dark),
+        "wizard_preview_unpinned",
+    );
+}
+
+#[test]
+fn wizard_preview_narrow() {
+    // The tallest card in the wizard at the shortest window the app opens
+    // at: the card scrolls, so Back and Launch stay reachable instead of
+    // sitting past the bottom edge.
+    let mut harness = app_harness(wizard_preview_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "wizard_preview_narrow");
+}
+
+#[test]
 fn wizard_launching() {
     wizard_snapshot(wizard_launching_app(Theme::Dark), "wizard_launching");
 }
@@ -632,7 +706,7 @@ fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {
 }
 
 fn session_invites_app(theme: Theme) -> JamApp {
-    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, true), theme);
+    let mut app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), theme);
     let (state, path) = invites_state();
     let mut panel = InvitesPanel::new(state, path);
     // One revoked row so all three statuses render: the demo roster has

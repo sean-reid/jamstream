@@ -998,6 +998,19 @@ pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
 impl HostWizard {
     pub fn ui(&mut self, ui: &mut Ui) -> Option<WizardEvent> {
         let event = self.poll();
+        // The card is taller than a short window: at 800x600, the app's
+        // smallest, the setup pane and the cost preview both run past the
+        // bottom edge, and Back and Continue live down there.
+        egui::ScrollArea::vertical()
+            .id_salt("wizard-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.card_ui(ui);
+            });
+        event
+    }
+
+    fn card_ui(&mut self, ui: &mut Ui) {
         theme::focused_column(ui, 620.0, |ui| {
             theme::panel(ui)
                 .inner_margin(egui::Margin::same(16))
@@ -1038,7 +1051,6 @@ impl HostWizard {
                     }
                 });
         });
-        event
     }
 
     fn provider_ui(&mut self, ui: &mut Ui) {

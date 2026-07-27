@@ -21,6 +21,16 @@ use crate::widgets::{
 
 const NARROW_BELOW_PX: f32 = 900.0;
 
+/// A host's bar stacks into two rows below this. The one-row form needs the
+/// readouts without their meters, 425, beside the full set of controls,
+/// 655: three sheet toggles, the lamp, the session id, the timer, the cost,
+/// and Leave.
+const BAR_STACK_BELOW_PX: f32 = 1100.0;
+
+/// What the pair of compact meters needs beside the readouts: two 52 px
+/// meters, their labels, the separator, and the gaps between them.
+const BAR_METERS_W: f32 = 180.0;
+
 // Console geometry: every strip is exactly this wide regardless of content.
 const STRIP_W: f32 = 104.0;
 const STRIP_INNER_W: f32 = STRIP_W - 20.0;
@@ -29,7 +39,17 @@ const ROW_H: f32 = 22.0;
 const DB_H: f32 = 16.0;
 const PAN_H: f32 = 14.0;
 const METER_SLOT_H: f32 = 12.0;
-const MIN_FADER_H: f32 = 120.0;
+const NAME_ROW_H: f32 = 18.0;
+/// The "disconnected" note; only a disconnected member's strip carries it.
+const NOTE_ROW_H: f32 = 18.0;
+/// Floor on the fader. The console reserves this much per strip before it
+/// draws and scrolls when the window cannot hold it, so a fader is never
+/// handed less and never takes the difference out of the portrait and the
+/// name above it. A host strip clears the floor at the smallest window the
+/// app opens at, 800x600; scrolling is for the sizes below that.
+const MIN_FADER_H: f32 = 32.0;
+/// The panel primitive's 10 px margins around the strip's content.
+const STRIP_FRAME_H: f32 = 20.0;
 
 // Chat columns: a monospace clock, a name gutter, then the message. The
 // message column is the one thing that must never move: every line of a
@@ -107,7 +127,7 @@ impl SessionScreen {
 
         egui::Panel::bottom(egui::Id::new("session-status"))
             .show_separator_line(true)
-            .show(ui, |ui| self.status_bar(ui, snap, narrow));
+            .show(ui, |ui| self.status_bar(ui, snap));
 
         if !narrow {
             egui::Panel::right(egui::Id::new("session-chat"))
@@ -227,19 +247,26 @@ impl SessionScreen {
                 self.metronome_ui(ui, snap, rt, lower_w);
             });
 
-        ScrollArea::horizontal()
-            .id_salt("mixer-scroll")
-            .show(ui, |ui| {
-                // Leave room for the scrollbar when the row overflows.
-                let bar = if overflow { 10.0 } else { 2.0 };
-                let strip_h = (ui.available_height() - bar).max(0.0);
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = STRIP_GAP;
-                    for member in &musicians {
-                        self.strip_ui(ui, member, snap, rt, strip_h);
-                    }
-                });
+        // The console scrolls in both directions: sideways past the last
+        // strip, and down when the window is too short for a whole strip.
+        ScrollArea::both().id_salt("mixer-scroll").show(ui, |ui| {
+            // Leave room for the scrollbar when the row overflows.
+            let bar = if overflow { 10.0 } else { 2.0 };
+            let gap = ui.spacing().item_spacing.y;
+            // Every strip is as tall as the tallest one needs to be, so
+            // the rows line up across the console.
+            let needed = musicians
+                .iter()
+                .map(|m| strip_content_h(gap, m, snap.is_host) + STRIP_FRAME_H)
+                .fold(0.0_f32, f32::max);
+            let strip_h = (ui.available_height() - bar).max(needed);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = STRIP_GAP;
+                for member in &musicians {
+                    self.strip_ui(ui, member, snap, rt, strip_h);
+                }
             });
+        });
     }
 
     fn strip_ui(
@@ -251,11 +278,16 @@ impl SessionScreen {
         strip_h: f32,
     ) {
         let frame = theme::panel(ui).show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.set_width(STRIP_INNER_W);
-                ui.set_min_height((strip_h - 20.0).max(0.0));
-                self.strip_body(ui, member, snap, rt);
-            });
+            // An exact box, not a minimum: the rows inside stack from the
+            // bottom, so they need a bottom edge that does not move.
+            ui.allocate_ui_with_layout(
+                vec2(STRIP_INNER_W, (strip_h - STRIP_FRAME_H).max(0.0)),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(STRIP_INNER_W);
+                    self.strip_body(ui, member, snap, rt);
+                },
+            );
         });
         if member.is_you {
             frame
@@ -292,7 +324,7 @@ impl SessionScreen {
             let name_w = (ui.available_width() - you_w).max(10.0);
             let response = ui
                 .allocate_ui_with_layout(
-                    vec2(name_w, 18.0),
+                    vec2(name_w, NAME_ROW_H),
                     Layout::left_to_right(Align::Center),
                     |ui| {
                         ui.set_min_width(name_w);
@@ -342,7 +374,7 @@ impl SessionScreen {
                     mute_button(ui, &mut muted, STRIP_INNER_W, MUTE_MONITOR_HOVER);
                     pan_row(ui, &format!("{} pan", member.name), &mut pan);
                     db_readout(ui, gain, false);
-                    let fader_h = (ui.available_height() - 2.0).max(MIN_FADER_H);
+                    let fader_h = (ui.available_height() - 2.0).max(0.0);
                     fader(ui, &label, &mut gain, vec2(STRIP_INNER_W, fader_h))
                         .on_disabled_hover_text(
                             "your own channel: self monitoring is local, not part of the mix",
@@ -354,7 +386,7 @@ impl SessionScreen {
                 }
                 changed |= pan_row(ui, &format!("{} pan", member.name), &mut pan);
                 db_readout(ui, gain, true);
-                let fader_h = (ui.available_height() - 2.0).max(MIN_FADER_H);
+                let fader_h = (ui.available_height() - 2.0).max(0.0);
                 changed |= fader(ui, &label, &mut gain, vec2(STRIP_INNER_W, fader_h)).changed();
             }
         });
@@ -524,14 +556,15 @@ impl SessionScreen {
 
     /// Everything numeric here is monospace so the bar never wobbles.
     ///
-    /// The host's bar carries two sheet toggles and the cost ticker on top of
-    /// everything a musician sees, which below the narrow threshold cannot
-    /// share a row with the readouts, and this bar may never overlap. So a
-    /// host's stacks into two rows there and a musician's stays on one.
-    fn status_bar(&mut self, ui: &mut Ui, snap: &Snapshot, narrow: bool) {
+    /// A host's bar carries three sheet toggles, the cost ticker, and the
+    /// timer on top of everything a musician sees, and this bar may never
+    /// overlap. Two rules keep it apart: below [`BAR_STACK_BELOW_PX`] a
+    /// host's controls take a row of their own, and on one row the controls
+    /// are measured first so the readouts get only what is left over.
+    fn status_bar(&mut self, ui: &mut Ui, snap: &Snapshot) {
         ui.add_space(theme::SPACE_SM);
-        if narrow && snap.is_host {
-            ui.horizontal(|ui| self.status_readouts(ui, snap));
+        if snap.is_host && ui.available_width() < BAR_STACK_BELOW_PX {
+            ui.horizontal(|ui| status_readouts(ui, snap));
             ui.add_space(theme::SPACE_SM);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -539,92 +572,16 @@ impl SessionScreen {
                 });
             });
         } else {
-            ui.horizontal(|ui| {
-                self.status_readouts(ui, snap);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    self.status_controls(ui, snap);
-                });
-            });
+            egui::containers::Sides::new().shrink_left().show(
+                ui,
+                |ui| status_readouts(ui, snap),
+                |ui| self.status_controls(ui, snap),
+            );
         }
         ui.add_space(theme::SPACE_SM);
     }
 
-    /// The instrument half: connection, the headline latency, what is leaving
-    /// the room, and the link numbers.
-    fn status_readouts(&mut self, ui: &mut Ui, snap: &Snapshot) {
-        {
-            let s = &snap.stats;
-            status_dot(
-                ui,
-                matches!(s.state, ConnState::Joined),
-                s.rtt_ms,
-                s.loss_pct,
-            );
-            // Mouth to ear is the headline number: an instrument readout,
-            // fixed-width digits so nothing wobbles.
-            let p = theme::palette_of(ui);
-            let m2e = s
-                .mouth_to_ear_ms
-                .map_or("--.-".to_owned(), |v| format!("{v:>4.1}"));
-            ui.label(
-                RichText::new(m2e)
-                    .monospace()
-                    .size(21.0)
-                    .color(p.text_primary),
-            );
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.label(
-                    RichText::new("ms")
-                        .monospace()
-                        .size(9.5)
-                        .color(p.text_muted),
-                );
-                ui.label(RichText::new("mouth to ear").size(9.5).color(p.text_muted));
-            });
-            // The audition reminder lives beside the headline readout so
-            // the host can never forget what they are hearing.
-            if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
-                audition_indicator(ui);
-            }
-            // Same place, same reason: what is leaving the room, for
-            // everyone in it, whether or not a sheet is open.
-            on_air_indicator(ui, snap);
-            ui.separator();
-            let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
-            ui.label(theme::mono(ui, format!("rtt {rtt} ms")));
-            ui.label(theme::mono(
-                ui,
-                format!("buffer {}/{}", s.jitter_depth, s.jitter_target),
-            ));
-            ui.label(theme::mono(ui, format!("loss {:.1}%", s.loss_pct)));
-            // The compact meters are the first thing to go when the bar
-            // gets tight; nothing may overlap.
-            if ui.available_width() > 420.0 {
-                ui.separator();
-                ui.label(theme::muted(ui, "in"));
-                meter(
-                    ui,
-                    "bar-in",
-                    snap.levels.input_peak,
-                    snap.levels.input_rms,
-                    vec2(52.0, 10.0),
-                    Meter::Horizontal,
-                );
-                ui.label(theme::muted(ui, "out"));
-                meter(
-                    ui,
-                    "bar-out",
-                    snap.levels.output_peak,
-                    snap.levels.output_rms,
-                    vec2(52.0, 10.0),
-                    Meter::Horizontal,
-                );
-            }
-        }
-    }
-
-    /// The control half: the two host sheets, the cost ticker, the on air
+    /// The control half: the three host sheets, the cost ticker, the on air
     /// lamp, and the way out. Laid out right to left by the caller.
     fn status_controls(&mut self, ui: &mut Ui, snap: &Snapshot) {
         {
@@ -877,6 +834,83 @@ fn chat_line(ui: &mut Ui, line: &ChatLine) {
     });
 }
 
+/// The instrument half: connection, the headline latency, what is leaving
+/// the room, and the link numbers.
+fn status_readouts(ui: &mut Ui, snap: &Snapshot) {
+    {
+        let s = &snap.stats;
+        status_dot(
+            ui,
+            matches!(s.state, ConnState::Joined),
+            s.rtt_ms,
+            s.loss_pct,
+        );
+        // Mouth to ear is the headline number: an instrument readout,
+        // fixed-width digits so nothing wobbles.
+        let p = theme::palette_of(ui);
+        let m2e = s
+            .mouth_to_ear_ms
+            .map_or("--.-".to_owned(), |v| format!("{v:>4.1}"));
+        ui.label(
+            RichText::new(m2e)
+                .monospace()
+                .size(21.0)
+                .color(p.text_primary),
+        );
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.label(
+                RichText::new("ms")
+                    .monospace()
+                    .size(9.5)
+                    .color(p.text_muted),
+            );
+            ui.label(RichText::new("mouth to ear").size(9.5).color(p.text_muted));
+        });
+        // The audition reminder lives beside the headline readout so
+        // the host can never forget what they are hearing.
+        if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
+            audition_indicator(ui);
+        }
+        // Same place, same reason: what is leaving the room, for
+        // everyone in it, whether or not a sheet is open.
+        on_air_indicator(ui, snap);
+        ui.separator();
+        let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
+        ui.label(theme::mono(ui, format!("rtt {rtt} ms")));
+        ui.label(theme::mono(
+            ui,
+            format!("buffer {}/{}", s.jitter_depth, s.jitter_target),
+        ));
+        ui.label(theme::mono(ui, format!("loss {:.1}%", s.loss_pct)));
+        // The compact meters are the first thing to go when the bar
+        // gets tight. What is left here is the room the controls did
+        // not take, so this is the real question: do the meters fit
+        // beside everything else, or not.
+        if ui.available_width() > BAR_METERS_W {
+            ui.separator();
+            ui.label(theme::muted(ui, "in"));
+            meter(
+                ui,
+                "bar-in",
+                snap.levels.input_peak,
+                snap.levels.input_rms,
+                vec2(52.0, 10.0),
+                Meter::Horizontal,
+            );
+            ui.label(theme::muted(ui, "out"));
+            meter(
+                ui,
+                "bar-out",
+                snap.levels.output_peak,
+                snap.levels.output_rms,
+                vec2(52.0, 10.0),
+                Meter::Horizontal,
+            );
+        }
+    }
+}
+
 /// The persistent audition reminder: a lit lamp and its sentence, beside
 /// the mouth-to-ear readout for as long as audition is on.
 fn audition_indicator(ui: &mut Ui) {
@@ -895,6 +929,28 @@ fn audition_indicator(ui: &mut Ui) {
         ui.label(theme::muted(ui, "hearing stream mix"))
             .on_hover_text("audition is on: your monitor carries what listeners hear");
     });
+}
+
+/// What one strip's content needs vertically: the portrait, the name row,
+/// the disconnected note when there is one, every fixed row, and a fader
+/// that is still a fader. Items are separated by `gap`, so the count of
+/// them decides the spacing.
+///
+/// The mixer reserves this before drawing, because the lower rows stack
+/// from the bottom edge upward: a fader handed less than it asked for used
+/// to run its track back up through the name and the portrait.
+fn strip_content_h(gap: f32, member: &MemberView, is_host: bool) -> f32 {
+    let mut rows = AVATAR_D_STRIP + NAME_ROW_H + MIN_FADER_H + DB_H + PAN_H + ROW_H + METER_SLOT_H;
+    let mut count = 7.0;
+    if !member.connected {
+        rows += NOTE_ROW_H;
+        count += 1.0;
+    }
+    if is_host {
+        rows += ROW_H;
+        count += 1.0;
+    }
+    rows + (count - 1.0) * gap
 }
 
 /// Fixed-width monospace dB readout; the width never shifts with digits.

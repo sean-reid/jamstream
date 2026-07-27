@@ -21,6 +21,26 @@ const HANDLE_H: f32 = 10.0;
 /// Tick rows on the track; 0 dB is emphasized.
 const TICKS_DB: [f32; 6] = [6.0, 0.0, -6.0, -12.0, -24.0, -40.0];
 
+/// Closest two tick rows may sit. A short strip cannot hold the whole
+/// ladder, and ticks a few pixels apart read as hatching, not as a scale.
+const MIN_TICK_GAP: f32 = 7.0;
+
+/// The ticks that fit in `travel` pixels of track, in the order they are
+/// drawn. 0 dB is the reference and is always one of them.
+fn visible_ticks(travel: f32) -> Vec<f32> {
+    let mut kept = vec![0.0_f32];
+    for db in TICKS_DB.iter().copied().filter(|db| *db != 0.0) {
+        let t = db_to_t(db);
+        if kept
+            .iter()
+            .all(|k| (db_to_t(*k) - t).abs() * travel >= MIN_TICK_GAP)
+        {
+            kept.push(db);
+        }
+    }
+    kept
+}
+
 /// dB to normalized travel (0 bottom, 1 top), piecewise like a console.
 pub fn db_to_t(db: f32) -> f32 {
     let db = db.clamp(FADER_MIN_DB, FADER_MAX_DB);
@@ -115,7 +135,7 @@ pub fn fader(ui: &mut Ui, label: &str, gain_db: &mut f32, size: Vec2) -> Respons
         let y_of = |db: f32| (bottom - db_to_t(db) * (bottom - top)).round_to_pixels(ppp);
 
         // Ticks first, then the track groove over them.
-        for db in TICKS_DB {
+        for db in visible_ticks(bottom - top) {
             let y = y_of(db);
             let (reach, stroke) = if db == 0.0 {
                 (rect.width() / 2.0 - 1.0, Stroke::new(1.0, p.text_muted))
@@ -166,6 +186,22 @@ pub fn fader(ui: &mut Ui, label: &str, gain_db: &mut f32, size: Vec2) -> Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_tracks_drop_ticks_but_keep_the_reference() {
+        // A console-height track carries the whole ladder.
+        assert_eq!(visible_ticks(300.0).len(), TICKS_DB.len());
+        for travel in [300.0, 120.0, 60.0, 25.0, 8.0] {
+            let kept = visible_ticks(travel);
+            assert!(kept.contains(&0.0), "0 dB dropped at travel {travel}");
+            for (i, a) in kept.iter().enumerate() {
+                for b in &kept[i + 1..] {
+                    let gap = (db_to_t(*a) - db_to_t(*b)).abs() * travel;
+                    assert!(gap >= MIN_TICK_GAP, "{a} and {b} collide at {travel}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn taper_round_trips_and_hits_anchors() {
