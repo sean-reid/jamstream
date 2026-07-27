@@ -106,6 +106,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::cloudinit::flat_config_value;
 use crate::private::{create_private_dir, write_private};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
@@ -114,6 +115,13 @@ use crate::types::{
 
 const REGION_ID: &str = "local";
 const REGISTRY_FILE: &str = "local.json";
+/// Cross-process guard on the registry: see [`FileLock`].
+const LOCK_FILE: &str = "local.json.lock";
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+const LOCK_POLL: Duration = Duration::from_millis(20);
+/// A registry cycle is a few milliseconds of file work, so anything
+/// holding the lock this long is a process that died holding it.
+const LOCK_STALE: Duration = Duration::from_secs(30);
 /// The graceful-shutdown request and the marker that proves the spawned
 /// server acts on it, both inside the per-session directory.
 const SHUTDOWN_FILE: &str = "shutdown";
@@ -244,14 +252,37 @@ impl LocalProvider {
         self.state_dir.join("sessions").join(fs_safe(session))
     }
 
-    /// One locked load-modify-save cycle on the registry file.
+    /// One load-modify-save cycle on the registry file, locked against
+    /// every other one on this machine.
     fn with_registry<T>(&self, f: impl FnOnce(&mut Vec<RegistryEntry>) -> T) -> Result<T> {
         let _gate = self.registry_gate.lock().unwrap();
+        create_private_dir(&self.state_dir).map_err(|e| {
+            ProviderError::Other(format!(
+                "cannot create state dir {}: {e}",
+                self.state_dir.display()
+            ))
+        })?;
+        let _lock = FileLock::acquire(&self.state_dir.join(LOCK_FILE));
         let path = self.registry_path();
         let mut entries: Vec<RegistryEntry> = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                ProviderError::Other(format!("registry {} is corrupt: {e}", path.display()))
-            })?,
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                // Refusing forever would leave the sweeper unable to find a
+                // single local session for the life of the file, and the
+                // registry is recoverable state: pids and session ids, no
+                // key material. Set it aside, say so, and carry on. What is
+                // lost is the ability to destroy whatever it named, and
+                // those servers still hold their own idle and duration
+                // limits.
+                let aside = path.with_extension("corrupt");
+                tracing::warn!(
+                    error = %err,
+                    registry = %path.display(),
+                    moved_to = %aside.display(),
+                    "registry does not parse; starting a new one"
+                );
+                let _ = std::fs::rename(&path, &aside);
+                Vec::new()
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
                 return Err(ProviderError::Other(format!(
@@ -380,7 +411,9 @@ impl Provider for LocalProvider {
             .unwrap_or("0")
             .to_owned();
 
-        let log = std::fs::File::create(dir.join("server.log"))
+        // 0600 like everything else in here: a server log is a session's
+        // roster, addresses, and whatever a future line decides to print.
+        let log = create_log_file(&dir.join("server.log"))
             .map_err(|e| ProviderError::Other(format!("cannot create server log: {e}")))?;
         // --shutdown-file is the graceful-exit request path. jamstreamd's
         // argument scan ignores flags it does not know, so passing it to a
@@ -533,6 +566,91 @@ impl Provider for LocalProvider {
     }
 }
 
+/// A best-effort mutual exclusion between processes, held for the length
+/// of one registry cycle.
+///
+/// The desktop app sweeps on launch while the CLI is mid-`host`, and both
+/// do load-modify-save on the same file; the in-process mutex says nothing
+/// about that, and the loser's entry disappears, leaving a server nothing
+/// will ever destroy. `create_new` is the primitive every platform has
+/// here, without a dependency and without flock's differences between
+/// Windows, Linux, and macOS.
+///
+/// Best effort in two specific ways, both deliberate:
+///
+/// * a holder that died leaves the file behind, so a lock older than
+///   [`LOCK_STALE`] is taken from it. A registry cycle is a few
+///   milliseconds of file work, so nothing legitimate holds one that long;
+/// * failing to take the lock does not fail the operation. The cycle it
+///   guards is what the CLI is for, and refusing to run a command because
+///   another process is holding a file would be a worse failure than the
+///   rare lost update it prevents.
+struct FileLock {
+    path: PathBuf,
+    held: bool,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> Self {
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(_) => {
+                    return FileLock {
+                        path: path.to_owned(),
+                        held: true,
+                    };
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(path) {
+                        tracing::warn!(lock = %path.display(), "breaking a stale registry lock");
+                        let _ = std::fs::remove_file(path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        tracing::warn!(
+                            lock = %path.display(),
+                            "registry lock is held elsewhere; proceeding unlocked"
+                        );
+                        return FileLock {
+                            path: path.to_owned(),
+                            held: false,
+                        };
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, lock = %path.display(), "cannot take the registry lock");
+                    return FileLock {
+                        path: path.to_owned(),
+                        held: false,
+                    };
+                }
+            }
+        }
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|m| m.elapsed().unwrap_or_default() > LOCK_STALE)
+        // A lock file we cannot stat is one we cannot wait on either.
+        .unwrap_or(true)
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -540,32 +658,40 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Keeps [A-Za-z0-9._-]; everything else becomes '-'. Session ids are hex
-/// in practice, this is belt and braces for the filesystem path.
+/// The spawned server's stdout and stderr. Truncating rather than
+/// appending, as `File::create` was: a relaunched session starts a new log.
+fn create_log_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// One path component for a session id: keeps [A-Za-z0-9_-] and turns
+/// everything else, the dot included, into '-'.
+///
+/// Session ids are lowercase hex, so in practice nothing is touched. The
+/// dot is what makes this worth having: destroy calls `remove_dir_all` on
+/// the directory this names, and a session of ".." would have named the
+/// parent, taking every other session's directory with it. An empty id
+/// would have named the parent too, by naming nothing at all.
 fn fs_safe(s: &str) -> String {
+    if s.is_empty() {
+        return "unnamed".to_owned();
+    }
     s.chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
                 c
             } else {
                 '-'
             }
         })
         .collect()
-}
-
-/// Reads one value out of the flat key=value config format
-/// (`BootConfig::render_flat_config`). Best effort: non-flat payloads
-/// simply yield None.
-fn flat_config_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    text.lines().find_map(|line| {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            return None;
-        }
-        let (k, v) = line.split_once('=')?;
-        (k.trim() == key).then(|| v.trim())
-    })
 }
 
 /// Where the graceful-shutdown request lives for a session, and the path
@@ -896,19 +1022,46 @@ fn parse_etime(field: &str) -> Option<u64> {
     Some(days * 86_400 + hours * 3_600 + mins * 60 + secs)
 }
 
+/// A helper the platform provides, resolved to an absolute path.
+///
+/// Every one of these used to go through `PATH`, so a writable directory
+/// early in it meant code execution on every liveness probe, in a process
+/// that is about to signal something. The candidates below are where each
+/// platform actually keeps these; the bare name is the last resort, for an
+/// unusual layout, and it is the only case that reads `PATH` at all.
+fn system_tool(name: &str, candidates: &[&str]) -> PathBuf {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
 #[cfg(unix)]
 mod process {
+    use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
-    use super::{PidProbe, Spawned};
+    use super::{PidProbe, Spawned, system_tool};
 
     /// Named in the error when a process outlives the forced step.
     pub const FORCED_KILL: &str = "SIGKILL";
 
+    fn ps() -> &'static PathBuf {
+        static PS: OnceLock<PathBuf> = OnceLock::new();
+        PS.get_or_init(|| system_tool("ps", &["/bin/ps", "/usr/bin/ps"]))
+    }
+
+    fn kill_bin() -> &'static PathBuf {
+        static KILL: OnceLock<PathBuf> = OnceLock::new();
+        KILL.get_or_init(|| system_tool("kill", &["/bin/kill", "/usr/bin/kill"]))
+    }
+
     /// See [`super::ps_probe`] for the parse and the pid-reuse rules.
     pub fn alive(pid: u32, spawned: Spawned<'_>) -> bool {
-        match Command::new("ps")
+        match Command::new(ps())
             .args(["-p", &pid.to_string(), "-o", "stat=,etime=,comm="])
             .output()
         {
@@ -949,13 +1102,13 @@ mod process {
     }
 
     pub fn terminate(pid: u32) {
-        let _ = Command::new("kill")
+        let _ = Command::new(kill_bin())
             .args(["-TERM", &pid.to_string()])
             .status();
     }
 
     pub fn kill(pid: u32) {
-        let _ = Command::new("kill")
+        let _ = Command::new(kill_bin())
             .args(["-KILL", &pid.to_string()])
             .status();
     }
@@ -963,10 +1116,31 @@ mod process {
 
 #[cfg(windows)]
 mod process {
+    use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
-    use super::{PidProbe, Spawned};
+    use super::{PidProbe, Spawned, system_tool};
+
+    /// `%SystemRoot%\System32` is where both of these live; the constant
+    /// path is the fallback for an environment with no SystemRoot set.
+    fn system32(name: &str) -> PathBuf {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+        let configured = format!("{root}\\System32\\{name}");
+        let default = format!("C:\\Windows\\System32\\{name}");
+        system_tool(name, &[configured.as_str(), default.as_str()])
+    }
+
+    fn tasklist() -> &'static PathBuf {
+        static TASKLIST: OnceLock<PathBuf> = OnceLock::new();
+        TASKLIST.get_or_init(|| system32("tasklist.exe"))
+    }
+
+    fn taskkill() -> &'static PathBuf {
+        static TASKKILL: OnceLock<PathBuf> = OnceLock::new();
+        TASKKILL.get_or_init(|| system32("taskkill.exe"))
+    }
 
     pub const FORCED_KILL: &str = "taskkill /F";
 
@@ -980,7 +1154,7 @@ mod process {
 
     /// See [`super::tasklist_probe`] for the parse and the pid-reuse rule.
     pub fn alive(pid: u32, spawned: Spawned<'_>) -> bool {
-        match Command::new("tasklist")
+        match Command::new(tasklist())
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .output()
         {
@@ -1030,7 +1204,7 @@ mod process {
     /// insurance for the day jamstreamd runs windowed, not the mechanism we
     /// rely on, so its status is ignored.
     pub fn terminate(pid: u32) {
-        let _ = Command::new("taskkill")
+        let _ = Command::new(taskkill())
             .args(["/PID", &pid.to_string(), "/T"])
             .output();
     }
@@ -1040,7 +1214,7 @@ mod process {
     /// process ... has been terminated" chatter does not land in the CLI's
     /// own stdout.
     pub fn kill(pid: u32) {
-        let _ = Command::new("taskkill")
+        let _ = Command::new(taskkill())
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
     }
@@ -1153,14 +1327,96 @@ mod tests {
         let _ = std::fs::remove_file(&sibling);
     }
 
+    /// `destroy` removes the session directory, so the id it comes from has
+    /// to stay inside `sessions/`. Session ids are hex and none of this is
+    /// reachable today, which is the point: it is reachable the moment
+    /// something upstream stops checking.
     #[test]
-    fn flat_config_values_parse() {
-        let text = "# comment\nport = 43210\nidle_shutdown_min = 10\nmax_duration_min = 720\n";
-        assert_eq!(flat_config_value(text, "port"), Some("43210"));
-        assert_eq!(flat_config_value(text, "idle_shutdown_min"), Some("10"));
-        assert_eq!(flat_config_value(text, "max_duration_min"), Some("720"));
-        assert_eq!(flat_config_value(text, "missing"), None);
-        assert_eq!(flat_config_value("#cloud-config\n", "port"), None);
+    fn a_session_id_cannot_name_a_directory_outside_its_own() {
+        let provider = LocalProvider::new(PathBuf::from("/state"));
+        let sessions = PathBuf::from("/state").join("sessions");
+        for id in ["..", ".", "../..", "a/../..", "..\\..", ""] {
+            let dir = provider.session_dir(id);
+            assert_eq!(
+                dir.parent(),
+                Some(sessions.as_path()),
+                "session {id:?} escaped to {dir:?}"
+            );
+            assert_ne!(dir, sessions, "session {id:?} named the sessions directory");
+        }
+        // The real thing is untouched, and so is anything readable.
+        assert_eq!(fs_safe("deadbeefcafef00d"), "deadbeefcafef00d");
+        assert_eq!(fs_safe("my_session-1"), "my_session-1");
+    }
+
+    /// A one-byte flip in the registry used to fail every local operation
+    /// for the life of the file, and `sweep` logged that and carried on, so
+    /// local sweeping was off with nothing to show for it.
+    #[tokio::test]
+    async fn a_corrupt_registry_is_set_aside_rather_than_fatal() {
+        let dir = temp_dir("corrupt");
+        let state = dir.join("state");
+        create_private_dir(&state).unwrap();
+        let registry = state.join(REGISTRY_FILE);
+        std::fs::write(&registry, b"{not json at all").unwrap();
+
+        let provider = LocalProvider::new(state.clone());
+        assert!(
+            provider.list_tagged(None).await.unwrap().is_empty(),
+            "a corrupt registry reads as no sessions, not as an error forever"
+        );
+        // The unparseable bytes are kept, in case a human wants them, and
+        // the registry itself is usable again.
+        let aside = registry.with_extension("corrupt");
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{not json at all");
+        assert!(provider.list_tagged(None).await.is_ok());
+        assert!(registry.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The app sweeping on launch while the CLI is mid-host is two
+    /// processes in the same load-modify-save cycle, and the loser's entry
+    /// used to vanish, leaving a server nothing would ever destroy.
+    #[test]
+    fn the_registry_lock_excludes_another_holder_and_breaks_a_stale_one() {
+        let dir = temp_dir("lock");
+        let path = dir.join("local.json.lock");
+
+        let held = FileLock::acquire(&path);
+        assert!(path.is_file(), "the lock is a file another process can see");
+
+        // A second holder waits, gives up inside its window, and says so
+        // rather than failing the command it was guarding.
+        let started = Instant::now();
+        let contended = FileLock::acquire(&path);
+        assert!(started.elapsed() >= LOCK_WAIT);
+        drop(contended);
+        assert!(
+            path.is_file(),
+            "giving up must not release someone else's lock"
+        );
+
+        drop(held);
+        assert!(!path.exists(), "the holder releases on drop");
+
+        // A process that died holding it must not lock the machine out
+        // forever, so an old enough lock is taken from it.
+        std::fs::write(&path, b"").unwrap();
+        let stale = std::time::SystemTime::now() - LOCK_STALE - Duration::from_secs(1);
+        // Opened for writing because Windows needs write access to set a
+        // file's times at all.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        assert!(lock_is_stale(&path));
+        let stolen = FileLock::acquire(&path);
+        assert!(path.is_file());
+        drop(stolen);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One real row, from a US-English Windows 11 `tasklist /FI "PID eq

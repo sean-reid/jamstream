@@ -43,6 +43,7 @@ struct State {
     next_ip: u32,
     launch_failures: VecDeque<ProviderError>,
     destroy_failures: VecDeque<ProviderError>,
+    list_failures: VecDeque<ProviderError>,
     calls: Vec<Call>,
 }
 
@@ -122,6 +123,16 @@ impl MockProvider {
         let mut s = self.state.lock().unwrap();
         for _ in 0..n {
             s.destroy_failures.push_back(err.clone());
+        }
+    }
+
+    /// The next `n` list calls fail with a clone of `err`. A provider that
+    /// cannot be listed is one the sweeper never searched, which is a
+    /// different outcome from finding nothing.
+    pub fn fail_next_lists(&self, n: usize, err: ProviderError) {
+        let mut s = self.state.lock().unwrap();
+        for _ in 0..n {
+            s.list_failures.push_back(err.clone());
         }
     }
 
@@ -254,6 +265,9 @@ impl Provider for MockProvider {
         let mut s = self.state.lock().unwrap();
         s.calls
             .push(Call::ListTagged(session_tag.map(str::to_owned)));
+        if let Some(err) = s.list_failures.pop_front() {
+            return Err(err);
+        }
         Ok(s.instances
             .iter()
             .filter(|i| match (session_id_from_tags(&i.tags), session_tag) {

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use jamstream_engine::JitterStats;
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
@@ -79,6 +80,34 @@ pub struct Traffic {
     pub dropped: u64,
 }
 
+/// Wall-clock cost of `ServerCore::tick`, split by whether that tick also had
+/// to fan a 20 ms broadcast frame out to the listeners (one tick in eight).
+///
+/// The two medians are what make this usable as a gate: the ratio between
+/// them is dimensionless, so a runner three times slower than a laptop moves
+/// both numbers and not the ratio. Absolute microseconds are for the log.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TickCost {
+    pub broadcast_ticks: usize,
+    pub ordinary_ticks: usize,
+    pub broadcast_median_us: f64,
+    pub ordinary_median_us: f64,
+    /// Mean over ticks of both kinds: what the 2.5 ms tick budget is actually
+    /// spent against once the broadcast tick is amortized.
+    pub amortized_mean_us: f64,
+}
+
+impl TickCost {
+    /// Broadcast tick cost in ordinary ticks. 1.0 would mean fanning out to
+    /// every listener is free; the cost of per-listener work shows up here
+    /// multiplied by the listener count. NaN with nothing measured, so a
+    /// scenario that forgot to ask for the measurement fails its gate rather
+    /// than passing it.
+    pub fn fanout_ratio(&self) -> f64 {
+        self.broadcast_median_us / self.ordinary_median_us
+    }
+}
+
 struct SimClient {
     endpoint: EndpointId,
     addr: SocketAddr,
@@ -119,6 +148,7 @@ pub struct ScenarioBuilder {
     duration_ms: u64,
     keep_audio: bool,
     raw_audio: bool,
+    tick_cost: bool,
 }
 
 impl ScenarioBuilder {
@@ -134,6 +164,7 @@ impl ScenarioBuilder {
             duration_ms: 10_000,
             keep_audio: true,
             raw_audio: false,
+            tick_cost: false,
         }
     }
 
@@ -189,6 +220,14 @@ impl ScenarioBuilder {
     /// compensators must steer out.
     pub fn raw_audio(mut self, raw: bool) -> Self {
         self.raw_audio = raw;
+        self
+    }
+
+    /// Times every `ServerCore::tick` and files it under [`TickCost`]. Off by
+    /// default: two `Instant::now` calls per tick would otherwise sit inside
+    /// the inner loop of every soak.
+    pub fn measure_tick_cost(mut self, measure: bool) -> Self {
+        self.tick_cost = measure;
         self
     }
 
@@ -292,6 +331,9 @@ impl ScenarioBuilder {
             duration_ms: self.duration_ms,
             keep_audio: self.keep_audio,
             raw_audio: self.raw_audio,
+            tick_cost: self.tick_cost,
+            bcast_tick_ns: Vec::new(),
+            other_tick_ns: Vec::new(),
             tick: 0,
             garbage_lcg: self.seed ^ 0x9E37_79B9_7F4A_7C15,
         }
@@ -312,6 +354,9 @@ pub struct Scenario {
     duration_ms: u64,
     keep_audio: bool,
     raw_audio: bool,
+    tick_cost: bool,
+    bcast_tick_ns: Vec<u64>,
+    other_tick_ns: Vec<u64>,
     tick: u64,
     garbage_lcg: u64,
 }
@@ -340,7 +385,15 @@ impl Scenario {
             }
         }
 
-        let out = self.server.tick(now_ms);
+        let out = if self.tick_cost {
+            let started = Instant::now();
+            let out = self.server.tick(now_ms);
+            let elapsed = started.elapsed().as_nanos() as u64;
+            self.file_tick_cost(elapsed, &out);
+            out
+        } else {
+            self.server.tick(now_ms)
+        };
         self.route_server_out(now_us, out);
         self.server_events.extend(self.server.events());
 
@@ -706,6 +759,55 @@ impl Scenario {
             }
         }
         longest as f32 * (TICK_US as f32 / 1_000.0)
+    }
+
+    /// Files one timed tick under broadcast or ordinary. A tick is a
+    /// broadcast tick exactly when it produced a datagram for a listener,
+    /// which is read off the output rather than off a tick counter so the
+    /// harness does not have to know the server's 20 ms accumulator period.
+    fn file_tick_cost(&mut self, elapsed_ns: u64, out: &[(SocketAddr, Vec<u8>)]) {
+        let broadcast = out.iter().any(|(addr, _)| {
+            self.endpoint_by_addr
+                .get(addr)
+                .is_some_and(|&i| self.clients[i].role == Role::Listener)
+        });
+        if broadcast {
+            self.bcast_tick_ns.push(elapsed_ns);
+        } else {
+            self.other_tick_ns.push(elapsed_ns);
+        }
+    }
+
+    /// Drops the samples collected so far. Called after the join and settle
+    /// phase, whose ticks do handshake work no steady-state tick does.
+    pub fn reset_tick_cost(&mut self) {
+        self.bcast_tick_ns.clear();
+        self.other_tick_ns.clear();
+    }
+
+    /// Empty unless built with `measure_tick_cost(true)`.
+    pub fn tick_cost(&self) -> TickCost {
+        let median = |v: &[u64]| -> f64 {
+            if v.is_empty() {
+                return 0.0;
+            }
+            let mut s = v.to_vec();
+            s.sort_unstable();
+            s[s.len() / 2] as f64 / 1_000.0
+        };
+        let total: u64 = self.bcast_tick_ns.iter().chain(&self.other_tick_ns).sum();
+        let n = self.bcast_tick_ns.len() + self.other_tick_ns.len();
+        TickCost {
+            broadcast_ticks: self.bcast_tick_ns.len(),
+            ordinary_ticks: self.other_tick_ns.len(),
+            broadcast_median_us: median(&self.bcast_tick_ns),
+            ordinary_median_us: median(&self.other_tick_ns),
+            amortized_mean_us: if n == 0 {
+                0.0
+            } else {
+                total as f64 / n as f64 / 1_000.0
+            },
+        }
     }
 
     pub fn traffic(&self) -> Traffic {

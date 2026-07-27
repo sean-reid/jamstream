@@ -701,6 +701,33 @@ fn metronome_host_controls_and_clicks() {
     )));
 }
 
+/// Every listener receives byte-identical broadcast audio, so the frame is
+/// encoded once per 20 ms whatever the audience size and only the seal
+/// differs per member. Encoding it per listener measured 20 x 190 us inside
+/// one 2500 us tick, which is a tick overrun at capacity.
+#[test]
+fn a_broadcast_frame_is_encoded_once_per_fanout_tick() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let musician = h.mint(0, Role::Musician);
+    h.add_client(&musician, Some(440.0));
+    for i in 0..MAX_LISTENERS as u16 {
+        let invite = h.mint(100 + i, Role::Listener);
+        h.add_client(&invite, None);
+    }
+    h.run_ms(200);
+    let listeners = h
+        .clients
+        .iter()
+        .filter(|c| c.role == Role::Listener && *c.core.state() == ClientState::Joined)
+        .count();
+    assert_eq!(listeners, MAX_LISTENERS);
+
+    // 400 ms is 160 ticks, which is 20 broadcast frames at 20 ms each.
+    let before = h.server.broadcast_encodes();
+    h.run_ms(400);
+    assert_eq!(h.server.broadcast_encodes() - before, 20);
+}
+
 #[test]
 fn listener_receives_broadcast_and_cannot_send_media() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
@@ -1588,6 +1615,30 @@ fn timeout_then_rejoin_with_same_token() {
     let roster = h.last_roster(c).expect("roster after rejoin");
     assert_eq!(roster.len(), 3);
     assert!(roster.iter().all(|m| m.connected));
+}
+
+/// An attacker on the same wifi sees the init leave and answers it with
+/// garbage before the server can. The join must still happen: snow restores
+/// its symmetric state on a failed read, so the client keeps the handshake it
+/// started and the server's real response completes it.
+#[test]
+fn a_sprayed_handshake_response_cannot_keep_a_client_out() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv = h.mint(0, Role::Musician);
+    let idx = h.add_client(&inv, Some(0.0));
+    let victim = h.clients[idx].addr;
+
+    // One forged response per step for the first 100 ms, arriving ahead of
+    // the server's own answer in every step.
+    for _ in 0..40 {
+        let now = h.now_ms();
+        let forged = wire::build_handshake_resp(&[0xA5; 96]);
+        h.clients[idx].core.handle_datagram(now, &forged);
+        h.step();
+    }
+    assert_eq!(*h.clients[idx].core.state(), ClientState::Joined);
+    assert_eq!(h.server.musicians_connected(), 1);
+    assert_eq!(h.clients[idx].addr, victim);
 }
 
 #[test]
