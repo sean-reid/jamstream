@@ -17,6 +17,10 @@ jamstream-protocol = { path = ".." }
 # the hash check is unreachable.
 jamstream-session = { path = "../../session" }
 blake2 = "0.10"
+# opus_decode needs the codec wrappers directly. It arrives transitively
+# through jamstream-session already; naming it keeps the target honest about
+# what it fuzzes.
+jamstream-engine = { path = "../../engine" }
 
 [[bin]]
 name = "wire_parse"
@@ -63,6 +67,13 @@ bench = false
 [[bin]]
 name = "avatar_reassembly"
 path = "fuzz_targets/avatar_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "opus_decode"
+path = "fuzz_targets/opus_decode.rs"
 test = false
 doc = false
 bench = false

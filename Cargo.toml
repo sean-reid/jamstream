@@ -69,8 +69,22 @@ aws-lc-rs = "1"
 blake2 = "0.10"
 getrandom = "0.3"
 zeroize = "1"
-# opus 0.3 (audiopus_sys) fails to build with CMake >= 4; opusic-c bundles a current libopus.
-opus = { package = "opusic-c", version = "1" }
+# opus 0.3 (audiopus_sys) fails to build with CMake >= 4; opusic-c bundles a
+# current libopus.
+#
+# ~1.6, not "1". This crate compiles a vendored C decoder that parses network
+# bytes on a publicly reachable VM, and opusic-c's minor version tracks the
+# libopus it bundles: ~1.6 keeps us on libopus 1.6.x and makes moving to 1.7 a
+# deliberate edit, which is when the vendored tree and its patch want looking
+# at again. opusic-sys is transitive and has no lever here beyond Cargo.lock.
+#
+# Default features, which resolve to ["bundled"] alone. The `no-hardening`,
+# `no-stack-protector` and `no-fortify-source` features must stay off: with
+# them off, opusic-sys's build.rs passes OPUS_HARDENING=ON,
+# OPUS_STACK_PROTECTOR=ON and OPUS_FORTIFY_SOURCE=ON to the libopus build.
+# crates/protocol/fuzz/fuzz_targets/opus_decode.rs records the rest of the
+# posture and fuzzes the decoder nightly.
+opus = { package = "opusic-c", version = "~1.6" }
 rubato = "4"
 cpal = "0.18"
 rtrb = "0.3"
