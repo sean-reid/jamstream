@@ -19,6 +19,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The engine and protocol microbenchmarks. Deliberately NOT on the PR path:
+  # the suite takes about 9 minutes against a 10 minute wall-time budget, and
+  # criterion's numbers on a shared runner are too noisy to gate on. The same
+  # benchmark was watched swinging 5x on a 14-core laptop under load; a
+  # two-core shared runner is worse.
+  #
+  # So this does not fail on a regression, deliberately. It exists so the
+  # tick-budget table lands in a job summary every night and a 10x change is
+  # visible to anyone who looks. No --save-baseline for the same reason:
+  # runner-to-runner variance would produce false failures and train everyone
+  # to ignore the job.
+  #
+  # No apt step: engine and protocol pull in neither the audio nor the UI
+  # stack, unlike every other job that touches this workspace.
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      - name: Benchmark the engine and protocol hot paths
+        run: |
+          {
+            echo '## Benchmarks'
+            echo '```'
+            cargo bench --locked -p jamstream-engine -p jamstream-protocol 2>&1 \
+              | grep -vE '^(Benchmarking|Found [0-9]+ outliers)'
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: criterion
+          path: target/criterion/
+          if-no-files-found: warn
+
   # Each target gets 10 minutes on top of its committed seed corpus plus
   # whatever the cache has grown on previous nights. Crashes upload as
   # artifacts and then become committed regression tests.
