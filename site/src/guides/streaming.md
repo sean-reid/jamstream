@@ -28,6 +28,9 @@ Both platforms give you a key that keeps working session after session.
 2. Repeat for the second platform if you want both.
 3. **Go live**.
 
+![Destinations sheet with the Twitch key being entered: the field is masked and reads 24 characters beside it, with a keychain checkbox and Go live still disabled](../images/session_destinations_key.png)
+*Adding a Twitch key. The field never shows the key back, so a paste is checked by the character count.*
+
 The lamp turns amber for everyone in the session. You can add or drop a platform while you are on air; **Remove** stops that one and leaves the others streaming.
 
 Your key is treated as a credential. The field is masked and there is no reveal button, so a paste is checked by the character count beside it rather than by reading it back. Leave **keep this key in this computer's keychain** on and the next session starts with **Use saved key** instead of a paste; **Forget key** deletes it again.
