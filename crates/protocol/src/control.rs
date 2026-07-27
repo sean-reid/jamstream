@@ -80,6 +80,23 @@ pub enum ControlMsg {
         uplink_jitter_depth: u16,
         uplink_recovered_pct: f32,
     },
+    /// Host shapes one member's fader in the broadcast mix (host to server);
+    /// the server relays accepted changes to every connected member so UIs
+    /// can mirror the state.
+    ///
+    /// Appended after Stats, same postcard append-safety rule: trailing
+    /// variants leave every existing variant's bytes unchanged.
+    BroadcastMixSet {
+        target: MemberId,
+        gain_db: f32,
+        pan: f32,
+        muted: bool,
+    },
+    /// Host to server: while enabled, the host hears the broadcast mix
+    /// instead of their personal mix. Trailing variant, as above.
+    BroadcastAudition {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -349,6 +366,32 @@ mod tests {
             text: "x".repeat(MAX_CHAT_LEN + 1),
         };
         assert!(a.send(big).is_err());
+    }
+
+    #[test]
+    fn broadcast_messages_round_trip() {
+        let msgs = [
+            ControlMsg::BroadcastMixSet {
+                target: MemberId(7),
+                gain_db: -6.5,
+                pan: 0.25,
+                muted: true,
+            },
+            ControlMsg::BroadcastAudition { enabled: true },
+        ];
+        // Bare postcard round trip of the payload encoding.
+        for m in &msgs {
+            let bytes = postcard::to_allocvec(m).unwrap();
+            let back: ControlMsg = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(&back, m);
+        }
+        // And through the reliable link.
+        let mut a = ControlLink::new();
+        let mut b = ControlLink::new();
+        for m in &msgs {
+            a.send(m.clone()).unwrap();
+        }
+        assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
     }
 
     #[test]

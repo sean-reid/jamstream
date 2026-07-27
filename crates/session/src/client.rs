@@ -101,6 +101,14 @@ pub enum ClientEvent {
     RttSample {
         ms: f32,
     },
+    /// The host changed one member's broadcast fader; the server relays it
+    /// to everyone so UIs can mirror broadcast mix state.
+    BroadcastMixChanged {
+        target: MemberId,
+        gain_db: f32,
+        pan: f32,
+        muted: bool,
+    },
     Ejected {
         reason: String,
     },
@@ -578,6 +586,39 @@ impl ClientCore {
         Ok(())
     }
 
+    /// Host-only server-side; shapes one member's fader in the broadcast
+    /// mix. Sent regardless of our member id: enforcement is the server's.
+    pub fn set_broadcast_fader(
+        &mut self,
+        target: MemberId,
+        gain_db: f32,
+        pan: f32,
+        muted: bool,
+    ) -> Result<(), SessionError> {
+        self.require_joined()?;
+        if !gain_db.is_finite() || !(-96.0..=24.0).contains(&gain_db) {
+            return Err(SessionError::InvalidParam("gain_db out of range"));
+        }
+        if !pan.is_finite() || !(-1.0..=1.0).contains(&pan) {
+            return Err(SessionError::InvalidParam("pan out of range"));
+        }
+        self.link.send(ControlMsg::BroadcastMixSet {
+            target,
+            gain_db,
+            pan,
+            muted,
+        })?;
+        Ok(())
+    }
+
+    /// Host-only server-side; while enabled the host's downlink carries the
+    /// broadcast mix (own signal included) instead of the personal mix.
+    pub fn set_broadcast_audition(&mut self, enabled: bool) -> Result<(), SessionError> {
+        self.require_joined()?;
+        self.link.send(ControlMsg::BroadcastAudition { enabled })?;
+        Ok(())
+    }
+
     /// Host-only server-side; the server ignores it from anyone else.
     pub fn set_metronome(
         &mut self,
@@ -683,9 +724,21 @@ impl ClientCore {
                 };
                 self.events.push(ClientEvent::Ejected { reason });
             }
+            ControlMsg::BroadcastMixSet {
+                target,
+                gain_db,
+                pan,
+                muted,
+            } => self.events.push(ClientEvent::BroadcastMixChanged {
+                target,
+                gain_db,
+                pan,
+                muted,
+            }),
             // The server never sends these; ignore.
             ControlMsg::MixerSet { .. }
             | ControlMsg::ClickEnable { .. }
+            | ControlMsg::BroadcastAudition { .. }
             | ControlMsg::Revoke { .. } => {}
         }
     }
@@ -751,6 +804,14 @@ mod tests {
         assert!(matches!(core.send_chat("hi"), Err(SessionError::NotJoined)));
         assert!(matches!(
             core.set_fader(MemberId(2), 0.0, 0.0, false),
+            Err(SessionError::NotJoined)
+        ));
+        assert!(matches!(
+            core.set_broadcast_fader(MemberId(2), 0.0, 0.0, false),
+            Err(SessionError::NotJoined)
+        ));
+        assert!(matches!(
+            core.set_broadcast_audition(true),
             Err(SessionError::NotJoined)
         ));
         assert!(matches!(core.leave("bye"), Err(SessionError::NotJoined)));

@@ -15,6 +15,12 @@
 # that cannot fit the budget lives in nightly.yml, which has none.
 name: ci
 
+# A newer push supersedes any still-running ci for the same ref; finishing
+# a stale run is pure runner burn.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main]
@@ -118,8 +124,12 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      # jamstream-harness is also excluded: its gates assert wall-clock
+      # budgets, which instrumentation invalidates by design, and its
+      # coverage contribution is redundant with the direct suites the
+      # floors below measure.
       - name: Workspace coverage (lcov)
-        run: cargo llvm-cov --workspace --exclude jamstream-client --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --exclude jamstream-client --exclude jamstream-harness --lcov --output-path lcov.info
       - name: Coverage summary
         run: |
           {

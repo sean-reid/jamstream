@@ -283,6 +283,31 @@ fn tail_rms(h: &Harness, i: usize, samples: usize) -> f32 {
     rms(&p[p.len().saturating_sub(samples)..])
 }
 
+/// Goertzel amplitude of one tone in an interleaved stereo window,
+/// mono-summed. A center-panned sine pushed at amplitude a reads ~a * 0.71
+/// (the constant-power pan weight); absent tones read near zero, so a 0.1
+/// present / 0.02 absent split discriminates cleanly.
+fn tone_amp(stereo: &[f32], hz: f32) -> f32 {
+    let n = stereo.len() / 2;
+    assert!(n > 0, "empty tone window");
+    let w = std::f32::consts::TAU * hz / 48_000.0;
+    let coeff = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for pair in stereo.chunks_exact(2) {
+        let x = 0.5 * (pair[0] + pair[1]);
+        let s0 = x + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
+    2.0 * power.sqrt() / n as f32
+}
+
+fn tail_tone(h: &Harness, i: usize, samples: usize, hz: f32) -> f32 {
+    let p = &h.clients[i].playout;
+    tone_amp(&p[p.len().saturating_sub(samples)..], hz)
+}
+
 /// A protocol-level member driven directly, bypassing ClientCore, for
 /// crafting traffic an honest client cannot produce.
 struct RawMember {
@@ -585,6 +610,194 @@ fn listener_receives_broadcast_and_cannot_send_media() {
             what: "media from listener"
         }
     )));
+}
+
+#[test]
+fn broadcast_fader_mute_reaches_listeners_not_monitors() {
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_c = h.mint(2, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    let host = h.add_client(&inv_host, Some(440.0));
+    h.add_client(&inv_b, Some(660.0));
+    let c = h.add_client(&inv_c, Some(0.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(2_000);
+
+    let win = 48_000; // last 0.5 s
+    assert!(
+        tail_tone(&h, l, win, 440.0) > 0.1 && tail_tone(&h, l, win, 660.0) > 0.1,
+        "listener should hear both tones before the mute: 440 {} 660 {}",
+        tail_tone(&h, l, win, 440.0),
+        tail_tone(&h, l, win, 660.0)
+    );
+
+    h.clients[host]
+        .core
+        .set_broadcast_fader(MemberId(1), 0.0, 0.0, true)
+        .unwrap();
+    h.run_ms(250); // propagate
+    h.clear_playouts();
+    h.run_ms(1_000);
+
+    // The listener lost B's tone and kept the host's.
+    assert!(
+        tail_tone(&h, l, win, 440.0) > 0.1,
+        "host tone gone from broadcast: {}",
+        tail_tone(&h, l, win, 440.0)
+    );
+    assert!(
+        tail_tone(&h, l, win, 660.0) < 0.02,
+        "B still audible in broadcast: {}",
+        tail_tone(&h, l, win, 660.0)
+    );
+    // Personal mixes are untouched: C and the host still monitor B.
+    assert!(
+        tail_tone(&h, c, win, 660.0) > 0.1,
+        "broadcast mute leaked into C's monitor: {}",
+        tail_tone(&h, c, win, 660.0)
+    );
+    assert!(
+        tail_tone(&h, host, win, 660.0) > 0.1,
+        "broadcast mute leaked into the host's monitor: {}",
+        tail_tone(&h, host, win, 660.0)
+    );
+}
+
+#[test]
+fn non_host_broadcast_controls_are_violations() {
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    let host = h.add_client(&inv_host, Some(440.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(2_000);
+
+    // B tries to mute the host in the broadcast and to audition it.
+    h.clients[b]
+        .core
+        .set_broadcast_fader(MemberId(0), 0.0, 0.0, true)
+        .unwrap();
+    h.clients[b].core.set_broadcast_audition(true).unwrap();
+    h.run_ms(250);
+
+    for what in [
+        "broadcast mix set by non-host",
+        "broadcast audition by non-host",
+    ] {
+        assert!(
+            h.server_events.iter().any(|e| matches!(
+                e,
+                ServerEvent::ProtocolViolation { id: MemberId(1), what: w } if *w == what
+            )),
+            "missing violation: {what}"
+        );
+    }
+    // Nothing was relayed.
+    for i in [host, b, l] {
+        assert!(
+            h.clients[i]
+                .events
+                .iter()
+                .all(|e| !matches!(e, ClientEvent::BroadcastMixChanged { .. })),
+            "client {i} received a relay for a refused change"
+        );
+    }
+
+    // And nothing changed: the listener still hears the tone B tried to
+    // mute, and the host still gets a minus-self personal mix.
+    h.clear_playouts();
+    h.run_ms(1_000);
+    let win = 48_000;
+    assert!(
+        tail_tone(&h, l, win, 440.0) > 0.1,
+        "non-host mute took effect: {}",
+        tail_tone(&h, l, win, 440.0)
+    );
+    assert!(
+        tail_tone(&h, host, win, 440.0) < 0.02,
+        "non-host audition took effect: {}",
+        tail_tone(&h, host, win, 440.0)
+    );
+}
+
+#[test]
+fn audition_swaps_host_playout_to_broadcast_and_back() {
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let host = h.add_client(&inv_host, Some(440.0));
+    h.add_client(&inv_b, Some(660.0));
+    h.run_ms(1_000);
+
+    let win = 48_000;
+    // Personal mix: minus-self, so B's tone only.
+    assert!(tail_tone(&h, host, win, 660.0) > 0.1);
+    assert!(tail_tone(&h, host, win, 440.0) < 0.02);
+
+    h.clients[host].core.set_broadcast_audition(true).unwrap();
+    h.run_ms(250);
+    h.clear_playouts();
+    h.run_ms(1_000);
+    // The broadcast mix includes the host's own signal; hearing what the
+    // stream hears is the point of auditioning.
+    assert!(
+        tail_tone(&h, host, win, 440.0) > 0.1,
+        "audition should carry the host's own tone: {}",
+        tail_tone(&h, host, win, 440.0)
+    );
+    assert!(
+        tail_tone(&h, host, win, 660.0) > 0.1,
+        "audition should still carry B's tone: {}",
+        tail_tone(&h, host, win, 660.0)
+    );
+
+    h.clients[host].core.set_broadcast_audition(false).unwrap();
+    // Bounded settle: control delivery plus the host's jitter buffer
+    // draining the last auditioned frames.
+    h.run_ms(250);
+    h.clear_playouts();
+    h.run_ms(1_000);
+    assert!(
+        tail_tone(&h, host, win, 440.0) < 0.02,
+        "minus-self not restored after audition off: {}",
+        tail_tone(&h, host, win, 440.0)
+    );
+    assert!(tail_tone(&h, host, win, 660.0) > 0.1);
+}
+
+#[test]
+fn broadcast_fader_changes_relay_to_all_members() {
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    let host = h.add_client(&inv_host, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(500);
+
+    h.clients[host]
+        .core
+        .set_broadcast_fader(MemberId(1), -6.0, 0.25, false)
+        .unwrap();
+    h.run_ms(250);
+    let expected = ClientEvent::BroadcastMixChanged {
+        target: MemberId(1),
+        gain_db: -6.0,
+        pan: 0.25,
+        muted: false,
+    };
+    for i in [host, b, l] {
+        assert!(
+            h.clients[i].events.contains(&expected),
+            "client {i} missed the broadcast mix relay: {:?}",
+            h.clients[i].events
+        );
+    }
 }
 
 #[test]

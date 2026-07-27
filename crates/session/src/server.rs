@@ -129,6 +129,12 @@ pub struct ServerCore {
     /// 20 ms broadcast accumulator.
     bcast_accum: Vec<f32>,
     bcast_clock: u64,
+    /// Host-set broadcast faders; absent members mix at unity.
+    bcast_faders: BTreeMap<MemberId, Fader>,
+    /// While set, the host's downlink carries the broadcast mix instead of
+    /// their personal mix. Connection-scoped: cleared whenever the host
+    /// disconnects or is readmitted.
+    audition: bool,
     reject_last: BTreeMap<SocketAddr, u64>,
     events: Vec<ServerEvent>,
     last_musician_count: usize,
@@ -154,6 +160,8 @@ impl ServerCore {
             decoded: Vec::new(),
             bcast_accum: vec![0.0; BCAST_LEN],
             bcast_clock: 0,
+            bcast_faders: BTreeMap::new(),
+            audition: false,
             reject_last: BTreeMap::new(),
             events: Vec::new(),
             last_musician_count: 0,
@@ -225,27 +233,65 @@ impl ServerCore {
             self.metronome.render(clock, &mut click, CLICK_GAIN);
         }
 
-        // Personal stereo mixes, each excluding its own member and shaped by
-        // that member's fader table.
         let sources: Vec<(MemberId, &[f32])> =
             self.decoded.iter().map(|(id, b)| (*id, &b[..])).collect();
+
+        // Broadcast mix first: everyone through the host-set broadcast
+        // faders (unity default) and the brickwall limiter, straight into
+        // this tick's slot of the 20 ms accumulator. It runs before the
+        // personal pass so an auditioning host can be fed the identical
+        // post-limiter signal.
+        let idx = (self.tick_count % BCAST_TICKS) as usize;
+        if idx == 0 {
+            self.bcast_clock = clock;
+        }
+        {
+            let faders = &self.bcast_faders;
+            let slot = &mut self.bcast_accum[idx * MIX_LEN..(idx + 1) * MIX_LEN];
+            mix_into(
+                &sources,
+                |t| faders.get(&t).copied().unwrap_or_default(),
+                None,
+                slot,
+            );
+            self.limiter.process(slot);
+        }
+
+        // Personal stereo mixes, each excluding its own member and shaped by
+        // that member's fader table. An auditioning host instead gets this
+        // tick's broadcast slice: the exact post-limiter stereo signal
+        // listeners get, the host's own signal included, because hearing
+        // what the stream hears is the point of auditioning. It still rides
+        // the host's Ms2_5 musician encoder, so latency and cadence stay
+        // musician-grade. No click either: listeners never hear it.
+        let audition_pcm: Option<&[f32]> = if self.audition {
+            Some(&self.bcast_accum[idx * MIX_LEN..(idx + 1) * MIX_LEN])
+        } else {
+            None
+        };
         for (&id, m) in self.members.iter_mut() {
             if !m.connected || m.role != Role::Musician {
                 continue;
             }
-            mix_into(
-                &sources,
-                |t| m.faders.get(&t).copied().unwrap_or_default(),
-                Some(id),
-                &mut self.mix_buf,
-            );
-            if self.metronome_enabled && m.click_enabled {
-                for (pair, &c) in self.mix_buf.chunks_exact_mut(2).zip(click.iter()) {
-                    pair[0] += c;
-                    pair[1] += c;
+            let pcm: &[f32] = match audition_pcm {
+                Some(b) if id == HOST_MEMBER_ID => b,
+                _ => {
+                    mix_into(
+                        &sources,
+                        |t| m.faders.get(&t).copied().unwrap_or_default(),
+                        Some(id),
+                        &mut self.mix_buf,
+                    );
+                    if self.metronome_enabled && m.click_enabled {
+                        for (pair, &c) in self.mix_buf.chunks_exact_mut(2).zip(click.iter()) {
+                            pair[0] += c;
+                            pair[1] += c;
+                        }
+                    }
+                    &self.mix_buf
                 }
-            }
-            if m.encoder.encode(&self.mix_buf, &mut self.pkt_buf).is_ok() {
+            };
+            if m.encoder.encode(pcm, &mut self.pkt_buf).is_ok() {
                 let frame = MediaFrame {
                     seq: m.send_seq,
                     timestamp: clock,
@@ -264,15 +310,8 @@ impl ServerCore {
             }
         }
 
-        // Broadcast mix: everyone, default faders (BroadcastMixSet is post-v1),
-        // through the limiter, accumulated into a 20 ms frame.
-        mix_into(&sources, |_| Fader::default(), None, &mut self.mix_buf);
-        self.limiter.process(&mut self.mix_buf);
-        let idx = (self.tick_count % BCAST_TICKS) as usize;
-        if idx == 0 {
-            self.bcast_clock = clock;
-        }
-        self.bcast_accum[idx * MIX_LEN..(idx + 1) * MIX_LEN].copy_from_slice(&self.mix_buf);
+        // The accumulator holds a full 20 ms broadcast frame: encode it for
+        // the listeners.
         if idx as u64 == BCAST_TICKS - 1 {
             for (&id, m) in self.members.iter_mut() {
                 if !m.connected || m.role != Role::Listener {
@@ -360,6 +399,9 @@ impl ServerCore {
         }
         if !timed_out.is_empty() {
             for id in timed_out {
+                if id == HOST_MEMBER_ID {
+                    self.audition = false;
+                }
                 self.events.push(ServerEvent::MemberDisconnected { id });
             }
             self.queue_roster();
@@ -531,7 +573,11 @@ impl ServerCore {
             .clone()
             .unwrap_or_else(|| format!("member {}", id.0));
         // A rejoin keeps the member's mixer state; everything stream-scoped
-        // starts fresh with the new transport.
+        // starts fresh with the new transport. Audition never survives a
+        // (re)join: the host comes back on their personal mix.
+        if id == HOST_MEMBER_ID {
+            self.audition = false;
+        }
         let prev = self.members.remove(&id);
         let (faders, click_enabled) =
             prev.map_or((BTreeMap::new(), true), |p| (p.faders, p.click_enabled));
@@ -707,6 +753,48 @@ impl ServerCore {
                     m.click_enabled = enabled;
                 }
             }
+            ControlMsg::BroadcastMixSet {
+                target,
+                gain_db,
+                pan,
+                muted,
+            } => {
+                if from != HOST_MEMBER_ID {
+                    self.violation(from, "broadcast mix set by non-host");
+                    return;
+                }
+                if !gain_db.is_finite() || !pan.is_finite() {
+                    self.violation(from, "non-finite fader");
+                    return;
+                }
+                let gain_db = gain_db.clamp(-96.0, 24.0);
+                let pan = pan.clamp(-1.0, 1.0);
+                self.bcast_faders.insert(
+                    target,
+                    Fader {
+                        gain_db,
+                        pan,
+                        muted,
+                    },
+                );
+                // Relay the accepted (clamped) values so UIs can mirror.
+                let relay = ControlMsg::BroadcastMixSet {
+                    target,
+                    gain_db,
+                    pan,
+                    muted,
+                };
+                for m in self.members.values_mut().filter(|m| m.connected) {
+                    let _ = m.link.send(relay.clone());
+                }
+            }
+            ControlMsg::BroadcastAudition { enabled } => {
+                if from != HOST_MEMBER_ID {
+                    self.violation(from, "broadcast audition by non-host");
+                    return;
+                }
+                self.audition = enabled;
+            }
             ControlMsg::Ping { nonce, sent_ms } => {
                 if let Some(m) = self.members.get_mut(&from) {
                     let _ = m.link.send(ControlMsg::Pong { nonce, sent_ms });
@@ -746,6 +834,9 @@ impl ServerCore {
                             }
                         }
                     }
+                    if id == HOST_MEMBER_ID {
+                        self.audition = false;
+                    }
                     self.members.remove(&id);
                     self.events.push(ServerEvent::MemberRevoked { id });
                     self.queue_roster();
@@ -760,6 +851,9 @@ impl ServerCore {
                     m.addr = None;
                     m.session = None;
                     m.resp_cache = None;
+                    if from == HOST_MEMBER_ID {
+                        self.audition = false;
+                    }
                     self.events
                         .push(ServerEvent::MemberDisconnected { id: from });
                     self.queue_roster();
