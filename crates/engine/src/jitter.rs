@@ -15,6 +15,21 @@ const SHRINK_PATIENCE: u32 = 16;
 const RESET_JUMP: i64 = 512;
 const LOSS_WINDOW: usize = 256;
 const MAX_BUFFERED: usize = 64;
+/// Consecutive stuck ticks (a concealed pull with nothing playable while
+/// packets keep being dropped as late) before the buffer re-anchors.
+///
+/// Derivation, at 2.5 ms per tick. The lower bound is set by the largest
+/// transient that legitimately looks like this and heals itself: playout is
+/// covered for at most `MAX_TARGET` = 24 frames of buffered audio, and a
+/// reorder spike can strand arrivals for the depth of the reorder window (a
+/// hostile-wifi 20 ms spike is 8 frames), so ~32 ticks bounds any honest
+/// transient; 60 leaves nearly 2x margin, and it is 60x the one-frame reach
+/// of the resurrect path, which must keep owning single-frame overruns. The
+/// upper bound is the healing deadline: 60 ticks of detection (150 ms) plus a
+/// refill of `target` frames (<= 24 frames = 60 ms) is at most ~210 ms of
+/// concealment, well inside a second and inside the 250 ms audio-continuity
+/// gate the harness holds the media path to.
+const REANCHOR_PATIENCE: u32 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPacket {
@@ -49,6 +64,12 @@ pub struct JitterStats {
     /// Pulls that consumed a slot (Frame, Recovered, or Missing; Waiting and
     /// growth holds excluded). Denominator for loss deltas over a window.
     pub pulled: u64,
+    /// Times the buffer gave up on a playout position it could not reconcile
+    /// with the arriving stream (see `REANCHOR_PATIENCE`) and re-anchored on
+    /// the newest arrivals, exactly as it does for a stream restart. Each one
+    /// costs the concealment already counted in `lost` plus a refill; a
+    /// healthy session never re-anchors.
+    pub reanchors: u64,
 }
 
 #[derive(Debug, Default)]
@@ -68,9 +89,18 @@ pub struct JitterBuffer {
     late: u64,
     resurrected: u64,
     pulled: u64,
+    reanchors: u64,
     /// Seq the most recent pull concealed (Missing with nothing usable).
     /// While set, `next_seq == concealed + 1`; delivering any frame clears it.
     concealed: Option<u32>,
+    /// A packet was dropped without ever playing since the last pull, either
+    /// as late (seq already behind playout) or evicted from a full buffer.
+    /// Both are `late` in the stats and both mean the arriving stream and the
+    /// playout position disagree.
+    dropped_since_pull: bool,
+    /// Consecutive stuck ticks: pulls that concealed with nothing playable
+    /// while `dropped_since_pull` was set. Any delivery clears it.
+    stuck_ticks: u32,
     loss_window: VecDeque<bool>,
 }
 
@@ -115,6 +145,7 @@ impl JitterBuffer {
                 return;
             }
             self.late += 1;
+            self.dropped_since_pull = true;
             return;
         }
         if let Some(red) = packet.redundant {
@@ -127,6 +158,7 @@ impl JitterBuffer {
         while self.frames.len() > MAX_BUFFERED {
             self.frames.pop_first();
             self.late += 1;
+            self.dropped_since_pull = true;
         }
     }
 
@@ -197,6 +229,32 @@ impl JitterBuffer {
         } else {
             self.over_ticks = 0;
         }
+
+        // Re-anchor watchdog. Between the resurrect path (which steps back
+        // exactly one frame) and RESET_JUMP (which treats a discontinuity
+        // over 512 frames as a restart) sits a hole: a persistent offset of
+        // 2..512 frames between the playout position and the arriving stream.
+        // Every packet is then dropped without ever playing - as late when
+        // the consumer overran the producer, as an eviction from a full
+        // buffer when it fell behind by more than MAX_BUFFERED - while every
+        // pull conceals, forever. The signature is exactly that: a concealed
+        // pull with nothing playable, on a tick that dropped a packet. Held
+        // past REANCHOR_PATIENCE it cannot be reordering or a brief stall, so
+        // treat it as a stream restart and re-anchor on the newest arrivals.
+        let stuck = matches!(result, Pull::Missing) && self.dropped_since_pull;
+        self.dropped_since_pull = false;
+        if stuck {
+            self.stuck_ticks += 1;
+            if self.stuck_ticks >= REANCHOR_PATIENCE {
+                // `reset` clears the counter, so this fires once per stuck
+                // episode: with no anchor nothing can be late, and the next
+                // pulls refill to target before playing again.
+                self.reset();
+                self.reanchors += 1;
+            }
+        } else {
+            self.stuck_ticks = 0;
+        }
         result
     }
 
@@ -210,6 +268,7 @@ impl JitterBuffer {
             late: self.late,
             resurrected: self.resurrected,
             pulled: self.pulled,
+            reanchors: self.reanchors,
         }
     }
 
@@ -237,6 +296,10 @@ impl JitterBuffer {
         }
     }
 
+    /// Drops the stream's anchor and all buffered audio: the next `target`
+    /// arrivals re-anchor playout. Idempotent, and the only state it touches
+    /// is anchor state - the counters and the jitter estimate carry over, so
+    /// `lost`, `late`, and `pulled` keep their meanings across it.
     fn reset(&mut self) {
         self.frames.clear();
         self.redundant.clear();
@@ -247,6 +310,8 @@ impl JitterBuffer {
         self.held_last = false;
         self.drop_pending = false;
         self.concealed = None;
+        self.dropped_since_pull = false;
+        self.stuck_ticks = 0;
     }
 }
 
@@ -265,6 +330,10 @@ mod tests {
 
     fn payload_for(seq: u32) -> Vec<u8> {
         seq.to_le_bytes().to_vec()
+    }
+
+    fn seq_of(payload: &[u8]) -> u32 {
+        u32::from_le_bytes(payload.try_into().expect("4-byte test payload"))
     }
 
     /// Pulls through any growth-hold concealment ticks (late arrivals
@@ -596,5 +665,321 @@ mod tests {
         assert_eq!(stats.late, 1);
         assert_eq!(stats.pulled, 5);
         assert!(jb.loss_ratio_recent() > 0.0);
+    }
+
+    /// A buffer whose consumer has overrun its producer by `offset` frames:
+    /// 20 ticks in lockstep, then `offset` ticks where the far end's capture
+    /// driver produced nothing (the buffer conceals and playout walks on),
+    /// leaving the sender permanently `offset` frames behind the playout
+    /// position with contiguous sequence numbers. Returns the buffer and the
+    /// next seq the sender will use.
+    fn overrun_by(offset: u32) -> (JitterBuffer, u32) {
+        let mut jb = JitterBuffer::new();
+        let mut seq = 0u32;
+        for _ in 0..20 {
+            jb.push(packet(seq, None));
+            assert_eq!(jb.pull(), Pull::Frame(payload_for(seq)));
+            seq += 1;
+        }
+        for _ in 0..offset {
+            assert_eq!(jb.pull(), Pull::Missing);
+        }
+        // The stall alone is honest concealment, not a reason to re-anchor.
+        assert_eq!(jb.stats().reanchors, 0);
+        (jb, seq)
+    }
+
+    /// Playout must never go backwards, and after a re-anchor it must be
+    /// essentially gapless: the only frames a healthy re-anchored stream
+    /// skips are the shrink path's, one per surplus episode while the jitter
+    /// estimate the stall inflated decays back.
+    fn assert_playout_forward(case: &str, played: &[u32]) {
+        assert!(!played.is_empty(), "{case}: nothing played");
+        for pair in played.windows(2) {
+            assert!(pair[1] > pair[0], "{case}: playout went backwards {pair:?}");
+        }
+        let span = (played[played.len() - 1] - played[0] + 1) as usize;
+        let skipped = span - played.len();
+        assert!(
+            skipped <= 2,
+            "{case}: {skipped} frames skipped after recovery (shrink allows at most 2)"
+        );
+    }
+
+    /// Runs a persistent `offset`-frame overrun to its conclusion: one push
+    /// and one pull per tick, sequence numbers contiguous. Before the
+    /// re-anchor policy this state was permanent - every packet late, `late`
+    /// climbing one per tick, depth pinned at 0, playout concealed for the
+    /// rest of the session. Now it must heal inside the patience window and
+    /// stay healed.
+    fn assert_heals_from_overrun(offset: u32) {
+        let (mut jb, mut seq) = overrun_by(offset);
+        let late_before = jb.stats().late;
+        let mut first_frame_tick = None;
+        let mut played = Vec::new();
+        let mut late_at_first_frame = 0;
+        for tick in 1..=600u32 {
+            jb.push(packet(seq, None));
+            seq += 1;
+            match jb.pull() {
+                Pull::Frame(p) => {
+                    if first_frame_tick.is_none() {
+                        first_frame_tick = Some(tick);
+                        late_at_first_frame = jb.stats().late;
+                    }
+                    played.push(seq_of(&p));
+                }
+                Pull::Missing | Pull::Waiting => {}
+                other => panic!("offset {offset}, tick {tick}: unexpected {other:?}"),
+            }
+        }
+        let stats = jb.stats();
+        assert_eq!(
+            stats.reanchors, 1,
+            "offset {offset}: expected exactly one re-anchor, got {stats:?}"
+        );
+        // Nothing resurrected: the overrun is out of that path's one-frame
+        // reach, so the re-anchor is what healed it.
+        assert_eq!(stats.resurrected, 0, "offset {offset}: {stats:?}");
+
+        // Healing is bounded: patience ticks of detection plus a refill of at
+        // most MAX_TARGET frames, i.e. at most 210 ms, inside a second.
+        let at = first_frame_tick.unwrap_or_else(|| panic!("offset {offset}: never recovered"));
+        assert!(
+            at > REANCHOR_PATIENCE / 2,
+            "offset {offset}: re-anchored after only {at} stuck ticks; \
+             ordinary reordering would trip it"
+        );
+        assert!(
+            at <= REANCHOR_PATIENCE + MAX_TARGET as u32,
+            "offset {offset}: took {at} ticks to recover (patience {REANCHOR_PATIENCE})"
+        );
+
+        // Delivery resumed and stayed up for the rest of the run.
+        assert!(
+            played.len() >= 500,
+            "offset {offset}: only {} frames played after recovery",
+            played.len()
+        );
+        assert_playout_forward(&format!("offset {offset}"), &played);
+
+        // `late` stopped climbing once playout re-anchored: the drops are
+        // confined to the detection window.
+        assert_eq!(
+            stats.late, late_at_first_frame,
+            "offset {offset}: late kept climbing after the re-anchor"
+        );
+        assert!(
+            stats.late - late_before <= u64::from(REANCHOR_PATIENCE) + 4,
+            "offset {offset}: {} late drops during recovery",
+            stats.late - late_before
+        );
+        assert!(stats.depth_frames <= MAX_BUFFERED, "offset {offset}");
+    }
+
+    // Five frames: the middle of the hole between the resurrect path and
+    // RESET_JUMP, the shape a partial capture-clock catch-up leaves behind.
+    #[test]
+    fn persistent_five_frame_overrun_reanchors() {
+        assert_heals_from_overrun(5);
+    }
+
+    // Two frames: one more than the resurrect path can step back.
+    #[test]
+    fn persistent_two_frame_overrun_reanchors() {
+        assert_heals_from_overrun(2);
+    }
+
+    // 500 frames: just under RESET_JUMP, so no discontinuity reset saves it.
+    #[test]
+    fn persistent_500_frame_overrun_reanchors() {
+        assert_heals_from_overrun(500);
+    }
+
+    // The mirror image inside the same hole: playout stalls (nothing pulled)
+    // long enough that the frames at the playout position are evicted from
+    // the full buffer, so afterwards every arrival is dropped by MAX_BUFFERED
+    // eviction, the playout position never catches the surviving window, and
+    // depth stays pinned at the cap. Same signature, same cure.
+    #[test]
+    fn playout_stall_past_max_buffered_reanchors() {
+        let mut jb = JitterBuffer::new();
+        let mut seq = 0u32;
+        for _ in 0..20 {
+            jb.push(packet(seq, None));
+            assert_eq!(jb.pull(), Pull::Frame(payload_for(seq)));
+            seq += 1;
+        }
+        // A frozen consumer: 200 frames arrive with nothing pulled, so the
+        // 64-frame cap throws away everything the playout position still
+        // wants. 200 stays under RESET_JUMP.
+        for _ in 0..200 {
+            jb.push(packet(seq, None));
+            seq += 1;
+        }
+        assert_eq!(jb.stats().depth_frames, MAX_BUFFERED);
+        assert_eq!(jb.stats().reanchors, 0);
+
+        let mut first_frame_tick = None;
+        let mut played = Vec::new();
+        for tick in 1..=400u32 {
+            jb.push(packet(seq, None));
+            seq += 1;
+            match jb.pull() {
+                Pull::Frame(p) => {
+                    first_frame_tick.get_or_insert(tick);
+                    played.push(seq_of(&p));
+                }
+                Pull::Missing | Pull::Waiting => {}
+                other => panic!("tick {tick}: unexpected {other:?}"),
+            }
+        }
+        let stats = jb.stats();
+        assert_eq!(stats.reanchors, 1, "{stats:?}");
+        let at = first_frame_tick.expect("never recovered from the playout stall");
+        // Patience, plus a refill to the target the stall's arrival pattern
+        // inflated (no pulls means no tick advance, which reads as jitter).
+        assert!(
+            at <= REANCHOR_PATIENCE + MAX_TARGET as u32,
+            "took {at} ticks to recover from a playout stall"
+        );
+        assert_playout_forward("playout stall", &played);
+        // Depth is back under control instead of pinned at the cap.
+        assert!(
+            stats.depth_frames <= stats.target_frames + 1,
+            "depth {} still above target {} + 1 after re-anchoring",
+            stats.depth_frames,
+            stats.target_frames
+        );
+    }
+
+    // Negative control: garden-variety 2% loss with reordering deep enough to
+    // strand packets behind playout. Late drops happen, concealment happens,
+    // but they never coincide for long, so the buffer must never re-anchor.
+    #[test]
+    fn ordinary_loss_and_reorder_never_reanchor() {
+        let mut jb = JitterBuffer::new();
+        let mut lcg = 0x2545_F491_4F6C_DD1Du64;
+        let mut draw = move || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+        // (arrival tick, seq) for packets held back by the network.
+        let mut delayed: Vec<(u32, u32)> = Vec::new();
+        let mut delivered = 0u32;
+        for tick in 0..5_000u32 {
+            let r = draw();
+            if r % 50 != 7 {
+                // 2% of packets never arrive; 5% arrive two or three ticks
+                // late, past their playout slot.
+                if r % 20 == 3 {
+                    delayed.push((tick + 2 + (r >> 5) % 2, tick));
+                } else {
+                    jb.push(packet(tick, Some(tick.wrapping_sub(1))));
+                }
+            }
+            delayed.retain(|&(at, seq)| {
+                if at > tick {
+                    return true;
+                }
+                jb.push(packet(seq, None));
+                false
+            });
+            if matches!(jb.pull(), Pull::Frame(_) | Pull::Recovered(_)) {
+                delivered += 1;
+            }
+        }
+        let stats = jb.stats();
+        assert_eq!(
+            stats.reanchors, 0,
+            "ordinary loss and reordering re-anchored the buffer: {stats:?}"
+        );
+        // The control is only meaningful if it actually exercised the
+        // signature's ingredients and kept a healthy stream running.
+        assert!(
+            stats.late > 0,
+            "no late drops in the control run: {stats:?}"
+        );
+        assert!(
+            stats.lost > 0,
+            "no concealment in the control run: {stats:?}"
+        );
+        assert!(
+            delivered >= 4_500,
+            "only {delivered} of 5000 ticks played audio; the control is not \
+             a healthy stream: {stats:?}"
+        );
+    }
+
+    // Negative control: a single concealed frame whose packet arrives one
+    // tick later is still the resurrect path's business, however long the
+    // pattern repeats. Re-anchoring here would throw away a frame of audio
+    // and a buffer refill for a one-frame slip.
+    #[test]
+    fn single_frame_overrun_still_resurrects() {
+        let (mut jb, mut seq) = overrun_by(1);
+        // The resurrect path steps playout back onto the arriving stream on
+        // the very next tick, so every tick from here on plays its own frame.
+        for tick in 0..400u32 {
+            let sending = seq;
+            jb.push(packet(sending, None));
+            seq += 1;
+            match jb.pull() {
+                Pull::Frame(p) => assert_eq!(seq_of(&p), sending, "tick {tick}"),
+                other => panic!("tick {tick}: unexpected {other:?}"),
+            }
+        }
+        let stats = jb.stats();
+        assert_eq!(stats.resurrected, 1, "{stats:?}");
+        assert_eq!(stats.reanchors, 0, "{stats:?}");
+        assert_eq!(stats.late, 0, "{stats:?}");
+        assert_eq!(stats.lost, 1, "{stats:?}");
+    }
+
+    // Negative control: an overrun past RESET_JUMP is a stream restart and
+    // must still be handled by the discontinuity reset, which re-anchors on
+    // the spot instead of waiting out the patience window.
+    #[test]
+    fn overrun_past_reset_jump_still_uses_reset_jump() {
+        let (mut jb, mut seq) = overrun_by(600);
+        jb.push(packet(seq, None));
+        seq += 1;
+        assert_eq!(jb.pull(), Pull::Frame(payload_for(seq - 1)));
+        for _ in 0..100 {
+            jb.push(packet(seq, None));
+            seq += 1;
+            assert_eq!(jb.pull(), Pull::Frame(payload_for(seq - 1)));
+        }
+        let stats = jb.stats();
+        assert_eq!(stats.reanchors, 0, "{stats:?}");
+        assert_eq!(stats.late, 0, "{stats:?}");
+    }
+
+    // The re-anchor is one event per episode, not a loop: a buffer that has
+    // just re-anchored has no anchor to be late against, so a second
+    // re-anchor can only follow a fresh stuck episode.
+    #[test]
+    fn reanchor_is_idempotent_across_two_episodes() {
+        let (mut jb, mut seq) = overrun_by(5);
+        for _ in 0..200 {
+            jb.push(packet(seq, None));
+            seq += 1;
+            jb.pull();
+        }
+        assert_eq!(jb.stats().reanchors, 1);
+        // A second stall of the same shape, once the stream is healthy again.
+        for _ in 0..5 {
+            jb.pull();
+        }
+        for _ in 0..200 {
+            jb.push(packet(seq, None));
+            seq += 1;
+            jb.pull();
+        }
+        let stats = jb.stats();
+        assert_eq!(stats.reanchors, 2, "{stats:?}");
+        assert!(stats.depth_frames <= MAX_BUFFERED);
     }
 }

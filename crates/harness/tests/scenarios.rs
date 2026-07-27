@@ -13,6 +13,7 @@
 
 use std::time::Instant;
 
+use jamstream_engine::JitterStats;
 use jamstream_harness::{ScenarioBuilder, Source, profiles};
 use jamstream_session::{ClientState, ServerEvent};
 
@@ -330,6 +331,191 @@ fn drift_200ppm_with_resampler() {
             "musician {i} longest silence {gap:.1} ms under steered 200 ppm drift (gate 250 ms)"
         );
     }
+}
+
+/// The server's jitter stats for one member id.
+fn member_jitter(s: &jamstream_harness::Scenario, id: u16) -> JitterStats {
+    s.server_member_stats()
+        .into_iter()
+        .find(|m| m.id.0 == id)
+        .unwrap_or_else(|| panic!("member {id} not on the server roster"))
+        .jitter
+}
+
+// The re-anchor gate: the real-world trigger for the jitter buffer's
+// re-anchor policy, end to end over the real cores.
+//
+// A client's audio driver freezes mid-session (a multi-second process stall
+// under load). While frozen it captures nothing - and those frames are gone,
+// not replayed - and asks for no playout, so two buffers come out of the
+// stall out of phase with the streams feeding them, both inside the hole the
+// buffer used to have no answer for (an offset of 2..512 frames: past the
+// resurrect path's one-frame reach, short of the 512-frame restart
+// threshold):
+//
+//   * the server's buffer for that member's uplink is `stall` frames ahead of
+//     the sequence numbers now arriving, which carried on contiguously across
+//     the gap, so every packet is late and the member is silent to everyone;
+//   * the client's own downlink buffer is `stall` frames behind the stream
+//     arriving into it, and the frames its playout position still wants were
+//     evicted from the full buffer long ago, so every pull conceals.
+//
+// Before the policy both states were permanent: `late` climbing one per tick
+// (~400/s), depth pinned, playout concealed for the rest of the session. Now
+// each must detect the stuck state and re-anchor inside a bounded window.
+// The second, longer stall checks the division of labour at the other edge:
+// past 512 frames the discontinuity reset still owns the recovery and no
+// re-anchor is needed.
+#[test]
+fn driver_stall_reanchors_and_audio_returns() {
+    // 400 ticks = 1 s of frozen driver, mid-hole. 1200 ticks = 3 s, past the
+    // 512-frame restart threshold.
+    const HOLE_STALL_TICKS: u64 = 400;
+    const BIG_STALL_TICKS: u64 = 1_200;
+    // 160 ticks = 400 ms. The engine's promise is 60 stuck ticks of detection
+    // (150 ms) plus a refill of at most 24 frames (60 ms), so ~210 ms; 400 ms
+    // is that with margin for the extra network legs, and nothing like
+    // "eventually".
+    const RECOVER_TICKS: u64 = 160;
+    // Each musician hears only the other one (the personal mix excludes its
+    // own signal): one 0.5-amp sine at ~0.707 center-pan gain is ~0.25 rms,
+    // so 0.1 is a 2.5x margin under the signal and 5x over concealment tails.
+    const AUDIO_GATE: f32 = 0.1;
+
+    let mut s = ScenarioBuilder::new(0xC3)
+        .profile(profiles::profile("regional-fiber"))
+        .musicians(2)
+        .source(
+            0,
+            Source::Sine {
+                hz: 440.0,
+                amp: 0.5,
+            },
+        )
+        .source(
+            1,
+            Source::Sine {
+                hz: 330.0,
+                amp: 0.5,
+            },
+        )
+        .keep_audio(false)
+        .build();
+    s.join_all_or_panic(4_000);
+    s.run_ms(2_000);
+
+    let base_from = s.current_tick();
+    s.run_ms(1_000);
+    let base_to = s.current_tick();
+    let baseline: Vec<f32> = (0..2).map(|i| s.rms_of(i, base_from, base_to)).collect();
+    for (i, &base) in baseline.iter().enumerate() {
+        assert!(
+            base > AUDIO_GATE,
+            "musician {i} rms {base:.4} before the stall (gate {AUDIO_GATE}); \
+             the scenario is not producing audio"
+        );
+    }
+
+    // --- Stall inside the hole.
+    s.set_driver_stalled(1, true);
+    s.run_ticks(HOLE_STALL_TICKS);
+    s.set_driver_stalled(1, false);
+    let resume = s.current_tick();
+
+    // The stall really did take member 1 off the air for member 0: the
+    // server's buffer for its uplink runs dry and conceals.
+    let during = s.rms_of(0, resume - HOLE_STALL_TICKS / 2, resume);
+    assert!(
+        during < AUDIO_GATE / 2.0,
+        "musician 0 rms {during:.4} during member 1's driver stall; \
+         the stall is not reproducing the trigger"
+    );
+
+    s.run_ticks(RECOVER_TICKS);
+    let healed_at = s.current_tick();
+    let uplink = member_jitter(&s, 1);
+    let downlink = s.client_jitter(1);
+    s.run_ms(1_000);
+    let after_to = s.current_tick();
+
+    println!(
+        "driver stall (1 s, mid-hole): server member 1 uplink {uplink:?}, \
+         client 1 downlink {downlink:?}"
+    );
+    // Both stuck buffers re-anchored, exactly once each, inside the window.
+    assert_eq!(
+        uplink.reanchors, 1,
+        "server's buffer for member 1 did not re-anchor within \
+         {RECOVER_TICKS} ticks of the stall ending: {uplink:?}"
+    );
+    assert_eq!(
+        downlink.reanchors, 1,
+        "client 1's own buffer did not re-anchor within {RECOVER_TICKS} ticks: {downlink:?}"
+    );
+    // And nothing else in the session was disturbed.
+    assert_eq!(member_jitter(&s, 0).reanchors, 0);
+    assert_eq!(s.client_jitter(0).reanchors, 0);
+
+    // Audio is back on both sides of the link, not merely trending up.
+    for (i, &base) in baseline.iter().enumerate() {
+        let rms = s.rms_of(i, healed_at, after_to);
+        assert!(
+            rms > AUDIO_GATE && rms > base / 2.0,
+            "musician {i} rms {rms:.4} in the second after recovery \
+             (gate {AUDIO_GATE}, baseline {base:.4})"
+        );
+    }
+
+    // The `late` counter stopped climbing: while stuck it grew one per tick,
+    // i.e. ~400 in the second just measured. regional-fiber has no
+    // reordering, so a handful of stragglers is all that is allowed.
+    let late_delta = member_jitter(&s, 1).late - uplink.late;
+    assert!(
+        late_delta <= 5,
+        "server's late count for member 1 climbed {late_delta} in the second \
+         after recovery (stuck would be ~400)"
+    );
+
+    // --- Stall past the restart threshold: RESET_JUMP's job, not the
+    // watchdog's.
+    let reanchors_before = (uplink.reanchors, downlink.reanchors);
+    s.set_driver_stalled(1, true);
+    s.run_ticks(BIG_STALL_TICKS);
+    s.set_driver_stalled(1, false);
+    s.run_ticks(RECOVER_TICKS);
+    let healed_at = s.current_tick();
+    s.run_ms(1_000);
+    let after_to = s.current_tick();
+
+    let uplink = member_jitter(&s, 1);
+    let downlink = s.client_jitter(1);
+    println!(
+        "driver stall (3 s, past RESET_JUMP): server member 1 uplink {uplink:?}, \
+         client 1 downlink {downlink:?}"
+    );
+    assert_eq!(
+        (uplink.reanchors, downlink.reanchors),
+        reanchors_before,
+        "a 3 s stall (offset past the {} frame restart threshold) should be \
+         healed by the discontinuity reset, not by a re-anchor",
+        512
+    );
+    for (i, &base) in baseline.iter().enumerate() {
+        let rms = s.rms_of(i, healed_at, after_to);
+        assert!(
+            rms > AUDIO_GATE && rms > base / 2.0,
+            "musician {i} rms {rms:.4} after the 3 s stall \
+             (gate {AUDIO_GATE}, baseline {base:.4})"
+        );
+    }
+    assert!(
+        !s.server_events().iter().any(|e| matches!(
+            e,
+            ServerEvent::MemberDisconnected { .. } | ServerEvent::MemberRevoked { .. }
+        )),
+        "a member dropped across the driver stalls: {:?}",
+        s.server_events()
+    );
 }
 
 // Six musicians with a seeded schedule of leaves, a garbage-stream client, a
