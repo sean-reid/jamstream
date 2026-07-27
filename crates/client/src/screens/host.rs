@@ -1444,10 +1444,12 @@ impl HostWizard {
             if self.pinned.is_some() {
                 // Release builds: the server download is pinned into the
                 // binary and verified by the machine at boot. One quiet
-                // factual line; no URL, no hash, nothing to interact with.
+                // factual line; no URL, no hash, nothing to interact with,
+                // and no version number, which would only put this build's
+                // number into a published screenshot.
                 ui.label(theme::muted(
                     ui,
-                    format!("Server {}, verified download.", env!("CARGO_PKG_VERSION")),
+                    "Pinned server binary, verified at download.",
                 ));
             } else {
                 // Development builds only: no pinned artifact exists, so
