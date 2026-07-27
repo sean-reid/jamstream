@@ -1,28 +1,15 @@
-//! Verifies that audio *content* survives a round trip through real hardware,
-//! which the callback-counting smoke test in `cpal_devices.rs` cannot show.
+//! Checks that audio content survives a round trip through real hardware. The
+//! smoke test in `cpal_devices.rs` counts callbacks, so it passes on a machine
+//! producing silence; only a frequency check catches a conversion that mangles
+//! amplitude or sign, a channel swap, or a NaN reaching the device.
 //!
-//! Ignored by default and skipped when no loopback device is present, because
-//! it needs a virtual device whose output feeds its own input: BlackHole on
-//! macOS, VB-CABLE on Windows, a PipeWire or PulseAudio null sink on Linux.
-//! Run it with
+//! Needs a device whose output feeds its own input, so it is ignored by default
+//! and skips when none is present: BlackHole on macOS, VB-CABLE on Windows, a
+//! null sink on Linux.
 //!
 //! ```text
 //! cargo test -p jamstream-audio-io --test hardware_loopback -- --ignored --nocapture
 //! ```
-//!
-//! A 440 Hz tone is generated on the test thread, encoded and decoded with the
-//! session's real Opus settings, pushed through the real `CallbackBridge`, and
-//! played to the loopback device. The same stream captures it back, and the
-//! captured samples are checked in the frequency domain. That covers the parts
-//! only real hardware exercises: the backend's sample format conversion, its
-//! channel layout handling, buffer size negotiation, and the two device
-//! threads driving the rings.
-//!
-//! Failures this catches that offline tests do not: a conversion that mangles
-//! amplitude or sign, a channel swap or interleave error, a negotiated buffer
-//! size the rings cannot keep up with, and non-finite samples reaching the
-//! device (which on Windows previously turned a NaN into full-scale positive,
-//! because `f32::min` returns the other operand on NaN).
 
 #![cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 
