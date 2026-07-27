@@ -1,0 +1,10 @@
+# scripts/render-icon.sh regenerates every size from jamstream.svg (the
+# source of record). Only the 512 png is committed: main.rs embeds it as
+# the window icon and the Linux tarball ships it. The other sizes are
+# intermediates.
+jamstream-16.png
+jamstream-32.png
+jamstream-64.png
+jamstream-128.png
+jamstream-256.png
+jamstream-1024.png
