@@ -7,6 +7,62 @@ use serde::{Deserialize, Serialize};
 /// session id; the sweeper keys off this and nothing else.
 pub const SESSION_TAG_KEY: &str = "jamstream-session";
 
+/// UDP port a session server listens on unless the host overrides it. The
+/// per-session firewall opens exactly this port, so the two have to agree:
+/// see `Provider::session_port`.
+pub const DEFAULT_SESSION_PORT: u16 = 43210;
+
+/// Everywhere, in the two address families. A musician dials in from an
+/// address nobody knows in advance, so the session port cannot be narrowed
+/// to anything smaller than this.
+pub const ANY_IPV4: &str = "0.0.0.0/0";
+pub const ANY_IPV6: &str = "::/0";
+
+/// One ingress permission a provider has open for a session, normalized
+/// across three unrelated APIs so the same assertions can be made about
+/// all of them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct IngressRule {
+    /// Lowercase protocol name as the provider reports it: `udp`, `tcp`,
+    /// `icmp`.
+    pub protocol: String,
+    /// Inclusive port range. Both ends are equal for a single port.
+    pub from_port: u16,
+    pub to_port: u16,
+    /// Source ranges, sorted, as CIDR strings.
+    pub cidrs: Vec<String>,
+}
+
+impl IngressRule {
+    /// The only rule a session needs: its UDP port, reachable from
+    /// anywhere. `cidrs` holds whichever families the provider's network
+    /// actually carries, so a v4-only instance gets one entry.
+    pub fn session_udp(port: u16, cidrs: Vec<String>) -> Self {
+        IngressRule {
+            protocol: "udp".to_owned(),
+            from_port: port,
+            to_port: port,
+            cidrs,
+        }
+    }
+
+    /// True when this is exactly one port and it is that port.
+    pub fn is_only_port(&self, port: u16) -> bool {
+        self.from_port == port && self.to_port == port
+    }
+
+    /// True when every source is an everywhere range. Narrowing the session
+    /// port would lock out musicians, so the check is that the sources are
+    /// these and not that they are small.
+    pub fn is_open_to_the_internet(&self) -> bool {
+        !self.cidrs.is_empty()
+            && self
+                .cidrs
+                .iter()
+                .all(|c| c == ANY_IPV4 || c == ANY_IPV6 || c == "::0/0")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
@@ -194,6 +250,47 @@ mod tests {
         let tags = vec![("name".to_owned(), "x".to_owned()), tag];
         assert_eq!(session_id_from_tags(&tags), Some("abc123"));
         assert_eq!(session_id_from_tags(&[]), None);
+    }
+
+    #[test]
+    fn session_rule_is_one_port_open_to_everyone() {
+        let rule = IngressRule::session_udp(
+            DEFAULT_SESSION_PORT,
+            vec![ANY_IPV4.to_owned(), ANY_IPV6.to_owned()],
+        );
+        assert_eq!(rule.protocol, "udp");
+        assert!(rule.is_only_port(43210));
+        assert!(!rule.is_only_port(43211));
+        assert!(rule.is_open_to_the_internet());
+    }
+
+    #[test]
+    fn a_port_range_is_not_one_port() {
+        let range = IngressRule {
+            protocol: "udp".to_owned(),
+            from_port: 0,
+            to_port: u16::MAX,
+            cidrs: vec![ANY_IPV4.to_owned()],
+        };
+        assert!(!range.is_only_port(43210));
+    }
+
+    #[test]
+    fn a_narrowed_source_is_not_open_to_the_internet() {
+        // A session narrowed to one address locks out every musician whose
+        // address nobody knew at launch.
+        let narrowed = IngressRule {
+            protocol: "udp".to_owned(),
+            from_port: 43210,
+            to_port: 43210,
+            cidrs: vec!["198.51.100.7/32".to_owned()],
+        };
+        assert!(!narrowed.is_open_to_the_internet());
+        let empty = IngressRule {
+            cidrs: Vec::new(),
+            ..narrowed
+        };
+        assert!(!empty.is_open_to_the_internet());
     }
 
     #[test]

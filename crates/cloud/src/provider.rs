@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::types::{Instance, LaunchSpec, Price, ProviderKind, Region, RegionId};
+use crate::types::{
+    DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Price, ProviderKind, Region, RegionId,
+};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ProviderError {
@@ -75,6 +77,32 @@ pub trait Provider: Send + Sync {
     /// Lists jamstream-tagged instances only. `session_tag` narrows to one
     /// session; `None` returns every jamstream-tagged instance.
     async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>>;
+
+    /// UDP port the session server will listen on, and so the only port
+    /// `launch` opens in the firewall it creates. It rides on the provider
+    /// rather than on `LaunchSpec` because the spec is also the local
+    /// provider's config channel; set it with each provider's
+    /// `with_session_port` when the host asks for something other than
+    /// [`DEFAULT_SESSION_PORT`].
+    fn session_port(&self) -> u16 {
+        DEFAULT_SESSION_PORT
+    }
+
+    /// Ingress the provider currently has open for `session`, empty when it
+    /// has none. This is how a caller, and the contract suite, can tell that
+    /// a launch opened exactly one port and a teardown closed it.
+    async fn session_ingress(&self, session: &str) -> Result<Vec<IngressRule>>;
+
+    /// Deletes the per-session firewalls that no longer have an instance
+    /// behind them, and returns their names. A live session's firewall is
+    /// never touched.
+    ///
+    /// Separate from `destroy` because AWS refuses to delete a security
+    /// group until the terminating instance's network interface is gone,
+    /// which takes longer than a teardown should block for. Callers run it
+    /// after `destroy` and the sweeper runs it on every launch, so a group
+    /// that was still attached the first time gets collected the next.
+    async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>>;
 
     /// Polls `probe` with capped exponential backoff until it returns true
     /// or the accumulated backoff exceeds `opts.total_timeout`. Elapsed time

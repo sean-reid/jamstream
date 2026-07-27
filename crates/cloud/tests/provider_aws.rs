@@ -37,6 +37,28 @@ fn error_body(code: &str, message: &str) -> String {
     )
 }
 
+/// Mounts the two calls a launch makes before RunInstances: the session's
+/// own security group, and the one port it opens. Tests that care about
+/// their shape assert on it themselves; the rest just need them answered.
+async fn mount_security_group(server: &MockServer, group_id: &str) {
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=CreateSecurityGroup"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<CreateSecurityGroupResponse><groupId>{group_id}</groupId>\
+             <return>true</return></CreateSecurityGroupResponse>"
+        )))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=AuthorizeSecurityGroupIngress"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<AuthorizeSecurityGroupIngressResponse><return>true</return>\
+             </AuthorizeSecurityGroupIngressResponse>",
+        ))
+        .mount(server)
+        .await;
+}
+
 /// Matches requests carrying a well-formed SigV4 authorization for the
 /// given region and service, signed with the test access key.
 struct SignedFor {
@@ -89,6 +111,13 @@ async fn run_instances_happy_path() {
         .and(body_string_contains(
             "InstanceInitiatedShutdownBehavior=terminate",
         ))
+        // The instance is in its own security group, not the VPC default,
+        // and its metadata service takes IMDSv2 tokens only.
+        .and(body_string_contains("SecurityGroupId.1=sg-jamstream"))
+        .and(body_string_contains("MetadataOptions.HttpTokens=required"))
+        .and(body_string_contains(
+            "MetadataOptions.HttpPutResponseHopLimit=1",
+        ))
         // base64("#cloud-config\n") with '=' percent-encoded.
         .and(body_string_contains("UserData=I2Nsb3VkLWNvbmZpZwo%3D"))
         .and(body_string_contains(
@@ -106,6 +135,8 @@ async fn run_instances_happy_path() {
         .expect(1)
         .mount(&server)
         .await;
+
+    mount_security_group(&server, "sg-jamstream").await;
 
     let p = provider(&server);
     let spec = LaunchSpec {
@@ -499,6 +530,8 @@ async fn launch_resolves_ami_via_ssm_get_parameter() {
         .mount(&server)
         .await;
 
+    mount_security_group(&server, "sg-jamstream").await;
+
     let p = provider(&server);
     let inst = p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
     assert_eq!(inst.id, "i-fromssm");
@@ -521,6 +554,8 @@ async fn launch_falls_back_to_bundled_ami_when_ssm_fails() {
         .expect(1)
         .mount(&server)
         .await;
+
+    mount_security_group(&server, "sg-jamstream").await;
 
     let p = provider(&server);
     let inst = p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
@@ -545,6 +580,8 @@ async fn ssm_ami_resolution_is_cached_per_region() {
         .mount(&server)
         .await;
 
+    mount_security_group(&server, "sg-jamstream").await;
+
     let p = provider(&server);
     p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
     p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
@@ -559,13 +596,34 @@ struct FakeInstance {
     tags: Vec<(String, String)>,
 }
 
-/// A tiny stateful EC2 Query API: per-region instance store keyed by the
-/// `?region=...` query parameter the provider adds under base_url
-/// override. Just enough of RunInstances / TerminateInstances /
-/// DescribeInstances for the behavioral contract suite.
+/// One authorized permission, as the strings the Query API sends and the
+/// XML sends back.
+#[derive(Clone, PartialEq)]
+struct FakePermission {
+    protocol: String,
+    from_port: String,
+    to_port: String,
+    v4: Vec<String>,
+    v6: Vec<String>,
+}
+
+#[derive(Clone)]
+struct FakeGroup {
+    id: String,
+    name: String,
+    tags: Vec<(String, String)>,
+    ingress: Vec<FakePermission>,
+}
+
+/// A tiny stateful EC2 Query API: per-region instance and security group
+/// stores keyed by the `?region=...` query parameter the provider adds under
+/// a base_url override. Just enough of RunInstances, TerminateInstances,
+/// DescribeInstances, and the four security group calls for the behavioral
+/// contract suite.
 #[derive(Default)]
 struct FakeEc2 {
     state: Mutex<HashMap<String, Vec<FakeInstance>>>,
+    groups: Mutex<HashMap<String, Vec<FakeGroup>>>,
     next_id: AtomicU64,
 }
 
@@ -724,6 +782,207 @@ impl FakeEc2 {
     }
 }
 
+impl FakeEc2 {
+    fn create_security_group(
+        &self,
+        region: &str,
+        params: &HashMap<String, String>,
+    ) -> ResponseTemplate {
+        let Some(name) = params.get("GroupName") else {
+            return xml_error("MissingParameter", "GroupName is required");
+        };
+        if params.get("GroupDescription").is_none() {
+            return xml_error("MissingParameter", "GroupDescription is required");
+        }
+        let mut groups = self.groups.lock().unwrap();
+        let in_region = groups.entry(region.to_owned()).or_default();
+        if in_region.iter().any(|g| &g.name == name) {
+            return xml_error(
+                "InvalidGroup.Duplicate",
+                &format!("The security group '{name}' already exists"),
+            );
+        }
+        let mut tags = Vec::new();
+        let mut n = 1;
+        while let (Some(key), Some(value)) = (
+            params.get(&format!("TagSpecification.1.Tag.{n}.Key")),
+            params.get(&format!("TagSpecification.1.Tag.{n}.Value")),
+        ) {
+            tags.push((key.clone(), value.clone()));
+            n += 1;
+        }
+        let id = format!(
+            "sg-fake{:012x}",
+            self.next_id.fetch_add(1, Ordering::SeqCst)
+        );
+        in_region.push(FakeGroup {
+            id: id.clone(),
+            name: name.clone(),
+            tags,
+            ingress: Vec::new(),
+        });
+        ResponseTemplate::new(200).set_body_string(format!(
+            "<CreateSecurityGroupResponse><groupId>{id}</groupId>\
+             <return>true</return></CreateSecurityGroupResponse>"
+        ))
+    }
+
+    fn authorize_ingress(
+        &self,
+        region: &str,
+        params: &HashMap<String, String>,
+    ) -> ResponseTemplate {
+        let Some(group_id) = params.get("GroupId") else {
+            return xml_error("MissingParameter", "GroupId is required");
+        };
+        let mut groups = self.groups.lock().unwrap();
+        let Some(group) = groups
+            .get_mut(region)
+            .and_then(|gs| gs.iter_mut().find(|g| &g.id == group_id))
+        else {
+            return xml_error(
+                "InvalidGroup.NotFound",
+                &format!("The security group '{group_id}' does not exist"),
+            );
+        };
+        let get = |key: &str| params.get(key).cloned().unwrap_or_default();
+        let list = |key: &str| {
+            let mut out = Vec::new();
+            let mut n = 1;
+            while let Some(v) = params.get(&format!(
+                "IpPermissions.1.{key}.{n}.{key2}",
+                key2 = if key == "IpRanges" {
+                    "CidrIp"
+                } else {
+                    "CidrIpv6"
+                }
+            )) {
+                out.push(v.clone());
+                n += 1;
+            }
+            out
+        };
+        let rule = FakePermission {
+            protocol: get("IpPermissions.1.IpProtocol"),
+            from_port: get("IpPermissions.1.FromPort"),
+            to_port: get("IpPermissions.1.ToPort"),
+            v4: list("IpRanges"),
+            v6: list("Ipv6Ranges"),
+        };
+        if group.ingress.contains(&rule) {
+            return xml_error(
+                "InvalidPermission.Duplicate",
+                "the specified rule already exists",
+            );
+        }
+        group.ingress.push(rule);
+        ResponseTemplate::new(200).set_body_string(
+            "<AuthorizeSecurityGroupIngressResponse><return>true</return>\
+             </AuthorizeSecurityGroupIngressResponse>",
+        )
+    }
+
+    fn describe_security_groups(
+        &self,
+        region: &str,
+        params: &HashMap<String, String>,
+    ) -> ResponseTemplate {
+        let name_filter = (params.get("Filter.1.Name").map(String::as_str) == Some("group-name"))
+            .then(|| params.get("Filter.1.Value.1").cloned().unwrap_or_default());
+        let tag_key_filter = (params.get("Filter.1.Name").map(String::as_str) == Some("tag-key"))
+            .then(|| params.get("Filter.1.Value.1").cloned().unwrap_or_default());
+        let groups = self.groups.lock().unwrap();
+        let empty = Vec::new();
+        let mut items = String::new();
+        for group in groups.get(region).unwrap_or(&empty) {
+            if let Some(name) = &name_filter
+                && &group.name != name
+            {
+                continue;
+            }
+            if let Some(key) = &tag_key_filter
+                && !group.tags.iter().any(|(k, _)| k == key)
+            {
+                continue;
+            }
+            let permissions: String = group
+                .ingress
+                .iter()
+                .map(|rule| {
+                    let v4: String = rule
+                        .v4
+                        .iter()
+                        .map(|c| format!("<item><cidrIp>{c}</cidrIp></item>"))
+                        .collect();
+                    let v6: String = rule
+                        .v6
+                        .iter()
+                        .map(|c| format!("<item><cidrIpv6>{c}</cidrIpv6></item>"))
+                        .collect();
+                    format!(
+                        "<item><ipProtocol>{}</ipProtocol>\
+                         <fromPort>{}</fromPort><toPort>{}</toPort>\
+                         <ipRanges>{v4}</ipRanges><ipv6Ranges>{v6}</ipv6Ranges></item>",
+                        rule.protocol, rule.from_port, rule.to_port
+                    )
+                })
+                .collect();
+            let _ = write!(
+                items,
+                "<item><groupId>{}</groupId><groupName>{}</groupName>\
+                 <ipPermissions>{permissions}</ipPermissions>\
+                 <ipPermissionsEgress><item><ipProtocol>-1</ipProtocol>\
+                 <ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges>\
+                 </item></ipPermissionsEgress></item>",
+                group.id, group.name
+            );
+        }
+        ResponseTemplate::new(200).set_body_string(format!(
+            "<DescribeSecurityGroupsResponse><securityGroupInfo>{items}</securityGroupInfo>\
+             </DescribeSecurityGroupsResponse>"
+        ))
+    }
+
+    fn delete_security_group(
+        &self,
+        region: &str,
+        params: &HashMap<String, String>,
+    ) -> ResponseTemplate {
+        let Some(group_id) = params.get("GroupId") else {
+            return xml_error("MissingParameter", "GroupId is required");
+        };
+        let mut groups = self.groups.lock().unwrap();
+        let in_region = groups.entry(region.to_owned()).or_default();
+        let Some(index) = in_region.iter().position(|g| &g.id == group_id) else {
+            return xml_error(
+                "InvalidGroup.NotFound",
+                &format!("The security group '{group_id}' does not exist"),
+            );
+        };
+        // Real EC2 refuses while an instance still holds the group, which is
+        // what makes cleanup a retry rather than part of destroy.
+        let attached = self
+            .state
+            .lock()
+            .unwrap()
+            .get(region)
+            .is_some_and(|instances| {
+                instances.iter().any(|i| {
+                    i.tags.iter().any(|(k, v)| {
+                        k == "jamstream-session" && in_region[index].name.ends_with(v.as_str())
+                    })
+                })
+            });
+        if attached {
+            return xml_error("DependencyViolation", "resource sg has a dependent object");
+        }
+        in_region.remove(index);
+        ResponseTemplate::new(200).set_body_string(
+            "<DeleteSecurityGroupResponse><return>true</return></DeleteSecurityGroupResponse>",
+        )
+    }
+}
+
 impl Respond for FakeEc2 {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let region = request
@@ -738,6 +997,10 @@ impl Respond for FakeEc2 {
             Some("RunInstances") => self.run_instances(&region, &params),
             Some("TerminateInstances") => self.terminate_instances(&region, &params),
             Some("DescribeInstances") => self.describe_instances(&region, &params),
+            Some("CreateSecurityGroup") => self.create_security_group(&region, &params),
+            Some("AuthorizeSecurityGroupIngress") => self.authorize_ingress(&region, &params),
+            Some("DescribeSecurityGroups") => self.describe_security_groups(&region, &params),
+            Some("DeleteSecurityGroup") => self.delete_security_group(&region, &params),
             _ => xml_error("InvalidAction", "unsupported action"),
         }
     }
@@ -752,4 +1015,199 @@ async fn aws_provider_passes_the_generic_contract() {
         .await;
     let p = provider(&server);
     assert_provider_contract(&p).await;
+}
+
+// ---- Security groups ----
+
+#[tokio::test]
+async fn launch_creates_a_group_that_opens_one_udp_port_and_nothing_else() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(query_param("region", "us-east-1"))
+        .and(body_string_contains("Action=CreateSecurityGroup"))
+        .and(body_string_contains("GroupName=jamstream-sess1"))
+        .and(body_string_contains(
+            "GroupDescription=JamStream%20session%20sess1",
+        ))
+        .and(body_string_contains(
+            "TagSpecification.1.ResourceType=security-group",
+        ))
+        .and(body_string_contains(
+            "TagSpecification.1.Tag.1.Key=jamstream-session",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<CreateSecurityGroupResponse><groupId>sg-0new</groupId>\
+             </CreateSecurityGroupResponse>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=AuthorizeSecurityGroupIngress"))
+        .and(body_string_contains("GroupId=sg-0new"))
+        .and(body_string_contains("IpPermissions.1.IpProtocol=udp"))
+        .and(body_string_contains("IpPermissions.1.FromPort=45000"))
+        .and(body_string_contains("IpPermissions.1.ToPort=45000"))
+        .and(body_string_contains(
+            "IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0",
+        ))
+        .and(body_string_contains(
+            "IpPermissions.1.Ipv6Ranges.1.CidrIpv6=%3A%3A%2F0",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<AuthorizeSecurityGroupIngressResponse><return>true</return>\
+             </AuthorizeSecurityGroupIngressResponse>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=RunInstances"))
+        .and(body_string_contains("SecurityGroupId.1=sg-0new"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RUN_INSTANCES_XML))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server).with_session_port(45000);
+    assert_eq!(p.session_port(), 45000);
+    p.launch(launch_spec(&p, "us-east-1")).await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn launch_reuses_the_group_a_previous_attempt_created() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=CreateSecurityGroup"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(error_body(
+            "InvalidGroup.Duplicate",
+            "The security group 'jamstream-sess1' already exists",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DescribeSecurityGroups"))
+        .and(body_string_contains("Filter.1.Name=group-name"))
+        .and(body_string_contains("Filter.1.Value.1=jamstream-sess1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<DescribeSecurityGroupsResponse><securityGroupInfo><item>\
+             <groupId>sg-0existing</groupId><groupName>jamstream-sess1</groupName>\
+             </item></securityGroupInfo></DescribeSecurityGroupsResponse>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The rule is already there too, which EC2 reports as a duplicate.
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=AuthorizeSecurityGroupIngress"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(error_body(
+            "InvalidPermission.Duplicate",
+            "the specified rule already exists",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=RunInstances"))
+        .and(body_string_contains("SecurityGroupId.1=sg-0existing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RUN_INSTANCES_XML))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    p.launch(launch_spec(&p, "us-east-1"))
+        .await
+        .expect("a relaunch of the same session reuses its group");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn session_ingress_parses_ports_and_both_families() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DescribeSecurityGroups"))
+        .and(query_param("region", "us-east-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<DescribeSecurityGroupsResponse><securityGroupInfo><item>\
+             <groupId>sg-0abc</groupId><groupName>jamstream-sess1</groupName>\
+             <ipPermissions><item>\
+             <ipProtocol>udp</ipProtocol><fromPort>43210</fromPort><toPort>43210</toPort>\
+             <ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges>\
+             <ipv6Ranges><item><cidrIpv6>::/0</cidrIpv6></item></ipv6Ranges>\
+             </item></ipPermissions>\
+             <ipPermissionsEgress><item><ipProtocol>-1</ipProtocol>\
+             <ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges>\
+             </item></ipPermissionsEgress>\
+             </item></securityGroupInfo></DescribeSecurityGroupsResponse>",
+        ))
+        .mount(&server)
+        .await;
+    // Every other region answers with nothing.
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DescribeSecurityGroups"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<DescribeSecurityGroupsResponse><securityGroupInfo/>\
+             </DescribeSecurityGroupsResponse>",
+        ))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let rules = p.session_ingress("sess1").await.expect("ingress");
+    assert_eq!(rules.len(), 1, "the allow-all egress rule is not ingress");
+    assert_eq!(rules[0].protocol, "udp");
+    assert!(rules[0].is_only_port(43210));
+    assert_eq!(
+        rules[0].cidrs,
+        vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()]
+    );
+    assert!(rules[0].is_open_to_the_internet());
+}
+
+#[tokio::test]
+async fn orphan_cleanup_leaves_a_group_that_is_still_attached() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DescribeSecurityGroups"))
+        .and(body_string_contains("Filter.1.Name=tag-key"))
+        .and(body_string_contains("Filter.1.Value.1=jamstream-session"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<DescribeSecurityGroupsResponse><securityGroupInfo>\
+             <item><groupId>sg-0busy</groupId><groupName>jamstream-live</groupName></item>\
+             <item><groupId>sg-0free</groupId><groupName>jamstream-gone</groupName></item>\
+             </securityGroupInfo></DescribeSecurityGroupsResponse>",
+        ))
+        .mount(&server)
+        .await;
+    // A group whose instance has not finished terminating is not an orphan;
+    // the next sweep collects it.
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DeleteSecurityGroup"))
+        .and(body_string_contains("GroupId=sg-0busy"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(error_body(
+            "DependencyViolation",
+            "resource sg-0busy has a dependent object",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DeleteSecurityGroup"))
+        .and(body_string_contains("GroupId=sg-0free"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<DeleteSecurityGroupResponse><return>true</return></DeleteSecurityGroupResponse>",
+        ))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let deleted = p.destroy_orphan_firewalls().await.expect("cleanup");
+    // One per region in the catalog, since the same fake answers all of them.
+    assert!(
+        deleted.iter().all(|name| name == "jamstream-gone"),
+        "only the unattached group is deleted, got {deleted:?}"
+    );
+    assert_eq!(deleted.len(), p.regions().len());
 }

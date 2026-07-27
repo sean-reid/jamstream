@@ -30,13 +30,18 @@ use tokio::sync::OnceCell;
 use crate::http::{client, error_body, send_retrying};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
-    Instance, InstanceClass, LaunchSpec, Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
+    ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec,
+    Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.digitalocean.com";
 
 /// Bare marker tag carried by every JamStream droplet.
 pub const BARE_TAG: &str = "jamstream";
+
+/// Name prefix of every firewall JamStream creates, so orphan cleanup can
+/// recognize its own work without touching the account's other firewalls.
+pub const FIREWALL_PREFIX: &str = "jamstream-";
 
 /// Debian is the boot image everywhere; cloud-init does the rest.
 const IMAGE: &str = "debian-12-x64";
@@ -154,6 +159,44 @@ struct DropletEnvelope {
 }
 
 #[derive(Debug, Deserialize)]
+struct FirewallEnvelope {
+    firewall: Firewall,
+}
+
+#[derive(Debug, Deserialize)]
+struct FirewallsPage {
+    firewalls: Vec<Firewall>,
+    #[serde(default)]
+    links: Option<Links>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Firewall {
+    id: String,
+    name: String,
+    #[serde(default)]
+    inbound_rules: Vec<FirewallRule>,
+    #[serde(default)]
+    droplet_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FirewallRule {
+    protocol: String,
+    /// A single port, a "from-to" range, or "0" for every port.
+    #[serde(default)]
+    ports: String,
+    #[serde(default)]
+    sources: FirewallSources,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FirewallSources {
+    #[serde(default)]
+    addresses: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DropletsPage {
     droplets: Vec<Droplet>,
     #[serde(default)]
@@ -191,6 +234,8 @@ struct NetworkV4 {
 pub struct DigitalOceanProvider {
     token: String,
     base_url: String,
+    /// The one port the per-session cloud firewall opens.
+    session_port: u16,
     http: reqwest::Client,
     /// GET /v2/sizes is region-independent and immutable for our purposes;
     /// fetched once per provider instance and reused by every price() call.
@@ -212,9 +257,17 @@ impl DigitalOceanProvider {
         DigitalOceanProvider {
             token,
             base_url: DEFAULT_BASE_URL.to_owned(),
+            session_port: DEFAULT_SESSION_PORT,
             http: client(),
             sizes: OnceCell::new(),
         }
+    }
+
+    /// Session UDP port the cloud firewall opens; see
+    /// [`Provider::session_port`].
+    pub fn with_session_port(mut self, port: u16) -> Self {
+        self.session_port = port;
+        self
     }
 
     /// Reads the API token from `DIGITALOCEAN_TOKEN`.
@@ -349,6 +402,107 @@ impl DigitalOceanProvider {
         Ok(self.instance_from(&envelope.droplet))
     }
 
+    /// Firewall name for a session. DigitalOcean accepts only
+    /// `^[a-zA-Z0-9][a-zA-Z0-9.-]+$` here, which is narrower than the tag
+    /// alphabet: no colons and no underscores.
+    fn firewall_name(session_id: &str) -> String {
+        let tail: String = session_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{FIREWALL_PREFIX}{tail}")
+    }
+
+    /// Creates the tag a firewall can be attached to. A firewall may only
+    /// reference tags that already exist, and a droplet create is what
+    /// would otherwise create this one, which is too late: the firewall has
+    /// to be in place before the droplet boots.
+    async fn ensure_tag(&self, tag: &str) -> Result<()> {
+        let url = format!("{}/v2/tags", self.base_url);
+        let body = json!({ "name": tag });
+        match send_retrying(|| self.http.post(&url).bearer_auth(&self.token).json(&body)).await {
+            Ok(_) => Ok(()),
+            // 422 is "already exists", which is the relaunch case.
+            Err(ProviderError::Other(msg)) if msg.contains("http 422") => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Creates the session's cloud firewall: inbound only the session UDP
+    /// port, outbound everything, attached to the session tag so the
+    /// droplet is covered from the moment it exists.
+    ///
+    /// Without this a droplet is reachable on every port for its whole life,
+    /// which is what made DigitalOcean the one provider a session could
+    /// reach and also the one with nothing in front of sshd.
+    async fn ensure_firewall(&self, session_id: &str) -> Result<String> {
+        let tag = session_do_tag(session_id);
+        self.ensure_tag(&tag).await?;
+        let anywhere = json!([ANY_IPV4, ANY_IPV6]);
+        // A firewall with no outbound rules blocks all egress, and the VM
+        // has to fetch jamstreamd and delete itself through the API.
+        let outbound: Vec<serde_json::Value> = ["tcp", "udp", "icmp"]
+            .iter()
+            .map(|protocol| {
+                json!({
+                    "protocol": protocol,
+                    "ports": "0",
+                    "destinations": { "addresses": anywhere },
+                })
+            })
+            .collect();
+        let body = json!({
+            "name": Self::firewall_name(session_id),
+            "inbound_rules": [{
+                "protocol": "udp",
+                "ports": self.session_port.to_string(),
+                "sources": { "addresses": anywhere },
+            }],
+            "outbound_rules": outbound,
+            "tags": [tag],
+        });
+        let url = format!("{}/v2/firewalls", self.base_url);
+        match send_retrying(|| self.http.post(&url).bearer_auth(&self.token).json(&body)).await {
+            Ok(resp) => {
+                let envelope: FirewallEnvelope = Self::parse_json(resp).await?;
+                Ok(envelope.firewall.id)
+            }
+            // A duplicate name means a previous attempt at this same session
+            // already created it.
+            Err(ProviderError::Other(msg)) if msg.contains("http 422") => {
+                let name = Self::firewall_name(session_id);
+                self.firewalls()
+                    .await?
+                    .into_iter()
+                    .find(|f| f.name == name)
+                    .map(|f| f.id)
+                    .ok_or(ProviderError::Other(msg))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Every firewall on the account, following pagination.
+    async fn firewalls(&self) -> Result<Vec<Firewall>> {
+        self.get_paginated(
+            format!("{}/v2/firewalls?per_page=200", self.base_url),
+            |value| {
+                let page: FirewallsPage = serde_json::from_value(value).map_err(|e| {
+                    ProviderError::Other(format!("digitalocean firewalls decode: {e}"))
+                })?;
+                let next = page.links.and_then(|l| l.pages).and_then(|p| p.next);
+                Ok((page.firewalls, next))
+            },
+        )
+        .await
+    }
+
     /// Bulk destroy by tag: `Some(session_id)` destroys that session's
     /// droplets, `None` destroys every JamStream-tagged droplet. DO returns
     /// 204 whether or not the tag matched anything, so this is idempotent.
@@ -393,7 +547,15 @@ impl Provider for DigitalOceanProvider {
         // against the static catalog up front gives the caller a proper
         // NotFound instead.
         self.known_region(&spec.region.id)?;
-        let suffix = spec.session_id().unwrap_or("session").to_owned();
+        let Some(session) = spec.session_id().map(str::to_owned) else {
+            return Err(ProviderError::Other(format!(
+                "launch spec has no {SESSION_TAG_KEY} tag; refusing to create a droplet the sweeper cannot find"
+            )));
+        };
+        // The firewall is attached to the session tag and created first, so
+        // the droplet is behind it from the moment DigitalOcean creates it.
+        self.ensure_firewall(&session).await?;
+        let suffix = session.clone();
         let name: String = format!("jamstream-{suffix}")
             .chars()
             .map(|c| {
@@ -469,6 +631,63 @@ impl Provider for DigitalOceanProvider {
             })
             .await?;
         Ok(droplets.iter().map(|d| self.instance_from(d)).collect())
+    }
+
+    fn session_port(&self) -> u16 {
+        self.session_port
+    }
+
+    async fn session_ingress(&self, session: &str) -> Result<Vec<IngressRule>> {
+        let name = Self::firewall_name(session);
+        let Some(firewall) = self.firewalls().await?.into_iter().find(|f| f.name == name) else {
+            return Ok(Vec::new());
+        };
+        Ok(firewall
+            .inbound_rules
+            .iter()
+            .map(|rule| {
+                let (from, to) = parse_do_ports(&rule.ports);
+                let mut cidrs = rule.sources.addresses.clone();
+                cidrs.sort();
+                IngressRule {
+                    protocol: rule.protocol.clone(),
+                    from_port: from,
+                    to_port: to,
+                    cidrs,
+                }
+            })
+            .collect())
+    }
+
+    async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>> {
+        let mut deleted = Vec::new();
+        for firewall in self.firewalls().await? {
+            // A firewall with droplets behind it belongs to a live session.
+            if !firewall.name.starts_with(FIREWALL_PREFIX) || !firewall.droplet_ids.is_empty() {
+                continue;
+            }
+            let url = format!("{}/v2/firewalls/{}", self.base_url, firewall.id);
+            match send_retrying(|| self.http.delete(&url).bearer_auth(&self.token)).await {
+                Ok(_) | Err(ProviderError::NotFound(_)) => deleted.push(firewall.name),
+                Err(err) => {
+                    tracing::warn!(firewall = firewall.name, error = %err, "could not delete firewall");
+                }
+            }
+        }
+        deleted.sort();
+        Ok(deleted)
+    }
+}
+
+/// DigitalOcean reports a rule's ports as a single port, a "from-to" range,
+/// or "0" meaning every port.
+fn parse_do_ports(ports: &str) -> (u16, u16) {
+    match ports.split_once('-') {
+        Some((from, to)) => (from.parse().unwrap_or(0), to.parse().unwrap_or(u16::MAX)),
+        None => match ports.parse::<u16>() {
+            Ok(0) | Err(_) => (0, u16::MAX),
+            Ok(port) => (port, port),
+        },
     }
 }
 

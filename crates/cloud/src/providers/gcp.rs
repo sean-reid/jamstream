@@ -79,7 +79,8 @@ use tokio::task::JoinSet;
 use crate::http::{client, send_retrying};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
-    Instance, InstanceClass, LaunchSpec, Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
+    ANY_IPV4, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec, Price,
+    ProviderKind, Region, RegionId, SESSION_TAG_KEY,
 };
 
 pub use super::gcp_auth::ServiceAccountTokenSource;
@@ -108,6 +109,13 @@ const MARKER_LABEL_KEY: &str = "jamstream";
 /// Reserved prefix introducing a hex-escaped label component.
 const ESCAPE_PREFIX: &str = "x--";
 const MAX_LABEL_LEN: usize = 63;
+/// The auto-mode network every project gets, given as a partial resource
+/// URL, which is what the API accepts here.
+const DEFAULT_NETWORK: &str = "global/networks/default";
+/// Prefix on the network tag and both firewall rule names of a session.
+const FIREWALL_PREFIX: &str = "jamstream-";
+const ALLOW_SUFFIX: &str = "allow";
+const DENY_SUFFIX: &str = "deny";
 
 const PRICES_JSON: &str = include_str!("../../data/gcp_prices.json");
 
@@ -139,6 +147,8 @@ pub struct GcpProvider {
     token: Arc<dyn TokenSource>,
     base_url: String,
     max_run_seconds: Option<u64>,
+    /// The one port the per-session firewall rule opens.
+    session_port: u16,
     http: reqwest::Client,
 }
 
@@ -176,8 +186,16 @@ impl GcpProvider {
             token,
             base_url: DEFAULT_BASE_URL.to_owned(),
             max_run_seconds: None,
+            session_port: DEFAULT_SESSION_PORT,
             http: client(),
         }
+    }
+
+    /// Session UDP port the firewall rule opens; see
+    /// [`Provider::session_port`].
+    pub fn with_session_port(mut self, port: u16) -> Self {
+        self.session_port = port;
+        self
     }
 
     /// Credentials from the environment: `GOOGLE_CLOUD_PROJECT` plus
@@ -309,6 +327,11 @@ impl GcpProvider {
             Value::String("true".to_owned()),
         );
         let seconds = self.max_run_seconds.unwrap_or(DEFAULT_MAX_RUN_SECONDS);
+        let session = spec.session_id().ok_or_else(|| {
+            ProviderError::Other(format!(
+                "launch spec has no {SESSION_TAG_KEY} tag; refusing to create an instance the sweeper cannot find"
+            ))
+        })?;
         Ok(json!({
             "name": name,
             "machineType": format!("zones/{zone}/machineTypes/{}", machine_type(spec.instance_class)),
@@ -318,11 +341,21 @@ impl GcpProvider {
                 "initializeParams": { "sourceImage": SOURCE_IMAGE },
             }],
             "networkInterfaces": [{
+                "network": DEFAULT_NETWORK,
                 // Ephemeral public IP.
                 "accessConfigs": [{ "type": "ONE_TO_ONE_NAT", "name": "External NAT" }],
             }],
-            // cloud-init on Debian images reads the "user-data" metadata key.
-            "metadata": { "items": [{ "key": "user-data", "value": spec.user_data }] },
+            // The firewall rules for this session target this tag and
+            // nothing else in the project.
+            "tags": { "items": [network_tag(session)?] },
+            "metadata": { "items": [
+                // cloud-init on Debian images reads the "user-data" key.
+                { "key": "user-data", "value": spec.user_data },
+                // Project-wide SSH keys would otherwise reach a session VM,
+                // and anyone holding one could read user-data back out of
+                // /var/lib/cloud. Nothing needs to log in to this box.
+                { "key": "block-project-ssh-keys", "value": "TRUE" },
+            ] },
             "labels": labels,
             "scheduling": {
                 // Duration fields serialize int64 seconds as a JSON string.
@@ -330,6 +363,123 @@ impl GcpProvider {
                 "instanceTerminationAction": "DELETE",
             },
         }))
+    }
+
+    fn firewalls_url(&self) -> String {
+        format!(
+            "{}/compute/v1/projects/{}/global/firewalls",
+            self.base_url, self.project_id
+        )
+    }
+
+    /// The two rules a session needs on the `default` network, which ships
+    /// with nothing that would let a musician's UDP reach an instance and
+    /// with tcp/22 open to the whole internet:
+    ///
+    /// * allow udp/{port} from anywhere at priority 900,
+    /// * deny everything else at priority 1000.
+    ///
+    /// Both target this session's network tag only, so the project's own
+    /// rules and its other instances are untouched. The deny rule is what
+    /// takes `default-allow-ssh` and `default-allow-rdp` (priority 65534)
+    /// out of the picture for this instance without editing them.
+    fn firewall_bodies(&self, session: &str) -> Result<Vec<(String, Value)>> {
+        let tag = network_tag(session)?;
+        let allow = format!("{tag}-{ALLOW_SUFFIX}");
+        let deny = format!("{tag}-{DENY_SUFFIX}");
+        for name in [&allow, &deny] {
+            if name.len() > MAX_LABEL_LEN {
+                return Err(ProviderError::Other(format!(
+                    "gcp firewall name {name:?} is {} characters; the cap is {MAX_LABEL_LEN}",
+                    name.len()
+                )));
+            }
+        }
+        Ok(vec![
+            (
+                allow.clone(),
+                json!({
+                    "name": allow,
+                    "description": "JamStream session traffic",
+                    "network": DEFAULT_NETWORK,
+                    "direction": "INGRESS",
+                    "priority": 900,
+                    "sourceRanges": [ANY_IPV4],
+                    "targetTags": [tag],
+                    "allowed": [{ "IPProtocol": "udp", "ports": [self.session_port.to_string()] }],
+                }),
+            ),
+            (
+                deny.clone(),
+                json!({
+                    "name": deny,
+                    "description": "JamStream: nothing but the session port",
+                    "network": DEFAULT_NETWORK,
+                    "direction": "INGRESS",
+                    "priority": 1000,
+                    "sourceRanges": [ANY_IPV4],
+                    "targetTags": [tag],
+                    "denied": [{ "IPProtocol": "all" }],
+                }),
+            ),
+        ])
+    }
+
+    /// Inserts both rules, tolerating the ones a previous attempt at the
+    /// same session already created.
+    async fn ensure_firewalls(&self, session: &str) -> Result<()> {
+        let token = self.token.access_token().await?;
+        let url = self.firewalls_url();
+        for (name, body) in self.firewall_bodies(session)? {
+            let resp = send_retrying(|| self.http.post(&url).bearer_auth(&token).json(&body)).await;
+            match resp {
+                Ok(resp) => {
+                    let op: Value = resp.json().await.map_err(|e| {
+                        ProviderError::Other(format!("gcp firewall response parse: {e}"))
+                    })?;
+                    if let Some(err) = op.get("error") {
+                        return Err(ProviderError::Other(format!(
+                            "gcp firewall insert failed for {name}: {err}"
+                        )));
+                    }
+                }
+                // 409 is "alreadyExists", which a relaunch of the same
+                // session hits.
+                Err(ProviderError::Other(msg)) if msg.contains("http 409") => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every firewall rule JamStream created, by name.
+    async fn jamstream_firewalls(&self) -> Result<Vec<GcpFirewall>> {
+        let token = self.token.access_token().await?;
+        let url = self.firewalls_url();
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let resp = send_retrying(|| {
+                let mut req = self.http.get(&url).bearer_auth(&token);
+                if let Some(t) = &page_token {
+                    req = req.query(&[("pageToken", t.as_str())]);
+                }
+                req
+            })
+            .await?;
+            let list: GcpFirewallList = resp.json().await.map_err(|e| {
+                ProviderError::Other(format!("gcp firewall list response parse: {e}"))
+            })?;
+            out.extend(
+                list.items
+                    .into_iter()
+                    .filter(|f| f.name.starts_with(FIREWALL_PREFIX)),
+            );
+            page_token = list.next_page_token.filter(|t| !t.is_empty());
+            if page_token.is_none() {
+                return Ok(out);
+            }
+        }
     }
 }
 
@@ -361,6 +511,11 @@ impl Provider for GcpProvider {
         let region = self.require_region(&spec.region.id)?;
         let name = generate_name();
         let body = self.launch_body(&spec, &name)?;
+        // The rules go in first: the instance's network tag is what they
+        // target, so an instance that exists before them is an instance the
+        // default network's implied deny is dropping session traffic to.
+        let session = spec.session_id().expect("launch_body requires a session");
+        self.ensure_firewalls(session).await?;
         let url = self.zone_url(&region.id);
         let token = self.token.access_token().await?;
         let resp = send_retrying(|| self.http.post(&url).bearer_auth(&token).json(&body)).await?;
@@ -437,6 +592,70 @@ impl Provider for GcpProvider {
                 .unwrap_or_else(|| ProviderError::Other("gcp catalog has no zones".to_owned())))
         }
     }
+
+    fn session_port(&self) -> u16 {
+        self.session_port
+    }
+
+    async fn session_ingress(&self, session: &str) -> Result<Vec<IngressRule>> {
+        let tag = network_tag(session)?;
+        let allow = format!("{tag}-{ALLOW_SUFFIX}");
+        let mut out = Vec::new();
+        for firewall in self.jamstream_firewalls().await? {
+            if firewall.name != allow {
+                continue;
+            }
+            let mut cidrs = firewall.source_ranges.clone();
+            cidrs.sort();
+            for protocol in &firewall.allowed {
+                for ports in &protocol.ports {
+                    let (from, to) = match ports.split_once('-') {
+                        Some((from, to)) => {
+                            (from.parse().unwrap_or(0), to.parse().unwrap_or(u16::MAX))
+                        }
+                        None => {
+                            let port = ports.parse().unwrap_or(0);
+                            (port, port)
+                        }
+                    };
+                    out.push(IngressRule {
+                        protocol: protocol.protocol.clone(),
+                        from_port: from,
+                        to_port: to,
+                        cidrs: cidrs.clone(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>> {
+        // A rule targets one session's network tag, and the instances still
+        // carrying that session label are what makes it live.
+        let live: Vec<String> = self
+            .list_tagged(None)
+            .await?
+            .iter()
+            .filter_map(|i| i.session_id().and_then(|s| network_tag(s).ok()))
+            .collect();
+        let token = self.token.access_token().await?;
+        let mut deleted = Vec::new();
+        for firewall in self.jamstream_firewalls().await? {
+            if firewall.target_tags.iter().any(|tag| live.contains(tag)) {
+                continue;
+            }
+            let url = format!("{}/{}", self.firewalls_url(), firewall.name);
+            match send_retrying(|| self.http.delete(&url).bearer_auth(&token)).await {
+                Ok(_) | Err(ProviderError::NotFound(_)) => deleted.push(firewall.name),
+                Err(err) => {
+                    tracing::warn!(firewall = firewall.name, error = %err, "could not delete firewall rule");
+                }
+            }
+        }
+        deleted.sort();
+        Ok(deleted)
+    }
 }
 
 /// Default zone per catalog region: the region id plus "-b". Zone b exists
@@ -484,6 +703,21 @@ fn label_encode(raw: &str) -> Result<String> {
         )));
     }
     Ok(encoded)
+}
+
+/// Network tag for a session. Tags take the same alphabet as labels
+/// (`[a-z]([-a-z0-9]*[a-z0-9])?`, 63 characters), so the label encoder does
+/// the work; the prefix is what makes a tag recognizably ours.
+fn network_tag(session: &str) -> Result<String> {
+    let encoded = label_encode(session)?;
+    let tag = format!("{FIREWALL_PREFIX}{encoded}");
+    if tag.len() > MAX_LABEL_LEN {
+        return Err(ProviderError::Other(format!(
+            "session id {session:?} makes a {}-character network tag; gcp caps at {MAX_LABEL_LEN}",
+            tag.len()
+        )));
+    }
+    Ok(tag)
 }
 
 /// Inverse of [`label_encode`]. Labels not written by JamStream (no valid
@@ -538,6 +772,35 @@ struct GcpNetworkInterface {
 struct GcpAccessConfig {
     #[serde(default, rename = "natIP")]
     nat_ip: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GcpFirewall {
+    name: String,
+    #[serde(default)]
+    allowed: Vec<GcpFirewallProtocol>,
+    #[serde(default)]
+    source_ranges: Vec<String>,
+    #[serde(default)]
+    target_tags: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct GcpFirewallProtocol {
+    #[serde(rename = "IPProtocol")]
+    protocol: String,
+    #[serde(default)]
+    ports: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GcpFirewallList {
+    #[serde(default)]
+    items: Vec<GcpFirewall>,
+    #[serde(default)]
+    next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]

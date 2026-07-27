@@ -34,7 +34,7 @@ Input and output devices are picked in Settings, in the Devices panel: a Capture
 Members need only outbound UDP. The client opens one UDP socket to the server's address and port, both baked into the invite (cloud sessions use port 43210; local sessions hosted from the app pick a free port); it listens on no ports, so home routers and NAT need no configuration and no port forwarding. Steady keepalive traffic holds the NAT mapping open for the whole session.
 
 - If joining times out after about 10 seconds, something between you and the server is dropping UDP. Corporate and campus networks sometimes block outbound UDP on unusual ports; a phone hotspot is a quick way to confirm that is the cause.
-- The server side needs nothing from you: the machine's firewall is configured at boot to accept only the session port.
+- The server side needs nothing from you: only the session port is reachable on the machine, and nothing else is.
 - IPv4 is required; IPv6 is used opportunistically when available.
 
 ## Session ends unexpectedly

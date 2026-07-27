@@ -4,14 +4,12 @@ One honest page on what actually happens when you host and play. Deeper detail l
 
 ## The machine's life
 
-When you host on a cloud provider, your computer asks it for one small Linux VM and hands it a boot script. (In [local mode](guides/local.md) there is no VM: the same server starts as a process on your machine, with the same keys and settings, and the story picks up at step 6.) The machine:
+When you host on a cloud provider, your computer asks it for one small Linux VM and hands it a boot script. (In [local mode](guides/local.md) there is no VM: the same server starts as a process on your machine, with the same keys and settings, and the story picks up at step 4.) The machine:
 
 1. writes its keys and settings from launch data held in memory, never onto a disk image that outlives it;
-2. arms its dead man's switch and closes its firewall down to the one UDP session port, before anything that can fail has run, so a boot that goes wrong still ends with the machine destroying itself;
-3. blocks the cloud's metadata service for every account except root, so the session server, which does not run as root, cannot read the launch data back out of it;
-4. downloads a pinned build of `jamstreamd`, the session server; release builds carry the URL of their release's own server build baked in, so host and server always match;
-5. verifies the download's sha256 checksum against the one pinned alongside the URL, and refuses to start on a mismatch;
-6. starts serving.
+2. arms its dead man's switch and closes its firewall down to the one UDP session port, before anything that can fail has run;
+3. downloads a pinned build of `jamstreamd`, the session server, and refuses to start unless its sha256 checksum matches the one pinned alongside the URL; release builds carry the URL of their release's own server build baked in, so host and server always match;
+4. starts serving.
 
 The hosting app or CLI then performs a full encrypted handshake against it before showing any invite, so a session is never announced that cannot actually be joined.
 
@@ -23,7 +21,7 @@ There are no accounts and no JamStream servers. Identity is the invite.
 
 When you host, your computer generates the session's keys locally and mints one invite per seat. Each invite is a signed statement: this person may occupy seat 3 of session `3f2a9c01` at this address until this time. The server, which received your public key at boot, admits only holders of statements you signed. Invites are individually revocable mid-session, and all of them expire at the session's hard cap.
 
-Every packet between every member and the server is encrypted and authenticated, from the first handshake byte; there is no plaintext mode. Keys are rotated hourly during long sessions, and replayed or tampered packets are dropped. The server itself knows nothing about anyone beyond what the host signed into their invite: a seat number, a role, an expiry.
+Every packet between every member and the server is encrypted and authenticated, from the first handshake byte; there is no plaintext mode. Replayed or tampered packets are dropped. The server itself knows nothing about anyone beyond what the host signed into their invite: a seat number, a role, an expiry.
 
 What this buys you concretely: strangers cannot join, listen in, or disrupt a session; a leaked invite is one revocation away from useless; and no third party, JamStream included, sits between your band and your machine.
 

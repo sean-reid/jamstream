@@ -8,7 +8,7 @@ use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::providers::digitalocean::DigitalOceanProvider;
 use jamstream_cloud::providers::gcp::GcpProvider;
 use jamstream_cloud::providers::local::LocalProvider;
-use jamstream_cloud::{MockProvider, Provider, ProviderKind};
+use jamstream_cloud::{DEFAULT_SESSION_PORT, MockProvider, Provider, ProviderKind};
 
 use crate::CliError;
 use crate::state;
@@ -31,21 +31,29 @@ fn local_state_dir() -> PathBuf {
 }
 
 pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
+    resolve_for_port(name, DEFAULT_SESSION_PORT)
+}
+
+/// [`resolve`] for a host that picked its own session port. The port is the
+/// only one the provider opens in the firewall it creates for the session,
+/// so `jamstream host --port` has to reach the provider or the VM comes up
+/// behind a firewall for a different port.
+pub fn resolve_for_port(name: &str, session_port: u16) -> Result<Box<dyn Provider>, CliError> {
     match name {
         "local" => Ok(Box::new(LocalProvider::new(local_state_dir()))),
         // The mock needs some underlying kind for its instances; Aws is
         // arbitrary and never leaves the process.
-        "mock" => Ok(Box::new(MockProvider::with_default_regions(
-            ProviderKind::Aws,
-        ))),
+        "mock" => Ok(Box::new(
+            MockProvider::with_default_regions(ProviderKind::Aws).with_session_port(session_port),
+        )),
         "aws" => AwsProvider::from_env()
-            .map(boxed)
+            .map(|p| boxed(p.with_session_port(session_port)))
             .map_err(|err| creds_error("aws", &err.to_string())),
         "digitalocean" => DigitalOceanProvider::from_env()
-            .map(boxed)
+            .map(|p| boxed(p.with_session_port(session_port)))
             .map_err(|err| creds_error("digitalocean", &err.to_string())),
         "gcp" => GcpProvider::from_env()
-            .map(boxed)
+            .map(|p| boxed(p.with_session_port(session_port)))
             .map_err(|err| creds_error("gcp", &err.to_string())),
         other => Err(CliError::Usage(format!(
             "unknown provider {other:?}; known providers are local, digitalocean, aws, gcp"

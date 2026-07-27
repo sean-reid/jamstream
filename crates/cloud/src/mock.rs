@@ -7,7 +7,8 @@ use async_trait::async_trait;
 
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
-    Instance, LaunchSpec, Price, ProviderKind, Region, RegionId, session_id_from_tags,
+    ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Price,
+    ProviderKind, Region, RegionId, session_id_from_tags,
 };
 
 /// Every call made against the mock, in order, for test assertions.
@@ -24,11 +25,20 @@ pub enum Call {
         id: String,
     },
     ListTagged(Option<String>),
+    /// A per-session firewall created by `launch`.
+    CreateFirewall {
+        session_id: String,
+        port: u16,
+    },
+    DestroyOrphanFirewalls,
 }
 
 #[derive(Default)]
 struct State {
     instances: Vec<Instance>,
+    /// Session id to the ingress the session's firewall holds, mirroring
+    /// what the real providers create at launch.
+    firewalls: HashMap<String, Vec<IngressRule>>,
     next_id: u64,
     next_ip: u32,
     launch_failures: VecDeque<ProviderError>,
@@ -41,6 +51,7 @@ pub struct MockProvider {
     kind: ProviderKind,
     regions: Vec<Region>,
     prices: HashMap<RegionId, Price>,
+    session_port: u16,
     state: Mutex<State>,
 }
 
@@ -50,8 +61,15 @@ impl MockProvider {
             kind,
             regions: Vec::new(),
             prices: HashMap::new(),
+            session_port: DEFAULT_SESSION_PORT,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Session UDP port the mock's firewalls open, like the real providers.
+    pub fn with_session_port(mut self, port: u16) -> Self {
+        self.session_port = port;
+        self
     }
 
     /// A mock with two regions at distinct prices, enough for most tests.
@@ -191,6 +209,22 @@ impl Provider for MockProvider {
         drop(s);
         let region = self.region(&spec.region.id)?.clone();
         let mut s = self.state.lock().unwrap();
+        // The firewall goes in before the instance, as it does on every real
+        // provider: an instance that exists before its ingress rule does is
+        // an instance sitting on provider defaults.
+        if let Some(session) = spec.session_id() {
+            s.calls.push(Call::CreateFirewall {
+                session_id: session.to_owned(),
+                port: self.session_port,
+            });
+            s.firewalls.insert(
+                session.to_owned(),
+                vec![IngressRule::session_udp(
+                    self.session_port,
+                    vec![ANY_IPV4.to_owned(), ANY_IPV6.to_owned()],
+                )],
+            );
+        }
         let inst = Self::build_instance(self.kind, &region, spec.tags, &mut s);
         s.instances.push(inst.clone());
         Ok(inst)
@@ -229,6 +263,41 @@ impl Provider for MockProvider {
             })
             .cloned()
             .collect())
+    }
+
+    fn session_port(&self) -> u16 {
+        self.session_port
+    }
+
+    async fn session_ingress(&self, session: &str) -> Result<Vec<IngressRule>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .firewalls
+            .get(session)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>> {
+        let mut s = self.state.lock().unwrap();
+        s.calls.push(Call::DestroyOrphanFirewalls);
+        let live: Vec<String> = s
+            .instances
+            .iter()
+            .filter_map(|i| i.session_id().map(str::to_owned))
+            .collect();
+        let orphans: Vec<String> = s
+            .firewalls
+            .keys()
+            .filter(|session| !live.contains(session))
+            .cloned()
+            .collect();
+        for session in &orphans {
+            s.firewalls.remove(session);
+        }
+        Ok(orphans)
     }
 }
 

@@ -30,6 +30,22 @@ fn zone_path(zone: &str) -> String {
     format!("/compute/v1/projects/{PROJECT}/zones/{zone}/instances")
 }
 
+fn firewalls_path() -> String {
+    format!("/compute/v1/projects/{PROJECT}/global/firewalls")
+}
+
+/// Answers the two firewall inserts a launch makes before the instance.
+async fn mount_firewalls(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(firewalls_path()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "name": "operation-fw", "status": "RUNNING" })),
+        )
+        .mount(server)
+        .await;
+}
+
 fn spec(p: &GcpProvider) -> LaunchSpec {
     LaunchSpec {
         region: region(p, "us-central1"),
@@ -52,6 +68,8 @@ async fn launch_inserts_instance_with_expected_body() {
         .mount(&server)
         .await;
 
+    mount_firewalls(&server).await;
+
     let p = provider(&server).with_max_run_seconds(7200);
     let instance = p.launch(spec(&p)).await.expect("launch");
 
@@ -61,8 +79,35 @@ async fn launch_inserts_instance_with_expected_body() {
     assert_eq!(instance.session_id(), Some("deadbeefcafef00d"));
 
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    let req = &requests[0];
+    // Two firewall rules, then the instance.
+    assert_eq!(requests.len(), 3);
+    let firewalls: Vec<Value> = requests
+        .iter()
+        .filter(|r| r.url.path() == firewalls_path())
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(firewalls.len(), 2, "one allow rule and one deny rule");
+    let allow = &firewalls[0];
+    assert_eq!(allow["name"], "jamstream-deadbeefcafef00d-allow");
+    assert_eq!(allow["network"], "global/networks/default");
+    assert_eq!(allow["direction"], "INGRESS");
+    assert_eq!(allow["priority"], 900);
+    assert_eq!(allow["sourceRanges"][0], "0.0.0.0/0");
+    assert_eq!(allow["targetTags"][0], "jamstream-deadbeefcafef00d");
+    assert_eq!(allow["allowed"][0]["IPProtocol"], "udp");
+    assert_eq!(allow["allowed"][0]["ports"][0], "43210");
+    // The deny rule outranks default-allow-ssh (priority 65534) for this
+    // instance without touching the project's own rules.
+    let deny = &firewalls[1];
+    assert_eq!(deny["name"], "jamstream-deadbeefcafef00d-deny");
+    assert_eq!(deny["priority"], 1000);
+    assert_eq!(deny["denied"][0]["IPProtocol"], "all");
+    assert!(deny["allowed"].is_null());
+
+    let req = requests
+        .iter()
+        .find(|r| r.url.path() != firewalls_path())
+        .expect("instance insert");
     let url_path = req.url.path();
     assert!(url_path.contains(PROJECT), "path must contain the project");
     assert!(
@@ -85,6 +130,11 @@ async fn launch_inserts_instance_with_expected_body() {
         body["networkInterfaces"][0]["accessConfigs"][0]["type"],
         "ONE_TO_ONE_NAT"
     );
+    assert_eq!(
+        body["networkInterfaces"][0]["network"],
+        "global/networks/default"
+    );
+    assert_eq!(body["tags"]["items"][0], "jamstream-deadbeefcafef00d");
     assert_eq!(body["metadata"]["items"][0]["key"], "user-data");
     assert_eq!(
         body["metadata"]["items"][0]["value"],
@@ -94,6 +144,12 @@ async fn launch_inserts_instance_with_expected_body() {
     assert_eq!(body["labels"]["jamstream"], "true");
     assert_eq!(body["scheduling"]["maxRunDuration"]["seconds"], "7200");
     assert_eq!(body["scheduling"]["instanceTerminationAction"], "DELETE");
+    // Project-wide SSH keys must not reach a session VM.
+    assert_eq!(
+        body["metadata"]["items"][1]["key"],
+        "block-project-ssh-keys"
+    );
+    assert_eq!(body["metadata"]["items"][1]["value"], "TRUE");
 }
 
 #[tokio::test]
@@ -432,4 +488,130 @@ async fn every_catalog_region_has_a_positive_price() {
         .price_for(&RegionId::new("mars-north1"), InstanceClass::Small)
         .unwrap_err();
     assert!(matches!(err, ProviderError::NotFound(_)));
+}
+
+// ---- Firewall rules ----
+
+#[tokio::test]
+async fn session_ingress_reads_the_allow_rule() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(firewalls_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                // The project's own rule, which we must not report as ours.
+                { "name": "default-allow-ssh", "sourceRanges": ["0.0.0.0/0"],
+                  "allowed": [{ "IPProtocol": "tcp", "ports": ["22"] }] },
+                { "name": "jamstream-deadbeefcafef00d-allow",
+                  "sourceRanges": ["0.0.0.0/0"],
+                  "targetTags": ["jamstream-deadbeefcafef00d"],
+                  "allowed": [{ "IPProtocol": "udp", "ports": ["43210"] }] },
+                { "name": "jamstream-deadbeefcafef00d-deny",
+                  "sourceRanges": ["0.0.0.0/0"],
+                  "targetTags": ["jamstream-deadbeefcafef00d"],
+                  "denied": [{ "IPProtocol": "all" }] },
+            ],
+        })))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let rules = p
+        .session_ingress("deadbeefcafef00d")
+        .await
+        .expect("ingress");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].protocol, "udp");
+    assert!(rules[0].is_only_port(43210));
+    assert!(rules[0].is_open_to_the_internet());
+    assert!(
+        p.session_ingress("nosuchsession").await.unwrap().is_empty(),
+        "a session with no rule reports no ingress"
+    );
+}
+
+#[tokio::test]
+async fn launch_survives_rules_a_previous_attempt_created() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(firewalls_path()))
+        // GCP answers a repeated insert with 409 alreadyExists.
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "error": { "code": 409, "message": "already exists" },
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(zone_path("us-central1-b")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "name": "operation-1", "status": "RUNNING" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    p.launch(spec(&p)).await.expect("launch");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn orphan_cleanup_spares_the_rules_of_a_live_session() {
+    let server = MockServer::start().await;
+    // One instance is still up, in one zone; every other zone is empty.
+    Mock::given(method("GET"))
+        .and(path(zone_path("us-central1-b")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "name": "jamstream-live",
+                "status": "RUNNING",
+                "labels": { "jamstream-session": "live", "jamstream": "true" },
+            }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(firewalls_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                { "name": "jamstream-live-allow", "targetTags": ["jamstream-live"] },
+                { "name": "jamstream-live-deny", "targetTags": ["jamstream-live"] },
+                { "name": "jamstream-gone-allow", "targetTags": ["jamstream-gone"] },
+                { "name": "jamstream-gone-deny", "targetTags": ["jamstream-gone"] },
+                // Not ours: no prefix, so it is never a candidate.
+                { "name": "default-allow-ssh", "targetTags": [] },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    // Every other zone answers empty. Mounted after the two mocks above
+    // because wiremock serves the first match.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .mount(&server)
+        .await;
+    for name in ["jamstream-gone-allow", "jamstream-gone-deny"] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("{}/{name}", firewalls_path())))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "name": "operation-del", "status": "DONE" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let p = provider(&server);
+    let deleted = p.destroy_orphan_firewalls().await.expect("cleanup");
+    assert_eq!(
+        deleted,
+        vec![
+            "jamstream-gone-allow".to_owned(),
+            "jamstream-gone-deny".to_owned()
+        ]
+    );
+    server.verify().await;
 }

@@ -29,4 +29,4 @@ That line means the credential works. An authentication error here names the env
 
 The CLI reads credentials from the environment: `DIGITALOCEAN_TOKEN`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or `GOOGLE_APPLICATION_CREDENTIALS`, as each provider page shows. The app reads the same variables as a silent fallback, so a machine configured for the CLI works in the app with no extra setup; a value saved from the app's pane takes precedence.
 
-Wherever they live, keychain or environment, credentials stay on your machine. They are never written to the server VM's disk, never included in invites, and never sent anywhere except to the provider's own API.
+Credentials are never included in an invite. Scope a DigitalOcean token to droplets and nothing else: a session droplet is given that token so it can delete itself when the session ends.
