@@ -24,7 +24,10 @@ const STEP_MS: f64 = 2.5;
 /// the shuttle: an AvatarChunk seals to a bit over its 8 KB payload while
 /// every other datagram (media, rosters, chat) stays under ~1.5 KB, so the
 /// count observes chunk transfers without unsealing anything.
-const BIG_DGRAM_BYTES: usize = 4_096;
+/// A sealed avatar chunk is the only control datagram that comes near a
+/// kilobyte; media frames and every other control message are far smaller,
+/// so this cleanly separates "an avatar moved" from ordinary traffic.
+const BIG_DGRAM_BYTES: usize = 900;
 
 fn addr_of(n: u8) -> SocketAddr {
     format!("10.0.0.{n}:5000").parse().unwrap()
@@ -1374,8 +1377,11 @@ fn tampered_avatar_train_is_a_violation_not_an_avatar() {
 
     // A raw member announces the hash of X and then streams Y: sizes and
     // train shape are valid, only the content lies.
-    let x = pattern(12_000, 3);
-    let y = pattern(12_000, 4);
+    // Sized from the chunk constant so the train stays exactly two chunks
+    // whatever that constant is.
+    let two_chunks = AVATAR_CHUNK_BYTES + AVATAR_CHUNK_BYTES / 2;
+    let x = pattern(two_chunks, 3);
+    let y = pattern(two_chunks, 4);
     let hash: [u8; 32] = Blake2s256::digest(&x).into();
     let inv = h.mint(3, Role::Musician);
     let mut raw = raw_join(&mut h, &inv, addr_of(99));
@@ -1500,7 +1506,7 @@ fn chat_delivers_within_four_steps_while_a_max_avatar_streams() {
 
     let bytes = pattern(MAX_AVATAR_BYTES, 5);
     let hash = h.clients[a].core.set_avatar(&bytes).unwrap();
-    let total_chunks = (MAX_AVATAR_BYTES / AVATAR_CHUNK_BYTES) as u64; // 32
+    let total_chunks = (MAX_AVATAR_BYTES / AVATAR_CHUNK_BYTES) as u64;
 
     // Wait for the upload to start, then inject a chat mid-train.
     for _ in 0..40 {
@@ -1536,8 +1542,10 @@ fn chat_delivers_within_four_steps_while_a_max_avatar_streams() {
         "avatar kept streaming around the chat"
     );
 
-    // Same bound while the server fans trains out to B and C.
-    for _ in 0..80 {
+    // Same bound while the server fans trains out to B and C. The budget
+    // follows the chunk count: the uplink train has to finish before the
+    // server has anything to fan out, and pacing is two chunks per tick.
+    for _ in 0..(2 * total_chunks as usize + 60) {
         if h.big_dgrams > total_chunks + 2 {
             break;
         }

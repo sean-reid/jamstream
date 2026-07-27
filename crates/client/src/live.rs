@@ -10,7 +10,7 @@
 //! forgiving because the raw capture/playout APIs are sample-count driven
 //! by the device clock, not the loop clock.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -21,15 +21,16 @@ use jamstream_audio_io::{
     AudioBackend, AudioError, CallbackBridge, EngineSide, StreamConfig, StreamHandle, WavBackend,
     WavStream,
 };
-use jamstream_protocol::control::MemberInfo;
+use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
 use jamstream_protocol::invite::Invite;
 use jamstream_session::SessionError;
 use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 
+use crate::avatar;
 use crate::runtime::{
-    BroadcastView, ChatLine, Command, ConnState, CostView, FaderView, LevelsView, MemberId,
-    MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
+    AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, FaderView, LevelsView,
+    MemberId, MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
 };
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -119,6 +120,14 @@ struct SharedState {
     chat: VecDeque<ChatLine>,
     levels: LevelsView,
     metronome: MetronomeView,
+    /// Decoded avatars by content hash (lowercase hex), the one decode per
+    /// hash the UI draws from. A roster hash with no entry yet means the
+    /// bytes are still in flight; that member keeps the initials disc.
+    avatars: HashMap<String, AvatarHandle>,
+    /// You dropped your own avatar. The wire has no way to unset one, so
+    /// this hides it locally until the next join; the settings sheet says
+    /// so in as many words.
+    own_dropped: bool,
     me: Option<MemberId>,
     session_short: String,
     server_addr: String,
@@ -151,6 +160,8 @@ impl SharedState {
                 enabled: false,
                 you_hear_click: true,
             },
+            avatars: HashMap::new(),
+            own_dropped: false,
             me: None,
             session_short,
             server_addr: server_addr.to_string(),
@@ -372,6 +383,7 @@ impl LiveRuntime {
             settings,
             shared: Arc::clone(&shared),
             rx,
+            rx_buf: vec![0u8; MAX_DATAGRAM_BYTES].into_boxed_slice(),
             epoch: Instant::now(),
             capture_buf: vec![0.0; capture_capacity],
             mono_buf: Vec::new(),
@@ -379,6 +391,7 @@ impl LiveRuntime {
             carry_pos: 0,
             carry_len: 0,
             levels: LevelsView::default(),
+            avatar_failed: HashSet::new(),
             reopen_attempts: 0,
             last_reopen: None,
         };
@@ -430,6 +443,14 @@ impl LiveRuntime {
                 // [`CostedRuntime`] wrapper injects them from the host's
                 // invite book. None hides the revoke buttons.
                 token: None,
+                // Present once the bytes for the roster's hash have arrived
+                // and decoded; None until then, and None for your own after
+                // you drop it.
+                avatar: match m.avatar_hash {
+                    Some(_) if s.me == Some(m.id) && s.own_dropped => None,
+                    Some(hash) => s.avatars.get(&avatar::hash_hex(&hash)).cloned(),
+                    None => None,
+                },
             })
             .collect();
         let is_host = s.me == Some(HOST_MEMBER_ID);
@@ -522,6 +543,9 @@ impl LiveRuntime {
                     );
                 }
                 Command::SetBroadcastAudition(on) => s.audition = *on,
+                // Your own picture comes back through the roster like
+                // anyone else's; dropping it can only be local.
+                Command::SetOwnAvatar(bytes) => s.own_dropped = bytes.is_none(),
                 Command::SendChat(_) | Command::Leave | Command::Revoke(_) => {}
             }
         }
@@ -640,6 +664,9 @@ struct Worker {
     settings: AudioSettings,
     shared: Arc<Mutex<SharedState>>,
     rx: mpsc::Receiver<ThreadMsg>,
+    /// Datagram scratch, allocated once: an avatar chunk is four times a
+    /// media packet, and a short buffer would truncate it silently.
+    rx_buf: Box<[u8]>,
     epoch: Instant,
     capture_buf: Vec<f32>,
     mono_buf: Vec<f32>,
@@ -649,6 +676,9 @@ struct Worker {
     carry_pos: usize,
     carry_len: usize,
     levels: LevelsView,
+    /// Hashes whose bytes did not decode; never retried, so one bad avatar
+    /// costs one decode attempt per session.
+    avatar_failed: HashSet<String>,
     reopen_attempts: u64,
     last_reopen: Option<Instant>,
 }
@@ -744,6 +774,24 @@ impl Worker {
             Command::SetBroadcastAudition(on) => self.core.set_broadcast_audition(on),
             Command::SendChat(text) => self.core.send_chat(&text),
             Command::Revoke(jti) => self.core.revoke(jti),
+            // The bytes arrive raw from the settings sheet: hashing,
+            // caching, and the announcement are the core's job, and it
+            // refuses anything outside the transfer caps.
+            Command::SetOwnAvatar(Some(bytes)) => self.core.set_avatar(&bytes).map(|hash| {
+                tracing::info!(
+                    hash = %avatar::hash_hex(&hash),
+                    bytes = bytes.len(),
+                    "own avatar announced"
+                );
+            }),
+            Command::SetOwnAvatar(None) => {
+                // The control protocol has no way to unset an avatar, so
+                // this is local only: your own strip falls back to the
+                // initials disc, and members already here keep the last
+                // picture you sent until you rejoin without one.
+                tracing::info!("own avatar dropped locally; the session keeps the announced hash");
+                Ok(())
+            }
             Command::Leave => unreachable!("handled by step"),
         };
         if let Err(err) = result {
@@ -837,13 +885,15 @@ impl Worker {
     }
 
     fn drain_socket(&mut self) {
-        let mut buf = [0u8; 2048];
         // WouldBlock ends the drain; other errors (ICMP refusals surface
         // here on connected sockets) also just wait for the timeout
         // machinery rather than tearing anything down.
-        while let Ok(len) = self.socket.recv(&mut buf) {
+        loop {
+            let Ok(len) = self.socket.recv(&mut self.rx_buf) else {
+                return;
+            };
             let now_ms = self.now_ms();
-            for pkt in self.core.handle_datagram(now_ms, &buf[..len]) {
+            for pkt in self.core.handle_datagram(now_ms, &self.rx_buf[..len]) {
                 let _ = self.socket.send(&pkt);
             }
         }
@@ -921,9 +971,13 @@ impl Worker {
         if events.is_empty() {
             return;
         }
+        // Decoding is milliseconds of work; it happens after the lock is
+        // released so the paint thread never waits on it.
+        let mut ready: Vec<(MemberId, [u8; 32])> = Vec::new();
         let mut s = self.shared.lock().expect("live state");
         for event in events {
             match event {
+                ClientEvent::AvatarReady { member, hash } => ready.push((member, hash)),
                 ClientEvent::Joined => {
                     self.ever_joined = true;
                     s.me = self.core.member_id();
@@ -968,8 +1022,65 @@ impl Worker {
                 }
                 // rtt_ms_last rides along in stats(); Ejected, Rejected,
                 // and TimedOut land through the state mapping below.
-                // Avatars have no UI surface yet.
                 _ => {}
+            }
+        }
+        // A member who left takes their decode with them: keep only what
+        // the current roster still points at.
+        let live: HashSet<String> = s
+            .roster
+            .iter()
+            .filter_map(|m| m.avatar_hash.as_ref().map(avatar::hash_hex))
+            .collect();
+        s.avatars.retain(|hash, _| live.contains(hash));
+        drop(s);
+        for (member, hash) in ready {
+            self.decode_avatar(member, hash);
+        }
+    }
+
+    /// Decodes one ready avatar into shared state, exactly once per content
+    /// hash. A decode failure is logged and dropped: the member keeps the
+    /// initials disc rather than a broken image, and the bad hash is not
+    /// retried.
+    fn decode_avatar(&mut self, member: MemberId, hash: [u8; 32]) {
+        let hex = avatar::hash_hex(&hash);
+        if self.avatar_failed.contains(&hex) {
+            return;
+        }
+        if self
+            .shared
+            .lock()
+            .expect("live state")
+            .avatars
+            .contains_key(&hex)
+        {
+            return;
+        }
+        let Some(bytes) = self.core.avatar_bytes(&hash) else {
+            // The cache evicted it between the event and here; a later
+            // roster sync re-requests the bytes.
+            tracing::debug!(member = member.0, hash = %hex, "avatar bytes are gone");
+            return;
+        };
+        match avatar::decode(hex.clone(), bytes) {
+            Ok(handle) => {
+                tracing::debug!(
+                    member = member.0,
+                    hash = %hex,
+                    width = handle.width,
+                    height = handle.height,
+                    "avatar decoded"
+                );
+                self.shared
+                    .lock()
+                    .expect("live state")
+                    .avatars
+                    .insert(hex, handle);
+            }
+            Err(err) => {
+                tracing::warn!(%err, member = member.0, hash = %hex, "avatar did not decode");
+                self.avatar_failed.insert(hex);
             }
         }
     }

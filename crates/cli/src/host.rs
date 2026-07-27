@@ -10,6 +10,7 @@ use jamstream_cloud::{
     BootConfig, CostPreview, InstanceClass, LaunchSpec, Price, ProbeMatrix, ProbeTarget, Provider,
     ProviderKind, Region, RegionId, RegionScore, SelfDestruct, rank, session_tag,
 };
+use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
@@ -514,7 +515,7 @@ async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), CliError
     let now = || start.elapsed().as_millis() as u64;
     let (mut core, init) = ClientCore::connect(invite, now())?;
     socket.send(&init).await?;
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; MAX_DATAGRAM_BYTES];
     while start.elapsed() < cap {
         for pkt in core.poll(now()) {
             socket.send(&pkt).await?;

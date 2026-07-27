@@ -487,8 +487,9 @@ fn paint_footer(px: &mut Pixmap, cfg: &SceneConfig, fonts: &Fonts, s: f32) {
     }
 }
 
-/// First letters of the first two words; two letters of a lone word.
-fn initials(name: &str) -> String {
+/// First letters of the first two words; two letters of a lone word. Public
+/// so the desktop client's copy can be held to it by test.
+pub fn initials(name: &str) -> String {
     let mut words = name.split_whitespace();
     let first = words.next().unwrap_or("");
     let second = words.next();
