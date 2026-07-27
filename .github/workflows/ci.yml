@@ -46,6 +46,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
+      # release.yml's shell helpers live in scripts/; keep them
+      # shellcheck-clean (shellcheck is preinstalled on ubuntu runners).
+      - name: Shellcheck release scripts
+        run: shellcheck scripts/*.sh
 
   # Unit, property, integration, and E2E story tests, plus a production
   # build of every binary. The harness gate suite runs in its own job below

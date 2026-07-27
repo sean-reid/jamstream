@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Assembles a minimal, correct JamStream.app bundle around a prebuilt
+# jamstream-app binary (release.yml calls this with the lipo'd universal
+# binary; locally any single-arch build works).
+#
+#   usage: macos-app-bundle.sh <jamstream-app-binary> <version> <out-dir>
+#
+# <version> is the release tag with or without the leading "v", e.g.
+# v0.1.3-beta.2. Produces <out-dir>/JamStream.app and lints the generated
+# Info.plist with plutil. No icon yet; release.yml has the named
+# placeholder step for the icns.
+set -euo pipefail
+
+if [ "$#" -ne 3 ]; then
+  echo "usage: $0 <jamstream-app-binary> <version> <out-dir>" >&2
+  exit 2
+fi
+
+BINARY=$1
+VERSION=${2#v}
+OUT_DIR=$3
+
+if [ ! -f "$BINARY" ]; then
+  echo "error: binary not found: $BINARY" >&2
+  exit 1
+fi
+
+# Apple's version fields only accept dotted integers, so the SemVer
+# prerelease suffix cannot pass through verbatim. For v0.1.3-beta.2:
+#   CFBundleShortVersionString = 0.1.3   (marketing version)
+#   CFBundleVersion            = 0.1.3.2 (build number; the trailing .2 is
+#                                         the beta number, so each beta of
+#                                         the same base version stays
+#                                         distinct)
+# Stable tags (v0.2.0) use the same value for both.
+SHORT_VERSION=${VERSION%%-*}
+BUILD_VERSION=$SHORT_VERSION
+case "$VERSION" in
+  *-*)
+    PRERELEASE=${VERSION#*-}
+    PRERELEASE_NUM=${PRERELEASE##*.}
+    case "$PRERELEASE_NUM" in
+      '' | *[!0-9]*) ;; # no trailing number; keep the base build version
+      *) BUILD_VERSION="$SHORT_VERSION.$PRERELEASE_NUM" ;;
+    esac
+    ;;
+esac
+
+APP="$OUT_DIR/JamStream.app"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+install -m 0755 "$BINARY" "$APP/Contents/MacOS/jamstream-app"
+
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>JamStream</string>
+	<key>CFBundleExecutable</key>
+	<string>jamstream-app</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.seanreid.jamstream</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>JamStream</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$SHORT_VERSION</string>
+	<key>CFBundleVersion</key>
+	<string>$BUILD_VERSION</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.seanreid.jamstream</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>jamstream</string>
+			</array>
+		</dict>
+	</array>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>JamStream captures your microphone or instrument input to stream audio to your jam session.</string>
+</dict>
+</plist>
+PLIST
+
+plutil -lint "$APP/Contents/Info.plist"
+echo "assembled $APP (version $SHORT_VERSION, build $BUILD_VERSION)"
