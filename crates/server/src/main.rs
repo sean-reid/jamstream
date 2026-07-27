@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use jamstream_server::config::Config;
 use jamstream_server::runtime::{Options, Server};
+use jamstream_stream::pipeline::StreamConfig;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -71,9 +72,19 @@ fn main() -> ExitCode {
 
     runtime.block_on(async {
         let server = match Server::bind(&cfg, opts).await {
-            Ok(server) => server
-                .with_idle_exit(idle_exit)
-                .with_max_duration(max_duration),
+            Ok(server) => {
+                let server = server
+                    .with_idle_exit(idle_exit)
+                    .with_max_duration(max_duration);
+                // The broadcast card's title. A flag rather than a config key:
+                // the wire protocol has no session name, and /etc/jamstream/config
+                // is the provisioning contract, which no released host writes it
+                // into yet.
+                match arg_value("--session-name") {
+                    Some(name) => server.with_stream_config(StreamConfig::new(name)),
+                    None => server,
+                }
+            }
             Err(err) => {
                 tracing::error!(%err, "bind failed");
                 return ExitCode::FAILURE;

@@ -6,8 +6,10 @@ use std::net::SocketAddr;
 
 use blake2::{Blake2s256, Digest};
 use jamstream_protocol::control::{
-    AVATAR_CHUNK_BYTES, ControlLink, ControlMsg, MAX_AVATAR_BYTES, MemberInfo,
+    AVATAR_CHUNK_BYTES, ControlLink, ControlMsg, DestinationState, DestinationStatus,
+    MAX_AVATAR_BYTES, MemberInfo, StreamKey, StreamOp, StreamPlatform,
 };
+use jamstream_protocol::ids::DestinationId;
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
@@ -61,12 +63,25 @@ struct TestClient {
     events: Vec<ClientEvent>,
 }
 
+/// A member whose downlink the test decrypts itself, so it can scan the
+/// plaintext the server actually relays rather than trusting a client core to
+/// surface it. It never acks, which only means the server keeps retransmitting
+/// for the length of a test.
+struct Sniffer {
+    id: MemberId,
+    addr: SocketAddr,
+    session: Session,
+    /// Every plaintext control or media payload delivered to this member.
+    seen: Vec<Vec<u8>>,
+}
+
 struct Harness {
     issuer: Issuer,
     server_pk: [u8; 32],
     session_id: SessionId,
     server: ServerCore,
     clients: Vec<TestClient>,
+    sniffer: Option<Sniffer>,
     t: f64,
     now_unix: u64,
     to_server: Vec<(SocketAddr, Vec<u8>)>,
@@ -95,6 +110,7 @@ impl Harness {
             session_id,
             server,
             clients: Vec::new(),
+            sniffer: None,
             t: 0.0,
             now_unix: 1_000,
             to_server: Vec::new(),
@@ -204,6 +220,9 @@ impl Harness {
             if dg.len() >= BIG_DGRAM_BYTES {
                 self.big_dgrams += 1;
             }
+            if self.sniff(addr, &dg) {
+                continue;
+            }
             let Some(i) = self.clients.iter().position(|c| c.addr == addr) else {
                 continue;
             };
@@ -283,6 +302,41 @@ impl Harness {
                 c.events.extend(c.core.events());
             }
         }
+    }
+
+    /// Admits a member whose downlink we decrypt in the test. Returns its id.
+    fn add_sniffer(&mut self, invite: &Invite, addr: SocketAddr) -> MemberId {
+        let raw = raw_join(self, invite, addr);
+        let id = raw.id;
+        self.sniffer = Some(Sniffer {
+            id: raw.id,
+            addr: raw.addr,
+            session: raw.session,
+            seen: Vec::new(),
+        });
+        id
+    }
+
+    /// True when the datagram belonged to the sniffer, whose plaintext is
+    /// recorded instead of being handed to a client core.
+    fn sniff(&mut self, addr: SocketAddr, dg: &[u8]) -> bool {
+        let Some(s) = self.sniffer.as_mut() else {
+            return false;
+        };
+        if s.addr != addr {
+            return false;
+        }
+        if let Ok(Packet::Transport {
+            member,
+            counter,
+            ciphertext,
+        }) = wire::parse(dg)
+            && member == s.id
+            && let Ok(plain) = s.session.open(counter, ciphertext)
+        {
+            s.seen.push(plain);
+        }
+        true
     }
 
     fn clear_playouts(&mut self) {
@@ -750,6 +804,291 @@ fn non_host_broadcast_controls_are_violations() {
         "non-host audition took effect: {}",
         tail_tone(&h, host, win, 440.0)
     );
+}
+
+fn add_dest(id: u16, platform: StreamPlatform, key: &str) -> StreamOp {
+    StreamOp::AddDestination {
+        id: DestinationId(id),
+        platform,
+        key: StreamKey::new(key),
+    }
+}
+
+fn status(id: u16, state: DestinationState) -> DestinationStatus {
+    DestinationStatus {
+        id: DestinationId(id),
+        platform: StreamPlatform::Twitch,
+        state,
+        bitrate_kbps: 2_628,
+        dropped_frames: 0,
+    }
+}
+
+fn stream_statuses(h: &Harness, i: usize) -> Vec<Vec<DestinationStatus>> {
+    h.clients[i]
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            ClientEvent::StreamStatus(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn stream_ctl_from_a_non_host_is_a_violation() {
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_host, Some(440.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(1_000);
+
+    // A musician and a listener both try to point the stream somewhere.
+    h.clients[b]
+        .core
+        .stream_ctl(add_dest(1, StreamPlatform::Twitch, "not-your-key"))
+        .unwrap();
+    h.clients[l].core.stream_ctl(StreamOp::Stop).unwrap();
+    h.run_ms(250);
+
+    let violations = h
+        .server_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ServerEvent::ProtocolViolation {
+                    what: "stream control by non-host",
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(violations, 2, "{:?}", h.server_events);
+    // Nothing reached the pipeline.
+    assert!(
+        !h.server_events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::StreamCtl(_))),
+        "a non-host op was accepted"
+    );
+
+    // The host's identical op is accepted and surfaces for the driver.
+    h.clients[0]
+        .core
+        .stream_ctl(add_dest(1, StreamPlatform::Twitch, "host-key"))
+        .unwrap();
+    h.clients[0].core.stream_ctl(StreamOp::Start).unwrap();
+    h.run_ms(250);
+    let ops: Vec<&StreamOp> = h
+        .server_events
+        .iter()
+        .filter_map(|e| match e {
+            ServerEvent::StreamCtl(op) => Some(op),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ops.len(), 2);
+    assert!(matches!(ops[1], StreamOp::Start));
+}
+
+#[test]
+fn stream_status_reaches_every_member() {
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_host, Some(440.0));
+    h.add_client(&inv_b, Some(660.0));
+    h.add_client(&inv_l, None);
+    h.run_ms(1_000);
+
+    // Nothing configured: no status traffic at all.
+    for i in 0..3 {
+        assert!(stream_statuses(&h, i).is_empty());
+    }
+
+    // The driver reports what the pipeline sees. Every member hears about it,
+    // musician and listener alike.
+    let now = h.now_ms();
+    h.server
+        .set_stream_status(now, vec![status(1, DestinationState::Connecting)]);
+    h.run_ms(250);
+    for i in 0..3 {
+        let seen = stream_statuses(&h, i);
+        assert_eq!(seen.len(), 1, "client {i} saw {seen:?}");
+        assert_eq!(seen[0][0].state, DestinationState::Connecting);
+        assert_eq!(seen[0][0].bitrate_kbps, 2_628);
+    }
+
+    // A transition goes out immediately.
+    let now = h.now_ms();
+    h.server
+        .set_stream_status(now, vec![status(1, DestinationState::Live)]);
+    h.run_ms(100);
+    for i in 0..3 {
+        let seen = stream_statuses(&h, i);
+        assert_eq!(seen.len(), 2, "client {i} saw {seen:?}");
+        assert_eq!(seen[1][0].state, DestinationState::Live);
+    }
+
+    // Unchanged status settles to the once-a-second heartbeat rather than a
+    // message per driver poll.
+    for _ in 0..30 {
+        let now = h.now_ms();
+        h.server
+            .set_stream_status(now, vec![status(1, DestinationState::Live)]);
+        h.run_ms(100);
+    }
+    for i in 0..3 {
+        let n = stream_statuses(&h, i).len();
+        assert!((4..=6).contains(&n), "client {i} got {n} statuses in 3 s");
+    }
+
+    // A member joining mid-broadcast is told at once, not up to a second later.
+    let inv_late = h.mint(6, Role::Listener);
+    let late = h.add_client(&inv_late, None);
+    h.run_ms(150);
+    let seen = stream_statuses(&h, late);
+    assert_eq!(seen.len(), 1, "late joiner saw {seen:?}");
+    assert_eq!(seen[0][0].state, DestinationState::Live);
+
+    // And clearing it tells everyone once, then goes quiet.
+    let before: Vec<usize> = (0..4).map(|i| stream_statuses(&h, i).len()).collect();
+    let now = h.now_ms();
+    h.server.set_stream_status(now, Vec::new());
+    h.run_ms(1_500);
+    for (i, was) in before.iter().enumerate() {
+        let seen = stream_statuses(&h, i);
+        assert_eq!(seen.len(), was + 1, "client {i} saw {seen:?}");
+        assert!(seen.last().expect("nonempty").is_empty());
+    }
+}
+
+/// The one property the whole key-handling design exists for: a stream key
+/// the host sends is never relayed to anyone. Asserted against the plaintext
+/// bytes the server actually seals, not against a client core's events.
+#[test]
+fn stream_keys_never_appear_in_anything_the_server_relays() {
+    const KEY: &str = "live_424242_donotleak";
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_snoop = h.mint(7, Role::Listener);
+    h.add_client(&inv_host, Some(440.0));
+    h.add_client(&inv_b, Some(0.0));
+    h.add_sniffer(&inv_snoop, addr_of(60));
+    h.run_ms(1_000);
+
+    h.clients[0]
+        .core
+        .stream_ctl(add_dest(1, StreamPlatform::Twitch, KEY))
+        .unwrap();
+    h.clients[0].core.stream_ctl(StreamOp::Start).unwrap();
+    h.run_ms(500);
+    // The op reached the driver, so the key really was in flight.
+    assert!(
+        h.server_events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::StreamCtl(StreamOp::AddDestination { .. }))),
+        "the host's add never arrived"
+    );
+
+    // The pipeline reports status, which is the only stream traffic that fans
+    // out. Include the destination in a failed state, since the reason string
+    // is the one status field that carries free text.
+    let now = h.now_ms();
+    h.server.set_stream_status(
+        now,
+        vec![status(
+            1,
+            DestinationState::Failed {
+                reason: "pusher exited: connection refused".to_owned(),
+            },
+        )],
+    );
+    h.run_ms(1_000);
+
+    let needle = KEY.as_bytes();
+    let contains = |bytes: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+
+    // Every plaintext byte the server sealed to a member.
+    let sniffed = h.sniffer.as_ref().expect("sniffer").seen.len();
+    assert!(sniffed > 0, "the sniffer received nothing to scan");
+    for plain in &h.sniffer.as_ref().expect("sniffer").seen {
+        assert!(!contains(plain), "key found in a relayed datagram");
+    }
+    // And every message the honest clients decoded, serialized back to bytes.
+    for i in 0..h.clients.len() {
+        for status in stream_statuses(&h, i) {
+            let bytes = postcard::to_allocvec(&ControlMsg::StreamStatus {
+                destinations: status,
+            })
+            .unwrap();
+            assert!(
+                !contains(&bytes),
+                "key found in a status sent to client {i}"
+            );
+        }
+        let debug = format!("{:?}", h.clients[i].events);
+        assert!(!debug.contains(KEY), "key found in client {i} events");
+    }
+    // The server's own copy of the status is key-free too.
+    let bytes = postcard::to_allocvec(h.server.stream_status()).unwrap();
+    assert!(!contains(&bytes));
+}
+
+#[test]
+fn broadcast_tap_exposes_post_limiter_audio_and_card_state() {
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    h.add_client(&inv_host, Some(440.0));
+    h.add_client(&inv_b, Some(0.0));
+    h.run_ms(1_000);
+
+    // Off by default: no metering work, no levels.
+    assert!(!h.server.broadcast_tap());
+    let tick = h.server.broadcast_tick();
+    assert_eq!(tick.audio.len(), 240);
+    assert_eq!(tick.members.len(), 2);
+    assert!(tick.members.iter().all(|m| m.level_peak == 0.0));
+    let epoch = tick.roster_epoch;
+
+    h.server.set_broadcast_tap(true);
+    h.run_ms(500);
+    let tick = h.server.broadcast_tick();
+    // The host is sending a 440 Hz tone at 0.5, the other musician silence.
+    let host = tick.members.iter().find(|m| m.id == MemberId(0)).unwrap();
+    let other = tick.members.iter().find(|m| m.id == MemberId(1)).unwrap();
+    assert!(host.level_peak > 0.1, "host peak {}", host.level_peak);
+    assert!(host.level_rms > 0.05, "host rms {}", host.level_rms);
+    // Not exactly zero: a silent musician's Opus round trip leaves denormals.
+    assert!(other.level_peak < 1e-6, "silent peak {}", other.level_peak);
+    assert!(host.connected);
+    assert_eq!(host.name, "member 0");
+    // The audio slice is the broadcast mix, so the tone is in it.
+    let rms = (tick.audio.iter().map(|s| s * s).sum::<f32>() / tick.audio.len() as f32).sqrt();
+    assert!(rms > 0.05, "broadcast slice is silent: {rms}");
+    // Listeners are counted separately; a roster change bumps the epoch.
+    assert_eq!(tick.listeners, 0);
+    assert_eq!(tick.roster_epoch, epoch);
+
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_l, None);
+    h.run_ms(200);
+    let tick = h.server.broadcast_tick();
+    assert_eq!(tick.listeners, 1);
+    assert_eq!(tick.members.len(), 2, "listeners are not carded");
+    assert!(tick.roster_epoch > epoch);
+
+    // Turning the tap off clears the meters.
+    h.server.set_broadcast_tap(false);
+    let tick = h.server.broadcast_tick();
+    assert!(tick.members.iter().all(|m| m.level_peak == 0.0));
 }
 
 #[test]

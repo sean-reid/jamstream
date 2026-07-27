@@ -1,0 +1,21 @@
+[package]
+name = "jamstream-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+jamstream-protocol.workspace = true
+jamstream-broadcast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# mkfifo and the nonblocking FIFO open dance. Server-side only; the crate
+# compiles on Windows but StdProcessHost refuses to spawn there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

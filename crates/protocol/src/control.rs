@@ -6,13 +6,19 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use zeroize::Zeroize;
 
 use crate::Error;
-use crate::ids::{MemberId, Role, TokenId};
+use crate::ids::{DestinationId, MemberId, Role, TokenId};
 use crate::wire::CHANNEL_CONTROL;
 
 pub const MAX_CHAT_LEN: usize = 1_000;
 pub const MAX_NAME_LEN: usize = 64;
+/// Longest accepted stream key. Twitch and YouTube keys are well under 100
+/// characters; the cap only stops a host from stuffing the control plane.
+pub const MAX_STREAM_KEY_LEN: usize = 256;
+/// Longest accepted failure reason in a [`DestinationStatus`].
+pub const MAX_STREAM_REASON_LEN: usize = 200;
 /// Avatars are capped at 256 KB and identified by the Blake2s-256 of their
 /// bytes; the hash is the cache key on both ends.
 pub const MAX_AVATAR_BYTES: usize = 256 * 1024;
@@ -36,6 +42,111 @@ pub const MAX_DATAGRAM_BYTES: usize = 2 * 1024;
 const RTO_INITIAL_MS: u64 = 100;
 const RTO_MAX_MS: u64 = 2_000;
 const MAX_SENDS: u32 = 20;
+
+/// Where a broadcast goes. V1 ships the two landscape platforms with
+/// persistent, ungated keys; the requirements behind each one (ingest URL,
+/// aspect, keyframe cadence) live as data in jamstream-stream, not here, so
+/// the wire type stays a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamPlatform {
+    Twitch,
+    YouTube,
+}
+
+impl StreamPlatform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StreamPlatform::Twitch => "twitch",
+            StreamPlatform::YouTube => "youtube",
+        }
+    }
+}
+
+/// A platform stream key. Its own type so the secret cannot be printed by
+/// accident: `Debug` redacts, and the bytes are wiped on drop. It is still
+/// an ordinary `String` on the wire (inside the Noise transport), and the
+/// server keeps it in memory only.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StreamKey(String);
+
+impl StreamKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        StreamKey(key.into())
+    }
+
+    /// The secret itself. Every call site is a place to audit.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for StreamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StreamKey(<redacted {} bytes>)", self.0.len())
+    }
+}
+
+impl Drop for StreamKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// What the host asks the broadcast pipeline to do. Destinations are named
+/// by host-minted ids so add and remove need no round trip, and adding or
+/// removing one mid-stream disturbs no other destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamOp {
+    AddDestination {
+        id: DestinationId,
+        platform: StreamPlatform,
+        key: StreamKey,
+    },
+    RemoveDestination {
+        id: DestinationId,
+    },
+    /// Bring the encoder up. Destinations added before or after both apply.
+    Start,
+    /// Tear the encoder and every pusher down.
+    Stop,
+}
+
+/// Per-destination lifecycle. `Failed` carries a reason a musician can act
+/// on ("pusher exited: connection refused"), never a stream key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DestinationState {
+    /// Configured, encoder not running.
+    Idle,
+    /// Pusher spawned, not yet observed healthy.
+    Connecting,
+    Live,
+    Failed {
+        reason: String,
+    },
+}
+
+/// One destination as the server sees it. Deliberately key-free: this goes
+/// to every member, not just the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationStatus {
+    pub id: DestinationId,
+    pub platform: StreamPlatform,
+    pub state: DestinationState,
+    /// Configured video plus audio bitrate for this destination; the copy
+    /// pushers all carry the one encode, so it is the same for each.
+    pub bitrate_kbps: u32,
+    /// Frames the pipeline could not hand the encoder in time, cumulative.
+    pub dropped_frames: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemberInfo {
@@ -145,6 +256,21 @@ pub enum ControlMsg {
     AvatarRequest {
         hash: [u8; 32],
     },
+    /// Host to server: drive the broadcast pipeline. Host-only; the server
+    /// counts a violation against any other sender. The key inside rides
+    /// the Noise transport, never touches disk outside the pusher's
+    /// root-only spawn file, and never appears in any relayed message.
+    /// Trailing variant, same postcard append-safety rule as Stats.
+    StreamCtl {
+        op: StreamOp,
+    },
+    /// Server to all: the on-air state, once a second while streaming and
+    /// immediately on any transition. Every member sees it, not just the
+    /// host, because everyone in the room deserves to know they are live.
+    /// Trailing variant, as above.
+    StreamStatus {
+        destinations: Vec<DestinationStatus>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -193,6 +319,20 @@ impl ControlLink {
             }
             ControlMsg::AvatarChunk { data, .. } if data.len() > AVATAR_CHUNK_BYTES => {
                 return Err(Error::Malformed);
+            }
+            ControlMsg::StreamCtl {
+                op: StreamOp::AddDestination { key, .. },
+            } if key.is_empty() || key.len() > MAX_STREAM_KEY_LEN => {
+                return Err(Error::Malformed);
+            }
+            ControlMsg::StreamStatus { destinations } => {
+                let bad_reason = destinations.iter().any(|d| match &d.state {
+                    DestinationState::Failed { reason } => reason.len() > MAX_STREAM_REASON_LEN,
+                    _ => false,
+                });
+                if bad_reason {
+                    return Err(Error::Malformed);
+                }
             }
             _ => {}
         }
@@ -498,6 +638,142 @@ mod tests {
             a.send(m.clone()).unwrap();
         }
         assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
+    }
+
+    #[test]
+    fn stream_messages_round_trip() {
+        let msgs = [
+            ControlMsg::StreamCtl {
+                op: StreamOp::AddDestination {
+                    id: DestinationId(1),
+                    platform: StreamPlatform::Twitch,
+                    key: StreamKey::new("live_1234_secret"),
+                },
+            },
+            ControlMsg::StreamCtl {
+                op: StreamOp::RemoveDestination {
+                    id: DestinationId(1),
+                },
+            },
+            ControlMsg::StreamCtl {
+                op: StreamOp::Start,
+            },
+            ControlMsg::StreamCtl { op: StreamOp::Stop },
+            ControlMsg::StreamStatus {
+                destinations: vec![
+                    DestinationStatus {
+                        id: DestinationId(1),
+                        platform: StreamPlatform::Twitch,
+                        state: DestinationState::Live,
+                        bitrate_kbps: 2_628,
+                        dropped_frames: 0,
+                    },
+                    DestinationStatus {
+                        id: DestinationId(2),
+                        platform: StreamPlatform::YouTube,
+                        state: DestinationState::Failed {
+                            reason: "pusher exited: connection refused".into(),
+                        },
+                        bitrate_kbps: 2_628,
+                        dropped_frames: 3,
+                    },
+                ],
+            },
+        ];
+        for m in &msgs {
+            let bytes = postcard::to_allocvec(m).unwrap();
+            let back: ControlMsg = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(&back, m);
+        }
+        let mut a = ControlLink::new();
+        let mut b = ControlLink::new();
+        for m in &msgs {
+            a.send(m.clone()).unwrap();
+        }
+        assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
+    }
+
+    /// The one property that matters more than the encoding: a stream key
+    /// cannot leak through a log line.
+    #[test]
+    fn stream_key_debug_is_redacted() {
+        let msg = ControlMsg::StreamCtl {
+            op: StreamOp::AddDestination {
+                id: DestinationId(4),
+                platform: StreamPlatform::YouTube,
+                key: StreamKey::new("super-secret-key"),
+            },
+        };
+        let printed = format!("{msg:?}");
+        assert!(!printed.contains("super-secret-key"), "{printed}");
+        assert!(printed.contains("redacted"), "{printed}");
+        // The value is still reachable where it is actually needed.
+        let ControlMsg::StreamCtl {
+            op: StreamOp::AddDestination { key, .. },
+        } = &msg
+        else {
+            unreachable!()
+        };
+        assert_eq!(key.expose(), "super-secret-key");
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_stream_keys() {
+        let mut a = ControlLink::new();
+        for key in [
+            StreamKey::new(""),
+            StreamKey::new("k".repeat(MAX_STREAM_KEY_LEN + 1)),
+        ] {
+            assert!(
+                a.send(ControlMsg::StreamCtl {
+                    op: StreamOp::AddDestination {
+                        id: DestinationId(1),
+                        platform: StreamPlatform::Twitch,
+                        key,
+                    },
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            a.send(ControlMsg::StreamStatus {
+                destinations: vec![DestinationStatus {
+                    id: DestinationId(1),
+                    platform: StreamPlatform::Twitch,
+                    state: DestinationState::Failed {
+                        reason: "x".repeat(MAX_STREAM_REASON_LEN + 1),
+                    },
+                    bitrate_kbps: 0,
+                    dropped_frames: 0,
+                }],
+            })
+            .is_err()
+        );
+    }
+
+    /// Trailing variants must leave every earlier variant's bytes alone:
+    /// postcard writes the variant index as a varint, so appending only
+    /// widens the tag space.
+    #[test]
+    fn appending_stream_variants_left_earlier_encodings_alone() {
+        let earlier = ControlMsg::Chat {
+            from: MemberId(1),
+            text: "hi".into(),
+        };
+        // Chat is variant index 1: tag byte 1, then the payload.
+        let bytes = postcard::to_allocvec(&earlier).unwrap();
+        assert_eq!(bytes[0], 1);
+        // The new variants land last, after AvatarRequest.
+        let ctl = postcard::to_allocvec(&ControlMsg::StreamCtl {
+            op: StreamOp::Start,
+        })
+        .unwrap();
+        assert_eq!(ctl[0], 15);
+        let status = postcard::to_allocvec(&ControlMsg::StreamStatus {
+            destinations: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(status[0], 16);
     }
 
     #[test]

@@ -15,6 +15,7 @@ path = "src/main.rs"
 jamstream-protocol.workspace = true
 jamstream-engine.workspace = true
 jamstream-session.workspace = true
+jamstream-stream.workspace = true
 ed25519-dalek.workspace = true
 data-encoding.workspace = true
 thiserror.workspace = true
@@ -27,3 +28,5 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 jamstream-cloud.workspace = true
+# The stream integration test scans the bytes a member receives.
+postcard.workspace = true

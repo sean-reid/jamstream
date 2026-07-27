@@ -2,7 +2,49 @@
 //! template engine. The rendered YAML is snapshot-tested per self-destruct
 //! variant; change the output and the snapshots must change with it.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::OnceLock;
+
+use serde::Deserialize;
+
+/// Pinned, checksummed static builds of the broadcast subprocesses. See
+/// data/media_artifacts.json for the licensing and refresh notes.
+const MEDIA_ARTIFACTS_JSON: &str = include_str!("../data/media_artifacts.json");
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MediaArtifact {
+    pub url: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MediaTool {
+    pub version: String,
+    pub source: String,
+    pub license: String,
+    /// `tar.xz` or `tar.gz`.
+    pub archive: String,
+    /// Path of the binary inside the archive; may contain a leading wildcard.
+    pub member: String,
+    /// Keyed by `uname -m`: `x86_64`, `aarch64`.
+    pub targets: BTreeMap<String, MediaArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MediaArtifacts {
+    pub ffmpeg: MediaTool,
+    pub mediamtx: MediaTool,
+}
+
+/// The bundled pins. The VM picks its own architecture at boot from
+/// `uname -m`, so provisioning does not have to know it.
+pub fn media_artifacts() -> &'static MediaArtifacts {
+    static PARSED: OnceLock<MediaArtifacts> = OnceLock::new();
+    PARSED.get_or_init(|| {
+        serde_json::from_str(MEDIA_ARTIFACTS_JSON).expect("data/media_artifacts.json is invalid")
+    })
+}
 
 /// How the VM guarantees its own death, per provider capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,12 +171,78 @@ fi
     )
 }
 
+/// Fetches one pinned tool into /usr/local/bin, refusing on a hash mismatch
+/// exactly like the jamstreamd download. The architecture is resolved on the
+/// box, so provisioning stays arch-agnostic.
+fn fetch_media_tool(name: &str, tool: &MediaTool) -> String {
+    let mut cases = String::new();
+    for (arch, artifact) in &tool.targets {
+        let pattern = match arch.as_str() {
+            // uname -m says aarch64 on Linux; accept arm64 too.
+            "aarch64" => "aarch64|arm64",
+            other => other,
+        };
+        let _ = writeln!(
+            cases,
+            "  {pattern}) url=\"{url}\"; sha=\"{sha}\" ;;",
+            url = artifact.url,
+            sha = artifact.sha256,
+        );
+    }
+    let extract = if tool.archive == "tar.xz" {
+        "xJf"
+    } else {
+        "xzf"
+    };
+    let strip = match tool.member.matches('/').count() {
+        0 => String::new(),
+        n => format!(" --strip-components={n}"),
+    };
+    // The GPL obligation only arises for the copyleft one, and the reason it
+    // stays where it is belongs next to the download.
+    let license_note = if tool.license.starts_with("GPL") {
+        "\n# JamStream never links it, only spawns it, which is what keeps the\n# copyleft obligation at the process boundary."
+    } else {
+        ""
+    };
+    format!(
+        "# {name} {version}, {license}. Pinned in data/media_artifacts.json.{license_note}
+# Source: {source}
+case \"$(uname -m)\" in
+{cases}  *) echo \"jamstream: no pinned {name} for $(uname -m)\" >&2; exit 1 ;;
+esac
+curl -fsSL --retry 5 -o \"$tmp/{name}.archive\" \"$url\"
+if ! echo \"$sha  $tmp/{name}.archive\" | sha256sum -c -; then
+  echo \"jamstream: {name} sha256 mismatch, refusing to start\" >&2
+  rm -rf \"$tmp\"
+  exit 1
+fi
+tar -{extract} \"$tmp/{name}.archive\" -C \"$tmp\" --wildcards{strip} '{member}'
+install -m 0755 \"$tmp/{name}\" /usr/local/bin/{name}
+rm -f \"$tmp/{name}.archive\" \"$tmp/{name}\"
+",
+        version = tool.version,
+        license = tool.license,
+        source = tool.source,
+        member = tool.member,
+    )
+}
+
 fn bootstrap_script(cfg: &BootConfig) -> String {
+    let media = media_artifacts();
     format!(
         "#!/bin/sh
 set -eu
 mkdir -p /run/jamstream
 touch /run/jamstream/last-active
+# Stream keys are staged here for the instant it takes to spawn a pusher.
+# /run is tmpfs, so nothing reaches persistent disk.
+mkdir -p /run/jamstream/keys
+chmod 0700 /run/jamstream/keys
+# A pusher's ffmpeg receives its ingest URL on stdin, but execs with it in
+# argv, so hide other processes' command lines from non-root. The VM has no
+# other users; this is the belt.
+mount -o remount,hidepid=2 /proc 2>/dev/null || true
 curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download \"{url}\"
 if ! echo \"{sha}  /usr/local/bin/jamstreamd.download\" | sha256sum -c -; then
   echo \"jamstream: artifact sha256 mismatch, refusing to start\" >&2
@@ -155,12 +263,20 @@ else
   iptables -P INPUT DROP
 fi
 systemctl daemon-reload
+# The session server comes up first: musicians are waiting, and the broadcast
+# tooling is only needed once the host goes live.
 systemctl enable --now jamstreamd.service
 systemctl enable --now jamstream-guard.timer
+# Broadcast subprocesses, pinned and checksummed like everything else.
+tmp=$(mktemp -d)
+{ffmpeg}{mediamtx}rmdir \"$tmp\" 2>/dev/null || true
+systemctl enable --now mediamtx.service
 ",
         url = cfg.artifact_url,
         sha = cfg.artifact_sha256,
         port = cfg.port,
+        ffmpeg = fetch_media_tool("ffmpeg", &media.ffmpeg),
+        mediamtx = fetch_media_tool("mediamtx", &media.mediamtx),
     )
 }
 
@@ -171,6 +287,45 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/jamstreamd --config /etc/jamstream/config
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+";
+
+/// The relay the encoder publishes to and the pushers read from. Bound to
+/// loopback and stripped to one protocol and one path: nothing else has any
+/// business reaching it, and the firewall already denies inbound anyway.
+const MEDIAMTX_CONFIG: &str = "logLevel: warn
+logDestinations: [stdout]
+readTimeout: 10s
+writeTimeout: 10s
+# One RTMP publisher (the encoder) and N local readers (the pushers).
+rtmp: true
+rtmpAddress: 127.0.0.1:1935
+rtmpEncryption: \"no\"
+rtsp: false
+rtsps: false
+hls: false
+webrtc: false
+srt: false
+api: false
+metrics: false
+pprof: false
+playback: false
+paths:
+  jamstream:
+    source: publisher
+";
+
+const MEDIAMTX_UNIT: &str = "[Unit]
+Description=JamStream broadcast relay (MediaMTX)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mediamtx /etc/jamstream/mediamtx.yml
 Restart=on-failure
 RestartSec=2
 
@@ -198,7 +353,7 @@ WantedBy=timers.target
 ";
 
 pub fn render(cfg: &BootConfig) -> String {
-    let files: [(&str, &str, String); 6] = [
+    let files: [(&str, &str, String); 8] = [
         ("/etc/jamstream/config", "0600", cfg.render_flat_config()),
         (
             "/usr/local/sbin/jamstream-self-destruct",
@@ -220,6 +375,16 @@ pub fn render(cfg: &BootConfig) -> String {
             "/etc/systemd/system/jamstream-guard.service",
             "0644",
             GUARD_UNIT.to_owned(),
+        ),
+        (
+            "/etc/jamstream/mediamtx.yml",
+            "0644",
+            MEDIAMTX_CONFIG.to_owned(),
+        ),
+        (
+            "/etc/systemd/system/mediamtx.service",
+            "0644",
+            MEDIAMTX_UNIT.to_owned(),
         ),
     ];
 
@@ -330,6 +495,85 @@ mod tests {
             assert!(out.contains("-ge 43200 ]"));
             assert!(out.contains("systemctl enable --now jamstreamd.service"));
             assert!(out.contains("systemctl enable --now jamstream-guard.timer"));
+        }
+    }
+
+    #[test]
+    fn broadcast_tooling_is_pinned_verified_and_local_only() {
+        let out = render(&base_config(SelfDestruct::AwsShutdown));
+        let media = media_artifacts();
+
+        // Every pinned pair appears, and every one of them is verified with
+        // the same refuse-on-mismatch discipline as jamstreamd.
+        for (name, tool) in [("ffmpeg", &media.ffmpeg), ("mediamtx", &media.mediamtx)] {
+            assert!(!tool.targets.is_empty(), "{name} has no targets");
+            for artifact in tool.targets.values() {
+                assert!(out.contains(&artifact.url), "{name} url missing");
+                assert!(out.contains(&artifact.sha256), "{name} sha missing");
+            }
+            assert!(out.contains(&format!(
+                "jamstream: {name} sha256 mismatch, refusing to start"
+            )));
+            assert!(out.contains(&format!("/usr/local/bin/{name}")));
+        }
+        // Both architectures are selected on the box, not at provision time.
+        assert!(out.contains("case \"$(uname -m)\" in"));
+        assert!(out.contains("x86_64)"));
+        assert!(out.contains("aarch64|arm64)"));
+
+        // The relay listens on loopback only and serves exactly one path.
+        assert!(out.contains("rtmpAddress: 127.0.0.1:1935"));
+        assert!(out.contains("    source: publisher"));
+        assert!(out.contains("api: false"));
+        assert!(out.contains("systemctl enable --now mediamtx.service"));
+        // The session server is up before the broadcast tooling downloads.
+        let jamstreamd = out.find("enable --now jamstreamd.service").unwrap();
+        let ffmpeg = out.find("ffmpeg.archive").unwrap();
+        assert!(
+            jamstreamd < ffmpeg,
+            "the session waits on a 100 MB download"
+        );
+
+        // Key staging is root-only tmpfs, and other processes' argv is hidden.
+        assert!(out.contains("mkdir -p /run/jamstream/keys"));
+        assert!(out.contains("chmod 0700 /run/jamstream/keys"));
+        assert!(out.contains("hidepid=2"));
+
+        // The GPL note travels with the copyleft artifact and only that one.
+        assert!(media.ffmpeg.license.starts_with("GPL"));
+        assert_eq!(media.mediamtx.license, "MIT");
+        assert_eq!(
+            out.matches("copyleft obligation at the process boundary")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pinned_media_urls_are_immutable_and_hashes_well_formed() {
+        let media = media_artifacts();
+        for tool in [&media.ffmpeg, &media.mediamtx] {
+            for (arch, artifact) in &tool.targets {
+                assert!(
+                    artifact.sha256.len() == 64
+                        && artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{arch} sha256 is not 64 hex digits"
+                );
+                assert!(artifact.url.starts_with("https://"), "{arch} url not https");
+                // A moving URL under a fixed path would turn every later boot
+                // into a hash mismatch.
+                for moving in ["latest/", "-release-", "/release/"] {
+                    assert!(
+                        !artifact.url.contains(moving),
+                        "{arch} url looks mutable: {}",
+                        artifact.url
+                    );
+                }
+                assert!(
+                    artifact.url.contains(&tool.version) || tool.version.contains('-'),
+                    "{arch} url does not name the pinned version"
+                );
+            }
         }
     }
 }

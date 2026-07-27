@@ -47,6 +47,14 @@ write_files:
       set -eu
       mkdir -p /run/jamstream
       touch /run/jamstream/last-active
+      # Stream keys are staged here for the instant it takes to spawn a pusher.
+      # /run is tmpfs, so nothing reaches persistent disk.
+      mkdir -p /run/jamstream/keys
+      chmod 0700 /run/jamstream/keys
+      # A pusher's ffmpeg receives its ingest URL on stdin, but execs with it in
+      # argv, so hide other processes' command lines from non-root. The VM has no
+      # other users; this is the belt.
+      mount -o remount,hidepid=2 /proc 2>/dev/null || true
       curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download "https://github.com/sean-reid/jamstream/releases/download/v0.1.0/jamstreamd-x86_64-unknown-linux-musl"
       if ! echo "0f2e5c1d3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d  /usr/local/bin/jamstreamd.download" | sha256sum -c -; then
         echo "jamstream: artifact sha256 mismatch, refusing to start" >&2
@@ -67,8 +75,48 @@ write_files:
         iptables -P INPUT DROP
       fi
       systemctl daemon-reload
+      # The session server comes up first: musicians are waiting, and the broadcast
+      # tooling is only needed once the host goes live.
       systemctl enable --now jamstreamd.service
       systemctl enable --now jamstream-guard.timer
+      # Broadcast subprocesses, pinned and checksummed like everything else.
+      tmp=$(mktemp -d)
+      # ffmpeg n7.1.5-10-g2aefd64d48, GPL-3.0-or-later. Pinned in data/media_artifacts.json.
+      # JamStream never links it, only spawns it, which is what keeps the
+      # copyleft obligation at the process boundary.
+      # Source: https://github.com/BtbN/FFmpeg-Builds (autobuild-2026-07-26-13-28, gpl, non-shared)
+      case "$(uname -m)" in
+        aarch64|arm64) url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-26-13-28/ffmpeg-n7.1.5-10-g2aefd64d48-linuxarm64-gpl-7.1.tar.xz"; sha="b803fab318029e530ecd4859013ffbd743a549d0ee4e1bced5e5c3be59bf11e3" ;;
+        x86_64) url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-26-13-28/ffmpeg-n7.1.5-10-g2aefd64d48-linux64-gpl-7.1.tar.xz"; sha="92f7ca590bb4cc17e596c4a9747e3c85d7456fde7bf6e297c48640b471be8f74" ;;
+        *) echo "jamstream: no pinned ffmpeg for $(uname -m)" >&2; exit 1 ;;
+      esac
+      curl -fsSL --retry 5 -o "$tmp/ffmpeg.archive" "$url"
+      if ! echo "$sha  $tmp/ffmpeg.archive" | sha256sum -c -; then
+        echo "jamstream: ffmpeg sha256 mismatch, refusing to start" >&2
+        rm -rf "$tmp"
+        exit 1
+      fi
+      tar -xJf "$tmp/ffmpeg.archive" -C "$tmp" --wildcards --strip-components=2 '*/bin/ffmpeg'
+      install -m 0755 "$tmp/ffmpeg" /usr/local/bin/ffmpeg
+      rm -f "$tmp/ffmpeg.archive" "$tmp/ffmpeg"
+      # mediamtx v1.19.3, MIT. Pinned in data/media_artifacts.json.
+      # Source: https://github.com/bluenviron/mediamtx/releases/tag/v1.19.3
+      case "$(uname -m)" in
+        aarch64|arm64) url="https://github.com/bluenviron/mediamtx/releases/download/v1.19.3/mediamtx_v1.19.3_linux_arm64.tar.gz"; sha="9e5b38a5b5fcab1916341b024031b2fc5dc6a2059baed9ba3f3b0d3768d231a8" ;;
+        x86_64) url="https://github.com/bluenviron/mediamtx/releases/download/v1.19.3/mediamtx_v1.19.3_linux_amd64.tar.gz"; sha="a7ba21268fccda3ebc43fdad76b87fddb85ce77e725b5cb637bca724b5394fbe" ;;
+        *) echo "jamstream: no pinned mediamtx for $(uname -m)" >&2; exit 1 ;;
+      esac
+      curl -fsSL --retry 5 -o "$tmp/mediamtx.archive" "$url"
+      if ! echo "$sha  $tmp/mediamtx.archive" | sha256sum -c -; then
+        echo "jamstream: mediamtx sha256 mismatch, refusing to start" >&2
+        rm -rf "$tmp"
+        exit 1
+      fi
+      tar -xzf "$tmp/mediamtx.archive" -C "$tmp" --wildcards 'mediamtx'
+      install -m 0755 "$tmp/mediamtx" /usr/local/bin/mediamtx
+      rm -f "$tmp/mediamtx.archive" "$tmp/mediamtx"
+      rmdir "$tmp" 2>/dev/null || true
+      systemctl enable --now mediamtx.service
   - path: /etc/systemd/system/jamstreamd.service
     owner: root:root
     permissions: "0644"
@@ -95,6 +143,46 @@ write_files:
       [Service]
       Type=oneshot
       ExecStart=/usr/local/sbin/jamstream-guard
+  - path: /etc/jamstream/mediamtx.yml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      logLevel: warn
+      logDestinations: [stdout]
+      readTimeout: 10s
+      writeTimeout: 10s
+      # One RTMP publisher (the encoder) and N local readers (the pushers).
+      rtmp: true
+      rtmpAddress: 127.0.0.1:1935
+      rtmpEncryption: "no"
+      rtsp: false
+      rtsps: false
+      hls: false
+      webrtc: false
+      srt: false
+      api: false
+      metrics: false
+      pprof: false
+      playback: false
+      paths:
+        jamstream:
+          source: publisher
+  - path: /etc/systemd/system/mediamtx.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=JamStream broadcast relay (MediaMTX)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      ExecStart=/usr/local/bin/mediamtx /etc/jamstream/mediamtx.yml
+      Restart=on-failure
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
   - path: /etc/systemd/system/jamstream-guard.timer
     owner: root:root
     permissions: "0644"

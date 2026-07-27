@@ -17,7 +17,7 @@ pub mod sweeper;
 pub mod types;
 
 pub use artifact::{PinnedServerArtifact, pinned};
-pub use cloudinit::{BootConfig, SelfDestruct};
+pub use cloudinit::{BootConfig, MediaArtifact, MediaArtifacts, MediaTool, SelfDestruct};
 pub use contract::assert_provider_contract;
 pub use cost::{CostPreview, LineItem};
 pub use mock::MockProvider;

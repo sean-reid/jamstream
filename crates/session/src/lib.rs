@@ -17,7 +17,9 @@ pub use limits::{
     DEFAULT_HOURS, DEFAULT_IDLE_MIN, DEFAULT_LISTENERS, DEFAULT_MAX_HOURS,
     DEFAULT_MEMBER_TIMEOUT_MS, DEFAULT_MUSICIANS, MAX_LISTENERS, MAX_MUSICIANS,
 };
-pub use server::{MemberStats, ServerConfig, ServerCore, ServerEvent};
+pub use server::{
+    BroadcastMember, BroadcastTick, MemberStats, ServerConfig, ServerCore, ServerEvent,
+};
 
 /// Errors surfaced by client-side calls; the cores otherwise swallow bad
 /// input from the network by design.
