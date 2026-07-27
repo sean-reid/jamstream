@@ -87,8 +87,11 @@ jobs:
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/jamstreamd
           file "$BIN" | grep -q 'static'
-          if ldd "$BIN"; then
-            echo "jamstreamd is dynamically linked" >&2
+          # A truly static binary has no NEEDED shared-library entries.
+          # (ldd is useless here: it exits zero on static-pie binaries.)
+          if readelf -d "$BIN" | grep -q 'NEEDED'; then
+            echo "jamstreamd links shared libraries:" >&2
+            readelf -d "$BIN" | grep 'NEEDED' >&2
             exit 1
           fi
       # Two shapes of the same binary: the BARE binary is what cloud-init
