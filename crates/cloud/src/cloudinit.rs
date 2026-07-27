@@ -12,6 +12,22 @@ use serde::Deserialize;
 /// data/media_artifacts.json for the licensing and refresh notes.
 const MEDIA_ARTIFACTS_JSON: &str = include_str!("../data/media_artifacts.json");
 
+/// Unprivileged system account both long-running services run as.
+const SERVICE_USER: &str = "jamstream";
+
+/// tmpfs working directory: the activity file the guard reads, the staged
+/// stream keys, and the guard's own uptime bookkeeping.
+const RUN_DIR: &str = "/run/jamstream";
+
+/// The link-local metadata address. All three providers serve user-data
+/// here over plain HTTP: AWS at /latest/user-data, DigitalOcean at
+/// /metadata/v1/user-data, and GCP behind metadata.google.internal, which
+/// resolves to this same address.
+const METADATA_V4: &str = "169.254.169.254";
+
+/// AWS also serves IMDS over IPv6 on dual-stack instances.
+const METADATA_V6: &str = "fd00:ec2::254";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MediaArtifact {
     pub url: String,
@@ -155,19 +171,90 @@ fn guard_script(cfg: &BootConfig) -> String {
 # Dead man's switch. jamstreamd touches /run/jamstream/last-active while
 # musicians are connected; staleness past the idle window, or exceeding the
 # session hard cap, triggers self-destruct.
+#
+# Both windows are measured in uptime seconds, never wall clock. A cloud VM
+# routinely boots with a wrong hardware clock and takes a large NTP step a
+# minute later; a wall-clock idle window reads that step as a dead session
+# and destroys a VM with musicians playing on it.
 set -eu
-now=$(date +%s)
-boot=$((now - $(cut -d. -f1 /proc/uptime)))
-last=$(stat -c %Y /run/jamstream/last-active 2>/dev/null || echo \"$boot\")
-if [ $((now - last)) -ge {idle_secs} ]; then
-  exec /usr/local/sbin/jamstream-self-destruct \"idle for $((now - last))s\"
+up=$(cut -d. -f1 /proc/uptime)
+stamp=$(stat -c %Y /run/jamstream/last-active 2>/dev/null || echo none)
+# The mtime is only ever compared for equality, so no clock step can fake
+# activity or hide it. What the idle window measures is the uptime at which
+# the mtime last changed.
+if [ \"$stamp\" != \"$(cat {state}/guard-stamp 2>/dev/null || echo none)\" ]; then
+  printf '%s\\n' \"$stamp\" > {state}/guard-stamp
+  printf '%s\\n' \"$up\" > {state}/guard-active-up
 fi
-if [ $((now - boot)) -ge {max_secs} ]; then
+active_up=$(cat {state}/guard-active-up 2>/dev/null || echo 0)
+idle=$((up - active_up))
+if [ \"$idle\" -ge {idle_secs} ]; then
+  exec /usr/local/sbin/jamstream-self-destruct \"idle for ${{idle}}s\"
+fi
+if [ \"$up\" -ge {max_secs} ]; then
   exec /usr/local/sbin/jamstream-self-destruct \"max session duration reached\"
 fi
 ",
+        state = RUN_DIR,
         idle_secs = cfg.idle_shutdown_min as u64 * 60,
         max_secs = cfg.max_duration_min as u64 * 60,
+    )
+}
+
+/// Packet filter for the session VM: only the session UDP port is
+/// reachable, and only root may talk to the cloud metadata service.
+///
+/// This lives in its own script rather than inline in the bootstrap
+/// because a reboot loses the rules while jamstreamd.service stays
+/// enabled, so `jamstream-firewall.service` runs it again before the
+/// server comes back up.
+fn firewall_script(cfg: &BootConfig) -> String {
+    format!(
+        "#!/bin/sh
+set -eu
+# Flushing first makes this idempotent: bootstrap runs it once and the
+# oneshot unit runs it again after every reboot.
+for ipt in iptables ip6tables; do
+  command -v \"$ipt\" >/dev/null 2>&1 || {{
+    echo \"jamstream: no $ipt on this image, no in-guest packet filter\" >&2
+    continue
+  }}
+  \"$ipt\" -F INPUT
+  \"$ipt\" -F OUTPUT
+  \"$ipt\" -A INPUT -i lo -j ACCEPT
+  \"$ipt\" -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  \"$ipt\" -A INPUT -p udp --dport {port} -j ACCEPT
+  # ICMPv6 carries path MTU discovery and neighbour discovery; dropping it
+  # breaks IPv6 rather than hardening it.
+  if [ \"$ipt\" = ip6tables ]; then
+    \"$ipt\" -A INPUT -p ipv6-icmp -j ACCEPT
+  fi
+  \"$ipt\" -P INPUT DROP
+done
+# The server private key and, on DigitalOcean, the API token arrive as
+# user-data, which the metadata service hands to anything that asks over
+# plain HTTP with no credential. jamstreamd runs as the unprivileged
+# jamstream user, so restricting the metadata address to uid 0 puts those
+# secrets out of reach of the process that parses untrusted UDP. cloud-init
+# and the self-destruct script are root and keep their access.
+for md in {metadata_v4} {metadata_v6}; do
+  case \"$md\" in
+    *:*) ipt=ip6tables ;;
+    *) ipt=iptables ;;
+  esac
+  command -v \"$ipt\" >/dev/null 2>&1 || continue
+  # The owner match needs xt_owner. Where it is missing the rule is
+  # refused, and saying so beats silently leaving the door open.
+  if \"$ipt\" -A OUTPUT -d \"$md\" -m owner --uid-owner 0 -j ACCEPT 2>/dev/null; then
+    \"$ipt\" -A OUTPUT -d \"$md\" -j REJECT
+  else
+    echo \"jamstream: no owner match for $md, metadata stays world-readable\" >&2
+  fi
+done
+",
+        port = cfg.port,
+        metadata_v4 = METADATA_V4,
+        metadata_v6 = METADATA_V6,
     )
 }
 
@@ -214,7 +301,6 @@ esac
 curl -fsSL --retry 5 -o \"$tmp/{name}.archive\" \"$url\"
 if ! echo \"$sha  $tmp/{name}.archive\" | sha256sum -c -; then
   echo \"jamstream: {name} sha256 mismatch, refusing to start\" >&2
-  rm -rf \"$tmp\"
   exit 1
 fi
 tar -{extract} \"$tmp/{name}.archive\" -C \"$tmp\" --wildcards{strip} '{member}'
@@ -229,20 +315,40 @@ rm -f \"$tmp/{name}.archive\" \"$tmp/{name}\"
 }
 
 fn bootstrap_script(cfg: &BootConfig) -> String {
-    let media = media_artifacts();
     format!(
         "#!/bin/sh
 set -eu
-mkdir -p /run/jamstream
-touch /run/jamstream/last-active
+# Everything below can fail: a GitHub 503 past --retry 5 is enough. A VM
+# that cannot finish bootstrapping has no server and no way to be told to
+# stop, so it bills until a human notices. This trap and the guard timer
+# below are what make every other failure in this script survivable.
+trap 'rc=$?; [ \"$rc\" -eq 0 ] || /usr/local/sbin/jamstream-self-destruct \"bootstrap failed with status $rc\"' EXIT
+
+# jamstreamd parses unauthenticated UDP and hands the bytes to libopus, so
+# it does not run as root. The config holds the server private key and stays
+# unreadable to everything but root and this account.
+id {user} >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin {user}
+chgrp {user} /etc/jamstream/config
+chmod 0640 /etc/jamstream/config
+install -d -o {user} -g {user} -m 0750 {run}
+# jamstreamd updates this file's mtime while musicians are connected and the
+# guard reads it, so the server has to own it.
+install -o {user} -g {user} -m 0644 /dev/null {run}/last-active
 # Stream keys are staged here for the instant it takes to spawn a pusher.
 # /run is tmpfs, so nothing reaches persistent disk.
-mkdir -p /run/jamstream/keys
-chmod 0700 /run/jamstream/keys
+install -d -o {user} -g {user} -m 0700 {run}/keys
 # A pusher's ffmpeg receives its ingest URL on stdin, but execs with it in
 # argv, so hide other processes' command lines from non-root. The VM has no
 # other users; this is the belt.
 mount -o remount,hidepid=2 /proc 2>/dev/null || true
+
+systemctl daemon-reload
+# The firewall and the dead man's switch go in before anything that can
+# fail. In the other order a failed download leaves a VM with provider
+# default networking, no idle window, and no hard cap.
+systemctl enable --now jamstream-firewall.service
+systemctl enable --now jamstream-guard.timer
+
 curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download \"{url}\"
 if ! echo \"{sha}  /usr/local/bin/jamstreamd.download\" | sha256sum -c -; then
   echo \"jamstream: artifact sha256 mismatch, refusing to start\" >&2
@@ -251,52 +357,104 @@ if ! echo \"{sha}  /usr/local/bin/jamstreamd.download\" | sha256sum -c -; then
 fi
 mv /usr/local/bin/jamstreamd.download /usr/local/bin/jamstreamd
 chmod 0755 /usr/local/bin/jamstreamd
-# Only the session UDP port is reachable from outside.
-if command -v ufw >/dev/null 2>&1; then
-  ufw default deny incoming
-  ufw allow {port}/udp
-  ufw --force enable
-else
-  iptables -A INPUT -i lo -j ACCEPT
-  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A INPUT -p udp --dport {port} -j ACCEPT
-  iptables -P INPUT DROP
-fi
-systemctl daemon-reload
 # The session server comes up first: musicians are waiting, and the broadcast
 # tooling is only needed once the host goes live.
 systemctl enable --now jamstreamd.service
-systemctl enable --now jamstream-guard.timer
-# Broadcast subprocesses, pinned and checksummed like everything else.
-tmp=$(mktemp -d)
-{ffmpeg}{mediamtx}rmdir \"$tmp\" 2>/dev/null || true
-systemctl enable --now mediamtx.service
+
+# A session runs fine with no broadcast tooling, so a failed fetch warns
+# instead of taking a working VM down with it.
+if /usr/local/sbin/jamstream-media; then
+  systemctl enable --now mediamtx.service
+else
+  echo \"jamstream: broadcast tooling unavailable, session continues without it\" >&2
+fi
 ",
         url = cfg.artifact_url,
         sha = cfg.artifact_sha256,
-        port = cfg.port,
+        user = SERVICE_USER,
+        run = RUN_DIR,
+    )
+}
+
+/// Fetches the pinned broadcast subprocesses. Separate from the bootstrap
+/// because the bootstrap runs it as an `if` condition, and a shell ignores
+/// `set -e` inside a condition: as its own process it still aborts on the
+/// first failed download.
+fn media_script() -> String {
+    let media = media_artifacts();
+    format!(
+        "#!/bin/sh
+set -eu
+tmp=$(mktemp -d)
+trap 'rm -rf \"$tmp\"' EXIT
+{ffmpeg}{mediamtx}",
         ffmpeg = fetch_media_tool("ffmpeg", &media.ffmpeg),
         mediamtx = fetch_media_tool("mediamtx", &media.mediamtx),
     )
 }
 
-const JAMSTREAMD_UNIT: &str = "[Unit]
-Description=JamStream session server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/jamstreamd --config /etc/jamstream/config
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
+/// Hardening common to both long-running services. jamstreamd is the one
+/// that matters (it is the process reachable from the internet), and
+/// MediaMTX gets the same treatment because leaving it as root while
+/// hardening its sibling protects nothing.
+const SERVICE_HARDENING: &str = "NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+LimitCORE=0
 ";
 
+fn jamstreamd_unit(cfg: &BootConfig) -> String {
+    format!(
+        "[Unit]
+Description=JamStream session server
+After=network-online.target jamstream-firewall.service
+Wants=network-online.target
+Requires=jamstream-firewall.service
+
+[Service]
+User={user}
+Group={user}
+# The guard is the cap that actually destroys the VM. These two make the
+# server stop serving on its own if the guard ever stops running.
+ExecStart=/usr/local/bin/jamstreamd --config /etc/jamstream/config \
+--idle-exit-min {idle_min} --max-duration-min {max_min}
+Restart=on-failure
+RestartSec=2
+ReadWritePaths={run}
+# The encoder and one RTMP pusher per destination are children in this
+# cgroup, on a 2 GB instance shared with MediaMTX and the OS. A memory
+# exhaustion bug in the packet path costs a restart instead of the session.
+MemoryMax=1500M
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+{hardening}
+[Install]
+WantedBy=multi-user.target
+",
+        user = SERVICE_USER,
+        run = RUN_DIR,
+        idle_min = cfg.idle_shutdown_min,
+        max_min = cfg.max_duration_min,
+        hardening = SERVICE_HARDENING,
+    )
+}
+
 /// The relay the encoder publishes to and the pushers read from. Bound to
-/// loopback and stripped to one protocol and one path: nothing else has any
-/// business reaching it, and the firewall already denies inbound anyway.
+/// loopback and stripped to one protocol and one path. The loopback bind is
+/// what keeps it off the internet: the packet filter is a second gate that
+/// is not up during early boot, and it is not there to make a listener on
+/// 0.0.0.0 safe.
 const MEDIAMTX_CONFIG: &str = "logLevel: warn
 logDestinations: [stdout]
 readTimeout: 10s
@@ -319,15 +477,45 @@ paths:
     source: publisher
 ";
 
-const MEDIAMTX_UNIT: &str = "[Unit]
+fn mediamtx_unit() -> String {
+    format!(
+        "[Unit]
 Description=JamStream broadcast relay (MediaMTX)
-After=network-online.target
+After=network-online.target jamstream-firewall.service
 Wants=network-online.target
+Requires=jamstream-firewall.service
 
 [Service]
+User={user}
+Group={user}
 ExecStart=/usr/local/bin/mediamtx /etc/jamstream/mediamtx.yml
 Restart=on-failure
 RestartSec=2
+MemoryMax=256M
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+{hardening}
+[Install]
+WantedBy=multi-user.target
+",
+        user = SERVICE_USER,
+        hardening = SERVICE_HARDENING,
+    )
+}
+
+const FIREWALL_UNIT: &str = "[Unit]
+Description=JamStream host firewall
+# A reboot loses the rules while jamstreamd.service stays enabled, so they
+# go back in before the network and before the server.
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target jamstreamd.service mediamtx.service shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/jamstream-firewall
 
 [Install]
 WantedBy=multi-user.target
@@ -335,6 +523,9 @@ WantedBy=multi-user.target
 
 const GUARD_UNIT: &str = "[Unit]
 Description=JamStream dead man's switch
+# A guard that cannot run is a VM with no cap on it at all, so a failed run
+# destroys the VM rather than logging and shrugging.
+OnFailure=jamstream-self-destruct.service
 
 [Service]
 Type=oneshot
@@ -352,8 +543,18 @@ OnUnitActiveSec=1min
 WantedBy=timers.target
 ";
 
+const SELF_DESTRUCT_UNIT: &str = "[Unit]
+Description=JamStream self-destruct
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/jamstream-self-destruct \"dead man's switch failed\"
+";
+
 pub fn render(cfg: &BootConfig) -> String {
-    let files: [(&str, &str, String); 8] = [
+    let files: Vec<(&str, &str, String)> = vec![
+        // Written root-only; the bootstrap hands the group to the service
+        // account once that account exists.
         ("/etc/jamstream/config", "0600", cfg.render_flat_config()),
         (
             "/usr/local/sbin/jamstream-self-destruct",
@@ -362,6 +563,12 @@ pub fn render(cfg: &BootConfig) -> String {
         ),
         ("/usr/local/sbin/jamstream-guard", "0700", guard_script(cfg)),
         (
+            "/usr/local/sbin/jamstream-firewall",
+            "0700",
+            firewall_script(cfg),
+        ),
+        ("/usr/local/sbin/jamstream-media", "0700", media_script()),
+        (
             "/usr/local/sbin/jamstream-bootstrap",
             "0700",
             bootstrap_script(cfg),
@@ -369,12 +576,27 @@ pub fn render(cfg: &BootConfig) -> String {
         (
             "/etc/systemd/system/jamstreamd.service",
             "0644",
-            JAMSTREAMD_UNIT.to_owned(),
+            jamstreamd_unit(cfg),
+        ),
+        (
+            "/etc/systemd/system/jamstream-firewall.service",
+            "0644",
+            FIREWALL_UNIT.to_owned(),
         ),
         (
             "/etc/systemd/system/jamstream-guard.service",
             "0644",
             GUARD_UNIT.to_owned(),
+        ),
+        (
+            "/etc/systemd/system/jamstream-guard.timer",
+            "0644",
+            GUARD_TIMER.to_owned(),
+        ),
+        (
+            "/etc/systemd/system/jamstream-self-destruct.service",
+            "0644",
+            SELF_DESTRUCT_UNIT.to_owned(),
         ),
         (
             "/etc/jamstream/mediamtx.yml",
@@ -384,7 +606,7 @@ pub fn render(cfg: &BootConfig) -> String {
         (
             "/etc/systemd/system/mediamtx.service",
             "0644",
-            MEDIAMTX_UNIT.to_owned(),
+            mediamtx_unit(),
         ),
     ];
 
@@ -396,11 +618,6 @@ pub fn render(cfg: &BootConfig) -> String {
             indent(&content, 6)
         );
     }
-    let _ = write!(
-        out,
-        "  - path: /etc/systemd/system/jamstream-guard.timer\n    owner: root:root\n    permissions: \"0644\"\n    content: |\n{}",
-        indent(GUARD_TIMER, 6)
-    );
     out.push_str("runcmd:\n  - [/usr/local/sbin/jamstream-bootstrap]\n");
     out
 }
@@ -466,36 +683,196 @@ mod tests {
         assert!(out.contains("Metadata-Flavor: Google"));
     }
 
-    #[test]
-    fn rendered_invariants() {
-        for sd in [
+    /// The three self-destruct variants, for tests that must hold for all
+    /// of them.
+    fn all_variants() -> [SelfDestruct; 3] {
+        [
             SelfDestruct::AwsShutdown,
             SelfDestruct::ApiToken {
                 endpoint: "https://api.digitalocean.com/v2/droplets".to_owned(),
                 token: "t".to_owned(),
             },
             SelfDestruct::GcpMaxRunDuration,
-        ] {
+        ]
+    }
+
+    /// Byte offset of `needle`, or a panic naming what was missing.
+    fn at(out: &str, needle: &str) -> usize {
+        out.find(needle)
+            .unwrap_or_else(|| panic!("rendered user-data has no {needle:?}"))
+    }
+
+    #[test]
+    fn rendered_invariants() {
+        for sd in all_variants() {
             let cfg = base_config(sd);
             let out = render(&cfg);
             assert!(out.starts_with("#cloud-config\n"));
-            // Secrets file is root-only.
+            // Secrets file is written root-only, then handed to the service
+            // account's group and nobody else.
             assert!(out.contains(
                 "path: /etc/jamstream/config\n    owner: root:root\n    permissions: \"0600\""
             ));
+            assert!(out.contains("chgrp jamstream /etc/jamstream/config"));
+            assert!(out.contains("chmod 0640 /etc/jamstream/config"));
             // Refuses to start on artifact hash mismatch.
             assert!(out.contains("sha256sum -c -"));
             assert!(out.contains("refusing to start"));
             assert!(out.contains(&cfg.artifact_sha256));
-            // Firewall opens only the session UDP port.
-            assert!(out.contains("ufw allow 43210/udp"));
-            assert!(out.contains("--dport 43210 -j ACCEPT"));
+            // Only the session UDP port is reachable, over both families.
+            assert!(out.contains("-A INPUT -p udp --dport 43210 -j ACCEPT"));
+            assert!(out.contains("for ipt in iptables ip6tables; do"));
+            assert!(out.contains("\"$ipt\" -P INPUT DROP"));
             // Guard thresholds in seconds.
             assert!(out.contains("-ge 600 ]"));
             assert!(out.contains("-ge 43200 ]"));
             assert!(out.contains("systemctl enable --now jamstreamd.service"));
             assert!(out.contains("systemctl enable --now jamstream-guard.timer"));
         }
+    }
+
+    /// The ordering defect this test exists for: the firewall and the dead
+    /// man's switch used to be the last two steps of the bootstrap, so any
+    /// earlier failure (a checksum mismatch, a GitHub 503 past --retry 5)
+    /// left a VM with provider default networking and no cap on its life.
+    #[test]
+    fn guard_and_firewall_are_armed_before_anything_can_fail() {
+        for sd in all_variants() {
+            let cfg = base_config(sd);
+            // Order is a property of the bootstrap script, not of the order
+            // cloud-init happens to write the files in.
+            let script = bootstrap_script(&cfg);
+            let trap = at(&script, "trap 'rc=$?;");
+            let firewall = at(&script, "systemctl enable --now jamstream-firewall.service");
+            let guard = at(&script, "systemctl enable --now jamstream-guard.timer");
+            let download = at(&script, "-o /usr/local/bin/jamstreamd.download");
+            let media = at(&script, "/usr/local/sbin/jamstream-media");
+
+            assert!(trap < firewall, "the trap must cover the firewall step too");
+            assert!(
+                firewall < download && guard < download,
+                "firewall and guard must be installed before the download"
+            );
+            assert!(download < media, "jamstreamd downloads before the encoder");
+            // A failed bootstrap ends in a destroyed VM, not an idle bill.
+            let out = render(&cfg);
+            assert!(out.contains("jamstream-self-destruct \"bootstrap failed with status $rc\""));
+            // The broadcast tools are the one part a session can live
+            // without, so their failure must not trip the trap.
+            assert!(out.contains("session continues without it"));
+        }
+    }
+
+    /// #42: the process that parses unauthenticated UDP does not run as
+    /// root, cannot gain privileges, and cannot eat the whole instance.
+    #[test]
+    fn jamstreamd_runs_unprivileged_and_confined() {
+        let out = render(&base_config(SelfDestruct::AwsShutdown));
+        assert!(out.contains("useradd --system --no-create-home"));
+        for setting in [
+            "User=jamstream",
+            "NoNewPrivileges=yes",
+            "CapabilityBoundingSet=\n",
+            "ProtectSystem=strict",
+            "PrivateTmp=yes",
+            "SystemCallFilter=@system-service",
+            "MemoryMax=1500M",
+            "LimitCORE=0",
+            "ReadWritePaths=/run/jamstream",
+        ] {
+            assert!(out.contains(setting), "jamstreamd unit lacks {setting}");
+        }
+        // The in-process windows match the guard's, so a dead guard still
+        // ends with the server refusing to serve.
+        assert!(out.contains("--idle-exit-min 10 --max-duration-min 720"));
+        // ProtectSystem=strict would make the tmpfs work directory
+        // read-only without this, and the guard reads the file the server
+        // has to be able to touch.
+        assert!(out.contains(
+            "install -o jamstream -g jamstream -m 0644 /dev/null /run/jamstream/last-active"
+        ));
+    }
+
+    /// #52: neither window may be derived from the wall clock. A VM whose
+    /// hardware clock is wrong at boot takes an NTP step minutes later, and
+    /// a wall-clock idle window reads that step as an empty session.
+    #[test]
+    fn guard_windows_are_uptime_derived() {
+        let out = render(&base_config(SelfDestruct::GcpMaxRunDuration));
+        assert!(!out.contains("date +%s"), "guard is back on the wall clock");
+        assert!(out.contains("up=$(cut -d. -f1 /proc/uptime)"));
+        assert!(out.contains("idle=$((up - active_up))"));
+        // The mtime is compared for equality only, never subtracted.
+        assert!(out.contains("stamp=$(stat -c %Y /run/jamstream/last-active"));
+        assert!(!out.contains("now - last"));
+        // A guard that cannot run destroys the VM instead of logging.
+        assert!(out.contains("OnFailure=jamstream-self-destruct.service"));
+        assert!(out.contains("path: /etc/systemd/system/jamstream-self-destruct.service"));
+    }
+
+    /// #41, the half of it that lives in the guest: user-data holds the
+    /// server private key and, on DigitalOcean, an account API token, and
+    /// the metadata service hands user-data to any process that asks.
+    #[test]
+    fn metadata_service_is_root_only() {
+        for sd in all_variants() {
+            let out = render(&base_config(sd));
+            assert!(out.contains("-d \"$md\" -m owner --uid-owner 0 -j ACCEPT"));
+            assert!(out.contains("-d \"$md\" -j REJECT"));
+            assert!(out.contains("for md in 169.254.169.254 fd00:ec2::254; do"));
+        }
+    }
+
+    /// Nothing else here catches a shell syntax error, and a broken
+    /// bootstrap script on the VM shows up as a session that never answers.
+    /// `sh -n` parses without executing; the runners that have a shell run
+    /// this, which is every OS in the matrix except Windows.
+    #[cfg(unix)]
+    #[test]
+    fn rendered_scripts_parse_as_posix_shell() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        for sd in all_variants() {
+            let cfg = base_config(sd);
+            let scripts = [
+                ("self-destruct", self_destruct_script(&cfg)),
+                ("guard", guard_script(&cfg)),
+                ("firewall", firewall_script(&cfg)),
+                ("media", media_script()),
+                ("bootstrap", bootstrap_script(&cfg)),
+            ];
+            for (name, script) in scripts {
+                let mut child = Command::new("sh")
+                    .arg("-n")
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .expect("spawn sh");
+                child
+                    .stdin
+                    .take()
+                    .expect("sh stdin")
+                    .write_all(script.as_bytes())
+                    .expect("write script");
+                let status = child.wait().expect("wait for sh");
+                assert!(status.success(), "{name} script is not valid shell");
+            }
+        }
+    }
+
+    /// The rules go back in after a reboot, which the old inline iptables
+    /// block never did: nothing persisted them and jamstreamd.service came
+    /// straight back up.
+    #[test]
+    fn firewall_survives_a_reboot() {
+        let out = render(&base_config(SelfDestruct::AwsShutdown));
+        assert!(out.contains("path: /usr/local/sbin/jamstream-firewall"));
+        assert!(out.contains("path: /etc/systemd/system/jamstream-firewall.service"));
+        assert!(out.contains("Before=network-pre.target jamstreamd.service"));
+        assert!(out.contains("Requires=jamstream-firewall.service"));
+        // Rerunning the script must not stack duplicate rules.
+        assert!(out.contains("\"$ipt\" -F INPUT"));
+        assert!(out.contains("\"$ipt\" -F OUTPUT"));
     }
 
     #[test]
@@ -527,16 +904,17 @@ mod tests {
         assert!(out.contains("api: false"));
         assert!(out.contains("systemctl enable --now mediamtx.service"));
         // The session server is up before the broadcast tooling downloads.
-        let jamstreamd = out.find("enable --now jamstreamd.service").unwrap();
-        let ffmpeg = out.find("ffmpeg.archive").unwrap();
+        let script = bootstrap_script(&base_config(SelfDestruct::AwsShutdown));
+        let jamstreamd = at(&script, "enable --now jamstreamd.service");
+        let ffmpeg = at(&script, "/usr/local/sbin/jamstream-media");
         assert!(
             jamstreamd < ffmpeg,
             "the session waits on a 100 MB download"
         );
 
-        // Key staging is root-only tmpfs, and other processes' argv is hidden.
-        assert!(out.contains("mkdir -p /run/jamstream/keys"));
-        assert!(out.contains("chmod 0700 /run/jamstream/keys"));
+        // Key staging is tmpfs readable only by the service account, and
+        // other processes' argv is hidden.
+        assert!(out.contains("install -d -o jamstream -g jamstream -m 0700 /run/jamstream/keys"));
         assert!(out.contains("hidepid=2"));
 
         // The GPL note travels with the copyleft artifact and only that one.

@@ -27,58 +27,82 @@ write_files:
       # Dead man's switch. jamstreamd touches /run/jamstream/last-active while
       # musicians are connected; staleness past the idle window, or exceeding the
       # session hard cap, triggers self-destruct.
+      #
+      # Both windows are measured in uptime seconds, never wall clock. A cloud VM
+      # routinely boots with a wrong hardware clock and takes a large NTP step a
+      # minute later; a wall-clock idle window reads that step as a dead session
+      # and destroys a VM with musicians playing on it.
       set -eu
-      now=$(date +%s)
-      boot=$((now - $(cut -d. -f1 /proc/uptime)))
-      last=$(stat -c %Y /run/jamstream/last-active 2>/dev/null || echo "$boot")
-      if [ $((now - last)) -ge 600 ]; then
-        exec /usr/local/sbin/jamstream-self-destruct "idle for $((now - last))s"
+      up=$(cut -d. -f1 /proc/uptime)
+      stamp=$(stat -c %Y /run/jamstream/last-active 2>/dev/null || echo none)
+      # The mtime is only ever compared for equality, so no clock step can fake
+      # activity or hide it. What the idle window measures is the uptime at which
+      # the mtime last changed.
+      if [ "$stamp" != "$(cat /run/jamstream/guard-stamp 2>/dev/null || echo none)" ]; then
+        printf '%s\n' "$stamp" > /run/jamstream/guard-stamp
+        printf '%s\n' "$up" > /run/jamstream/guard-active-up
       fi
-      if [ $((now - boot)) -ge 43200 ]; then
+      active_up=$(cat /run/jamstream/guard-active-up 2>/dev/null || echo 0)
+      idle=$((up - active_up))
+      if [ "$idle" -ge 600 ]; then
+        exec /usr/local/sbin/jamstream-self-destruct "idle for ${idle}s"
+      fi
+      if [ "$up" -ge 43200 ]; then
         exec /usr/local/sbin/jamstream-self-destruct "max session duration reached"
       fi
-  - path: /usr/local/sbin/jamstream-bootstrap
+  - path: /usr/local/sbin/jamstream-firewall
     owner: root:root
     permissions: "0700"
     content: |
       #!/bin/sh
       set -eu
-      mkdir -p /run/jamstream
-      touch /run/jamstream/last-active
-      # Stream keys are staged here for the instant it takes to spawn a pusher.
-      # /run is tmpfs, so nothing reaches persistent disk.
-      mkdir -p /run/jamstream/keys
-      chmod 0700 /run/jamstream/keys
-      # A pusher's ffmpeg receives its ingest URL on stdin, but execs with it in
-      # argv, so hide other processes' command lines from non-root. The VM has no
-      # other users; this is the belt.
-      mount -o remount,hidepid=2 /proc 2>/dev/null || true
-      curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download "https://github.com/sean-reid/jamstream/releases/download/v0.1.0/jamstreamd-x86_64-unknown-linux-musl"
-      if ! echo "0f2e5c1d3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d  /usr/local/bin/jamstreamd.download" | sha256sum -c -; then
-        echo "jamstream: artifact sha256 mismatch, refusing to start" >&2
-        rm -f /usr/local/bin/jamstreamd.download
-        exit 1
-      fi
-      mv /usr/local/bin/jamstreamd.download /usr/local/bin/jamstreamd
-      chmod 0755 /usr/local/bin/jamstreamd
-      # Only the session UDP port is reachable from outside.
-      if command -v ufw >/dev/null 2>&1; then
-        ufw default deny incoming
-        ufw allow 43210/udp
-        ufw --force enable
-      else
-        iptables -A INPUT -i lo -j ACCEPT
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        iptables -A INPUT -p udp --dport 43210 -j ACCEPT
-        iptables -P INPUT DROP
-      fi
-      systemctl daemon-reload
-      # The session server comes up first: musicians are waiting, and the broadcast
-      # tooling is only needed once the host goes live.
-      systemctl enable --now jamstreamd.service
-      systemctl enable --now jamstream-guard.timer
-      # Broadcast subprocesses, pinned and checksummed like everything else.
+      # Flushing first makes this idempotent: bootstrap runs it once and the
+      # oneshot unit runs it again after every reboot.
+      for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || {
+          echo "jamstream: no $ipt on this image, no in-guest packet filter" >&2
+          continue
+        }
+        "$ipt" -F INPUT
+        "$ipt" -F OUTPUT
+        "$ipt" -A INPUT -i lo -j ACCEPT
+        "$ipt" -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        "$ipt" -A INPUT -p udp --dport 43210 -j ACCEPT
+        # ICMPv6 carries path MTU discovery and neighbour discovery; dropping it
+        # breaks IPv6 rather than hardening it.
+        if [ "$ipt" = ip6tables ]; then
+          "$ipt" -A INPUT -p ipv6-icmp -j ACCEPT
+        fi
+        "$ipt" -P INPUT DROP
+      done
+      # The server private key and, on DigitalOcean, the API token arrive as
+      # user-data, which the metadata service hands to anything that asks over
+      # plain HTTP with no credential. jamstreamd runs as the unprivileged
+      # jamstream user, so restricting the metadata address to uid 0 puts those
+      # secrets out of reach of the process that parses untrusted UDP. cloud-init
+      # and the self-destruct script are root and keep their access.
+      for md in 169.254.169.254 fd00:ec2::254; do
+        case "$md" in
+          *:*) ipt=ip6tables ;;
+          *) ipt=iptables ;;
+        esac
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        # The owner match needs xt_owner. Where it is missing the rule is
+        # refused, and saying so beats silently leaving the door open.
+        if "$ipt" -A OUTPUT -d "$md" -m owner --uid-owner 0 -j ACCEPT 2>/dev/null; then
+          "$ipt" -A OUTPUT -d "$md" -j REJECT
+        else
+          echo "jamstream: no owner match for $md, metadata stays world-readable" >&2
+        fi
+      done
+  - path: /usr/local/sbin/jamstream-media
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/sh
+      set -eu
       tmp=$(mktemp -d)
+      trap 'rm -rf "$tmp"' EXIT
       # ffmpeg n7.1.5-10-g2aefd64d48, GPL-3.0-or-later. Pinned in data/media_artifacts.json.
       # JamStream never links it, only spawns it, which is what keeps the
       # copyleft obligation at the process boundary.
@@ -91,7 +115,6 @@ write_files:
       curl -fsSL --retry 5 -o "$tmp/ffmpeg.archive" "$url"
       if ! echo "$sha  $tmp/ffmpeg.archive" | sha256sum -c -; then
         echo "jamstream: ffmpeg sha256 mismatch, refusing to start" >&2
-        rm -rf "$tmp"
         exit 1
       fi
       tar -xJf "$tmp/ffmpeg.archive" -C "$tmp" --wildcards --strip-components=2 '*/bin/ffmpeg'
@@ -107,27 +130,128 @@ write_files:
       curl -fsSL --retry 5 -o "$tmp/mediamtx.archive" "$url"
       if ! echo "$sha  $tmp/mediamtx.archive" | sha256sum -c -; then
         echo "jamstream: mediamtx sha256 mismatch, refusing to start" >&2
-        rm -rf "$tmp"
         exit 1
       fi
       tar -xzf "$tmp/mediamtx.archive" -C "$tmp" --wildcards 'mediamtx'
       install -m 0755 "$tmp/mediamtx" /usr/local/bin/mediamtx
       rm -f "$tmp/mediamtx.archive" "$tmp/mediamtx"
-      rmdir "$tmp" 2>/dev/null || true
-      systemctl enable --now mediamtx.service
+  - path: /usr/local/sbin/jamstream-bootstrap
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/sh
+      set -eu
+      # Everything below can fail: a GitHub 503 past --retry 5 is enough. A VM
+      # that cannot finish bootstrapping has no server and no way to be told to
+      # stop, so it bills until a human notices. This trap and the guard timer
+      # below are what make every other failure in this script survivable.
+      trap 'rc=$?; [ "$rc" -eq 0 ] || /usr/local/sbin/jamstream-self-destruct "bootstrap failed with status $rc"' EXIT
+
+      # jamstreamd parses unauthenticated UDP and hands the bytes to libopus, so
+      # it does not run as root. The config holds the server private key and stays
+      # unreadable to everything but root and this account.
+      id jamstream >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin jamstream
+      chgrp jamstream /etc/jamstream/config
+      chmod 0640 /etc/jamstream/config
+      install -d -o jamstream -g jamstream -m 0750 /run/jamstream
+      # jamstreamd updates this file's mtime while musicians are connected and the
+      # guard reads it, so the server has to own it.
+      install -o jamstream -g jamstream -m 0644 /dev/null /run/jamstream/last-active
+      # Stream keys are staged here for the instant it takes to spawn a pusher.
+      # /run is tmpfs, so nothing reaches persistent disk.
+      install -d -o jamstream -g jamstream -m 0700 /run/jamstream/keys
+      # A pusher's ffmpeg receives its ingest URL on stdin, but execs with it in
+      # argv, so hide other processes' command lines from non-root. The VM has no
+      # other users; this is the belt.
+      mount -o remount,hidepid=2 /proc 2>/dev/null || true
+
+      systemctl daemon-reload
+      # The firewall and the dead man's switch go in before anything that can
+      # fail. In the other order a failed download leaves a VM with provider
+      # default networking, no idle window, and no hard cap.
+      systemctl enable --now jamstream-firewall.service
+      systemctl enable --now jamstream-guard.timer
+
+      curl -fsSL --retry 5 -o /usr/local/bin/jamstreamd.download "https://github.com/sean-reid/jamstream/releases/download/v0.1.0/jamstreamd-x86_64-unknown-linux-musl"
+      if ! echo "0f2e5c1d3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d  /usr/local/bin/jamstreamd.download" | sha256sum -c -; then
+        echo "jamstream: artifact sha256 mismatch, refusing to start" >&2
+        rm -f /usr/local/bin/jamstreamd.download
+        exit 1
+      fi
+      mv /usr/local/bin/jamstreamd.download /usr/local/bin/jamstreamd
+      chmod 0755 /usr/local/bin/jamstreamd
+      # The session server comes up first: musicians are waiting, and the broadcast
+      # tooling is only needed once the host goes live.
+      systemctl enable --now jamstreamd.service
+
+      # A session runs fine with no broadcast tooling, so a failed fetch warns
+      # instead of taking a working VM down with it.
+      if /usr/local/sbin/jamstream-media; then
+        systemctl enable --now mediamtx.service
+      else
+        echo "jamstream: broadcast tooling unavailable, session continues without it" >&2
+      fi
   - path: /etc/systemd/system/jamstreamd.service
     owner: root:root
     permissions: "0644"
     content: |
       [Unit]
       Description=JamStream session server
-      After=network-online.target
+      After=network-online.target jamstream-firewall.service
       Wants=network-online.target
+      Requires=jamstream-firewall.service
 
       [Service]
-      ExecStart=/usr/local/bin/jamstreamd --config /etc/jamstream/config
+      User=jamstream
+      Group=jamstream
+      # The guard is the cap that actually destroys the VM. These two make the
+      # server stop serving on its own if the guard ever stops running.
+      ExecStart=/usr/local/bin/jamstreamd --config /etc/jamstream/config --idle-exit-min 10 --max-duration-min 720
       Restart=on-failure
       RestartSec=2
+      ReadWritePaths=/run/jamstream
+      # The encoder and one RTMP pusher per destination are children in this
+      # cgroup, on a 2 GB instance shared with MediaMTX and the OS. A memory
+      # exhaustion bug in the packet path costs a restart instead of the session.
+      MemoryMax=1500M
+      RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+      NoNewPrivileges=yes
+      CapabilityBoundingSet=
+      AmbientCapabilities=
+      ProtectSystem=strict
+      ProtectHome=yes
+      PrivateTmp=yes
+      PrivateDevices=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+      RestrictNamespaces=yes
+      LockPersonality=yes
+      SystemCallArchitectures=native
+      SystemCallFilter=@system-service
+      LimitCORE=0
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/jamstream-firewall.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=JamStream host firewall
+      # A reboot loses the rules while jamstreamd.service stays enabled, so they
+      # go back in before the network and before the server.
+      DefaultDependencies=no
+      After=local-fs.target
+      Before=network-pre.target jamstreamd.service mediamtx.service shutdown.target
+      Wants=network-pre.target
+      Conflicts=shutdown.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/jamstream-firewall
 
       [Install]
       WantedBy=multi-user.target
@@ -137,10 +261,36 @@ write_files:
     content: |
       [Unit]
       Description=JamStream dead man's switch
+      # A guard that cannot run is a VM with no cap on it at all, so a failed run
+      # destroys the VM rather than logging and shrugging.
+      OnFailure=jamstream-self-destruct.service
 
       [Service]
       Type=oneshot
       ExecStart=/usr/local/sbin/jamstream-guard
+  - path: /etc/systemd/system/jamstream-guard.timer
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Run the JamStream dead man's switch every minute
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=1min
+
+      [Install]
+      WantedBy=timers.target
+  - path: /etc/systemd/system/jamstream-self-destruct.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=JamStream self-destruct
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/jamstream-self-destruct "dead man's switch failed"
   - path: /etc/jamstream/mediamtx.yml
     owner: root:root
     permissions: "0644"
@@ -171,28 +321,36 @@ write_files:
     content: |
       [Unit]
       Description=JamStream broadcast relay (MediaMTX)
-      After=network-online.target
+      After=network-online.target jamstream-firewall.service
       Wants=network-online.target
+      Requires=jamstream-firewall.service
 
       [Service]
+      User=jamstream
+      Group=jamstream
       ExecStart=/usr/local/bin/mediamtx /etc/jamstream/mediamtx.yml
       Restart=on-failure
       RestartSec=2
+      MemoryMax=256M
+      RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+      NoNewPrivileges=yes
+      CapabilityBoundingSet=
+      AmbientCapabilities=
+      ProtectSystem=strict
+      ProtectHome=yes
+      PrivateTmp=yes
+      PrivateDevices=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+      RestrictNamespaces=yes
+      LockPersonality=yes
+      SystemCallArchitectures=native
+      SystemCallFilter=@system-service
+      LimitCORE=0
 
       [Install]
       WantedBy=multi-user.target
-  - path: /etc/systemd/system/jamstream-guard.timer
-    owner: root:root
-    permissions: "0644"
-    content: |
-      [Unit]
-      Description=Run the JamStream dead man's switch every minute
-
-      [Timer]
-      OnBootSec=2min
-      OnUnitActiveSec=1min
-
-      [Install]
-      WantedBy=timers.target
 runcmd:
   - [/usr/local/sbin/jamstream-bootstrap]
