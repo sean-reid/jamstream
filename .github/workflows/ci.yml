@@ -32,6 +32,12 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repository. Without an explicit block the jobs
+# inherit the repository default, and the artifact uploads use the runner's
+# own token rather than GITHUB_TOKEN, so read is all that is ever needed.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -42,10 +48,21 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Third-party actions are pinned to commits repo-wide, not to tags or
+      # branches, and dependabot bumps the pins weekly. The reason starts with
+      # the jobs that hold signing secrets (release.yml, sign-smoke.yml) but
+      # applies here too: a retargeted ref in this workflow could make a
+      # malicious pull request look green on the branch that auto-merges.
+      # dtolnay/rust-toolchain is pinned to master, which is append-only, with
+      # an explicit `toolchain: stable`; the @stable branch is only master
+      # plus that default and it gets force-pushed.
+      # Re-pin from: gh api repos/dtolnay/rust-toolchain/git/ref/heads/master
+      #              gh api repos/Swatinem/rust-cache/git/ref/tags/v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       # Staleness gate. cargo-deny audits Cargo.lock and every cargo
       # invocation in this repo passes --locked, so a lockfile that does not
       # match Cargo.toml turns into a build failure minutes into some other
@@ -88,10 +105,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - uses: taiki-e/install-action@v2
@@ -130,8 +148,10 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - run: cargo build --locked --workspace --release
@@ -148,8 +168,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -170,10 +192,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
@@ -251,10 +274,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --locked -p jamstream-server --release --target x86_64-unknown-linux-musl
       - name: Verify the binary is fully static

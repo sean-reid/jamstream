@@ -8,6 +8,13 @@ on:
     - cron: '17 4 * * *'
   workflow_dispatch:
 
+# The cloud smoke below spends real money against a live DigitalOcean account,
+# so it is the one workflow where a token wider than it needs would matter
+# most. Nothing here writes to the repository; the crash and preview uploads
+# use the runner's own token.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -43,8 +50,13 @@ jobs:
           - avatar_reassembly
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      # Pinned like everything else, but to master with `toolchain: nightly`:
+      # the @nightly branch is master plus that as a default, and it gets
+      # force-pushed. The toolchain itself is still whatever nightly is today.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
         with:
           workspaces: crates/protocol/fuzz
       - run: cargo install cargo-fuzz --locked
@@ -91,8 +103,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - if: runner.os == 'macOS'
@@ -111,14 +125,19 @@ jobs:
   # the secret into env and publishes whether it was non-empty; every later
   # step conditions on that output. On forks and secretless clones the job
   # succeeds as a no-op.
+  #
+  # DIGITALOCEAN_TOKEN is bound per step, not on the job. On the job it sat in
+  # process.env for every action in the job, including the toolchain and cache
+  # actions, and that token can create and destroy droplets. Only the two
+  # steps that talk to DigitalOcean get it.
   cloud-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
     steps:
       - name: Detect cloud credentials
         id: creds
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
         run: |
           if [ -n "$DIGITALOCEAN_TOKEN" ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
@@ -128,15 +147,21 @@ jobs:
           fi
       - if: steps.creds.outputs.available == 'true'
         uses: actions/checkout@v7
+      # Commit pins, per the policy documented in ci.yml. This job holds a
+      # credential that can create and destroy droplets.
       - if: steps.creds.outputs.available == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
       - if: steps.creds.outputs.available == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       # Placeholder smoke: a real authenticated sweep of the account in
       # dry-run mode proves credentials, API reachability, and tag listing
       # without destroying anything.
       - name: Sweep dry-run against live account
         if: steps.creds.outputs.available == 'true'
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
         run: cargo run --locked -p jamstream-cli --release -- sweep --dry-run --provider digitalocean
       # Later addition goes here: provision the cheapest real instance,
       # verify boot + handshake + self-termination, then assert a final

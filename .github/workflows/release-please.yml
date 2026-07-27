@@ -15,27 +15,51 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
+permissions: {}
 
 jobs:
+  # Holds contents: write so release-please can push the tag and cut the
+  # release. Deliberately does NOT hold actions: write; see dispatch-release.
   release-please:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@v5
+      # Pinned to the v5.0.0 commit rather than the v5 tag, which is mutable.
+      # A retargeted v5 would run attacker code in a job that can push a tag,
+      # and the dispatch below would then have release.yml sign and notarize
+      # whatever that tag points at. SHA256SUMS comes out of the same
+      # pipeline, so it would certify the result rather than catch it.
+      # Re-pin from: gh api repos/googleapis/release-please-action/tags
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-      # Events published with the workflow token do not trigger workflows
-      # (recursion guard), so the artifact build is chained by explicit
-      # dispatch, which is exempt.
-      - if: steps.release.outputs.release_created == 'true'
-        env:
+
+  # Events published with the workflow token do not trigger workflows
+  # (recursion guard), so the artifact build is chained by explicit dispatch,
+  # which is the sanctioned exception.
+  #
+  # This is a separate job so that actions: write, which can start any
+  # workflow in the repository, is never held by the job that runs the
+  # third-party release-please action. The two permissions together are the
+  # whole attack: push a tag, then dispatch the notarizing build at it.
+  dispatch-release:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh workflow run release.yml
-          --repo ${{ github.repository }}
-          -f tag=${{ steps.release.outputs.tag_name }}
+          # Bound to env rather than interpolated into the command, so a tag
+          # name is never shell input.
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" -f "tag=$TAG"

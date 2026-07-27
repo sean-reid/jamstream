@@ -61,6 +61,8 @@ on:
         required: true
         type: string
 
+# Every job here uploads assets to the release, so contents: write is the
+# floor. Nothing needs actions, packages, or id-token.
 permissions:
   contents: write
 
@@ -81,10 +83,14 @@ jobs:
       server_sha256: ${{ steps.pin.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Commit pins, per the policy documented in ci.yml. Every job in this
+      # workflow holds a token that can write release assets, and the macos
+      # job below also holds the Developer ID certificate and the notary key.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       # Fetch, then compile with the network off. Two things this buys over a
       # bare `cargo build`: --locked means the graph cargo-deny audited is the
@@ -143,10 +149,11 @@ jobs:
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - name: Verify the pinned server artifact reached this job
         run: |
           set -eu
@@ -189,8 +196,10 @@ jobs:
             echo "APPLE_CERT_P12 secret is missing; a release must be signed" >&2
             exit 1
           fi
+          # KEYCHAIN_PW stays a shell local. It used to be written to
+          # $GITHUB_ENV, which is not log-masked, and no later step ever read
+          # it back.
           KEYCHAIN_PW=$(uuidgen)
-          echo "KEYCHAIN_PW=$KEYCHAIN_PW" >> "$GITHUB_ENV"
           security create-keychain -p "$KEYCHAIN_PW" release.keychain
           security set-keychain-settings -lut 3600 release.keychain
           security unlock-keychain -p "$KEYCHAIN_PW" release.keychain
@@ -266,6 +275,9 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           set -eu
+          # Shell redirection creates 0666 & ~umask, and the runner umask is
+          # 022, so without this the notary private key lands 0644.
+          umask 077
           # The secret may hold the raw pkcs8 pem or a base64 wrapping of
           # it; accept either so a correctly-set secret never fails on
           # encoding alone.
@@ -307,6 +319,7 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           set -eu
+          umask 077
           if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
             printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
           else
@@ -329,6 +342,14 @@ jobs:
             jamstream-app-macos.dmg \
             jamstream-cli-macos-universal.tar.gz \
             --clobber
+      # Both notarize steps write the key and then remove it on their happy
+      # path only, so a `notarytool submit --wait` that fails, and the DMG
+      # submit can take minutes, leaves the notary private key in RUNNER_TEMP
+      # until the job ends. Unconditional scrub, next to the keychain
+      # teardown.
+      - name: Scrub the notarization key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/asc-key.p8" "$RUNNER_TEMP/JamStream.zip"
       - name: Remove the throwaway keychain
         if: always()
         run: security delete-keychain release.keychain || true
@@ -342,8 +363,10 @@ jobs:
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - name: Verify the pinned server artifact reached this job
         shell: bash
         run: |
@@ -386,8 +409,10 @@ jobs:
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - name: Verify the pinned server artifact reached this job
         run: |
           set -eu
