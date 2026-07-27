@@ -41,7 +41,16 @@ pub const MAX_DATAGRAM_BYTES: usize = 2 * 1024;
 
 const RTO_INITIAL_MS: u64 = 100;
 const RTO_MAX_MS: u64 = 2_000;
-const MAX_SENDS: u32 = 20;
+/// Attempts at one frame before the link declares the peer unreachable.
+/// A frame is retired only when it arrives and an ack comes back, so at the
+/// 50% loss in each direction the link is required to survive, one attempt
+/// succeeds about a quarter of the time. 20 left a lone straggler failing
+/// 0.25% of the time, measured over 60,000 lossy runs, which is what made
+/// the delivery property flaky; at 36 the same measurement is 0 in 60,000.
+/// The give-up horizon this buys, 65 s, is well past the 10 s member timeout
+/// that actually reaps a vanished peer, so it only ever helps a peer that is
+/// alive on a bad link.
+const MAX_SENDS: u32 = 36;
 
 /// Sequence numbers past the cumulative ack that a receiver will hold while
 /// waiting for the gap to fill. `ack_bits` advertises exactly 32 entries, so
@@ -311,6 +320,10 @@ struct Pending {
 pub struct ControlLink {
     next_seq: u64,
     pending: VecDeque<Pending>,
+    /// The peer's `recv_next` as last heard, which is the base of the window
+    /// it will accept. Frames at or past `peer_ack + RECV_WINDOW` stay off
+    /// the wire until it advances.
+    peer_ack: u64,
     recv_next: u64,
     out_of_order: BTreeMap<u64, ControlMsg>,
     need_ack: bool,
@@ -347,7 +360,19 @@ impl ControlLink {
         let mut out = Vec::new();
         let ack = self.recv_next;
         let ack_bits = self.ack_bits();
+        // Flow control, matching the receiver's rule in `receive`: it refuses
+        // anything at or past `recv_next + RECV_WINDOW`, so sending such a
+        // frame only spends one of its MAX_SENDS attempts against a closed
+        // window. Without this the queue's 128-deep cap let a sender put four
+        // windows on the wire at once and give up on everything past the
+        // first, which a chat burst, a roster fanout, or an avatar train all
+        // reach. `pending` is in ascending seq order, so the first frame past
+        // the limit ends the scan.
+        let send_limit = self.peer_ack + RECV_WINDOW;
         for p in self.pending.iter_mut() {
+            if p.seq >= send_limit {
+                break;
+            }
             if now_ms < p.next_send_ms {
                 continue;
             }
@@ -385,7 +410,10 @@ impl ControlLink {
         let pkt: CtlPacket = postcard::from_bytes(&buf[1..])?;
 
         // Their ack state clears our pending queue: everything below the
-        // cumulative ack, plus whatever the selective bitmap covers.
+        // cumulative ack, plus whatever the selective bitmap covers. It also
+        // slides our send window; acks can arrive out of order, so it only
+        // ever moves forward.
+        self.peer_ack = self.peer_ack.max(pkt.ack);
         self.pending.retain(|p| {
             if p.seq < pkt.ack {
                 return false;
@@ -910,6 +938,81 @@ mod tests {
         });
         assert_eq!(b.receive(&open).unwrap().len(), RECV_WINDOW as usize);
         assert_eq!(b.buffered(), 0);
+    }
+
+    /// The receive window was bounded without a matching bound on the send
+    /// side, so `poll` put up to MAX_PENDING frames on the wire while the
+    /// peer accepted only RECV_WINDOW of them. Everything past the window was
+    /// dropped on arrival, retransmitted, dropped again, and abandoned after
+    /// MAX_SENDS attempts, all without a packet ever being lost.
+    #[test]
+    fn poll_holds_frames_the_receiver_would_refuse() {
+        let mut a = ControlLink::new();
+        let mut b = ControlLink::new();
+        let count = RECV_WINDOW + 8;
+        for n in 0..count {
+            a.send(chat(n)).unwrap();
+        }
+        // A window's worth goes out, no more, on a lossless path.
+        let first = a.poll(0);
+        assert_eq!(first.len(), RECV_WINDOW as usize);
+        let got: Vec<_> = first
+            .iter()
+            .flat_map(|d| b.receive(d).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(got.len(), RECV_WINDOW as usize);
+        // Nothing more until the peer's ack slides the window.
+        assert!(a.poll(1).is_empty());
+        for ack in b.poll(1) {
+            a.receive(&ack).unwrap();
+        }
+        let rest: Vec<_> = a
+            .poll(2)
+            .iter()
+            .flat_map(|d| b.receive(d).unwrap())
+            .collect();
+        assert_eq!(rest, (RECV_WINDOW..count).map(chat).collect::<Vec<_>>());
+        assert!(!a.is_dead());
+    }
+
+    /// The same defect end to end. The property test above this in
+    /// `tests/properties.rs` only finds it on some seeds, which is how it
+    /// reached main and then failed other people's branches, so the case it
+    /// shrank to is pinned here as an ordinary test: 38 messages, 50% loss in
+    /// both directions, and all 38 have to arrive. Before the send window,
+    /// m35 through m37 were abandoned with no packet loss to blame.
+    #[test]
+    fn every_message_arrives_past_the_window_under_loss() {
+        let count = 38u64;
+        let mut a = ControlLink::new();
+        let mut b = ControlLink::new();
+        for n in 0..count {
+            a.send(chat(n)).unwrap();
+        }
+        let mut state = 4_896_297_390_500_780_748u64 | 1;
+        let mut lost = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state >> 61 < 4
+        };
+        let mut got = Vec::new();
+        let mut now = 0u64;
+        while (got.len() as u64) < count && now < 120_000 {
+            for d in a.poll(now) {
+                if !lost() {
+                    got.extend(b.receive(&d).unwrap());
+                }
+            }
+            for d in b.poll(now) {
+                if !lost() {
+                    a.receive(&d).unwrap();
+                }
+            }
+            now += 50;
+        }
+        assert_eq!(got, (0..count).map(chat).collect::<Vec<_>>());
+        assert!(!a.is_dead());
     }
 
     /// The window bound only holds if `ack_bits` cannot advertise past it,
