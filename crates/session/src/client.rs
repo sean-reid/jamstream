@@ -2,13 +2,13 @@
 //! desktop app, headless CLI, and harness own the socket and clock, feed
 //! datagrams and capture frames in, and pull playout audio and events out.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use jamstream_engine::{
     Channels, CodecError, Decoder, DriftCompensator, Encoder, JitterBuffer, JitterStats,
     MediaPacket, Pull, RedundancyPolicy,
 };
-use jamstream_protocol::control::{ControlLink, ControlMsg, MemberInfo};
+use jamstream_protocol::control::{ControlLink, ControlMsg, MAX_AVATAR_BYTES, MemberInfo};
 use jamstream_protocol::ids::{MemberId, Role, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
@@ -16,6 +16,9 @@ use jamstream_protocol::transport::{Initiator, Session, Welcome};
 use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
 
 use crate::SessionError;
+use crate::avatar::{
+    AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep, avatar_hash,
+};
 
 const TICK_SAMPLES: u64 = 120;
 const UPLINK_BITRATE: u32 = 128_000;
@@ -29,6 +32,9 @@ const REDUNDANCY_OFF_HOLD: u32 = 10;
 /// Playout steering samples the local jitter buffer this often, matching the
 /// once-per-second cadence of the server's uplink Stats reports.
 const PLAYOUT_STEER_FRAMES: u64 = 48_000;
+/// Client-side avatar byte budget; roster-referenced hashes and our own
+/// avatar are pinned, the rest evict least-recently-referenced first.
+const AVATAR_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 /// PI controller steering a `DriftCompensator` from a jitter-buffer depth.
 /// Depth persistently above the setpoint means production outruns
@@ -109,6 +115,12 @@ pub enum ClientEvent {
         pan: f32,
         muted: bool,
     },
+    /// A member's avatar bytes are cached and hash-verified; fetch them
+    /// with `avatar_bytes`. Emitted once per (member, hash).
+    AvatarReady {
+        member: MemberId,
+        hash: [u8; 32],
+    },
     Ejected {
         reason: String,
     },
@@ -165,6 +177,20 @@ pub struct ClientCore {
     /// Resampled playout awaiting delivery to arbitrary-length raw pulls.
     playout_stage: VecDeque<f32>,
     playout_frames_since_steer: u64,
+    /// Own avatar (hash, length); the bytes live pinned in the cache. Kept
+    /// across reconnects and re-announced on every join.
+    own_avatar: Option<(AvatarHash, u32)>,
+    avatar_cache: AvatarCache,
+    /// Hashes requested from the server and not yet received.
+    avatar_requested: BTreeSet<AvatarHash>,
+    /// Single inbound train; the server streams one train per link.
+    avatar_rx: Option<AvatarRx>,
+    /// Outbound trains answering the server's AvatarRequest for our bytes.
+    avatar_tx: VecDeque<AvatarTx>,
+    /// Latest roster, for cache pinning and AvatarReady fanout.
+    roster: Vec<MemberInfo>,
+    /// Hash last surfaced as AvatarReady per member, deduping the event.
+    avatar_announced: BTreeMap<MemberId, AvatarHash>,
     prev_payload: Option<Vec<u8>>,
     pkt_buf: Vec<u8>,
     frames_sent: u64,
@@ -204,6 +230,13 @@ impl ClientCore {
             playout_steer: DepthSteer::default(),
             playout_stage: VecDeque::new(),
             playout_frames_since_steer: 0,
+            own_avatar: None,
+            avatar_cache: AvatarCache::new(AVATAR_CACHE_BYTES),
+            avatar_requested: BTreeSet::new(),
+            avatar_rx: None,
+            avatar_tx: VecDeque::new(),
+            roster: Vec::new(),
+            avatar_announced: BTreeMap::new(),
             prev_payload: None,
             pkt_buf: Vec::new(),
             frames_sent: 0,
@@ -241,6 +274,13 @@ impl ClientCore {
         self.playout_steer = DepthSteer::default();
         self.playout_stage.clear();
         self.playout_frames_since_steer = 0;
+        // Transfers are connection-scoped; the cache and own avatar are
+        // identity and survive, so a rejoin re-announces without re-upload.
+        self.avatar_requested.clear();
+        self.avatar_rx = None;
+        self.avatar_tx.clear();
+        self.roster.clear();
+        self.avatar_announced.clear();
         self.prev_payload = None;
         self.frames_sent = 0;
         self.last_server_ms = now_ms;
@@ -271,6 +311,11 @@ impl ClientCore {
                         self.last_server_ms = now_ms;
                         self.last_ping_ms = now_ms;
                         self.events.push(ClientEvent::Joined);
+                        // Re-announce on every join: on a cache hit the
+                        // server asks for nothing and no chunk moves.
+                        if let Some((hash, len)) = self.own_avatar {
+                            let _ = self.link.send(ControlMsg::SetAvatar { hash, len });
+                        }
                     }
                     Err(_) => {
                         // A forged or corrupt response consumed the handshake
@@ -520,6 +565,28 @@ impl ClientCore {
                         sent_ms: now_ms,
                     });
                 }
+                // Avatar upload pacing, same rule as the server: at most a
+                // couple of chunks per poll so bulk bytes never starve
+                // pings or chat on the ordered link.
+                let mut fed = 0;
+                while fed < AVATAR_CHUNKS_PER_POLL {
+                    let Some(tx) = self.avatar_tx.front_mut() else {
+                        break;
+                    };
+                    match self
+                        .avatar_cache
+                        .get(tx.hash())
+                        .and_then(|bytes| tx.next_chunk(bytes))
+                    {
+                        Some(chunk) => {
+                            let _ = self.link.send(chunk);
+                            fed += 1;
+                        }
+                        None => {
+                            self.avatar_tx.pop_front();
+                        }
+                    }
+                }
                 // Redundancy is fed by the server's Stats reports as they
                 // arrive (once a second); no downlink proxy here.
                 self.flush_link(now_ms, &mut out);
@@ -552,6 +619,36 @@ impl ClientCore {
             uplink_recovered_pct: self.uplink_report.map(|(_, _, rec)| rec),
             redundancy_active: self.redundancy.active(),
         }
+    }
+
+    /// Sets or replaces this member's avatar. The bytes are hashed
+    /// (Blake2s-256, the avatar's identity), cached locally, and the hash
+    /// announced; the server pulls the bytes only when its cache lacks
+    /// them. Callable before joining: the announce then rides every join.
+    pub fn set_avatar(&mut self, bytes: &[u8]) -> Result<[u8; 32], SessionError> {
+        if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES {
+            return Err(SessionError::InvalidParam("avatar size out of range"));
+        }
+        let hash = avatar_hash(bytes);
+        let mut pins = self.avatar_pins();
+        pins.insert(hash);
+        self.avatar_cache.insert(hash, bytes.to_vec(), &pins);
+        self.own_avatar = Some((hash, bytes.len() as u32));
+        // Drop queued trains for a replaced avatar so the server never
+        // sees stale chunks after the new announce.
+        self.avatar_tx.retain(|t| *t.hash() == hash);
+        if self.state == ClientState::Joined {
+            self.link.send(ControlMsg::SetAvatar {
+                hash,
+                len: bytes.len() as u32,
+            })?;
+        }
+        Ok(hash)
+    }
+
+    /// Verified avatar bytes for a hash seen on the roster, if cached.
+    pub fn avatar_bytes(&self, hash: &[u8; 32]) -> Option<&[u8]> {
+        self.avatar_cache.get(hash)
     }
 
     pub fn send_chat(&mut self, text: &str) -> Result<(), SessionError> {
@@ -683,7 +780,11 @@ impl ClientCore {
 
     fn handle_control(&mut self, now_ms: u64, msg: ControlMsg) {
         match msg {
-            ControlMsg::Roster(members) => self.events.push(ClientEvent::Roster(members)),
+            ControlMsg::Roster(members) => {
+                self.sync_avatars(&members);
+                self.roster = members.clone();
+                self.events.push(ClientEvent::Roster(members));
+            }
             ControlMsg::Chat { from, text } => self.events.push(ClientEvent::Chat { from, text }),
             ControlMsg::MetronomeSet {
                 bpm,
@@ -735,12 +836,98 @@ impl ClientCore {
                 pan,
                 muted,
             }),
+            // The server wants our avatar bytes. Anything but our current
+            // hash is a stale request from before a replacement; per client
+            // style it is dropped silently rather than flagged.
+            ControlMsg::AvatarRequest { hash } => {
+                if self.own_avatar.is_some_and(|(h, _)| h == hash)
+                    && !self.avatar_tx.iter().any(|t| *t.hash() == hash)
+                {
+                    self.avatar_tx.push_back(AvatarTx::new(hash));
+                }
+            }
+            ControlMsg::AvatarChunk {
+                hash,
+                index,
+                total,
+                data,
+            } => self.handle_avatar_chunk(hash, index, total, &data),
             // The server never sends these; ignore.
             ControlMsg::MixerSet { .. }
             | ControlMsg::ClickEnable { .. }
             | ControlMsg::BroadcastAudition { .. }
-            | ControlMsg::Revoke { .. } => {}
+            | ControlMsg::Revoke { .. }
+            | ControlMsg::SetAvatar { .. } => {}
         }
+    }
+
+    /// Requests roster hashes we lack and surfaces AvatarReady for the ones
+    /// already cached (once per member and hash).
+    fn sync_avatars(&mut self, roster: &[MemberInfo]) {
+        self.avatar_announced
+            .retain(|id, _| roster.iter().any(|m| m.id == *id));
+        for mi in roster {
+            let Some(hash) = mi.avatar_hash else {
+                self.avatar_announced.remove(&mi.id);
+                continue;
+            };
+            if self.avatar_cache.contains(&hash) {
+                self.avatar_cache.touch(&hash);
+                self.announce(mi.id, hash);
+            } else if self.avatar_requested.insert(hash) {
+                let _ = self.link.send(ControlMsg::AvatarRequest { hash });
+            }
+        }
+    }
+
+    /// One chunk from the server. Malformed or unsolicited trains are
+    /// dropped silently: the client has no violation channel, and a stale
+    /// train racing a replacement is expected, not hostile. A failed fetch
+    /// is not retried until the hash next appears on a fresh connection.
+    fn handle_avatar_chunk(&mut self, hash: AvatarHash, index: u16, total: u16, data: &[u8]) {
+        if index == 0 && self.avatar_requested.contains(&hash) {
+            self.avatar_rx = Some(AvatarRx::new(hash, None));
+        }
+        let Some(rx) = self.avatar_rx.as_mut().filter(|rx| *rx.hash() == hash) else {
+            return;
+        };
+        match rx.push(index, total, data) {
+            Ok(RxStep::More) => {}
+            Ok(RxStep::Done(bytes)) => {
+                self.avatar_rx = None;
+                self.avatar_requested.remove(&hash);
+                let pins = self.avatar_pins();
+                self.avatar_cache.insert(hash, bytes, &pins);
+                let ready: Vec<MemberId> = self
+                    .roster
+                    .iter()
+                    .filter(|m| m.avatar_hash == Some(hash))
+                    .map(|m| m.id)
+                    .collect();
+                for id in ready {
+                    self.announce(id, hash);
+                }
+            }
+            Err(_) => self.avatar_rx = None,
+        }
+    }
+
+    fn announce(&mut self, member: MemberId, hash: AvatarHash) {
+        if self.avatar_announced.get(&member) != Some(&hash) {
+            self.avatar_announced.insert(member, hash);
+            self.events.push(ClientEvent::AvatarReady { member, hash });
+        }
+    }
+
+    /// Hashes eviction must never remove: everything the current roster
+    /// references plus our own avatar.
+    fn avatar_pins(&self) -> BTreeSet<AvatarHash> {
+        let mut pins: BTreeSet<AvatarHash> =
+            self.roster.iter().filter_map(|m| m.avatar_hash).collect();
+        if let Some((h, _)) = self.own_avatar {
+            pins.insert(h);
+        }
+        pins
     }
 
     fn flush_link(&mut self, now_ms: u64, out: &mut Vec<Vec<u8>>) {
