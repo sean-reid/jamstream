@@ -11,6 +11,7 @@ use egui::{
 use crate::runtime::{
     BroadcastView, ChatLine, Command, ConnState, FaderView, MemberView, Role, Runtime, Snapshot,
 };
+use crate::screens::destinations::{DestinationsPanel, on_air_indicator};
 use crate::screens::invites::{InvitesEvent, InvitesPanel};
 use crate::theme;
 use crate::widgets::{
@@ -60,6 +61,11 @@ pub struct SessionScreen {
     /// Host only: the stream mix sheet. Snapshots without a broadcast view
     /// never show the toggle, so this stays false for everyone else.
     pub broadcast_open: bool,
+    /// Host sessions this app launched carry the destinations sheet; it needs
+    /// the credential store, so plain joins have none and show no toggle,
+    /// exactly like the invites panel.
+    pub destinations: Option<DestinationsPanel>,
+    pub destinations_open: bool,
 }
 
 impl SessionScreen {
@@ -88,6 +94,10 @@ impl SessionScreen {
                 // Closing the sheet is navigation; audition keeps playing
                 // until it is switched off.
                 self.broadcast_open = false;
+            } else if self.destinations_open {
+                // Same rule: closing the sheet is navigation and never takes
+                // the session off air.
+                self.destinations_open = false;
             } else if self.invites_open {
                 self.invites_open = false;
             } else if narrow && self.chat_open {
@@ -97,7 +107,7 @@ impl SessionScreen {
 
         egui::Panel::bottom(egui::Id::new("session-status"))
             .show_separator_line(true)
-            .show(ui, |ui| self.status_bar(ui, snap));
+            .show(ui, |ui| self.status_bar(ui, snap, narrow));
 
         if !narrow {
             egui::Panel::right(egui::Id::new("session-chat"))
@@ -134,6 +144,13 @@ impl SessionScreen {
 
         if self.broadcast_open && snap.broadcast.is_some() {
             self.stream_mix_ui(ui, snap, rt);
+        }
+
+        if self.destinations_open
+            && snap.is_host
+            && let Some(panel) = &mut self.destinations
+        {
+            panel.ui(ui, snap, rt, &mut self.destinations_open);
         }
 
         self.confirm_windows(ui, rt, &mut event);
@@ -506,9 +523,36 @@ impl SessionScreen {
     }
 
     /// Everything numeric here is monospace so the bar never wobbles.
-    fn status_bar(&mut self, ui: &mut Ui, snap: &Snapshot) {
+    ///
+    /// The host's bar carries two sheet toggles and the cost ticker on top of
+    /// everything a musician sees, which below the narrow threshold cannot
+    /// share a row with the readouts, and this bar may never overlap. So a
+    /// host's stacks into two rows there and a musician's stays on one.
+    fn status_bar(&mut self, ui: &mut Ui, snap: &Snapshot, narrow: bool) {
         ui.add_space(theme::SPACE_SM);
-        ui.horizontal(|ui| {
+        if narrow && snap.is_host {
+            ui.horizontal(|ui| self.status_readouts(ui, snap));
+            ui.add_space(theme::SPACE_SM);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.status_controls(ui, snap);
+                });
+            });
+        } else {
+            ui.horizontal(|ui| {
+                self.status_readouts(ui, snap);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.status_controls(ui, snap);
+                });
+            });
+        }
+        ui.add_space(theme::SPACE_SM);
+    }
+
+    /// The instrument half: connection, the headline latency, what is leaving
+    /// the room, and the link numbers.
+    fn status_readouts(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        {
             let s = &snap.stats;
             status_dot(
                 ui,
@@ -543,6 +587,9 @@ impl SessionScreen {
             if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
                 audition_indicator(ui);
             }
+            // Same place, same reason: what is leaving the room, for
+            // everyone in it, whether or not a sheet is open.
+            on_air_indicator(ui, snap);
             ui.separator();
             let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
             ui.label(theme::mono(ui, format!("rtt {rtt} ms")));
@@ -574,8 +621,14 @@ impl SessionScreen {
                     Meter::Horizontal,
                 );
             }
+        }
+    }
 
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    /// The control half: the two host sheets, the cost ticker, the on air
+    /// lamp, and the way out. Laid out right to left by the caller.
+    fn status_controls(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        {
+            {
                 let p = theme::palette_of(ui);
                 if ui
                     .add(
@@ -593,10 +646,11 @@ impl SessionScreen {
                         .clicked()
                 {
                     self.invites_open = !self.invites_open;
-                    // The two host sheets share the same anchor; only one
-                    // is ever open.
+                    // The host sheets share one anchor; only one is ever
+                    // open.
                     if self.invites_open {
                         self.broadcast_open = false;
+                        self.destinations_open = false;
                     }
                 }
                 if let Some(cost) = &snap.cost {
@@ -615,10 +669,22 @@ impl SessionScreen {
                     ));
                 }
                 ui.label(theme::mono_muted(ui, snap.session_short.clone()));
-                // Reserved for broadcast (M2); always dark in v1.
-                on_air(ui, false);
-                // The stream mix toggle sits with the lamp: both are about
-                // what leaves the session, not what anyone monitors.
+                // The lamp everyone in the room can see, host or not.
+                on_air(ui, snap.stream.on_air());
+                // Both toggles sit with the lamp: they are about what leaves
+                // the session, not what anyone monitors.
+                if snap.is_host
+                    && self.destinations.is_some()
+                    && ui
+                        .add(Button::new("Destinations").selected(self.destinations_open))
+                        .clicked()
+                {
+                    self.destinations_open = !self.destinations_open;
+                    if self.destinations_open {
+                        self.invites_open = false;
+                        self.broadcast_open = false;
+                    }
+                }
                 if snap.broadcast.is_some()
                     && ui
                         .add(Button::new("Stream mix").selected(self.broadcast_open))
@@ -627,11 +693,11 @@ impl SessionScreen {
                     self.broadcast_open = !self.broadcast_open;
                     if self.broadcast_open {
                         self.invites_open = false;
+                        self.destinations_open = false;
                     }
                 }
-            });
-        });
-        ui.add_space(theme::SPACE_SM);
+            }
+        }
     }
 
     fn confirm_windows(&mut self, ui: &mut Ui, rt: &dyn Runtime, event: &mut Option<SessionEvent>) {

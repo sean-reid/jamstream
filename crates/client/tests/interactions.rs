@@ -6,8 +6,10 @@ use std::sync::Arc;
 use egui::accesskit::Role as AkRole;
 use egui::{Event, Key, Modifiers, PointerButton, vec2};
 use egui_kittest::{Harness, kittest::Queryable};
+use jamstream_client::creds::MemStore;
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME, RecordingRuntime};
-use jamstream_client::runtime::{Command, MemberId, Runtime, Snapshot};
+use jamstream_client::runtime::{Command, DestinationState, MemberId, Runtime, Snapshot};
+use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::session::SessionScreen;
 use jamstream_client::theme::{self, Theme};
 
@@ -363,6 +365,239 @@ fn non_hosts_see_no_stream_mix() {
     assert!(harness.query_by_label("Stream mix").is_none());
     assert!(harness.query_by_label("hearing stream mix").is_none());
     assert!(rt.snapshot().broadcast.is_none());
+}
+
+// Destinations. The key path is the one that has to be exactly right: what
+// the host pastes is what the server gets, once, and nothing else keeps it.
+
+/// A key nothing could stream with.
+const FAKE_KEY: &str = "live_000000_fakefakefake";
+
+fn destinations_harness(
+    reported: &[(jamstream_client::runtime::StreamPlatform, DestinationState)],
+) -> (Recorder, Harness<'static>) {
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, true);
+    demo.set_destinations(reported);
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let rt_ui = rt.clone();
+    let mut screen = SessionScreen {
+        destinations: Some(DestinationsPanel::new(Arc::new(MemStore::default()))),
+        destinations_open: true,
+        ..Default::default()
+    };
+    let harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        });
+    (rt, harness)
+}
+
+fn destination_commands(rt: &Recorder) -> Vec<Command> {
+    rt.commands()
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c,
+                Command::AddDestination { .. }
+                    | Command::RemoveDestination(_)
+                    | Command::StartStream
+                    | Command::StopStream
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_pasted_key_reaches_the_server_once_and_then_going_live() {
+    let (rt, mut harness) = destinations_harness(&[]);
+    harness.run_steps(2);
+    // Nothing configured: Go live has nothing to do.
+    assert!(destination_commands(&rt).is_empty());
+
+    harness
+        .get_all_by_role_and_label(AkRole::Button, "Add key")
+        .next()
+        .expect("Twitch add key")
+        .click();
+    harness.run_steps(2);
+    // The one masked field on screen. Its accessible role says so, which is
+    // itself worth asserting: a stream key is never a plain text input.
+    harness.get_by_role(AkRole::PasswordInput).click();
+    harness.run_steps(1);
+    harness
+        .get_by_role(AkRole::PasswordInput)
+        .type_text(FAKE_KEY);
+    harness.run_steps(2);
+    // Still nothing on the wire: typing is not sending.
+    assert!(destination_commands(&rt).is_empty());
+    // And the key is not in the accessibility tree either, only its mask.
+    let shown = harness
+        .get_by_role(AkRole::PasswordInput)
+        .value()
+        .unwrap_or_default();
+    assert!(
+        !shown.contains(FAKE_KEY) && shown.chars().count() == FAKE_KEY.chars().count(),
+        "a password field must expose the mask, not the key: {shown:?}"
+    );
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Save key")
+        .click();
+    harness.run_steps(2);
+    let sent = destination_commands(&rt);
+    assert_eq!(sent.len(), 1, "commands were {sent:?}");
+    match &sent[0] {
+        Command::AddDestination { id, platform, key } => {
+            assert_eq!(*id, jamstream_client::runtime::DestinationId(0));
+            assert_eq!(*platform, jamstream_client::runtime::StreamPlatform::Twitch);
+            assert_eq!(key.expose(), FAKE_KEY, "the key must arrive verbatim");
+        }
+        other => panic!("expected AddDestination, got {other:?}"),
+    }
+    // The field is gone from the screen, and the row now reads as a
+    // destination the server knows about.
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_role(AkRole::PasswordInput).is_none(),
+        "the key pane must close once the key is sent"
+    );
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Go live")
+        .click();
+    harness.run_steps(2);
+    assert_eq!(
+        destination_commands(&rt).last(),
+        Some(&Command::StartStream)
+    );
+    // The demo's stand-in server brings it up, so the whole room is on air.
+    assert!(rt.snapshot().stream.on_air());
+    assert!(harness.query_by_label("2 live").is_none());
+    assert!(harness.query_by_label("1 live").is_some());
+}
+
+#[test]
+fn removing_one_live_destination_leaves_the_other_alone() {
+    use jamstream_client::runtime::{DestinationId, StreamPlatform};
+    let (rt, mut harness) = destinations_harness(&[
+        (StreamPlatform::Twitch, DestinationState::Live),
+        (StreamPlatform::YouTube, DestinationState::Live),
+    ]);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("2 live").is_some());
+
+    // Twitch is the first row, so the first Remove is its own.
+    harness
+        .get_all_by_role_and_label(AkRole::Button, "Remove")
+        .next()
+        .expect("Twitch remove")
+        .click();
+    harness.run_steps(2);
+    assert_eq!(
+        destination_commands(&rt),
+        vec![Command::RemoveDestination(DestinationId(0))]
+    );
+    // YouTube keeps streaming, which is the whole point of one pusher each.
+    let snap = rt.snapshot();
+    assert_eq!(snap.stream.live_count(), 1);
+    assert_eq!(
+        snap.stream
+            .of_platform(StreamPlatform::YouTube)
+            .map(|d| d.state.clone()),
+        Some(DestinationState::Live)
+    );
+}
+
+#[test]
+fn stopping_the_stream_takes_everything_off_air() {
+    use jamstream_client::runtime::StreamPlatform;
+    let (rt, mut harness) = destinations_harness(&[
+        (StreamPlatform::Twitch, DestinationState::Live),
+        (StreamPlatform::YouTube, DestinationState::Live),
+    ]);
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stop streaming")
+        .click();
+    harness.run_steps(2);
+    assert_eq!(destination_commands(&rt), vec![Command::StopStream]);
+    assert!(!rt.snapshot().stream.on_air());
+}
+
+#[test]
+fn escape_closes_the_destinations_sheet_without_leaving_the_air() {
+    use jamstream_client::runtime::StreamPlatform;
+    let (rt, mut harness) =
+        destinations_harness(&[(StreamPlatform::Twitch, DestinationState::Live)]);
+    harness.run_steps(2);
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Stop streaming")
+            .is_none(),
+        "Escape must close the sheet"
+    );
+    // Closing a sheet is navigation: nothing was sent and the room is still
+    // on air, with the lamp and the count to say so.
+    assert!(destination_commands(&rt).is_empty());
+    assert!(harness.query_by_label("1 live").is_some());
+    assert!(harness.query_by_label("on air").is_some());
+}
+
+#[test]
+fn a_failed_destination_says_why_where_the_host_will_see_it() {
+    use jamstream_client::runtime::StreamPlatform;
+    let (_, mut harness) = destinations_harness(&[
+        (StreamPlatform::Twitch, DestinationState::Live),
+        (
+            StreamPlatform::YouTube,
+            DestinationState::Failed {
+                reason: "pusher exited: rtmp connection refused".to_owned(),
+            },
+        ),
+    ]);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label("pusher exited: rtmp connection refused")
+            .is_some(),
+        "the pipeline's reason must be on screen verbatim"
+    );
+    // And with the sheet closed, the status bar still says one died.
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("1 failed").is_some());
+    assert!(harness.query_by_label("1 live").is_some());
+}
+
+#[test]
+fn non_hosts_get_no_destination_controls_but_do_see_the_air() {
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, false);
+    demo.set_destinations(&[(
+        jamstream_client::runtime::StreamPlatform::Twitch,
+        DestinationState::Live,
+    )]);
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let rt_ui = rt.clone();
+    // A musician's screen has no panel to give it, the way it has no invites.
+    let mut screen = SessionScreen::default();
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        });
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Destinations").is_none());
+    assert!(harness.query_by_label("Go live").is_none());
+    assert!(harness.query_by_label("1 live").is_some());
+    assert!(harness.query_by_label("on air").is_some());
 }
 
 #[test]

@@ -1,3 +1,4 @@
+pub mod destinations;
 pub mod devices;
 pub mod home;
 pub mod host;

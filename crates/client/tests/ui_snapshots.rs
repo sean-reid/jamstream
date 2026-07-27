@@ -9,9 +9,11 @@ use std::sync::Arc;
 use egui::vec2;
 use egui_kittest::Harness;
 use jamstream_client::app::{JamApp, Screen};
-use jamstream_client::creds::{EnvReader, MemStore};
+use jamstream_client::creds::{self, CredStore, EnvReader, MemStore};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
 use jamstream_client::exec::Executor;
+use jamstream_client::runtime::{DestinationState, StreamPlatform};
+use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
 use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow};
 use jamstream_client::screens::invites::InvitesPanel;
@@ -269,6 +271,157 @@ fn session_stream_mix_audition() {
     // the mouth-to-ear readout.
     let mut harness = app_harness(stream_mix_app(Theme::Dark, true), WIDE);
     snapshot(&mut harness, "session_stream_mix_audition");
+}
+
+// The destinations sheet, in the states a broadcast actually passes through.
+// Every key here is obviously fake and none of them is ever drawn: the entry
+// field is masked with no reveal, and the status the server sends back
+// carries no key at all.
+
+/// A key nothing could stream with, for the keychain slots a snapshot needs
+/// to read as "key saved".
+const FAKE_KEY: &str = "0000-0000-0000-0000-fake";
+
+fn saved_keys(platforms: &[StreamPlatform]) -> Arc<MemStore> {
+    let store = Arc::new(MemStore::default());
+    for platform in platforms {
+        let field = creds::stream_key_field(*platform);
+        store
+            .set(field.0, field.1, FAKE_KEY)
+            .expect("store the fake key");
+    }
+    store
+}
+
+/// The host session with the destinations sheet open: `saved` platforms have
+/// a key on this computer, `reported` is what the server says each
+/// destination is doing.
+fn destinations_app(
+    theme: Theme,
+    saved: &[StreamPlatform],
+    reported: &[(StreamPlatform, DestinationState)],
+) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_destinations(reported);
+    let mut app = session_app(rt, theme);
+    app.session.destinations = Some(DestinationsPanel::new(saved_keys(saved)));
+    app.session.destinations_open = true;
+    app
+}
+
+fn live(platform: StreamPlatform) -> (StreamPlatform, DestinationState) {
+    (platform, DestinationState::Live)
+}
+
+#[test]
+fn session_destinations() {
+    // Nothing configured and no key anywhere: the empty state says what to do
+    // next, and the on air lamp is dark.
+    let app = destinations_app(Theme::Dark, &[], &[]);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_destinations");
+}
+
+#[test]
+fn session_destinations_light() {
+    let app = destinations_app(Theme::Light, &[], &[]);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_destinations_light");
+}
+
+#[test]
+fn session_destinations_key() {
+    // The one surface where a key exists: masked, with its character count
+    // standing in for reading it back, and the platform's own guidance above.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    let mut app = session_app(rt, Theme::Dark);
+    app.session.destinations = Some(DestinationsPanel::with_key_entry(
+        Arc::new(MemStore::default()),
+        StreamPlatform::Twitch,
+        FAKE_KEY,
+    ));
+    app.session.destinations_open = true;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_destinations_key");
+}
+
+#[test]
+fn session_destinations_ready() {
+    // One destination configured and waiting for Go live, one platform with a
+    // key saved and nothing configured. Both rows land on the same columns.
+    let app = destinations_app(
+        Theme::Dark,
+        &[StreamPlatform::YouTube],
+        &[(StreamPlatform::Twitch, DestinationState::Idle)],
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_destinations_ready");
+}
+
+#[test]
+fn session_destinations_live() {
+    // On air to one platform: the row lamp and the status bar lamp both lit,
+    // the bitrate and dropped-frame readouts in the monospace.
+    let app = destinations_app(Theme::Dark, &[], &[live(StreamPlatform::Twitch)]);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_destinations_live");
+}
+
+#[test]
+fn session_destinations_live_two() {
+    let app = destinations_app(
+        Theme::Dark,
+        &[],
+        &[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)],
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_destinations_live_two");
+}
+
+#[test]
+fn session_destinations_failed() {
+    // One destination died and the other kept streaming, which is the whole
+    // point of a process per destination. The reason is verbatim from the
+    // pipeline and the dropped-frame count runs red.
+    let app = destinations_app(
+        Theme::Dark,
+        &[],
+        &[
+            live(StreamPlatform::Twitch),
+            (
+                StreamPlatform::YouTube,
+                DestinationState::Failed {
+                    reason: "pusher exited: rtmp connection refused".to_owned(),
+                },
+            ),
+        ],
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_destinations_failed");
+}
+
+#[test]
+fn session_destinations_narrow() {
+    // At 800 px the status bar carries three toggles, the cost ticker, the
+    // lamp, and the live count; nothing may overlap.
+    let app = destinations_app(
+        Theme::Dark,
+        &[],
+        &[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)],
+    );
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_destinations_narrow");
+}
+
+#[test]
+fn session_on_air_musician() {
+    // Not a host, no sheet, no controls: a musician still sees that the room
+    // is on air and to how many places.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_destinations(&[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)]);
+    let app = session_app(rt, Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_on_air_musician");
 }
 
 // Wizard states are constructed through the real transitions with a

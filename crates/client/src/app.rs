@@ -12,6 +12,7 @@ use crate::demo::DemoRuntime;
 use crate::exec::{Executor, Job};
 use crate::live::{AudioSettings, CostedRuntime, LiveRuntime};
 use crate::runtime::{AvatarHandle, Command, ConnState, LevelsView, Runtime, Snapshot};
+use crate::screens::destinations::DestinationsPanel;
 use crate::screens::devices::{DeviceCatalog, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
@@ -133,6 +134,10 @@ impl JamApp {
     pub fn demo() -> Self {
         let mut app = Self::new();
         app.runtime = Some(Box::new(DemoRuntime::host()));
+        // The demo reaches no platform, so its destinations sheet keeps keys
+        // in memory for the run instead of touching the real keychain.
+        app.session.destinations =
+            Some(DestinationsPanel::new(Arc::new(creds::MemStore::default())));
         app.screen = Screen::Session;
         app
     }
@@ -186,6 +191,10 @@ impl JamApp {
                 self.session = SessionScreen::default();
                 self.session.invites = Some(panel);
                 self.session.invites_open = true;
+                // Hosting is the only role that can stream, so the sheet
+                // exists only here. It reads the keychain for saved stream
+                // keys on construction and holds no key of its own.
+                self.session.destinations = Some(DestinationsPanel::new(Arc::clone(&self.creds)));
                 self.recent = RecentSession::load();
                 self.screen = Screen::Session;
                 self.announce_own_avatar();
