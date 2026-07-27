@@ -1,62 +1,78 @@
 # Hosting a session
 
-Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three, and so does the desktop app: its host wizard walks the same steps, stores your provider credentials in the system keychain, joins you automatically once the server answers, and both record the session in the same place, so a session hosted in the app shows up in `jamstream status` and can be ended from either side.
+Hosting means launching one small server, minting the invites, and ending the session when you are done. In the app, **Host a session** on the home screen walks four steps: where the server runs, which region, a cost preview, and the launch itself. The wizard stores your provider credentials in the system keychain, joins you automatically once the server answers, and opens the invites panel. The CLI does the same three jobs from the terminal, and both record the session in the same place, so a session hosted in the app shows up in `jamstream status` and can be ended from either side.
 
-Hosting does not have to involve a cloud at all: `jamstream host --provider local` runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; [Playing on the same network](local.md) covers local mode.
+Hosting does not have to involve a cloud at all: picking **local** in the wizard's first step runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; [Playing on the same network](local.md) covers local mode.
+
+## The provider step
+
+The first step lists where the server can run: local, then the three clouds, each with its status. A cloud with saved credentials reads `ready`; one without reads `setup needed`, and selecting it opens an inline pane that takes the credential, checks it with a real API call, and saves it to your keychain. [Provider setup](providers.md) walks each provider from zero.
 
 ## The region table
 
-Before launching, JamStream measures the round trip from your machine to each of the provider's regions and prints a table:
+Before launching, JamStream measures the round trip from your machine to each of the provider's regions and shows a table:
 
-```text
-REGION              WORST RTT         HOURLY       EGRESS
-nyc3                    14 ms    $0.02679/hr     $0.01/GB
-tor1                    27 ms    $0.02679/hr     $0.01/GB
-sfo3                    72 ms    $0.02679/hr     $0.01/GB
-```
+![Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns](../images/wizard_region.png)
+*Step 2 of 4, with prices fetched live and latencies probed from the host's machine. The CLI prints the same table.*
 
-- **WORST RTT** is the slowest measured round trip, in milliseconds, among the people probing. At create time that is only you; your bandmates' distances are not known yet. The probes time a TCP handshake against each region's public endpoints, which tracks the UDP path closely enough to rank regions.
-- **HOURLY** is the machine's current price per hour, fetched live where the provider offers it.
-- **EGRESS** is what the provider charges per GB of outbound audio.
+- **worst rtt** is the slowest measured round trip, in milliseconds, among the people probing. At create time that is only you; your bandmates' distances are not known yet. The probes time a TCP handshake against each region's public endpoints, which tracks the UDP path closely enough to rank regions.
+- **hourly** is the machine's current price per hour, fetched live where the provider offers it.
+- **egress** is what the provider charges per GB of outbound audio.
 
-The pick weighs worst round trip and hourly price equally, and the table is printed in that order, best first. The top row launches unless you override it:
-
-```console
-$ jamstream host --provider digitalocean --region tor1 ...
-```
+The ranking weighs worst round trip and hourly price equally, and the table is listed in that order, best first. The top row is preselected; click another to override it (`--region` in the CLI).
 
 A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable. If the band spans a continent, pick the region that is mediocre for everyone over the one that is perfect for you; the person with the worst round trip sets the feel. See [Troubleshooting](troubleshooting.md) for what the numbers mean in the ear.
 
-![Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns](../images/wizard_region.png)
-*The same table in the app's host wizard, step 2 of 4, with prices fetched live and latencies probed from the host's machine.*
+## The cost preview and the seats
+
+Step 3 shows the expected hours, the seat counts, and the resulting estimate, all editable in place:
+
+- **hours** shapes the estimate only; the real bill is metered. Play longer and you pay for the time played.
+- **musicians** is the number of players you are inviting, not counting yourself; **listeners** are people who only hear the mix.
+- **stream destinations** counts toward the egress estimate; broadcasting itself is designed but not shipped.
+
+Under the numbers, release builds show one line naming the exact `jamstreamd` build the machine will download and verify at boot; there is nothing to configure. [Understanding cost](cost.md) explains every line of the estimate. Clicking **Launch** boots the machine, waits for its address, proves the server answers a real encrypted handshake, and joins you.
 
 ## Invites are minted at launch
 
-`host` mints one invite per seat, up front, on your machine:
-
-- `--musicians N` invites for players, default 4, not counting you. Cap 10.
-- `--listeners N` invites for people who only listen, default 0. Cap 20.
-
-Each invite is tied to one seat and signed. The CLI cannot add seats to a running session; the app's invites panel can mint more mid-session, within the same caps. Unused invites cost nothing. See [Joining a session](joining.md) for how invites behave.
+One invite per seat is minted up front, on your machine, and the wizard opens the invites panel the moment you are in:
 
 ![Invites panel over the session screen listing per-person invites with copy and revoke buttons](../images/session_invites.png)
-*The app after launch: the wizard joins you automatically and opens the invites panel. Each link admits one person; copy, revoke, or mint more.*
+*Each link admits one person. Copy, revoke, or mint more, and end the session for everyone from here.*
+
+- Each row is one seat with a live status: `not joined`, `connected`, or `revoked`. **Copy link** puts that person's invite on the clipboard; send it to exactly one person over a channel you trust.
+- **Revoke** ejects that member and kills their invite, with a confirmation step. The host also sees a Revoke button on each mixer strip.
+- **Mint invite** adds a musician or listener seat mid-session, up to 10 musicians (you included) and 20 listeners. Unused invites cost nothing.
+
+See [Joining a session](joining.md) for how invites behave on the other end. The CLI mints its seats with `--musicians` (default 4, not counting you) and `--listeners` (default 0) and cannot add seats to a running session; the app's panel can, even for sessions the CLI hosted.
 
 ## The safety knobs
 
 Every session carries two timers, both set at launch:
 
-- `--idle-min`, default 10: with no musicians connected for this many minutes, the server shuts itself down and the machine is destroyed.
-- `--max-hours`, default 12: the hard cap. The machine is destroyed at the cap no matter what, and invites expire with it.
+- the idle exit, 10 minutes by default: with no musicians connected for that long, the server shuts itself down and the machine is destroyed.
+- the hard cap, 12 hours by default: the machine is destroyed at the cap no matter what, and invites expire with it.
 
-There is no way to extend a running session; host a new one. The point of the caps is that a forgotten session costs a bounded, small amount, not a month of billing. [Understanding cost](cost.md) covers the other guardrails.
+The app uses the defaults; the CLI can change both (`--idle-min` and `--max-hours` in the [host reference](../cli/host.md)). There is no way to extend a running session; host a new one. The point of the caps is that a forgotten session costs a bounded, small amount, not a month of billing. [Understanding cost](cost.md) covers the other guardrails.
 
 ## While it runs
 
-`jamstream status` lists your sessions with elapsed time, cost accrued so far, and a projection. In the app, the host's session screen shows the same cost figure live in the status bar, next to latency.
+The host's status bar shows cost so far next to the latency readout, with elapsed time beside it; nothing accrues silently. Devices and buffer size can change mid-session from Settings in the top bar, and the change applies immediately; [Joining a session](joining.md#the-session-screen) walks the whole screen. `jamstream status` lists the same sessions from the terminal, with elapsed time, cost accrued so far, and a projection.
 
-If you host from the app or another terminal later, the CLI also warns at host time when it finds JamStream-tagged machines already running in your account, so a stray session does not hide behind a new one.
+If tagged machines already exist in your account when you host again, the CLI warns at host time, so a stray session does not hide behind a new one.
 
 ## Ending
 
-`jamstream end 3f2a9c01` (any unambiguous prefix of the session id works) or `jamstream end --last`. In the app, "End session for everyone" in the invites panel does the same. Ending destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended. The invites are dead from that moment.
+**End session for everyone** in the invites panel destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended, with a progress sheet until the provider confirms. The invites are dead from that moment. Leaving is not ending: **Leave** disconnects you and the server keeps running until the host ends it or the idle exit fires.
+
+## From the terminal
+
+The CLI runs the same flow without a screen:
+
+```console
+$ jamstream host --provider digitalocean
+$ jamstream status
+$ jamstream end 3f2a9c01        # any unambiguous prefix, or --last
+```
+
+`host` prints the region table and cost preview, asks for confirmation, and prints one invite per seat; `end` confirms with the provider that nothing tagged with the session is still listed. Every flag is in the [CLI reference](../cli/index.md).

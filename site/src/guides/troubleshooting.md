@@ -23,9 +23,7 @@ Things to check, in order of payoff:
 
 ## Device problems
 
-Input and output devices are picked in Settings, in the Devices panel: a Capture picker, a Playback picker, and an input level meter that should move when you play. If the meter is still, the wrong capture device is selected or the operating system has not granted microphone access to the app.
-
-Honest note for the current build: real device enumeration is still being wired up, so the device lists you see may be placeholders. Use your operating system's default device selection in the meantime.
+Input and output devices are picked in Settings, in the Devices panel: a Capture picker, a Playback picker, and an input level meter that should move when you play. If the meter is still, the wrong capture device is selected or the operating system has not granted microphone access to the app. The lists come from the platform's audio backend (CoreAudio on macOS, WASAPI on Windows, PipeWire or ALSA on Linux), with the system default listed first, and a change mid-session reopens the stream on the new device without leaving the session.
 
 - "no devices found" in a picker means the platform reported nothing for that direction; check that the interface is connected and visible to other apps.
 - Sample rate is fixed at 48 kHz. Most interfaces are fine with this; set your interface to 48 kHz in its control panel if it is pinned elsewhere.
@@ -33,7 +31,7 @@ Honest note for the current build: real device enumeration is still being wired 
 
 ## Firewall and NAT
 
-Members need only outbound UDP. The client opens one UDP socket to the server's address and port (default 43210, printed in the host output and baked into invites); it listens on no ports, so home routers and NAT need no configuration and no port forwarding. Steady keepalive traffic holds the NAT mapping open for the whole session.
+Members need only outbound UDP. The client opens one UDP socket to the server's address and port, both baked into the invite (cloud sessions use port 43210; local sessions hosted from the app pick a free port); it listens on no ports, so home routers and NAT need no configuration and no port forwarding. Steady keepalive traffic holds the NAT mapping open for the whole session.
 
 - If joining times out after about 10 seconds, something between you and the server is dropping UDP. Corporate and campus networks sometimes block outbound UDP on unusual ports; a phone hotspot is a quick way to confirm that is the cause.
 - The server side needs nothing from you: the machine's firewall is configured at boot to accept only the session port.
