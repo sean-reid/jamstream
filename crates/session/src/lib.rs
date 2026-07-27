@@ -9,7 +9,9 @@ pub mod client;
 pub mod server;
 
 pub use client::{ClientCore, ClientEvent, ClientState, ClientStats};
-pub use server::{MemberStats, ServerConfig, ServerCore, ServerEvent};
+pub use server::{
+    BroadcastMember, BroadcastTick, MemberStats, ServerConfig, ServerCore, ServerEvent,
+};
 
 /// Errors surfaced by client-side calls; the cores otherwise swallow bad
 /// input from the network by design.

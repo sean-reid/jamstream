@@ -1,0 +1,85 @@
+{
+  "_notes": [
+    "Broadcast destination requirements as data, not code. Adding a landscape",
+    "platform is an entry here; adding a vertical one is an entry plus a second",
+    "encode, which is why the card renderer keeps a 9:16 layout in its design.",
+    "",
+    "Refresh cadence: review at each release, and whenever a platform announces",
+    "an ingest change. The fields that actually gate a stream are ingest_url,",
+    "requires_cbr and keyframe_secs; the rest is guidance surfaced in the UI.",
+    "",
+    "V1 ships Twitch and YouTube only: both take a persistent key with no",
+    "account gating and both accept landscape 720p. Everything under 'deferred'",
+    "is documented with the reason it is not in v1."
+  ],
+  "video": {
+    "codec": "h264",
+    "profile": "main",
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "kbps": 2500,
+    "keyframe_secs": 2
+  },
+  "audio": {
+    "codec": "aac-lc",
+    "kbps": 128,
+    "sample_rate": 48000,
+    "channels": 2,
+    "_note": "AAC everywhere. No platform accepts Opus on ingest, so the broadcast leg transcodes even though the session speaks Opus end to end."
+  },
+  "platforms": [
+    {
+      "id": "twitch",
+      "display_name": "Twitch",
+      "ingest_url": "rtmps://live.twitch.tv:443/app/{key}",
+      "ingest_url_plaintext": "rtmp://live.twitch.tv/app/{key}",
+      "requires_cbr": true,
+      "keyframe_secs": 2,
+      "aspect": "16:9",
+      "max_video_kbps": 6000,
+      "max_audio_kbps": 160,
+      "key_acquisition": "Creator Dashboard, Settings, Stream, Primary Stream key. Persistent until reset.",
+      "notes": "Twitch requires constant bitrate; variable bitrate shows up as viewer buffering rather than an ingest error. The regional ingest list is served over their API, but live.twitch.tv resolves to a nearby POP and is what the docs recommend for a fixed configuration."
+    },
+    {
+      "id": "youtube",
+      "display_name": "YouTube Live",
+      "ingest_url": "rtmps://a.rtmps.youtube.com:443/live2/{key}",
+      "ingest_url_plaintext": "rtmp://a.rtmp.youtube.com/live2/{key}",
+      "requires_cbr": false,
+      "keyframe_secs": 2,
+      "aspect": "16:9",
+      "max_video_kbps": 9000,
+      "max_audio_kbps": 128,
+      "key_acquisition": "YouTube Studio, Go Live, Stream, Stream key. Persistent keys are the default; the channel needs live streaming enabled once, which can take 24 hours on a new account.",
+      "notes": "YouTube enforces a 4 s maximum keyframe interval and recommends 2 s. Sending 2 s satisfies both platforms with one encode."
+    }
+  ],
+  "deferred": [
+    {
+      "id": "facebook",
+      "display_name": "Facebook Live",
+      "aspect": "16:9",
+      "reason": "Ingest keys are per-broadcast and minted through the Graph API, so a session cannot be configured ahead of time with a persistent key. Needs an OAuth app review."
+    },
+    {
+      "id": "instagram",
+      "display_name": "Instagram Live",
+      "aspect": "9:16",
+      "reason": "No public RTMP ingest for ordinary accounts; vertical only, so it also needs the second encode."
+    },
+    {
+      "id": "tiktok",
+      "display_name": "TikTok Live",
+      "aspect": "9:16",
+      "reason": "RTMP ingest is gated behind follower thresholds and a per-region application. Vertical, so it needs the second encode."
+    },
+    {
+      "id": "kick",
+      "display_name": "Kick",
+      "aspect": "16:9",
+      "reason": "Persistent key and landscape, so technically the cheapest addition; deferred only to keep v1 to the two platforms we can test end to end."
+    }
+  ]
+}

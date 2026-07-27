@@ -8,7 +8,9 @@ use jamstream_engine::{
     Channels, CodecError, Decoder, DriftCompensator, Encoder, JitterBuffer, JitterStats,
     MediaPacket, Pull, RedundancyPolicy,
 };
-use jamstream_protocol::control::{ControlLink, ControlMsg, MAX_AVATAR_BYTES, MemberInfo};
+use jamstream_protocol::control::{
+    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MemberInfo, StreamOp,
+};
 use jamstream_protocol::ids::{MemberId, Role, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
@@ -115,6 +117,10 @@ pub enum ClientEvent {
         pan: f32,
         muted: bool,
     },
+    /// The broadcast's per-destination state, as the server sees it. Sent to
+    /// every member, so any client can show the room it is on air. Never
+    /// carries a stream key.
+    StreamStatus(Vec<DestinationStatus>),
     /// A member's avatar bytes are cached and hash-verified; fetch them
     /// with `avatar_bytes`. Emitted once per (member, hash).
     AvatarReady {
@@ -716,6 +722,16 @@ impl ClientCore {
         Ok(())
     }
 
+    /// Host-only server-side: add or remove a broadcast destination, or start
+    /// and stop the stream. The server counts a violation against anyone else.
+    /// A key inside the op is already inside the transport encryption; the
+    /// server keeps it in memory only.
+    pub fn stream_ctl(&mut self, op: StreamOp) -> Result<(), SessionError> {
+        self.require_joined()?;
+        self.link.send(ControlMsg::StreamCtl { op })?;
+        Ok(())
+    }
+
     /// Host-only server-side; the server ignores it from anyone else.
     pub fn set_metronome(
         &mut self,
@@ -852,12 +868,16 @@ impl ClientCore {
                 total,
                 data,
             } => self.handle_avatar_chunk(hash, index, total, &data),
+            ControlMsg::StreamStatus { destinations } => {
+                self.events.push(ClientEvent::StreamStatus(destinations));
+            }
             // The server never sends these; ignore.
             ControlMsg::MixerSet { .. }
             | ControlMsg::ClickEnable { .. }
             | ControlMsg::BroadcastAudition { .. }
             | ControlMsg::Revoke { .. }
-            | ControlMsg::SetAvatar { .. } => {}
+            | ControlMsg::SetAvatar { .. }
+            | ControlMsg::StreamCtl { .. } => {}
         }
     }
 

@@ -1,6 +1,14 @@
 //! Socket, tick, and lifecycle driver for `ServerCore`. All session logic
 //! lives in jamstream-session; this file owns exactly the things the core
-//! must not: time, UDP, and the activity file the dead man's switch reads.
+//! must not: time, UDP, the activity file the dead man's switch reads, and
+//! the broadcast pipeline's processes.
+//!
+//! Why the pipeline is driven here rather than from `ServerCore`: the core is
+//! sans-io and deterministic, which is what lets the harness replay a session
+//! packet for packet. Spawning ffmpeg is neither. So the core routes an
+//! accepted `StreamCtl` out as an event, this file hands it to the stream
+//! worker, and the worker's per-destination status comes back in through
+//! `set_stream_status` for fanout to every member.
 
 use std::io;
 use std::net::SocketAddr;
@@ -8,8 +16,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
+use jamstream_protocol::control::StreamOp;
 use jamstream_protocol::transport::derive_public;
 use jamstream_session::server::{ServerConfig, ServerCore, ServerEvent};
+use jamstream_stream::pipeline::{Roster, StreamConfig, StreamMember};
+use jamstream_stream::worker::{StreamWorker, TickPayload};
 use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
 
@@ -17,6 +28,8 @@ use crate::config::Config;
 
 const TICK: Duration = Duration::from_micros(2_500);
 const ACTIVITY_PERIOD: Duration = Duration::from_secs(1);
+/// Card title when provisioning supplied no session name.
+const DEFAULT_SESSION_NAME: &str = "JamStream session";
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -84,6 +97,13 @@ pub struct Server {
     activity_path: Option<PathBuf>,
     idle_exit: Duration,
     max_duration: Duration,
+    /// Broadcast pipeline, started on the host's first stream request. Most
+    /// sessions never stream, and the renderer's buffers plus a thread are not
+    /// worth paying for until one does.
+    stream: Option<StreamWorker>,
+    stream_cfg: StreamConfig,
+    /// Roster generation last handed to the pipeline.
+    stream_roster_epoch: u64,
 }
 
 impl Server {
@@ -106,12 +126,19 @@ impl Server {
             member_timeout_ms: 10_000,
         });
         let socket = UdpSocket::bind(opts.bind).await?;
+        // The card title. The wire protocol carries no session name, so
+        // jamstreamd takes it as a flag (see with_stream_config); this is the
+        // fallback when nobody supplies one.
+        let stream_cfg = StreamConfig::new(DEFAULT_SESSION_NAME);
         Ok(Server {
             core,
             socket,
             activity_path: opts.activity_path,
             idle_exit: Duration::ZERO,
             max_duration: Duration::ZERO,
+            stream: None,
+            stream_cfg,
+            stream_roster_epoch: 0,
         })
     }
 
@@ -136,8 +163,99 @@ impl Server {
         self
     }
 
+    /// Overrides the broadcast pipeline's configuration (ffmpeg path, relay
+    /// URL, working directories). Tests and local runs use it; the default is
+    /// the layout cloud-init creates on the session VM.
+    pub fn with_stream_config(mut self, cfg: StreamConfig) -> Self {
+        self.stream_cfg = cfg;
+        self
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Hands one accepted host request to the pipeline, starting the worker on
+    /// the first one.
+    fn route_stream_ctl(&mut self, now_ms: u64, op: StreamOp) {
+        if self.stream.is_none() {
+            match StreamWorker::spawn(self.stream_cfg.clone()) {
+                Ok(worker) => self.stream = Some(worker),
+                Err(err) => {
+                    tracing::error!(error = %err, "cannot start the broadcast pipeline");
+                    return;
+                }
+            }
+        }
+        if let Some(worker) = self.stream.as_ref() {
+            worker.apply(now_ms, op);
+        }
+    }
+
+    /// Feeds the pipeline this tick's broadcast audio and card state. Copies a
+    /// fixed-size payload and hands it off; it never waits on ffmpeg.
+    fn feed_stream(&mut self, now_ms: u64) {
+        let Some(worker) = self.stream.as_ref() else {
+            return;
+        };
+        let wants = worker.wants_audio();
+        if wants != self.core.broadcast_tap() {
+            self.core.set_broadcast_tap(wants);
+        }
+        if !wants {
+            return;
+        }
+        let tick = self.core.broadcast_tick();
+        let mut payload = TickPayload::default();
+        let n = tick.audio.len().min(payload.audio.len());
+        payload.audio[..n].copy_from_slice(&tick.audio[..n]);
+        for m in &tick.members {
+            payload.levels.push(m.level_peak, m.level_rms);
+        }
+        let roster = (tick.roster_epoch != self.stream_roster_epoch).then(|| Roster {
+            members: tick
+                .members
+                .iter()
+                .map(|m| StreamMember {
+                    id: m.id,
+                    name: m.name.to_owned(),
+                    connected: m.connected,
+                    avatar: m.avatar.map(|(hash, bytes)| (*hash, bytes.to_vec())),
+                })
+                .collect(),
+            listeners: tick.listeners,
+        });
+        let epoch = tick.roster_epoch;
+        if let Some(roster) = roster {
+            worker.submit_roster(roster);
+            self.stream_roster_epoch = epoch;
+        }
+        worker.submit_tick(now_ms, payload);
+    }
+
+    /// Once a second: keep the supervisor's clock moving and publish its
+    /// per-destination status to every member.
+    fn beat_stream(&mut self, now_ms: u64) {
+        let Some(worker) = self.stream.as_ref() else {
+            return;
+        };
+        worker.beat(now_ms);
+        let gaps = worker.gap_ticks();
+        if gaps > 0 {
+            tracing::warn!(gaps, "broadcast pipeline fell behind the mix tick");
+        }
+        let status = worker.status();
+        self.core.set_stream_status(now_ms, status);
+    }
+
+    /// Logs the core's events and routes the one kind that needs an actuator.
+    fn drain_events(&mut self, now_ms: u64) {
+        for event in self.core.events() {
+            log_event(&event);
+            if let ServerEvent::StreamCtl(op) = event {
+                self.route_stream_ctl(now_ms, op);
+            }
+        }
     }
 
     /// Runs until `shutdown` resolves. Datagram handling, the 2.5 ms mix
@@ -163,11 +281,14 @@ impl Server {
                     for (addr, pkt) in self.core.tick(now_ms) {
                         let _ = self.socket.send_to(&pkt, addr).await;
                     }
-                    for event in self.core.events() {
-                        log_event(&event);
-                    }
+                    // Straight after the tick: the broadcast slice the tap
+                    // exposes is the slot that tick just wrote.
+                    self.feed_stream(now_ms);
+                    self.drain_events(now_ms);
                 }
                 _ = heartbeat.tick() => {
+                    let now_ms = start.elapsed().as_millis() as u64;
+                    self.beat_stream(now_ms);
                     let musicians = self.core.musicians_connected();
                     if musicians > 0 {
                         touch(self.activity_path.as_deref());
@@ -207,6 +328,9 @@ impl Server {
                     for (addr, pkt) in self.core.handle_datagram(now_ms, now_unix, src, &buf[..len]) {
                         let _ = self.socket.send_to(&pkt, addr).await;
                     }
+                    // A StreamCtl arrives on this path, not the tick, and the
+                    // host should not wait 2.5 ms for it.
+                    self.drain_events(now_ms);
                 }
             }
         }
@@ -226,6 +350,8 @@ fn log_event(event: &ServerEvent) {
         ServerEvent::ProtocolViolation { id, what } => {
             tracing::warn!(member = id.0, what, "protocol violation");
         }
+        // The op's Debug redacts the stream key by construction.
+        ServerEvent::StreamCtl(op) => tracing::info!(op = ?op, "stream control"),
     }
 }
 

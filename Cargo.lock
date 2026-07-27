@@ -2801,7 +2801,9 @@ dependencies = [
  "jamstream-engine",
  "jamstream-protocol",
  "jamstream-session",
+ "jamstream-stream",
  "mimalloc",
+ "postcard",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -2816,7 +2818,21 @@ dependencies = [
  "ed25519-dalek",
  "jamstream-engine",
  "jamstream-protocol",
+ "postcard",
  "proptest",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "jamstream-stream"
+version = "0.1.1-beta"
+dependencies = [
+ "jamstream-broadcast",
+ "jamstream-protocol",
+ "libc",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tracing",
 ]

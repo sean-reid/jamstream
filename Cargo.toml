@@ -11,6 +11,7 @@ members = [
     "crates/client",
     "crates/harness",
     "crates/broadcast",
+    "crates/stream",
     "xtask",
 ]
 
@@ -31,6 +32,8 @@ jamstream-cli = { path = "crates/cli" }
 jamstream-audio-io = { path = "crates/audio-io" }
 jamstream-cloud = { path = "crates/cloud" }
 jamstream-harness = { path = "crates/harness" }
+jamstream-broadcast = { path = "crates/broadcast" }
+jamstream-stream = { path = "crates/stream" }
 
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }

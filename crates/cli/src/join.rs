@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use jamstream_protocol::control::DestinationState;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
@@ -265,6 +266,13 @@ fn print_event<W: Write>(out: &mut W, event: &ClientEvent) -> std::io::Result<()
             "rejected: this client speaks protocol {ours}, the server speaks {theirs}"
         ),
         ClientEvent::TimedOut => writeln!(out, "timed out"),
+        ClientEvent::StreamStatus(destinations) => {
+            let live = destinations
+                .iter()
+                .filter(|d| d.state == DestinationState::Live)
+                .count();
+            writeln!(out, "stream: {live} of {} live", destinations.len())
+        }
         // Once a second; too chatty for line output.
         ClientEvent::RttSample { .. } => Ok(()),
         // Mixer mirroring and avatars are UI concerns; line output ignores them.

@@ -17,3 +17,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Loopback tests scan the bytes the server actually seals.
+postcard.workspace = true

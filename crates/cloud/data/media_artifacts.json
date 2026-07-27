@@ -1,0 +1,59 @@
+{
+  "_notes": [
+    "Pinned static builds of the two subprocesses the broadcast pipeline needs.",
+    "The session VM fetches these at bootstrap and refuses to use either one on",
+    "a sha256 mismatch, exactly as it does with the jamstreamd artifact.",
+    "",
+    "Licensing, and why these are subprocesses: the ffmpeg build below is GPL",
+    "(it includes libx264). JamStream links no ffmpeg code, bundles no ffmpeg",
+    "code, and speaks to it only over pipes and argv, so the copyleft obligation",
+    "stays at the process boundary; the VM downloads the binary from the",
+    "publisher named in 'source', which is also where its corresponding source",
+    "is published. Keep it that way: linking libav* into jamstreamd would pull",
+    "the whole binary under the GPL. MediaMTX is MIT.",
+    "",
+    "Refresh cadence: review at every release and whenever either project ships",
+    "a security fix. To refresh an entry, download the URL, run",
+    "`shasum -a 256 <file>`, paste the digest here, and run",
+    "`cargo test -p jamstream-cloud` (the snapshots pin the rendered output).",
+    "Only immutable URLs belong here: a 'latest' or 'release' URL whose content",
+    "changes under a fixed path would turn every future boot into a hash",
+    "mismatch and refuse to start.",
+    "",
+    "Verified 2026-07-27 by downloading each artifact and hashing it."
+  ],
+  "ffmpeg": {
+    "version": "n7.1.5-10-g2aefd64d48",
+    "source": "https://github.com/BtbN/FFmpeg-Builds (autobuild-2026-07-26-13-28, gpl, non-shared)",
+    "license": "GPL-3.0-or-later",
+    "archive": "tar.xz",
+    "member": "*/bin/ffmpeg",
+    "targets": {
+      "x86_64": {
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-26-13-28/ffmpeg-n7.1.5-10-g2aefd64d48-linux64-gpl-7.1.tar.xz",
+        "sha256": "92f7ca590bb4cc17e596c4a9747e3c85d7456fde7bf6e297c48640b471be8f74"
+      },
+      "aarch64": {
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-26-13-28/ffmpeg-n7.1.5-10-g2aefd64d48-linuxarm64-gpl-7.1.tar.xz",
+        "sha256": "b803fab318029e530ecd4859013ffbd743a549d0ee4e1bced5e5c3be59bf11e3"
+      }
+    }
+  },
+  "mediamtx": {
+    "version": "v1.19.3",
+    "source": "https://github.com/bluenviron/mediamtx/releases/tag/v1.19.3",
+    "license": "MIT",
+    "archive": "tar.gz",
+    "member": "mediamtx",
+    "targets": {
+      "x86_64": {
+        "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.19.3/mediamtx_v1.19.3_linux_amd64.tar.gz",
+        "sha256": "a7ba21268fccda3ebc43fdad76b87fddb85ce77e725b5cb637bca724b5394fbe"
+      },
+      "aarch64": {
+        "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.19.3/mediamtx_v1.19.3_linux_arm64.tar.gz",
+        "sha256": "9e5b38a5b5fcab1916341b024031b2fc5dc6a2059baed9ba3f3b0d3768d231a8"
+      }
+    }
+  }
+}

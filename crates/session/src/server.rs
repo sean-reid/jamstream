@@ -12,7 +12,10 @@ use jamstream_engine::{
     Pull, mix_into,
 };
 use jamstream_protocol::PROTOCOL_VERSION;
-use jamstream_protocol::control::{ControlLink, ControlMsg, MAX_AVATAR_BYTES, MemberInfo};
+use jamstream_protocol::control::{
+    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_STREAM_KEY_LEN, MemberInfo,
+    StreamOp,
+};
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::verify_token;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
@@ -36,6 +39,12 @@ const REJECT_INTERVAL_MS: u64 = 1_000;
 const REJECT_MAP_MAX: usize = 64;
 /// Uplink Stats reports go to each musician this often.
 const STATS_INTERVAL_MS: u64 = 1_000;
+/// While anything is configured for broadcast, every member is told the
+/// on-air state at least this often. Transitions are sent immediately.
+const STREAM_STATUS_INTERVAL_MS: u64 = 1_000;
+/// Meter fall per 2.5 ms tick for the broadcast cards, matching the client's
+/// own ballistics: roughly a 170 ms half-life.
+const BCAST_LEVEL_DECAY: f32 = 0.99;
 /// How long a cached handshake response answers an identical resent init.
 const RESP_CACHE_MS: u64 = 5_000;
 /// A connected member silent this long may be replaced by a fresh init
@@ -66,10 +75,55 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEvent {
     MusicianCountChanged(usize),
-    MemberJoined { id: MemberId, name: String },
-    MemberDisconnected { id: MemberId },
-    MemberRevoked { id: MemberId },
-    ProtocolViolation { id: MemberId, what: &'static str },
+    MemberJoined {
+        id: MemberId,
+        name: String,
+    },
+    MemberDisconnected {
+        id: MemberId,
+    },
+    MemberRevoked {
+        id: MemberId,
+    },
+    ProtocolViolation {
+        id: MemberId,
+        what: &'static str,
+    },
+    /// An accepted host request for the broadcast pipeline. The core does not
+    /// run processes, so it hands the op to whatever drives it (jamstreamd's
+    /// runtime, which owns the stream worker) and stays deterministic. The op
+    /// may carry a stream key: its `Debug` is redacted, and nothing in the
+    /// core logs, stores, or relays it.
+    StreamCtl(StreamOp),
+}
+
+/// One member as the broadcast card renderer needs them, borrowed from the
+/// core for the duration of one tick.
+#[derive(Debug, Clone, Copy)]
+pub struct BroadcastMember<'a> {
+    pub id: MemberId,
+    pub name: &'a str,
+    pub connected: bool,
+    /// Meter values with ballistics already applied.
+    pub level_peak: f32,
+    pub level_rms: f32,
+    /// Content hash and bytes, when the server has them cached.
+    pub avatar: Option<(&'a [u8; 32], &'a [u8])>,
+}
+
+/// Everything the broadcast pipeline needs from one mix tick. Valid until the
+/// next [`ServerCore::tick`]: the audio slice is this tick's slot of the
+/// broadcast accumulator, which the next tick overwrites eight ticks later.
+#[derive(Debug)]
+pub struct BroadcastTick<'a> {
+    /// Post-limiter broadcast stereo for this tick: 240 interleaved samples.
+    pub audio: &'a [f32],
+    /// Musicians, in member id order, capped by the caller's card limit.
+    pub members: Vec<BroadcastMember<'a>>,
+    pub listeners: usize,
+    /// Bumps on every roster change, so a caller can skip resending an
+    /// unchanged roster to the renderer.
+    pub roster_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +168,9 @@ struct Member {
     /// Jitter stats snapshot at the last Stats report; deltas against it
     /// give the per-window uplink numbers.
     stats_prev: JitterStats,
+    /// Broadcast card meters, updated per tick while the tap is on.
+    level_peak: f32,
+    level_rms: f32,
     /// Announced avatar (content hash, declared length). Survives
     /// disconnect and rejoin like the fader table.
     avatar: Option<(AvatarHash, u32)>,
@@ -143,6 +200,10 @@ pub struct ServerCore {
     /// 20 ms broadcast accumulator.
     bcast_accum: Vec<f32>,
     bcast_clock: u64,
+    /// Accumulator slot the last tick wrote; the broadcast tap reads it.
+    bcast_slot: usize,
+    /// While set, per-member card meters are maintained. Off costs nothing.
+    bcast_tap: bool,
     /// Host-set broadcast faders; absent members mix at unity.
     bcast_faders: BTreeMap<MemberId, Fader>,
     /// While set, the host's downlink carries the broadcast mix instead of
@@ -159,6 +220,11 @@ pub struct ServerCore {
     events: Vec<ServerEvent>,
     last_musician_count: usize,
     last_stats_ms: u64,
+    /// Latest per-destination broadcast status, as the pipeline reported it.
+    /// Key-free by construction: this goes to every member.
+    stream_status: Vec<DestinationStatus>,
+    last_stream_status_ms: u64,
+    roster_epoch: u64,
 }
 
 impl ServerCore {
@@ -180,6 +246,8 @@ impl ServerCore {
             decoded: Vec::new(),
             bcast_accum: vec![0.0; BCAST_LEN],
             bcast_clock: 0,
+            bcast_slot: 0,
+            bcast_tap: false,
             bcast_faders: BTreeMap::new(),
             audition: false,
             avatar_cache: AvatarCache::new(AVATAR_CACHE_BYTES),
@@ -188,6 +256,9 @@ impl ServerCore {
             events: Vec::new(),
             last_musician_count: 0,
             last_stats_ms: 0,
+            stream_status: Vec::new(),
+            last_stream_status_ms: 0,
+            roster_epoch: 0,
         }
     }
 
@@ -247,6 +318,21 @@ impl ServerCore {
                     pcm = [0.0; TICK_SAMPLES];
                 }
             }
+            if self.bcast_tap {
+                // Card meters, computed once here rather than by a second
+                // pass over the audio: peak with a slow fall, rms smoothed
+                // the same way, so the broadcast's only moving element looks
+                // like the client's own meters.
+                let mut peak = 0.0f32;
+                let mut sum_sq = 0.0f32;
+                for &s in &pcm {
+                    peak = peak.max(s.abs());
+                    sum_sq += s * s;
+                }
+                let rms = (sum_sq / TICK_SAMPLES as f32).sqrt();
+                m.level_peak = peak.max(m.level_peak * BCAST_LEVEL_DECAY);
+                m.level_rms = rms.max(m.level_rms * BCAST_LEVEL_DECAY);
+            }
             self.decoded.push((id, pcm));
         }
 
@@ -264,6 +350,7 @@ impl ServerCore {
         // personal pass so an auditioning host can be fed the identical
         // post-limiter signal.
         let idx = (self.tick_count % BCAST_TICKS) as usize;
+        self.bcast_slot = idx;
         if idx == 0 {
             self.bcast_clock = clock;
         }
@@ -464,6 +551,79 @@ impl ServerCore {
         std::mem::take(&mut self.events)
     }
 
+    /// Turns per-member card metering on or off. The broadcast pipeline wants
+    /// it while streaming; nothing else does, and off it costs nothing.
+    pub fn set_broadcast_tap(&mut self, on: bool) {
+        if self.bcast_tap == on {
+            return;
+        }
+        self.bcast_tap = on;
+        if !on {
+            for m in self.members.values_mut() {
+                m.level_peak = 0.0;
+                m.level_rms = 0.0;
+            }
+        }
+    }
+
+    pub fn broadcast_tap(&self) -> bool {
+        self.bcast_tap
+    }
+
+    /// The last tick's broadcast audio and card state, for the stream
+    /// pipeline. Call it right after [`ServerCore::tick`]: the audio slice is
+    /// the accumulator slot that tick wrote.
+    pub fn broadcast_tick(&self) -> BroadcastTick<'_> {
+        let start = self.bcast_slot * MIX_LEN;
+        let members =
+            self.members
+                .iter()
+                .filter(|(_, m)| m.role == Role::Musician)
+                .map(|(&id, m)| BroadcastMember {
+                    id,
+                    name: &m.name,
+                    connected: m.connected,
+                    level_peak: m.level_peak,
+                    level_rms: m.level_rms,
+                    // Both borrows live as long as the tick: the hash is the
+                    // member's own field, the bytes are the server's cache.
+                    avatar: m.avatar.as_ref().and_then(|(hash, _)| {
+                        self.avatar_cache.get(hash).map(|bytes| (hash, bytes))
+                    }),
+                })
+                .collect();
+        BroadcastTick {
+            audio: &self.bcast_accum[start..start + MIX_LEN],
+            members,
+            listeners: self
+                .members
+                .values()
+                .filter(|m| m.connected && m.role == Role::Listener)
+                .count(),
+            roster_epoch: self.roster_epoch,
+        }
+    }
+
+    /// Publishes the broadcast pipeline's per-destination status. Fans out
+    /// immediately on any change and at least once a second while anything is
+    /// configured, so every member (not just the host) sees the on-air state.
+    /// The caller is the pipeline's driver; the status it passes carries no
+    /// stream key by construction.
+    pub fn set_stream_status(&mut self, now_ms: u64, destinations: Vec<DestinationStatus>) {
+        let changed = destinations != self.stream_status;
+        let due = !destinations.is_empty()
+            && now_ms.saturating_sub(self.last_stream_status_ms) >= STREAM_STATUS_INTERVAL_MS;
+        self.stream_status = destinations;
+        if changed || due {
+            self.last_stream_status_ms = now_ms;
+            self.queue_stream_status();
+        }
+    }
+
+    pub fn stream_status(&self) -> &[DestinationStatus] {
+        &self.stream_status
+    }
+
     pub fn musicians_connected(&self) -> usize {
         self.members
             .values()
@@ -655,6 +815,8 @@ impl ServerCore {
                 send_seq: 0,
                 violations: 0,
                 stats_prev: JitterStats::default(),
+                level_peak: 0.0,
+                level_rms: 0.0,
                 avatar,
                 avatar_rx: None,
                 avatar_tx: VecDeque::new(),
@@ -663,6 +825,15 @@ impl ServerCore {
         out.push((src, resp));
         self.events.push(ServerEvent::MemberJoined { id, name });
         self.queue_roster();
+        // A member who joins mid-broadcast learns they are on air now, not up
+        // to a second later.
+        if !self.stream_status.is_empty()
+            && let Some(m) = self.members.get_mut(&id)
+        {
+            let _ = m.link.send(ControlMsg::StreamStatus {
+                destinations: self.stream_status.clone(),
+            });
+        }
         self.note_musician_count();
     }
 
@@ -1020,8 +1191,24 @@ impl ServerCore {
                     let _ = o.link.send(ControlMsg::AvatarRequest { hash });
                 }
             }
+            ControlMsg::StreamCtl { op } => {
+                if from != HOST_MEMBER_ID {
+                    self.violation(from, "stream control by non-host");
+                    return;
+                }
+                if let StreamOp::AddDestination { key, .. } = &op
+                    && (key.is_empty() || key.len() > MAX_STREAM_KEY_LEN)
+                {
+                    self.violation(from, "stream key out of range");
+                    return;
+                }
+                // The core owns no processes: the op goes to the driver, which
+                // owns the stream worker. Nothing here stores or relays it.
+                self.events.push(ServerEvent::StreamCtl(op));
+            }
             ControlMsg::Roster(_) => self.violation(from, "roster from client"),
             ControlMsg::Stats { .. } => self.violation(from, "stats from client"),
+            ControlMsg::StreamStatus { .. } => self.violation(from, "stream status from client"),
         }
     }
 
@@ -1040,7 +1227,17 @@ impl ServerCore {
         }
     }
 
+    fn queue_stream_status(&mut self) {
+        let msg = ControlMsg::StreamStatus {
+            destinations: self.stream_status.clone(),
+        };
+        for m in self.members.values_mut().filter(|m| m.connected) {
+            let _ = m.link.send(msg.clone());
+        }
+    }
+
     fn queue_roster(&mut self) {
+        self.roster_epoch += 1;
         let roster: Vec<MemberInfo> = self
             .members
             .iter()

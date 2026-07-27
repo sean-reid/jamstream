@@ -47,6 +47,12 @@ pub enum Role {
 /// The host holds a musician token whose member id is always 0.
 pub const HOST_MEMBER_ID: MemberId = MemberId(0);
 
+/// Small integer naming one broadcast destination within one session. The
+/// host mints it, so add and remove refer to the same destination without a
+/// server round trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DestinationId(pub u16);
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
