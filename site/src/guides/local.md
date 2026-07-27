@@ -8,7 +8,7 @@ Picking **local** in the host wizard's first step runs the session server as a p
 - You want the lowest possible latency. The audio path is one hop across your own network, with no internet in it.
 - You want to try JamStream before creating a cloud account. Local sessions need no credentials and cost nothing.
 
-Playing alone on one machine also works: joining from the hosting computer goes over the loopback interface.
+Playing alone on one machine also works.
 
 ## The limits, honestly
 
@@ -16,7 +16,7 @@ An invite that names 192.168.1.12 means nothing outside your network. Reaching a
 
 ## Ending and the idle exit
 
-**End session for everyone** in the invites panel kills the server process, and the same shared state means `jamstream end` from a terminal does too; for local sessions the instance id shown in `status` and `end` output is the process id. If you forget, the server watches its own activity and exits on its own after 10 minutes with no musicians connected. There is no bill either way. The 12 hour hard cap still shapes the invites: they expire at the cap, so nobody new can join after it.
+**End session for everyone** in the invites panel kills the server process, and the same shared state means `jamstream end` from a terminal does too; for local sessions the instance id shown in `status` and `end` output is the process id. If you forget, the server watches its own activity and exits on its own after 10 minutes with no musicians connected. There is no bill either way. The local server also exits at the 12 hour hard cap, and the invites expire with it.
 
 If a laptop dies mid-session or a state file is lost, `jamstream sweep` finds local strays the same way it finds cloud ones: the local provider keeps an on-disk registry of the processes it spawned, so a later sweep from a fresh shell still sees and kills them.
 
@@ -30,8 +30,8 @@ Unlike the app, the CLI does not bundle the server, so local mode needs a `jamst
 2. A `jamstreamd` sitting next to the running executable itself: next to the `jamstream` CLI, or inside the desktop app beside the app binary (on macOS that is `JamStream.app/Contents/MacOS/jamstreamd`).
 3. `jamstreamd` on your PATH.
 
-Every desktop app artifact bundles `jamstreamd` in that app-adjacent spot, which is why the app needs nothing else on every platform. For the CLI alone: on Linux x86_64, the [install script's](../download.md) `--with-server` flag puts `jamstreamd` next to the `jamstream` CLI, satisfying the second step; building from source with `cargo install --path crates/server` satisfies the last one. If none resolves, `host` fails before starting anything, with an error naming all three places it looked.
+Every desktop app artifact bundles `jamstreamd` in that app-adjacent spot, which is why the app needs nothing else on every platform. For the CLI alone: on Linux x86_64, the [install script's](../download.md) `--with-server` flag puts `jamstreamd` next to the `jamstream` CLI, satisfying the second step; building from source with `cargo install --path crates/server` satisfies the last one. If none resolves, `host` fails before starting anything, with an error naming every place it looked.
 
 ## What lands on disk
 
-Under your platform's data directory in `jamstream/`: a `local.json` registry of running server processes, and one directory per session holding the server's config and its log (`server.log`, the first place to look if a local server exits at startup). The session state files that `status` and `end` read live in `jamstream/sessions/` as for any provider, whichever side hosted.
+Under your platform's data directory in `jamstream/`: a `local.json` registry of running server processes, and `jamstream/sessions/`, holding one directory per session with the server's config and its log (`server.log`, the first place to look if a local server exits at startup) alongside the session state files that `status` and `end` read.

@@ -58,7 +58,7 @@ The token lands in your system keychain, so this is a one-time step; next sessio
 
 ### Pick a region and launch
 
-Click Continue. The app fetches live prices and times the network from your computer to each of the provider's regions, then lists them best first; the ranking weighs latency and price equally. Take the top row unless you know your bandmates sit far from you; [Hosting a session](guides/hosting.md#the-region-table) explains how to pick fairly.
+Click Continue. The app fetches live prices and times the network from your computer to each of the provider's regions, then sorts them by worst round trip in 5 ms steps, with price breaking ties inside a step. Take the top row unless you know your bandmates sit far from you; [Hosting a session](guides/hosting.md#the-region-table) explains how to pick fairly.
 
 The next step is the cost preview: set the expected hours and seats, read the estimate (a three hour four musician session on DigitalOcean is about $0.08), and click **Launch**. The wizard boots the machine, waits for its address, proves the server answers a real encrypted handshake, joins you, and opens the invites panel. There is no server to find or upload: release builds carry their release's own `jamstreamd` build pinned in, and the machine verifies the download at boot.
 

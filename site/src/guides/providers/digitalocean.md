@@ -2,7 +2,7 @@
 
 The recommended provider: one token in one screen, and the droplet's included transfer covers a session's audio traffic. Total setup is about 10 minutes, most of it account signup.
 
-JamStream launches an `s-2vcpu-2gb` Basic droplet: $0.02679 per hour as of July 2026, billed per second with a 60 second minimum, with 3,000 GiB of transfer included ([pricing](https://www.digitalocean.com/pricing/droplets)). Powered-off droplets still bill on DigitalOcean, which is why JamStream only ever destroys them outright.
+JamStream launches an `s-2vcpu-2gb` Basic droplet: $0.02679 per hour as of July 2026, billed per second with a 60 second minimum, with 3,000 GB of transfer included ([pricing](https://www.digitalocean.com/pricing/droplets)). Powered-off droplets still bill on DigitalOcean, which is why JamStream only ever destroys them outright.
 
 ## 1. Create the account
 
