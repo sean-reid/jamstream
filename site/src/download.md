@@ -10,8 +10,6 @@ Every link on this page points at the latest release by a stable name, so a new 
 - Desktop app: [jamstream-app-macos.dmg](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-macos.dmg)
 - CLI, one universal binary for Apple silicon and Intel: [jamstream-cli-macos-universal.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-macos-universal.tar.gz)
 
-The disk image and the app inside it are both signed with a Developer ID certificate and notarized by Apple, and the notarization ticket is stapled to each, so the app opens on first launch with no warning and without needing a network check.
-
 Verify a download against the release checksums:
 
 ```console
