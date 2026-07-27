@@ -76,6 +76,20 @@ pub async fn run<W: Write>(
         Err(e) => return Err(e.into()),
     }
 
+    // The instance is gone, so its firewall has nothing behind it. AWS may
+    // still refuse while the network interface detaches, in which case the
+    // next sweep collects it, so this never fails an otherwise clean end.
+    match provider.destroy_orphan_firewalls().await {
+        Ok(names) if !names.is_empty() => {
+            writeln!(out, "Closed {} session firewall(s).", names.len())?;
+        }
+        Ok(_) => {}
+        Err(e) => writeln!(
+            out,
+            "Could not close the session firewall ({e}); jamstream sweep will retry."
+        )?,
+    }
+
     let remaining = provider.list_tagged(Some(&session.session_id_hex)).await?;
     if !remaining.is_empty() {
         return Err(CliError::Failed(format!(

@@ -33,7 +33,7 @@ fn main() -> ExitCode {
 async fn dispatch<W: Write>(cli: Cli, out: &mut W) -> Result<(), CliError> {
     match cli.command {
         Command::Host(args) => {
-            let provider = providers::resolve(&args.provider)?;
+            let provider = providers::resolve_for_port(&args.provider, args.port)?;
             host::run(&args, provider.as_ref(), out).await
         }
         Command::Status(args) => status::run(&args, out),

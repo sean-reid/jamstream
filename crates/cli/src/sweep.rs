@@ -16,40 +16,49 @@ pub async fn run<W: Write>(
 
     if report.found.is_empty() {
         writeln!(out, "No jamstream-tagged instances found.")?;
-        return Ok(());
-    }
-    writeln!(
-        out,
-        "{:<14} {:<14} {:<16} RESULT",
-        "PROVIDER", "REGION", "INSTANCE"
-    )?;
-    for inst in &report.found {
-        let result = if dry_run {
-            "would destroy".to_owned()
-        } else if report.destroyed.contains(inst) {
-            "destroyed".to_owned()
-        } else if let Some((_, err)) = report.failed.iter().find(|(f, _)| f == inst) {
-            format!("failed: {err}")
-        } else {
-            "found".to_owned()
-        };
+    } else {
         writeln!(
             out,
-            "{:<14} {:<14} {:<16} {}",
-            inst.provider.as_str(),
-            // RegionId's Display ignores width flags; pad the &str instead.
-            inst.region.id.as_str(),
-            inst.id,
-            result
+            "{:<14} {:<14} {:<16} RESULT",
+            "PROVIDER", "REGION", "INSTANCE"
+        )?;
+        for inst in &report.found {
+            let result = if dry_run {
+                "would destroy".to_owned()
+            } else if report.destroyed.contains(inst) {
+                "destroyed".to_owned()
+            } else if let Some((_, err)) = report.failed.iter().find(|(f, _)| f == inst) {
+                format!("failed: {err}")
+            } else {
+                "found".to_owned()
+            };
+            writeln!(
+                out,
+                "{:<14} {:<14} {:<16} {}",
+                inst.provider.as_str(),
+                // RegionId's Display ignores width flags; pad the &str instead.
+                inst.region.id.as_str(),
+                inst.id,
+                result
+            )?;
+        }
+        writeln!(
+            out,
+            "{} found, {} destroyed, {} failed.",
+            report.found.len(),
+            report.destroyed.len(),
+            report.failed.len()
         )?;
     }
-    writeln!(
-        out,
-        "{} found, {} destroyed, {} failed.",
-        report.found.len(),
-        report.destroyed.len(),
-        report.failed.len()
-    )?;
+    // Only worth a line when there was something to close: firewalls cost
+    // nothing, so their absence is not news.
+    if !report.firewalls_removed.is_empty() {
+        writeln!(
+            out,
+            "Closed {} leftover session firewall(s).",
+            report.firewalls_removed.len()
+        )?;
+    }
     if !report.is_clean() {
         return Err(CliError::Failed(
             "sweep could not destroy every instance; the failures above are still billing"
