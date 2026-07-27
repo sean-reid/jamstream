@@ -22,13 +22,13 @@ If a laptop dies mid-session or a state file is lost, `jamstream sweep` finds lo
 
 ## Where the server binary comes from
 
-Local mode runs a `jamstreamd` binary already on your machine; nothing is downloaded, and the `--artifact-url` and `--artifact-sha256` flags are not needed. The binary is found in this order:
+Local mode runs a `jamstreamd` binary already on your machine; nothing is downloaded, and the `--artifact-url` and `--artifact-sha256` flags play no part. The binary is found in this order:
 
 1. The `JAMSTREAMD_PATH` environment variable, if set, is used as the path.
-2. A `jamstreamd` sitting next to the `jamstream` executable itself.
+2. A `jamstreamd` sitting next to the running executable itself: next to the `jamstream` CLI, or inside the desktop app beside the app binary (on macOS that is `JamStream.app/Contents/MacOS/jamstreamd`).
 3. `jamstreamd` on your PATH.
 
-On Linux x86_64, the [install script's](../download.md) `--with-server` flag puts `jamstreamd` next to the `jamstream` CLI, satisfying the second. The desktop app ships `jamstreamd` alongside the app binary, which is how hosting from the app works everywhere. Building from source with `cargo install --path crates/server` satisfies the last one. If none resolves, `host` fails before starting anything, with an error naming all three places it looked.
+Every desktop app artifact bundles `jamstreamd` in that app-adjacent spot, so hosting from the app works with nothing else installed, on every platform. For the CLI alone: on Linux x86_64, the [install script's](../download.md) `--with-server` flag puts `jamstreamd` next to the `jamstream` CLI, satisfying the second step; building from source with `cargo install --path crates/server` satisfies the last one. If none resolves, `host` fails before starting anything, with an error naming all three places it looked.
 
 ## What lands on disk
 
