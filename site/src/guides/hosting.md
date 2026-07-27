@@ -1,6 +1,6 @@
 # Hosting a session
 
-Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three; the desktop app's host wizard walks the same steps but does not launch real machines yet, so real sessions are hosted from the CLI.
+Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three, and so does the desktop app: its host wizard walks the same steps, stores your provider credentials in the system keychain, joins you automatically once the server answers, and both record the session in the same place, so a session hosted in the app shows up in `jamstream status` and can be ended from either side.
 
 Hosting does not have to involve a cloud at all: `jamstream host --provider local` runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; [Playing on the same network](local.md) covers local mode.
 
@@ -28,7 +28,7 @@ $ jamstream host --provider digitalocean --region tor1 ...
 A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable. If the band spans a continent, pick the region that is mediocre for everyone over the one that is perfect for you; the person with the worst round trip sets the feel. See [Troubleshooting](troubleshooting.md) for what the numbers mean in the ear.
 
 ![Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns](../images/wizard_region.png)
-*The same table in the app's host wizard, step 2 of 4. Current build, demo data, fabricated latencies.*
+*The same table in the app's host wizard, step 2 of 4, with prices fetched live and latencies probed from the host's machine.*
 
 ## Invites are minted at launch
 
@@ -37,10 +37,10 @@ A region under 30 ms from everyone keeps the network's share of latency in singl
 - `--musicians N` invites for players, default 4, not counting you. Cap 10.
 - `--listeners N` invites for people who only listen, default 0. Cap 20.
 
-Each invite is tied to one seat and signed; there is no way to add seats to a running session in the current build, so count heads before hosting. Unused invites cost nothing. See [Joining a session](joining.md) for how invites behave.
+Each invite is tied to one seat and signed. The CLI cannot add seats to a running session; the app's invites panel can mint more mid-session, within the same caps. Unused invites cost nothing. See [Joining a session](joining.md) for how invites behave.
 
-![Wizard step 4 of 4 showing a running session with per-person copy invite buttons](../images/wizard_done.png)
-*Step 4 of 4 in the app's wizard: one copy button per invite. Current build.*
+![Invites panel over the session screen listing per-person invites with copy and revoke buttons](../images/session_invites.png)
+*The app after launch: the wizard joins you automatically and opens the invites panel. Each link admits one person; copy, revoke, or mint more.*
 
 ## The safety knobs
 
@@ -59,4 +59,4 @@ If you host from the app or another terminal later, the CLI also warns at host t
 
 ## Ending
 
-`jamstream end 3f2a9c01` (any unambiguous prefix of the session id works) or `jamstream end --last`. Ending destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended. The invites are dead from that moment.
+`jamstream end 3f2a9c01` (any unambiguous prefix of the session id works) or `jamstream end --last`. In the app, "End session for everyone" in the invites panel does the same. Ending destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended. The invites are dead from that moment.

@@ -182,7 +182,7 @@
 <p>JamStream is under active development and not yet at a first release.</p>
 <ul>
 <li>The command line tool hosts, monitors, and ends real sessions. It can also host a session on your own computer with no cloud account at all; see <a href="#playing-on-the-same-network">Playing on the same network</a>.</li>
-<li>The desktop app is usable but unfinished. Its host wizard does not launch real machines yet; real sessions are hosted from the CLI. Screenshots on this site are from the current build and will change.</li>
+<li>The desktop app hosts real sessions: its wizard launches on your own computer or in your cloud account, joins you automatically, and manages the invites while the session runs. Screenshots on this site are from the current build and will change.</li>
 <li>No release artifacts are published yet, so hosting on a cloud provider means pointing the CLI at a <code>jamstreamd</code> server build you host yourself. The <a href="#quickstart-host-your-first-session">quickstart</a> shows where those flags go.</li>
 </ul>
 <p>If something here does not match what the software does, that is a bug in one of them. <a href="#about">Report it.</a></p>
@@ -306,7 +306,7 @@ No jamstream-tagged instances found.
 <p>That line is the whole point of the design: nothing left behind, nothing still billing.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="hosting-a-session"><a class="header" href="#hosting-a-session">Hosting a session</a></h1>
-<p>Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three; the desktop app's host wizard walks the same steps but does not launch real machines yet, so real sessions are hosted from the CLI.</p>
+<p>Hosting means launching one small virtual machine in your own cloud account, minting the invites, and ending the session when you are done. The CLI does all three, and so does the desktop app: its host wizard walks the same steps, stores your provider credentials in the system keychain, joins you automatically once the server answers, and both record the session in the same place, so a session hosted in the app shows up in <code>jamstream status</code> and can be ended from either side.</p>
 <p>Hosting does not have to involve a cloud at all: <code>jamstream host --provider local</code> runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; <a href="#playing-on-the-same-network">Playing on the same network</a> covers local mode.</p>
 <h2 id="the-region-table"><a class="header" href="#the-region-table">The region table</a></h2>
 <p>Before launching, JamStream measures the round trip from your machine to each of the provider's regions and prints a table:</p>
@@ -325,16 +325,16 @@ sfo3                    72 ms    $0.02679/hr     $0.01/GB
 </code></pre>
 <p>A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable. If the band spans a continent, pick the region that is mediocre for everyone over the one that is perfect for you; the person with the worst round trip sets the feel. See <a href="#troubleshooting">Troubleshooting</a> for what the numbers mean in the ear.</p>
 <p><label class="checkbox-label"><input class="checkbox-img" type="checkbox"><img src="images/wizard_region.png" alt="Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns"><span class="img-wrapper"><img src="images/wizard_region.png" alt="Wizard step 2 of 4, a region table with worst rtt, hourly, and egress columns"></span></label>
-<em>The same table in the app's host wizard, step 2 of 4. Current build, demo data, fabricated latencies.</em></p>
+<em>The same table in the app's host wizard, step 2 of 4, with prices fetched live and latencies probed from the host's machine.</em></p>
 <h2 id="invites-are-minted-at-launch"><a class="header" href="#invites-are-minted-at-launch">Invites are minted at launch</a></h2>
 <p><code>host</code> mints one invite per seat, up front, on your machine:</p>
 <ul>
 <li><code>--musicians N</code> invites for players, default 4, not counting you. Cap 10.</li>
 <li><code>--listeners N</code> invites for people who only listen, default 0. Cap 20.</li>
 </ul>
-<p>Each invite is tied to one seat and signed; there is no way to add seats to a running session in the current build, so count heads before hosting. Unused invites cost nothing. See <a href="#joining-a-session">Joining a session</a> for how invites behave.</p>
-<p><label class="checkbox-label"><input class="checkbox-img" type="checkbox"><img src="images/wizard_done.png" alt="Wizard step 4 of 4 showing a running session with per-person copy invite buttons"><span class="img-wrapper"><img src="images/wizard_done.png" alt="Wizard step 4 of 4 showing a running session with per-person copy invite buttons"></span></label>
-<em>Step 4 of 4 in the app's wizard: one copy button per invite. Current build.</em></p>
+<p>Each invite is tied to one seat and signed. The CLI cannot add seats to a running session; the app's invites panel can mint more mid-session, within the same caps. Unused invites cost nothing. See <a href="#joining-a-session">Joining a session</a> for how invites behave.</p>
+<p><label class="checkbox-label"><input class="checkbox-img" type="checkbox"><img src="images/session_invites.png" alt="Invites panel over the session screen listing per-person invites with copy and revoke buttons"><span class="img-wrapper"><img src="images/session_invites.png" alt="Invites panel over the session screen listing per-person invites with copy and revoke buttons"></span></label>
+<em>The app after launch: the wizard joins you automatically and opens the invites panel. Each link admits one person; copy, revoke, or mint more.</em></p>
 <h2 id="the-safety-knobs"><a class="header" href="#the-safety-knobs">The safety knobs</a></h2>
 <p>Every session carries two timers, both set at launch:</p>
 <ul>
@@ -346,7 +346,7 @@ sfo3                    72 ms    $0.02679/hr     $0.01/GB
 <p><code>jamstream status</code> lists your sessions with elapsed time, cost accrued so far, and a projection. In the app, the host's session screen shows the same cost figure live in the status bar, next to latency.</p>
 <p>If you host from the app or another terminal later, the CLI also warns at host time when it finds JamStream-tagged machines already running in your account, so a stray session does not hide behind a new one.</p>
 <h2 id="ending"><a class="header" href="#ending">Ending</a></h2>
-<p><code>jamstream end 3f2a9c01</code> (any unambiguous prefix of the session id works) or <code>jamstream end --last</code>. Ending destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended. The invites are dead from that moment.</p>
+<p><code>jamstream end 3f2a9c01</code> (any unambiguous prefix of the session id works) or <code>jamstream end --last</code>. In the app, "End session for everyone" in the invites panel does the same. Ending destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended. The invites are dead from that moment.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="joining-a-session"><a class="header" href="#joining-a-session">Joining a session</a></h1>
 <p>You need exactly one thing: your invite, a string starting with <code>jamstream://join/</code>, sent to you by the host.</p>
@@ -400,7 +400,7 @@ left after 120 s; wrote mix.wav
 <h2 id="the-limits-honestly"><a class="header" href="#the-limits-honestly">The limits, honestly</a></h2>
 <p>An invite that names 192.168.1.12 means nothing outside your network. Reaching a local session across the internet would take router port forwarding: forwarding the session's UDP port (default 43210) to this computer in your router's admin pages, a public IP that many home connections behind carrier NAT do not have, and an invite carrying that public address, which the current build cannot mint (invites carry the network address it discovers, and multi-address invites are future work). JamStream automates none of that. If anyone is joining from outside your network, host in the cloud instead; see <a href="#provider-setup">Provider setup</a>.</p>
 <h2 id="ending-and-the-idle-exit"><a class="header" href="#ending-and-the-idle-exit">Ending and the idle exit</a></h2>
-<p><code>jamstream end</code> kills the server process; for local sessions the instance id shown in <code>status</code> and <code>end</code> output is the process id. If you forget, the server watches its own activity and exits on its own after <code>--idle-min</code> minutes (default 10) with no musicians connected. There is no bill either way. <code>--max-hours</code> still shapes the invites: they expire at the cap, so nobody new can join after it.</p>
+<p><code>jamstream end</code> kills the server process; for local sessions the instance id shown in <code>status</code> and <code>end</code> output is the process id. If you forget, the server watches its own activity and exits on its own after <code>--idle-min</code> minutes (default 10) with no musicians connected. There is no bill either way. <code>--max-hours</code> is a hard cap: invites expire at it, and the server exits on its own once the session has run that long, even with musicians still connected.</p>
 <p>If a laptop dies mid-session or a state file is lost, <code>jamstream sweep</code> finds local strays the same way it finds cloud ones: the local provider keeps an on-disk registry of the processes it spawned, so a later sweep from a fresh shell still sees and kills them.</p>
 <h2 id="where-the-server-binary-comes-from"><a class="header" href="#where-the-server-binary-comes-from">Where the server binary comes from</a></h2>
 <p>Local mode runs a <code>jamstreamd</code> binary already on your machine; nothing is downloaded, and the <code>--artifact-url</code> and <code>--artifact-sha256</code> flags are not needed. The binary is found in this order:</p>

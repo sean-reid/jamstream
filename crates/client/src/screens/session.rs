@@ -9,6 +9,7 @@ use egui::{
 };
 
 use crate::runtime::{Command, ConnState, MemberView, Role, Runtime, Snapshot};
+use crate::screens::invites::{InvitesEvent, InvitesPanel};
 use crate::theme;
 use crate::widgets::{Meter, fader, meter, on_air, pan_slider, status_dot};
 
@@ -27,6 +28,8 @@ const MIN_FADER_H: f32 = 120.0;
 pub enum SessionEvent {
     /// The user confirmed leaving; the app should drop the runtime.
     Left,
+    /// Host only: leave, destroy the server, and mark the session ended.
+    EndSession,
 }
 
 #[derive(Default)]
@@ -37,6 +40,10 @@ pub struct SessionScreen {
     pub confirm_revoke: Option<(crate::runtime::MemberId, String)>,
     /// Narrow layout only: chat shown instead of the mixer.
     pub chat_open: bool,
+    /// Host sessions launched by this app carry the invite book; plain
+    /// joins have none and show no panel.
+    pub invites: Option<InvitesPanel>,
+    pub invites_open: bool,
 }
 
 impl SessionScreen {
@@ -48,10 +55,21 @@ impl SessionScreen {
         // nothing on this screen can trap the user.
         let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if escape {
+            let panel_confirming = self
+                .invites
+                .as_ref()
+                .is_some_and(|p| p.confirm_revoke.is_some() || p.confirm_end);
             if self.confirm_leave {
                 self.confirm_leave = false;
             } else if self.confirm_revoke.is_some() {
                 self.confirm_revoke = None;
+            } else if panel_confirming {
+                if let Some(panel) = &mut self.invites {
+                    panel.confirm_revoke = None;
+                    panel.confirm_end = false;
+                }
+            } else if self.invites_open {
+                self.invites_open = false;
             } else if narrow && self.chat_open {
                 self.chat_open = false;
             }
@@ -84,6 +102,14 @@ impl SessionScreen {
             } else {
                 self.mixer_ui(ui, snap, rt);
             }
+        }
+
+        if self.invites_open
+            && snap.is_host
+            && let Some(panel) = &mut self.invites
+            && let Some(InvitesEvent::EndSession) = panel.ui(ui, snap, rt, &mut self.invites_open)
+        {
+            event = Some(SessionEvent::EndSession);
         }
 
         self.confirm_windows(ui, rt, &mut event);
@@ -459,6 +485,14 @@ impl SessionScreen {
                 {
                     self.confirm_leave = true;
                 }
+                if snap.is_host
+                    && self.invites.is_some()
+                    && ui
+                        .add(Button::new("Invites").selected(self.invites_open))
+                        .clicked()
+                {
+                    self.invites_open = !self.invites_open;
+                }
                 if let Some(cost) = &snap.cost {
                     ui.label(theme::mono(
                         ui,
@@ -543,6 +577,11 @@ impl SessionScreen {
                                 .and_then(|m| m.token);
                             if let Some(token) = token {
                                 rt.send(Command::Revoke(token));
+                                // Keep the invites panel's local record in
+                                // step with strip-side revocations.
+                                if let Some(panel) = &mut self.invites {
+                                    panel.mark_revoked(token);
+                                }
                             }
                             self.confirm_revoke = None;
                         }
