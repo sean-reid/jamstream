@@ -34,6 +34,11 @@ jobs:
   # jamstream-session and jamstream-engine (and libopus through cmake, which
   # ubuntu runners have) under the sanitizer. That lands inside the existing
   # 45 minute ceiling.
+  #
+  # opus_decode is the only target that spends its execution inside C. It runs
+  # at ~48000/s locally with the sanitizer off, so it is not the slow one;
+  # ASan over the vendored libopus is why it matters that it runs here and not
+  # only on a laptop.
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -48,6 +53,7 @@ jobs:
           - handshake_read_init
           - transport_open
           - avatar_reassembly
+          - opus_decode
     steps:
       - uses: actions/checkout@v7
       # Pinned like everything else, but to master with `toolchain: nightly`:
