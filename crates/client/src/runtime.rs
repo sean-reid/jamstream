@@ -10,7 +10,8 @@
 
 use std::sync::Arc;
 
-pub use jamstream_protocol::ids::{MemberId, Role, TokenId};
+pub use jamstream_protocol::control::{DestinationState, StreamKey, StreamPlatform};
+pub use jamstream_protocol::ids::{DestinationId, MemberId, Role, TokenId};
 
 /// One member's avatar, decoded. The UI needs pixels, not a file: the
 /// runtime decodes each content hash exactly once and hands out clones of
@@ -84,6 +85,22 @@ pub enum Command {
     /// a hash. Bytes past the transfer cap are refused with a log line, the
     /// same way the settings sheet refuses them before sending.
     SetOwnAvatar(Option<Vec<u8>>),
+    /// Host only: configure one broadcast destination. The id is minted on
+    /// this side so add and remove name the same destination with no round
+    /// trip. The only command that carries a secret: [`StreamKey`] redacts
+    /// its own `Debug` and wipes on drop.
+    AddDestination {
+        id: DestinationId,
+        platform: StreamPlatform,
+        key: StreamKey,
+    },
+    /// Host only: drop one destination. Live or not, the others carry on.
+    RemoveDestination(DestinationId),
+    /// Host only: bring the encoder up. Destinations configured before or
+    /// after both apply.
+    StartStream,
+    /// Host only: tear the encoder and every pusher down.
+    StopStream,
 }
 
 /// Your monitor-mix settings for one member.
@@ -171,6 +188,62 @@ pub struct BroadcastView {
     pub audition: bool,
 }
 
+/// One broadcast destination as the server reports it. Key-free by
+/// construction: the wire status carries no key, so neither does this, and
+/// every member gets the same view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DestinationView {
+    pub id: DestinationId,
+    pub platform: StreamPlatform,
+    pub state: DestinationState,
+    /// Video plus audio bitrate the encoder is configured for. One encode
+    /// feeds every destination, so it is the same number on each.
+    pub bitrate_kbps: u32,
+    /// Frames the pipeline could not hand the encoder in time, cumulative.
+    pub dropped_frames: u64,
+}
+
+/// Where the broadcast is going, as everyone in the room sees it. Empty
+/// until the server reports a destination, which is also how "nothing
+/// configured" reads.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StreamView {
+    pub destinations: Vec<DestinationView>,
+}
+
+impl StreamView {
+    /// On air: at least one destination is actually being watched. Idle and
+    /// connecting destinations are not on air, and a failed one is the
+    /// opposite of on air.
+    pub fn on_air(&self) -> bool {
+        self.destinations
+            .iter()
+            .any(|d| d.state == DestinationState::Live)
+    }
+
+    pub fn live_count(&self) -> usize {
+        self.destinations
+            .iter()
+            .filter(|d| d.state == DestinationState::Live)
+            .count()
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.destinations
+            .iter()
+            .filter(|d| matches!(d.state, DestinationState::Failed { .. }))
+            .count()
+    }
+
+    pub fn get(&self, id: DestinationId) -> Option<&DestinationView> {
+        self.destinations.iter().find(|d| d.id == id)
+    }
+
+    pub fn of_platform(&self, platform: StreamPlatform) -> Option<&DestinationView> {
+        self.destinations.iter().find(|d| d.platform == platform)
+    }
+}
+
 /// Host only: the running cost of the session VM.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostView {
@@ -188,6 +261,9 @@ pub struct Snapshot {
     pub metronome: MetronomeView,
     /// The broadcast mix; None for everyone but the host.
     pub broadcast: Option<BroadcastView>,
+    /// Where the broadcast is going. Not host-only: the on-air lamp is for
+    /// everyone in the room, because everyone in it is being broadcast.
+    pub stream: StreamView,
     pub cost: Option<CostView>,
     /// First 8 hex characters of the session id.
     pub session_short: String,

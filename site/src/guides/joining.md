@@ -27,11 +27,12 @@ Once connected you are in the session screen:
 What you are looking at:
 
 - One mixer strip per musician: an avatar disc, a status dot, name, fader, pan, dB readout, and a Mute button. This is your personal monitor mix; moving Ana's fader changes what you hear, not what anyone else hears.
-- The avatar disc shows a member's picture if they set one, and their initials on a color hashed from their name if they have not. The same disc and the same color appear on the stream card, so a member looks the same in the app and on air. Pictures are cover cropped into the circle, never squashed, and the space is reserved either way, so nothing shifts when one arrives mid-session.
+- The avatar disc shows a member's picture if they set one, and their initials on a color hashed from their name if they have not. The same disc and the same color appear on the card the broadcast renders, so a member looks the same in the app and on a stream. Pictures are cover cropped into the circle, never squashed, and the space is reserved either way, so nothing shifts when one arrives mid-session.
 - Your own strip is dimmed with a "you" tag. Self monitoring is local, on your interface, not through the server, so your own channel has no fader in the mix.
 - The host additionally sees a Revoke button on every other strip. Revoking ejects that member and kills their invite, with a confirmation step.
 - Chat, with timestamps. The metronome panel shows tempo, beats per bar, and click state; the host sets them, and "hear the click" is your own choice.
 - The status bar, in the same place every session. Leave is on the right, with a confirmation; leaving does not end the session, and your seat is kept.
+- The **on air** lamp, beside the session id: dark until the host starts a broadcast, amber while one is running, with a count of how many platforms are receiving it beside the latency readout. Only the host can start or stop one, but everyone sees the lamp, because everyone is in it. See [Streaming to Twitch and YouTube](streaming.md).
 
 A member who stops responding grays out after 10 seconds and their fader freezes; when they reconnect with their invite, they come back in the same seat.
 

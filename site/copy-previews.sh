@@ -9,7 +9,7 @@ set -eu
 cd "$(dirname "$0")"
 SRC="../target/ui-previews"
 DST="src/images"
-CURATED="home_empty.png session_demo.png session_full.png session_settings.png wizard_provider.png wizard_setup_digitalocean.png wizard_region.png session_invites.png"
+CURATED="home_empty.png session_demo.png session_full.png session_settings.png wizard_provider.png wizard_setup_digitalocean.png wizard_region.png wizard_preview.png session_invites.png session_destinations_live_two.png session_destinations_failed.png"
 [ -d "$SRC" ] || { echo "no $SRC; run the ui_snapshots test first" >&2; exit 1; }
 status=0
 for f in $CURATED; do

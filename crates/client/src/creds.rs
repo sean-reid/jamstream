@@ -13,6 +13,7 @@ use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::providers::digitalocean::DigitalOceanProvider;
 use jamstream_cloud::providers::gcp::GcpProvider;
 use jamstream_cloud::providers::gcp_auth::ServiceAccountTokenSource;
+use jamstream_protocol::control::StreamPlatform;
 
 /// Keychain service name; one entry per provider field.
 const SERVICE: &str = "jamstream";
@@ -22,6 +23,14 @@ pub const DO_TOKEN: (&str, &str) = ("digitalocean", "token");
 pub const AWS_ACCESS_KEY_ID: (&str, &str) = ("aws", "access_key_id");
 pub const AWS_SECRET_ACCESS_KEY: (&str, &str) = ("aws", "secret_access_key");
 pub const GCP_SERVICE_ACCOUNT_JSON: (&str, &str) = ("gcp", "service_account_json");
+
+/// Where one platform's stream key is kept between sessions, so a host
+/// pastes it once per computer rather than once per session. The keychain is
+/// the only place it rests on this machine; the session server holds it in
+/// memory and never writes it to the VM's disk.
+pub fn stream_key_field(platform: StreamPlatform) -> (&'static str, &'static str) {
+    (platform.as_str(), "stream_key")
+}
 
 /// Reads one environment variable; injectable so provider readiness and
 /// lookup order are testable without touching the process environment.
@@ -262,6 +271,20 @@ mod tests {
         // Mixed sources are fine: id from the store, secret from env.
         let env = env_of(&[("AWS_SECRET_ACCESS_KEY", "s")]);
         assert!(build_provider("aws", &store, &env).is_ok());
+    }
+
+    #[test]
+    fn each_platform_gets_its_own_stream_key_slot() {
+        let store = MemStore::default();
+        let twitch = stream_key_field(StreamPlatform::Twitch);
+        let youtube = stream_key_field(StreamPlatform::YouTube);
+        assert_ne!(twitch, youtube);
+        store.set(twitch.0, twitch.1, "live_000_fake").expect("set");
+        assert_eq!(store.get(youtube.0, youtube.1), None);
+        // And a stream key shares no slot with a provider credential.
+        assert_ne!(twitch, DO_TOKEN);
+        store.delete(twitch.0, twitch.1);
+        assert_eq!(store.get(twitch.0, twitch.1), None);
     }
 
     #[test]

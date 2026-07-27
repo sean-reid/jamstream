@@ -6,13 +6,21 @@ use std::sync::{Arc, Mutex};
 
 use crate::avatar::disc_color;
 use crate::runtime::{
-    AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, FaderView, LevelsView,
-    MemberId, MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
+    AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationId,
+    DestinationState, DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView,
+    Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView, TokenId,
 };
 use crate::theme;
 
 /// The frame snapshot tests freeze at; chosen so meters sit mid-scale.
 pub const FROZEN_FRAME: u64 = 1234;
+
+/// What the encoder is configured for, from the same catalog the server
+/// reads, so the demo's readout is the number a real session shows.
+pub fn demo_bitrate_kbps() -> u32 {
+    let catalog = jamstream_stream::PlatformCatalog::bundled();
+    catalog.video().kbps + catalog.audio().kbps
+}
 
 const HOURLY_MICROUSD: u64 = 16_800;
 /// Elapsed time the demo session pretends to have before frame zero.
@@ -86,6 +94,16 @@ fn demo_avatar(name: &str, w: u32, h: u32) -> AvatarHandle {
     }
 }
 
+/// A configured destination, as the demo's stand-in server tracks it. There
+/// is deliberately no key field: the demo takes the key the panel sends and
+/// drops it on the spot, which is what the real client does too.
+struct Destination {
+    id: DestinationId,
+    platform: StreamPlatform,
+    state: DestinationState,
+    dropped_frames: u64,
+}
+
 struct DemoState {
     frame: u64,
     members: Vec<Member>,
@@ -94,6 +112,7 @@ struct DemoState {
     revoked: Vec<u16>,
     left: bool,
     audition: bool,
+    destinations: Vec<Destination>,
 }
 
 pub struct DemoRuntime {
@@ -244,10 +263,33 @@ impl DemoRuntime {
                 revoked: Vec::new(),
                 left: false,
                 audition: false,
+                destinations: Vec::new(),
             }),
             is_host,
             frozen,
         }
+    }
+
+    /// Pins the broadcast state, ids assigned in the given order. Lets a
+    /// snapshot hold a state a real pipeline passes through in seconds; no
+    /// key is involved, which is the point.
+    pub fn set_destinations(&self, entries: &[(StreamPlatform, DestinationState)]) {
+        let mut s = self.state.lock().expect("demo state");
+        s.destinations = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (platform, state))| Destination {
+                id: DestinationId(i as u16),
+                platform: *platform,
+                state: state.clone(),
+                // A dropped frame is the one number that has to be visibly
+                // nonzero somewhere, so the failed destination carries some.
+                dropped_frames: match state {
+                    DestinationState::Failed { .. } => 41,
+                    _ => 0,
+                },
+            })
+            .collect();
     }
 
     fn scripted_chat() -> Vec<ChatLine> {
@@ -341,6 +383,21 @@ impl Runtime for DemoRuntime {
             audition: s.audition,
         });
 
+        let bitrate_kbps = demo_bitrate_kbps();
+        let stream = StreamView {
+            destinations: s
+                .destinations
+                .iter()
+                .map(|d| DestinationView {
+                    id: d.id,
+                    platform: d.platform,
+                    state: d.state.clone(),
+                    bitrate_kbps,
+                    dropped_frames: d.dropped_frames,
+                })
+                .collect(),
+        };
+
         Snapshot {
             stats,
             members,
@@ -348,6 +405,7 @@ impl Runtime for DemoRuntime {
             levels,
             metronome: s.metronome,
             broadcast,
+            stream,
             cost: self.is_host.then_some(CostView {
                 hourly_microusd: HOURLY_MICROUSD,
                 accrued_microusd: HOURLY_MICROUSD * elapsed_secs / 3600,
@@ -417,6 +475,40 @@ impl Runtime for DemoRuntime {
                 });
                 if let Some(me) = s.members.iter_mut().find(|m| m.id == 0) {
                     me.avatar = decoded;
+                }
+            }
+            // The key is taken by value and dropped here, unstored: the
+            // demo's stand-in server keeps what the wire status carries and
+            // nothing more.
+            Command::AddDestination { id, platform, .. } => {
+                s.destinations.retain(|d| d.id != id);
+                let streaming = s
+                    .destinations
+                    .iter()
+                    .any(|d| d.state != DestinationState::Idle);
+                s.destinations.push(Destination {
+                    id,
+                    platform,
+                    // Added mid-broadcast, a destination joins the running
+                    // encode; added before one, it waits.
+                    state: if streaming {
+                        DestinationState::Live
+                    } else {
+                        DestinationState::Idle
+                    },
+                    dropped_frames: 0,
+                });
+            }
+            Command::RemoveDestination(id) => s.destinations.retain(|d| d.id != id),
+            Command::StartStream => {
+                for d in &mut s.destinations {
+                    d.state = DestinationState::Live;
+                }
+            }
+            Command::StopStream => {
+                for d in &mut s.destinations {
+                    d.state = DestinationState::Idle;
+                    d.dropped_frames = 0;
                 }
             }
             Command::Leave => s.left = true,

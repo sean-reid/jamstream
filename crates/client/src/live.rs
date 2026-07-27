@@ -21,7 +21,7 @@ use jamstream_audio_io::{
     AudioBackend, AudioError, CallbackBridge, EngineSide, StreamConfig, StreamHandle, WavBackend,
     WavStream,
 };
-use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo};
+use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
 use jamstream_protocol::invite::Invite;
 use jamstream_session::SessionError;
@@ -29,8 +29,9 @@ use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 
 use crate::avatar;
 use crate::runtime::{
-    AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, FaderView, LevelsView,
-    MemberId, MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView, TokenId,
+    AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationView,
+    FaderView, LevelsView, MemberId, MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView,
+    StreamView, TokenId,
 };
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -117,6 +118,11 @@ struct SharedState {
     broadcast_faders: HashMap<MemberId, FaderView>,
     /// Client-local optimistic audition state; the server sends no echo.
     audition: bool,
+    /// Last `StreamStatus` the server sent, verbatim. Unlike the faders
+    /// there is no optimistic copy: the pipeline's own view is the only
+    /// honest one, and a destination that failed to come up must not read as
+    /// live for even one frame.
+    stream: Vec<DestinationView>,
     chat: VecDeque<ChatLine>,
     levels: LevelsView,
     metronome: MetronomeView,
@@ -152,6 +158,7 @@ impl SharedState {
             faders: HashMap::new(),
             broadcast_faders: HashMap::new(),
             audition: false,
+            stream: Vec::new(),
             chat: VecDeque::new(),
             levels: LevelsView::default(),
             metronome: MetronomeView {
@@ -486,6 +493,9 @@ impl LiveRuntime {
             levels: s.levels,
             metronome: s.metronome,
             broadcast,
+            stream: StreamView {
+                destinations: s.stream.clone(),
+            },
             // The wizard's [`CostedRuntime`] wrapper fills this for
             // sessions this app launched; plain joins have no meter.
             cost: None,
@@ -546,7 +556,16 @@ impl LiveRuntime {
                 // Your own picture comes back through the roster like
                 // anyone else's; dropping it can only be local.
                 Command::SetOwnAvatar(bytes) => s.own_dropped = bytes.is_none(),
-                Command::SendChat(_) | Command::Leave | Command::Revoke(_) => {}
+                // Stream state gets no optimistic echo on purpose: the
+                // pipeline is what decides whether a destination is live,
+                // and it says so within a second.
+                Command::SendChat(_)
+                | Command::Leave
+                | Command::Revoke(_)
+                | Command::AddDestination { .. }
+                | Command::RemoveDestination(_)
+                | Command::StartStream
+                | Command::StopStream => {}
             }
         }
         let _ = self.tx.send(ThreadMsg::Cmd(cmd));
@@ -784,6 +803,23 @@ impl Worker {
                     "own avatar announced"
                 );
             }),
+            // Straight through to the control link. The key is moved into
+            // the op and never copied, logged, or kept here; the server
+            // holds it in memory for as long as the destination exists.
+            Command::AddDestination { id, platform, key } => {
+                tracing::info!(
+                    destination = id.0,
+                    platform = platform.as_str(),
+                    "destination configured"
+                );
+                self.core
+                    .stream_ctl(StreamOp::AddDestination { id, platform, key })
+            }
+            Command::RemoveDestination(id) => {
+                self.core.stream_ctl(StreamOp::RemoveDestination { id })
+            }
+            Command::StartStream => self.core.stream_ctl(StreamOp::Start),
+            Command::StopStream => self.core.stream_ctl(StreamOp::Stop),
             Command::SetOwnAvatar(None) => {
                 // The control protocol has no way to unset an avatar, so
                 // this is local only: your own strip falls back to the
@@ -1019,6 +1055,18 @@ impl Worker {
                             muted,
                         },
                     );
+                }
+                ClientEvent::StreamStatus(destinations) => {
+                    s.stream = destinations
+                        .into_iter()
+                        .map(|d| DestinationView {
+                            id: d.id,
+                            platform: d.platform,
+                            state: d.state,
+                            bitrate_kbps: d.bitrate_kbps,
+                            dropped_frames: d.dropped_frames,
+                        })
+                        .collect();
                 }
                 // rtt_ms_last rides along in stats(); Ejected, Rejected,
                 // and TimedOut land through the state mapping below.

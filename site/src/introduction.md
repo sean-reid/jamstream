@@ -19,7 +19,7 @@ These are public on-demand prices as of July 2026 and they drift. The cost previ
 
 ## Streaming
 
-Broadcasting a session to platforms like Twitch and YouTube is designed but not shipped, so this documentation does not cover it further.
+The host can put a session on air to Twitch and YouTube Live, either one or both at once, and one platform dropping out never interrupts the other. Stream keys are masked, never shown back, and kept in your system keychain. See [Streaming to Twitch and YouTube](guides/streaming.md).
 
 ## Project status
 

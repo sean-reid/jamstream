@@ -2772,11 +2772,13 @@ dependencies = [
  "jamstream-protocol",
  "jamstream-server",
  "jamstream-session",
+ "jamstream-stream",
  "keyring",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
