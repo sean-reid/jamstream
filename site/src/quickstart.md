@@ -39,6 +39,10 @@ In the invites panel, click **End session for everyone**. The server process is 
 
 That is the whole local loop. The rest of this page is the internet path.
 
+## Put it on air
+
+Any session, local or cloud, can stream live to Twitch, YouTube Live, or both at once while you play. **Destinations** in the status bar takes a stream key per platform, and the on air lamp lights for everyone in the session. Dropping one platform leaves the other streaming. See [Streaming to Twitch and YouTube](guides/streaming.md).
+
 ## Host on the internet with DigitalOcean
 
 The flow is the same wizard; the server runs on a small droplet in your own DigitalOcean account instead of on your machine, and the invites work from anywhere.
