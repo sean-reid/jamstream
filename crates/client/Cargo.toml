@@ -21,6 +21,11 @@ jamstream-session.workspace = true
 jamstream-audio-io.workspace = true
 jamstream-cloud.workspace = true
 jamstream-cli.workspace = true
+# The platform catalog: display names, per-platform key guidance, and the
+# encode's bitrate. The app draws no stream frames and spawns no ffmpeg; it
+# reads the same data file the server does so the two cannot disagree about
+# which platforms ship.
+jamstream-stream.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
@@ -31,6 +36,9 @@ tracing.workspace = true
 dirs.workspace = true
 keyring.workspace = true
 tokio.workspace = true
+# Wipes a typed stream key out of the entry field's allocation, rather than
+# leaving it in freed memory after a String::clear.
+zeroize.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true
