@@ -47,7 +47,7 @@ jobs:
         with:
           shared-key: docs-check-previews
       - name: Render UI previews
-        run: cargo test -p jamstream-client --test ui_snapshots
+        run: cargo test --locked -p jamstream-client --test ui_snapshots
       - name: Check committed docs images against fresh previews
         run: site/copy-previews.sh --check
 

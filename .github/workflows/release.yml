@@ -86,7 +86,14 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build -p jamstream-server --release --target x86_64-unknown-linux-musl
+      # Fetch, then compile with the network off. Two things this buys over a
+      # bare `cargo build`: --locked means the graph cargo-deny audited is the
+      # graph that ships (no silent version bump, no lockfile fix-up), and
+      # --offline means the only step that can reach a registry is this one,
+      # so nothing a build script does can pull a crate in behind cargo's
+      # back. `cargo fetch` with no --target covers every architecture.
+      - run: cargo fetch --locked
+      - run: cargo build --locked --offline -p jamstream-server --release --target x86_64-unknown-linux-musl
       - name: Verify the binary is fully static
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/jamstreamd
@@ -145,10 +152,13 @@ jobs:
           set -eu
           printf '%s\n' "$JAMSTREAM_SERVER_URL" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
           printf '%s\n' "$JAMSTREAM_SERVER_SHA256" | grep -qE '^[0-9a-f]{64}$'
+      # See the server-musl job for why release builds fetch first and then
+      # compile offline.
+      - run: cargo fetch --locked
       - name: Build both architectures
         run: |
-          cargo build --release -p jamstream-client -p jamstream-cli -p jamstream-server --target aarch64-apple-darwin
-          cargo build --release -p jamstream-client -p jamstream-cli -p jamstream-server --target x86_64-apple-darwin
+          cargo build --locked --offline --release -p jamstream-client -p jamstream-cli -p jamstream-server --target aarch64-apple-darwin
+          cargo build --locked --offline --release -p jamstream-client -p jamstream-cli -p jamstream-server --target x86_64-apple-darwin
       - name: Lipo into universal binaries
         run: |
           mkdir -p target/universal
@@ -340,7 +350,10 @@ jobs:
           set -eu
           printf '%s\n' "$JAMSTREAM_SERVER_URL" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
           printf '%s\n' "$JAMSTREAM_SERVER_SHA256" | grep -qE '^[0-9a-f]{64}$'
-      - run: cargo build --release -p jamstream-client -p jamstream-cli -p jamstream-server
+      # See the server-musl job for why release builds fetch first and then
+      # compile offline.
+      - run: cargo fetch --locked
+      - run: cargo build --locked --offline --release -p jamstream-client -p jamstream-cli -p jamstream-server
       # Placeholder: Authenticode signing of both .exe files lands once a
       # Windows code-signing certificate exists.
       - name: Sign Windows binaries (not yet implemented)
@@ -383,7 +396,10 @@ jobs:
       # Same desktop build deps ci.yml uses (alsa, wayland/xkb for eframe,
       # pipewire + dbus).
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
-      - run: cargo build --release -p jamstream-client -p jamstream-cli -p jamstream-server
+      # See the server-musl job for why release builds fetch first and then
+      # compile offline.
+      - run: cargo fetch --locked
+      - run: cargo build --locked --offline --release -p jamstream-client -p jamstream-cli -p jamstream-server
       # The app tarball carries jamstreamd (the gnu build, same as the app)
       # beside jamstream-app; the local provider resolves the app-adjacent
       # helper, so hosting on this computer works straight from the

@@ -48,6 +48,10 @@ jobs:
         with:
           workspaces: crates/protocol/fuzz
       - run: cargo install cargo-fuzz --locked
+      # No --locked on the `cargo fuzz run` below: cargo-fuzz has no such flag
+      # and would reject it before libFuzzer's argument list. The fuzz targets
+      # live in their own workspace with their own Cargo.lock anyway, so the
+      # audited root lockfile is not what is being built here.
       # The key includes the run id so every night saves its grown corpus;
       # restore-keys picks up the most recent previous night. The restore
       # unpacks on top of the committed seeds, never replacing them.
@@ -92,9 +96,9 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - if: runner.os == 'macOS'
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - if: runner.os != 'macOS'
-        run: cargo test --workspace --exclude jamstream-client
+        run: cargo test --locked --workspace --exclude jamstream-client
       - if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@v7
         with:
@@ -133,7 +137,7 @@ jobs:
       # without destroying anything.
       - name: Sweep dry-run against live account
         if: steps.creds.outputs.available == 'true'
-        run: cargo run -p jamstream-cli --release -- sweep --dry-run --provider digitalocean
+        run: cargo run --locked -p jamstream-cli --release -- sweep --dry-run --provider digitalocean
       # Later addition goes here: provision the cheapest real instance,
       # verify boot + handshake + self-termination, then assert a final
       # sweep finds nothing (testing.md, "Cloud provider tests" item 3).

@@ -34,8 +34,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - if: steps.gate.outputs.configured == 'true'
         uses: Swatinem/rust-cache@v2
+      # The same fetch-then-build-offline shape release.yml uses, so this
+      # canary exercises that too, not just the certificate.
       - if: steps.gate.outputs.configured == 'true'
-        run: cargo build -p jamstream-client --release
+        run: cargo fetch --locked
+      - if: steps.gate.outputs.configured == 'true'
+        run: cargo build --locked --offline -p jamstream-client --release
       - if: steps.gate.outputs.configured == 'true'
         name: Import certificate into a throwaway keychain
         env:
