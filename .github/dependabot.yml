@@ -1,0 +1,20 @@
+# Security fixes arrive as soon as advisories publish; routine version
+# drift arrives once a month in one grouped pr per ecosystem, so the
+# lockfile never fossilizes without a weekly noise tax. cargo-deny
+# remains the blocking gate; this is the remediation side.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo-deps:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
