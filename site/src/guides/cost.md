@@ -2,11 +2,11 @@
 
 A session costs machine time plus network traffic, paid to your cloud provider. Both are small; this page explains how the preview is computed, what egress is, and the guardrails that keep a mistake from costing more than a coffee.
 
-Local sessions cost nothing: `--provider local` runs the server on your own computer, so there is no machine to rent and no egress to meter. The preview says so in one line, and the only guardrail a local session needs is the idle exit, since a forgotten process bills nobody. The rest of this page is about the cloud providers.
+Local sessions cost nothing: hosting on this computer (the wizard's local row, or `--provider local` in the CLI) rents no machine and meters no egress. The preview says so in one line, and the only guardrail a local session needs is the idle exit, since a forgotten process bills nobody. The rest of this page is about the cloud providers.
 
 ## The preview
 
-Before anything launches, `jamstream host` and the app's wizard show the same preview:
+Before anything launches, the app's wizard and `jamstream host` show the same preview:
 
 ```text
 Cost preview for digitalocean nyc3 over 3.0 hours:
@@ -18,7 +18,7 @@ Total (estimate)                                  $0.08037
 
 Line by line:
 
-- **VM** is the machine's hourly price times your expected length (`--hours`, default 3). The price is fetched live from the provider where possible (DigitalOcean's sizes API) and from a bundled snapshot of public pricing otherwise, so the preview tracks reality and the numbers in this documentation are the approximations.
+- **VM** is the machine's hourly price times your expected length, set on the preview step (`--hours` in the CLI). The price is fetched live from the provider where possible (DigitalOcean's sizes API) and from a bundled snapshot of public pricing otherwise, so the preview tracks reality and the numbers in this documentation are the approximations.
 - **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Each musician's personal mix streams down at about 300 kbit/s, each listener at about 150 kbit/s. Four musicians for three hours is about 1.6 GB.
 - **Included egress credit** appears when the provider bundles free transfer that covers some or all of the estimate. DigitalOcean droplets include thousands of GiB; AWS accounts include 100 GB per month; GCP includes close to nothing.
 
