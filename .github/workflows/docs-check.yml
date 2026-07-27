@@ -11,6 +11,12 @@
 # - install-scripts: the installer scripts the site serves at /install.sh
 #   and /install.ps1 (they live in site/src/, which mdBook copies into the
 #   built site verbatim) must stay shellcheck-clean and parseable.
+# - palette: crates/client/src/theme.rs is the single source of truth for
+#   JamStream's colors. The docs theme's custom properties, the docs
+#   theme-color meta, and the app icon's fills are generated from it by
+#   scripts/render-palette.sh. A change to a palette value that is not
+#   propagated (run the script, then scripts/render-icon.sh when the icon
+#   moved) fails this job.
 
 name: docs-check
 
@@ -44,6 +50,15 @@ jobs:
         run: cargo test -p jamstream-client --test ui_snapshots
       - name: Check committed docs images against fresh previews
         run: site/copy-previews.sh --check
+
+  palette:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Shellcheck the palette and icon generators
+        run: shellcheck scripts/render-palette.sh scripts/render-icon.sh
+      - name: Check the generated palette consumers against theme.rs
+        run: scripts/render-palette.sh --check
 
   install-scripts:
     runs-on: ubuntu-latest
