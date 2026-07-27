@@ -20,14 +20,14 @@ pub const KNOWN_PROVIDERS: &[&str] = &["local", "digitalocean", "aws", "gcp", "m
 
 /// Where the local provider keeps its process registry and per-session
 /// server configs: the same JAMSTREAM_STATE_DIR override the session state
-/// files honor (see state.rs), else the platform data directory.
-fn local_state_dir() -> PathBuf {
+/// files honor (see state.rs), else the platform data directory. Like the
+/// session records, this holds a private key and never falls back to the
+/// temp directory.
+fn local_state_dir() -> Result<PathBuf, CliError> {
     if let Some(dir) = std::env::var_os(state::STATE_DIR_ENV) {
-        return PathBuf::from(dir);
+        return Ok(PathBuf::from(dir));
     }
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("jamstream")
+    state::data_dir()
 }
 
 pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
@@ -40,7 +40,7 @@ pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
 /// behind a firewall for a different port.
 pub fn resolve_for_port(name: &str, session_port: u16) -> Result<Box<dyn Provider>, CliError> {
     match name {
-        "local" => Ok(Box::new(LocalProvider::new(local_state_dir()))),
+        "local" => Ok(Box::new(LocalProvider::new(local_state_dir()?))),
         // The mock needs some underlying kind for its instances; Aws is
         // arbitrary and never leaves the process.
         "mock" => Ok(Box::new(
@@ -108,8 +108,13 @@ mod tests {
         // Read-only consistency check against the live environment, like
         // real_providers_track_env_credentials below.
         match std::env::var_os(state::STATE_DIR_ENV) {
-            Some(dir) => assert_eq!(local_state_dir(), PathBuf::from(dir)),
-            None => assert!(local_state_dir().ends_with("jamstream")),
+            Some(dir) => assert_eq!(local_state_dir().unwrap(), PathBuf::from(dir)),
+            // Without the override it is the platform data directory, and
+            // on an environment that has none it is an error, never /tmp.
+            None => match local_state_dir() {
+                Ok(dir) => assert!(dir.ends_with("jamstream")),
+                Err(err) => assert!(err.to_string().contains(state::STATE_DIR_ENV)),
+            },
         }
     }
 

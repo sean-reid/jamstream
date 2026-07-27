@@ -29,6 +29,7 @@ pub mod contract;
 pub mod cost;
 pub mod http;
 pub mod mock;
+pub mod private;
 pub mod probe;
 pub mod provider;
 pub mod providers;
