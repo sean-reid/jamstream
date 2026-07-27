@@ -8,7 +8,7 @@ Only the one UDP session port is reachable from outside. Nothing about a session
 
 The machine destroys itself three ways: when you end the session, when no musician has been connected for the idle window (default 10 minutes), and at the hard cap (default 12 hours) regardless. The provider and the machine enforce those, not your laptop, so quitting the app does not leave anything running and billing. `jamstream sweep` destroys anything tagged that somehow survives.
 
-One exception worth knowing: on GCP the idle window does not currently work, so the hard cap is the only thing that ends a session. End GCP sessions explicitly.
+GCP differs in one way worth knowing: an idle session stops serving but the machine is not deleted until you end the session, until your next `jamstream sweep`, or at the hard cap. The other two providers delete it on idle.
 
 ## Invites
 
