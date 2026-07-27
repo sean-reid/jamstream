@@ -66,6 +66,9 @@ egui = "0.35"
 egui_extras = "0.35"
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 
+[profile.test]
+opt-level = 1
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

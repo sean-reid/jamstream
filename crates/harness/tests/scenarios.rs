@@ -688,8 +688,16 @@ fn perf_sanity_sixty_seconds_regional() {
     let wall = start.elapsed().as_secs_f64();
     println!("perf sanity: 60 s virtual, 4 musicians, regional-fiber: {wall:.2} s wall");
     assert_eq!(s.musicians_connected(), 4, "scenario did not even join");
+    // The default budget assumes a developer machine. Shared ci runners are
+    // several times slower, so the harness jobs raise it via the env var;
+    // the point of this gate is catching order-of-magnitude regressions,
+    // not benchmarking the runner.
+    let budget = std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(30.0);
     assert!(
-        wall < 30.0,
-        "60 s regional-fiber scenario took {wall:.2} s wall (budget 30 s in debug)"
+        wall < budget,
+        "60 s regional-fiber scenario took {wall:.2} s wall (budget {budget:.0} s)"
     );
 }

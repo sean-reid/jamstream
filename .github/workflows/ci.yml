@@ -128,6 +128,11 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run -p jamstream-harness
+        env:
+          # Shared runners are several times slower than a developer
+          # machine; the gate catches order-of-magnitude regressions.
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
+
 
   # Coverage is the slowest job (fully instrumented rebuild), so it runs on
   # pushes to main only; PRs get their signal from the jobs above. The
