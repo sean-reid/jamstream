@@ -3,7 +3,7 @@
 //! socket and the clock and calls in with datagrams and timestamps.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use blake2::{Blake2s256, Digest};
 use ed25519_dalek::VerifyingKey;
@@ -23,7 +23,7 @@ use jamstream_protocol::transport::{Responder, Session, Welcome};
 use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
 
 use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
-use crate::limits::{DEFAULT_MEMBER_TIMEOUT_MS, MAX_LISTENERS, MAX_MUSICIANS};
+use crate::limits::{DEFAULT_MEMBER_TIMEOUT_MS, MAX_LISTENERS, MAX_MUSICIANS, TokenBucket};
 
 /// Samples per mix tick: 2.5 ms at 48 kHz.
 const TICK_SAMPLES: usize = 120;
@@ -35,9 +35,24 @@ const BCAST_LEN: usize = MIX_LEN * BCAST_TICKS as usize;
 const PERSONAL_MIX_BITRATE: u32 = 192_000;
 const BROADCAST_BITRATE: u32 = 128_000;
 const CLICK_GAIN: f32 = 0.7;
-/// At most one version reject per source address per this interval.
+/// At most one version reject per source slot per this interval.
 const REJECT_INTERVAL_MS: u64 = 1_000;
-const REJECT_MAP_MAX: usize = 64;
+/// Slots the reject limiter keeps, indexed by a hash of the source network.
+/// Sources that collide share one slot's allowance, which costs an honest
+/// mismatched client at most a second of extra silence and buys an O(1)
+/// per-packet check with no allocation and nothing to evict.
+const REJECT_SLOTS: usize = 256;
+const _: () = assert!(REJECT_SLOTS.is_power_of_two());
+/// Version rejects emitted per second across every source, and the burst
+/// allowed. A client on the wrong version needs exactly one to show its user
+/// what to update, so this is generous for the honest case while capping
+/// reflected volume at roughly 16 * 49 = 784 bytes per second on the wire.
+const REJECT_RATE_PER_SEC: u32 = 16;
+const REJECT_BURST: u32 = 16;
+/// Shortest handshake init that earns a reject. A reject is 21 bytes and a
+/// real Noise IK first message is over 90, so answering anything shorter
+/// would make the server an amplifier by size: `[1, 9, 0]` in, 21 bytes out.
+const REJECT_MIN_INIT_BYTES: usize = 48;
 /// Uplink Stats reports go to each musician this often.
 const STATS_INTERVAL_MS: u64 = 1_000;
 /// While anything is configured for broadcast, every member is told the
@@ -258,7 +273,10 @@ pub struct ServerCore {
     /// for waiters who disconnect or hashes never completed are skipped or
     /// linger harmlessly (a few dozen bytes each).
     avatar_waiters: BTreeMap<AvatarHash, Vec<MemberId>>,
-    reject_last: BTreeMap<SocketAddr, u64>,
+    /// When each slot last emitted a version reject. Fixed length
+    /// [`REJECT_SLOTS`], never resized.
+    reject_seen: Vec<Option<u64>>,
+    reject_budget: TokenBucket,
     events: Vec<ServerEvent>,
     last_musician_count: usize,
     last_stats_ms: u64,
@@ -294,7 +312,8 @@ impl ServerCore {
             audition: false,
             avatar_cache: AvatarCache::new(AVATAR_CACHE_BYTES),
             avatar_waiters: BTreeMap::new(),
-            reject_last: BTreeMap::new(),
+            reject_seen: vec![None; REJECT_SLOTS],
+            reject_budget: TokenBucket::new(REJECT_BURST, REJECT_RATE_PER_SEC),
             events: Vec::new(),
             last_musician_count: 0,
             last_stats_ms: 0,
@@ -687,6 +706,12 @@ impl ServerCore {
             .collect()
     }
 
+    /// The only reply an unauthenticated peer ever draws, so every step here
+    /// is a step an attacker gets to run at line rate. It is ordered cheapest
+    /// first and does no work at all once either limiter says no: the source
+    /// port is attacker-chosen, so the earlier `ip:port` key made every
+    /// packet a fresh key, and the retain-on-insert that kept that map from
+    /// growing turned a flood into quadratic work.
     fn version_reject(
         &mut self,
         now_ms: u64,
@@ -695,18 +720,21 @@ impl ServerCore {
         init_packet: &[u8],
         out: &mut Outgoing,
     ) {
-        let recent = self
-            .reject_last
-            .get(&src)
-            .is_some_and(|&t| now_ms.saturating_sub(t) < REJECT_INTERVAL_MS);
+        if init_packet.len() < REJECT_MIN_INIT_BYTES {
+            return;
+        }
+        let slot = reject_slot(src.ip());
+        let recent =
+            self.reject_seen[slot].is_some_and(|t| now_ms.saturating_sub(t) < REJECT_INTERVAL_MS);
         if recent {
             return;
         }
-        self.reject_last.insert(src, now_ms);
-        if self.reject_last.len() > REJECT_MAP_MAX {
-            self.reject_last
-                .retain(|_, t| now_ms.saturating_sub(*t) < REJECT_INTERVAL_MS);
+        // Checked after the per-slot gate and left unstamped when it fails,
+        // so an exhausted budget does not consume an honest client's turn.
+        if !self.reject_budget.take(now_ms) {
+            return;
         }
+        self.reject_seen[slot] = Some(now_ms);
         out.push((
             src,
             wire::build_version_reject(
@@ -1316,6 +1344,25 @@ impl ServerCore {
     }
 }
 
+/// Which reject slot a source claims. The network, not the address: a source
+/// port is attacker-chosen, and a single IPv6 host routinely holds a whole
+/// /64, so the low half of a v6 address is as free as the port was. The mix
+/// is a fixed splitmix64 rather than a randomly seeded hasher because the
+/// cores must replay identically under the harness; the worst an attacker
+/// buys by computing a collision is one second of suppressed reject for the
+/// address they collided with.
+fn reject_slot(ip: IpAddr) -> usize {
+    let network = match ip {
+        IpAddr::V4(v4) => u128::from(u32::from_be_bytes(v4.octets())),
+        IpAddr::V6(v6) => u128::from_be_bytes(v6.octets()) & !((1u128 << 64) - 1),
+    };
+    let mut x = (network as u64) ^ ((network >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (x as usize) & (REJECT_SLOTS - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,6 +1371,13 @@ mod tests {
 
     fn addr(n: u8) -> SocketAddr {
         format!("10.0.0.{n}:5000").parse().unwrap()
+    }
+
+    /// A wrong-version init the size a real one would be: the Noise IK first
+    /// message is over 90 bytes, and the server refuses to answer anything
+    /// short enough to make the 21-byte reject an amplification.
+    fn wrong_version_init() -> Vec<u8> {
+        wire::build_handshake_init(9, &[0xAA; 96])
     }
 
     fn server_with_issuer() -> (ServerCore, Issuer, [u8; 32]) {
@@ -1364,7 +1418,7 @@ mod tests {
     #[test]
     fn version_reject_is_rate_limited_per_source() {
         let (mut core, _issuer, public) = server_with_issuer();
-        let init = wire::build_handshake_init(9, &[0xAA; 40]);
+        let init = wrong_version_init();
         let out = core.handle_datagram(0, 0, addr(2), &init);
         assert_eq!(out.len(), 1);
         let Ok(Packet::VersionReject { ours, theirs, mac }) = wire::parse(&out[0].1) else {
@@ -1379,6 +1433,69 @@ mod tests {
         assert_eq!(core.handle_datagram(500, 0, addr(3), &init).len(), 1);
         // After the interval the same source is answered again.
         assert_eq!(core.handle_datagram(1_500, 0, addr(2), &init).len(), 1);
+    }
+
+    /// A UDP source port is chosen by whoever sends the packet, so a limiter
+    /// keyed on `ip:port` sees a fresh key every time and limits nothing. One
+    /// host walking ports must draw one reject, not thousands.
+    #[test]
+    fn one_host_cannot_walk_source_ports_for_unlimited_rejects() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wrong_version_init();
+        let mut rejects = 0;
+        for port in 1_024..6_024u16 {
+            let src: SocketAddr = format!("203.0.113.7:{port}").parse().unwrap();
+            rejects += core.handle_datagram(0, 0, src, &init).len();
+        }
+        assert_eq!(rejects, 1, "5000 source ports drew {rejects} rejects");
+    }
+
+    /// Spoofed source addresses defeat any per-source key, so the total
+    /// reject rate is capped too: the server is not a reflector whatever the
+    /// source distribution.
+    #[test]
+    fn reject_volume_is_capped_across_all_sources() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wrong_version_init();
+        let mut rejects = 0;
+        // 40,000 distinct /24s at one instant: far more slots than the table
+        // has, so only the global budget can hold this down.
+        for a in 0..160u16 {
+            for b in 0..250u16 {
+                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
+                rejects += core.handle_datagram(0, 0, src, &init).len();
+            }
+        }
+        assert_eq!(
+            rejects, REJECT_BURST as usize,
+            "40,000 distinct sources drew {rejects} rejects"
+        );
+        // The budget refills, so honest mismatched clients still get told.
+        assert_eq!(core.handle_datagram(1_000, 0, addr(9), &init).len(), 1);
+    }
+
+    /// The reject is 21 bytes. Answering a 3-byte `[1, 9, 0]` would make the
+    /// server an amplifier by size, which the threat model rules out.
+    #[test]
+    fn a_reject_is_never_larger_than_the_init_it_answers() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        for noise_len in [0usize, 1, 8, 44] {
+            let short = wire::build_handshake_init(9, &vec![0xAA; noise_len]);
+            assert!(
+                core.handle_datagram(0, 0, addr(2), &short).is_empty(),
+                "{}-byte init drew a reject",
+                short.len()
+            );
+        }
+        let init = wrong_version_init();
+        let out = core.handle_datagram(0, 0, addr(2), &init);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].1.len() < init.len(),
+            "reject {} bytes vs init {} bytes",
+            out[0].1.len(),
+            init.len()
+        );
     }
 
     #[test]

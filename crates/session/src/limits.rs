@@ -39,3 +39,106 @@ pub const DEFAULT_MAX_HOURS: u32 = 12;
 
 /// A member silent this long is dropped from the roster.
 pub const DEFAULT_MEMBER_TIMEOUT_MS: u64 = 10_000;
+
+/// A token bucket over integer milliseconds. Time-free like the rest of the
+/// cores: the caller passes `now_ms`, so the harness replays a rate limit
+/// exactly. Refill is accounted in thousandths of a token, which makes the
+/// rate exact at millisecond resolution instead of drifting a percent or so
+/// per refill.
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    capacity: u32,
+    per_sec: u32,
+    tokens: u32,
+    millitokens: u64,
+    last_ms: u64,
+}
+
+impl TokenBucket {
+    /// Starts full: the first burst of `capacity` is always allowed.
+    pub fn new(capacity: u32, per_sec: u32) -> TokenBucket {
+        TokenBucket {
+            capacity,
+            per_sec,
+            tokens: capacity,
+            millitokens: 0,
+            last_ms: 0,
+        }
+    }
+
+    /// Spends one token, answering whether there was one. Time going
+    /// backwards only forfeits refill; it never grants any.
+    pub fn take(&mut self, now_ms: u64) -> bool {
+        self.refill(now_ms);
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    fn refill(&mut self, now_ms: u64) {
+        let elapsed = now_ms.saturating_sub(self.last_ms);
+        self.last_ms = self.last_ms.max(now_ms);
+        if self.tokens >= self.capacity {
+            self.millitokens = 0;
+            return;
+        }
+        self.millitokens += elapsed.saturating_mul(u64::from(self.per_sec));
+        let gained = u32::try_from(self.millitokens / 1_000).unwrap_or(u32::MAX);
+        self.millitokens %= 1_000;
+        self.tokens = self.capacity.min(self.tokens.saturating_add(gained));
+        if self.tokens >= self.capacity {
+            self.millitokens = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenBucket;
+
+    #[test]
+    fn burst_then_refill_at_the_configured_rate() {
+        let mut b = TokenBucket::new(4, 2);
+        for _ in 0..4 {
+            assert!(b.take(0));
+        }
+        assert!(!b.take(0));
+        // Two per second: the first token is back at 500 ms, not before.
+        assert!(!b.take(499));
+        assert!(b.take(500));
+        assert!(!b.take(500));
+        // Idle long enough to refill past capacity: it clamps.
+        for _ in 0..4 {
+            assert!(b.take(60_000));
+        }
+        assert!(!b.take(60_000));
+    }
+
+    #[test]
+    fn refill_does_not_drift_over_many_small_steps() {
+        // 16 per second sampled every millisecond: exactly 16 tokens per
+        // second, which a naive integer division would overshoot.
+        let mut b = TokenBucket::new(16, 16);
+        for _ in 0..16 {
+            assert!(b.take(0));
+        }
+        let mut granted = 0;
+        for ms in 1..=1_000u64 {
+            if b.take(ms) {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 16);
+    }
+
+    #[test]
+    fn time_going_backwards_grants_nothing() {
+        let mut b = TokenBucket::new(1, 1);
+        assert!(b.take(10_000));
+        assert!(!b.take(0));
+        assert!(!b.take(10_500));
+        assert!(b.take(11_000));
+    }
+}
