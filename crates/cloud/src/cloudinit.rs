@@ -80,8 +80,8 @@ pub enum SelfDestruct {
     /// itself through the API with a droplet-scoped token from user-data.
     ApiToken { endpoint: String, token: String },
     /// GCP: maxRunDuration with instanceTerminationAction=DELETE is the
-    /// provider-enforced hard cap; the idle path self-deletes with the
-    /// scoped service account token from metadata.
+    /// provider-enforced hard cap, and it is the only thing that ends the
+    /// instance, because nothing on the box holds a credential that could.
     GcpMaxRunDuration,
 }
 
@@ -121,6 +121,22 @@ impl BootConfig {
     }
 }
 
+/// Reads one value back out of the flat key=value config. Lines are
+/// trimmed first, so this also reads the config as it appears indented
+/// inside the rendered cloud-init, which is how a provider recovers the
+/// session's own shape from `LaunchSpec::user_data`. Best effort:
+/// a payload in some other format simply yields None.
+pub fn flat_config_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (k, v) = line.split_once('=')?;
+        (k.trim() == key).then(|| v.trim())
+    })
+}
+
 /// Prefixes every nonempty line for embedding in a YAML block scalar.
 fn indent(text: &str, spaces: usize) -> String {
     let pad = " ".repeat(spaces);
@@ -155,19 +171,17 @@ curl -fsS -X DELETE -H \"Authorization: Bearer {token}\" \\
 "
         ),
         SelfDestruct::GcpMaxRunDuration => "#!/bin/sh
-# The hard cap is provider-enforced (maxRunDuration with
-# instanceTerminationAction=DELETE). This script is the idle path: delete
-# the instance with the scoped service account token from metadata.
+# No credential is attached to this instance, so it cannot delete itself.
+# What ends it is maxRunDuration with instanceTerminationAction=DELETE,
+# set at launch to the session's own hard cap, plus the host's sweeper,
+# which runs on every app and CLI launch and gets there sooner.
+#
+# So this stops serving and nothing more. It must not power the VM off:
+# Compute Engine clears the pending termination timestamp whenever a VM
+# stops, so a powered-off instance outlives the cap that was supposed to
+# collect it and keeps billing its disk until a human notices.
 echo \"jamstream self-destruct: $1\" > /dev/console 2>/dev/null || true
-md=http://metadata.google.internal/computeMetadata/v1
-name=$(curl -fsS -H 'Metadata-Flavor: Google' \"$md/instance/name\")
-zone=$(curl -fsS -H 'Metadata-Flavor: Google' \"$md/instance/zone\")
-token=$(curl -fsS -H 'Metadata-Flavor: Google' \\
-  \"$md/instance/service-accounts/default/token\" \\
-  | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p')
-curl -fsS -X DELETE -H \"Authorization: Bearer $token\" \\
-  \"https://compute.googleapis.com/compute/v1/$zone/instances/$name\" \\
-  || poweroff
+systemctl stop jamstreamd.service mediamtx.service 2>/dev/null || true
 "
         .to_owned(),
     }
@@ -692,12 +706,60 @@ mod tests {
         assert!(out.contains("https://api.digitalocean.com/v2/droplets/$droplet_id"));
     }
 
+    /// #51: the idle path used to fetch a service account token from
+    /// metadata, and no service account was ever attached, so the fetch
+    /// failed and the script fell through to `poweroff`. Compute Engine
+    /// clears a stopped VM's termination timestamp, so that left an
+    /// instance nothing would ever collect.
     #[test]
     fn snapshot_gcp_max_run_duration() {
         let out = render(&base_config(SelfDestruct::GcpMaxRunDuration));
         check_snapshot("cloudinit_gcp_max_run_duration.yaml", &out);
-        assert!(out.contains("compute.googleapis.com"));
-        assert!(out.contains("Metadata-Flavor: Google"));
+        assert!(!out.contains("poweroff"), "a stopped VM outlives its cap");
+        assert!(
+            !out.contains("service-accounts"),
+            "nothing on the instance can authenticate, so nothing should try"
+        );
+        assert!(!out.contains("Authorization: Bearer"));
+        assert!(out.contains("systemctl stop jamstreamd.service"));
+    }
+
+    /// Every self-destruct variant has to actually end the instance, or
+    /// stand aside for the thing that does. Neither shutdown nor poweroff
+    /// qualifies on GCP.
+    #[test]
+    fn no_variant_leaves_an_instance_that_bills_forever() {
+        for sd in all_variants() {
+            let script = self_destruct_script(&base_config(sd.clone()));
+            match sd {
+                // Instance-initiated shutdown behavior is terminate.
+                SelfDestruct::AwsShutdown => assert!(script.contains("shutdown -h now")),
+                // Powered-off droplets bill, so deletion is the end state.
+                SelfDestruct::ApiToken { .. } => {
+                    assert!(script.contains("-X DELETE"));
+                }
+                SelfDestruct::GcpMaxRunDuration => {
+                    assert!(!script.contains("poweroff") && !script.contains("shutdown"));
+                }
+            }
+        }
+    }
+
+    /// The flat config is how the session's own shape reaches a provider
+    /// that otherwise sees nothing but `LaunchSpec::user_data`, so it has
+    /// to read back the same from either rendering: bare, or indented
+    /// inside the YAML.
+    #[test]
+    fn flat_config_reads_back_from_both_renderings() {
+        let cfg = base_config(SelfDestruct::GcpMaxRunDuration);
+        for text in [cfg.render_flat_config(), render(&cfg)] {
+            assert_eq!(flat_config_value(&text, "max_duration_min"), Some("720"));
+            assert_eq!(flat_config_value(&text, "idle_shutdown_min"), Some("10"));
+            assert_eq!(flat_config_value(&text, "port"), Some("43210"));
+            assert_eq!(flat_config_value(&text, "missing"), None);
+        }
+        assert_eq!(flat_config_value("# port = 1\n", "port"), None);
+        assert_eq!(flat_config_value("#cloud-config\n", "port"), None);
     }
 
     /// The bootstrap script runs as root, and the artifact pair is the one
