@@ -59,10 +59,14 @@ pub async fn run<W: Write>(
             report.firewalls_removed.len()
         )?;
     }
+    // A provider that could not be listed was never searched, which is not
+    // the same as finding nothing there, and the difference is a bill.
+    for (kind, err) in &report.unswept {
+        writeln!(out, "{}: could not be searched: {err}", kind.as_str())?;
+    }
     if !report.is_clean() {
         return Err(CliError::Failed(
-            "sweep could not destroy every instance; the failures above are still billing"
-                .to_owned(),
+            "sweep did not account for every provider; anything above is still billing".to_owned(),
         ));
     }
     Ok(())

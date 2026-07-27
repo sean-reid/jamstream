@@ -198,9 +198,21 @@ fn harden_new_dir(dir: &Path) {
         );
         return;
     };
+    // By absolute path: this runs while a directory that is about to hold a
+    // private key is being created, and a writable directory early in PATH
+    // would otherwise choose the program that decides its permissions.
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+    let exe = [
+        PathBuf::from(format!("{root}\\System32\\icacls.exe")),
+        PathBuf::from("C:\\Windows\\System32\\icacls.exe"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+    .unwrap_or_else(|| PathBuf::from("icacls.exe"));
+
     let grant = format!("{}:(OI)(CI)F", user.to_string_lossy());
     let icacls = |args: &[&std::ffi::OsStr]| -> bool {
-        match Command::new("icacls").args(args).output() {
+        match Command::new(&exe).args(args).output() {
             Ok(out) if out.status.success() => true,
             Ok(out) => {
                 tracing::warn!(
