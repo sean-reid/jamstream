@@ -171,7 +171,9 @@ impl RegistryEntry {
 #[derive(Debug, Clone, Copy)]
 struct Spawned<'a> {
     image_name: Option<&'a str>,
-    /// Wall-clock second the spawn was recorded, or 0 when unknown.
+    /// Wall-clock second the spawn was recorded, or 0 when unknown. Only
+    /// unix reconciles it; [`tasklist_probe`] explains why Windows cannot.
+    #[cfg_attr(windows, allow(dead_code))]
     started_unix: u64,
 }
 
@@ -1748,12 +1750,15 @@ mod tests {
         let image = exe.file_name().unwrap().to_string_lossy().into_owned();
         let me = std::process::id();
         assert!(
-            process::alive(me, Some(&image)),
+            process::alive(me, spawned(Some(&image), 0)),
             "tasklist did not see this test process ({me}, {image})"
         );
-        assert!(process::alive(me, None), "pid-only probe must see us too");
         assert!(
-            !process::alive(me, Some("definitely-not-jamstreamd.exe")),
+            process::alive(me, spawned(None, 0)),
+            "pid-only probe must see us too"
+        );
+        assert!(
+            !process::alive(me, spawned(Some("definitely-not-jamstreamd.exe"), 0)),
             "an image mismatch must read as dead so we never kill a stranger"
         );
     }
@@ -1772,7 +1777,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
         child.wait().unwrap();
-        assert!(!process::alive(pid, Some("cmd.exe")));
+        assert!(!process::alive(pid, spawned(Some("cmd.exe"), 0)));
     }
 
     /// The ACL tightening must leave the directory usable by us: the worst
