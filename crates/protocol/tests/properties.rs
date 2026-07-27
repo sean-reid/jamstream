@@ -1,4 +1,4 @@
-use jamstream_protocol::control::{ControlLink, ControlMsg};
+use jamstream_protocol::control::{ControlLink, ControlMsg, RECV_WINDOW};
 use jamstream_protocol::ids::MemberId;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
 use jamstream_protocol::replay::ReplayWindow;
@@ -109,5 +109,31 @@ proptest! {
     fn control_receive_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..300)) {
         let mut link = ControlLink::new();
         let _ = link.receive(&bytes);
+    }
+
+    /// Growth, not panics: for any sequence of arriving frames, including the
+    /// ones an attacker picks so the gap never closes, the reassembly buffer
+    /// stays inside the window `ack_bits` can advertise.
+    #[test]
+    fn control_reassembly_stays_inside_the_window(
+        seqs in prop::collection::vec(0u64..4_000, 1..500),
+    ) {
+        let mut sender = ControlLink::new();
+        let mut link = ControlLink::new();
+        // One legal datagram per sequence number, built by a real sender so
+        // only the ordering is adversarial.
+        for &seq in &seqs {
+            sender.send(ControlMsg::Chat { from: MemberId(1), text: format!("m{seq}") }).unwrap();
+        }
+        let dgrams = sender.poll(0);
+        for &seq in &seqs {
+            let Some(dgram) = dgrams.get(seq as usize) else { continue };
+            let _ = link.receive(dgram);
+            prop_assert!(
+                link.buffered() <= RECV_WINDOW as usize,
+                "buffered {} frames",
+                link.buffered()
+            );
+        }
     }
 }

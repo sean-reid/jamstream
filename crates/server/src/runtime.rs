@@ -354,6 +354,9 @@ fn log_event(event: &ServerEvent) {
         ServerEvent::ProtocolViolation { id, what } => {
             tracing::warn!(member = id.0, what, "protocol violation");
         }
+        ServerEvent::MemberEjected { id, violations } => {
+            tracing::warn!(member = id.0, violations, "ejected for protocol violations");
+        }
         // The op's Debug redacts the stream key by construction.
         ServerEvent::StreamCtl(op) => tracing::info!(op = ?op, "stream control"),
     }

@@ -40,6 +40,17 @@ pub const DEFAULT_MAX_HOURS: u32 = 12;
 /// A member silent this long is dropped from the roster.
 pub const DEFAULT_MEMBER_TIMEOUT_MS: u64 = 10_000;
 
+/// Illegal packets a member may send before the server drops them. An honest
+/// client sends none: every violation the server counts is something no
+/// shipped client does. 32 is room for a version skew nobody anticipated.
+pub const VIOLATION_BURST: u32 = 32;
+
+/// How fast that allowance comes back. One per second means a peer who keeps
+/// rejoining after an ejection gets one illegal packet per second rather than
+/// a flood, and a client with a systematic bug trickles instead of being
+/// locked out of the session for good.
+pub const VIOLATION_REFILL_PER_SEC: u32 = 1;
+
 /// A token bucket over integer milliseconds. Time-free like the rest of the
 /// cores: the caller passes `now_ms`, so the harness replays a rate limit
 /// exactly. Refill is accounted in thousandths of a token, which makes the
@@ -75,6 +86,12 @@ impl TokenBucket {
         }
         self.tokens -= 1;
         true
+    }
+
+    /// Whether a token is there, without spending it.
+    pub fn available(&mut self, now_ms: u64) -> bool {
+        self.refill(now_ms);
+        self.tokens > 0
     }
 
     fn refill(&mut self, now_ms: u64) {

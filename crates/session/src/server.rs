@@ -13,8 +13,8 @@ use jamstream_engine::{
 };
 use jamstream_protocol::PROTOCOL_VERSION;
 use jamstream_protocol::control::{
-    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_STREAM_KEY_LEN, MemberInfo,
-    StreamOp,
+    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN, MAX_STREAM_KEY_LEN,
+    MemberInfo, StreamOp,
 };
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::verify_token;
@@ -23,7 +23,10 @@ use jamstream_protocol::transport::{Responder, Session, Welcome};
 use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
 
 use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
-use crate::limits::{DEFAULT_MEMBER_TIMEOUT_MS, MAX_LISTENERS, MAX_MUSICIANS, TokenBucket};
+use crate::limits::{
+    DEFAULT_MEMBER_TIMEOUT_MS, MAX_LISTENERS, MAX_MUSICIANS, TokenBucket, VIOLATION_BURST,
+    VIOLATION_REFILL_PER_SEC,
+};
 
 /// Samples per mix tick: 2.5 ms at 48 kHz.
 const TICK_SAMPLES: usize = 120;
@@ -146,6 +149,14 @@ pub enum ServerEvent {
         id: MemberId,
         what: &'static str,
     },
+    /// A member ran their violation budget out and was dropped. Their token
+    /// stays valid: they can hand back a fresh handshake once the budget
+    /// refills, which is what keeps a buggy client from being locked out of
+    /// the session for good.
+    MemberEjected {
+        id: MemberId,
+        violations: u64,
+    },
     /// An accepted host request for the broadcast pipeline. The core does not
     /// run processes, so it hands the op to whatever drives it (jamstreamd's
     /// runtime, which owns the stream worker) and stays deterministic. The op
@@ -221,7 +232,11 @@ struct Member {
     last_heard_ms: u64,
     rtt_ms_last: Option<f32>,
     send_seq: u32,
+    /// Lifetime count, for the stats surface.
     violations: u64,
+    /// What is left of this member's allowance for illegal packets. Survives
+    /// disconnect and rejoin, so ejection is not undone by a handshake.
+    violation_budget: TokenBucket,
     /// Jitter stats snapshot at the last Stats report; deltas against it
     /// give the per-window uplink numbers.
     stats_prev: JitterStats,
@@ -580,24 +595,17 @@ impl ServerCore {
 
         // Timeout scan: keep state so the same token can rejoin, free the
         // address binding and transport.
-        let mut timed_out = Vec::new();
-        for (&id, m) in self.members.iter_mut() {
-            if m.connected && now_ms.saturating_sub(m.last_heard_ms) >= self.cfg.member_timeout_ms {
-                m.connected = false;
-                m.addr = None;
-                m.session = None;
-                m.resp_cache = None;
-                // Transfers are connection-scoped; the announced hash stays.
-                m.avatar_rx = None;
-                m.avatar_tx.clear();
-                timed_out.push(id);
-            }
-        }
+        let timed_out: Vec<MemberId> = self
+            .members
+            .iter()
+            .filter(|(_, m)| {
+                m.connected && now_ms.saturating_sub(m.last_heard_ms) >= self.cfg.member_timeout_ms
+            })
+            .map(|(&id, _)| id)
+            .collect();
         if !timed_out.is_empty() {
             for id in timed_out {
-                if id == HOST_MEMBER_ID {
-                    self.audition = false;
-                }
+                self.disconnect_member(id);
                 self.events.push(ServerEvent::MemberDisconnected { id });
             }
             self.queue_roster();
@@ -783,6 +791,15 @@ impl ServerCore {
             return;
         }
         let id = token.member_id;
+        // An ejected member gets back in when their violation budget does,
+        // not the moment they redo the handshake. Without this, ejection cost
+        // an abusive peer one handshake and bought them nothing.
+        if let Some(m) = self.members.get_mut(&id)
+            && !m.violation_budget.available(now_ms)
+        {
+            tracing::debug!(member = id.0, "handshake dropped: violation budget");
+            return;
+        }
         let init_hash: [u8; 32] = Blake2s256::digest(noise).into();
         if let Some(m) = self.members.get(&id)
             && m.connected
@@ -849,9 +866,14 @@ impl ServerCore {
             return;
         };
 
+        // The roster carries the name to everyone, and `ControlLink` refuses
+        // to carry one past MAX_NAME_LEN, so a hint longer than the cap would
+        // silently break roster fanout for the whole session rather than for
+        // the member who brought it.
         let name = token
             .name_hint
             .clone()
+            .filter(|n| n.len() <= MAX_NAME_LEN)
             .unwrap_or_else(|| format!("member {}", id.0));
         // A rejoin keeps the member's mixer state; everything stream-scoped
         // starts fresh with the new transport. Audition never survives a
@@ -860,9 +882,29 @@ impl ServerCore {
             self.audition = false;
         }
         let prev = self.members.remove(&id);
-        let (faders, click_enabled, avatar) = prev.map_or((BTreeMap::new(), true, None), |p| {
-            (p.faders, p.click_enabled, p.avatar)
-        });
+        // The violation record follows the member across a rejoin for the
+        // same reason the fader table does: a fresh handshake is not a fresh
+        // reputation.
+        let (faders, click_enabled, avatar, violations, violation_budget) = prev.map_or_else(
+            || {
+                (
+                    BTreeMap::new(),
+                    true,
+                    None,
+                    0,
+                    TokenBucket::new(VIOLATION_BURST, VIOLATION_REFILL_PER_SEC),
+                )
+            },
+            |p| {
+                (
+                    p.faders,
+                    p.click_enabled,
+                    p.avatar,
+                    p.violations,
+                    p.violation_budget,
+                )
+            },
+        );
         self.members.insert(
             id,
             Member {
@@ -886,7 +928,8 @@ impl ServerCore {
                 last_heard_ms: now_ms,
                 rtt_ms_last: None,
                 send_seq: 0,
-                violations: 0,
+                violations,
+                violation_budget,
                 stats_prev: JitterStats::default(),
                 level_peak: 0.0,
                 level_rms: 0.0,
@@ -919,6 +962,9 @@ impl ServerCore {
         ciphertext: &[u8],
         out: &mut Outgoing,
     ) {
+        // Nothing on this path counts a violation inline: the borrow of the
+        // member ends first, so every violation goes through `violation`,
+        // which is the one place the ejection threshold is applied.
         let msgs = {
             let Some(m) = self.members.get_mut(&member) else {
                 return;
@@ -941,49 +987,38 @@ impl ServerCore {
             match wire::split_channel(&plain) {
                 Ok((CHANNEL_MEDIA, _)) => {
                     if m.role != Role::Musician {
-                        m.violations += 1;
-                        self.events.push(ServerEvent::ProtocolViolation {
-                            id: member,
-                            what: "media from listener",
-                        });
-                        return;
-                    }
-                    match MediaFrame::decode(&plain) {
-                        Ok(f) => m.jitter.push(MediaPacket {
-                            seq: f.seq,
-                            timestamp: f.timestamp,
-                            payload: f.payload.to_vec(),
-                            redundant: f.redundant.map(<[u8]>::to_vec),
-                        }),
-                        Err(_) => {
-                            m.violations += 1;
-                            self.events.push(ServerEvent::ProtocolViolation {
-                                id: member,
-                                what: "malformed media frame",
-                            });
+                        Err("media from listener")
+                    } else {
+                        match MediaFrame::decode(&plain) {
+                            Ok(f) => {
+                                m.jitter.push(MediaPacket {
+                                    seq: f.seq,
+                                    timestamp: f.timestamp,
+                                    payload: f.payload.to_vec(),
+                                    redundant: f.redundant.map(<[u8]>::to_vec),
+                                });
+                                // Media never polls the control link: at 400
+                                // frames a second per musician it must not.
+                                Ok(None)
+                            }
+                            Err(_) => Err("malformed media frame"),
                         }
                     }
-                    return;
                 }
-                Ok((CHANNEL_CONTROL, _)) => match m.link.receive(&plain) {
-                    Ok(msgs) => msgs,
-                    Err(_) => {
-                        m.violations += 1;
-                        self.events.push(ServerEvent::ProtocolViolation {
-                            id: member,
-                            what: "malformed control packet",
-                        });
-                        return;
-                    }
-                },
-                _ => {
-                    m.violations += 1;
-                    self.events.push(ServerEvent::ProtocolViolation {
-                        id: member,
-                        what: "unknown channel",
-                    });
-                    return;
-                }
+                Ok((CHANNEL_CONTROL, _)) => m
+                    .link
+                    .receive(&plain)
+                    .map(Some)
+                    .map_err(|_| "malformed control packet"),
+                _ => Err("unknown channel"),
+            }
+        };
+        let msgs = match msgs {
+            Ok(Some(msgs)) => msgs,
+            Ok(None) => return,
+            Err(what) => {
+                self.violation(now_ms, member, what);
+                return;
             }
         };
         for msg in msgs {
@@ -1010,7 +1045,7 @@ impl ServerCore {
                 muted,
             } => {
                 if !gain_db.is_finite() || !pan.is_finite() {
-                    self.violation(from, "non-finite fader");
+                    self.violation(now_ms, from, "non-finite fader");
                     return;
                 }
                 if let Some(m) = self.members.get_mut(&from) {
@@ -1030,7 +1065,7 @@ impl ServerCore {
                 enabled,
             } => {
                 if from != HOST_MEMBER_ID {
-                    self.violation(from, "metronome set by non-host");
+                    self.violation(now_ms, from, "metronome set by non-host");
                     return;
                 }
                 self.metronome = Metronome { bpm, beats_per_bar };
@@ -1056,11 +1091,11 @@ impl ServerCore {
                 muted,
             } => {
                 if from != HOST_MEMBER_ID {
-                    self.violation(from, "broadcast mix set by non-host");
+                    self.violation(now_ms, from, "broadcast mix set by non-host");
                     return;
                 }
                 if !gain_db.is_finite() || !pan.is_finite() {
-                    self.violation(from, "non-finite fader");
+                    self.violation(now_ms, from, "non-finite fader");
                     return;
                 }
                 let gain_db = gain_db.clamp(-96.0, 24.0);
@@ -1086,7 +1121,7 @@ impl ServerCore {
             }
             ControlMsg::BroadcastAudition { enabled } => {
                 if from != HOST_MEMBER_ID {
-                    self.violation(from, "broadcast audition by non-host");
+                    self.violation(now_ms, from, "broadcast audition by non-host");
                     return;
                 }
                 self.audition = enabled;
@@ -1103,7 +1138,7 @@ impl ServerCore {
             }
             ControlMsg::Revoke { jti } => {
                 if from != HOST_MEMBER_ID {
-                    self.violation(from, "revoke by non-host");
+                    self.violation(now_ms, from, "revoke by non-host");
                     return;
                 }
                 self.revoked.insert(jti);
@@ -1140,18 +1175,8 @@ impl ServerCore {
                 }
             }
             ControlMsg::Bye { .. } => {
-                if let Some(m) = self.members.get_mut(&from)
-                    && m.connected
-                {
-                    m.connected = false;
-                    m.addr = None;
-                    m.session = None;
-                    m.resp_cache = None;
-                    m.avatar_rx = None;
-                    m.avatar_tx.clear();
-                    if from == HOST_MEMBER_ID {
-                        self.audition = false;
-                    }
+                if self.members.get(&from).is_some_and(|m| m.connected) {
+                    self.disconnect_member(from);
                     self.events
                         .push(ServerEvent::MemberDisconnected { id: from });
                     self.queue_roster();
@@ -1160,7 +1185,7 @@ impl ServerCore {
             }
             ControlMsg::SetAvatar { hash, len } => {
                 if len == 0 || len as usize > MAX_AVATAR_BYTES {
-                    self.violation(from, "avatar length out of range");
+                    self.violation(now_ms, from, "avatar length out of range");
                     return;
                 }
                 let have_bytes = self.avatar_cache.contains(&hash);
@@ -1227,7 +1252,7 @@ impl ServerCore {
                             }
                         }
                     }
-                    Err(what) => self.violation(from, what),
+                    Err(what) => self.violation(now_ms, from, what),
                 }
             }
             ControlMsg::AvatarRequest { hash } => {
@@ -1266,22 +1291,24 @@ impl ServerCore {
             }
             ControlMsg::StreamCtl { op } => {
                 if from != HOST_MEMBER_ID {
-                    self.violation(from, "stream control by non-host");
+                    self.violation(now_ms, from, "stream control by non-host");
                     return;
                 }
                 if let StreamOp::AddDestination { key, .. } = &op
                     && (key.is_empty() || key.len() > MAX_STREAM_KEY_LEN)
                 {
-                    self.violation(from, "stream key out of range");
+                    self.violation(now_ms, from, "stream key out of range");
                     return;
                 }
                 // The core owns no processes: the op goes to the driver, which
                 // owns the stream worker. Nothing here stores or relays it.
                 self.events.push(ServerEvent::StreamCtl(op));
             }
-            ControlMsg::Roster(_) => self.violation(from, "roster from client"),
-            ControlMsg::Stats { .. } => self.violation(from, "stats from client"),
-            ControlMsg::StreamStatus { .. } => self.violation(from, "stream status from client"),
+            ControlMsg::Roster(_) => self.violation(now_ms, from, "roster from client"),
+            ControlMsg::Stats { .. } => self.violation(now_ms, from, "stats from client"),
+            ControlMsg::StreamStatus { .. } => {
+                self.violation(now_ms, from, "stream status from client")
+            }
         }
     }
 
@@ -1335,12 +1362,54 @@ impl ServerCore {
         }
     }
 
-    fn violation(&mut self, id: MemberId, what: &'static str) {
-        if let Some(m) = self.members.get_mut(&id) {
-            m.violations += 1;
-        }
+    /// Charges one protocol violation against a member, ejecting them once
+    /// they run their budget out. Every violation site funnels through here;
+    /// the counter used to be incremented in five places and read nowhere, so
+    /// an admitted peer, a listener invite included, could send illegal
+    /// packets at line rate forever.
+    fn violation(&mut self, now_ms: u64, id: MemberId, what: &'static str) {
+        let Some(m) = self.members.get_mut(&id) else {
+            self.events
+                .push(ServerEvent::ProtocolViolation { id, what });
+            return;
+        };
+        m.violations += 1;
+        let violations = m.violations;
+        // The budget is a bucket, not a lifetime total: a client with a
+        // systematic bug trickles rather than being locked out of the session
+        // for good, while a flood exhausts it in VIOLATION_BURST packets.
+        let ejected = !m.violation_budget.take(now_ms);
         self.events
             .push(ServerEvent::ProtocolViolation { id, what });
+        if ejected {
+            self.disconnect_member(id);
+            self.events
+                .push(ServerEvent::MemberEjected { id, violations });
+            self.queue_roster();
+            self.note_musician_count();
+        }
+    }
+
+    /// Tears down one member's connection state, keeping the roster entry and
+    /// everything that survives a rejoin (faders, click, announced avatar,
+    /// violation budget). Shared by the timeout scan, `Bye`, and ejection.
+    fn disconnect_member(&mut self, id: MemberId) {
+        let Some(m) = self.members.get_mut(&id) else {
+            return;
+        };
+        if !m.connected {
+            return;
+        }
+        m.connected = false;
+        m.addr = None;
+        m.session = None;
+        m.resp_cache = None;
+        // Transfers are connection-scoped; the announced hash stays.
+        m.avatar_rx = None;
+        m.avatar_tx.clear();
+        if id == HOST_MEMBER_ID {
+            self.audition = false;
+        }
     }
 }
 

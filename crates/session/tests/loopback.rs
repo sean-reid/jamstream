@@ -17,7 +17,7 @@ use jamstream_protocol::transport::{Initiator, Session, generate_keypair};
 use jamstream_protocol::wire::{self, Packet};
 use jamstream_session::{
     ClientCore, ClientEvent, ClientState, MAX_LISTENERS, MAX_MUSICIANS, ServerConfig, ServerCore,
-    ServerEvent,
+    ServerEvent, VIOLATION_BURST,
 };
 use proptest::prelude::*;
 
@@ -400,23 +400,26 @@ struct RawMember {
 }
 
 fn raw_join(h: &mut Harness, invite: &Invite, addr: SocketAddr) -> RawMember {
+    raw_join_attempt(h, invite, addr).expect("handshake response")
+}
+
+/// `raw_join` for the cases where refusal is the expected outcome. Admission
+/// refusals are silent by design, so None means the server dropped the init.
+fn raw_join_attempt(h: &mut Harness, invite: &Invite, addr: SocketAddr) -> Option<RawMember> {
     let (init, pkt) = Initiator::new(invite).unwrap();
     let now = h.now_ms();
     let replies = h.server.handle_datagram(now, h.now_unix, addr, &pkt);
-    let (_, resp) = replies
-        .into_iter()
-        .find(|(a, _)| *a == addr)
-        .expect("handshake response");
+    let (_, resp) = replies.into_iter().find(|(a, _)| *a == addr)?;
     let Packet::HandshakeResp { noise } = wire::parse(&resp).unwrap() else {
         panic!("expected handshake response");
     };
     let (session, welcome) = init.finish(noise).unwrap();
-    RawMember {
+    Some(RawMember {
         id: welcome.member_id,
         addr,
         session,
         link: ControlLink::new(),
-    }
+    })
 }
 
 impl RawMember {
@@ -692,6 +695,74 @@ fn listener_receives_broadcast_and_cannot_send_media() {
             what: "media from listener"
         }
     )));
+}
+
+/// The violation counter was incremented in five places and read in none, so
+/// a listener invite, the cheapest credential a host hands out, bought the
+/// right to send illegal packets at line rate forever. Now it buys
+/// VIOLATION_BURST of them.
+#[test]
+fn a_violation_flood_ejects_the_member_and_holds_the_rejoin() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_host = h.mint(0, Role::Musician);
+    h.add_client(&inv_host, Some(440.0));
+    h.run_ms(200);
+
+    // A listener sending media: one violation per packet, no rate limit of
+    // its own, so it is the cheapest way to exhaust the budget.
+    let inv_l = h.mint(7, Role::Listener);
+    let mut raw = raw_join(&mut h, &inv_l, addr_of(97));
+    let frame = MediaFrame {
+        seq: 0,
+        timestamp: 0,
+        duration: FrameDuration::Ms2_5,
+        stereo: false,
+        payload: &[1, 2, 3],
+        redundant: None,
+    }
+    .encode();
+    for _ in 0..VIOLATION_BURST + 8 {
+        raw.send_media(&mut h, &frame);
+    }
+    h.run(1);
+
+    let ejected: Vec<&ServerEvent> = h
+        .server_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ServerEvent::MemberEjected {
+                    id: MemberId(7),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(ejected.len(), 1, "{:?}", h.server_events);
+    // Exactly the budget was spent: the packets after ejection are dropped by
+    // the disconnected check, not counted again.
+    let violations = h
+        .server
+        .stats()
+        .into_iter()
+        .find(|s| s.id == MemberId(7))
+        .expect("ejected member stays on the roster")
+        .violations;
+    // The budget tolerates VIOLATION_BURST; the next one ejects.
+    assert_eq!(violations, u64::from(VIOLATION_BURST) + 1);
+    assert_eq!(h.server.musicians_connected(), 1, "the band plays on");
+
+    // A fresh handshake does not buy a fresh reputation: readmission waits
+    // for the budget to refill.
+    let mut rejected = raw_join_attempt(&mut h, &inv_l, addr_of(96));
+    assert!(rejected.is_none(), "ejected member was readmitted at once");
+    h.advance_quiet(2_000);
+    rejected = raw_join_attempt(&mut h, &inv_l, addr_of(96));
+    assert!(
+        rejected.is_some(),
+        "the budget refills, so an ejected member can come back"
+    );
 }
 
 #[test]
