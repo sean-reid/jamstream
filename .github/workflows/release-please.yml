@@ -5,8 +5,10 @@
 # Channel design: the workspace versions as a single root package
 # ("jamstream", manifest at 0.1.0). While we are in beta, the config pins
 # the prerelease versioning strategy with the "beta" label, so releases
-# from main come out as v0.1.x-beta.N and are marked prereleases on GitHub;
-# that is the beta channel.
+# from main come out as v0.1.x-beta.N; the beta channel lives in the
+# version string. The GitHub prerelease flag stays OFF because
+# /releases/latest excludes prereleases, which would break the installer
+# and download links for the whole beta period.
 #
 # Promote path to stable: in release-please-config.json set
 # "prerelease": false and drop "versioning": "prerelease" and
