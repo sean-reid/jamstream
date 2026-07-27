@@ -285,38 +285,63 @@ fn session_settings() {
 
 #[test]
 fn session_settings_avatar() {
-    // The other half of the avatar row: a picture chosen this run, shown
-    // cover-cropped, with Remove enabled. Wide and short, so the crop is
-    // visible rather than assumed.
+    // The other half of the avatar row: a photograph picked this run,
+    // through the same read, fit, and decode a picked file goes through, so
+    // the disc, the file name, and the two sizes are all the real ones.
     let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Light);
     app.settings_open = true;
-    app.own_avatar = Some(test_avatar());
+    app.load_avatar_from(avatar_fixture("rehearsal.jpg"));
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_avatar");
 }
 
-/// A deterministic 80x40 picture built through the public contract: warm
-/// diagonal bands, no image encoder and no file involved.
-fn test_avatar() -> jamstream_client::runtime::AvatarHandle {
-    let (w, h) = (80u32, 40u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let band = ((x + y * 2) / 8) % 3;
-            let px = match band {
-                0 => [0xc0, 0x6a, 0x28, 255],
-                1 => [0x8f, 0x4f, 0x1e, 255],
-                _ => [0xe0, 0x94, 0x40, 255],
-            };
-            rgba.extend_from_slice(&px);
+#[test]
+fn session_settings_avatar_refused() {
+    // A file the dialog's image filter offers and the fitter still cannot
+    // use: a .png that is really a GIF, which is the shape every refusal
+    // takes on screen. The disc stays on the initials and the reason sits
+    // under the row in the danger colour.
+    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
+    app.settings_open = true;
+    app.load_avatar_from(fixture_file(
+        "poster.png",
+        b"GIF89a\x01\x00\x01\x00\x00\x00\x00;",
+    ));
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_avatar_refused");
+}
+
+/// A file on disk that is a real photograph in every way that matters: a
+/// 1600x1200 JPEG, over the byte cap and over the dimension cap, which the
+/// fitter has to bring down to 256x256.
+fn avatar_fixture(name: &str) -> PathBuf {
+    let (w, h) = (1600u32, 1200u32);
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        // Warm diagonal bands with a soft vertical wash, so the disc has
+        // both flat areas and detail through the crop.
+        let band = ((x + y * 2) / 90) % 3;
+        let wash = (y * 40 / h) as u8;
+        match band {
+            0 => image::Rgb([0xc0 - wash, 0x6a, 0x28 + wash]),
+            1 => image::Rgb([0x8f, 0x4f + wash, 0x1e]),
+            _ => image::Rgb([0xe0 - wash, 0x94, 0x40]),
         }
-    }
-    jamstream_client::runtime::AvatarHandle {
-        hash: "snapshot-avatar".to_owned(),
-        width: w,
-        height: h,
-        rgba: std::sync::Arc::from(rgba.into_boxed_slice()),
-    }
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 95)
+        .encode_image(&img)
+        .expect("encode the fixture photo");
+    fixture_file(name, &buf.into_inner())
+}
+
+/// Writes a fixture under a name of our choosing, because the row shows the
+/// file's name and the snapshot has to be the same every run.
+fn fixture_file(name: &str, bytes: &[u8]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("jamstream-snapshot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write the fixture");
+    path
 }
 
 // The stream mix sheet over the host session: the frozen demo carries
@@ -413,6 +438,12 @@ fn session_destinations_light() {
 fn session_destinations_key() {
     // The one surface where a key exists: masked, with its character count
     // standing in for reading it back, and the platform's own guidance above.
+    //
+    // Publishable: this is a host who clicked Add key and typed one. The
+    // keychain behind it is empty, which is a first-time host's real state,
+    // and it is why Twitch still reads "no key" and Go live is still off.
+    // Nothing else is stubbed: the status bar carries Invites, Stream mix,
+    // and Destinations, because the fixture is a real host.
     let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
     let mut app = host_app(rt, Theme::Dark);
     app.session.destinations = Some(DestinationsPanel::with_key_entry(

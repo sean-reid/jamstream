@@ -11,6 +11,7 @@ use crate::creds::{self, CredStore, EnvReader, KeyringStore};
 use crate::demo::DemoRuntime;
 use crate::exec::{Executor, Job};
 use crate::live::{AudioSettings, CostedRuntime, LiveRuntime};
+use crate::picker::{Pick, Picked};
 use crate::runtime::{AvatarHandle, Command, ConnState, LevelsView, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
 use crate::screens::devices::{DeviceCatalog, DevicesScreen};
@@ -56,15 +57,18 @@ pub struct JamApp {
     /// state).
     pub live: Option<Arc<LiveRuntime>>,
     pub settings_open: bool,
-    /// The path typed into the settings sheet's avatar row. There is no
-    /// application settings store to keep it in, so a chosen avatar lasts
-    /// for this run of the app; joining a session announces it.
-    pub avatar_path: String,
     /// Why the last avatar load failed, shown inline under the row.
     pub avatar_error: Option<String>,
+    /// The picture picked this run: its file name and what it became, for
+    /// the line under the row. There is no application settings store to
+    /// keep it in, so it lasts for this run of the app; joining a session
+    /// announces it.
+    avatar_picture: Option<avatar::Picture>,
+    /// The file dialog, while one is open.
+    avatar_dialog: Option<Pick>,
     /// The avatar you picked, decoded for the settings disc.
     pub own_avatar: Option<AvatarHandle>,
-    /// The same avatar's file bytes, kept so a join can announce it.
+    /// The same avatar's fitted bytes, kept so a join can announce it.
     own_avatar_bytes: Option<Vec<u8>>,
     /// Device selection last applied to the live runtime, as
     /// (capture_idx, playback_idx, buffer_frames).
@@ -100,8 +104,9 @@ impl JamApp {
             runtime: None,
             live: None,
             settings_open: false,
-            avatar_path: String::new(),
             avatar_error: None,
+            avatar_picture: None,
+            avatar_dialog: None,
             own_avatar: None,
             own_avatar_bytes: None,
             applied_audio,
@@ -278,6 +283,9 @@ impl JamApp {
             ui.add_space(theme::SPACE_SM);
         });
 
+        // Before the sheet draws, so a picture that landed while the dialog
+        // was open shows in the same frame it arrived.
+        self.poll_avatar_pick();
         self.settings_window(ui.ctx());
 
         match self.screen {
@@ -426,9 +434,10 @@ impl JamApp {
             });
     }
 
-    /// "Your avatar": the disc as everyone else sees it, a path field, and
-    /// the two actions. There is no file dialog in this app, so the path is
-    /// pasted; every refusal names its own reason on the spot.
+    /// "Your avatar": the disc as everyone else sees it, the picker, and
+    /// Remove. Under them, either what the picked file became or, before
+    /// anything is picked, what will happen to one. Every refusal names its
+    /// own reason on the spot.
     fn avatar_ui(&mut self, ui: &mut Ui, snap: Option<&Snapshot>) {
         ui.label(theme::title(ui, "Your avatar"));
         let me = snap.and_then(|s| s.members.iter().find(|m| m.is_you));
@@ -441,76 +450,109 @@ impl JamApp {
             .own_avatar
             .clone()
             .or_else(|| me.and_then(|m| m.avatar.clone()));
-        let mut load = false;
+        let picking = self.avatar_dialog.is_some();
+        let mut choose = false;
         let mut remove = false;
         ui.horizontal(|ui| {
             avatar_disc(ui, &name, handle.as_ref(), AVATAR_D_STRIP, false);
             ui.vertical(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.avatar_path)
-                        .desired_width(206.0)
-                        .hint_text("path to a PNG or JPEG"),
-                );
                 ui.horizontal(|ui| {
-                    load = ui.button("Load").clicked();
+                    choose = ui
+                        .add_enabled(!picking, egui::Button::new("Choose picture"))
+                        .clicked();
                     remove = ui
                         .add_enabled(handle.is_some(), egui::Button::new("Remove"))
                         .clicked();
                 });
+                match &self.avatar_picture {
+                    Some(picture) => {
+                        ui.add(egui::Label::new(theme::muted(ui, picture.file.clone())).truncate());
+                        let (w, h) = picture.fitted;
+                        let line = if picture.source == picture.fitted {
+                            format!("{w}x{h}")
+                        } else {
+                            let (sw, sh) = picture.source;
+                            format!("{sw}x{sh} fitted to {w}x{h}")
+                        };
+                        ui.label(theme::mono_muted(ui, line));
+                    }
+                    None => {
+                        ui.label(theme::muted(
+                            ui,
+                            format!(
+                                "PNG or JPEG. A photo is cropped square and fitted to \
+                                 {d}x{d}.",
+                                d = avatar::FIT_DIM
+                            ),
+                        ));
+                    }
+                }
             });
         });
         if let Some(err) = &self.avatar_error {
             let p = theme::palette_of(ui);
             ui.label(egui::RichText::new(err.clone()).color(p.danger));
         }
-        ui.label(theme::muted(
-            ui,
-            format!(
-                "PNG or JPEG up to {} KB. Removing applies here and on your next join; \
-                 the session keeps the picture you already sent.",
-                avatar::MAX_BYTES / 1024
-            ),
-        ));
-        if load {
-            self.load_avatar();
+        if handle.is_some() {
+            ui.label(theme::muted(
+                ui,
+                "Removing applies here and on your next join; the session keeps the \
+                 picture you already sent.",
+            ));
+        }
+        if choose {
+            self.avatar_error = None;
+            self.avatar_dialog = Some(Pick::picture());
         }
         if remove {
             self.remove_avatar();
         }
     }
 
-    /// Reads the pasted path and validates it against the same caps the
-    /// transfer layer enforces, so a refusal happens here with a specific
-    /// message instead of silently on the wire.
-    fn load_avatar(&mut self) {
-        self.avatar_error = None;
-        let path = self.avatar_path.trim().to_owned();
-        if path.is_empty() {
-            self.avatar_error = Some("type or paste the path to a PNG or JPEG file".to_owned());
+    /// Takes the picked file when the dialog thread is done with it. The
+    /// picture is already fitted and decoded by then; all that is left is to
+    /// show it and tell the session.
+    fn poll_avatar_pick(&mut self) {
+        let Some(dialog) = &mut self.avatar_dialog else {
             return;
-        }
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                self.avatar_error = Some(format!("{path} could not be read: {err}"));
-                return;
-            }
         };
-        match avatar::decode(avatar::local_key(&bytes), &bytes) {
-            Ok(handle) => {
-                self.own_avatar = Some(handle);
-                if let Some(rt) = self.runtime.as_deref() {
-                    rt.send(Command::SetOwnAvatar(Some(bytes.clone())));
-                }
-                self.own_avatar_bytes = Some(bytes);
-            }
-            Err(err) => self.avatar_error = Some(err.to_string()),
+        let Some(picked) = dialog.poll() else {
+            return;
+        };
+        self.avatar_dialog = None;
+        match picked {
+            Picked::Cancelled => {}
+            Picked::Loaded(picture) => self.set_avatar(*picture),
+            Picked::Failed(err) => self.avatar_error = Some(err),
         }
+    }
+
+    /// Reads, fits, and decodes `path` on this thread, then applies it. The
+    /// picker does the same work on its own thread; this is the way in for a
+    /// test, which cannot open a dialog.
+    pub fn load_avatar_from(&mut self, path: impl AsRef<std::path::Path>) {
+        self.avatar_error = None;
+        match avatar::load(path.as_ref()) {
+            Ok(picture) => self.set_avatar(picture),
+            Err(err) => self.avatar_error = Some(err),
+        }
+    }
+
+    /// Shows the picture and announces it. The bytes are the fitted ones, so
+    /// they are inside the transfer layer's caps by construction.
+    fn set_avatar(&mut self, picture: avatar::Picture) {
+        self.avatar_error = None;
+        self.own_avatar = Some(picture.handle.clone());
+        if let Some(rt) = self.runtime.as_deref() {
+            rt.send(Command::SetOwnAvatar(Some(picture.bytes.clone())));
+        }
+        self.own_avatar_bytes = Some(picture.bytes.clone());
+        self.avatar_picture = Some(picture);
     }
 
     fn remove_avatar(&mut self) {
         self.avatar_error = None;
-        self.avatar_path.clear();
+        self.avatar_picture = None;
         self.own_avatar = None;
         self.own_avatar_bytes = None;
         if let Some(rt) = self.runtime.as_deref() {
@@ -538,7 +580,10 @@ impl eframe::App for JamApp {
         theme::apply(ctx, self.theme);
         // Meters, the cost ticker, and connection quality move while a
         // session or the input meter is on screen.
+        // A file dialog is a second window the frame loop cannot see, so
+        // repaint until its thread answers.
         let animating = self.ending.is_some()
+            || self.avatar_dialog.is_some()
             || match self.screen {
                 Screen::Session | Screen::Devices => true,
                 Screen::HostWizard => self.wizard.busy() || self.settings_open,
