@@ -83,6 +83,13 @@ jobs:
       server_sha256: ${{ steps.pin.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The live path into this workflow is workflow_dispatch, whose
+          # default ref is the default branch, not the tag. Without this
+          # the artifacts for a tag are built from whatever main happens
+          # to be when the build starts, which with parallel PRs merging
+          # is not the tagged commit.
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
       # Commit pins, per the policy documented in ci.yml. Every job in this
       # workflow holds a token that can write release assets, and the macos
       # job below also holds the Developer ID certificate and the notary key.
@@ -149,6 +156,13 @@ jobs:
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The live path into this workflow is workflow_dispatch, whose
+          # default ref is the default branch, not the tag. Without this
+          # the artifacts for a tag are built from whatever main happens
+          # to be when the build starts, which with parallel PRs merging
+          # is not the tagged commit.
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
@@ -363,6 +377,13 @@ jobs:
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The live path into this workflow is workflow_dispatch, whose
+          # default ref is the default branch, not the tag. Without this
+          # the artifacts for a tag are built from whatever main happens
+          # to be when the build starts, which with parallel PRs merging
+          # is not the tagged commit.
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
@@ -409,6 +430,13 @@ jobs:
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The live path into this workflow is workflow_dispatch, whose
+          # default ref is the default branch, not the tag. Without this
+          # the artifacts for a tag are built from whatever main happens
+          # to be when the build starts, which with parallel PRs merging
+          # is not the tagged commit.
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
@@ -460,6 +488,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The live path into this workflow is workflow_dispatch, whose
+          # default ref is the default branch, not the tag. Without this
+          # the artifacts for a tag are built from whatever main happens
+          # to be when the build starts, which with parallel PRs merging
+          # is not the tagged commit.
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
       - name: Download all release assets, checksum, upload SHA256SUMS
         run: |
           set -eu
@@ -488,6 +523,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The live path into this workflow is workflow_dispatch, whose
+          # default ref is the default branch, not the tag. Without this
+          # the artifacts for a tag are built from whatever main happens
+          # to be when the build starts, which with parallel PRs merging
+          # is not the tagged commit.
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
       - name: Render every manifest from this release's SHA256SUMS
         run: ./scripts/render-packaging.sh --output-dir rendered "$TAG"
       - name: Show what was rendered
