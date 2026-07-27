@@ -26,7 +26,7 @@ jobs:
   cli-docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docs-check-cli
@@ -36,7 +36,7 @@ jobs:
   screenshots:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docs-check-previews
@@ -48,7 +48,7 @@ jobs:
   install-scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Shellcheck the POSIX installer
         run: shellcheck site/src/install.sh
       - name: Parse the PowerShell installer

@@ -67,7 +67,7 @@ jobs:
       server_url: ${{ steps.pin.outputs.url }}
       server_sha256: ${{ steps.pin.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -119,7 +119,7 @@ jobs:
       JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -280,7 +280,7 @@ jobs:
       JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Verify the pinned server artifact reached this job
@@ -317,7 +317,7 @@ jobs:
       JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
       JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Verify the pinned server artifact reached this job
@@ -354,7 +354,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download all release assets, checksum, upload SHA256SUMS
         run: |
           set -eu
