@@ -8,10 +8,12 @@ use egui::{
     vec2,
 };
 
-use crate::runtime::{Command, ConnState, MemberView, Role, Runtime, Snapshot};
+use crate::runtime::{
+    BroadcastView, Command, ConnState, FaderView, MemberView, Role, Runtime, Snapshot,
+};
 use crate::screens::invites::{InvitesEvent, InvitesPanel};
 use crate::theme;
-use crate::widgets::{Meter, fader, meter, on_air, pan_slider, status_dot};
+use crate::widgets::{Meter, db_drag, fader, lamp_toggle, meter, on_air, pan_slider, status_dot};
 
 const NARROW_BELOW_PX: f32 = 900.0;
 
@@ -44,6 +46,9 @@ pub struct SessionScreen {
     /// joins have none and show no panel.
     pub invites: Option<InvitesPanel>,
     pub invites_open: bool,
+    /// Host only: the stream mix sheet. Snapshots without a broadcast view
+    /// never show the toggle, so this stays false for everyone else.
+    pub broadcast_open: bool,
 }
 
 impl SessionScreen {
@@ -68,6 +73,10 @@ impl SessionScreen {
                     panel.confirm_revoke = None;
                     panel.confirm_end = false;
                 }
+            } else if self.broadcast_open {
+                // Closing the sheet is navigation; audition keeps playing
+                // until it is switched off.
+                self.broadcast_open = false;
             } else if self.invites_open {
                 self.invites_open = false;
             } else if narrow && self.chat_open {
@@ -110,6 +119,10 @@ impl SessionScreen {
             && let Some(InvitesEvent::EndSession) = panel.ui(ui, snap, rt, &mut self.invites_open)
         {
             event = Some(SessionEvent::EndSession);
+        }
+
+        if self.broadcast_open && snap.broadcast.is_some() {
+            self.stream_mix_ui(ui, snap, rt);
         }
 
         self.confirm_windows(ui, rt, &mut event);
@@ -281,7 +294,7 @@ impl SessionScreen {
                 // Your uplink has no fader; monitoring yourself happens
                 // locally on your interface, not through the server mix.
                 ui.add_enabled_ui(false, |ui| {
-                    mute_button(ui, &mut muted);
+                    mute_button(ui, &mut muted, STRIP_INNER_W, MUTE_MONITOR_HOVER);
                     pan_row(ui, &format!("{} pan", member.name), &mut pan);
                     db_readout(ui, gain, false);
                     let fader_h = (ui.available_height() - 2.0).max(MIN_FADER_H);
@@ -291,7 +304,7 @@ impl SessionScreen {
                         );
                 });
             } else {
-                if mute_button(ui, &mut muted) {
+                if mute_button(ui, &mut muted, STRIP_INNER_W, MUTE_MONITOR_HOVER) {
                     changed = true;
                 }
                 changed |= pan_row(ui, &format!("{} pan", member.name), &mut pan);
@@ -308,6 +321,69 @@ impl SessionScreen {
                 muted,
             });
         }
+    }
+
+    /// The host's broadcast mix sheet: one compact row per musician, the
+    /// host's own channel included (listeners hear it too), plus the
+    /// audition switch. Deliberately unlike the monitor strips: horizontal
+    /// rows on a sheet, so the two mixes are never mistaken for each other.
+    fn stream_mix_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) {
+        let Some(broadcast) = &snap.broadcast else {
+            return;
+        };
+        let panel = {
+            let p = theme::palette_of(ui);
+            egui::Frame::new()
+                .fill(p.surface1)
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(CornerRadius::same(theme::RADIUS))
+                .inner_margin(egui::Margin::same(14))
+        };
+        egui::Window::new("Stream mix")
+            .title_bar(false)
+            .frame(panel)
+            .anchor(Align2::RIGHT_TOP, vec2(-10.0, 56.0))
+            .fixed_size(vec2(384.0, 0.0))
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(theme::title(ui, "Stream mix"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            self.broadcast_open = false;
+                        }
+                    });
+                });
+                ui.label(theme::muted(
+                    ui,
+                    "What listeners and the stream hear. Your monitor mix is unaffected.",
+                ));
+                ui.add_space(theme::SPACE_SM);
+                egui::Grid::new("stream-mix-grid")
+                    .num_columns(4)
+                    .spacing(vec2(theme::SPACE_MD, 4.0))
+                    .show(ui, |ui| {
+                        for member in snap.members.iter().filter(|m| m.role == Role::Musician) {
+                            stream_mix_row(ui, member, broadcast, rt);
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(theme::SPACE_MD);
+                ui.separator();
+                let lit = broadcast.audition;
+                let response = lamp_toggle(ui, "audition stream mix", lit).on_hover_text(if lit {
+                    "you are hearing the stream mix; switch off to get your monitor mix back"
+                } else {
+                    "swap your monitor for the exact mix listeners hear, your own voice included"
+                });
+                if response.clicked() {
+                    rt.send(Command::SetBroadcastAudition(!lit));
+                }
+                ui.label(theme::muted(
+                    ui,
+                    "While on, your monitor is the stream mix, your own voice included.",
+                ));
+            });
     }
 
     fn metronome_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, row_w: f32) {
@@ -442,6 +518,11 @@ impl SessionScreen {
                 );
                 ui.label(RichText::new("mouth to ear").size(9.5).color(p.text_muted));
             });
+            // The audition reminder lives beside the headline readout so
+            // the host can never forget what they are hearing.
+            if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
+                audition_indicator(ui);
+            }
             ui.separator();
             let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
             ui.label(theme::mono(ui, format!("rtt {rtt} ms")));
@@ -492,6 +573,11 @@ impl SessionScreen {
                         .clicked()
                 {
                     self.invites_open = !self.invites_open;
+                    // The two host sheets share the same anchor; only one
+                    // is ever open.
+                    if self.invites_open {
+                        self.broadcast_open = false;
+                    }
                 }
                 if let Some(cost) = &snap.cost {
                     ui.label(theme::mono(
@@ -511,6 +597,18 @@ impl SessionScreen {
                 ui.label(theme::mono_muted(ui, snap.session_short.clone()));
                 // Reserved for broadcast (M2); always dark in v1.
                 on_air(ui, false);
+                // The stream mix toggle sits with the lamp: both are about
+                // what leaves the session, not what anyone monitors.
+                if snap.broadcast.is_some()
+                    && ui
+                        .add(Button::new("Stream mix").selected(self.broadcast_open))
+                        .clicked()
+                {
+                    self.broadcast_open = !self.broadcast_open;
+                    if self.broadcast_open {
+                        self.invites_open = false;
+                    }
+                }
             });
         });
         ui.add_space(theme::SPACE_SM);
@@ -591,6 +689,95 @@ impl SessionScreen {
     }
 }
 
+/// One compact broadcast row: name, dB drag-value, pan, mute. Everything
+/// is enabled, the host's own channel included; listeners hear that too.
+/// Any change sends the row's full fader state.
+fn stream_mix_row(ui: &mut Ui, member: &MemberView, broadcast: &BroadcastView, rt: &dyn Runtime) {
+    const NAME_W: f32 = 116.0;
+    let view = broadcast
+        .faders
+        .iter()
+        .find(|(id, _)| *id == member.id)
+        .map_or(
+            FaderView {
+                gain_db: 0.0,
+                pan: 0.0,
+                muted: false,
+            },
+            |(_, f)| *f,
+        );
+
+    ui.allocate_ui_with_layout(
+        vec2(NAME_W, ROW_H),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_min_width(NAME_W);
+            let you_w = if member.is_you { 34.0 } else { 0.0 };
+            let name_w = (NAME_W - you_w).max(10.0);
+            let response = ui
+                .allocate_ui_with_layout(
+                    vec2(name_w, 18.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(member.name.clone()).strong())
+                                .truncate(),
+                        )
+                    },
+                )
+                .inner;
+            if member.name.chars().count() > 12 {
+                response.on_hover_text(member.name.clone());
+            }
+            if member.is_you {
+                ui.label(theme::muted(ui, "you"));
+            }
+        },
+    );
+
+    let mut gain = view.gain_db;
+    let mut pan = view.pan;
+    let mut muted = view.muted;
+    let mut changed = false;
+    changed |= db_drag(
+        ui,
+        &format!("{} stream gain", member.name),
+        &mut gain,
+        vec2(68.0, ROW_H),
+    )
+    .changed();
+    changed |= pan_slider(ui, &format!("{} stream pan", member.name), &mut pan).changed();
+    changed |= mute_button(ui, &mut muted, 52.0, MUTE_STREAM_HOVER);
+    if changed {
+        rt.send(Command::SetBroadcastFader {
+            member: member.id,
+            gain_db: gain,
+            pan,
+            muted,
+        });
+    }
+}
+
+/// The persistent audition reminder: a lit lamp and its sentence, beside
+/// the mouth-to-ear readout for as long as audition is on.
+fn audition_indicator(ui: &mut Ui) {
+    let p = theme::palette_of(ui);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        let (rect, _) = ui.allocate_exact_size(vec2(9.0, 16.0), Sense::hover());
+        if ui.is_rect_visible(rect) {
+            ui.painter().circle(
+                egui::pos2(rect.left() + 4.0, rect.center().y),
+                4.0,
+                p.accent,
+                Stroke::new(1.0, theme::blend(p.accent, p.text_primary, 0.45)),
+            );
+        }
+        ui.label(theme::muted(ui, "hearing stream mix"))
+            .on_hover_text("audition is on: your monitor carries what listeners hear");
+    });
+}
+
 /// Fixed-width monospace dB readout; the width never shifts with digits.
 fn db_readout(ui: &mut Ui, gain_db: f32, primary: bool) {
     let text = if gain_db <= -59.95 {
@@ -622,8 +809,15 @@ fn pan_row(ui: &mut Ui, label: &str, pan: &mut f32) -> bool {
     changed
 }
 
+/// Hover wording per mix; index 0 while muted, 1 while live.
+const MUTE_MONITOR_HOVER: [&str; 2] = ["muted in your monitor mix", "mute in your monitor mix"];
+const MUTE_STREAM_HOVER: [&str; 2] = [
+    "muted for listeners and the stream",
+    "mute for listeners and the stream",
+];
+
 /// Fixed-width mute button; state is shown by fill, the label never moves.
-fn mute_button(ui: &mut Ui, muted: &mut bool) -> bool {
+fn mute_button(ui: &mut Ui, muted: &mut bool, width: f32, hover: [&str; 2]) -> bool {
     let p = theme::palette_of(ui);
     // Fill only; a stroke would change the button height and shift the
     // rows above it in the bottom-up stack.
@@ -634,12 +828,8 @@ fn mute_button(ui: &mut Ui, muted: &mut bool) -> bool {
             .fill(theme::blend(p.surface2, p.danger, t));
     }
     let response = ui
-        .add_sized(vec2(STRIP_INNER_W, ROW_H), button)
-        .on_hover_text(if *muted {
-            "muted in your monitor mix"
-        } else {
-            "mute in your monitor mix"
-        });
+        .add_sized(vec2(width, ROW_H), button)
+        .on_hover_text(if *muted { hover[0] } else { hover[1] });
     if response.clicked() {
         *muted = !*muted;
         true
