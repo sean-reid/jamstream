@@ -1403,7 +1403,11 @@ mod tests {
         // forever, so an old enough lock is taken from it.
         std::fs::write(&path, b"").unwrap();
         let stale = std::time::SystemTime::now() - LOCK_STALE - Duration::from_secs(1);
-        std::fs::File::open(&path)
+        // Opened for writing because Windows needs write access to set a
+        // file's times at all.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(stale))
             .unwrap();
