@@ -121,9 +121,6 @@ pub struct DestinationsPanel {
     next_id: u16,
     /// The encode every destination shares, spelled out once.
     encode: String,
-    /// The one deferred-platform line, built from the catalog so the app and
-    /// the docs cannot disagree about what ships.
-    deferred: String,
     error: Option<String>,
 }
 
@@ -148,11 +145,6 @@ impl DestinationsPanel {
                 })
             })
             .collect();
-        let names: Vec<&str> = catalog
-            .deferred()
-            .iter()
-            .map(|d| d.display_name.as_str())
-            .collect();
         let (video, audio) = (catalog.video(), catalog.audio());
         DestinationsPanel {
             rows,
@@ -165,7 +157,6 @@ impl DestinationsPanel {
                 video.fps,
                 video.kbps + audio.kbps
             ),
-            deferred: format!("Not shipped yet: {}.", names.join(", ")),
             error: None,
         }
     }
@@ -333,7 +324,6 @@ impl DestinationsPanel {
                 }
                 ui.add_space(theme::SPACE_SM);
                 ui.label(theme::muted(ui, self.encode.clone()).small());
-                ui.label(theme::muted(ui, self.deferred.clone()).small());
                 if let Some(err) = &self.error {
                     let p = theme::palette_of(ui);
                     ui.add_space(theme::SPACE_XS);
@@ -649,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn both_shipped_platforms_get_a_row_and_the_deferred_ones_a_line() {
+    fn both_shipped_platforms_get_a_row_and_nothing_else_does() {
         let (_, panel) = panel();
         let names: Vec<&str> = panel.rows.iter().map(|r| r.display_name.as_str()).collect();
         assert_eq!(names, vec!["Twitch", "YouTube Live"]);
@@ -660,10 +650,13 @@ mod tests {
                 row.platform.as_str()
             );
         }
-        // The catalog's four deferred platforms, named, so the app and the
-        // docs cannot disagree about what ships.
-        assert!(panel.deferred.contains("Facebook Live"));
-        assert!(panel.deferred.contains("Kick"));
+        // The catalog still records the platforms that do not ship, with
+        // their reasons, but the sheet is for the ones a host can use: a
+        // list of absent features is not something anyone can act on.
+        assert!(
+            !PlatformCatalog::bundled().deferred().is_empty(),
+            "the catalog is still the record of what does not ship"
+        );
     }
 
     #[test]
