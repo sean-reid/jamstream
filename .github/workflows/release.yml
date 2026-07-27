@@ -42,6 +42,10 @@
 #   jamstreamd-linux-x86_64-musl.tar.gz  the same server, tarred for
 #                                        humans and the install script
 #   SHA256SUMS                           checksums of all of the above
+#   jamstream-packaging.tar.gz           the rendered Homebrew, winget, and
+#                                        AUR manifests for this release,
+#                                        derived FROM SHA256SUMS and so
+#                                        deliberately not listed in it
 name: release
 
 on:
@@ -355,8 +359,10 @@ jobs:
             jamstream-cli-windows-x86_64.zip \
             jamstream-app-windows-x86_64.zip \
             --clobber
+      # The winget manifest itself exists now (the packaging job renders it
+      # for the zip); only a signed MSI is still missing.
       - name: Build signed MSI (not yet implemented)
-        run: echo 'Placeholder; signed MSI plus winget manifest lands with the installer milestone.'
+        run: echo 'Placeholder; a signed MSI lands with the installer milestone. The winget manifest for the zip is rendered by the packaging job.'
 
   linux:
     needs: server-musl
@@ -397,8 +403,10 @@ jobs:
             jamstream-cli-linux-x86_64.tar.gz \
             jamstream-app-linux-x86_64.tar.gz \
             --clobber
+      # AUR PKGBUILDs now come out of the packaging job below; deb, rpm, and
+      # AppImage are still unbuilt.
       - name: Build deb/rpm/AppImage (not yet implemented)
-        run: echo 'Placeholder; deb, rpm, AppImage, and AUR packaging lands with the installer milestone.'
+        run: echo 'Placeholder; deb, rpm, and AppImage land with the installer milestone. The AUR PKGBUILDs are rendered by the packaging job.'
 
   # SHA256SUMS covers every asset uploaded above and is the verification
   # anchor for downstream consumers: the future install script and the
@@ -421,3 +429,82 @@ jobs:
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --clobber
+
+  # Package-manager manifests: the Homebrew cask and formula, the winget
+  # manifest set, and the two AUR PKGBUILDs, rendered for THIS tag with
+  # this release's real hashes. It needs checksums because
+  # scripts/render-packaging.sh reads every hash out of the published
+  # SHA256SUMS rather than recomputing anything, which also means the
+  # rendered bundle cannot appear in SHA256SUMS itself.
+  #
+  # The bundle is attached to the release so the two manual channels
+  # (a winget-pkgs pull request, an AUR push) are a copy, never a
+  # re-derivation of hashes by hand. The committed copies under packaging/
+  # are the same files for the previous release; see packaging/README.md.
+  packaging:
+    needs: checksums
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Render every manifest from this release's SHA256SUMS
+        run: ./scripts/render-packaging.sh --output-dir rendered "$TAG"
+      - name: Show what was rendered
+        run: |
+          set -eu
+          find rendered -type f | sort
+          grep -RE '^\s*(sha256|sha256sums|InstallerSha256)' rendered | sort
+      - name: Attach the rendered manifests to the release
+        run: |
+          set -eu
+          tar -C rendered -czf jamstream-packaging.tar.gz .
+          gh release upload "$TAG" jamstream-packaging.tar.gz --clobber
+      # Homebrew is the one channel that can publish itself: a tap is just a
+      # git repository. It stays gated on a token so a release never fails
+      # for a distribution channel that does not exist yet. When
+      # sean-reid/homebrew-jamstream exists and HOMEBREW_TAP_TOKEN (a PAT
+      # with contents:write on it) is set, the next release pushes the cask
+      # and formula with no workflow change; until then this skips loudly
+      # and the manifests are still attached to the release above.
+      - name: Push the Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: sean-reid/homebrew-jamstream
+        run: |
+          set -eu
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW TAP PUSH SKIPPED: no HOMEBREW_TAP_TOKEN secret. The rendered cask and formula are attached to this release inside jamstream-packaging.tar.gz. Create $TAP_REPO and add the token to publish automatically."
+            exit 0
+          fi
+          STATUS=$(curl -sS -o tap-repo.json -w '%{http_code}' \
+            -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$TAP_REPO")
+          if [ "$STATUS" = 404 ]; then
+            echo "::warning::HOMEBREW TAP PUSH SKIPPED: https://github.com/$TAP_REPO does not exist, or the token cannot see it. Create it as a public, empty repository; nothing else needs to change."
+            exit 0
+          fi
+          if [ "$STATUS" != 200 ]; then
+            echo "::error::the GitHub API returned $STATUS for $TAP_REPO; check HOMEBREW_TAP_TOKEN"
+            exit 1
+          fi
+          # Pushing to an explicit ref works whether the tap is empty (its
+          # first commit) or already has history, and whatever its default
+          # branch is called.
+          BRANCH=$(sed -n 's/.*"default_branch": *"\([^"]*\)".*/\1/p' tap-repo.json | head -1)
+          [ -n "$BRANCH" ] || BRANCH=main
+          git clone "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/$TAP_REPO.git" tap
+          mkdir -p tap/Casks tap/Formula
+          cp rendered/homebrew/Casks/jamstream.rb tap/Casks/jamstream.rb
+          cp rendered/homebrew/Formula/jamstream-cli.rb tap/Formula/jamstream-cli.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/jamstream.rb Formula/jamstream-cli.rb
+          if git diff --cached --quiet; then
+            echo "the tap already carries $TAG; nothing to push"
+            exit 0
+          fi
+          git commit -m "jamstream $TAG"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "pushed $TAG to https://github.com/$TAP_REPO ($BRANCH)"
