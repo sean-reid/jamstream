@@ -98,7 +98,17 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 mimalloc = "0.1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
-tiny-skia = "0.11"
+# default-features off drops `png-format`, which is tiny-skia's own PNG
+# encoder and decoder (Pixmap::load_png, encode_png, save_png). Nothing calls
+# them: the card renderer builds pixmaps in memory and hands raw RGBA to
+# ffmpeg, and the avatars that do arrive as PNG go through the `image` crate.
+# Keeping it put a second, older PNG decoder (png 0.17 next to image's 0.18)
+# into the jamstreamd musl binary, which is the one process on a publicly
+# reachable VM. `std` and `simd` are the rest of the default set and stay on.
+tiny-skia = { version = "0.11", default-features = false, features = [
+    "std",
+    "simd",
+] }
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service"] }
