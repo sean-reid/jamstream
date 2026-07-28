@@ -874,27 +874,17 @@ fn create_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
-/// One path component for a session id: keeps [A-Za-z0-9_-] and turns
-/// everything else, the dot included, into '-'.
+/// One path component for a session id: the object-key rule from
+/// [`crate::storage::sanitize_component`], with the dots taken out as well.
 ///
-/// Session ids are lowercase hex, so in practice nothing is touched. The
-/// dot is what makes this worth having: destroy calls `remove_dir_all` on
-/// the directory this names, and a session of ".." would have named the
-/// parent, taking every other session's directory with it. An empty id
-/// would have named the parent too, by naming nothing at all.
+/// Session ids are lowercase hex, so in practice nothing is touched. The dot is
+/// the one difference from the key rule, and it is what makes this worth
+/// having: destroy calls `remove_dir_all` on the directory this names, and a
+/// session of ".." would have named the parent, taking every other session's
+/// directory with it. An empty id would have named the parent too, by naming
+/// nothing at all, which is why the shared rule yields `unnamed`.
 fn fs_safe(s: &str) -> String {
-    if s.is_empty() {
-        return "unnamed".to_owned();
-    }
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    crate::storage::sanitize_component(s).replace('.', "-")
 }
 
 /// Where the graceful-shutdown request lives for a session, and the path

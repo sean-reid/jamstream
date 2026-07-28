@@ -46,7 +46,7 @@ use crate::retention::{
 };
 use crate::storage::{
     ChunkSink, DEFAULT_PART_SIZE, JSON_CONTENT_TYPE, MultipartBackend, ObjectMeta, ObjectStore,
-    Part, PartSource, drain_body, drive_upload,
+    Part, PartSource, clamp_part_size, drain_body, drive_upload,
 };
 use crate::types::ProviderKind;
 
@@ -105,10 +105,11 @@ impl GcsStore {
         self
     }
 
-    /// Overrides the resumable chunk size. Real uploads should keep the
-    /// default, which is a multiple of the 256 KiB GCS requires.
+    /// Overrides the resumable chunk size, raised to a multiple of the 256 KiB
+    /// GCS requires by [`clamp_part_size`]. Real uploads should keep the
+    /// default.
     pub fn with_part_size(mut self, bytes: usize) -> Self {
-        self.part_size = bytes.max(1);
+        self.part_size = clamp_part_size(bytes);
         self
     }
 

@@ -4,6 +4,8 @@
 //! server and carries the region as a `?region=...` query parameter, which
 //! lets mocks and the fake discriminate regions.
 
+mod signature;
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
@@ -14,14 +16,15 @@ use jamstream_cloud::{
     InstanceClass, LaunchSpec, Provider, ProviderError, ProviderKind, Region, RegionId,
     assert_provider_contract, session_tag,
 };
+use signature::Signer;
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const ACCESS_KEY_ID: &str = "AKIDTEST";
+const SECRET: &str = "test-secret-key";
 
 fn provider(server: &MockServer) -> AwsProvider {
-    AwsProvider::new(ACCESS_KEY_ID.to_owned(), "test-secret-key".to_owned())
-        .with_base_url(server.uri())
+    AwsProvider::new(ACCESS_KEY_ID.to_owned(), SECRET.to_owned()).with_base_url(server.uri())
 }
 
 fn region_of(p: &AwsProvider, id: &str) -> Region {
@@ -59,8 +62,13 @@ async fn mount_security_group(server: &MockServer, group_id: &str) {
         .await;
 }
 
-/// Matches requests carrying a well-formed SigV4 authorization for the
-/// given region and service, signed with the test access key.
+/// Matches a request whose signature, recomputed from the method, path, query,
+/// headers and body that arrived, is the signature that arrived.
+///
+/// This used to check the shape of the header instead: the prefix, the scope
+/// substring, the signed-header list. A provider that signed a canonical
+/// request nobody sent passed all of it, which is the whole point of a signer
+/// test and the one thing it was not doing.
 struct SignedFor {
     region: &'static str,
     service: &'static str,
@@ -68,17 +76,19 @@ struct SignedFor {
 
 impl Match for SignedFor {
     fn matches(&self, request: &Request) -> bool {
-        let Some(auth) = request
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-        else {
-            return false;
+        let signer = Signer {
+            access_key_id: ACCESS_KEY_ID,
+            secret_access_key: SECRET,
+            region: self.region,
+            service: self.service,
         };
-        auth.starts_with(&format!("AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/"))
-            && auth.contains(&format!("/{}/{}/aws4_request", self.region, self.service))
-            && auth.contains("SignedHeaders=content-type;host;x-amz-date")
-            && request.headers.get("x-amz-date").is_some()
+        match signature::verify(request, &signer) {
+            Ok(()) => true,
+            Err(why) => {
+                eprintln!("unsigned or wrongly signed request: {why}");
+                false
+            }
+        }
     }
 }
 

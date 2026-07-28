@@ -8,25 +8,16 @@
 //!
 //! The DigitalOcean *API token* that launches droplets (`DIGITALOCEAN_TOKEN`,
 //! used by [`crate::providers::digitalocean::DigitalOceanProvider`]) cannot
-//! talk to Spaces at all. Spaces authenticates with a separate **Spaces
-//! access key** pair — an access key id and a secret, generated in a
-//! different part of the control panel — because it is an S3-compatible
-//! service signed with SigV4 rather than a bearer token.
+//! talk to Spaces at all. Spaces is an S3-compatible service signed with
+//! SigV4, so it takes a separate **Spaces access key** pair, generated in a
+//! different part of the control panel.
 //!
-//! This is a real product consequence, not an implementation detail. On
-//! DigitalOcean, the provider JamStream recommends precisely because setup is
-//! "one token in one screen", turning on recording is the one feature that
-//! makes a host go back and generate a *second* credential. The honest
-//! handling, which this API is shaped for:
-//!
-//! * recording stays optional and off by default, so the plain path still
-//!   needs one token;
-//! * a host who has not created a Spaces key gets a clear error naming the
-//!   two environment variables and saying they are not the API token, rather
-//!   than a 403 from a signer;
-//! * the credential is only needed on the host's machine to configure and
-//!   verify the bucket. What reaches the session VM is a narrower thing (see
-//!   the crate docs on what the server half needs).
+//! That is a product consequence, not an implementation detail: on the provider
+//! JamStream recommends for being "one token in one screen", turning on
+//! recording is the one feature that sends a host back for a second credential.
+//! So recording stays off by default, a missing Spaces key is an error naming
+//! the two variables rather than a 403 from a signer, and the key is only
+//! needed on the host's machine.
 //!
 //! AWS has the same shape for a different reason: the recording credential
 //! wants `s3:PutObject`, `s3:DeleteObject` (the launch probe) and
@@ -64,7 +55,7 @@ use crate::retention::{
 };
 use crate::storage::{
     ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
-    drain_body, drive_upload,
+    clamp_part_size, drain_body, drive_upload,
 };
 use crate::types::ProviderKind;
 
@@ -237,11 +228,12 @@ impl S3Store {
         self
     }
 
-    /// Overrides the multipart part size. Real uploads should keep the
-    /// default; tests use a few bytes so a multipart lifecycle is cheap to
-    /// exercise.
+    /// Overrides the multipart part size, raised to something S3 accepts by
+    /// [`clamp_part_size`]. Real uploads should keep the default; a test that
+    /// wants the cheapest possible multipart upload asks for
+    /// [`crate::storage::MIN_PART_SIZE`] and gets it.
     pub fn with_part_size(mut self, bytes: usize) -> Self {
-        self.part_size = bytes.max(1);
+        self.part_size = clamp_part_size(bytes);
         self
     }
 
@@ -352,11 +344,32 @@ impl S3Store {
         }
 
         let sends_body = matches!(req.method, "PUT" | "POST");
+        // A body on a method that does not send one is signed and then dropped,
+        // which S3 answers with SignatureDoesNotMatch and no hint as to why.
+        debug_assert!(
+            sends_body || req.body.is_empty(),
+            "{} carries a {}-byte body that would be signed and not sent",
+            req.method,
+            req.body.len()
+        );
         let build = || {
             let amz_date = amz_date_now();
             let mut headers = base.clone();
             headers.push(("x-amz-date".to_owned(), amz_date.clone()));
             headers.sort();
+            // SigV4 signs the header names in ascending order, lowercase, once
+            // each. A duplicate or a capital here produces a signature over a
+            // canonical request the far end cannot reproduce.
+            debug_assert!(
+                headers.windows(2).all(|w| w[0].0 < w[1].0),
+                "the signed header set is not sorted and unique: {headers:?}"
+            );
+            debug_assert!(
+                headers
+                    .iter()
+                    .all(|(name, _)| *name == name.to_ascii_lowercase()),
+                "the signed header set is not lowercase: {headers:?}"
+            );
             let refs: Vec<(&str, &str)> = headers
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1236,11 +1249,20 @@ mod tests {
     #[test]
     fn part_size_defaults_and_overrides() {
         assert_eq!(aws_store().part_size(), DEFAULT_PART_SIZE);
-        assert_eq!(aws_store().with_part_size(8).part_size(), 8);
+        // An override S3 would refuse is raised to one it accepts rather than
+        // taken as given: EntityTooSmall on part two of a real recording is not
+        // something to discover in production.
+        assert_eq!(
+            aws_store().with_part_size(8).part_size(),
+            crate::storage::MIN_PART_SIZE
+        );
         assert_eq!(
             aws_store().with_part_size(0).part_size(),
-            1,
-            "a zero part size would loop forever"
+            crate::storage::MIN_PART_SIZE
+        );
+        assert_eq!(
+            aws_store().with_part_size(DEFAULT_PART_SIZE).part_size(),
+            DEFAULT_PART_SIZE
         );
     }
 }

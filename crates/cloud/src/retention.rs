@@ -43,12 +43,12 @@
 //! | DigitalOcean Spaces | the same call, [`LifecycleDialect::SpacesV1`] XML | Spaces |
 //! | GCS | `PATCH /storage/v1/b/{bucket}` with [`gcs_lifecycle_patch`] | GCS |
 //!
-//! Where a target has no lifecycle API at all — a local session writing to
-//! the host's own disk, or an S3-compatible endpoint that rejects the call —
-//! the store returns [`RetentionEnforcement::Manual`] carrying
-//! [`manual_note`], and the caller is expected to show that text instead of
-//! implying a rule exists. An unenforceable retention choice must never be
-//! reported as enforced.
+//! Where a target has no lifecycle API at all, which means a local session
+//! writing to the host's own disk or an S3-compatible endpoint that rejects the
+//! call, the store returns [`RetentionEnforcement::Manual`] carrying
+//! [`manual_note`], and the caller shows that text instead of implying a rule
+//! exists. An unenforceable retention choice must never be reported as
+//! enforced.
 //!
 //! # Scoping, and why the document is merged rather than written
 //!
@@ -58,30 +58,24 @@
 //! [`crate::storage::sanitize_component`] sanitizes the parts of a key: a key
 //! that escaped the prefix would also escape the retention rule.
 //!
-//! Retention is a per-session choice, so the rule is per session too: its id
-//! is [`rule_id`] of that session's prefix. Both provider calls replace the
-//! bucket's whole rule list, so applying one session's choice by writing one
-//! rule deleted every other rule on the bucket, JamStream's and the host's
-//! alike. The second recorded session in a bucket silently removed the
-//! first's expiry rule and those takes then lived forever, billing. So
-//! [`merge_s3_lifecycle`] and [`merge_gcs_lifecycle`] read the document that
-//! is there, keep every rule that is not this session's verbatim, and add
-//! ours. Reading is a separate permission from writing on S3
-//! (`s3:GetLifecycleConfiguration`); without it nothing is written, because a
-//! blind write would take the host's own rules with it.
+//! Retention is a per-session choice, so the rule is per session too, keyed by
+//! [`rule_id`] of that session's prefix. Both provider calls replace the
+//! bucket's whole rule list, so [`merge_s3_lifecycle`] and
+//! [`merge_gcs_lifecycle`] read what is there first and keep every rule that is
+//! not this session's, JamStream's other sessions and the host's own alike.
+//! Reading is a separate permission on S3 (`s3:GetLifecycleConfiguration`);
+//! without it nothing is written, because a blind write would take the host's
+//! rules with it.
 //!
-//! Two consequences worth knowing:
+//! Two things a caller has to know:
 //!
 //! * Two hosts applying retention to one bucket at the same instant can lose
-//!   one of the two rules, because neither API has a compare-and-set. The
-//!   window is one round trip and the loss is a rule, never an object: the
-//!   takes are kept and keep billing until someone re-arms recording.
+//!   one of the two rules, because neither API has a compare-and-set. The loss
+//!   is a rule, never an object: those takes are kept and keep billing.
 //! * Providers cap the rule list ([`S3_MAX_LIFECYCLE_RULES`],
-//!   [`GCS_MAX_LIFECYCLE_RULES`]). At the cap the merge evicts JamStream's
-//!   own oldest rule to make room, which is almost always a rule whose
-//!   objects the provider already deleted, and never a rule of the host's. A
-//!   bucket filled to the cap with the host's own rules gets
-//!   [`RetentionEnforcement::Manual`] and a note saying so.
+//!   [`GCS_MAX_LIFECYCLE_RULES`]). At the cap the merge evicts JamStream's own
+//!   oldest rule and never one of the host's, and a bucket filled to the cap
+//!   with the host's own rules gets [`RetentionEnforcement::Manual`].
 //!
 //! Each rule set additionally carries an abort-incomplete-multipart-upload
 //! action ([`ABORT_INCOMPLETE_DAYS`]). A recording upload that dies with the
