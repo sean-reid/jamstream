@@ -7,12 +7,21 @@
 //! 48 kHz, keyframes exactly 2 s apart), and that the audio-mastered cadence
 //! keeps A/V drift far under a frame.
 //!
-//! Skipped with a message when ffmpeg or ffprobe is missing, rather than
-//! failing: the pipeline's logic is covered by the fake-host unit tests, and
-//! CI runs this job on Linux where the pinned build is present.
+//! Missing tools are a FAILURE on Linux, which is where jamstreamd runs and
+//! where CI installs ffmpeg. This used to return early instead, so the whole
+//! RTMP path reported PASS on every runner in the matrix and nothing checked
+//! H.264, AAC-LC, `nal-hrd=cbr`, the keyframe cadence, or A/V drift. On other
+//! unixes a missing ffmpeg is still a skip, so a laptop without it can run the
+//! rest of the suite; set `JAMSTREAM_REQUIRE_FFMPEG` there to demand it.
+//!
+//! The whole file is unix-only: the pipeline hands video to ffmpeg through a
+//! named pipe. On Windows this test target compiles to nothing rather than to
+//! a test that passes without testing.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use jamstream_protocol::control::StreamOp;
 use jamstream_protocol::ids::MemberId;
@@ -24,6 +33,49 @@ const SECONDS: u64 = 5;
 /// Session ticks per second.
 const TICKS_PER_SEC: u64 = 400;
 const TICK_STEREO: usize = 240;
+
+/// Wall-clock ceiling for the whole test.
+///
+/// The work is about a second of encoding, so this is not a budget for slow
+/// hardware. It guards the way this test fails badly, which is that it does
+/// not fail, it stops. The pipeline writes video and audio to two blocking
+/// pipes from one thread, and a 720p frame is twenty times any pipe buffer, so
+/// an ffmpeg that wants audio while a video write is in flight deadlocks
+/// against us with no timer on either side. It sat there for 926 seconds
+/// before a human killed it, longer than the CI job is allowed to live, so the
+/// job would have died with no idea which test hung it.
+///
+/// A shared runner is several times slower than a laptop and this leaves two
+/// orders of magnitude of room, so it cannot flake. Raise it with
+/// `JAMSTREAM_FFMPEG_DEADLINE_SECS` if that ever stops being true.
+const DEADLINE_SECS: u64 = 240;
+
+/// Aborts the test binary if the deadline passes.
+///
+/// A thread rather than an elapsed-time check, because the failure it exists
+/// for is a blocking syscall on the main thread, which never comes back to
+/// look at a clock. `abort` rather than `exit` for the same reason: `exit`
+/// runs atexit handlers on a process whose main thread is parked holding
+/// whatever it holds.
+fn arm_deadline() {
+    let secs = std::env::var("JAMSTREAM_FFMPEG_DEADLINE_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEADLINE_SECS);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(secs));
+        eprintln!(
+            "real_ffmpeg exceeded its {secs}s deadline and is being aborted. \
+             This is a deadlock, not slow encoding: the pipeline writes both \
+             streams from one thread, so it stops if ffmpeg wants audio while \
+             a video write is in flight (issue #248). Confirm with `sample` or \
+             `gdb` on both processes; a `write` on the video fifo under \
+             push_tick, against an ffmpeg in `read`, is that bug. Anything \
+             ffmpeg printed follows."
+        );
+        std::process::abort();
+    });
+}
 
 fn tool(name: &str) -> Option<PathBuf> {
     let out = Command::new("which").arg(name).output().ok()?;
@@ -69,15 +121,18 @@ fn last_pts(ffprobe: &Path, file: &Path, stream: &str) -> f64 {
 
 #[test]
 fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
-    if !cfg!(unix) {
-        eprintln!(
-            "SKIP real_ffmpeg_produces_a_stream_the_platforms_would_accept: \
-             the pipeline feeds video through a named pipe, which is a unix \
-             thing. jamstreamd runs on Linux."
-        );
-        return;
-    }
+    arm_deadline();
     let (Some(ffmpeg), Some(ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
+        // Linux is where jamstreamd encodes and where CI installs ffmpeg, so
+        // an absent encoder there means the job that exists to run this test
+        // is not running it. Say so instead of reporting a pass.
+        assert!(
+            !cfg!(target_os = "linux") && std::env::var_os("JAMSTREAM_REQUIRE_FFMPEG").is_none(),
+            "ffmpeg and ffprobe are not on PATH, so nothing here checked the \
+             encode ladder the platforms accept. Install them (apt-get install \
+             ffmpeg) or, on a machine that will never have them, unset \
+             JAMSTREAM_REQUIRE_FFMPEG and run this off Linux."
+        );
         eprintln!(
             "SKIP real_ffmpeg_produces_a_stream_the_platforms_would_accept: \
              ffmpeg and ffprobe are not on PATH. The pipeline's supervision, \
