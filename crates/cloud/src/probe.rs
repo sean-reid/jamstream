@@ -160,6 +160,59 @@ mod tests {
         );
     }
 
+    /// Runs the shipped catalog against the real internet from this machine
+    /// and prints one line per target: resolved address, per-attempt outcome,
+    /// and the value `probe_all` would return. Ignored because it needs the
+    /// network and takes seconds; it exists because "every region reads the
+    /// same" is a catalog or connectivity question that no mock can answer.
+    ///
+    /// ```console
+    /// $ cargo nextest run -p jamstream-cloud --run-ignored all \
+    ///     probe_the_shipped_catalog --no-capture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hits the real network"]
+    async fn probe_the_shipped_catalog() {
+        let catalog = probe_catalog();
+        let results = probe_all(&catalog).await;
+        let mut failed = Vec::new();
+        for t in &catalog {
+            let addrs = tokio::net::lookup_host((t.url_host.as_str(), t.port))
+                .await
+                .map(|it| it.map(|a| a.to_string()).collect::<Vec<_>>())
+                .unwrap_or_else(|e| vec![format!("dns failed: {e}")]);
+            match results.get(&t.region) {
+                Some(rtt) => println!(
+                    "{:>16} {:<40} {:>8.1} ms  {}",
+                    t.region.as_str(),
+                    t.url_host,
+                    rtt,
+                    addrs.join(", ")
+                ),
+                None => {
+                    println!(
+                        "{:>16} {:<40} {:>11}  {}",
+                        t.region.as_str(),
+                        t.url_host,
+                        "no probe",
+                        addrs.join(", ")
+                    );
+                    failed.push(t.region.as_str().to_owned());
+                }
+            }
+        }
+        println!(
+            "{} of {} targets answered",
+            catalog.len() - failed.len(),
+            catalog.len()
+        );
+        assert!(
+            failed.is_empty(),
+            "unreachable probe targets: {}",
+            failed.join(", ")
+        );
+    }
+
     #[tokio::test]
     async fn probe_all_mixes_reachable_and_unreachable() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

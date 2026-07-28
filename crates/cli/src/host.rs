@@ -103,10 +103,20 @@ pub async fn run<W: Write>(
             )?;
         }
     }
-    let mut candidates: Vec<(Region, Price)> = Vec::with_capacity(regions.len());
-    for region in &regions {
-        candidates.push((region.clone(), provider.price(&region.id).await?));
+    // A region that does not sell this session's machine size is not an
+    // error, it is a region we cannot use; priced_regions drops it and
+    // keeps the rest, and anything worse than that still stops here.
+    let table = jamstream_cloud::priced_regions(provider).await?;
+    if !table.unavailable.is_empty() && !args.json {
+        let names: Vec<&str> = table.unavailable.iter().map(|r| r.id.as_str()).collect();
+        writeln!(
+            out,
+            "not listed: {} ({} does not offer this session's machine size there)",
+            names.join(", "),
+            args.provider
+        )?;
     }
+    let candidates = table.candidates;
 
     let (region, price) = choose_region(args, provider, &candidates, is_mock, out).await?;
 

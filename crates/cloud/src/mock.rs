@@ -41,6 +41,7 @@ struct State {
     firewalls: HashMap<String, Vec<IngressRule>>,
     next_id: u64,
     next_ip: u32,
+    price_failures: VecDeque<ProviderError>,
     launch_failures: VecDeque<ProviderError>,
     destroy_failures: VecDeque<ProviderError>,
     list_failures: VecDeque<ProviderError>,
@@ -108,6 +109,24 @@ impl MockProvider {
         self.prices.insert(region.id.clone(), price);
         self.regions.push(region);
         self
+    }
+
+    /// A region the provider offers but has no price for, which is how the
+    /// real ones report "this size is not sold here": DigitalOcean's atl1
+    /// does not carry `s-2vcpu-2gb`, and `price` there is a NotFound.
+    pub fn with_unpriced_region(mut self, region: Region) -> Self {
+        self.regions.push(region);
+        self
+    }
+
+    /// The next `n` price calls fail with a clone of `err`, whatever the
+    /// region. For telling a region that cannot run our size apart from a
+    /// credential or network failure, which must not be mistaken for one.
+    pub fn fail_next_prices(&self, n: usize, err: ProviderError) {
+        let mut s = self.state.lock().unwrap();
+        for _ in 0..n {
+            s.price_failures.push_back(err.clone());
+        }
     }
 
     /// The next `n` launch calls fail with a clone of `err`.
@@ -196,11 +215,13 @@ impl Provider for MockProvider {
     }
 
     async fn price(&self, region: &RegionId) -> Result<Price> {
-        self.state
-            .lock()
-            .unwrap()
-            .calls
-            .push(Call::Price(region.clone()));
+        {
+            let mut s = self.state.lock().unwrap();
+            s.calls.push(Call::Price(region.clone()));
+            if let Some(err) = s.price_failures.pop_front() {
+                return Err(err);
+            }
+        }
         self.region(region)?;
         self.prices
             .get(region)

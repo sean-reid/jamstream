@@ -15,10 +15,10 @@ use jamstream_client::exec::Executor;
 use jamstream_client::runtime::{DestinationState, StreamPlatform};
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
-use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow};
+use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow, RegionSurvey};
 use jamstream_client::screens::invites::InvitesPanel;
 use jamstream_client::theme::{self, Theme};
-use jamstream_cloud::{Price, ProviderKind, Region, RegionId};
+use jamstream_cloud::{Price, ProbeMatrix, ProviderKind, Region, RegionId, rank};
 
 const WIDE: egui::Vec2 = vec2(1280.0, 800.0);
 const NARROW: egui::Vec2 = vec2(800.0, 600.0);
@@ -615,14 +615,57 @@ fn wizard_provider_app(theme: Theme) -> JamApp {
 }
 
 fn wizard_region_app(theme: Theme) -> JamApp {
+    region_step(theme, fixed_regions().into())
+}
+
+fn region_step(theme: Theme, survey: RegionSurvey) -> JamApp {
     let mut app = test_app(theme);
     let mut w = fixed_wizard();
     w.providers[1].status = ProviderStatus::Ready;
     w.select_provider(1);
-    w.continue_to_region(fixed_regions());
+    w.continue_to_region(survey);
     app.wizard = w;
     app.screen = Screen::HostWizard;
     app
+}
+
+/// Rows as the wizard really receives them: candidates and whatever probes
+/// came back, put through the shared solver rather than hand-ordered. A
+/// fixture that ordered the table itself could not show that an unmeasured
+/// region sorts last, which is the whole point of these two.
+fn ranked_regions(probed: &[(&str, u64, Option<f32>)]) -> Vec<RegionRow> {
+    let candidates: Vec<(Region, Price)> = probed
+        .iter()
+        .map(|(id, hourly, _)| {
+            (
+                Region {
+                    provider: ProviderKind::DigitalOcean,
+                    id: RegionId::new(*id),
+                    display: (*id).to_owned(),
+                    country: "US".to_owned(),
+                },
+                Price {
+                    hourly_microusd: *hourly,
+                    egress_microusd_per_gb: 10_000,
+                    included_egress_gb: 3000,
+                },
+            )
+        })
+        .collect();
+    let mut matrix = ProbeMatrix::new();
+    for (id, _, rtt) in probed {
+        if let Some(rtt) = rtt {
+            matrix.insert(0, RegionId::new(*id), *rtt);
+        }
+    }
+    rank(&matrix, &candidates)
+        .into_iter()
+        .map(|score| RegionRow {
+            region: score.region,
+            price: score.price,
+            worst_rtt_ms: score.worst_rtt_ms,
+        })
+        .collect()
 }
 
 /// The DigitalOcean setup pane, open inline with a masked token typed.
@@ -724,6 +767,47 @@ fn wizard_setup_digitalocean_light() {
 #[test]
 fn wizard_region() {
     wizard_snapshot_for_docs(wizard_region_app(Theme::Dark), "wizard_region");
+}
+
+/// One region the probe never reached, and one the account cannot run this
+/// machine size in. Both facts are absent for different reasons and the
+/// table says so differently: atl1 stays, reads `no probe`, and sits at the
+/// bottom despite being the cheapest row; blr1 is gone with a line naming
+/// it. Before this, atl1 read `0 ms` and sorted first.
+#[test]
+fn wizard_region_unmeasured() {
+    let survey = RegionSurvey {
+        rows: ranked_regions(&[
+            ("nyc3", 26_790, Some(21.0)),
+            ("sfo3", 26_790, Some(74.0)),
+            ("atl1", 9_000, None),
+        ]),
+        unavailable: vec!["blr1".to_owned()],
+    };
+    let app = region_step(Theme::Dark, survey);
+    assert!(
+        !app.wizard.regions.last().expect("rows").measured(),
+        "the unmeasured region must be the last row for this fixture to mean anything"
+    );
+    wizard_snapshot(app, "wizard_region_unmeasured");
+}
+
+/// Nothing answered at all, which is what the host actually saw. Every row
+/// reads `no probe`, the order is price and says so, and no region is
+/// preselected: the previous behaviour rendered eight `0 ms` rows and
+/// preselected one of them.
+#[test]
+fn wizard_region_no_probes() {
+    let survey: RegionSurvey = ranked_regions(&[
+        ("nyc3", 26_790, None),
+        ("sfo3", 26_790, None),
+        ("atl1", 9_000, None),
+    ])
+    .into();
+    let app = region_step(Theme::Dark, survey);
+    assert!(app.wizard.nothing_measured());
+    assert_eq!(app.wizard.selected_region, None);
+    wizard_snapshot(app, "wizard_region_no_probes");
 }
 
 #[test]

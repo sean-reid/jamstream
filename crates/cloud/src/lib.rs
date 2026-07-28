@@ -34,6 +34,7 @@ pub mod probe;
 pub mod provider;
 pub mod providers;
 pub mod recording;
+pub mod regions;
 pub mod retention;
 pub mod solver;
 pub mod storage;
@@ -48,6 +49,7 @@ pub use mock::MockProvider;
 pub use probe::{ProbeTarget, probe_all, probe_catalog};
 pub use provider::{Provider, ProviderError, Result, Sleeper, TokioSleeper, WaitOpts};
 pub use recording::{BitDepth, RecordingEstimate, RecordingPlan, StoragePrice, storage_price};
+pub use regions::{RegionTable, priced_regions};
 pub use retention::{Retention, RetentionEnforcement};
 pub use solver::{MemberId, ProbeMatrix, RegionScore, rank};
 pub use storage::{

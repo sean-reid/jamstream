@@ -131,6 +131,35 @@ pub struct RegionRow {
     pub worst_rtt_ms: f32,
 }
 
+impl RegionRow {
+    /// True when a probe actually came back for this region. Unknown is not
+    /// a slow measurement and it is certainly not a fast one, so nothing may
+    /// print it as a number or treat it as one.
+    pub fn measured(&self) -> bool {
+        self.worst_rtt_ms.is_finite()
+    }
+}
+
+/// What the region step got back: the rows to show, and the regions that
+/// never made it into them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RegionSurvey {
+    pub rows: Vec<RegionRow>,
+    /// Region ids the provider offers but cannot run this session's instance
+    /// size in. Named in the interface so a table that is shorter than the
+    /// provider's own region list says why.
+    pub unavailable: Vec<String>,
+}
+
+impl From<Vec<RegionRow>> for RegionSurvey {
+    fn from(rows: Vec<RegionRow>) -> Self {
+        RegionSurvey {
+            rows,
+            unavailable: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchPhase {
     Launching,
@@ -170,6 +199,9 @@ pub struct HostWizard {
     pub check_result: Option<Result<(), String>>,
     pub regions: Vec<RegionRow>,
     pub regions_error: Option<String>,
+    /// Region ids left out of the table because this session's instance size
+    /// is not offered there.
+    pub regions_unavailable: Vec<String>,
     pub selected_region: Option<usize>,
     pub hours: f32,
     /// Musician seats including the host's own, exactly as `--musicians`
@@ -197,7 +229,7 @@ pub struct HostWizard {
     pub artifact_sha256: String,
     pub launch_error: Option<String>,
     check_job: Option<Job<Result<(), String>>>,
-    regions_job: Option<Job<Result<Vec<RegionRow>, String>>>,
+    regions_job: Option<Job<Result<RegionSurvey, String>>>,
     launch_job: Option<Job<Result<LaunchOutcome, String>>>,
     launch_phase: Arc<Mutex<LaunchPhase>>,
     creds: Arc<dyn CredStore>,
@@ -221,6 +253,7 @@ impl HostWizard {
             check_result: None,
             regions: Vec::new(),
             regions_error: None,
+            regions_unavailable: Vec::new(),
             selected_region: None,
             hours: DEFAULT_HOURS,
             musicians: DEFAULT_MUSICIANS,
@@ -412,10 +445,11 @@ impl HostWizard {
         match creds::build_provider(&name, self.creds.as_ref(), &self.env) {
             Ok(provider) => {
                 self.regions = Vec::new();
+                self.regions_unavailable = Vec::new();
                 self.selected_region = None;
                 self.regions_error = None;
                 self.step = WizardStep::Region;
-                self.regions_job = Some(self.exec.run(probe_regions(provider)));
+                self.regions_job = Some(self.exec.run(survey_regions(provider)));
                 true
             }
             Err(err) => {
@@ -433,19 +467,30 @@ impl HostWizard {
 
     /// Provider -> Region with rows supplied directly; the pure transition
     /// tests and snapshot fixtures feed this, bypassing the probe job.
-    pub fn continue_to_region(&mut self, rows: Vec<RegionRow>) -> bool {
+    pub fn continue_to_region(&mut self, survey: impl Into<RegionSurvey>) -> bool {
         if self.step == WizardStep::Provider && self.selected_provider.is_some() {
             self.step = WizardStep::Region;
-            self.set_regions(rows);
+            self.set_regions(survey.into());
             true
         } else {
             false
         }
     }
 
-    fn set_regions(&mut self, rows: Vec<RegionRow>) {
-        self.selected_region = if rows.is_empty() { None } else { Some(0) };
-        self.regions = rows;
+    fn set_regions(&mut self, survey: RegionSurvey) {
+        // The top row is preselected only when it was actually measured.
+        // With nothing measured the order is price alone, which is not a
+        // recommendation, and preselecting anyway is how a region nobody
+        // timed became the default choice.
+        self.selected_region = survey.rows.first().filter(|r| r.measured()).map(|_| 0);
+        self.regions = survey.rows;
+        self.regions_unavailable = survey.unavailable;
+    }
+
+    /// True when the table is up and not one region answered a probe. The
+    /// rows are still usable, but their order is price and nothing else.
+    pub fn nothing_measured(&self) -> bool {
+        !self.regions.is_empty() && self.regions.iter().all(|r| !r.measured())
     }
 
     pub fn select_region(&mut self, idx: usize) -> bool {
@@ -581,7 +626,7 @@ impl HostWizard {
         {
             self.regions_job = None;
             match result {
-                Ok(rows) => self.set_regions(rows),
+                Ok(survey) => self.set_regions(survey),
                 Err(err) => self.regions_error = Some(err),
             }
         }
@@ -642,36 +687,48 @@ pub async fn check_provider(provider: Box<dyn Provider>) -> Result<(), String> {
     Ok(())
 }
 
-/// Real probes: live price per region plus TCP connect timing from this
-/// machine against the provider's catalog endpoints, ranked by the shared
-/// solver (worst RTT in 5 ms buckets, price breaking ties).
-async fn probe_regions(provider: Box<dyn Provider>) -> Result<Vec<RegionRow>, String> {
-    let regions = provider.regions();
-    if regions.is_empty() {
-        return Err("provider offers no regions".to_owned());
-    }
-    let mut candidates: Vec<(Region, Price)> = Vec::with_capacity(regions.len());
-    for region in &regions {
-        let price = provider
-            .price(&region.id)
-            .await
-            .map_err(|e| e.to_string())?;
-        candidates.push((region.clone(), price));
-    }
+/// The real region step: live price per region, TCP connect timing from
+/// this machine against the provider's catalog endpoints, ranked by the
+/// shared solver (worst RTT in 5 ms buckets, price breaking ties, unknown
+/// last).
+///
+/// Both facts can be absent and neither absence is fatal here.
+/// `priced_regions` drops a region whose instance size the account cannot
+/// buy and keeps the rest; a region no probe answered keeps its row and an
+/// infinite worst RTT, which the table renders as `no probe`.
+async fn survey_regions(provider: Box<dyn Provider>) -> Result<RegionSurvey, String> {
+    let table = jamstream_cloud::priced_regions(provider.as_ref())
+        .await
+        .map_err(|e| e.to_string())?;
+    let regions: Vec<Region> = table.candidates.iter().map(|(r, _)| r.clone()).collect();
     let targets = jamstream_cli::host::catalog_targets(provider.kind(), &regions);
     let rtts = jamstream_cloud::probe_all(&targets).await;
+    if rtts.is_empty() && !targets.is_empty() {
+        tracing::warn!(
+            targets = targets.len(),
+            provider = provider.kind().as_str(),
+            "no probe target answered; the region table has prices but no latencies"
+        );
+    }
     let mut matrix = ProbeMatrix::new();
     for (region, rtt_ms) in rtts {
         matrix.insert(0, region, rtt_ms);
     }
-    Ok(rank(&matrix, &candidates)
-        .into_iter()
-        .map(|score| RegionRow {
-            region: score.region,
-            price: score.price,
-            worst_rtt_ms: score.worst_rtt_ms,
-        })
-        .collect())
+    Ok(RegionSurvey {
+        rows: rank(&matrix, &table.candidates)
+            .into_iter()
+            .map(|score| RegionRow {
+                region: score.region,
+                price: score.price,
+                worst_rtt_ms: score.worst_rtt_ms,
+            })
+            .collect(),
+        unavailable: table
+            .unavailable
+            .into_iter()
+            .map(|r| r.id.as_str().to_owned())
+            .collect(),
+    })
 }
 
 struct LaunchParams {
@@ -1274,14 +1331,47 @@ impl HostWizard {
         }
         // The solver sorts by coverage, then worst round trip bucketed to
         // 5 ms, then hourly price, so price only decides inside a bucket.
-        ui.label(theme::muted(
-            ui,
-            "Sorted by worst round trip in 5 ms steps, with price breaking ties.",
-        ));
-        ui.label(theme::muted(
-            ui,
-            "Latency is measured from this computer; bandmates elsewhere will differ.",
-        ));
+        // A region with no probe has its own bucket at the end.
+        if self.nothing_measured() {
+            // Zeros here would be a lie the table tells confidently; say
+            // instead that the measurement is missing and what is left.
+            let p = theme::palette_of(ui);
+            ui.label(
+                RichText::new("No region answered a probe, so none of them are timed.")
+                    .color(p.danger),
+            );
+            ui.label(theme::muted(
+                ui,
+                "Check this computer's connection and go back to try again, or pick a region \
+                 below on price alone.",
+            ));
+        } else {
+            ui.label(theme::muted(
+                ui,
+                "Sorted by worst round trip in 5 ms steps, with price breaking ties.",
+            ));
+            ui.label(theme::muted(
+                ui,
+                "Latency is measured from this computer; bandmates elsewhere will differ.",
+            ));
+            // Only when there is one on screen: a line about a state that is
+            // not happening is a line to read every time for nothing.
+            if self.regions.iter().any(|r| !r.measured()) {
+                ui.label(theme::muted(
+                    ui,
+                    "A region that did not answer a probe reads no probe and sorts last.",
+                ));
+            }
+        }
+        if !self.regions_unavailable.is_empty() {
+            ui.label(theme::muted(
+                ui,
+                format!(
+                    "Not listed: {}. Your account cannot run this session's machine size there.",
+                    self.regions_unavailable.join(", ")
+                ),
+            ));
+        }
         ui.add_space(theme::SPACE_MD);
         let cols = [130.0, 90.0, 110.0, 90.0];
         ui.horizontal(|ui| {
@@ -1294,7 +1384,7 @@ impl HostWizard {
         });
         for i in 0..self.regions.len() {
             let row = self.regions[i].clone();
-            let rtt = if row.worst_rtt_ms.is_finite() {
+            let rtt = if row.measured() {
                 format!("{:.0} ms", row.worst_rtt_ms)
             } else {
                 "no probe".to_owned()
@@ -1596,7 +1686,7 @@ fn secret_field(ui: &mut Ui, label: &str, value: &mut String, reveal: bool) {
 mod tests {
     use super::*;
     use crate::creds::MemStore;
-    use jamstream_cloud::MockProvider;
+    use jamstream_cloud::{MockProvider, ProviderError};
 
     fn no_env() -> EnvReader {
         Arc::new(|_| None)
@@ -1736,6 +1826,101 @@ mod tests {
         assert_eq!(w.step, WizardStep::Preview);
         let preview = w.preview().expect("preview");
         assert!(preview.total_microusd > 0);
+    }
+
+    /// The real job, not the fixture path: a provider whose probe targets
+    /// are all unreachable. Every row must come back unmeasured, nothing may
+    /// be preselected, and the wizard must be able to say so. This is the
+    /// path the snapshot fixtures skip, which is why the defect shipped.
+    #[tokio::test]
+    async fn every_probe_failing_leaves_the_table_unmeasured_and_unselected() {
+        let survey = survey_regions(Box::new(unreachable_provider()))
+            .await
+            .expect("prices still work when probes do not");
+        assert_eq!(survey.rows.len(), 2);
+        for row in &survey.rows {
+            assert!(
+                !row.measured(),
+                "{} claims {} ms with no probe behind it",
+                row.region.id,
+                row.worst_rtt_ms
+            );
+        }
+        // Price is the only signal left, so it decides the order.
+        assert_eq!(survey.rows[0].region.id.as_str(), "mock-east");
+
+        let mut w = wizard();
+        w.set_regions(survey);
+        assert!(w.nothing_measured());
+        assert_eq!(
+            w.selected_region, None,
+            "a region nobody timed must not be the default choice"
+        );
+        assert!(
+            !w.continue_to_preview(),
+            "continue stays gated until the host picks one"
+        );
+    }
+
+    /// One region missing from the probe catalog, the rest fine: the
+    /// unmeasured one keeps its row, reads as unknown, and sorts last, while
+    /// the measured ones keep the table usable.
+    #[test]
+    fn an_unmeasured_region_sorts_last_and_is_not_preselected_over_a_measured_one() {
+        let mut w = wizard();
+        w.providers[1].status = ProviderStatus::Ready;
+        assert!(w.select_provider(1));
+        assert!(w.continue_to_region(vec![
+            region_row("nyc3", 26_790, 21.0),
+            region_row("atl1", 9_000, f32::INFINITY),
+        ]));
+        assert_eq!(w.selected_region, Some(0));
+        assert!(w.regions[0].measured());
+        assert!(!w.regions[1].measured());
+        assert!(!w.nothing_measured());
+    }
+
+    /// A region the account cannot buy the machine size in is dropped from
+    /// the table, and the table says which, rather than being quietly one
+    /// row shorter than the provider's region list.
+    #[tokio::test]
+    async fn a_region_without_our_machine_size_is_named_not_fatal() {
+        let provider = MockProvider::with_default_regions(ProviderKind::DigitalOcean)
+            .with_unpriced_region(Region {
+                provider: ProviderKind::DigitalOcean,
+                id: RegionId::new("mock-atl"),
+                display: "Mock Atlanta".to_owned(),
+                country: "US".to_owned(),
+            });
+        let survey = survey_regions(Box::new(provider)).await.expect("a table");
+        assert_eq!(survey.rows.len(), 2);
+        assert_eq!(survey.unavailable, vec!["mock-atl".to_owned()]);
+
+        let mut w = wizard();
+        w.set_regions(survey);
+        assert_eq!(w.regions_unavailable, vec!["mock-atl".to_owned()]);
+    }
+
+    /// The other half of the same distinction: a provider that cannot be
+    /// priced at all is a failure with a message, not a short table.
+    #[tokio::test]
+    async fn a_credential_failure_on_price_is_still_an_error() {
+        let provider = MockProvider::with_default_regions(ProviderKind::DigitalOcean);
+        provider.fail_next_prices(1, ProviderError::Auth("token rejected".to_owned()));
+        let err = survey_regions(Box::new(provider))
+            .await
+            .expect_err("an auth failure must not read as a shorter table");
+        assert!(err.contains("token rejected"), "{err}");
+    }
+
+    /// A provider none of whose regions are in the probe catalog, so the
+    /// probe matrix comes back empty. That is the same state as every probe
+    /// timing out, which is what the host actually hit, and it gets there
+    /// without the test depending on the network being down while it runs.
+    /// Real timeouts are covered in the cloud crate by
+    /// `probe_all_mixes_reachable_and_unreachable`.
+    fn unreachable_provider() -> MockProvider {
+        MockProvider::with_default_regions(ProviderKind::DigitalOcean)
     }
 
     #[test]
