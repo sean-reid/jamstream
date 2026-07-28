@@ -1412,6 +1412,54 @@ fn broadcast_tap_exposes_post_limiter_audio_and_card_state() {
 }
 
 #[test]
+fn the_stem_tap_carries_decoded_members_and_their_broadcast_faders() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let host = h.add_client(&inv_host, Some(440.0));
+    h.add_client(&inv_b, Some(0.0));
+    h.run_ms(1_000);
+
+    // Right after a tick, the tap holds each connected musician's decoded
+    // audio at unity until the host sets a broadcast fader.
+    let stems: Vec<_> = h.server.stems().collect();
+    assert_eq!(stems.len(), 2);
+    let tone = stems.iter().find(|s| s.id == MemberId(0)).unwrap();
+    let silent = stems.iter().find(|s| s.id == MemberId(1)).unwrap();
+    assert!(rms(tone.pcm) > 0.1, "tone stem rms {}", rms(tone.pcm));
+    assert!(
+        rms(silent.pcm) < 1e-6,
+        "silent stem rms {}",
+        rms(silent.pcm)
+    );
+    assert_eq!(
+        (tone.fader.gain_db, tone.fader.pan, tone.fader.muted),
+        (0.0, 0.0, false)
+    );
+
+    // The tap reports the fader the broadcast mix runs the member through,
+    // and the pcm stays pre-fader: the recorder applies it off the tick.
+    h.clients[host]
+        .core
+        .set_broadcast_fader(MemberId(0), -6.0, 0.25, false)
+        .unwrap();
+    h.run_ms(250);
+    let stems: Vec<_> = h.server.stems().collect();
+    let tone = stems.iter().find(|s| s.id == MemberId(0)).unwrap();
+    assert_eq!(
+        (tone.fader.gain_db, tone.fader.pan, tone.fader.muted),
+        (-6.0, 0.25, false)
+    );
+    assert!(rms(tone.pcm) > 0.1, "pre-mix pcm was attenuated");
+
+    // A member who leaves stops appearing; the tap never yields stale audio.
+    h.clients[host].core.leave("done").unwrap();
+    h.clients[host].tone_hz = None;
+    h.run_ms(250);
+    assert!(h.server.stems().all(|s| s.id != MemberId(0)));
+}
+
+#[test]
 fn audition_swaps_host_playout_to_broadcast_and_back() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_host = h.mint(0, Role::Musician);
