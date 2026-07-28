@@ -17,10 +17,20 @@ pub fn run<W: Write>(args: &StatusArgs, out: &mut W) -> Result<(), CliError> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // Where each session's takes went, from the sidecar written at launch. A
+    // session that recorded nothing has no file, and a file that will not
+    // decode is an error rather than a session quietly reported as recording
+    // nowhere.
+    let recordings: Vec<Option<state::RecordingRecord>> = sessions
+        .iter()
+        .map(|(_, s)| state::load_recording(&s.session_id_hex))
+        .collect::<Result<_, _>>()?;
+
     if args.json {
         let rows: Vec<serde_json::Value> = sessions
             .iter()
-            .map(|(_, s)| {
+            .zip(&recordings)
+            .map(|((_, s), recording)| {
                 let elapsed = elapsed_secs(s, now_unix);
                 serde_json::json!({
                     "session_id": s.session_id_hex,
@@ -33,6 +43,7 @@ pub fn run<W: Write>(args: &StatusArgs, out: &mut W) -> Result<(), CliError> {
                     "hourly_microusd": s.hourly_microusd,
                     "accrued_microusd": cost_for(s.hourly_microusd, elapsed),
                     "projected_microusd": projected(s.hourly_microusd, args.hours),
+                    "recording": recording,
                 })
             })
             .collect();
@@ -46,10 +57,10 @@ pub fn run<W: Write>(args: &StatusArgs, out: &mut W) -> Result<(), CliError> {
     }
     writeln!(
         out,
-        "{:<10} {:<20} {:<8} {:>10} {:>12} {:>14}",
+        "{:<10} {:<20} {:<8} {:>10} {:>12} {:>14} TAKES",
         "SESSION", "PROVIDER/REGION", "STATUS", "ELAPSED", "ACCRUED", "PROJECTED"
     )?;
-    for (_, s) in &sessions {
+    for ((_, s), recording) in sessions.iter().zip(&recordings) {
         let elapsed = elapsed_secs(s, now_unix);
         let status = match s.status {
             SessionStatus::Running => "running",
@@ -67,16 +78,31 @@ pub fn run<W: Write>(args: &StatusArgs, out: &mut W) -> Result<(), CliError> {
         };
         writeln!(
             out,
-            "{:<10} {:<20} {:<8} {:>10} {:>12} {:>14}",
+            "{:<10} {:<20} {:<8} {:>10} {:>12} {:>14} {}",
             &s.session_id_hex[..8.min(s.session_id_hex.len())],
             format!("{}/{}", s.provider, s.region),
             status,
             format_elapsed(elapsed),
             format_microusd(cost_for(s.hourly_microusd, elapsed)),
             projected,
+            takes(recording.as_ref()),
         )?;
     }
     Ok(())
+}
+
+/// What a session recorded, in one cell: the bucket it went to, with a mark for
+/// stems, or a dash for a session that recorded to no bucket.
+///
+/// A take on a bucket is the one this can speak for. A local session writes to
+/// this computer's disk through the server's own flags and leaves no bucket
+/// record, so it reads as a dash here and the directory is printed at launch.
+fn takes(recording: Option<&state::RecordingRecord>) -> String {
+    match recording {
+        Some(record) if record.stems => format!("{} +stems", record.bucket),
+        Some(record) => record.bucket.clone(),
+        None => "-".to_owned(),
+    }
 }
 
 /// Ended sessions stop accruing at ended_unix.
@@ -114,6 +140,24 @@ mod tests {
         assert_eq!(cost_for(16_800, 1800), 8_400);
         assert_eq!(projected(16_800, 3.0), 50_400);
         assert_eq!(projected(16_800, 0.0), 0);
+    }
+
+    #[test]
+    fn a_session_says_which_bucket_it_recorded_to_or_nothing_at_all() {
+        assert_eq!(takes(None), "-");
+        let mut record = state::RecordingRecord {
+            provider: "aws".to_owned(),
+            bucket: "my-jams".to_owned(),
+            region: "eu-west-1".to_owned(),
+            retention: "30d".to_owned(),
+            stems: false,
+        };
+        assert_eq!(takes(Some(&record)), "my-jams");
+        record.stems = true;
+        assert_eq!(takes(Some(&record)), "my-jams +stems");
+        // Nothing in the cell could be a key: the record has none to print.
+        let json = serde_json::to_string(&record).expect("encode");
+        assert!(!json.contains("secret"), "{json}");
     }
 
     #[test]
