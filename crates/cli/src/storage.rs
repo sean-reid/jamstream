@@ -27,24 +27,27 @@ use jamstream_cloud::{ObjectStore, ProviderKind, RegionId, Retention};
 use crate::CliError;
 use crate::state::RecordingRecord;
 
-/// The provider names that can hold a recording bucket.
-pub const STORAGE_PROVIDERS: &[&str] = &["aws", "digitalocean", "gcp"];
+/// Every provider that can hold a recording bucket, from the one list of
+/// providers there is.
+pub fn storage_providers() -> impl Iterator<Item = ProviderKind> {
+    ProviderKind::ALL
+        .into_iter()
+        .filter(ProviderKind::has_object_storage)
+}
 
 /// Parses a provider name into the kind that decides which endpoint gets
-/// signed.
+/// signed. The name itself is [`ProviderKind`]'s to parse; what this adds is
+/// that a bucket is being asked for.
 pub fn provider_kind(name: &str) -> Result<ProviderKind, CliError> {
-    match name {
-        "aws" => Ok(ProviderKind::Aws),
-        "digitalocean" => Ok(ProviderKind::DigitalOcean),
-        "gcp" => Ok(ProviderKind::Gcp),
-        "local" => Err(CliError::Usage(
-            "a local session records to this computer's disk, which needs no bucket".to_owned(),
-        )),
-        other => Err(CliError::Usage(format!(
-            "provider {other:?} has no recording storage; buckets live on {}",
-            STORAGE_PROVIDERS.join(", ")
-        ))),
+    let kind: ProviderKind = name.parse().map_err(|e| CliError::Usage(format!("{e}")))?;
+    if !kind.has_object_storage() {
+        return Err(CliError::Usage(format!(
+            "a {kind} session records to this computer's disk, which needs no bucket; \
+             buckets live on {}",
+            ProviderKind::name_list(storage_providers())
+        )));
     }
+    Ok(kind)
 }
 
 /// The recording key's own variables, read first on every provider.
@@ -226,8 +229,9 @@ mod tests {
 
     #[test]
     fn every_storage_provider_reads_the_recording_pair_first() {
-        for name in STORAGE_PROVIDERS {
-            let kind = provider_kind(name).unwrap();
+        for kind in storage_providers() {
+            let name = kind.as_str();
+            assert_eq!(provider_kind(name).unwrap(), kind);
             let pairs = credential_var_pairs(kind).unwrap();
             assert_eq!(pairs[0], RECORDING_VARS, "{name} must take its own pair");
             for (id, secret) in &pairs {
@@ -306,8 +310,12 @@ mod tests {
     fn local_has_no_bucket_and_an_unknown_provider_lists_the_real_ones() {
         let err = provider_kind("local").unwrap_err().to_string();
         assert!(err.contains("this computer's disk"), "{err}");
+        assert!(err.contains("digitalocean, aws, gcp"), "{err}");
         let err = provider_kind("azure").unwrap_err().to_string();
-        assert!(err.contains("aws, digitalocean, gcp"), "{err}");
+        assert!(err.contains("azure"), "{err}");
+        for kind in ProviderKind::ALL {
+            assert!(err.contains(kind.as_str()), "{err} omits {kind}");
+        }
         assert!(credential_vars(ProviderKind::Local).is_err());
     }
 

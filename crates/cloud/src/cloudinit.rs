@@ -236,12 +236,14 @@ impl RecordingStorage {
                 .map(str::to_owned)
                 .ok_or_else(|| format!("recording config is missing {key}"))
         };
-        let provider = match want("provider")?.as_str() {
-            "aws" => ProviderKind::Aws,
-            "digitalocean" => ProviderKind::DigitalOcean,
-            "gcp" => ProviderKind::Gcp,
-            other => return Err(format!("recording config names provider {other:?}")),
-        };
+        let provider: ProviderKind = want("provider")?
+            .parse()
+            .map_err(|e| format!("recording config: {e}"))?;
+        if !provider.has_object_storage() {
+            return Err(format!(
+                "recording config names provider {provider}, which has no bucket to record to"
+            ));
+        }
         let retention: Retention = want("retention")?
             .parse()
             .map_err(|e| format!("recording config retention: {e}"))?;
@@ -1233,6 +1235,25 @@ mod tests {
         let text = gcp.render_flat_config();
         assert_eq!(flat_config_value(&text, "provider"), Some("gcp"));
         assert_eq!(RecordingStorage::parse_flat_config(&text).unwrap(), gcp);
+    }
+
+    #[test]
+    fn a_recording_config_naming_a_bucketless_provider_is_refused() {
+        let swap = |name: &str| {
+            recording_storage()
+                .render_flat_config()
+                .replace("provider = aws", &format!("provider = {name}"))
+        };
+        // Local records to the host's own disk, so a config that names it
+        // never came from a launch this code path can serve.
+        let err = RecordingStorage::parse_flat_config(&swap("local")).unwrap_err();
+        assert!(err.contains("local"), "{err}");
+        assert!(err.contains("no bucket"), "{err}");
+        // An unknown name says what the known ones are, once, from
+        // ProviderKind.
+        let err = RecordingStorage::parse_flat_config(&swap("azure")).unwrap_err();
+        assert!(err.contains("azure"), "{err}");
+        assert!(err.contains("digitalocean"), "{err}");
     }
 
     #[test]
