@@ -20,6 +20,8 @@ pub const CHANNELS: usize = 2;
 pub const BITS_PER_SAMPLE: usize = 16;
 /// Samples per channel per FLAC frame: the format's customary block, ~85 ms.
 pub const BLOCK_SAMPLES: usize = 4096;
+/// Interleaved samples per FLAC frame.
+pub const BLOCK_INTERLEAVED: usize = BLOCK_SAMPLES * CHANNELS;
 
 /// Encodes one stereo signal to 16-bit FLAC, block by block.
 pub struct FlacEncoder {
@@ -48,6 +50,18 @@ impl FlacEncoder {
             pending: Vec::with_capacity(BLOCK_SAMPLES * CHANNELS),
             frames: 0,
         }
+    }
+
+    /// An encoder whose stream already holds `frames` written blocks and
+    /// `pending` interleaved samples of silence not yet in a block. Frames
+    /// carry no state beyond their number here, so a silent head can be
+    /// copied in from elsewhere and continued from.
+    pub fn resume_silent(frames: usize, pending: usize) -> FlacEncoder {
+        debug_assert!(pending < BLOCK_INTERLEAVED, "pending is under one block");
+        let mut enc = FlacEncoder::new();
+        enc.frames = frames;
+        enc.pending.resize(pending, 0);
+        enc
     }
 
     /// The stream header: `fLaC`, then STREAMINFO with total samples and MD5
