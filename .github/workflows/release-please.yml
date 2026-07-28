@@ -41,6 +41,45 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # release-please bumps [workspace.package].version in Cargo.toml and
+      # leaves Cargo.lock naming the old version for every workspace crate.
+      # ci.yml runs `cargo metadata --locked`, so the release pull request
+      # fails its own version bump. Switching to the rust release type did not
+      # help: this root manifest is virtual, so there is no [package] version
+      # for that strategy to find.
+      #
+      # So refresh the lock on the release branch. `--workspace` re-resolves
+      # only the workspace members, and the guard below fails the job if
+      # anything else moved, because a release is the last place a dependency
+      # should change without anyone asking for it.
+      - if: steps.release.outputs.pr
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+      - if: steps.release.outputs.pr
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - if: steps.release.outputs.pr
+        name: Refresh Cargo.lock for the version bump
+        run: |
+          set -eu
+          cargo update --workspace
+          if git diff --quiet Cargo.lock; then
+            echo "Cargo.lock already current"
+            exit 0
+          fi
+          if git diff -U0 Cargo.lock | grep -E '^[-+]name = ' | grep -qv 'name = "jamstream'; then
+            echo "::error::refreshing the lockfile moved a non-workspace crate; refusing" >&2
+            git diff Cargo.lock >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: refresh Cargo.lock for the version bump"
+          git push
+
   # Events published with the workflow token do not trigger workflows
   # (recursion guard), so the artifact build is chained by explicit dispatch,
   # which is the sanctioned exception.
