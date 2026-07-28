@@ -118,6 +118,7 @@ wiremock = "0.6"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 mimalloc = "0.1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 dirs = "6"
 # default-features off drops `png-format`, which is tiny-skia's own PNG
 # encoder and decoder (Pixmap::load_png, encode_png, save_png). Nothing calls
