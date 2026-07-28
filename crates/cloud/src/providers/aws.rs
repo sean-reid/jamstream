@@ -594,7 +594,8 @@ impl Provider for AwsProvider {
         // window in which the instance is up on VPC defaults.
         let group_id = self
             .ensure_group(region.id.as_str(), &session, &spec.tags)
-            .await?;
+            .await
+            .map_err(|e| e.while_doing("creating the session security group"))?;
 
         let mut params = vec![
             ("ImageId".to_owned(), ami),
@@ -650,7 +651,8 @@ impl Provider for AwsProvider {
 
         let body = self
             .ec2_call(region.id.as_str(), "RunInstances", &params)
-            .await?;
+            .await
+            .map_err(|e| e.while_doing("launching the instance"))?;
         let first = parse_instances(&region, &body)
             .into_iter()
             .next()

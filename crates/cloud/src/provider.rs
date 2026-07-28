@@ -27,6 +27,28 @@ pub enum ProviderError {
 
 pub type Result<T> = std::result::Result<T, ProviderError>;
 
+impl ProviderError {
+    /// Prefixes the message with the operation that produced it, keeping
+    /// the variant so classification is unchanged. A launch is several API
+    /// calls, and "authentication failed" without which one leaves the
+    /// person reading it to guess; "creating the session firewall:
+    /// authentication failed" is the difference between a docs search that
+    /// lands and a diagnosis round-trip.
+    pub(crate) fn while_doing(self, op: &str) -> Self {
+        match self {
+            ProviderError::Auth(m) => ProviderError::Auth(format!("{op}: {m}")),
+            ProviderError::QuotaExceeded(m) => ProviderError::QuotaExceeded(format!("{op}: {m}")),
+            ProviderError::NotFound(m) => ProviderError::NotFound(format!("{op}: {m}")),
+            ProviderError::Transient(m) => ProviderError::Transient(format!("{op}: {m}")),
+            ProviderError::Other(m) => ProviderError::Other(format!("{op}: {m}")),
+            // No message to prefix; the variant already says everything.
+            ProviderError::RateLimited { retry_after } => {
+                ProviderError::RateLimited { retry_after }
+            }
+        }
+    }
+}
+
 /// Injectable sleep so backoff loops are testable without real time.
 #[async_trait]
 pub trait Sleeper: Send + Sync {
