@@ -1522,10 +1522,20 @@ impl ServerCore {
                 // owns the stream worker. Nothing here stores or relays it.
                 self.events.push(ServerEvent::StreamCtl(op));
             }
+            // Host-only checked from the first release that speaks the
+            // message; the recorder that acts on the op lands separately.
+            ControlMsg::RecordCtl { .. } => {
+                if from != HOST_MEMBER_ID {
+                    self.violation(now_ms, from, "record control by non-host");
+                }
+            }
             ControlMsg::Roster(_) => self.violation(now_ms, from, "roster from client"),
             ControlMsg::Stats { .. } => self.violation(now_ms, from, "stats from client"),
             ControlMsg::StreamStatus { .. } => {
                 self.violation(now_ms, from, "stream status from client")
+            }
+            ControlMsg::RecordStatus { .. } => {
+                self.violation(now_ms, from, "record status from client")
             }
         }
     }

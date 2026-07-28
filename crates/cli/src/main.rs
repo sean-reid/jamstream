@@ -50,5 +50,10 @@ async fn dispatch<W: Write>(cli: Cli, out: &mut W) -> Result<(), CliError> {
             sweep::run(&providers, args.dry_run, out).await
         }
         Command::Join(args) => join::run(&args, out).await,
+        Command::Completions(args) => {
+            use clap::CommandFactory;
+            clap_complete::generate(args.shell, &mut Cli::command(), "jamstream", out);
+            Ok(())
+        }
     }
 }

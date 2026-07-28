@@ -30,6 +30,28 @@ fn region(p: &DigitalOceanProvider, slug: &str) -> Region {
         .expect("slug in static catalog")
 }
 
+/// Mounts the distribution image catalog a launch resolves its boot image
+/// from. Debian 12 and 13 are both offered, as during a release transition,
+/// so a launch asserting `debian-13-x64` proves selection rather than
+/// echoing the only option.
+async fn mount_images(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v2/images"))
+        .and(query_param("type", "distribution"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "images": [
+                { "id": 1, "slug": "ubuntu-24-04-x64" },
+                { "id": 2, "slug": "debian-12-x64" },
+                { "id": 3, "slug": "debian-13-x64" },
+                { "id": 4, "slug": null },
+            ],
+            "links": {},
+            "meta": {},
+        })))
+        .mount(server)
+        .await;
+}
+
 /// Mounts the two calls a launch makes before the droplet exists: the
 /// session tag, which a firewall may only reference once it exists, and the
 /// cloud firewall attached to it.
@@ -116,6 +138,7 @@ fn droplet_json(
 #[tokio::test]
 async fn create_happy_path_sends_full_body_and_parses_response() {
     let server = MockServer::start().await;
+    mount_images(&server).await;
     let tags = ["jamstream", "jamstream-session:sess1"];
     Mock::given(method("POST"))
         .and(path("/v2/droplets"))
@@ -124,7 +147,7 @@ async fn create_happy_path_sends_full_body_and_parses_response() {
             "name": "jamstream-sess1",
             "region": "nyc1",
             "size": "s-1vcpu-2gb",
-            "image": "debian-12-x64",
+            "image": "debian-13-x64",
             "user_data": "#cloud-config\nhello\n",
             "tags": tags,
         })))
@@ -203,6 +226,7 @@ async fn create_422_surfaces_the_api_message() {
         .await;
 
     mount_firewall(&server, "sess1").await;
+    mount_images(&server).await;
 
     let p = provider(&server);
     let err = p
@@ -671,6 +695,7 @@ async fn launch_reuses_the_firewall_a_previous_attempt_created() {
         .expect(1)
         .mount(&server)
         .await;
+    mount_images(&server).await;
 
     let p = provider(&server);
     let inst = p
@@ -684,6 +709,35 @@ async fn launch_reuses_the_firewall_a_previous_attempt_created() {
         .expect("launch survives a firewall that already exists");
     assert_eq!(inst.id, "7");
     server.verify().await;
+}
+
+#[tokio::test]
+async fn launch_with_no_debian_in_the_catalog_names_the_problem() {
+    let server = MockServer::start().await;
+    mount_firewall(&server, "sess1").await;
+    Mock::given(method("GET"))
+        .and(path("/v2/images"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "images": [{ "id": 1, "slug": "ubuntu-24-04-x64" }],
+            "links": {},
+            "meta": {},
+        })))
+        .mount(&server)
+        .await;
+    let p = provider(&server);
+    let err = p
+        .launch(LaunchSpec {
+            region: region(&p, "nyc1"),
+            instance_class: InstanceClass::Small,
+            user_data: String::new(),
+            tags: vec![session_tag("sess1")],
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no debian"),
+        "the error has to say what is missing: {err}"
+    );
 }
 
 #[tokio::test]

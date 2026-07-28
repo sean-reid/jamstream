@@ -43,8 +43,14 @@ pub const BARE_TAG: &str = "jamstream";
 /// recognize its own work without touching the account's other firewalls.
 pub const FIREWALL_PREFIX: &str = "jamstream-";
 
-/// Debian is the boot image everywhere; cloud-init does the rest.
-const IMAGE: &str = "debian-12-x64";
+/// Debian is the boot image everywhere; cloud-init does the rest. The
+/// slug is resolved from the live image catalog at launch rather than
+/// hardcoded: DigitalOcean retires a release's slug when the next one
+/// ships, and a pinned `debian-12-x64` failed every launch with "invalid
+/// image" the day only 13 existed. Same idea as the AWS provider asking
+/// SSM for its AMI.
+const IMAGE_SLUG_PREFIX: &str = "debian-";
+const IMAGE_SLUG_SUFFIX: &str = "-x64";
 
 /// Egress beyond the included pool costs $0.01/GB on DigitalOcean.
 const EGRESS_MICROUSD_PER_GB: u64 = 10_000;
@@ -65,6 +71,22 @@ const CATALOG: &[(&str, &str, &str)] = &[
 ];
 
 /// Maps the abstract instance class to a concrete droplet size slug.
+/// Picks the highest-numbered `debian-N-x64` slug, or None if none is
+/// offered.
+fn newest_debian<'a>(slugs: impl Iterator<Item = &'a str>) -> Option<String> {
+    slugs
+        .filter_map(|slug| {
+            let n: u32 = slug
+                .strip_prefix(IMAGE_SLUG_PREFIX)?
+                .strip_suffix(IMAGE_SLUG_SUFFIX)?
+                .parse()
+                .ok()?;
+            Some((n, slug))
+        })
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, slug)| slug.to_owned())
+}
+
 pub fn size_slug(class: InstanceClass) -> &'static str {
     match class {
         InstanceClass::Small => "s-1vcpu-2gb",
@@ -137,6 +159,19 @@ struct SizeInfo {
 #[derive(Debug, Deserialize)]
 struct SizesPage {
     sizes: Vec<SizeInfo>,
+    #[serde(default)]
+    links: Option<Links>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageInfo {
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImagesPage {
+    images: Vec<ImageInfo>,
     #[serde(default)]
     links: Option<Links>,
 }
@@ -240,6 +275,8 @@ pub struct DigitalOceanProvider {
     /// GET /v2/sizes is region-independent and immutable for our purposes;
     /// fetched once per provider instance and reused by every price() call.
     sizes: OnceCell<Vec<SizeInfo>>,
+    /// Newest Debian distribution slug, resolved once per provider instance.
+    image: OnceCell<String>,
 }
 
 /// The token is a live credential; it never appears in Debug output.
@@ -260,6 +297,7 @@ impl DigitalOceanProvider {
             session_port: DEFAULT_SESSION_PORT,
             http: client(),
             sizes: OnceCell::new(),
+            image: OnceCell::new(),
         }
     }
 
@@ -369,6 +407,34 @@ impl DigitalOceanProvider {
             })
             .await
             .map(Vec::as_slice)
+    }
+
+    /// Newest Debian boot image slug from the live distribution catalog.
+    async fn image(&self) -> Result<&str> {
+        self.image
+            .get_or_try_init(|| async {
+                let images = self
+                    .get_paginated(
+                        format!("{}/v2/images?type=distribution&per_page=200", self.base_url),
+                        |value| {
+                            let page: ImagesPage = serde_json::from_value(value).map_err(|e| {
+                                ProviderError::Other(format!("digitalocean images decode: {e}"))
+                            })?;
+                            let next = page.links.and_then(|l| l.pages).and_then(|p| p.next);
+                            Ok((page.images, next))
+                        },
+                    )
+                    .await?;
+                newest_debian(images.iter().filter_map(|i| i.slug.as_deref())).ok_or_else(|| {
+                    ProviderError::Other(
+                        "digitalocean lists no debian-N-x64 distribution image; \
+                         cannot pick a boot image"
+                            .to_owned(),
+                    )
+                })
+            })
+            .await
+            .map(String::as_str)
     }
 
     /// Live price for one instance class in one region, from the cached
@@ -572,7 +638,7 @@ impl Provider for DigitalOceanProvider {
             "name": name,
             "region": spec.region.id.as_str(),
             "size": size_slug(spec.instance_class),
-            "image": IMAGE,
+            "image": self.image().await?,
             "user_data": spec.user_data,
             "tags": tags,
         });
@@ -696,6 +762,26 @@ mod tests {
     use super::*;
     use crate::types::{session_id_from_tags, session_tag};
     use proptest::prelude::*;
+
+    #[test]
+    fn newest_debian_picks_the_highest_release() {
+        // Both offered during a transition: the newer one wins.
+        let both = ["debian-12-x64", "debian-13-x64", "ubuntu-24-04-x64"];
+        assert_eq!(
+            newest_debian(both.iter().copied()),
+            Some("debian-13-x64".to_owned())
+        );
+        // Numeric, not lexicographic: 100 beats 99.
+        let wide = ["debian-99-x64", "debian-100-x64"];
+        assert_eq!(
+            newest_debian(wide.iter().copied()),
+            Some("debian-100-x64".to_owned())
+        );
+        // Near misses are not Debian boot images.
+        let misses = ["debian-13-arm64", "debian-x64", "notdebian-13-x64"];
+        assert_eq!(newest_debian(misses.iter().copied()), None);
+        assert_eq!(newest_debian([].iter().copied()), None);
+    }
 
     #[test]
     fn size_slugs() {

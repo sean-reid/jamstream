@@ -17,7 +17,7 @@ fi
 "$BIN" help >/dev/null
 
 status=0
-for cmd in host status end sweep join; do
+for cmd in host status end sweep join completions; do
   page="src/cli/$cmd.md"
   [ -f "$page" ] || { echo "missing page: $page" >&2; status=1; continue; }
   help_out="$("$BIN" "$cmd" --help)"

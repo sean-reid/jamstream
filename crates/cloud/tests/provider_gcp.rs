@@ -184,6 +184,7 @@ async fn the_run_cap_on_the_wire_is_the_session_cap() {
         // The host asked for two hours.
         max_duration_min: 120,
         self_destruct: SelfDestruct::GcpMaxRunDuration,
+        recording: None,
     };
     let mut spec = spec(&p);
     spec.user_data = jamstream_cloud::cloudinit::render(&boot);

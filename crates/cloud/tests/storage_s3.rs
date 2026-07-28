@@ -358,6 +358,125 @@ async fn an_error_inside_a_200_completion_response_still_aborts() {
     assert!(err.to_string().contains("InternalError"), "{err}");
 }
 
+// ---- ObjectSink over the real store ----
+
+/// The sink is what the recorder feeds; here it drives the real signer and
+/// the real multipart state machine, not a fake of them.
+#[tokio::test]
+async fn sink_streams_chunks_through_a_real_multipart_upload() {
+    use jamstream_cloud::ObjectSink;
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    let key = mix_key("s1");
+    Mock::given(method("POST"))
+        .and(path(object_path(&key)))
+        .and(query_param("uploads", ""))
+        .and(signed())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<InitiateMultipartUploadResult><UploadId>up-sink</UploadId></InitiateMultipartUploadResult>"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(object_path(&key)))
+        .and(query_param("uploadId", "up-sink"))
+        .and(signed())
+        .respond_with(PartEtag)
+        .expect(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(object_path(&key)))
+        .and(query_param("uploadId", "up-sink"))
+        .and(query_param_is_missing("partNumber"))
+        .and(signed())
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<CompleteMultipartUploadResult><ETag>&quot;sink-etag&quot;</ETag></CompleteMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = std::env::temp_dir().join(format!("jamstream-s3-sink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut sink =
+        ObjectSink::open_with_marker_dir(Arc::new(store(&server)), BUCKET, &key, WAV, &dir);
+    // 20 bytes in ragged chunks at a part size of 8: 8 + 8 + 4.
+    sink.write((0..5u8).collect()).await.unwrap();
+    sink.write((5..19u8).collect()).await.unwrap();
+    sink.write(vec![19]).await.unwrap();
+    let meta = sink.finish().await.unwrap();
+    assert_eq!(meta.size, 20);
+    assert_eq!(meta.etag.as_deref(), Some("sink-etag"));
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.method == wiremock::http::Method::DELETE),
+        "a successful sink upload aborted itself"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Abandoning the sink must reach S3 as AbortMultipartUpload, and never as
+/// CompleteMultipartUpload over a truncated body.
+#[tokio::test]
+async fn sink_abort_sends_a_real_abort_and_never_completes() {
+    use jamstream_cloud::ObjectSink;
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    let key = mix_key("s1");
+    Mock::given(method("POST"))
+        .and(path(object_path(&key)))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<InitiateMultipartUploadResult><UploadId>up-gone</UploadId></InitiateMultipartUploadResult>"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(object_path(&key)))
+        .and(query_param("uploadId", "up-gone"))
+        .respond_with(PartEtag)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(object_path(&key)))
+        .and(query_param("uploadId", "up-gone"))
+        .and(signed())
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .named("AbortMultipartUpload from the sink")
+        .mount(&server)
+        .await;
+
+    let dir = std::env::temp_dir().join(format!("jamstream-s3-sink-abort-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut sink =
+        ObjectSink::open_with_marker_dir(Arc::new(store(&server)), BUCKET, &key, WAV, &dir);
+    sink.write((0..30u8).collect()).await.unwrap();
+    sink.abort().await;
+
+    let requests = server.received_requests().await.unwrap();
+    let completes = requests
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.query_pairs().any(|(k, _)| k == "uploadId")
+        })
+        .count();
+    assert_eq!(completes, 0, "an aborted sink must never complete");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn a_part_response_without_an_etag_fails_and_aborts() {
     // Without the ETag the completion body cannot be built, so continuing
