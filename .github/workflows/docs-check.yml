@@ -24,6 +24,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # All four jobs are required checks, so they have to report on a merge
+  # group too: one that never reports leaves the queue entry waiting
+  # forever. This workflow is also the reason the queue exists. One pull
+  # request added a twelfth image to a curated list while another added a
+  # gate asserting the eleven that existed when it was written; both were
+  # green, and main went red when they met.
+  merge_group:
 
 # Every job here only reads the tree and compares generated output against
 # what is committed. Nothing writes to the repository.
