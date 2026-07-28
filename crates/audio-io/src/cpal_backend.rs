@@ -127,12 +127,28 @@ impl AudioBackend for CpalBackend {
         let out_native = out_device
             .default_output_config()
             .map_err(|e| map_err(&e))?;
+        let in_open = config_at_rate(
+            &in_native,
+            in_device
+                .supported_input_configs()
+                .map_err(|e| map_err(&e))?,
+            config.sample_rate,
+        )
+        .ok_or_else(|| wrong_rate(Direction::Capture, &in_native, config.sample_rate))?;
+        let out_open = config_at_rate(
+            &out_native,
+            out_device
+                .supported_output_configs()
+                .map_err(|e| map_err(&e))?,
+            config.sample_rate,
+        )
+        .ok_or_else(|| wrong_rate(Direction::Playback, &out_native, config.sample_rate))?;
 
         let (on_capture, on_playback) = handler.into_parts();
         let errored = Arc::new(AtomicBool::new(false));
 
-        let input = build_input(&in_device, &in_native, &config, on_capture, &errored)?;
-        let output = build_output(&out_device, &out_native, &config, on_playback, &errored)?;
+        let input = build_input(&in_device, &in_open, &config, on_capture, &errored)?;
+        let output = build_output(&out_device, &out_open, &config, on_playback, &errored)?;
 
         // cpal 0.18 streams start paused.
         input.play().map_err(|e| map_err(&e))?;
@@ -164,6 +180,42 @@ fn map_err(e: &cpal::Error) -> AudioError {
         }
         _ => AudioError::Backend(e.to_string()),
     }
+}
+
+/// The device config to open at `rate`: the device's own when it already runs
+/// there, else a supported range that covers it. None means the device cannot
+/// run at the session rate, and opening it anyway would play everything at
+/// the wrong pitch and speed instead of failing.
+fn config_at_rate(
+    native: &cpal::SupportedStreamConfig,
+    supported: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+    rate: u32,
+) -> Option<cpal::SupportedStreamConfig> {
+    if native.sample_rate() == rate {
+        return Some(*native);
+    }
+    // f32 first, because that is the sample type the streams are built with,
+    // then the native channel layout, then the widest.
+    supported
+        .filter_map(|r| r.try_with_sample_rate(rate))
+        .max_by_key(|c| {
+            (
+                c.sample_format() == cpal::SampleFormat::F32,
+                c.channels() == native.channels(),
+                c.channels(),
+            )
+        })
+}
+
+fn wrong_rate(direction: Direction, native: &cpal::SupportedStreamConfig, rate: u32) -> AudioError {
+    let side = match direction {
+        Direction::Capture => "capture",
+        Direction::Playback => "playback",
+    };
+    AudioError::Unsupported(format!(
+        "{side} device runs at {} Hz and will not open at {rate} Hz",
+        native.sample_rate()
+    ))
 }
 
 fn buffer_bounds(size: &cpal::SupportedBufferSize) -> (Option<u32>, Option<u32>) {
@@ -202,19 +254,19 @@ fn make_error_callback(errored: &Arc<AtomicBool>) -> impl FnMut(cpal::Error) + S
 
 fn build_input(
     device: &cpal::Device,
-    native: &cpal::SupportedStreamConfig,
+    open: &cpal::SupportedStreamConfig,
     config: &StreamConfig,
     mut on_capture: CaptureFn,
     errored: &Arc<AtomicBool>,
 ) -> Result<cpal::Stream> {
-    let device_ch = usize::from(native.channels().max(1));
+    let device_ch = usize::from(open.channels().max(1));
     let handler_ch = usize::from(config.channels);
     let mut scratch = vec![0.0f32; MAX_CHUNK_FRAMES * handler_ch];
 
     let stream_config = cpal::StreamConfig {
-        channels: native.channels(),
-        sample_rate: config.sample_rate,
-        buffer_size: choose_buffer_size(native, config.buffer_frames),
+        channels: open.channels(),
+        sample_rate: open.sample_rate(),
+        buffer_size: choose_buffer_size(open, config.buffer_frames),
     };
     device
         .build_input_stream::<f32, _, _>(
@@ -235,19 +287,19 @@ fn build_input(
 
 fn build_output(
     device: &cpal::Device,
-    native: &cpal::SupportedStreamConfig,
+    open: &cpal::SupportedStreamConfig,
     config: &StreamConfig,
     mut on_playback: PlaybackFn,
     errored: &Arc<AtomicBool>,
 ) -> Result<cpal::Stream> {
-    let device_ch = usize::from(native.channels().max(1));
+    let device_ch = usize::from(open.channels().max(1));
     let handler_ch = usize::from(config.channels);
     let mut scratch = vec![0.0f32; MAX_CHUNK_FRAMES * handler_ch];
 
     let stream_config = cpal::StreamConfig {
-        channels: native.channels(),
-        sample_rate: config.sample_rate,
-        buffer_size: choose_buffer_size(native, config.buffer_frames),
+        channels: open.channels(),
+        sample_rate: open.sample_rate(),
+        buffer_size: choose_buffer_size(open, config.buffer_frames),
     };
     device
         .build_output_stream::<f32, _, _>(
@@ -287,5 +339,73 @@ impl StreamHandle for CpalStreamHandle {
         // Pause is best-effort; dropping the streams tears them down.
         let _ = self.input.pause();
         let _ = self.output.pause();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cpal::{
+        SampleFormat, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    };
+
+    const BUF: SupportedBufferSize = SupportedBufferSize::Range { min: 64, max: 4096 };
+
+    fn native(rate: u32, channels: u16) -> SupportedStreamConfig {
+        SupportedStreamConfig::new(channels, rate, BUF, SampleFormat::F32)
+    }
+
+    fn range(lo: u32, hi: u32, channels: u16, format: SampleFormat) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(channels, lo, hi, BUF, format)
+    }
+
+    #[test]
+    fn a_device_already_at_the_session_rate_opens_as_it_is() {
+        let native = native(48_000, 2);
+        let chosen = config_at_rate(&native, std::iter::empty(), 48_000).expect("native rate");
+        assert_eq!(chosen.sample_rate(), 48_000);
+        assert_eq!(chosen.channels(), 2);
+    }
+
+    #[test]
+    fn a_44_1_device_that_also_does_48_opens_at_48() {
+        let native = native(44_100, 2);
+        let ranges = [
+            range(44_100, 44_100, 2, SampleFormat::F32),
+            range(44_100, 96_000, 4, SampleFormat::I16),
+            range(44_100, 96_000, 2, SampleFormat::F32),
+        ];
+        let chosen =
+            config_at_rate(&native, ranges.into_iter(), 48_000).expect("48 kHz is in range");
+        assert_eq!(chosen.sample_rate(), 48_000);
+        // f32 and the native layout win over the wider i16 range.
+        assert_eq!(chosen.sample_format(), SampleFormat::F32);
+        assert_eq!(chosen.channels(), 2);
+    }
+
+    /// The bug this guards: a 44.1 kHz-only device used to be opened at 48 kHz
+    /// anyway, which plays the session sharp and fast instead of failing.
+    #[test]
+    fn a_44_1_only_device_is_refused_rather_than_pitch_shifted() {
+        let native = native(44_100, 2);
+        let ranges = [
+            range(8_000, 44_100, 2, SampleFormat::F32),
+            range(22_050, 44_100, 1, SampleFormat::I16),
+        ];
+        assert!(config_at_rate(&native, ranges.into_iter(), 48_000).is_none());
+        let err = wrong_rate(Direction::Capture, &native, 48_000);
+        let AudioError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("44100") && msg.contains("48000"), "{msg}");
+    }
+
+    #[test]
+    fn an_i16_only_device_at_the_session_rate_still_opens() {
+        let native = native(44_100, 2);
+        let ranges = [range(44_100, 48_000, 2, SampleFormat::I16)];
+        let chosen = config_at_rate(&native, ranges.into_iter(), 48_000).expect("rate is in range");
+        assert_eq!(chosen.sample_rate(), 48_000);
+        assert_eq!(chosen.sample_format(), SampleFormat::I16);
     }
 }

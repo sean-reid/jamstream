@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use jamstream_audio_io::{AudioError, DuplexHandler, StreamConfig, WavBackend};
+use jamstream_audio_io::{AudioError, DuplexHandler, StreamConfig, StreamHandle, WavBackend};
 
 fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("jamstream-audio-io-{}-{name}", std::process::id()))
@@ -175,6 +175,56 @@ fn int16_input_is_scaled() {
     assert_eq!(&written[..], &expected[..]);
     let _ = std::fs::remove_file(&input_path);
     let _ = std::fs::remove_file(&output_path);
+}
+
+/// The 44.1 kHz interface, modelled: the session runs at 48 kHz and the fake
+/// refuses the same way the cpal backend now does, rather than opening and
+/// playing sharp.
+#[test]
+fn a_device_at_44_1_refuses_a_48_khz_session() {
+    let backend = WavBackend::new(None, None).with_device_rate(44_100);
+    let err = backend.open_offline(config(2), passthrough()).unwrap_err();
+    let AudioError::Unsupported(msg) = err else {
+        panic!("expected Unsupported, got {err:?}");
+    };
+    assert!(msg.contains("44100") && msg.contains("48000"), "{msg}");
+}
+
+#[test]
+fn a_device_at_44_1_opens_at_its_own_rate() {
+    let backend = WavBackend::new(None, None).with_device_rate(44_100);
+    let cfg = StreamConfig {
+        sample_rate: 44_100,
+        ..config(2)
+    };
+    let mut stream = backend.open_offline(cfg, passthrough()).unwrap();
+    stream.pump(441).unwrap();
+    assert!(!stream.errored());
+}
+
+/// Device loss is observable offline, so the caller's device-gone path is no
+/// longer reachable only from real hardware.
+#[test]
+fn a_lost_device_is_reported_through_the_stream_handle() {
+    let backend = WavBackend::new(None, None).with_device_loss_after(480);
+    let mut stream = backend.open_offline(config(2), passthrough()).unwrap();
+    stream.pump(240).unwrap();
+    assert!(!stream.errored(), "the device is still there at 240 frames");
+    stream.pump(240).unwrap();
+    assert!(stream.errored(), "the device was pulled at 480 frames");
+    // And it stays gone, the way a real invalidated stream does.
+    stream.pump(240).unwrap();
+    assert!(stream.errored());
+}
+
+#[test]
+fn a_device_loss_can_be_triggered_on_demand() {
+    let backend = WavBackend::new(None, None);
+    let mut stream = backend.open_offline(config(1), passthrough()).unwrap();
+    stream.pump(64).unwrap();
+    assert!(!stream.errored());
+    stream.report_device_lost();
+    assert!(stream.errored());
 }
 
 #[test]

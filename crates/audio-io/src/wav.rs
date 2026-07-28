@@ -24,6 +24,8 @@ const WAV_PLAYBACK_ID: &str = "wav-playback";
 pub struct WavBackend {
     input_wav: Option<PathBuf>,
     capture_output: Option<PathBuf>,
+    device_rate: u32,
+    lose_device_after: Option<u64>,
 }
 
 impl WavBackend {
@@ -34,16 +36,35 @@ impl WavBackend {
         Self {
             input_wav,
             capture_output,
+            device_rate: 48_000,
+            lose_device_after: None,
         }
+    }
+
+    /// Models an interface running at `rate`: opening at any other rate fails
+    /// the way a real device does, instead of playing back pitch shifted.
+    #[must_use]
+    pub fn with_device_rate(mut self, rate: u32) -> Self {
+        self.device_rate = rate;
+        self
+    }
+
+    /// Models a device unplugged mid-session: once this many frames have been
+    /// pumped the stream reports [`StreamHandle::errored`], so the caller's
+    /// device-gone path runs offline instead of only against real hardware.
+    #[must_use]
+    pub fn with_device_loss_after(mut self, frames: u64) -> Self {
+        self.lose_device_after = Some(frames);
+        self
     }
 
     /// Concrete-typed variant of [`AudioBackend::open_duplex`] so callers can
     /// reach [`WavStream::pump`] without downcasting.
     pub fn open_offline(&self, config: StreamConfig, handler: DuplexHandler) -> Result<WavStream> {
-        if config.sample_rate != 48_000 {
+        if config.sample_rate != self.device_rate {
             return Err(AudioError::Unsupported(format!(
-                "wav backend is fixed at 48 kHz, requested {}",
-                config.sample_rate
+                "wav device runs at {} Hz and will not open at {} Hz",
+                self.device_rate, config.sample_rate
             )));
         }
         if config.channels == 0 {
@@ -51,7 +72,7 @@ impl WavBackend {
         }
 
         let input = match &self.input_wav {
-            Some(path) => read_input(path, config.channels)?,
+            Some(path) => read_input(path, config.channels, config.sample_rate)?,
             None => Vec::new(),
         };
 
@@ -77,6 +98,9 @@ impl WavBackend {
             channels: usize::from(config.channels),
             capture_buf: Vec::new(),
             playback_buf: Vec::new(),
+            pumped_frames: 0,
+            lose_device_after: self.lose_device_after,
+            errored: false,
         })
     }
 }
@@ -125,6 +149,9 @@ pub struct WavStream {
     channels: usize,
     capture_buf: Vec<f32>,
     playback_buf: Vec<f32>,
+    pumped_frames: u64,
+    lose_device_after: Option<u64>,
+    errored: bool,
 }
 
 impl WavStream {
@@ -152,7 +179,20 @@ impl WavStream {
                 writer.write_sample(s).map_err(wav_err)?;
             }
         }
+        self.pumped_frames += frames as u64;
+        if self
+            .lose_device_after
+            .is_some_and(|f| self.pumped_frames >= f)
+        {
+            self.errored = true;
+        }
         Ok(())
+    }
+
+    /// Reports the device as lost from now on, the way a real backend's error
+    /// callback would. Pumping still works; the flag is what the caller polls.
+    pub fn report_device_lost(&mut self) {
+        self.errored = true;
     }
 
     /// True once a pump has run past the end of the input WAV (or from the
@@ -191,6 +231,10 @@ impl StreamHandle for WavStream {
         Some(0)
     }
 
+    fn errored(&self) -> bool {
+        self.errored
+    }
+
     fn close(mut self: Box<Self>) {
         let _ = self.finish_inner();
     }
@@ -200,15 +244,15 @@ fn wav_err(e: hound::Error) -> AudioError {
     AudioError::Backend(e.to_string())
 }
 
-/// Read the whole input file, asserting 48 kHz, and convert to `channels`:
-/// matching layouts copy through, mono fans out to every channel, and a
-/// wider source contributes its first `channels` channels.
-fn read_input(path: &PathBuf, channels: u16) -> Result<Vec<f32>> {
+/// Read the whole input file, asserting the stream's rate, and convert to
+/// `channels`: matching layouts copy through, mono fans out to every channel,
+/// and a wider source contributes its first `channels` channels.
+fn read_input(path: &PathBuf, channels: u16, sample_rate: u32) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(path).map_err(wav_err)?;
     let spec = reader.spec();
-    if spec.sample_rate != 48_000 {
+    if spec.sample_rate != sample_rate {
         return Err(AudioError::Unsupported(format!(
-            "input wav must be 48 kHz, got {}",
+            "input wav must be {sample_rate} Hz, got {}",
             spec.sample_rate
         )));
     }
