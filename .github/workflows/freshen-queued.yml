@@ -52,14 +52,34 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -eu
-          # BEHIND is the only state worth acting on. BLOCKED means checks
-          # are still running or failing, CONFLICTING needs a human, and
-          # CLEAN is already current.
+          # Staleness is measured with the compare API, not mergeStateStatus.
+          # The first version of this filtered on BEHIND, and BEHIND is a
+          # status GitHub only reports when protection requires branches to
+          # be current, the exact setting this repository turned off. With
+          # strict off, a stale branch with failing checks reports BLOCKED,
+          # so the filter matched nothing and this workflow was a no-op from
+          # the day it merged. It went unnoticed because a no-op run is
+          # green, and it surfaced only when a pull request this was built
+          # for sat stale behind a fix it needed. behind_by has no such
+          # dependency on settings: it counts the base commits the branch
+          # lacks, and zero means current.
+          #
+          # CONFLICTING is still skipped: update-branch cannot resolve a
+          # conflict, only a human can.
           gh pr list --repo "$REPO" --state open \
-            --json number,mergeStateStatus,autoMergeRequest \
+            --json number,headRefName,baseRefName,mergeStateStatus,autoMergeRequest \
             --jq '.[] | select(.autoMergeRequest != null)
-                      | select(.mergeStateStatus == "BEHIND")
-                      | .number' > behind.txt
+                      | select(.mergeStateStatus != "CONFLICTING")
+                      | "\(.number) \(.baseRefName) \(.headRefName)"' > armed.txt
+          : > behind.txt
+          while read -r pr base head; do
+            behind=$(gh api "repos/$REPO/compare/$base...$head" --jq .behind_by) || {
+              # The branch can vanish between the list and the compare.
+              echo "::warning::could not compare #$pr ($base...$head); skipping"
+              continue
+            }
+            [ "$behind" -gt 0 ] && echo "$pr" >> behind.txt
+          done < armed.txt
           if [ ! -s behind.txt ]; then
             echo "nothing armed and behind"
             exit 0
