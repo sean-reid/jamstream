@@ -207,13 +207,32 @@ fn config_at_rate(
         })
 }
 
+/// Where the person at the keyboard sets a device to 48 kHz. jamstream does
+/// not resample, so this sentence is the entire remedy.
+#[cfg(windows)]
+const RATE_REMEDY: &str = "set that device to 48000 Hz in Sound, Recording or \
+                           Playback, the device's Properties, Advanced, Default Format";
+/// macOS switches the device's rate itself when the hardware has 48 kHz, so a
+/// refusal here means the Format list has no such entry to pick.
+#[cfg(target_os = "macos")]
+const RATE_REMEDY: &str = "check Audio MIDI Setup, Format, for a 48000 Hz entry \
+                           on that device, and use another device if there is none";
+/// PipeWire reports its graph rate as the device's, so that is what has to
+/// change; there is no settings panel for it.
+#[cfg(target_os = "linux")]
+const RATE_REMEDY: &str = "set the audio server to 48000 Hz (PipeWire: \
+                           default.clock.rate in a pipewire.conf.d drop-in, then \
+                           restart the pipewire service)";
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+const RATE_REMEDY: &str = "run that device at 48000 Hz";
+
 fn wrong_rate(direction: Direction, native: &cpal::SupportedStreamConfig, rate: u32) -> AudioError {
     let side = match direction {
         Direction::Capture => "capture",
         Direction::Playback => "playback",
     };
     AudioError::Unsupported(format!(
-        "{side} device runs at {} Hz and will not open at {rate} Hz",
+        "{side} device runs at {} Hz and will not open at {rate} Hz; {RATE_REMEDY}",
         native.sample_rate()
     ))
 }
@@ -398,6 +417,25 @@ mod tests {
             panic!("expected Unsupported, got {err:?}");
         };
         assert!(msg.contains("44100") && msg.contains("48000"), "{msg}");
+    }
+
+    /// The refusal is the whole remedy, so it has to name the place this
+    /// platform's rate is set. Each arm only compiles and runs on its own
+    /// runner, which is why all three are here.
+    #[test]
+    fn the_refusal_says_where_to_set_the_rate() {
+        let AudioError::Unsupported(msg) =
+            wrong_rate(Direction::Playback, &native(44_100, 2), 48_000)
+        else {
+            panic!("expected Unsupported");
+        };
+        assert!(msg.starts_with("playback device runs at 44100 Hz"), "{msg}");
+        #[cfg(windows)]
+        assert!(msg.contains("Advanced, Default Format"), "{msg}");
+        #[cfg(target_os = "macos")]
+        assert!(msg.contains("Audio MIDI Setup, Format"), "{msg}");
+        #[cfg(target_os = "linux")]
+        assert!(msg.contains("default.clock.rate"), "{msg}");
     }
 
     #[test]
