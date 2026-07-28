@@ -62,11 +62,13 @@ pub mod contract;
 pub mod gcs;
 pub mod mock;
 pub mod s3;
+pub mod sink;
 
 pub use contract::assert_object_store_contract;
 pub use gcs::GcsStore;
 pub use mock::MockStore;
 pub use s3::S3Store;
+pub use sink::ObjectSink;
 
 /// S3 rejects any non-final part below 5 MiB.
 pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
@@ -79,6 +81,8 @@ pub const MAX_PARTS: u32 = 10_000;
 
 /// Content type for the recorded WAV objects.
 pub const WAV_CONTENT_TYPE: &str = "audio/wav";
+/// Content type for recorded FLAC objects.
+pub const FLAC_CONTENT_TYPE: &str = "audio/flac";
 /// Content type for the recording manifest.
 pub const JSON_CONTENT_TYPE: &str = "application/json";
 

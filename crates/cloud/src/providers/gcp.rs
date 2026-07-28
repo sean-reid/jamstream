@@ -1041,6 +1041,7 @@ mod tests {
             idle_shutdown_min: 10,
             max_duration_min: max_hours * 60,
             self_destruct: crate::cloudinit::SelfDestruct::GcpMaxRunDuration,
+            recording: None,
         };
         let spec = |user_data: String| LaunchSpec {
             region: region.clone(),

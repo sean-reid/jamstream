@@ -61,12 +61,31 @@ write_files:
       fi
       active_up=$(cat /run/jamstream/guard-active-up 2>/dev/null || echo 0)
       idle=$((up - active_up))
+      reason=""
       if [ "$idle" -ge 600 ]; then
-        exec /usr/local/sbin/jamstream-self-destruct "idle for ${idle}s"
+        reason="idle for ${idle}s"
       fi
       if [ "$up" -ge 43200 ]; then
-        exec /usr/local/sbin/jamstream-self-destruct "max session duration reached"
+        reason="max session duration reached"
       fi
+      if [ -z "$reason" ]; then
+        rm -f /run/jamstream/guard-defer-up
+        exit 0
+      fi
+      # A recording upload in flight (a marker file under /run/jamstream/uploads) defers
+      # destruction, but never past the ceiling: a stuck upload keeping a VM
+      # alive forever is a worse failure than a lost recording.
+      if [ -n "$(ls -A /run/jamstream/uploads 2>/dev/null || true)" ]; then
+        if [ ! -f /run/jamstream/guard-defer-up ]; then
+          printf '%s\n' "$up" > /run/jamstream/guard-defer-up
+        fi
+        deferred=$((up - $(cat /run/jamstream/guard-defer-up)))
+        if [ "$deferred" -lt 600 ]; then
+          exit 0
+        fi
+        exec /usr/local/sbin/jamstream-self-destruct "$reason; upload still in flight after ${deferred}s, abandoning it to the lifecycle cleanup rule"
+      fi
+      exec /usr/local/sbin/jamstream-self-destruct "$reason"
   - path: /usr/local/sbin/jamstream-firewall
     owner: root:root
     permissions: "0700"
@@ -170,6 +189,13 @@ write_files:
       id jamstream >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin jamstream
       chgrp jamstream /etc/jamstream/config
       chmod 0640 /etc/jamstream/config
+      # The recording storage key, present only when the host turned recording
+      # on. Same handling as the config: root writes it, the service account
+      # reads it, nobody else sees it.
+      if [ -f /etc/jamstream/recording ]; then
+        chgrp jamstream /etc/jamstream/recording
+        chmod 0640 /etc/jamstream/recording
+      fi
       install -d -o jamstream -g jamstream -m 0750 /run/jamstream
       # jamstreamd updates this file's mtime while musicians are connected and the
       # guard reads it, so the server has to own it.
@@ -177,6 +203,9 @@ write_files:
       # Stream keys are staged here for the instant it takes to spawn a pusher.
       # /run is tmpfs, so nothing reaches persistent disk.
       install -d -o jamstream -g jamstream -m 0700 /run/jamstream/keys
+      # The recorder drops one marker file per in-flight upload; the guard defers
+      # self-destruct while any remain.
+      install -d -o jamstream -g jamstream -m 0700 /run/jamstream/uploads
       # A pusher's ffmpeg receives its ingest URL on stdin, but execs with it in
       # argv, so hide other processes' command lines from non-root. The VM has no
       # other users; this is the belt.
