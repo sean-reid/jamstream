@@ -22,6 +22,14 @@ const DEFAULT_ACTIVITY: &str = "/run/jamstream/last-active";
 const DEFAULT_REVOKED: &str = "/run/jamstream/revoked";
 
 fn main() -> ExitCode {
+    // The VM bootstrap runs `jamstreamd --version` once before enabling the
+    // unit, proving the binary executes on this machine at all; answer
+    // before anything touches the config so it works on a bare box.
+    if version_requested(std::env::args()) {
+        println!("jamstreamd {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -241,6 +249,11 @@ fn minutes_arg(flag: &str) -> Result<Duration, String> {
     }
 }
 
+/// True when any argument is `--version`; the flag takes no value.
+fn version_requested(mut args: impl Iterator<Item = String>) -> bool {
+    args.any(|arg| arg == "--version")
+}
+
 fn arg_value(flag: &str) -> Option<String> {
     let mut args = std::env::args();
     while let Some(arg) = args.next() {
@@ -253,8 +266,27 @@ fn arg_value(flag: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bind;
+    use super::{parse_bind, version_requested};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// #139: the bootstrap execs `jamstreamd --version` before enabling the
+    /// unit, so the flag must be recognized wherever it lands in argv and
+    /// must never require a config file. The full no-config run is proven
+    /// by the version integration test against the real binary.
+    #[test]
+    fn version_flag_is_found_anywhere_in_argv() {
+        let args = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(version_requested(
+            args(&["jamstreamd", "--version"]).into_iter()
+        ));
+        assert!(version_requested(
+            args(&["jamstreamd", "--config", "/tmp/c", "--version"]).into_iter()
+        ));
+        assert!(!version_requested(args(&["jamstreamd"]).into_iter()));
+        assert!(!version_requested(
+            args(&["jamstreamd", "--config", "/tmp/c"]).into_iter()
+        ));
+    }
 
     /// The default has to keep being every interface: a session VM that
     /// bound loopback would serve nobody, and no released host passes the

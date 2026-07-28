@@ -221,6 +221,10 @@ write_files:
       fi
       mv /usr/local/bin/jamstreamd.download /usr/local/bin/jamstreamd
       chmod 0755 /usr/local/bin/jamstreamd
+      # A simple-type unit's start job succeeds at fork, so a binary that dies at
+      # exec (say, the wrong architecture) would let this script exit 0 and disarm
+      # the trap. Running it once here makes that death the script's own failure.
+      /usr/local/bin/jamstreamd --version >/dev/null
       # The session server comes up first: musicians are waiting, and the broadcast
       # tooling is only needed once the host goes live.
       systemctl enable --now jamstreamd.service

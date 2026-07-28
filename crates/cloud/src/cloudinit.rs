@@ -564,6 +564,10 @@ if ! sha256sum -c {artifact_sha_file}; then
 fi
 mv {download} /usr/local/bin/jamstreamd
 chmod 0755 /usr/local/bin/jamstreamd
+# A simple-type unit's start job succeeds at fork, so a binary that dies at
+# exec (say, the wrong architecture) would let this script exit 0 and disarm
+# the trap. Running it once here makes that death the script's own failure.
+/usr/local/bin/jamstreamd --version >/dev/null
 # The session server comes up first: musicians are waiting, and the broadcast
 # tooling is only needed once the host goes live.
 systemctl enable --now jamstreamd.service
@@ -1211,6 +1215,30 @@ mod tests {
             // The broadcast tools are the one part a session can live
             // without, so their failure must not trip the trap.
             assert!(out.contains("session continues without it"));
+        }
+    }
+
+    /// #139: `systemctl enable --now` on a simple-type unit reports success
+    /// at fork, so a downloaded binary that dies at exec (an x86_64 build on
+    /// a Graviton machine) used to leave the bootstrap exiting 0, the trap
+    /// disarmed, and the VM billing with no server. The script must run the
+    /// binary itself, after the hash check and before the unit is enabled,
+    /// so an exec failure trips the trap and destroys the machine.
+    #[test]
+    fn the_binary_must_execute_before_the_unit_is_enabled() {
+        for sd in all_variants() {
+            let script = bootstrap_script(&base_config(sd));
+            let sha = at(&script, "sha256sum -c /etc/jamstream/artifact-sha256");
+            let exec = at(&script, "/usr/local/bin/jamstreamd --version >/dev/null");
+            let enable = at(&script, "systemctl enable --now jamstreamd.service");
+            assert!(
+                sha < exec,
+                "the binary must not run before its hash is proven"
+            );
+            assert!(
+                exec < enable,
+                "the exec check must come before the unit hides the failure"
+            );
         }
     }
 
