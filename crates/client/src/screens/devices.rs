@@ -79,32 +79,68 @@ impl Default for DevicesScreen {
     }
 }
 
+/// How a block is set. On its own screen each one is a panel, sitting on the
+/// window surface like every other panel in the app. In the settings drawer
+/// they are flat, because the drawer is already the panel and the sheets
+/// never put a card inside a card: Destinations and Invites read the same
+/// way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Block {
+    Panel,
+    Flat,
+}
+
+impl Block {
+    fn show(self, ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+        match self {
+            Block::Panel => {
+                theme::panel(ui).show(ui, |ui| {
+                    ui.set_width(ui.available_width().min(560.0));
+                    add(ui);
+                });
+            }
+            Block::Flat => add(ui),
+        }
+    }
+}
+
 impl DevicesScreen {
     /// The full-screen route: a focused column like home and the wizard.
-    pub fn ui(&mut self, ui: &mut Ui, catalog: &DeviceCatalog, levels: &LevelsView) {
-        theme::focused_column(ui, 560.0, |ui| self.panels_ui(ui, catalog, levels));
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        catalog: &DeviceCatalog,
+        levels: &LevelsView,
+        mouth_to_ear_ms: Option<f32>,
+    ) {
+        theme::focused_column(ui, 560.0, |ui| {
+            self.audio_ui(ui, Block::Panel, catalog, levels, mouth_to_ear_ms)
+        });
     }
 
-    /// The bare panels; also embedded in the settings window.
-    pub fn panels_ui(&mut self, ui: &mut Ui, catalog: &DeviceCatalog, levels: &LevelsView) {
-        theme::panel(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width().min(560.0));
-            ui.label(theme::title(ui, "Devices"));
-            egui::Grid::new("device-grid")
-                .num_columns(2)
-                .spacing(vec2(theme::SPACE_LG, 6.0))
-                .show(ui, |ui| {
-                    ui.label(theme::muted(ui, "Capture"));
-                    device_combo(ui, "capture", &catalog.capture, &mut self.capture_idx);
-                    ui.end_row();
-                    ui.label(theme::muted(ui, "Playback"));
-                    device_combo(ui, "playback", &catalog.playback, &mut self.playback_idx);
-                    ui.end_row();
-                });
-        });
+    /// The audio blocks; also embedded in the settings drawer.
+    ///
+    /// Buffer size and the input meter come first because they are what a
+    /// musician reaches for mid session, by ear and by meter, while the
+    /// device pickers are set once. Whatever is last is what a short window
+    /// puts behind a scroll, so the order is the priority.
+    pub fn audio_ui(
+        &mut self,
+        ui: &mut Ui,
+        block: Block,
+        catalog: &DeviceCatalog,
+        levels: &LevelsView,
+        mouth_to_ear_ms: Option<f32>,
+    ) {
+        self.buffer_ui(ui, block, mouth_to_ear_ms);
         ui.add_space(theme::SPACE_MD);
-        theme::panel(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width().min(560.0));
+        input_level_ui(ui, block, levels);
+        ui.add_space(theme::SPACE_MD);
+        self.devices_ui(ui, block, catalog);
+    }
+
+    fn buffer_ui(&mut self, ui: &mut Ui, block: Block, mouth_to_ear_ms: Option<f32>) {
+        block.show(ui, |ui| {
             ui.label(theme::title(ui, "Buffer size"));
             ui.label(theme::muted(
                 ui,
@@ -121,34 +157,88 @@ impl DevicesScreen {
                     self.buffer_frames = frames;
                 }
             }
+            // The number the choice is being traded against. The capture
+            // buffer is one of the four terms in mouth to ear, so this moves
+            // with the pick, and the same figure in the same monospace is in
+            // the status bar. Outside a session nothing has been measured,
+            // and a placeholder would be an instrument reading a made-up
+            // number, so the row is absent instead.
+            if let Some(ms) = mouth_to_ear_ms {
+                ui.add_space(theme::SPACE_SM);
+                ui.horizontal(|ui| {
+                    ui.label(theme::mono(ui, format!("{ms:.1} ms")));
+                    ui.label(theme::muted(ui, "mouth to ear"));
+                });
+            }
         });
-        ui.add_space(theme::SPACE_MD);
-        theme::panel(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width().min(560.0));
-            ui.label(theme::title(ui, "Input level"));
-            ui.horizontal(|ui| {
-                meter(
-                    ui,
-                    "devices-input",
-                    levels.input_peak,
-                    levels.input_rms,
-                    vec2(220.0, 12.0),
-                    Meter::Horizontal,
-                );
-                ui.label(theme::muted(ui, "speak or play to check the meter moves"));
-            });
+    }
+
+    fn devices_ui(&mut self, ui: &mut Ui, block: Block, catalog: &DeviceCatalog) {
+        block.show(ui, |ui| {
+            ui.label(theme::title(ui, "Devices"));
+            // The pickers take the width that is left rather than a fixed
+            // 280 px. A row wider than its container widens the sheet around
+            // it, which is how the settings sheet came to be half again as
+            // wide as the width it asks for.
+            let combo_w =
+                (ui.available_width() - DEVICE_LABEL_W - theme::SPACE_LG).clamp(140.0, 280.0);
+            egui::Grid::new("device-grid")
+                .num_columns(2)
+                .min_col_width(DEVICE_LABEL_W)
+                .spacing(vec2(theme::SPACE_LG, 6.0))
+                .show(ui, |ui| {
+                    ui.label(theme::muted(ui, "Capture"));
+                    device_combo(
+                        ui,
+                        "capture",
+                        &catalog.capture,
+                        &mut self.capture_idx,
+                        combo_w,
+                    );
+                    ui.end_row();
+                    ui.label(theme::muted(ui, "Playback"));
+                    device_combo(
+                        ui,
+                        "playback",
+                        &catalog.playback,
+                        &mut self.playback_idx,
+                        combo_w,
+                    );
+                    ui.end_row();
+                });
         });
     }
 }
 
-fn device_combo(ui: &mut Ui, id: &str, devices: &[DeviceInfo], selected: &mut usize) {
+/// The label column in the device grid: "Capture" and "Playback".
+const DEVICE_LABEL_W: f32 = 66.0;
+
+fn input_level_ui(ui: &mut Ui, block: Block, levels: &LevelsView) {
+    block.show(ui, |ui| {
+        ui.label(theme::title(ui, "Input level"));
+        // The meter spans the full width and its line sits under it. Side by
+        // side, the two needed more width than the drawer has.
+        let w = ui.available_width();
+        meter(
+            ui,
+            "devices-input",
+            levels.input_peak,
+            levels.input_rms,
+            vec2(w, 12.0),
+            Meter::Horizontal,
+        );
+        ui.label(theme::muted(ui, "speak or play to check the meter moves"));
+    });
+}
+
+fn device_combo(ui: &mut Ui, id: &str, devices: &[DeviceInfo], selected: &mut usize, width: f32) {
     if devices.is_empty() {
         ui.label(theme::muted(ui, "no devices found"));
         return;
     }
     *selected = (*selected).min(devices.len() - 1);
     ComboBox::from_id_salt(id)
-        .width(280.0)
+        .width(width)
         .selected_text(devices[*selected].name.clone())
         .show_ui(ui, |ui| {
             for (i, dev) in devices.iter().enumerate() {

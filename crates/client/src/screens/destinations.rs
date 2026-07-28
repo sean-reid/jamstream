@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use egui::{Align, Align2, Button, Layout, RichText, Stroke, TextEdit, Ui, vec2};
+use egui::{Align, Align2, Button, Layout, RichText, TextEdit, Ui, vec2};
 use jamstream_stream::PlatformCatalog;
 use zeroize::Zeroize;
 
@@ -290,18 +290,10 @@ impl DestinationsPanel {
 
 impl DestinationsPanel {
     pub fn ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, open: &mut bool) {
-        let panel = {
-            let p = theme::palette_of(ui);
-            egui::Frame::new()
-                .fill(p.surface1)
-                .stroke(Stroke::new(1.0, p.border))
-                .corner_radius(egui::CornerRadius::same(theme::RADIUS))
-                .inner_margin(egui::Margin::same(14))
-        };
         egui::Window::new("Destinations")
             .title_bar(false)
-            .frame(panel)
-            .anchor(Align2::RIGHT_TOP, vec2(-10.0, 56.0))
+            .frame(theme::sheet_frame(theme::palette_of(ui)))
+            .anchor(Align2::RIGHT_TOP, theme::SHEET_OFFSET)
             .fixed_size(vec2(460.0, 0.0))
             .resizable(false)
             .show(ui.ctx(), |ui| {
