@@ -1407,3 +1407,37 @@ async fn a_denied_call_is_not_retried() {
         .await
         .unwrap_err();
 }
+
+#[tokio::test]
+async fn preflight_surfaces_a_missing_describe_permission() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DescribeSecurityGroups"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(error_body(
+            "UnauthorizedOperation",
+            "You are not authorized to perform: ec2:DescribeSecurityGroups",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = provider(&server).preflight().await.unwrap_err();
+    assert!(
+        err.to_string().contains("ec2:DescribeSecurityGroups"),
+        "the action name has to survive: {err}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_passes_when_describe_is_allowed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DescribeSecurityGroups"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<DescribeSecurityGroupsResponse><securityGroupInfo/>\
+             </DescribeSecurityGroupsResponse>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    provider(&server).preflight().await.unwrap();
+}

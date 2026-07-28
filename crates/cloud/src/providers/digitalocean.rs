@@ -684,6 +684,21 @@ impl Provider for DigitalOceanProvider {
         Ok(())
     }
 
+    /// One firewall list: the cheapest read in the scope group a launch
+    /// hits first. A token minted without the firewall scopes 403s here at
+    /// credential-check time instead of at launch, with the scope names in
+    /// the error so the fix is on screen.
+    async fn preflight(&self) -> Result<()> {
+        self.firewalls().await.map_err(|e| match e {
+            ProviderError::Auth(msg) => ProviderError::Auth(format!(
+                "{msg} (listing firewalls; the token needs the firewall:create, \
+                 firewall:read, firewall:delete scopes to launch)"
+            )),
+            other => other,
+        })?;
+        Ok(())
+    }
+
     async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>> {
         let tag = match session_tag {
             Some(id) => session_do_tag(id),
