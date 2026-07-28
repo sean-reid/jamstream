@@ -1,7 +1,10 @@
 use std::fmt;
 use std::net::IpAddr;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+use crate::provider::ProviderError;
 
 /// Tag key applied to every resource JamStream creates. The value is the
 /// session id; the sweeper keys off this and nothing else.
@@ -74,6 +77,18 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    /// Every provider, in the order the CLI and the app offer them. A fifth
+    /// one is a compile error here rather than a name some list forgot.
+    pub const ALL: [ProviderKind; 4] = [
+        ProviderKind::Local,
+        ProviderKind::DigitalOcean,
+        ProviderKind::Aws,
+        ProviderKind::Gcp,
+    ];
+
+    /// The one spelling of this provider's name. Config files, session
+    /// records, keychain entries, and error messages all use it, and
+    /// [`ProviderKind::from_str`] is its only inverse.
     pub fn as_str(&self) -> &'static str {
         match self {
             ProviderKind::Aws => "aws",
@@ -82,11 +97,49 @@ impl ProviderKind {
             ProviderKind::Local => "local",
         }
     }
+
+    /// True when this provider has an S3-compatible bucket a recording can go
+    /// to. A local session records to the host's own disk instead.
+    pub fn has_object_storage(&self) -> bool {
+        match self {
+            ProviderKind::Aws | ProviderKind::DigitalOcean | ProviderKind::Gcp => true,
+            ProviderKind::Local => false,
+        }
+    }
+
+    /// Comma-separated names, for an error that has to say what it would have
+    /// accepted.
+    pub fn name_list(kinds: impl IntoIterator<Item = ProviderKind>) -> String {
+        kinds
+            .into_iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl fmt::Display for ProviderKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// The inverse of [`ProviderKind::as_str`], accepting that spelling and
+/// nothing else beyond surrounding space and case.
+impl FromStr for ProviderKind {
+    type Err = ProviderError;
+
+    fn from_str(s: &str) -> Result<Self, ProviderError> {
+        let normalized = s.trim().to_ascii_lowercase();
+        ProviderKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == normalized)
+            .ok_or_else(|| {
+                ProviderError::Other(format!(
+                    "unknown provider {s:?}; known providers are {}",
+                    ProviderKind::name_list(ProviderKind::ALL)
+                ))
+            })
     }
 }
 
@@ -344,5 +397,54 @@ mod tests {
         assert_eq!(ProviderKind::DigitalOcean.as_str(), "digitalocean");
         assert_eq!(ProviderKind::Gcp.as_str(), "gcp");
         assert_eq!(ProviderKind::Local.as_str(), "local");
+    }
+
+    #[test]
+    fn every_provider_name_parses_back_to_the_kind_it_names() {
+        for kind in ProviderKind::ALL {
+            assert_eq!(kind.as_str().parse::<ProviderKind>().unwrap(), kind);
+            // Config files and flags arrive with whatever spacing and case a
+            // host typed.
+            let typed = format!("  {}  ", kind.as_str().to_ascii_uppercase());
+            assert_eq!(typed.parse::<ProviderKind>().unwrap(), kind);
+        }
+        // ALL is a set, not a list that grew a duplicate.
+        let mut names: Vec<&str> = ProviderKind::ALL.iter().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique);
+    }
+
+    #[test]
+    fn an_unknown_provider_name_lists_the_ones_that_exist() {
+        let err = "azure".parse::<ProviderKind>().unwrap_err().to_string();
+        assert!(err.contains("azure"), "{err}");
+        for kind in ProviderKind::ALL {
+            assert!(err.contains(kind.as_str()), "{err} omits {kind}");
+        }
+        // Not a name, not a kind: an empty provider must not resolve to one.
+        assert!("".parse::<ProviderKind>().is_err());
+        assert!("digital ocean".parse::<ProviderKind>().is_err());
+    }
+
+    #[test]
+    fn only_the_local_provider_has_no_bucket() {
+        assert!(!ProviderKind::Local.has_object_storage());
+        for kind in ProviderKind::ALL {
+            assert_eq!(
+                kind.has_object_storage(),
+                kind != ProviderKind::Local,
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            ProviderKind::name_list(
+                ProviderKind::ALL
+                    .into_iter()
+                    .filter(|k| k.has_object_storage())
+            ),
+            "digitalocean, aws, gcp"
+        );
     }
 }

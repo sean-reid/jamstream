@@ -13,10 +13,18 @@ use jamstream_cloud::{DEFAULT_SESSION_PORT, MockProvider, Provider, ProviderKind
 use crate::CliError;
 use crate::state;
 
-/// Every provider name this build recognizes. The mock is last and stays
-/// out of help text and error messages; it exists for tests and launches
-/// nothing real.
-pub const KNOWN_PROVIDERS: &[&str] = &["local", "digitalocean", "aws", "gcp", "mock"];
+/// The name of the test-only provider, which launches nothing real and stays
+/// out of help text and error messages. Every other name is
+/// [`ProviderKind`]'s.
+pub const MOCK_PROVIDER: &str = "mock";
+
+/// Every provider name this build recognizes, the mock last.
+pub fn known_providers() -> impl Iterator<Item = &'static str> {
+    ProviderKind::ALL
+        .into_iter()
+        .map(|kind| kind.as_str())
+        .chain(std::iter::once(MOCK_PROVIDER))
+}
 
 /// Where the local provider keeps its process registry and per-session
 /// server configs: the same JAMSTREAM_STATE_DIR override the session state
@@ -73,7 +81,7 @@ pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
 /// the same directory `jamstream host` prints. Recording on any other
 /// provider is refused by `host::run`, where the refusal can say why.
 pub fn resolve_for_host(args: &crate::cli::HostArgs) -> Result<Box<dyn Provider>, CliError> {
-    if args.provider == "local" && args.wants_recording() {
+    if args.provider.parse().ok() == Some(ProviderKind::Local) && args.wants_recording() {
         return resolve_local_recording(args.record_stems);
     }
     resolve_for_port(&args.provider, args.port)
@@ -92,25 +100,28 @@ pub fn resolve_local_recording(stems: bool) -> Result<Box<dyn Provider>, CliErro
 /// so `jamstream host --port` has to reach the provider or the VM comes up
 /// behind a firewall for a different port.
 pub fn resolve_for_port(name: &str, session_port: u16) -> Result<Box<dyn Provider>, CliError> {
-    match name {
-        "local" => Ok(Box::new(local_provider()?)),
-        // The mock needs some underlying kind for its instances; Aws is
-        // arbitrary and never leaves the process.
-        "mock" => Ok(Box::new(
+    // The mock needs some underlying kind for its instances; Aws is arbitrary
+    // and never leaves the process. It is matched before the parse because it
+    // is not a ProviderKind at all.
+    if name.trim() == MOCK_PROVIDER {
+        return Ok(Box::new(
             MockProvider::with_default_regions(ProviderKind::Aws).with_session_port(session_port),
-        )),
-        "aws" => AwsProvider::from_env()
+        ));
+    }
+    // One parser, so a fifth provider is a missing match arm here rather than
+    // a name that silently resolves to nothing.
+    let kind: ProviderKind = name.parse().map_err(|e| CliError::Usage(format!("{e}")))?;
+    match kind {
+        ProviderKind::Local => Ok(Box::new(local_provider()?)),
+        ProviderKind::Aws => AwsProvider::from_env()
             .map(|p| boxed(p.with_session_port(session_port)))
-            .map_err(|err| creds_error("aws", &err.to_string())),
-        "digitalocean" => DigitalOceanProvider::from_env()
+            .map_err(|err| creds_error(kind, &err.to_string())),
+        ProviderKind::DigitalOcean => DigitalOceanProvider::from_env()
             .map(|p| boxed(p.with_session_port(session_port)))
-            .map_err(|err| creds_error("digitalocean", &err.to_string())),
-        "gcp" => GcpProvider::from_env()
+            .map_err(|err| creds_error(kind, &err.to_string())),
+        ProviderKind::Gcp => GcpProvider::from_env()
             .map(|p| boxed(p.with_session_port(session_port)))
-            .map_err(|err| creds_error("gcp", &err.to_string())),
-        other => Err(CliError::Usage(format!(
-            "unknown provider {other:?}; known providers are local, digitalocean, aws, gcp"
-        ))),
+            .map_err(|err| creds_error(kind, &err.to_string())),
     }
 }
 
@@ -118,8 +129,7 @@ pub fn resolve_for_port(name: &str, session_port: u16) -> Result<Box<dyn Provide
 /// local and the mock, which need none. Sweep runs across all of them, so
 /// stray local servers are found like any cloud stray.
 pub fn resolve_all() -> Vec<Box<dyn Provider>> {
-    KNOWN_PROVIDERS
-        .iter()
+    known_providers()
         .filter_map(|name| resolve(name).ok())
         .collect()
 }
@@ -128,9 +138,9 @@ fn boxed<P: Provider + 'static>(p: P) -> Box<dyn Provider> {
     Box::new(p)
 }
 
-fn creds_error(name: &str, detail: &str) -> CliError {
+fn creds_error(kind: ProviderKind, detail: &str) -> CliError {
     CliError::Usage(format!(
-        "provider {name}: {detail}. Use --provider local to host on this computer \
+        "provider {kind}: {detail}. Use --provider local to host on this computer \
          without credentials."
     ))
 }
@@ -218,7 +228,25 @@ mod tests {
             .to_string();
         assert!(err.contains("azure"));
         assert!(err.contains("local, digitalocean, aws, gcp"));
-        assert!(!err.contains("mock"));
+        assert!(!err.contains(MOCK_PROVIDER));
+    }
+
+    // Every name this build answers to, and nothing else. The mock is
+    // resolvable but stays out of the enum, and out of any error a host sees.
+    #[test]
+    fn the_known_names_are_the_provider_kinds_plus_the_mock() {
+        let names: Vec<&str> = known_providers().collect();
+        assert_eq!(names, vec!["local", "digitalocean", "aws", "gcp", "mock"]);
+        for name in known_providers() {
+            if name == MOCK_PROVIDER {
+                continue;
+            }
+            assert_eq!(
+                name.parse::<ProviderKind>().unwrap().as_str(),
+                name,
+                "{name} is not a provider name"
+            );
+        }
     }
 
     #[test]
