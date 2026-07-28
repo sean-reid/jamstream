@@ -97,6 +97,18 @@ zeroize = "1"
 # posture and fuzzes the decoder nightly.
 opus = { package = "opusic-c", version = "~1.6" }
 rubato = "4"
+# Pure-Rust FLAC encoder for session recording; nothing to cross-compile for
+# the musl and Windows builds. default-features off drops `par` (a
+# crossbeam-channel worker pool: the recorder already encodes on its own
+# thread and a 2 vCPU VM has nowhere to fan out to), `serde` (config files we
+# never read) and `log`. What it adds to the lock is crc + crc-catalog,
+# heapless + hash32, md-5, seq-macro, and `built` at build time, all pure
+# Rust. flac-codec was the alternative and asks for rust-version 1.88, above
+# this workspace's 1.85.
+flacenc = { version = "0.5", default-features = false }
+# FLAC decoder, dev-only: recordings are verified by decoding with an
+# independent implementation, never with the encoder's own decode feature.
+claxon = "0.4"
 cpal = "0.18"
 rtrb = "0.3"
 hound = "3"

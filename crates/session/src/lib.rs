@@ -18,7 +18,8 @@ pub use limits::{
     DEFAULT_MEMBER_TIMEOUT_MS, DEFAULT_MUSICIANS, MAX_LISTENERS, MAX_MUSICIANS, VIOLATION_BURST,
 };
 pub use server::{
-    BroadcastMember, BroadcastTick, MemberStats, ServerConfig, ServerCore, ServerEvent,
+    BroadcastMember, BroadcastTick, MemberStats, ServerConfig, ServerCore, ServerEvent, Stem,
+    TICK_SAMPLES,
 };
 
 /// Errors surfaced by client-side calls; the cores otherwise swallow bad
