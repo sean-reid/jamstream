@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use jamstream_audio_io::WavBackend;
 use jamstream_client::live::{AudioSettings, LiveRuntime};
-use jamstream_client::runtime::{Command, ConnState, MemberId, Runtime, Snapshot};
-use jamstream_protocol::ids::{Role, SessionId, TokenId};
+use jamstream_client::runtime::{Command, ConnState, MemberId, RecordState, Runtime, Snapshot};
+use jamstream_protocol::ids::{HOST_MEMBER_ID, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
 use jamstream_server::config::Config;
-use jamstream_server::runtime::{Options, Server};
+use jamstream_server::runtime::{Options, RecordingOptions, Server};
 
 const RATE: u32 = 48_000;
 
@@ -31,7 +31,23 @@ struct TestServer {
 }
 
 impl TestServer {
+    /// A session that was never armed to record, which is every session the
+    /// app's own launch wizard makes.
     fn start() -> Self {
+        TestServer::with_recording(None)
+    }
+
+    /// A session armed to record to a directory, as `jamstream host
+    /// --record` arms the server it spawns.
+    fn recording_to(dir: &Path) -> Self {
+        std::fs::create_dir_all(dir).expect("record dir");
+        TestServer::with_recording(Some(RecordingOptions::Disk {
+            dir: dir.to_path_buf(),
+            stems: false,
+        }))
+    }
+
+    fn with_recording(recording: Option<RecordingOptions>) -> Self {
         let issuer = Issuer::generate();
         let keys = generate_keypair();
         let session_id = SessionId::generate();
@@ -54,7 +70,7 @@ impl TestServer {
                 Options {
                     bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                     activity_path: None,
-                    recording: None,
+                    recording,
                 },
             )
             .await
@@ -557,4 +573,131 @@ fn reconfigure_audio_swaps_the_stream_mid_session() {
     for p in [&sine, &out_b] {
         let _ = std::fs::remove_file(p);
     }
+}
+
+/// Finished takes under `dir`: `.flac` files, never `.part` leftovers.
+fn finished_takes(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "flac"))
+        .collect()
+}
+
+/// User story: the host presses Record in the app, the lamp goes red for
+/// everyone, and the room's music is in a file afterwards.
+///
+/// This is the only test that crosses from the command the record sheet's
+/// button sends to a take on disk. `interactions.rs` proves the button
+/// emits `StartRecord`, but into a fake runtime that does nothing except
+/// collect commands, and the server's own suite proves `record_ctl`
+/// records. Between those two halves sat the seam of #164: recording no
+/// surface could reach, while both halves stayed green. `LiveRuntime`'s
+/// dispatch has an arm that ignores `StartRecord` a screen above the arm
+/// that routes it, so dropping the routing is a plausible edit that
+/// nothing else in the suite would notice.
+#[test]
+fn the_host_pressing_record_lands_a_take_and_lights_the_lamp() {
+    let takes = temp_path("record", "takes");
+    let _ = std::fs::remove_dir_all(&takes);
+    let server = TestServer::recording_to(&takes);
+    let sine = sine_fixture("record", 440.0);
+
+    // Member 0 is the host seat, and the server refuses record control
+    // from anybody else, so it is the only seat this could pass from.
+    let host = LiveRuntime::join_offline(
+        &server.invite(HOST_MEMBER_ID.0, "host"),
+        settings(),
+        WavBackend::new(Some(sine.clone()), None),
+    )
+    .expect("join host");
+    let snap = wait_for(&host, "the host joined", Duration::from_secs(10), joined);
+    assert!(snap.is_host, "member 0 holds the host seat");
+    assert_eq!(snap.record.state, RecordState::Idle, "nothing recorded yet");
+    assert!(
+        finished_takes(&takes).is_empty(),
+        "no take before the press"
+    );
+
+    host.send(Command::StartRecord);
+    // The lamp the record sheet paints, which only turns red on the
+    // server's own status report; there is no optimistic echo to mistake
+    // for the recorder having started.
+    wait_for(&host, "the record lamp", Duration::from_secs(10), |s| {
+        s.record.state == RecordState::Recording
+    });
+
+    // Half a second of the sine through the mix tick, then end the take.
+    std::thread::sleep(Duration::from_millis(500));
+    host.send(Command::StopRecord);
+    wait_for(&host, "the take to end", Duration::from_secs(10), |s| {
+        s.record.state == RecordState::Idle
+    });
+    host.send(Command::Leave);
+    wait_for(&host, "the host idle", Duration::from_secs(3), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(host);
+
+    // The rename off `.part` happens on the recorder's own thread, so it
+    // is waited for rather than assumed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let take = loop {
+        let found = finished_takes(&takes);
+        if let [take] = found.as_slice() {
+            break take.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the take never landed in {}: {found:?}",
+            takes.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let name = take.file_name().expect("take name").to_string_lossy();
+    assert!(name.ends_with("-mix.flac"), "named as a mix: {name}");
+    let bytes = std::fs::read(&take).expect("read the take");
+    assert_eq!(&bytes[..4], b"fLaC", "the take is a flac stream");
+    // The host's sine, not an empty container and not silence: FLAC codes
+    // half a second of silence as a handful of constant blocks, a couple of
+    // hundred bytes all in, while half a second of 440 Hz stereo runs to
+    // tens of kilobytes. The floor sits an order of magnitude above the
+    // first and an order below the second.
+    assert!(
+        bytes.len() > 2_048,
+        "the take holds no audio: {} bytes",
+        bytes.len()
+    );
+
+    let _ = std::fs::remove_file(&sine);
+    let _ = std::fs::remove_dir_all(&takes);
+}
+
+/// The other half of the same contract: a session nobody armed to record
+/// must say so in the lamp rather than swallow the press. That is what a
+/// host who launched from the app sees today, because the app's own launch
+/// wizard hardcodes `recording: None` (#164), so it is the path most
+/// presses of that button currently take.
+#[test]
+fn record_on_an_unarmed_session_fails_visibly_in_the_lamp() {
+    let server = TestServer::start();
+    let host = join_silent(&server, HOST_MEMBER_ID.0, "host");
+    wait_for(&host, "the host joined", Duration::from_secs(10), joined);
+
+    host.send(Command::StartRecord);
+    let snap = wait_for(&host, "the refusal", Duration::from_secs(10), |s| {
+        matches!(s.record.state, RecordState::Failed { .. })
+    });
+    let RecordState::Failed { reason } = snap.record.state else {
+        unreachable!("the predicate above matched Failed")
+    };
+    assert!(
+        reason.contains("not configured"),
+        "the lamp must say why, verbatim from the server: {reason:?}"
+    );
+
+    host.send(Command::Leave);
+    drop(host);
 }

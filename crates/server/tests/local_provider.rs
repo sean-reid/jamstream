@@ -32,19 +32,62 @@ fn server_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_jamstreamd"))
 }
 
-/// Bind-then-drop; racy in principle, unique enough in practice.
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A port the kernel handed out, kept reserved by holding the socket until
+/// the server is about to take it. Bind-then-drop hands the port straight
+/// back, so between the pick and the spawn any of the other three tests in
+/// this binary (nextest runs them concurrently, each in its own process)
+/// can be given the same one and the loser's server dies on a bind error.
+/// Holding it narrows that window to the instant of the spawn itself.
+struct ReservedPort {
+    socket: Option<std::net::UdpSocket>,
+    port: u16,
 }
+
+impl ReservedPort {
+    fn reserve() -> ReservedPort {
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        ReservedPort {
+            socket: Some(socket),
+            port,
+        }
+    }
+
+    /// Hands the port back to the kernel. Called immediately before the
+    /// server that is to bind it starts, and never earlier.
+    fn release(&mut self) {
+        self.socket.take();
+    }
+}
+
+/// Kills the spawned server unless it has already exited. These tests are
+/// about servers that outlive their launcher, so a panic between the spawn
+/// and the wait must not leave one running: the drop on the way out is the
+/// only thing that can clean up after a failure.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            eprintln!("test left jamstreamd {} running; killing it", self.0.id());
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// Every server these tests spawn is confined to loopback. Without it
+/// jamstreamd binds every interface, and the macOS Application Firewall
+/// filters incoming connections per binary: every rebuild is a new binary,
+/// so an unconfined server raises a dialog and drops this test's datagrams
+/// until somebody answers it. Loopback is the one path it does not govern.
+const BIND: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
 struct SessionMaterial {
     issuer: Issuer,
     server_public: [u8; 32],
     session_id: SessionId,
+    reserved: ReservedPort,
     port: u16,
     flat_config: String,
 }
@@ -53,7 +96,8 @@ fn session_material(idle_shutdown_min: u32) -> SessionMaterial {
     let issuer = Issuer::generate();
     let server_keys = generate_keypair();
     let session_id = SessionId::generate();
-    let port = free_udp_port();
+    let reserved = ReservedPort::reserve();
+    let port = reserved.port;
     let cfg = BootConfig {
         // Artifact fields feed the cloud bootstrap script only; they do
         // not appear in the flat config the local provider consumes.
@@ -74,6 +118,7 @@ fn session_material(idle_shutdown_min: u32) -> SessionMaterial {
         flat_config: cfg.render_flat_config(),
         issuer,
         session_id,
+        reserved,
         port,
     }
 }
@@ -143,9 +188,12 @@ async fn join_musician(mat: &SessionMaterial, name: &str) -> (ClientCore, UdpSoc
 #[tokio::test]
 async fn launch_join_destroy_end_to_end() {
     let dir = temp_dir("e2e");
-    let provider = LocalProvider::new(dir.clone()).with_server_binary(server_binary());
-    let mat = session_material(10);
+    let provider = LocalProvider::new(dir.clone())
+        .with_server_binary(server_binary())
+        .with_bind(IpAddr::V4(BIND));
+    let mut mat = session_material(10);
 
+    mat.reserved.release();
     let instance = provider
         .launch(launch_spec(&provider, &mat, "e2e-session"))
         .await
@@ -202,9 +250,12 @@ async fn launch_join_destroy_end_to_end() {
 #[tokio::test]
 async fn registry_survives_provider_restart() {
     let dir = temp_dir("sweeper");
-    let mat = session_material(10);
+    let mut mat = session_material(10);
+    mat.reserved.release();
     let instance = {
-        let provider = LocalProvider::new(dir.clone()).with_server_binary(server_binary());
+        let provider = LocalProvider::new(dir.clone())
+            .with_server_binary(server_binary())
+            .with_bind(IpAddr::V4(BIND));
         provider
             .launch(launch_spec(&provider, &mat, "sweep-session"))
             .await
@@ -233,32 +284,36 @@ async fn registry_survives_provider_restart() {
 #[test]
 fn idle_exit_terminates_an_unjoined_server() {
     let dir = temp_dir("idle");
-    let mat = session_material(10);
+    let mut mat = session_material(10);
     let config_path = dir.join("config");
     std::fs::write(&config_path, &mat.flat_config).unwrap();
 
-    let mut child = std::process::Command::new(server_binary())
-        .arg("--config")
-        .arg(&config_path)
-        .arg("--activity-file")
-        .arg(dir.join("last-active"))
-        .arg("--idle-exit-min")
-        .arg("0.05")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn jamstreamd");
+    mat.reserved.release();
+    let mut child = ChildGuard(
+        std::process::Command::new(server_binary())
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--bind")
+            .arg(BIND.to_string())
+            .arg("--activity-file")
+            .arg(dir.join("last-active"))
+            .arg("--idle-exit-min")
+            .arg("0.05")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn jamstreamd"),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
+        if let Some(status) = child.0.try_wait().expect("try_wait") {
             break status;
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("server never idle-exited within 15 s");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "server never idle-exited within 15 s"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(status.success(), "idle exit must be a clean exit: {status}");
@@ -277,21 +332,26 @@ fn idle_exit_terminates_an_unjoined_server() {
 #[tokio::test]
 async fn max_duration_ends_an_occupied_session() {
     let dir = temp_dir("maxdur");
-    let mat = session_material(10);
+    let mut mat = session_material(10);
     let config_path = dir.join("config");
     std::fs::write(&config_path, &mat.flat_config).unwrap();
 
-    let mut child = std::process::Command::new(server_binary())
-        .arg("--config")
-        .arg(&config_path)
-        .arg("--activity-file")
-        .arg(dir.join("last-active"))
-        .arg("--max-duration-min")
-        .arg("0.05")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn jamstreamd");
+    mat.reserved.release();
+    let mut child = ChildGuard(
+        std::process::Command::new(server_binary())
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--bind")
+            .arg(BIND.to_string())
+            .arg("--activity-file")
+            .arg(dir.join("last-active"))
+            .arg("--max-duration-min")
+            .arg("0.05")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn jamstreamd"),
+    );
 
     let (mut client, socket, start) = join_musician(&mat, "capped").await;
     let now = || start.elapsed().as_millis() as u64;
@@ -302,14 +362,13 @@ async fn max_duration_ends_an_occupied_session() {
     let mut told = false;
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
+        if let Some(status) = child.0.try_wait().expect("try_wait") {
             break status;
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("server never hit the max-duration cap within 15 s");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "server never hit the max-duration cap within 15 s"
+        );
         for pkt in client.poll(now()) {
             let _ = socket.send(&pkt).await;
         }
