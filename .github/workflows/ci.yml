@@ -179,10 +179,22 @@ jobs:
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-nextest
+      # JAMSTREAM_PERF_BUDGET_SECS was set only on the harness job, so a
+      # wall-clock deadline in any suite that runs here had nothing to scale
+      # itself by on a shared runner. That is why the absolute tick gate had to
+      # live in the harness suite even though the tighter distribution is here:
+      # loopback measures p99 647 us against a 718 us max, against p99 1558 us
+      # and a 20084 us max through the full network simulation. Same value as
+      # the harness job, so every scaled deadline in the repo agrees on one
+      # number.
       - if: runner.os == 'macOS'
         run: cargo nextest run --locked --workspace --exclude jamstream-harness
+        env:
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
       - if: runner.os != 'macOS'
         run: cargo nextest run --locked --workspace --exclude jamstream-harness --exclude jamstream-client
+        env:
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
       # `cargo xtask fixtures` was invoked by nothing, and its WAV generator is
       # duplicated verbatim into crates/cli/tests/common/mod.rs with "keep them
       # in sync" written in a doc comment and enforced nowhere. The nextest run
