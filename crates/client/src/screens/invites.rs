@@ -420,18 +420,10 @@ impl InvitesPanel {
         open: &mut bool,
     ) -> Option<InvitesEvent> {
         let mut event = None;
-        let panel = {
-            let p = theme::palette_of(ui);
-            egui::Frame::new()
-                .fill(p.surface1)
-                .stroke(egui::Stroke::new(1.0, p.border))
-                .corner_radius(egui::CornerRadius::same(theme::RADIUS))
-                .inner_margin(egui::Margin::same(14))
-        };
         egui::Window::new("Invites")
             .title_bar(false)
-            .frame(panel)
-            .anchor(Align2::RIGHT_TOP, vec2(-10.0, 56.0))
+            .frame(theme::sheet_frame(theme::palette_of(ui)))
+            .anchor(Align2::RIGHT_TOP, theme::SHEET_OFFSET)
             .fixed_size(vec2(430.0, 0.0))
             .resizable(false)
             .show(ui.ctx(), |ui| {

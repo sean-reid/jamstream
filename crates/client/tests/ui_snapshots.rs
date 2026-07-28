@@ -314,6 +314,18 @@ fn session_settings() {
 }
 
 #[test]
+fn session_settings_narrow() {
+    // The drawer at the smallest window the app opens, over the busiest
+    // session there is: buffer size and input level are both on screen with
+    // the two-row host bar under them, and the mouth-to-ear readout the
+    // buffer is traded against is visible in both places at once.
+    let mut app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
+    app.settings_open = true;
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_settings_narrow");
+}
+
+#[test]
 fn session_settings_avatar() {
     // The other half of the avatar row: a photograph picked this run,
     // through the same read, fit, and decode a picked file goes through, so

@@ -86,6 +86,10 @@ pub struct SessionScreen {
     /// exactly like the invites panel.
     pub destinations: Option<DestinationsPanel>,
     pub destinations_open: bool,
+    /// Where the status bar starts, from this frame. The settings drawer is
+    /// drawn after the screen and stops here, so it never covers the
+    /// mouth-to-ear readout or the meters a musician adjusts against.
+    pub status_bar_top: Option<f32>,
 }
 
 impl SessionScreen {
@@ -125,9 +129,10 @@ impl SessionScreen {
             }
         }
 
-        egui::Panel::bottom(egui::Id::new("session-status"))
+        let bar = egui::Panel::bottom(egui::Id::new("session-status"))
             .show_separator_line(true)
             .show(ui, |ui| self.status_bar(ui, snap));
+        self.status_bar_top = Some(bar.response.rect.top());
 
         if !narrow {
             egui::Panel::right(egui::Id::new("session-chat"))
@@ -408,18 +413,10 @@ impl SessionScreen {
         let Some(broadcast) = &snap.broadcast else {
             return;
         };
-        let panel = {
-            let p = theme::palette_of(ui);
-            egui::Frame::new()
-                .fill(p.surface1)
-                .stroke(Stroke::new(1.0, p.border))
-                .corner_radius(CornerRadius::same(theme::RADIUS))
-                .inner_margin(egui::Margin::same(14))
-        };
         egui::Window::new("Stream mix")
             .title_bar(false)
-            .frame(panel)
-            .anchor(Align2::RIGHT_TOP, vec2(-10.0, 56.0))
+            .frame(theme::sheet_frame(theme::palette_of(ui)))
+            .anchor(Align2::RIGHT_TOP, theme::SHEET_OFFSET)
             .fixed_size(vec2(384.0, 0.0))
             .resizable(false)
             .show(ui.ctx(), |ui| {

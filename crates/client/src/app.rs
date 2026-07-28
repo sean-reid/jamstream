@@ -12,15 +12,19 @@ use crate::demo::DemoRuntime;
 use crate::exec::{Executor, Job};
 use crate::live::{AudioSettings, CostedRuntime, LiveRuntime};
 use crate::picker::{Pick, Picked};
-use crate::runtime::{AvatarHandle, Command, ConnState, LevelsView, Runtime, Snapshot};
+use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
-use crate::screens::devices::{DeviceCatalog, DevicesScreen};
+use crate::screens::devices::{Block, DeviceCatalog, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
 use crate::screens::session::{SessionEvent, SessionScreen};
 use crate::theme::{self, Theme};
 use crate::widgets::{AVATAR_D_STRIP, avatar_disc, sweep_avatar_textures};
+
+/// The settings drawer's content width. Every row inside it fits, so the
+/// drawer is this wide and no wider whatever the window does.
+const DRAWER_W: f32 = 340.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -301,7 +305,15 @@ impl JamApp {
         // Before the sheet draws, so a picture that landed while the dialog
         // was open shows in the same frame it arrived.
         self.poll_avatar_pick();
-        self.settings_window(ui.ctx());
+        // Escape is consumed here, ahead of the screen, even though the sheet
+        // is drawn after it: the session screen closes its own sheets on
+        // Escape, and the innermost thing entered has to be the first thing
+        // left.
+        if self.settings_open
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.settings_open = false;
+        }
 
         match self.screen {
             Screen::Home => {
@@ -337,8 +349,10 @@ impl JamApp {
                 }
             }
             Screen::Devices => {
-                let levels = self.current_levels();
-                self.devices.ui(ui, &self.catalog, &levels);
+                let snap = self.runtime.as_deref().map(|rt| rt.snapshot());
+                let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
+                let m2e = snap.and_then(|s| s.stats.mouth_to_ear_ms);
+                self.devices.ui(ui, &self.catalog, &levels, m2e);
             }
             Screen::HostWizard => {
                 if let Some(WizardEvent::Launched(outcome)) = self.wizard.ui(ui) {
@@ -366,6 +380,9 @@ impl JamApp {
         }
 
         self.ending_progress(ui.ctx());
+        // Last, so a session has already drawn its status bar and the drawer
+        // knows where to stop.
+        self.settings_drawer(ui.ctx());
 
         // Device picks apply immediately: mid-session the live runtime
         // reopens its stream, otherwise the selection just waits for the
@@ -388,37 +405,38 @@ impl JamApp {
         sweep_avatar_textures(ui.ctx());
     }
 
-    fn current_levels(&self) -> LevelsView {
-        self.runtime
-            .as_deref()
-            .map(|rt| rt.snapshot().levels)
-            .unwrap_or_default()
+    /// What the drawer has to stay above: the session's status bar, which
+    /// carries the mouth-to-ear readout and the input and output meters.
+    /// Buffer size and input level are adjusted against exactly those, so a
+    /// sheet that covered them would hide the instruments it is being read
+    /// against. Screens without a bar give it the window's bottom edge.
+    fn drawer_floor(&self, ctx: &Context) -> f32 {
+        let bottom = ctx.content_rect().bottom();
+        match self.screen {
+            Screen::Session => self.session.status_bar_top.unwrap_or(bottom),
+            _ => bottom,
+        }
     }
 
-    /// Settings as a compact sheet anchored top right, under the top bar:
-    /// it never covers the mixer strips or the status readout, and Escape
-    /// or its own Close button dismisses it.
-    fn settings_window(&mut self, ctx: &Context) {
+    /// Settings as a drawer down the right side, under the top bar and above
+    /// the status bar, so the session stays readable beside it. Escape or
+    /// Close dismisses it.
+    ///
+    /// The drawer takes the whole height it is allowed rather than the height
+    /// its content wants, because at 800x600, the smallest window the app
+    /// opens, the content is taller than the window. The body scrolls inside
+    /// it, so what a short window puts out of sight is whatever the body puts
+    /// last, and never the buffer picks or the input meter.
+    fn settings_drawer(&mut self, ctx: &Context) {
         if !self.settings_open {
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            self.settings_open = false;
-            return;
-        }
-        let panel = {
-            let p = theme::palette(self.theme);
-            egui::Frame::new()
-                .fill(p.surface1)
-                .stroke(egui::Stroke::new(1.0, p.border))
-                .corner_radius(egui::CornerRadius::same(theme::RADIUS))
-                .inner_margin(egui::Margin::same(14))
-        };
+        let body_h = theme::sheet_body_height(ctx, self.drawer_floor(ctx));
         egui::Window::new("Settings")
             .title_bar(false)
-            .frame(panel)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 56.0))
-            .fixed_size(egui::vec2(340.0, 0.0))
+            .frame(theme::sheet_frame(theme::palette(self.theme)))
+            .anchor(egui::Align2::RIGHT_TOP, theme::SHEET_OFFSET)
+            .fixed_size(egui::vec2(DRAWER_W, body_h))
             .resizable(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -430,23 +448,36 @@ impl JamApp {
                     });
                 });
                 ui.add_space(theme::SPACE_SM);
-                ui.label(theme::title(ui, "Theme"));
-                for (value, label) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
-                    let response =
-                        crate::widgets::pick_row(ui, label, self.theme == value, true, |ui| {
-                            ui.label(label);
-                        });
-                    if response.clicked() {
-                        self.theme = value;
-                    }
-                }
-                ui.add_space(theme::SPACE_SM);
-                let snap = self.runtime.as_deref().map(|rt| rt.snapshot());
-                self.avatar_ui(ui, snap.as_ref());
-                ui.add_space(theme::SPACE_SM);
-                let levels = snap.map(|s| s.levels).unwrap_or_default();
-                self.devices.panels_ui(ui, &self.catalog, &levels);
+                // The header stays put and the rest scrolls, so Close is
+                // never the control that scrolled away.
+                egui::ScrollArea::vertical()
+                    .id_salt("settings-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.settings_body(ui));
             });
+    }
+
+    /// Ordered by how often a control is reached for: the two a musician
+    /// touches mid session, then the devices behind them, then the things
+    /// set once.
+    fn settings_body(&mut self, ui: &mut Ui) {
+        let snap = self.runtime.as_deref().map(|rt| rt.snapshot());
+        let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
+        let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
+        self.devices
+            .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e);
+        ui.add_space(theme::SPACE_MD);
+        self.avatar_ui(ui, snap.as_ref());
+        ui.add_space(theme::SPACE_MD);
+        ui.label(theme::title(ui, "Theme"));
+        for (value, label) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+            let response = crate::widgets::pick_row(ui, label, self.theme == value, true, |ui| {
+                ui.label(label);
+            });
+            if response.clicked() {
+                self.theme = value;
+            }
+        }
     }
 
     /// "Your avatar": the disc as everyone else sees it, the picker, and

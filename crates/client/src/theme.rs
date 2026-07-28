@@ -95,6 +95,46 @@ pub const SPACE_XL: f32 = 20.0;
 /// Uniform corner radius; tight radii read as a tool.
 pub const RADIUS: u8 = 3;
 
+/// Where every right-anchored sheet sits: in from the window's right edge,
+/// and far enough down to clear the top bar. Settings, Invites,
+/// Destinations, and Stream mix share this anchor, so they stack in exactly
+/// one place and never half-cover each other.
+pub const SHEET_OFFSET: egui::Vec2 = egui::vec2(-SHEET_GAP, 56.0);
+
+/// The gap a sheet keeps to the window's edge.
+pub const SHEET_GAP: f32 = 10.0;
+
+/// A sheet's own margin, wider than a panel's: a sheet is the surface, not
+/// one panel among several on one.
+pub const SHEET_PAD: i8 = 14;
+
+/// A sheet never shrinks below this, whatever the window does. The app's
+/// minimum window is 800x600 and gives more than three times as much.
+const SHEET_MIN_BODY: f32 = 160.0;
+
+/// The frame every right-anchored sheet is drawn in.
+pub fn sheet_frame(p: &Palette) -> Frame {
+    Frame::new()
+        .fill(p.surface1)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(RADIUS))
+        .inner_margin(Margin::same(SHEET_PAD))
+}
+
+/// How tall a sheet's content may be if the sheet is to end at `clear_of`,
+/// which is the window's bottom edge or the top of something it must not
+/// cover. The frame's own margins come off here because the result goes to
+/// `Window::fixed_size`, which sizes the content and not the frame.
+///
+/// Sheets need this because an egui window sizes its body from its resize
+/// default, never from the screen: without a height it grows past the
+/// bottom edge, and a scroll area inside one collapses to its minimum.
+pub fn sheet_body_height(ctx: &Context, clear_of: f32) -> f32 {
+    let top = ctx.content_rect().top() + SHEET_OFFSET.y;
+    let pad = 2.0 * f32::from(SHEET_PAD);
+    (clear_of - top - SHEET_GAP - pad).max(SHEET_MIN_BODY)
+}
+
 /// The emphasis family: Public Sans semibold. Fonts set with
 /// `Context::set_fonts` only activate on the next pass, so this falls back
 /// to the proportional family for the one frame where the named family is

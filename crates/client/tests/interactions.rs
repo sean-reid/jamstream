@@ -153,6 +153,114 @@ fn a_fader_never_crosses_the_name_above_it() {
     }
 }
 
+/// The whole shell with the settings drawer open over a host session, which
+/// is the tallest sheet in the app over the shortest status bar it can sit
+/// above. `in_memory` for the same reason every fixture uses it: the real
+/// keychain would put a system dialog in front of the test run.
+fn settings_harness_sized(size: egui::Vec2) -> Harness<'static> {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(rt));
+    app.screen = Screen::Session;
+    app.session.invites = Some(empty_invites());
+    app.session.destinations = Some(DestinationsPanel::new(Arc::new(MemStore::default())));
+    app.settings_open = true;
+    Harness::builder()
+        .with_size(size)
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        })
+}
+
+/// The invariant behind #122. Buffer size and input level are adjusted while
+/// listening, against the mouth-to-ear readout and the meters in the status
+/// bar, so the drawer has to fit the window and stop above them: at 800x600
+/// the sheet used to run past the bottom edge with both of them on the part
+/// that was gone. Every window size the app can be, both are on screen, and
+/// nothing in the drawer is drawn over the readouts.
+#[test]
+fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
+    for size in SIZES {
+        let mut harness = settings_harness_sized(size);
+        harness.run_steps(4);
+        let readouts = harness
+            .get_all_by_label_contains("loss ")
+            .next()
+            .expect("the loss readout")
+            .rect();
+        // What a musician reaches for mid session is on screen with nothing
+        // scrolled, along with the way out of the sheet.
+        for label in [
+            "Close",
+            "120 frames (2.5 ms)",
+            "480 frames (10.0 ms)",
+            "speak or play to check the meter moves",
+        ] {
+            let rect = harness
+                .get_all_by_label_contains(label)
+                .next()
+                .unwrap_or_else(|| panic!("{label} is not on screen at {size:?}"))
+                .rect();
+            assert!(
+                rect.bottom() <= readouts.top(),
+                "{label} at {rect:?} reaches the readouts at {readouts:?}, window {size:?}"
+            );
+            assert!(
+                rect.right() <= size.x && rect.top() >= 0.0,
+                "{label} at {rect:?} is outside the {size:?} window"
+            );
+        }
+        // And the last thing in the sheet, which a short window has no room
+        // for, comes into view when the body is scrolled. A sheet with no
+        // height of its own has no body to scroll: it grows to its content,
+        // past the bottom edge, and this is what that leaves unreachable.
+        harness.event(Event::PointerMoved(egui::pos2(size.x - 100.0, 200.0)));
+        harness.run_steps(1);
+        harness.event(Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -1000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        });
+        harness.run_steps(3);
+        let last = harness
+            .get_all_by_label_contains("light")
+            .next()
+            .expect("the theme picker is the last thing in the sheet")
+            .rect();
+        assert!(
+            last.top() >= 0.0 && last.bottom() <= readouts.top(),
+            "the end of the sheet is at {last:?}, out of reach above the readouts at \
+             {readouts:?}, window {size:?}"
+        );
+    }
+}
+
+/// Escape closes the drawer before the session screen sees the key, so the
+/// innermost thing entered is the first thing left. The drawer is drawn
+/// after the screen, which is the order that makes it possible to measure
+/// the status bar, and this is the one thing that order could have broken.
+#[test]
+fn escape_closes_the_settings_drawer_before_a_session_sheet() {
+    let mut harness = settings_harness_sized(vec2(1280.0, 800.0));
+    harness.run_steps(2);
+    assert!(harness.query_by_label_contains("Buffer size").is_some());
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label_contains("Buffer size").is_none(),
+        "Escape must close the drawer"
+    );
+}
+
 fn set_fader_commands(rt: &Recorder, member: u16) -> Vec<(f32, f32, bool)> {
     rt.commands()
         .into_iter()
