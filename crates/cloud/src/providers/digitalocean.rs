@@ -71,7 +71,6 @@ const CATALOG: &[(&str, &str, &str)] = &[
     ("blr1", "Bangalore 1", "IN"),
 ];
 
-/// Maps the abstract instance class to a concrete droplet size slug.
 /// Picks the highest-numbered `debian-N-x64` slug, or None if none is
 /// offered.
 fn newest_debian<'a>(slugs: impl Iterator<Item = &'a str>) -> Option<String> {
@@ -88,6 +87,7 @@ fn newest_debian<'a>(slugs: impl Iterator<Item = &'a str>) -> Option<String> {
         .map(|(_, slug)| slug.to_owned())
 }
 
+/// Maps the abstract instance class to a concrete droplet size slug.
 pub fn size_slug(class: InstanceClass) -> &'static str {
     match class {
         InstanceClass::Small => "s-1vcpu-2gb",
@@ -626,7 +626,9 @@ impl Provider for DigitalOceanProvider {
         };
         // The firewall is attached to the session tag and created first, so
         // the droplet is behind it from the moment DigitalOcean creates it.
-        self.ensure_firewall(&session).await?;
+        self.ensure_firewall(&session)
+            .await
+            .map_err(|e| e.while_doing("creating the session firewall"))?;
         let suffix = session.clone();
         let name: String = format!("jamstream-{suffix}")
             .chars()
@@ -644,7 +646,10 @@ impl Provider for DigitalOceanProvider {
             "name": name,
             "region": spec.region.id.as_str(),
             "size": size_slug(spec.instance_class),
-            "image": self.image().await?,
+            "image": self
+                .image()
+                .await
+                .map_err(|e| e.while_doing("picking the boot image"))?,
             "user_data": spec.user_data,
             "tags": tags,
         });
@@ -668,7 +673,7 @@ impl Provider for DigitalOceanProvider {
                         ),
                     })
                 }
-                _ => e,
+                _ => e.while_doing("creating the droplet"),
             })?;
         let envelope: DropletEnvelope = Self::parse_json(resp).await?;
         // The create response carries no public IP; DO assigns it
