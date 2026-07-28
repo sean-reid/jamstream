@@ -196,12 +196,18 @@ impl ObjectSink {
 mod tests {
     use super::*;
     use crate::storage::mock::{MockStore, StoreCall};
-    use crate::storage::{FLAC_CONTENT_TYPE, mix_key};
+    use crate::storage::{FLAC_CONTENT_TYPE, session_prefix};
     use crate::types::ProviderKind;
     use std::time::Duration;
 
     fn store(part_size: usize) -> Arc<MockStore> {
         Arc::new(MockStore::new(ProviderKind::Aws).with_part_size(part_size))
+    }
+
+    /// A take's key, the shape the recorder produces: the session prefix from
+    /// `storage`, the file name from the server crate's recorder.
+    fn take_key() -> String {
+        format!("{}jamstream-2026-07-25-1030-mix.flac", session_prefix("s1"))
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -220,7 +226,7 @@ mod tests {
     async fn chunks_of_any_size_assemble_into_one_object() {
         let store = store(8);
         let dir = scratch("assemble");
-        let key = mix_key("s1");
+        let key = take_key();
         let mut s = sink(store.clone(), &key, &dir);
         // 27 bytes in ragged chunks: smaller and larger than a part.
         let body: Vec<u8> = (0..27).collect();
@@ -248,7 +254,7 @@ mod tests {
     async fn a_short_recording_takes_the_single_put_path() {
         let store = store(64);
         let dir = scratch("short");
-        let mut s = sink(store.clone(), "k.flac", &dir);
+        let mut s = sink(store.clone(), "take.flac", &dir);
         s.write(b"tiny".to_vec()).await.unwrap();
         let meta = s.finish().await.unwrap();
         assert_eq!(meta.size, 4);
@@ -265,7 +271,7 @@ mod tests {
     async fn abort_aborts_the_multipart_upload_before_returning() {
         let store = store(4);
         let dir = scratch("abort");
-        let mut s = sink(store.clone(), "k.flac", &dir);
+        let mut s = sink(store.clone(), "take.flac", &dir);
         for chunk in [vec![1u8; 4], vec![2u8; 4], vec![3u8; 4]] {
             s.write(chunk).await.unwrap();
         }
@@ -298,7 +304,7 @@ mod tests {
     async fn dropping_the_sink_aborts_instead_of_completing_short() {
         let store = store(4);
         let dir = scratch("drop");
-        let mut s = sink(store.clone(), "k.flac", &dir);
+        let mut s = sink(store.clone(), "take.flac", &dir);
         for chunk in [vec![1u8; 4], vec![2u8; 4], vec![3u8; 4]] {
             s.write(chunk).await.unwrap();
         }
@@ -330,7 +336,7 @@ mod tests {
         let store = store(4);
         store.fail_part(2);
         let dir = scratch("fail");
-        let mut s = sink(store.clone(), "k.flac", &dir);
+        let mut s = sink(store.clone(), "take.flac", &dir);
         for chunk in [vec![1u8; 4], vec![2u8; 4], vec![3u8; 4]] {
             // Failure may race the writes; the queue soaks them either way.
             let _ = s.write(chunk).await;
@@ -350,7 +356,7 @@ mod tests {
     async fn the_marker_covers_exactly_the_life_of_the_upload() {
         let store = store(8);
         let dir = scratch("marker");
-        let key = mix_key("s1");
+        let key = take_key();
         let mut s = sink(store.clone(), &key, &dir);
         let marker = dir.join(sanitize_component(&key));
         assert!(marker.exists(), "the marker goes down before any byte");
@@ -379,13 +385,13 @@ mod tests {
         let mut s = ObjectSink::open_with_marker_dir(
             store.clone(),
             "b",
-            "k.flac",
+            "take.flac",
             FLAC_CONTENT_TYPE,
             &not_a_dir,
         );
         s.write(vec![1u8; 20]).await.unwrap();
         let meta = s.finish().await.unwrap();
         assert_eq!(meta.size, 20);
-        assert_eq!(store.body("b", "k.flac").unwrap().len(), 20);
+        assert_eq!(store.body("b", "take.flac").unwrap().len(), 20);
     }
 }

@@ -109,6 +109,11 @@ fn included_egress_gb(class: InstanceClass) -> u32 {
 }
 
 /// True for the characters DigitalOcean accepts in a tag.
+///
+/// A charset, not a name rule: this encodes a key/value pair into DigitalOcean's
+/// flat tag syntax, which is why `:` survives here and nowhere else. The rule
+/// for names JamStream derives from anything a person typed is
+/// `storage::sanitize_component`.
 fn do_tag_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == ':' || c == '-' || c == '_'
 }

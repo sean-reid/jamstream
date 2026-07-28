@@ -6,8 +6,8 @@
 use crate::provider::ProviderError;
 use crate::retention::{Retention, RetentionEnforcement};
 use crate::storage::{
-    BytesSource, ChunkSink, ObjectStore, PartSource, WAV_CONTENT_TYPE, manifest_key, mix_key,
-    session_prefix, stem_key,
+    BytesSource, ChunkSink, FLAC_CONTENT_TYPE, JSON_CONTENT_TYPE, ObjectStore, PartSource,
+    session_prefix,
 };
 
 /// Panics on the first contract violation.
@@ -19,9 +19,14 @@ use crate::storage::{
 pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str) {
     let session = "contract-session";
     let prefix = session_prefix(session);
-    let mix = mix_key(session);
-    let stem = stem_key(session, "contract-member");
-    let manifest = manifest_key(session);
+    // The three objects a session really writes: a take, a second take, and the
+    // launch's write probe. The names are the recorder's shape, spelled out
+    // here rather than built by a key helper, because the helpers that used to
+    // live in `storage` named objects nothing writes and every store test
+    // believed them.
+    let mix = format!("{prefix}jamstream-2026-07-25-1030-mix.flac");
+    let stem = format!("{prefix}jamstream-2026-07-25-1030-contract-member.flac");
+    let probe = format!("{prefix}.jamstream-probe");
 
     // ---- Absent objects ----
 
@@ -46,18 +51,18 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
 
     // ---- Single-shot put ----
 
-    let manifest_body = br#"{"session":"contract-session"}"#;
+    let probe_body = br#"{"probe":true}"#;
     let meta = store
-        .put(bucket, &manifest, "application/json", manifest_body)
+        .put(bucket, &probe, JSON_CONTENT_TYPE, probe_body)
         .await
         .expect("put must succeed");
-    assert_eq!(meta.key, manifest, "put must echo the key it wrote");
-    assert_eq!(meta.size, manifest_body.len() as u64);
+    assert_eq!(meta.key, probe, "put must echo the key it wrote");
+    assert_eq!(meta.size, probe_body.len() as u64);
 
-    let head = store.head(bucket, &manifest).await.expect("head after put");
-    assert_eq!(head.size, manifest_body.len() as u64, "head size mismatch");
+    let head = store.head(bucket, &probe).await.expect("head after put");
+    assert_eq!(head.size, probe_body.len() as u64, "head size mismatch");
     if let Some(ct) = &head.content_type {
-        assert_eq!(ct, "application/json", "content type was not preserved");
+        assert_eq!(ct, JSON_CONTENT_TYPE, "content type was not preserved");
     }
 
     // ---- put_stream: one part, so the plain PUT path ----
@@ -65,13 +70,13 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
     // Exactly one full part: the boundary case for the escalation decision,
     // which must still take the single-PUT path because the lookahead read
     // comes back empty.
-    let short_len = store.part_size().min(1024);
+    let short_len = store.part_size();
     let short: Vec<u8> = (0..short_len).map(|i| (i % 251) as u8).collect();
     let meta = store
         .put_stream(
             bucket,
             &stem,
-            WAV_CONTENT_TYPE,
+            FLAC_CONTENT_TYPE,
             &mut BytesSource::new(short.clone()),
         )
         .await
@@ -91,7 +96,7 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
         .put_stream(
             bucket,
             &mix,
-            WAV_CONTENT_TYPE,
+            FLAC_CONTENT_TYPE,
             &mut CountingSource::new(big_len),
         )
         .await
@@ -110,7 +115,7 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
 
     let listed = store.list(bucket, &prefix).await.expect("list prefix");
     let keys: Vec<&str> = listed.iter().map(|m| m.key.as_str()).collect();
-    for expected in [&mix, &stem, &manifest] {
+    for expected in [&mix, &stem, &probe] {
         assert!(
             keys.contains(&expected.as_str()),
             "list under {prefix} missed {expected}: {keys:?}"
@@ -120,16 +125,18 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
         listed.windows(2).all(|w| w[0].key <= w[1].key),
         "list must be sorted by key: {keys:?}"
     );
-    let stems_only = store
-        .list(bucket, &format!("{prefix}stems/"))
+    // A narrower prefix narrows the listing: the two takes share a timestamp
+    // and the probe does not.
+    let takes_only = store
+        .list(bucket, &format!("{prefix}jamstream-2026-07-25-1030-"))
         .await
-        .expect("list stems");
+        .expect("list one take's objects");
     assert_eq!(
-        stems_only.len(),
-        1,
-        "a narrower prefix must narrow the listing: {stems_only:?}"
+        takes_only.len(),
+        2,
+        "a narrower prefix must narrow the listing: {takes_only:?}"
     );
-    assert_eq!(stems_only[0].key, stem);
+    assert!(takes_only.iter().all(|m| m.key != probe));
     let nothing = store
         .list(bucket, "jamstream/recordings/no-such-session/")
         .await
@@ -229,7 +236,7 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
 
     let mut nowhere = Collector::default();
     match store
-        .get(bucket, &format!("{prefix}absent.wav"), &mut nowhere)
+        .get(bucket, &format!("{prefix}absent.flac"), &mut nowhere)
         .await
     {
         Err(ProviderError::NotFound(_)) => {}
@@ -242,7 +249,7 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
 
     // ---- Cleanup ----
 
-    for key in [&mix, &stem, &manifest] {
+    for key in [&mix, &stem, &probe] {
         store.delete(bucket, key).await.expect("delete");
         match store.head(bucket, key).await {
             Err(ProviderError::NotFound(_)) => {}
