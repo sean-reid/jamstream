@@ -83,18 +83,30 @@ pub struct Traffic {
 /// Wall-clock cost of `ServerCore::tick`, split by whether that tick also had
 /// to fan a 20 ms broadcast frame out to the listeners (one tick in eight).
 ///
-/// The two medians are what make this usable as a gate: the ratio between
-/// them is dimensionless, so a runner three times slower than a laptop moves
-/// both numbers and not the ratio. Absolute microseconds are for the log.
+/// Two kinds of number live here and they gate different things. The ratio of
+/// the medians is dimensionless, so a runner three times slower than a laptop
+/// moves both and not the ratio, but it is blind to anything the two ticks
+/// share: doubling per-tick work shared by both moves the ratio *down*.
+/// `broadcast_p99_us` is the absolute one, against the 2.5 ms deadline, and it
+/// needs the runner named (see `perf_budget_secs` in the gate suite).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TickCost {
     pub broadcast_ticks: usize,
     pub ordinary_ticks: usize,
     pub broadcast_median_us: f64,
     pub ordinary_median_us: f64,
+    /// 99th percentile of the broadcast ticks. The deadline is a per-tick
+    /// deadline and the broadcast tick is the expensive one, so a mean over
+    /// all ticks would divide the tick at risk into the seven that are not.
+    pub broadcast_p99_us: f64,
+    /// Worst single broadcast tick in the window, for the log.
+    pub broadcast_max_us: f64,
     /// Mean over ticks of both kinds: what the 2.5 ms tick budget is actually
     /// spent against once the broadcast tick is amortized.
     pub amortized_mean_us: f64,
+    /// Broadcast frames `ServerCore` reports encoding over the window, which
+    /// is a count and not a timing: one per 20 ms whatever the audience size.
+    pub broadcast_encodes: u64,
 }
 
 impl TickCost {
@@ -334,6 +346,7 @@ impl ScenarioBuilder {
             tick_cost: self.tick_cost,
             bcast_tick_ns: Vec::new(),
             other_tick_ns: Vec::new(),
+            bcast_encodes_at_reset: 0,
             tick: 0,
             garbage_lcg: self.seed ^ 0x9E37_79B9_7F4A_7C15,
         }
@@ -357,6 +370,9 @@ pub struct Scenario {
     tick_cost: bool,
     bcast_tick_ns: Vec<u64>,
     other_tick_ns: Vec<u64>,
+    /// `ServerCore::broadcast_encodes` when the timing window opened, so the
+    /// count reported covers the window and not the joins before it.
+    bcast_encodes_at_reset: u64,
     tick: u64,
     garbage_lcg: u64,
 }
@@ -386,10 +402,11 @@ impl Scenario {
         }
 
         let out = if self.tick_cost {
+            let encodes_before = self.server.broadcast_encodes();
             let started = Instant::now();
             let out = self.server.tick(now_ms);
             let elapsed = started.elapsed().as_nanos() as u64;
-            self.file_tick_cost(elapsed, &out);
+            self.file_tick_cost(elapsed, encodes_before);
             out
         } else {
             self.server.tick(now_ms)
@@ -761,16 +778,15 @@ impl Scenario {
         longest as f32 * (TICK_US as f32 / 1_000.0)
     }
 
-    /// Files one timed tick under broadcast or ordinary. A tick is a
-    /// broadcast tick exactly when it produced a datagram for a listener,
-    /// which is read off the output rather than off a tick counter so the
-    /// harness does not have to know the server's 20 ms accumulator period.
-    fn file_tick_cost(&mut self, elapsed_ns: u64, out: &[(SocketAddr, Vec<u8>)]) {
-        let broadcast = out.iter().any(|(addr, _)| {
-            self.endpoint_by_addr
-                .get(addr)
-                .is_some_and(|&i| self.clients[i].role == Role::Listener)
-        });
+    /// Files one timed tick under broadcast or ordinary. A tick is a broadcast
+    /// tick exactly when it encoded a broadcast frame, which the core counts
+    /// itself, so the harness needs to know neither the 20 ms accumulator
+    /// period nor which of the datagrams leaving the server was audio. It used
+    /// to look for any datagram addressed to a listener, which also matched a
+    /// tick that only retransmitted a roster to the gallery: those ticks are
+    /// cheap, and averaging them into the broadcast median understated it.
+    fn file_tick_cost(&mut self, elapsed_ns: u64, encodes_before: u64) {
+        let broadcast = self.server.broadcast_encodes() > encodes_before;
         if broadcast {
             self.bcast_tick_ns.push(elapsed_ns);
         } else {
@@ -783,30 +799,40 @@ impl Scenario {
     pub fn reset_tick_cost(&mut self) {
         self.bcast_tick_ns.clear();
         self.other_tick_ns.clear();
+        self.bcast_encodes_at_reset = self.server.broadcast_encodes();
     }
 
     /// Empty unless built with `measure_tick_cost(true)`.
     pub fn tick_cost(&self) -> TickCost {
-        let median = |v: &[u64]| -> f64 {
+        // Nearest-rank, no interpolation: these are wall-clock samples and a
+        // percentile between two of them is not a measurement of anything.
+        let quantile = |v: &[u64], q: f64| -> f64 {
             if v.is_empty() {
                 return 0.0;
             }
             let mut s = v.to_vec();
             s.sort_unstable();
-            s[s.len() / 2] as f64 / 1_000.0
+            let rank = ((q * s.len() as f64).ceil() as usize).clamp(1, s.len()) - 1;
+            s[rank] as f64 / 1_000.0
         };
         let total: u64 = self.bcast_tick_ns.iter().chain(&self.other_tick_ns).sum();
         let n = self.bcast_tick_ns.len() + self.other_tick_ns.len();
         TickCost {
             broadcast_ticks: self.bcast_tick_ns.len(),
             ordinary_ticks: self.other_tick_ns.len(),
-            broadcast_median_us: median(&self.bcast_tick_ns),
-            ordinary_median_us: median(&self.other_tick_ns),
+            broadcast_median_us: quantile(&self.bcast_tick_ns, 0.5),
+            ordinary_median_us: quantile(&self.other_tick_ns, 0.5),
+            broadcast_p99_us: quantile(&self.bcast_tick_ns, 0.99),
+            broadcast_max_us: quantile(&self.bcast_tick_ns, 1.0),
             amortized_mean_us: if n == 0 {
                 0.0
             } else {
                 total as f64 / n as f64 / 1_000.0
             },
+            broadcast_encodes: self
+                .server
+                .broadcast_encodes()
+                .saturating_sub(self.bcast_encodes_at_reset),
         }
     }
 

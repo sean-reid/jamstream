@@ -842,11 +842,16 @@ const REFERENCE_LAPTOP_SECS: f64 = 30.0;
 /// and takes the same multiplier from that one variable, so the runner is
 /// described once instead of per gate.
 fn perf_budget_secs(laptop_secs: f64) -> f64 {
-    let scale = std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
+    laptop_secs * perf_scale()
+}
+
+/// How much slower than the reference laptop the machine running this suite is
+/// declared to be. 1.0 unless `JAMSTREAM_PERF_BUDGET_SECS` says otherwise.
+fn perf_scale() -> f64 {
+    std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS);
-    laptop_secs * scale
+        .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS)
 }
 
 // Not a benchmark: a coarse guard that the simulation stays usable for
@@ -975,25 +980,37 @@ fn latency_at_capacity() {
 // growing, so the symptom is latency creeping up over a session and no test
 // anywhere going red. That is how a 20x broadcast encode shipped.
 //
-// What is asserted is a ratio, not a duration: the median cost of a tick that
-// fans the broadcast frame out to every listener, over the median cost of an
-// ordinary tick. Both numbers move together with the machine, so a ci runner
-// three times slower than a laptop does not move the ratio, and the gate can
-// be tight without an env knob. It is a timing measurement underneath, but a
-// self-normalizing one; a genuinely deterministic version would need
-// ServerCore to count its own encodes, which is a change in another crate.
+// Three things are asserted, because no one of them covers the others.
+//
+// 1. The deadline itself: the p99 of the broadcast tick against 2500 us,
+//    scaled by the one runner multiplier every wall-clock gate here takes.
+//    p99 and not a mean, because the deadline is per tick and a mean over all
+//    ticks divides the expensive one into the seven that are not. This is the
+//    only assertion that fails when the whole tick gets slower, which the two
+//    below cannot see.
+// 2. The fanout ratio, broadcast median over ordinary median, at a limit of 5.
+//    Dimensionless, so it is tight without a knob, and it answers exactly one
+//    question: has per-listener work come back into the broadcast path. It is
+//    blind to everything else and worse than blind to shared cost, because
+//    the ratio is 1 + fanout/ordinary, so doubling the work both ticks share
+//    moves it from 1.95 down to 1.47. That is why 1 exists.
+// 3. One broadcast encode per eight ticks, from `ServerCore::broadcast_encodes`.
+//    A count, not a timing, so it is deterministic on any machine.
 //
 // Measured on an M4 Max, 10 musicians and 20 listeners, 20 s of virtual time:
-// broadcast 575 us, ordinary 296 us, ratio 1.95. With the pre-#78 per-listener
-// broadcast encode restored: 4357 us and 300 us, ratio 14.53. The gate at 5
-// sits 2.5x above what the fanout costs today and 2.9x below what one extra
-// per-listener encode costs, so it fails on a reintroduction and does not
-// fail on a runner having a bad minute.
+// broadcast median 607 us, p99 704 us, ordinary 285 us, ratio 1.95, amortized
+// 339 us. With the pre-#78 per-listener broadcast encode restored: 4357 us and
+// 300 us, ratio 14.53. The ratio gate at 5 sits 2.5x above what the fanout
+// costs today and 2.9x below what one extra per-listener encode costs.
 #[test]
 fn tick_budget_at_capacity() {
     // 20 ms broadcast frame accumulated over 2.5 ms master ticks.
     const TICKS_PER_BROADCAST: usize = 8;
     const FANOUT_GATE: f64 = 5.0;
+    // The mix tick's slot in the latency budget in protocol.md, in
+    // microseconds. Not a number to tune: it is the frame duration, and a tick
+    // that takes longer than the audio it produces falls behind for good.
+    const TICK_BUDGET_US: f64 = 2_500.0;
     // Measured 5.6 s here; the same generosity the 60 s reference run takes.
     const WALL_BUDGET_SECS: f64 = 35.0;
 
@@ -1026,16 +1043,21 @@ fn tick_budget_at_capacity() {
     let wall = start.elapsed().as_secs_f64();
     let cost = s.tick_cost();
 
+    let budget_us = TICK_BUDGET_US * perf_scale();
     println!(
         "capacity tick cost ({MAX_MUSICIANS} musicians, {MAX_LISTENERS} listeners): \
-         broadcast {:.0} us over {} ticks, ordinary {:.0} us over {} ticks, ratio {:.2}, \
-         amortized {:.0} us of the 2500 us tick budget, {wall:.2} s wall",
+         broadcast median {:.0} us, p99 {:.0} us, max {:.0} us over {} ticks; \
+         ordinary median {:.0} us over {} ticks; ratio {:.2}; amortized {:.0} us; \
+         p99 is {:.0}% of the {budget_us:.0} us budget on this machine; {wall:.2} s wall",
         cost.broadcast_median_us,
+        cost.broadcast_p99_us,
+        cost.broadcast_max_us,
         cost.broadcast_ticks,
         cost.ordinary_median_us,
         cost.ordinary_ticks,
         cost.fanout_ratio(),
         cost.amortized_mean_us,
+        100.0 * cost.broadcast_p99_us / budget_us,
     );
 
     // The room really was full for the whole measurement, and the listeners
@@ -1059,15 +1081,42 @@ fn tick_budget_at_capacity() {
     }
 
     // One broadcast per 20 ms and no more, give or take where the measurement
-    // window opened in the accumulator's cycle. Deterministic, and the cheap
-    // half of the same question: fanning out every tick would multiply both
-    // the encode work and the host's egress bill by eight.
+    // window opened in the accumulator's cycle. Fanning out every tick would
+    // multiply both the encode work and the host's egress bill by eight.
+    //
+    // Counted twice on purpose. `broadcast_ticks` is read off the datagrams
+    // that left the server, so it also catches a fanout that stopped; the
+    // encode count comes from `ServerCore` itself, so it catches one encode
+    // per listener without depending on how long that takes. Neither is a
+    // timing, so both hold on any machine.
     let total = cost.broadcast_ticks + cost.ordinary_ticks;
     let expected = total / TICKS_PER_BROADCAST;
     assert!(
         cost.broadcast_ticks.abs_diff(expected) <= 1,
         "listeners were fed on {} of {total} ticks, expected one in {TICKS_PER_BROADCAST}",
         cost.broadcast_ticks
+    );
+    assert_eq!(
+        cost.broadcast_encodes as usize, cost.broadcast_ticks,
+        "{} broadcast frames encoded over {} fanout ticks at {MAX_LISTENERS} listeners; \
+         one encode shared by every listener is the whole point of #78",
+        cost.broadcast_encodes, cost.broadcast_ticks
+    );
+
+    // The deadline. This is the assertion the ratio below cannot make: a
+    // slowdown spread evenly over every tick leaves the ratio alone or lowers
+    // it, and lands here.
+    assert!(
+        cost.broadcast_p99_us < budget_us,
+        "the broadcast tick's p99 is {:.0} us against a {budget_us:.0} us budget \
+         ({:.0} us of deadline x {:.2} for this machine). Median {:.0} us, max {:.0} us, \
+         ordinary {:.0} us. The mix tick has to produce 2.5 ms of audio in under 2.5 ms.",
+        cost.broadcast_p99_us,
+        TICK_BUDGET_US,
+        perf_scale(),
+        cost.broadcast_median_us,
+        cost.broadcast_max_us,
+        cost.ordinary_median_us,
     );
 
     assert!(
@@ -1080,9 +1129,9 @@ fn tick_budget_at_capacity() {
         cost.ordinary_median_us,
     );
 
-    // Backstop for a slowdown spread evenly across every tick, which the
-    // ratio cancels out by construction. Coarse on purpose: at ci generosity
-    // this catches an order of magnitude, not a doubling.
+    // Whole-run backstop, which also covers the work outside the tick: the
+    // simulated network, the client cores, and the harness itself. Coarse on
+    // purpose, at ci generosity it catches an order of magnitude.
     let budget = perf_budget_secs(WALL_BUDGET_SECS);
     assert!(
         wall < budget,
