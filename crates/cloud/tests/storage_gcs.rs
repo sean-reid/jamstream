@@ -665,6 +665,27 @@ impl Respond for FakeGcs {
         } else if let Some(encoded) = path.strip_prefix(&object_prefix) {
             let name = percent_decode(encoded);
             match method {
+                // alt=media asks for the bytes; without it the object
+                // resource itself is what GCS returns.
+                "GET" if query.get("alt").map(String::as_str) == Some("media") => {
+                    match state.objects.get(&name) {
+                        Some(body) => ResponseTemplate::new(200)
+                            .insert_header("content-length", body.len().to_string().as_str())
+                            .insert_header(
+                                "content-type",
+                                state
+                                    .types
+                                    .get(&name)
+                                    .map(String::as_str)
+                                    .unwrap_or("application/octet-stream"),
+                            )
+                            .insert_header("etag", format!("\"e-{}\"", body.len()).as_str())
+                            .set_body_bytes(body.clone()),
+                        None => ResponseTemplate::new(404).set_body_json(json!({
+                            "error": { "code": 404, "message": "No such object" }
+                        })),
+                    }
+                }
                 "GET" => match state.objects.get(&name) {
                     Some(body) => {
                         let body = body.clone();

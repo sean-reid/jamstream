@@ -7,10 +7,10 @@
 
 use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::retention::{LifecycleDialect, Retention};
-use jamstream_cloud::storage::S3Store;
+use jamstream_cloud::storage::{ChunkSink, S3Store};
 use jamstream_cloud::{
-    BytesSource, ObjectStore, Provider, ProviderError, ProviderKind, assert_object_store_contract,
-    mix_key, session_prefix,
+    BytesSource, ObjectStore, Provider, ProviderError, ProviderKind, Result,
+    assert_object_store_contract, mix_key, session_prefix,
 };
 use wiremock::matchers::{
     body_string_contains, header, header_exists, method, path, query_param, query_param_is_missing,
@@ -600,6 +600,95 @@ async fn head_of_a_missing_object_is_not_found() {
     assert!(matches!(err, ProviderError::NotFound(_)), "{err:?}");
 }
 
+// ---- get ----
+
+/// Collects a downloaded body in arrival order, which is what the assertions
+/// compare against; hyper may coalesce chunks, so the bytes are the only thing
+/// worth asserting on.
+#[derive(Default)]
+struct Collector {
+    bytes: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl ChunkSink for Collector {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn get_streams_a_signed_object_to_the_sink() {
+    let server = MockServer::start().await;
+    let key = mix_key("s1");
+    // Deterministic bytes, regenerated in the assertion rather than compared
+    // against anything the mock or the store handed back.
+    let body: Vec<u8> = (0..600usize).map(|i| (i % 251) as u8).collect();
+    Mock::given(method("GET"))
+        .and(path(object_path(&key)))
+        .and(signed())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", WAV)
+                .insert_header("etag", "\"take-etag\"")
+                .insert_header("last-modified", "Sat, 25 Jul 2026 10:00:00 GMT")
+                .set_body_bytes(body),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut sink = Collector::default();
+    let meta = store(&server).get(BUCKET, &key, &mut sink).await.unwrap();
+    assert_eq!(
+        sink.bytes,
+        (0..600usize).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        "the sink did not receive the body in order"
+    );
+    assert_eq!(meta.key, key);
+    assert_eq!(meta.size, 600, "size must be what was delivered");
+    assert_eq!(
+        meta.etag.as_deref(),
+        Some("take-etag"),
+        "quotes must be stripped"
+    );
+    assert_eq!(meta.content_type.as_deref(), Some(WAV));
+    assert_eq!(
+        meta.last_modified.as_deref(),
+        Some("Sat, 25 Jul 2026 10:00:00 GMT")
+    );
+}
+
+#[tokio::test]
+async fn get_of_a_missing_object_is_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(signed())
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_string("<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut sink = Collector::default();
+    let err = store(&server)
+        .get(BUCKET, &mix_key("s1"), &mut sink)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::NotFound(_)), "{err:?}");
+    assert!(sink.bytes.is_empty(), "a 404 body reached the sink");
+}
+
+// A short body under an inflated content-length has no test here on purpose:
+// hyper refuses to serve one. Inserting a content-length that disagrees with
+// the payload panics inside hyper's encoder ("payload claims content-length of
+// 100, custom content-length header claims 4096"), so wiremock cannot lie and
+// the case is unreachable over HTTP. The truncation guard is unit-tested
+// against `check_delivered` in storage.rs instead, which is what `drain_body`
+// calls once the body is drained.
+
 #[tokio::test]
 async fn list_follows_the_continuation_token() {
     let server = MockServer::start().await;
@@ -1108,6 +1197,25 @@ impl Respond for FakeS3 {
                     )
                     .insert_header("etag", format!("\"e-{}\"", body.len()).as_str()),
                 None => ResponseTemplate::new(404),
+            },
+            // No sub-resource in the query, so this is GetObject rather than
+            // one of the multipart calls or the bucket listing above.
+            ("GET", Some(key)) if query.is_empty() => match state.objects.get(key) {
+                Some(body) => ResponseTemplate::new(200)
+                    .insert_header("content-length", body.len().to_string().as_str())
+                    .insert_header(
+                        "content-type",
+                        state
+                            .types
+                            .get(key)
+                            .map(String::as_str)
+                            .unwrap_or("application/octet-stream"),
+                    )
+                    .insert_header("etag", format!("\"e-{}\"", body.len()).as_str())
+                    .set_body_bytes(body.clone()),
+                None => ResponseTemplate::new(404).set_body_string(
+                    "<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>",
+                ),
             },
             ("DELETE", Some(key)) => {
                 // 204 whether or not it was there.

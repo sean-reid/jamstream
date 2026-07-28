@@ -414,6 +414,79 @@ impl RecordingEstimate {
     }
 }
 
+/// What pulling a recording out of a bucket costs, worked out before the
+/// download starts.
+///
+/// This is the one charge in the feature that lands after the session has
+/// already priced itself: upload into a bucket beside the VM is free, storage
+/// is pennies, and then somebody presses download and pays egress on every
+/// byte. 5.5 GB of stems out of S3 is about 49 cents. So the figure belongs
+/// on screen before the transfer, which is what this type is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressQuote {
+    pub price: StoragePrice,
+    /// Bytes about to be transferred, as the bucket reports them.
+    pub bytes: u64,
+    pub microusd: u64,
+}
+
+impl EgressQuote {
+    /// Prices one download of `bytes` from a bucket in this provider region.
+    pub fn compute(provider: ProviderKind, region: &RegionId, bytes: u64) -> Result<EgressQuote> {
+        Ok(Self::with_price(storage_price(provider, region)?, bytes))
+    }
+
+    /// [`EgressQuote::compute`] against a price the caller already has.
+    pub fn with_price(price: StoragePrice, bytes: u64) -> EgressQuote {
+        let microusd = div_round(
+            bytes as u128 * price.egress_microusd_per_gb as u128,
+            BYTES_PER_GB,
+        );
+        EgressQuote {
+            price,
+            bytes,
+            microusd,
+        }
+    }
+
+    /// Size and rate, in the same shape [`RecordingEstimate`] uses.
+    pub fn line_item(&self) -> LineItem {
+        LineItem {
+            label: format!(
+                "Download {} at {}",
+                gb_display(self.bytes),
+                self.price.egress_display()
+            ),
+            microusd: self.microusd as i64,
+        }
+    }
+
+    /// The one row a confirmation prompt prints.
+    pub fn display_row(&self) -> String {
+        let item = self.line_item();
+        format!(
+            "{:<44} {:>12}",
+            item.label,
+            format_microusd(item.microusd.unsigned_abs())
+        )
+    }
+
+    /// Why the figure may be an upper bound, in plain words.
+    pub fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.price.included_egress_gb > 0 {
+            notes.push(format!(
+                "Your plan includes {} GB/month of free download, so this is an upper bound.",
+                self.price.included_egress_gb
+            ));
+        }
+        notes.push(
+            "Billed to your own cloud account at list prices; JamStream never sees it.".to_owned(),
+        );
+        notes
+    }
+}
+
 // ---- Bundled price table ----
 
 #[derive(Debug, Deserialize)]
@@ -876,6 +949,59 @@ mod tests {
         assert!(rows[1].ends_with("$0.373248"), "{}", rows[1]);
         assert!(rows[2].contains("Recording total (estimate)"));
         assert!(rows[2].ends_with("$0.468634"), "{}", rows[2]);
+    }
+
+    // ---- Download egress ----
+
+    /// The figure the design put on the download button: 5.5 GB of stems out
+    /// of S3 is about 49 cents, and it is the same arithmetic the estimate
+    /// quotes before the session, so the two can never disagree.
+    #[test]
+    fn five_and_a_half_gigabytes_out_of_s3_is_about_forty_nine_cents() {
+        let quote = EgressQuote::with_price(aws(), 5_500_000_000);
+        assert_eq!(quote.microusd, 495_000);
+        assert_eq!(format_microusd(quote.microusd), "$0.495");
+        assert_eq!(
+            quote.line_item().label,
+            "Download 5.50 GB at $0.09/GB",
+            "the row has to name the size and the rate"
+        );
+        assert!(quote.display_row().ends_with("$0.495"));
+    }
+
+    #[test]
+    fn a_quote_matches_the_pre_session_estimate_for_the_same_bytes() {
+        let est = RecordingEstimate::with_price(aws(), &RecordingPlan::with_stems(4), 2.0);
+        let quote = EgressQuote::with_price(aws(), est.total_bytes);
+        assert_eq!(quote.microusd, est.download_egress_microusd);
+    }
+
+    #[test]
+    fn a_quote_is_priced_per_region_and_provider() {
+        let sa = EgressQuote::compute(
+            ProviderKind::Aws,
+            &RegionId::new("sa-east-1"),
+            1_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(sa.microusd, 150_000);
+        let dop = EgressQuote::compute(
+            ProviderKind::DigitalOcean,
+            &RegionId::new("nyc3"),
+            1_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(dop.microusd, 10_000);
+        assert!(
+            dop.notes().iter().any(|n| n.contains("upper bound")),
+            "an included allowance has to be disclosed: {:?}",
+            dop.notes()
+        );
+        // Nothing to download costs nothing, and says so without dividing by
+        // zero anywhere.
+        assert_eq!(EgressQuote::with_price(aws(), 0).microusd, 0);
+        // A local session has no bucket to be billed for.
+        assert!(EgressQuote::compute(ProviderKind::Local, &RegionId::new("local"), 1).is_err());
     }
 
     #[test]

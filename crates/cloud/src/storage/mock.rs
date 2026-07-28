@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use crate::provider::{ProviderError, Result};
 use crate::retention::{Retention, RetentionEnforcement, manual_note};
 use crate::storage::{
-    DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource, drive_upload,
+    ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
+    drive_upload,
 };
 use crate::types::ProviderKind;
 
@@ -48,6 +49,10 @@ pub enum StoreCall {
         upload_id: String,
     },
     Head {
+        bucket: String,
+        key: String,
+    },
+    Get {
         bucket: String,
         key: String,
     },
@@ -378,6 +383,39 @@ impl ObjectStore for MockStore {
             size: stored.body.len() as u64,
             etag: Some(format!("mock-{}", stored.body.len())),
             content_type: Some(stored.content_type.clone()),
+            last_modified: None,
+        })
+    }
+
+    async fn get(
+        &self,
+        bucket: &str,
+        key: &str,
+        sink: &mut (dyn ChunkSink + Send),
+    ) -> Result<ObjectMeta> {
+        // The body is cloned out before the first await: the lock cannot be
+        // held across one, and a sink is free to be slow.
+        let stored = {
+            let mut s = self.state.lock().expect("mock store lock");
+            s.calls.push(StoreCall::Get {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            });
+            s.objects
+                .get(&(bucket.to_owned(), key.to_owned()))
+                .cloned()
+                .ok_or_else(|| ProviderError::NotFound(format!("{bucket}/{key}")))?
+        };
+        // Served a part at a time, so a multi-chunk sink is exercised by
+        // every test that downloads through the mock.
+        for chunk in stored.body.chunks(self.part_size()) {
+            sink.write_chunk(chunk).await?;
+        }
+        Ok(ObjectMeta {
+            key: key.to_owned(),
+            size: stored.body.len() as u64,
+            etag: Some(format!("mock-{}", stored.body.len())),
+            content_type: Some(stored.content_type),
             last_modified: None,
         })
     }
