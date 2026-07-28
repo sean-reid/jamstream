@@ -18,6 +18,7 @@ jamstream-session.workspace = true
 jamstream-stream.workspace = true
 ed25519-dalek.workspace = true
 data-encoding.workspace = true
+flacenc.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -32,3 +33,11 @@ jamstream-cloud.workspace = true
 jamstream-protocol = { workspace = true, features = ["testing"] }
 # The stream integration test scans the bytes a member receives.
 postcard.workspace = true
+# Recording tests decode the FLAC the recorder wrote with an encoder-
+# independent implementation.
+claxon.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "flac"
+harness = false
