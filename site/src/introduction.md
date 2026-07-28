@@ -2,8 +2,8 @@
 
 JamStream is a desktop app that lets a band play together over the internet with latency low enough to actually play. One of you hosts: the app starts a small server on your own computer or in your own cloud account, close to your group, and it exists only for the length of the session. Everyone else pastes a personal invite link into their app; there are no accounts and no JamStream servers in the middle. Every packet is encrypted, and the server shuts itself down when the music stops. When the session ends, you have paid your cloud provider a few cents and nobody else anything.
 
-![JamStream home screen with a field to paste an invite and a button to host a session](images/home_empty.png)
-*The home screen in the current build: paste an invite or host a session.*
+![A four piece mid session: one mixer strip per musician with avatar, fader and mute, a chat column, the metronome, and a status bar reading 7.9 ms mouth to ear](images/session_demo.png)
+*A four piece playing. One strip per musician, the click, and the latency in the bar.*
 
 ## What it costs
 

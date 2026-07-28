@@ -1,12 +1,28 @@
-//! The host's invites panel on the session screen: every non-host invite
-//! from the shared state file, its live status, per-row copy and revoke,
-//! minting new invites within capacity, and the end-session action. The
-//! host's own invite exists in the state file (the app joined with it) but
-//! is never rendered anywhere.
+//! The host's invites panel on the session screen: the session's seats,
+//! what is in each of them, per-seat copy and revoke, minting into a free
+//! seat, and the end-session action. The host's own seat exists (the app
+//! joined with its invite) but is never rendered anywhere.
+//!
+//! # Seats, not a list of invites
+//!
+//! A session has [`MAX_MUSICIANS`] musician seats and [`MAX_LISTENERS`]
+//! listener seats, and the server admits against exactly those numbers by
+//! counting who is *connected*. So this panel counts seats too. Revoking
+//! ejects the holder, which frees the seat on the server; a panel that went
+//! on counting the revoked invite would refuse to mint a replacement the
+//! server would happily admit, which is what it used to do.
+//!
+//! A freed seat is minted into again, member id and all. That is safe
+//! because revocation keys on the token's `jti`, never on the member id:
+//! the replacement invite carries a fresh `jti` and the revoked one stays
+//! in the server's persisted revoked set forever. Reuse is also what keeps
+//! a member id meaning "seat number", which every invite label already
+//! implies, instead of climbing past the size of the band.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use egui::{Align2, Button, RichText, Ui, vec2};
 use jamstream_cli::state::{InviteRecord, SessionState, SessionStatus};
@@ -24,15 +40,46 @@ use crate::widgets::{AVATAR_D_ROW, avatar_disc};
 /// seats against. Re-exported so this panel's callers keep one import.
 pub use jamstream_session::{MAX_LISTENERS, MAX_MUSICIANS};
 
-/// One invite from the state file, with its token id decoded so revocation
-/// and roster matching work.
+/// Member id to the token that admits whoever holds that seat right now.
+/// Shared with [`crate::live::CostedRuntime`], which injects it into every
+/// snapshot, so the mixer's revoke button targets the invite that is in the
+/// seat rather than whatever was in it when the app started.
+pub type TokenMap = Arc<Mutex<HashMap<MemberId, TokenId>>>;
+
+/// The invite filling a seat.
 #[derive(Debug, Clone, PartialEq)]
-pub struct InviteEntry {
-    pub label: String,
-    pub role: Role,
-    pub member: MemberId,
+pub struct SeatInvite {
     pub token: TokenId,
     pub encoded: String,
+}
+
+/// One admission slot, identified by the member id the server will know its
+/// holder by. Free seats stay in the list, so the host sees the shape of
+/// the session and can mint straight back into one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Seat {
+    pub member: MemberId,
+    /// A free seat keeps the role it last carried, so its row still reads
+    /// "musician 3" and refilling it needs no second decision.
+    pub role: Role,
+    /// None once the seat is revoked, which is what makes it free.
+    pub invite: Option<SeatInvite>,
+    /// Who the revoke removed, kept greyed on the row as context. Cleared
+    /// when someone else takes the seat.
+    pub was: Option<String>,
+}
+
+impl Seat {
+    /// "host", "musician 3", "listener 12": the same label the CLI writes
+    /// into the state file, derived rather than stored so a seat that
+    /// changes hands cannot keep the label of its last occupant.
+    pub fn label(&self) -> String {
+        jamstream_cli::host::invite_label(self.role, self.member)
+    }
+
+    pub fn is_free(&self) -> bool {
+        self.invite.is_none()
+    }
 }
 
 /// What the panel asks the session screen to bubble up.
@@ -44,33 +91,37 @@ pub enum InvitesEvent {
 pub struct InvitesPanel {
     pub state: SessionState,
     pub path: PathBuf,
-    pub entries: Vec<InviteEntry>,
-    /// Tokens revoked from this app; the server keeps no queryable list,
-    /// so the host's own action log is the record.
-    pub revoked: Vec<TokenId>,
+    /// Every seat the session has, in member id order, the host's first.
+    pub seats: Vec<Seat>,
+    tokens: TokenMap,
     pub mint_role: Role,
-    pub mint_error: Option<String>,
+    /// A mint or a state-file write that failed, shown under the mint row.
+    /// Capacity is not one of these: the button is disabled instead, with
+    /// the reason on hover.
+    pub error: Option<String>,
     pub confirm_revoke: Option<(TokenId, String)>,
     pub confirm_end: bool,
     expires_unix: u64,
 }
 
 impl InvitesPanel {
-    /// Decodes the invite book out of the state record. Undecodable
-    /// entries are dropped with a warning rather than wedging the panel.
+    /// Reads the seats out of the state record. Undecodable invites are
+    /// dropped with a warning rather than wedging the panel.
     pub fn new(state: SessionState, path: PathBuf) -> InvitesPanel {
-        let mut entries = Vec::with_capacity(state.invites.len());
+        let mut seats: Vec<Seat> = Vec::with_capacity(state.invites.len());
         let mut expires_unix = 0;
         for record in &state.invites {
             match Invite::decode(&record.invite) {
                 Ok(invite) => {
                     expires_unix = expires_unix.max(invite.token.expires_unix);
-                    entries.push(InviteEntry {
-                        label: record.role.clone(),
-                        role: invite.token.role,
+                    seats.push(Seat {
                         member: invite.token.member_id,
-                        token: invite.token.jti,
-                        encoded: record.invite.clone(),
+                        role: invite.token.role,
+                        invite: Some(SeatInvite {
+                            token: invite.token.jti,
+                            encoded: record.invite.clone(),
+                        }),
+                        was: None,
                     });
                 }
                 Err(err) => {
@@ -78,68 +129,128 @@ impl InvitesPanel {
                 }
             }
         }
+        seats.sort_by_key(|s| s.member.0);
         if expires_unix == 0 {
             expires_unix = unix_now() + 12 * 3600;
         }
-        InvitesPanel {
+        let panel = InvitesPanel {
             state,
             path,
-            entries,
-            revoked: Vec::new(),
+            seats,
+            tokens: TokenMap::default(),
             mint_role: Role::Musician,
-            mint_error: None,
+            error: None,
             confirm_revoke: None,
             confirm_end: false,
             expires_unix,
-        }
+        };
+        panel.publish_tokens();
+        panel
     }
 
-    /// Member id to token id for every invite, host included; the
-    /// [`crate::live::CostedRuntime`] wrapper injects this into snapshots
-    /// so the mixer's revoke buttons have something to send.
-    pub fn token_map(&self) -> HashMap<MemberId, TokenId> {
-        self.entries.iter().map(|e| (e.member, e.token)).collect()
+    /// The live member-to-token map, shared rather than copied: minting into
+    /// a reused seat has to retarget the mixer's revoke button in the same
+    /// instant it retargets this panel's.
+    pub fn tokens(&self) -> TokenMap {
+        Arc::clone(&self.tokens)
     }
 
-    /// The rows the panel shows: everyone but the host.
-    pub fn guest_entries(&self) -> impl Iterator<Item = &InviteEntry> {
-        self.entries.iter().filter(|e| e.member != HOST_MEMBER_ID)
+    /// The token admitting whoever holds this seat, if anyone does.
+    pub fn token_of(&self, member: MemberId) -> Option<TokenId> {
+        self.seat_of(member)?.invite.as_ref().map(|i| i.token)
     }
 
-    pub fn is_revoked(&self, token: TokenId) -> bool {
-        self.revoked.contains(&token)
+    pub fn seat_of(&self, member: MemberId) -> Option<&Seat> {
+        self.seats.iter().find(|s| s.member == member)
     }
 
-    pub fn mark_revoked(&mut self, token: TokenId) {
-        if !self.revoked.contains(&token) {
-            self.revoked.push(token);
-        }
+    /// The rows the panel shows: every seat but the host's.
+    pub fn guest_seats(&self) -> impl Iterator<Item = &Seat> {
+        self.seats.iter().filter(|s| s.member != HOST_MEMBER_ID)
     }
 
-    fn count(&self, role: Role) -> usize {
-        self.entries.iter().filter(|e| e.role == role).count()
+    /// Seats in this role with a live invite in them. This is the number
+    /// the cap applies to, and revoking lowers it.
+    pub fn taken(&self, role: Role) -> usize {
+        self.seats
+            .iter()
+            .filter(|s| s.role == role && !s.is_free())
+            .count()
     }
 
-    /// Mints one more invite with the issuer key from the state file and
-    /// appends it to the same file, so `jamstream status` sees it too.
-    /// Refuses past capacity ([`MAX_MUSICIANS`] musicians including the
-    /// host, [`MAX_LISTENERS`] listeners); the count below includes the
-    /// host's own invite, which is why the cap can be compared to it
-    /// directly.
+    /// Frees the seat holding `token`. The server ejected its holder before
+    /// this runs, so the seat is free immediately; anything slower would
+    /// have the panel contradict the session.
+    ///
+    /// `was` is the name the roster had for them, kept on the row until
+    /// someone else takes the seat.
+    pub fn revoke(&mut self, token: TokenId, was: Option<String>) {
+        let Some(seat) = self
+            .seats
+            .iter_mut()
+            .find(|s| s.invite.as_ref().is_some_and(|i| i.token == token))
+        else {
+            return;
+        };
+        let member = seat.member;
+        seat.invite = None;
+        seat.was = was;
+        // The record goes with it: a dead invite left in the file is a seat
+        // this panel would count again after a restart, which is the same
+        // defect one layer down.
+        self.state
+            .invites
+            .retain(|r| !record_holds(r, member, token));
+        self.persist();
+        self.publish_tokens();
+    }
+
+    /// Mints into the lowest free seat, or into a new seat when none is
+    /// free. Refuses at capacity; the UI disables the button first and this
+    /// is the guard behind it.
     pub fn mint(&mut self, role: Role) -> Result<(), String> {
-        match role {
-            Role::Musician if self.count(Role::Musician) >= MAX_MUSICIANS => {
-                return Err(format!(
-                    "the session is at its capacity of {MAX_MUSICIANS} musicians"
-                ));
-            }
-            Role::Listener if self.count(Role::Listener) >= MAX_LISTENERS => {
-                return Err(format!(
-                    "the session is at its capacity of {MAX_LISTENERS} listeners"
-                ));
-            }
-            _ => {}
+        if self.taken(role) >= cap(role) {
+            return Err(at_capacity(role));
         }
+        let member = self.open_seat();
+        self.mint_into(member, role)
+    }
+
+    /// Mints into one named free seat, keeping its member id and its role.
+    /// This is what a freed row's own button does.
+    pub fn refill(&mut self, member: MemberId) -> Result<(), String> {
+        let Some(seat) = self.seat_of(member) else {
+            return Err(format!("seat {} is not part of this session", member.0));
+        };
+        if !seat.is_free() {
+            return Err(format!("seat {} is already taken", member.0));
+        }
+        let role = seat.role;
+        if self.taken(role) >= cap(role) {
+            return Err(at_capacity(role));
+        }
+        self.mint_into(member, role)
+    }
+
+    /// The seat the next invite takes: the lowest member id no live invite
+    /// holds, so a freed seat comes back before the session grows a new one
+    /// and ids stay as dense as the band is large. Seat 0 is the host's and
+    /// is never minted here.
+    ///
+    /// A free seat of the other role is taken as readily as one of this
+    /// role. A seat is an admission slot; its label follows whoever is in
+    /// it now, not whoever was.
+    fn open_seat(&self) -> MemberId {
+        (HOST_MEMBER_ID.0 + 1..=u16::MAX)
+            .map(MemberId)
+            .find(|id| !self.seats.iter().any(|s| s.member == *id && !s.is_free()))
+            .expect("a session has far fewer seats than u16 has values")
+    }
+
+    /// Signs an invite for one seat with the issuer key from the state
+    /// file, appends it to that file so `jamstream status` sees it too, and
+    /// puts it in the seat.
+    fn mint_into(&mut self, member: MemberId, role: Role) -> Result<(), String> {
         let issuer_bytes: [u8; 32] = base64_decode(&self.state.issuer_private_key_b64)?
             .try_into()
             .map_err(|_| "issuer key in the state file has the wrong length".to_owned())?;
@@ -152,53 +263,106 @@ impl InvitesPanel {
             self.state.address.parse().map_err(|_| {
                 format!("state file address {:?} does not parse", self.state.address)
             })?;
-        let member = MemberId(
-            self.entries
-                .iter()
-                .map(|e| e.member.0)
-                .max()
-                .unwrap_or(HOST_MEMBER_ID.0)
-                + 1,
-        );
         let token = Token {
             member_id: member,
             role,
             name_hint: None,
             expires_unix: self.expires_unix,
+            // A fresh jti every time, which is what makes reusing a member
+            // id safe: the revoked credential and this one are not the same
+            // credential, and only the revoked one is in the server's set.
             jti: TokenId::generate(),
         };
         let jti = token.jti;
         let invite = issuer.mint(session_id, vec![address], server_pk, token);
-        let label = jamstream_cli::host::invite_label(role, member);
         let encoded = invite.encode();
+        let seat = Seat {
+            member,
+            role,
+            invite: Some(SeatInvite {
+                token: jti,
+                encoded: encoded.clone(),
+            }),
+            was: None,
+        };
         self.state.invites.push(InviteRecord {
-            role: label.clone(),
-            invite: encoded.clone(),
+            role: seat.label(),
+            invite: encoded,
         });
         jamstream_cli::state::write_to(&self.path, &self.state).map_err(|e| e.to_string())?;
-        self.entries.push(InviteEntry {
-            label,
-            role,
-            member,
-            token: jti,
-            encoded,
-        });
+        match self.seats.iter_mut().find(|s| s.member == member) {
+            Some(existing) => *existing = seat,
+            None => {
+                self.seats.push(seat);
+                self.seats.sort_by_key(|s| s.member.0);
+            }
+        }
+        self.publish_tokens();
         Ok(())
     }
 
-    fn status_of(&self, entry: &InviteEntry, snap: &Snapshot) -> &'static str {
-        if self.is_revoked(entry.token) {
-            "revoked"
-        } else if snap
-            .members
-            .iter()
-            .any(|m| m.id == entry.member && m.connected)
-        {
-            "connected"
-        } else {
-            "not joined"
+    fn persist(&mut self) {
+        if let Err(err) = jamstream_cli::state::write_to(&self.path, &self.state) {
+            self.error = Some(format!("the session file could not be updated: {err}"));
         }
     }
+
+    fn publish_tokens(&self) {
+        let map: HashMap<MemberId, TokenId> = self
+            .seats
+            .iter()
+            .filter_map(|s| s.invite.as_ref().map(|i| (s.member, i.token)))
+            .collect();
+        *self.tokens.lock().expect("token map") = map;
+    }
+
+    fn status_of(&self, seat: &Seat, snap: &Snapshot) -> String {
+        if seat.is_free() {
+            return match &seat.was {
+                Some(name) => format!("free, was {name}"),
+                None => "free".to_owned(),
+            };
+        }
+        if snap
+            .members
+            .iter()
+            .any(|m| m.id == seat.member && m.connected)
+        {
+            "connected".to_owned()
+        } else {
+            "not joined".to_owned()
+        }
+    }
+}
+
+/// How many seats a role has. The numbers live in `jamstream_session` and
+/// nowhere else, because the server admits against them.
+pub fn cap(role: Role) -> usize {
+    match role {
+        Role::Musician => MAX_MUSICIANS,
+        Role::Listener => MAX_LISTENERS,
+    }
+}
+
+/// What the host is told when a role has no seat left, including the one
+/// action that frees one.
+fn at_capacity(role: Role) -> String {
+    match role {
+        Role::Musician => {
+            format!("all {MAX_MUSICIANS} musician seats are taken. Revoke someone to free one.")
+        }
+        Role::Listener => {
+            format!("all {MAX_LISTENERS} listener seats are taken. Revoke someone to free one.")
+        }
+    }
+}
+
+/// Whether a state-file record is the invite just revoked. Matched on the
+/// token id inside it, not on the label, which stops being unique the
+/// moment a seat changes hands.
+fn record_holds(record: &InviteRecord, member: MemberId, token: TokenId) -> bool {
+    Invite::decode(&record.invite)
+        .is_ok_and(|i| i.token.member_id == member && i.token.jti == token)
 }
 
 /// Ends the session the way `jamstream end` does: destroy the instance
@@ -281,7 +445,7 @@ impl InvitesPanel {
                 });
                 ui.label(theme::muted(
                     ui,
-                    "Each link admits one person. Send each musician their own.",
+                    "One seat per link. Revoking frees the seat for the next person.",
                 ));
                 ui.add_space(theme::SPACE_SM);
                 self.rows_ui(ui, snap);
@@ -311,13 +475,17 @@ impl InvitesPanel {
     }
 
     fn rows_ui(&mut self, ui: &mut Ui, snap: &Snapshot) {
-        let rows: Vec<InviteEntry> = self.guest_entries().cloned().collect();
+        let seats: Vec<Seat> = self.guest_seats().cloned().collect();
+        // Refilling rebuilds the seat list, so it happens after the grid
+        // rather than under the iterator reading it.
+        let mut refill = None;
         egui::Grid::new("invites-grid")
             .num_columns(4)
             .min_col_width(72.0)
             .spacing(vec2(theme::SPACE_LG, 4.0))
             .show(ui, |ui| {
-                for entry in &rows {
+                for seat in &seats {
+                    let label = seat.label();
                     ui.horizontal(|ui| {
                         // The disc slot is reserved on every row, drawn only
                         // for whoever is actually here, so someone joining
@@ -325,7 +493,8 @@ impl InvitesPanel {
                         let member = snap
                             .members
                             .iter()
-                            .find(|m| m.id == entry.member && m.connected);
+                            .find(|m| m.id == seat.member && m.connected)
+                            .filter(|_| !seat.is_free());
                         match member {
                             Some(m) => {
                                 avatar_disc(ui, &m.name, m.avatar.as_ref(), AVATAR_D_ROW, false)
@@ -338,26 +507,61 @@ impl InvitesPanel {
                                 );
                             }
                         }
-                        ui.label(entry.label.clone());
+                        if seat.is_free() {
+                            ui.label(theme::muted(ui, label.clone()));
+                        } else {
+                            ui.label(label.clone());
+                        }
                     });
-                    let status = self.status_of(entry, snap);
-                    match status {
-                        "connected" => ui.label(status),
-                        _ => ui.label(theme::muted(ui, status)),
-                    };
-                    let revoked = self.is_revoked(entry.token);
-                    if ui.add_enabled(!revoked, Button::new("Copy link")).clicked() {
-                        ui.ctx().copy_text(entry.encoded.clone());
+                    let status = self.status_of(seat, snap);
+                    if status == "connected" {
+                        ui.label(status);
+                    } else {
+                        ui.label(theme::muted(ui, status));
                     }
-                    if ui.add_enabled(!revoked, Button::new("Revoke")).clicked() {
-                        self.confirm_revoke = Some((entry.token, entry.label.clone()));
+                    match &seat.invite {
+                        Some(invite) => {
+                            if ui.button("Copy link").clicked() {
+                                ui.ctx().copy_text(invite.encoded.clone());
+                            }
+                            if ui.button("Revoke").clicked() {
+                                self.confirm_revoke = Some((invite.token, label));
+                            }
+                        }
+                        None => {
+                            // A free seat's own action: one click puts a
+                            // fresh link in the same chair.
+                            if ui
+                                .button("New link")
+                                .on_hover_text(format!("mint a new {label} link for this seat"))
+                                .clicked()
+                            {
+                                refill = Some(seat.member);
+                            }
+                            ui.label("");
+                        }
                     }
                     ui.end_row();
                 }
             });
+        if let Some(member) = refill {
+            self.error = self.refill(member).err();
+        }
     }
 
     fn mint_ui(&mut self, ui: &mut Ui) {
+        // Seats taken against seats there are, in the monospace, so the
+        // host never has to click Mint to find out whether there is room.
+        ui.horizontal(|ui| {
+            for (role, label) in [(Role::Musician, "musicians"), (Role::Listener, "listeners")] {
+                ui.label(theme::muted(ui, label));
+                ui.label(theme::mono(
+                    ui,
+                    format!("{}/{}", self.taken(role), cap(role)),
+                ));
+                ui.add_space(theme::SPACE_MD);
+            }
+        });
         ui.horizontal(|ui| {
             ui.label(theme::muted(ui, "new invite"));
             for (role, label) in [(Role::Musician, "musician"), (Role::Listener, "listener")] {
@@ -368,11 +572,15 @@ impl InvitesPanel {
                     self.mint_role = role;
                 }
             }
-            if ui.button("Mint invite").clicked() {
-                self.mint_error = self.mint(self.mint_role).err();
+            let full = self.taken(self.mint_role) >= cap(self.mint_role);
+            let response = ui.add_enabled(!full, Button::new("Mint invite"));
+            if full {
+                response.on_disabled_hover_text(at_capacity(self.mint_role));
+            } else if response.clicked() {
+                self.error = self.mint(self.mint_role).err();
             }
         });
-        if let Some(err) = &self.mint_error {
+        if let Some(err) = &self.error {
             let p = theme::palette_of(ui);
             ui.label(RichText::new(err.clone()).color(p.danger));
         }
@@ -386,8 +594,8 @@ impl InvitesPanel {
                 .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                 .show(ui.ctx(), |ui| {
                     ui.label(format!(
-                        "Revoke the {label} invite? Whoever holds it is disconnected \
-                         and the link stops working."
+                        "Revoke the {label} invite? Whoever holds it is disconnected, \
+                         the link stops working, and the seat is free again."
                     ));
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -404,7 +612,21 @@ impl InvitesPanel {
                             .clicked()
                         {
                             rt.send(Command::Revoke(token));
-                            self.mark_revoked(token);
+                            // The name the roster has for them right now:
+                            // the eject takes them off it a moment later,
+                            // and the row keeps saying whose seat it was.
+                            let was = self
+                                .seats
+                                .iter()
+                                .find(|s| s.invite.as_ref().is_some_and(|i| i.token == token))
+                                .and_then(|seat| {
+                                    rt.snapshot()
+                                        .members
+                                        .iter()
+                                        .find(|m| m.id == seat.member)
+                                        .map(|m| m.name.clone())
+                                });
+                            self.revoke(token, was);
                             self.confirm_revoke = None;
                         }
                     });
@@ -500,10 +722,11 @@ mod tests {
     }
 
     #[test]
-    fn token_map_covers_every_invite_including_the_host() {
+    fn the_token_map_covers_every_seat_including_the_host() {
         let (state, path) = fixture("map");
         let panel = InvitesPanel::new(state, path);
-        let map = panel.token_map();
+        let map = panel.tokens();
+        let map = map.lock().unwrap();
         assert_eq!(map.len(), 4);
         assert_eq!(map[&MemberId(0)], TokenId([1; 16]));
         assert_eq!(map[&MemberId(2)], TokenId([3; 16]));
@@ -513,7 +736,7 @@ mod tests {
     fn guest_rows_never_include_the_host() {
         let (state, path) = fixture("rows");
         let panel = InvitesPanel::new(state, path);
-        let labels: Vec<&str> = panel.guest_entries().map(|e| e.label.as_str()).collect();
+        let labels: Vec<String> = panel.guest_seats().map(Seat::label).collect();
         assert_eq!(labels, vec!["musician 1", "musician 2", "listener 3"]);
     }
 
@@ -523,11 +746,11 @@ mod tests {
         let mut panel = InvitesPanel::new(state, path.clone());
 
         panel.mint(Role::Listener).expect("mint listener");
-        let new = panel.entries.last().unwrap().clone();
-        assert_eq!(new.label, "listener 4");
+        let new = panel.seats.last().unwrap().clone();
+        assert_eq!(new.label(), "listener 4");
         assert_eq!(new.member, MemberId(4));
         // The invite decodes and carries the same session and expiry.
-        let decoded = Invite::decode(&new.encoded).expect("minted invite decodes");
+        let decoded = Invite::decode(&new.invite.unwrap().encoded).expect("minted invite decodes");
         assert_eq!(decoded.token.expires_unix, 4_000_000_000);
         assert_eq!(decoded.token.role, Role::Listener);
         // The CLI sees it too: the state file on disk has the new record.
@@ -543,7 +766,7 @@ mod tests {
         }
         let err = panel.mint(Role::Musician).expect_err("over musician cap");
         assert!(
-            err.contains(&format!("{MAX_MUSICIANS} musicians")),
+            err.contains(&format!("all {MAX_MUSICIANS} musician seats")),
             "error was {err:?}"
         );
         // Listeners: the fixture's one plus the one minted above.
@@ -552,23 +775,126 @@ mod tests {
         }
         let err = panel.mint(Role::Listener).expect_err("over listener cap");
         assert!(
-            err.contains(&format!("{MAX_LISTENERS} listeners")),
+            err.contains(&format!("all {MAX_LISTENERS} listener seats")),
             "error was {err:?}"
         );
 
         std::fs::remove_file(&path).ok();
     }
 
+    /// Which seats hold a live musician invite, in seat order.
+    fn seated_musicians(panel: &InvitesPanel) -> Vec<u16> {
+        panel
+            .seats
+            .iter()
+            .filter(|s| s.role == Role::Musician && !s.is_free())
+            .map(|s| s.member.0)
+            .collect()
+    }
+
+    /// The defect in #81: revoking every musician used to leave the session
+    /// unable to mint a single replacement, because the panel counted
+    /// invites ever issued while the server counted people connected.
     #[test]
-    fn revocation_is_tracked_locally() {
-        let (state, path) = fixture("revoke");
-        let mut panel = InvitesPanel::new(state, path);
-        let token = panel.entries[1].token;
-        assert!(!panel.is_revoked(token));
-        panel.mark_revoked(token);
-        panel.mark_revoked(token);
-        assert!(panel.is_revoked(token));
-        assert_eq!(panel.revoked.len(), 1);
+    fn revoking_frees_the_seat_and_the_band_refills_it() {
+        let (state, path) = fixture("free");
+        let mut panel = InvitesPanel::new(state, path.clone());
+        while panel.taken(Role::Musician) < MAX_MUSICIANS {
+            panel.mint(Role::Musician).expect("mint to capacity");
+        }
+        assert!(panel.mint(Role::Musician).is_err(), "full means full");
+        let before = seated_musicians(&panel);
+
+        // Every guest musician leaves the band. The host keeps seat 0.
+        let tokens: Vec<TokenId> = panel
+            .guest_seats()
+            .filter(|s| s.role == Role::Musician)
+            .filter_map(|s| s.invite.as_ref().map(|i| i.token))
+            .collect();
+        assert_eq!(tokens.len(), MAX_MUSICIANS - 1);
+        for token in tokens {
+            panel.revoke(token, Some("Ana".to_owned()));
+        }
+        assert_eq!(panel.taken(Role::Musician), 1, "only the host is seated");
+
+        // The whole band can be re-invited, into the seats it just left
+        // rather than into "musician 11" and up.
+        for _ in 1..MAX_MUSICIANS {
+            panel.mint(Role::Musician).expect("mint after revoke");
+        }
+        assert_eq!(seated_musicians(&panel), before);
+        assert!(panel.mint(Role::Musician).is_err(), "full again");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Reusing a member id is safe because revocation keys on the token's
+    /// jti. The replacement invite for a seat is a different credential
+    /// from the one revoked out of it, and only the revoked one is in the
+    /// set the server persists.
+    #[test]
+    fn a_refilled_seat_carries_a_new_token_and_leaves_the_old_one_dead() {
+        let (state, path) = fixture("reissue");
+        let mut panel = InvitesPanel::new(state, path.clone());
+        let seat = MemberId(2);
+        let old = panel.token_of(seat).expect("musician 2 holds an invite");
+        let old_encoded = panel
+            .seat_of(seat)
+            .and_then(|s| s.invite.as_ref())
+            .map(|i| i.encoded.clone())
+            .expect("musician 2 has a link");
+
+        panel.revoke(old, Some("Ben".to_owned()));
+        assert!(panel.seat_of(seat).unwrap().is_free());
+        assert_eq!(panel.token_of(seat), None);
+
+        panel.refill(seat).expect("refill seat 2");
+        let new = panel.token_of(seat).expect("seat 2 holds a new invite");
+        assert_ne!(new, old, "a reused seat must not reuse the credential");
+        assert_eq!(panel.seat_of(seat).unwrap().was, None, "the seat is taken");
+        assert_eq!(panel.seat_of(seat).unwrap().label(), "musician 2");
+
+        // Both links name the same member; only the jti separates them,
+        // which is exactly what the server's revoked set holds.
+        let old_invite = Invite::decode(&old_encoded).expect("old link decodes");
+        let new_invite = Invite::decode(
+            &panel
+                .seat_of(seat)
+                .unwrap()
+                .invite
+                .as_ref()
+                .unwrap()
+                .encoded,
+        )
+        .expect("new link decodes");
+        assert_eq!(old_invite.token.member_id, new_invite.token.member_id);
+        assert_eq!(old_invite.token.jti, old);
+        assert_eq!(new_invite.token.jti, new);
+
+        // The token map the mixer's revoke button reads follows the seat,
+        // so revoking from a strip cannot target the dead credential.
+        assert_eq!(panel.tokens().lock().unwrap()[&seat], new);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A revoked invite is gone from the state file too, so restarting the
+    /// app does not resurrect the seat it used to hold.
+    #[test]
+    fn a_revoked_invite_leaves_the_state_file() {
+        let (state, path) = fixture("persist");
+        let mut panel = InvitesPanel::new(state, path.clone());
+        let token = panel.token_of(MemberId(1)).expect("musician 1");
+        panel.revoke(token, Some("Ana".to_owned()));
+        assert_eq!(panel.error, None, "the write must succeed");
+
+        let reloaded = jamstream_cli::state::load(&path).expect("state reloads");
+        assert_eq!(reloaded.invites.len(), 3);
+        let restarted = InvitesPanel::new(reloaded, path.clone());
+        assert_eq!(restarted.taken(Role::Musician), 2, "host and musician 2");
+        assert_eq!(restarted.token_of(MemberId(1)), None);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

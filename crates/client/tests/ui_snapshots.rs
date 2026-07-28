@@ -750,7 +750,9 @@ fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {
             role,
             name_hint: None,
             expires_unix: 4_000_000_000,
-            jti: TokenId([member as u8 + 1; 16]),
+            // The demo roster's own token scheme, so a revoke sent to the
+            // panel and to the runtime lands on the same person.
+            jti: TokenId([member as u8; 16]),
         };
         jamstream_cli::state::InviteRecord {
             role: label.to_owned(),
@@ -780,18 +782,32 @@ fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {
         status: jamstream_cli::state::SessionStatus::Running,
         ended_unix: None,
     };
-    let path = std::env::temp_dir().join("jamstream-snapshot-invites.json");
+    // Per process: revoking rewrites the record, and nextest runs each test
+    // in one of its own, so two of these must not write the same file.
+    let path = std::env::temp_dir().join(format!(
+        "jamstream-snapshot-invites-{}.json",
+        std::process::id()
+    ));
     (state, path)
 }
 
+/// The host who has just revoked one musician, so every row state is on
+/// screen at once: connected, free, and not joined.
+///
+/// The revoke goes to the runtime as well as to the panel, which is what a
+/// click does. Freeing the seat in the panel alone would leave the mixer
+/// showing a strip for someone the panel says is gone, and a screenshot of
+/// two halves disagreeing is exactly what the docs gate exists to stop.
 fn session_invites_app(theme: Theme) -> JamApp {
-    let mut app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), theme);
+    use jamstream_client::runtime::Runtime;
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
     let (state, path) = invites_state();
     let mut panel = InvitesPanel::new(state, path);
-    // One revoked row so all three statuses render: the demo roster has
-    // members 1..4 connected and member 5 absent.
-    let revoked = panel.token_map()[&jamstream_protocol::ids::MemberId(2)];
-    panel.mark_revoked(revoked);
+    let member = jamstream_protocol::ids::MemberId(2);
+    let revoked = panel.token_of(member).expect("musician 2 holds an invite");
+    rt.send(jamstream_client::runtime::Command::Revoke(revoked));
+    panel.revoke(revoked, Some("Ben".to_owned()));
+    let mut app = host_app(rt, theme);
     app.session.invites = Some(panel);
     app.session.invites_open = true;
     app

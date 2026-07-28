@@ -19,7 +19,7 @@ use jamstream_protocol::control::{
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::verify_token;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
-use jamstream_protocol::transport::{Responder, Session, Welcome};
+use jamstream_protocol::transport::{self, Responder, Session, Welcome};
 use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
 
 use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
@@ -52,6 +52,22 @@ const _: () = assert!(REJECT_SLOTS.is_power_of_two());
 /// reflected volume at roughly 16 * 49 = 784 bytes per second on the wire.
 const REJECT_RATE_PER_SEC: u32 = 16;
 const REJECT_BURST: u32 = 16;
+/// Handshake inits the server will pay a Diffie-Hellman for per second, and
+/// the burst it allows. `Responder::read_init` performs an X25519 before
+/// anything about the sender is known, on the same task that runs the 2.5 ms
+/// mix tick, so an unbudgeted flood is a tick overrun for everyone already
+/// playing. A full session is 30 members, each sending one init and resending
+/// at most twice a second while connecting, so a whole band arriving at once
+/// and retrying sits inside the burst; past that, joining degrades and the
+/// session keeps playing, which is the trade the budget exists to make.
+const INIT_RATE_PER_SEC: u32 = 32;
+const INIT_BURST: u32 = 64;
+/// Per source network share of that budget, so one host flooding from a real
+/// address cannot spend the whole allowance. Sized for a rehearsal room: a
+/// band behind one NAT is one network here, and ten musicians arriving
+/// together with a resend each is 20 inits.
+const INIT_SLOT_RATE_PER_SEC: u32 = 8;
+const INIT_SLOT_BURST: u32 = 24;
 /// Shortest handshake init that earns a reject. A reject is 21 bytes and a
 /// real Noise IK first message is over 90, so answering anything shorter
 /// would make the server an amplifier by size: `[1, 9, 0]` in, 21 bytes out.
@@ -87,8 +103,8 @@ pub struct ServerConfig {
     pub session_id: SessionId,
     /// X25519 static private key, from provider user-data.
     pub server_private: Vec<u8>,
-    /// Public half of `server_private`. Token signatures bind it, and the
-    /// version reject is MAC'd with it, so the core needs it explicitly.
+    /// Public half of `server_private`. Token signatures bind it, so the core
+    /// needs it explicitly.
     pub server_public: [u8; 32],
     pub issuer_pk: VerifyingKey,
     /// Musicians admitted at once, the host's seat included. Defaults to
@@ -321,6 +337,15 @@ pub struct ServerCore {
     /// [`REJECT_SLOTS`], never resized.
     reject_seen: Vec<Option<u64>>,
     reject_budget: TokenBucket,
+    /// What an unauthenticated peer may spend of the handshake's asymmetric
+    /// crypto, globally and per source network. Same fixed table and same
+    /// slot function as the reject limiter: a source port is attacker-chosen,
+    /// so anything keyed finer than a network limits nothing.
+    init_slot_budget: Vec<TokenBucket>,
+    init_budget: TokenBucket,
+    /// Inits this core has paid a Diffie-Hellman for. The quantity the budget
+    /// exists to bound, so a test can assert it rather than infer it.
+    init_reads: u64,
     events: Vec<ServerEvent>,
     last_musician_count: usize,
     last_stats_ms: u64,
@@ -363,6 +388,12 @@ impl ServerCore {
             avatar_waiters: BTreeMap::new(),
             reject_seen: vec![None; REJECT_SLOTS],
             reject_budget: TokenBucket::new(REJECT_BURST, REJECT_RATE_PER_SEC),
+            init_slot_budget: vec![
+                TokenBucket::new(INIT_SLOT_BURST, INIT_SLOT_RATE_PER_SEC);
+                REJECT_SLOTS
+            ],
+            init_budget: TokenBucket::new(INIT_BURST, INIT_RATE_PER_SEC),
+            init_reads: 0,
             events: Vec::new(),
             last_musician_count: 0,
             last_stats_ms: 0,
@@ -385,7 +416,7 @@ impl ServerCore {
         match wire::parse(data) {
             Ok(Packet::HandshakeInit { version, noise }) => {
                 if version != PROTOCOL_VERSION {
-                    self.version_reject(now_ms, src, version, data, &mut out);
+                    self.version_reject(now_ms, src, version, noise, data, &mut out);
                 } else {
                     self.admit(now_ms, now_unix, src, noise, &mut out);
                 }
@@ -840,6 +871,7 @@ impl ServerCore {
         now_ms: u64,
         src: SocketAddr,
         theirs: u16,
+        noise: &[u8],
         init_packet: &[u8],
         out: &mut Outgoing,
     ) {
@@ -857,16 +889,43 @@ impl ServerCore {
         if !self.reject_budget.take(now_ms) {
             return;
         }
+        // Both limiters are spent before the key derivation, not after: the
+        // derivation reads the Noise first message, which is two X25519
+        // operations and an AEAD open, and a flood of unreadable inits must
+        // buy the attacker REJECT_RATE_PER_SEC of those and no more.
         self.reject_seen[slot] = Some(now_ms);
+        let Some(key) = transport::reject_key_for_init(
+            &self.cfg.server_private,
+            &self.cfg.session_id,
+            theirs,
+            noise,
+        ) else {
+            // Not a first flight this build can read, so there is nobody to
+            // authenticate a reject to. Silence, as for any other garbage.
+            return;
+        };
         out.push((
             src,
-            wire::build_version_reject(
-                &self.cfg.server_public,
-                PROTOCOL_VERSION,
-                theirs,
-                init_packet,
-            ),
+            wire::build_version_reject(&key, PROTOCOL_VERSION, theirs, init_packet),
         ));
+    }
+
+    /// Spends one unauthenticated peer's share of the handshake budget. The
+    /// per-network bucket goes first so a single flooding host cannot empty
+    /// the global one, and neither is charged when the other refuses.
+    fn init_budget_take(&mut self, now_ms: u64, src: SocketAddr) -> bool {
+        let slot = reject_slot(src.ip());
+        if !self.init_slot_budget[slot].available(now_ms) || !self.init_budget.available(now_ms) {
+            return false;
+        }
+        self.init_slot_budget[slot].take(now_ms) && self.init_budget.take(now_ms)
+    }
+
+    /// Handshake inits this core has paid a Diffie-Hellman for. Bounded per
+    /// second by construction; the tick has to survive whatever an
+    /// unauthenticated flood asks for.
+    pub fn handshake_reads(&self) -> u64 {
+        self.init_reads
     }
 
     /// Full admission path for a version-matched handshake init. Every
@@ -880,6 +939,14 @@ impl ServerCore {
         noise: &[u8],
         out: &mut Outgoing,
     ) {
+        // Everything below this line costs asymmetric crypto, so the budget
+        // is spent first and a refusal is silent. An honest client resends
+        // its init, so a drop here is packet loss to it; the flood it is
+        // sharing the server with is what made the difference.
+        if !self.init_budget_take(now_ms, src) {
+            return;
+        }
+        self.init_reads += 1;
         let Ok((hp, responder)) = Responder::read_init(
             &self.cfg.server_private,
             &self.cfg.session_id,
@@ -1650,11 +1717,24 @@ mod tests {
         format!("10.0.0.{n}:5000").parse().unwrap()
     }
 
-    /// A wrong-version init the size a real one would be: the Noise IK first
-    /// message is over 90 bytes, and the server refuses to answer anything
-    /// short enough to make the 21-byte reject an amplification.
-    fn wrong_version_init() -> Vec<u8> {
-        wire::build_handshake_init(9, &[0xAA; 96])
+    /// A first flight from a client speaking a version this build does not,
+    /// which is the only thing that draws a reject: the reject is
+    /// authenticated with a secret recovered from the init, so an init the
+    /// server cannot read is answered with silence like any other garbage.
+    fn wrong_version_init(issuer: &Issuer, server_pk: [u8; 32]) -> (Initiator, Vec<u8>) {
+        let invite = issuer.mint(
+            SessionId([7u8; 16]),
+            vec![addr(1)],
+            server_pk,
+            Token {
+                member_id: MemberId(1),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId([1u8; 16]),
+            },
+        );
+        Initiator::new_claiming_version(&invite, 9).unwrap()
     }
 
     fn server_with_issuer() -> (ServerCore, Issuer, [u8; 32]) {
@@ -1694,8 +1774,8 @@ mod tests {
 
     #[test]
     fn version_reject_is_rate_limited_per_source() {
-        let (mut core, _issuer, public) = server_with_issuer();
-        let init = wrong_version_init();
+        let (mut core, issuer, public) = server_with_issuer();
+        let (initiator, init) = wrong_version_init(&issuer, public);
         let out = core.handle_datagram(0, 0, addr(2), &init);
         assert_eq!(out.len(), 1);
         let Ok(Packet::VersionReject { ours, theirs, mac }) = wire::parse(&out[0].1) else {
@@ -1703,7 +1783,11 @@ mod tests {
         };
         assert_eq!((ours, theirs), (PROTOCOL_VERSION, 9));
         assert!(wire::verify_version_reject(
-            &public, ours, theirs, &mac, &init
+            initiator.reject_key().unwrap(),
+            ours,
+            theirs,
+            &mac,
+            &init
         ));
         // Within a second: silence. A different source still gets one.
         assert!(core.handle_datagram(500, 0, addr(2), &init).is_empty());
@@ -1717,8 +1801,8 @@ mod tests {
     /// host walking ports must draw one reject, not thousands.
     #[test]
     fn one_host_cannot_walk_source_ports_for_unlimited_rejects() {
-        let (mut core, _issuer, _public) = server_with_issuer();
-        let init = wrong_version_init();
+        let (mut core, issuer, public) = server_with_issuer();
+        let (_initiator, init) = wrong_version_init(&issuer, public);
         let mut rejects = 0;
         for port in 1_024..6_024u16 {
             let src: SocketAddr = format!("203.0.113.7:{port}").parse().unwrap();
@@ -1732,8 +1816,8 @@ mod tests {
     /// source distribution.
     #[test]
     fn reject_volume_is_capped_across_all_sources() {
-        let (mut core, _issuer, _public) = server_with_issuer();
-        let init = wrong_version_init();
+        let (mut core, issuer, public) = server_with_issuer();
+        let (_initiator, init) = wrong_version_init(&issuer, public);
         let mut rejects = 0;
         // 40,000 distinct /24s at one instant: far more slots than the table
         // has, so only the global budget can hold this down.
@@ -1751,11 +1835,64 @@ mod tests {
         assert_eq!(core.handle_datagram(1_000, 0, addr(9), &init).len(), 1);
     }
 
+    /// `Responder::read_init` performs an X25519 before anything about the
+    /// sender is known, on the task that also runs the 2.5 ms mix tick. A
+    /// flood must not be able to buy more of that than the budget allows,
+    /// however widely it spreads its source addresses.
+    #[test]
+    fn an_init_flood_cannot_buy_unbounded_asymmetric_crypto() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        // 40,000 distinct sources at one instant, far more than the table has
+        // slots, so only the global budget can hold this down.
+        for a in 0..160u16 {
+            for b in 0..250u16 {
+                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
+                core.handle_datagram(0, 0, src, &init);
+            }
+        }
+        assert_eq!(core.handshake_reads(), u64::from(INIT_BURST));
+        // A second later the allowance is back, so an honest client that
+        // resent through the flood is read: 8 from one source, inside both
+        // the refilled global budget and that source's own.
+        for _ in 0..8 {
+            core.handle_datagram(1_000, 0, addr(9), &init);
+        }
+        assert_eq!(core.handshake_reads(), u64::from(INIT_BURST) + 8);
+        // And no faster than the rate: the flood cannot buy more by waiting.
+        for a in 0..160u16 {
+            for b in 0..250u16 {
+                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
+                core.handle_datagram(1_000, 0, src, &init);
+            }
+        }
+        assert_eq!(
+            core.handshake_reads(),
+            u64::from(INIT_BURST) + u64::from(INIT_RATE_PER_SEC)
+        );
+    }
+
+    /// A single host cannot spend the whole allowance and leave a band
+    /// arriving from anywhere else with nothing.
+    #[test]
+    fn one_source_cannot_spend_the_whole_handshake_budget() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        for port in 1_024..3_024u16 {
+            let src: SocketAddr = format!("203.0.113.7:{port}").parse().unwrap();
+            core.handle_datagram(0, 0, src, &init);
+        }
+        assert_eq!(core.handshake_reads(), u64::from(INIT_SLOT_BURST));
+        // And the rest of the budget is still there for everybody else.
+        core.handle_datagram(0, 0, addr(9), &init);
+        assert_eq!(core.handshake_reads(), u64::from(INIT_SLOT_BURST) + 1);
+    }
+
     /// The reject is 21 bytes. Answering a 3-byte `[1, 9, 0]` would make the
     /// server an amplifier by size, which the threat model rules out.
     #[test]
     fn a_reject_is_never_larger_than_the_init_it_answers() {
-        let (mut core, _issuer, _public) = server_with_issuer();
+        let (mut core, issuer, public) = server_with_issuer();
         for noise_len in [0usize, 1, 8, 44] {
             let short = wire::build_handshake_init(9, &vec![0xAA; noise_len]);
             assert!(
@@ -1764,7 +1901,7 @@ mod tests {
                 short.len()
             );
         }
-        let init = wrong_version_init();
+        let (_initiator, init) = wrong_version_init(&issuer, public);
         let out = core.handle_datagram(0, 0, addr(2), &init);
         assert_eq!(out.len(), 1);
         assert!(
@@ -1773,6 +1910,16 @@ mod tests {
             out[0].1.len(),
             init.len()
         );
+    }
+
+    /// The reject carries a MAC over a secret recovered from the init, so an
+    /// init this server cannot read leaves nobody to authenticate it to. It
+    /// used to answer any wrong-version packet over the minimum length.
+    #[test]
+    fn an_unreadable_init_draws_no_reject() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let garbage = wire::build_handshake_init(9, &[0xAA; 96]);
+        assert!(core.handle_datagram(0, 0, addr(2), &garbage).is_empty());
     }
 
     #[test]

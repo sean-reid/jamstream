@@ -22,7 +22,7 @@ The app starts a real `jamstreamd` process on your machine, completes a full enc
 
 ## 3. Share the invites
 
-![Invites panel listing per-person invite links with copy and revoke buttons](images/session_invites.png)
+![Invites panel showing one seat per link: two connected musicians, a free seat that reads was Ben with a New link button, and a seat count of 3 of 10 musicians](images/session_invites.png)
 *The invites panel, open the moment you are hosting. Each link admits one person.*
 
 Each row is one seat. Click **Copy link** on a row and send that link to exactly one person, over any channel you trust. Rows read `not joined`, `connected`, or `revoked` as people come and go, and **Mint invite** adds seats mid-session. Details in [Hosting a session](guides/hosting.md).

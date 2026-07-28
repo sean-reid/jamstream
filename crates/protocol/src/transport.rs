@@ -4,6 +4,7 @@
 //! trust-on-first-use. The client's own identity is the signed token it
 //! carries in the first message, not its (fresh per connection) keypair.
 
+use blake2::{Blake2s256, Digest};
 use serde::{Deserialize, Serialize};
 use snow::{Builder, HandshakeState, StatelessTransportState};
 use zeroize::Zeroizing;
@@ -39,6 +40,62 @@ pub fn derive_public(private: &[u8]) -> Result<[u8; 32], Error> {
     let private: [u8; 32] = private.try_into().map_err(|_| Error::Malformed)?;
     let secret = x25519_dalek::StaticSecret::from(private);
     Ok(x25519_dalek::PublicKey::from(&secret).to_bytes())
+}
+
+/// Domain separator for the version reject key. Nothing else derives a key
+/// from this shared secret, but naming it costs a hash update.
+const REJECT_KEY_DOMAIN: &[u8] = b"jamstream-version-reject-key-v1";
+
+/// Hashes an X25519 shared secret into the reject MAC key. A shared secret is
+/// not a uniform key, so it goes through Blake2s rather than being used raw.
+/// A non-contributory exchange, which is what a low-order public key
+/// produces, yields no key at all: the constant that comes back would be
+/// derivable by anyone.
+fn reject_key_from_dh(private: &[u8], public: &[u8]) -> Option<wire::RejectKey> {
+    let private: [u8; 32] = private.try_into().ok()?;
+    let public: [u8; 32] = public.try_into().ok()?;
+    let shared = x25519_dalek::StaticSecret::from(private)
+        .diffie_hellman(&x25519_dalek::PublicKey::from(public));
+    if !shared.was_contributory() {
+        return None;
+    }
+    let mut h = Blake2s256::new();
+    h.update(REJECT_KEY_DOMAIN);
+    h.update(shared.as_bytes());
+    Some(wire::RejectKey::from_bytes(h.finalize().into()))
+}
+
+/// The key that authenticates a version reject for an init this server will
+/// not otherwise process, recovered from the init itself.
+///
+/// The server reads the Noise first message with the prologue the sender's
+/// own version implies, which is the only reason a mismatched init is
+/// readable at all, and takes the initiator's static key out of it. That key
+/// is fresh per connection, so the shared secret with the server's static key
+/// belongs to exactly one connection attempt and to no invite holder.
+///
+/// The read costs two X25519 operations plus one AEAD open, so callers must
+/// spend their rate-limit budget before calling: this is the only expensive
+/// thing an unauthenticated peer can ask for on the reject path. `None` when
+/// the message is not a first flight this server can read, which is every
+/// forgery and every future version that changes the Noise pattern or the
+/// prologue. Those get silence, which is what they got before.
+pub fn reject_key_for_init(
+    server_private: &[u8],
+    session_id: &SessionId,
+    version_theirs: u16,
+    noise_msg: &[u8],
+) -> Option<wire::RejectKey> {
+    let mut hs = Builder::new(NOISE_PATTERN.parse().expect("pattern"))
+        .local_private_key(server_private)
+        .ok()?
+        .prologue(&prologue(version_theirs, session_id))
+        .ok()?
+        .build_responder()
+        .ok()?;
+    let mut payload = vec![0u8; noise_msg.len()];
+    hs.read_message(noise_msg, &mut payload).ok()?;
+    reject_key_from_dh(server_private, hs.get_remote_static()?)
 }
 
 /// Client identity material carried in the first handshake message.
@@ -104,17 +161,34 @@ impl std::fmt::Debug for HandshakeRetry {
 /// attacker sets the rate of.
 pub struct Initiator {
     hs: Box<HandshakeState>,
+    /// Derived once at construction: a reject sprayed at a connecting client
+    /// must cost it a MAC, not a Diffie-Hellman.
+    reject_key: Option<wire::RejectKey>,
 }
 
 impl Initiator {
     pub fn new(invite: &Invite) -> Result<(Self, Vec<u8>), Error> {
+        Self::claiming_version(invite, PROTOCOL_VERSION)
+    }
+
+    /// A first flight claiming some other protocol version, prologue and
+    /// framing included. Nothing ships this: a client speaks one version.
+    /// Tests need it because a version reject can only be drawn by an init
+    /// the server can read and will not accept.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_claiming_version(invite: &Invite, version: u16) -> Result<(Self, Vec<u8>), Error> {
+        Self::claiming_version(invite, version)
+    }
+
+    fn claiming_version(invite: &Invite, version: u16) -> Result<(Self, Vec<u8>), Error> {
         let params = NOISE_PATTERN.parse().expect("pattern");
         let builder = Builder::new(params);
         let local = builder.generate_keypair()?;
+        let reject_key = reject_key_from_dh(&local.private, &invite.server_pk);
         let mut hs = Builder::new(NOISE_PATTERN.parse().expect("pattern"))
             .local_private_key(&local.private)?
             .remote_public_key(&invite.server_pk)?
-            .prologue(&prologue(PROTOCOL_VERSION, &invite.session_id))?
+            .prologue(&prologue(version, &invite.session_id))?
             .build_initiator()?;
         let payload = postcard::to_stdvec(&HandshakePayload {
             token: invite.token.clone(),
@@ -123,9 +197,19 @@ impl Initiator {
         let mut msg = vec![0u8; payload.len() + 160];
         let len = hs.write_message(&payload, &mut msg)?;
         Ok((
-            Self { hs: Box::new(hs) },
-            wire::build_handshake_init(PROTOCOL_VERSION, &msg[..len]),
+            Self {
+                hs: Box::new(hs),
+                reject_key,
+            },
+            wire::build_handshake_init(version, &msg[..len]),
         ))
+    }
+
+    /// The key that authenticates a version reject answering this handshake.
+    /// `None` when the invite names a server key no shared secret can be had
+    /// with, in which case no reject is ever believable.
+    pub fn reject_key(&self) -> Option<&wire::RejectKey> {
+        self.reject_key.as_ref()
     }
 
     /// Consumes the server's handshake response and yields the transport.
@@ -485,6 +569,63 @@ mod tests {
         let back: HandshakePayload = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(back.signature, hp.signature);
         assert_eq!(back.token, hp.token);
+    }
+
+    /// The reject key is a shared secret between the server's static key and
+    /// the client key behind one init. The server derives it from the init
+    /// itself, the client from the handshake it started, and an invite,
+    /// which carries only the server's public key, is no help to anyone else.
+    #[test]
+    fn only_the_server_and_the_client_that_sent_an_init_derive_its_reject_key() {
+        let (_, server, invite) = setup();
+        let (initiator, init_packet) = Initiator::new_claiming_version(&invite, 9).unwrap();
+        let wire::Packet::HandshakeInit { version, noise } = wire::parse(&init_packet).unwrap()
+        else {
+            panic!("expected init");
+        };
+        assert_eq!(version, 9);
+
+        let server_key = reject_key_for_init(&server.private, &invite.session_id, version, noise)
+            .expect("server derives the key from the init");
+        let reject =
+            wire::build_version_reject(&server_key, PROTOCOL_VERSION, version, &init_packet);
+        let wire::Packet::VersionReject { ours, theirs, mac } = wire::parse(&reject).unwrap()
+        else {
+            panic!("expected reject");
+        };
+        assert!(wire::verify_version_reject(
+            initiator.reject_key().expect("client derives the key"),
+            ours,
+            theirs,
+            &mac,
+            &init_packet
+        ));
+
+        // Another handshake with the same invite, so another client key: the
+        // reject that answers one connection attempt does not answer another.
+        let (other, _) = Initiator::new_claiming_version(&invite, 9).unwrap();
+        assert!(!wire::verify_version_reject(
+            other.reject_key().unwrap(),
+            ours,
+            theirs,
+            &mac,
+            &init_packet
+        ));
+
+        // Holding the invite is holding the server's public key. Without the
+        // private half the init is unreadable and no key comes out of it.
+        let imposter = generate_keypair();
+        assert!(
+            reject_key_for_init(&imposter.private, &invite.session_id, version, noise).is_none()
+        );
+        // Nor does an init this server cannot read, whatever its length.
+        assert!(
+            reject_key_for_init(&server.private, &invite.session_id, version, &[0x5A; 96])
+                .is_none()
+        );
+        // Nor one whose claimed version does not match the prologue it was
+        // written under, which is what a replayed init relabelled looks like.
+        assert!(reject_key_for_init(&server.private, &invite.session_id, 8, noise).is_none());
     }
 
     #[test]

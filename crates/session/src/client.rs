@@ -15,7 +15,7 @@ use jamstream_protocol::ids::{MemberId, Role, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
 use jamstream_protocol::transport::{Initiator, Session, Welcome};
-use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
+use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet, RejectKey};
 
 use crate::SessionError;
 use crate::avatar::{
@@ -29,6 +29,12 @@ const PING_INTERVAL_MS: u64 = 1_000;
 /// First init resend after 500 ms, doubling to the cap while Connecting.
 const INIT_RESEND_MS: u64 = 500;
 const INIT_RESEND_MAX_MS: u64 = 2_000;
+/// A rejected client keeps trying, slowly. A reject is authenticated, so it
+/// is a true statement about the server that answered, but it is a statement
+/// about one moment: a migration or a redeploy can answer the next init, and
+/// a client that gave up for good would need the user to restart it.
+const REJECT_RETRY_MS: u64 = 5_000;
+const REJECT_RETRY_MAX_MS: u64 = 60_000;
 /// Reports of clean link required before redundancy turns back off.
 const REDUNDANCY_OFF_HOLD: u32 = 10;
 /// Playout steering samples the local jitter buffer this often, matching the
@@ -157,6 +163,9 @@ pub struct ClientCore {
     initiator: Option<Initiator>,
     /// The exact init bytes on the wire; the version reject MAC covers them.
     init_packet: Vec<u8>,
+    /// Authenticates a version reject answering this connection attempt.
+    /// Derived from the handshake, so it changes on every reconnect.
+    reject_key: Option<RejectKey>,
     session: Option<Session>,
     welcome: Option<Welcome>,
     link: ControlLink,
@@ -215,11 +224,13 @@ impl ClientCore {
     pub fn connect(invite: &Invite, now_ms: u64) -> Result<(Self, Vec<u8>), SessionError> {
         let (initiator, init_packet) = Initiator::new(invite)?;
         let (encoder, decoder, decode_len) = Self::media_state(invite.token.role)?;
+        let reject_key = initiator.reject_key().cloned();
         let core = Self {
             invite: invite.clone(),
             state: ClientState::Connecting,
             initiator: Some(initiator),
             init_packet: init_packet.clone(),
+            reject_key,
             session: None,
             welcome: None,
             link: ControlLink::new(),
@@ -263,6 +274,7 @@ impl ClientCore {
         let (initiator, init_packet) = Initiator::new(&self.invite)?;
         let (encoder, decoder, decode_len) = Self::media_state(self.invite.token.role)?;
         self.state = ClientState::Connecting;
+        self.reject_key = initiator.reject_key().cloned();
         self.initiator = Some(initiator);
         self.init_packet = init_packet.clone();
         self.session = None;
@@ -303,7 +315,12 @@ impl ClientCore {
         };
         match pkt {
             Packet::HandshakeResp { noise } => {
-                if self.state != ClientState::Connecting {
+                // Rejected keeps retrying, so a server that starts answering
+                // (a migration, a redeploy) is let in.
+                if !matches!(
+                    self.state,
+                    ClientState::Connecting | ClientState::Rejected { .. }
+                ) {
                     return out;
                 }
                 let Some(initiator) = self.initiator.take() else {
@@ -336,17 +353,14 @@ impl ClientCore {
                 }
             }
             Packet::VersionReject { ours, theirs, mac } => {
-                // Only honored when the MAC binds the server key from our
-                // invite to the exact init packet we sent.
-                if self.state == ClientState::Connecting
-                    && wire::verify_version_reject(
-                        &self.invite.server_pk,
-                        ours,
-                        theirs,
-                        &mac,
-                        &self.init_packet,
-                    )
-                {
+                // Honored only when the MAC binds the exact init packet we
+                // sent under the secret this handshake shares with the
+                // server. Nothing an invite carries can produce one.
+                let ok = self.state == ClientState::Connecting
+                    && self.reject_key.as_ref().is_some_and(|key| {
+                        wire::verify_version_reject(key, ours, theirs, &mac, &self.init_packet)
+                    });
+                if ok {
                     // Wire fields are from the server's perspective; ours is
                     // the version this client speaks.
                     self.state = ClientState::Rejected {
@@ -357,6 +371,8 @@ impl ClientCore {
                         ours: theirs,
                         theirs: ours,
                     });
+                    self.last_init_ms = now_ms;
+                    self.init_resend_ms = REJECT_RETRY_MS;
                 }
             }
             Packet::Transport {
@@ -603,6 +619,19 @@ impl ClientCore {
                 // Redundancy is fed by the server's Stats reports as they
                 // arrive (once a second); no downlink proxy here.
                 self.flush_link(now_ms, &mut out);
+            }
+            // A rejected client has something to show its user, and it keeps
+            // handing the same init back at a minute's spacing. That costs
+            // the server one packet a minute and means a session that
+            // migrates or is redeployed onto a build this client can talk to
+            // is joined without anyone restarting anything. No timeout here:
+            // the state is already the answer.
+            ClientState::Rejected { .. }
+                if now_ms.saturating_sub(self.last_init_ms) >= self.init_resend_ms =>
+            {
+                self.last_init_ms = now_ms;
+                self.init_resend_ms = (self.init_resend_ms * 2).min(REJECT_RETRY_MAX_MS);
+                out.push(self.init_packet.clone());
             }
             _ => {}
         }
@@ -984,13 +1013,17 @@ mod tests {
     use super::*;
     use jamstream_protocol::ids::SessionId;
     use jamstream_protocol::invite::{Issuer, Token};
-    use jamstream_protocol::transport::generate_keypair;
+    use jamstream_protocol::transport::{Keypair, generate_keypair, reject_key_for_init};
     use jamstream_protocol::wire::TYPE_HANDSHAKE_INIT;
 
     fn invite(role: Role) -> Invite {
+        invite_and_server(role).0
+    }
+
+    fn invite_and_server(role: Role) -> (Invite, Keypair) {
         let issuer = Issuer::generate();
         let kp = generate_keypair();
-        issuer.mint(
+        let invite = issuer.mint(
             SessionId::generate(),
             vec!["10.0.0.1:5000".parse().unwrap()],
             kp.public,
@@ -1001,7 +1034,20 @@ mod tests {
                 expires_unix: u64::MAX,
                 jti: TokenId::generate(),
             },
-        )
+        );
+        (invite, kp)
+    }
+
+    /// The reject a real server would send in answer to `init`, keyed the way
+    /// the server keys it: on the secret it shares with the client that sent
+    /// this exact init.
+    fn genuine_reject(server: &Keypair, inv: &Invite, init: &[u8], theirs: u16) -> Vec<u8> {
+        let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(init) else {
+            panic!("expected an init");
+        };
+        let key = reject_key_for_init(&server.private, &inv.session_id, version, noise)
+            .expect("server derives the reject key");
+        wire::build_version_reject(&key, theirs, version, init)
     }
 
     #[test]
@@ -1031,19 +1077,27 @@ mod tests {
         assert!(matches!(core.leave("bye"), Err(SessionError::NotJoined)));
     }
 
+    /// Holding an invite used to be enough to forge a reject, because the MAC
+    /// was keyed on the server public key every invite carries and the
+    /// resulting state was terminal. One 21-byte packet from a revoked member
+    /// wedged a victim for good.
     #[test]
-    fn forged_version_reject_is_ignored() {
-        let inv = invite(Role::Musician);
+    fn a_reject_forged_by_an_invite_holder_is_ignored() {
+        let (inv, server) = invite_and_server(Role::Musician);
         let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
-        // MAC keyed on the wrong server key.
-        let forged = wire::build_version_reject(&[9u8; 32], 2, 1, &init);
+
+        // Everything an invite holder has: the server's public key, the
+        // session id, and the victim's init off the wire. None of it keys
+        // the MAC, and a second handshake of their own derives another key.
+        let (other, _) = Initiator::new(&inv).unwrap();
+        let forged = wire::build_version_reject(other.reject_key().unwrap(), 2, 1, &init);
         assert!(core.handle_datagram(1, &forged).is_empty());
         assert_eq!(*core.state(), ClientState::Connecting);
         assert!(core.events().is_empty());
-        // The genuine article, MAC'd with the invite's server key over our
-        // init packet, is honored and mapped to the client's perspective.
-        let real = wire::build_version_reject(&inv.server_pk, 2, 1, &init);
-        core.handle_datagram(2, &real);
+
+        // The server's own, over the same init, is honored and mapped to the
+        // client's perspective.
+        core.handle_datagram(2, &genuine_reject(&server, &inv, &init, 2));
         assert_eq!(*core.state(), ClientState::Rejected { ours: 1, theirs: 2 });
         assert_eq!(
             core.events(),
@@ -1066,6 +1120,27 @@ mod tests {
         // Same init bytes on the wire, so the server's cached response and
         // its transport state still pair with what this client sent.
         assert_eq!(core.poll(500), vec![first]);
+    }
+
+    /// Rejected is a report, not an ending: the client keeps offering the
+    /// same init at a widening interval, so a session that migrates or is
+    /// redeployed onto a build it can talk to is joined without a restart.
+    #[test]
+    fn a_rejected_client_keeps_trying_and_can_still_join() {
+        let (inv, server) = invite_and_server(Role::Musician);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+        core.handle_datagram(1, &genuine_reject(&server, &inv, &init, 2));
+        assert!(matches!(core.state(), ClientState::Rejected { .. }));
+
+        // Backoff from 5 s, doubling, and the same bytes every time.
+        assert!(core.poll(4_000).is_empty());
+        assert_eq!(core.poll(5_001), vec![init.clone()]);
+        assert!(core.poll(12_000).is_empty());
+        assert_eq!(core.poll(15_002), vec![init.clone()]);
+        // No timeout while rejected: the state is already the answer, and a
+        // client that gave up for good would need the user to restart it.
+        core.poll(600_000);
+        assert!(matches!(core.state(), ClientState::Rejected { .. }));
     }
 
     #[test]

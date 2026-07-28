@@ -17,11 +17,26 @@ use jamstream_audio_io::WavBackend;
 use jamstream_client::creds::{EnvReader, MemStore};
 use jamstream_client::exec::Executor;
 use jamstream_client::live::{AudioSettings, CostedRuntime, LiveRuntime};
-use jamstream_client::runtime::{Command, ConnState, Runtime, Snapshot};
+use jamstream_client::runtime::{Command, ConnState, Runtime, Snapshot, TokenId};
 use jamstream_client::screens::host::{HostWizard, WizardEvent, WizardStep};
-use jamstream_client::screens::invites::{self, InvitesPanel};
-use jamstream_protocol::ids::HOST_MEMBER_ID;
+use jamstream_client::screens::invites::{self, InvitesPanel, Seat};
+use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId};
 use jamstream_protocol::invite::Invite;
+
+/// The token and the shareable link in the seat with this label. Panics
+/// rather than returning an option: every caller here names a seat the
+/// session has.
+fn link_of(panel: &InvitesPanel, label: &str) -> (TokenId, String) {
+    let seat = panel
+        .guest_seats()
+        .find(|s| s.label() == label)
+        .unwrap_or_else(|| panic!("no seat labelled {label}"));
+    let invite = seat
+        .invite
+        .as_ref()
+        .unwrap_or_else(|| panic!("seat {label} holds no invite"));
+    (invite.token, invite.encoded.clone())
+}
 
 #[cfg(windows)]
 const BIN_NAME: &str = "jamstreamd.exe";
@@ -162,7 +177,7 @@ async fn wizard_hosts_a_real_local_session() {
 
     // Auto-join with the host invite, as the app does (offline backend in
     // place of the sound card), wrapped the same way the app wraps it.
-    let panel = InvitesPanel::new(outcome.state.clone(), outcome.state_path.clone());
+    let mut panel = InvitesPanel::new(outcome.state.clone(), outcome.state_path.clone());
     let host_invite = Invite::decode(&outcome.state.invites[0].invite).expect("host invite");
     let live = Arc::new(
         LiveRuntime::join_offline(&host_invite, settings(), WavBackend::new(None, None))
@@ -172,7 +187,7 @@ async fn wizard_hosts_a_real_local_session() {
         Arc::clone(&live),
         outcome.state.hourly_microusd,
         outcome.state.created_unix,
-        panel.token_map(),
+        panel.tokens(),
     );
     let snap = wait_for(&rt, "host joined", Duration::from_secs(15), |s| {
         s.stats.state == ConnState::Joined
@@ -186,26 +201,27 @@ async fn wizard_hosts_a_real_local_session() {
         .iter()
         .find(|m| m.id == HOST_MEMBER_ID)
         .expect("host in roster");
-    assert_eq!(me.token, Some(panel.token_map()[&HOST_MEMBER_ID]));
+    assert_eq!(me.token, panel.token_of(HOST_MEMBER_ID));
 
-    // The invites panel model: every non-host invite, labeled, with its
-    // token; the host's own invite is never listed.
-    let labels: Vec<&str> = panel.guest_entries().map(|e| e.label.as_str()).collect();
+    // The invites panel model: one seat per non-host invite, labeled, with
+    // its token; the host's own seat is never listed.
+    let labels: Vec<String> = panel.guest_seats().map(Seat::label).collect();
     assert_eq!(labels, vec!["musician 1", "musician 2", "listener 3"]);
-    assert_eq!(panel.token_map().len(), 4);
+    assert_eq!(panel.tokens().lock().unwrap().len(), 4);
 
     // Revoke musician 1 the way the panel does, then prove the server
     // refuses that invite on a real join attempt: the handshake is
     // silently dropped, so the joiner times out and never reaches Joined.
-    let revoked_entry = panel
-        .guest_entries()
-        .find(|e| e.label == "musician 1")
-        .expect("musician 1 entry")
-        .clone();
-    rt.send(Command::Revoke(revoked_entry.token));
+    let (revoked_token, revoked_link) = link_of(&panel, "musician 1");
+    rt.send(Command::Revoke(revoked_token));
+    panel.revoke(revoked_token, Some("Ana".to_owned()));
+    assert!(
+        panel.seat_of(MemberId(1)).expect("seat 1").is_free(),
+        "revoking frees the seat, because the server has already ejected them"
+    );
     std::thread::sleep(Duration::from_millis(500));
 
-    let revoked_invite = Invite::decode(&revoked_entry.encoded).expect("revoked invite decodes");
+    let revoked_invite = Invite::decode(&revoked_link).expect("revoked invite decodes");
     let refused =
         LiveRuntime::join_offline(&revoked_invite, settings(), WavBackend::new(None, None))
             .expect("join attempt starts");
@@ -226,14 +242,8 @@ async fn wizard_hosts_a_real_local_session() {
     drop(refused);
 
     // A musician with an intact invite still gets in.
-    let good_invite = Invite::decode(
-        &panel
-            .guest_entries()
-            .find(|e| e.label == "musician 2")
-            .expect("musician 2 entry")
-            .encoded,
-    )
-    .expect("good invite");
+    let (_, good_link) = link_of(&panel, "musician 2");
+    let good_invite = Invite::decode(&good_link).expect("good invite");
     let good = LiveRuntime::join_offline(&good_invite, settings(), WavBackend::new(None, None))
         .expect("musician 2 join");
     wait_for(&good, "musician 2 joined", Duration::from_secs(15), |s| {
@@ -244,6 +254,56 @@ async fn wizard_hosts_a_real_local_session() {
         s.stats.state == ConnState::Idle
     });
     drop(good);
+
+    // #81: the freed seat takes a replacement, member id and all. This is
+    // the claim the whole seat model rests on, so it is made against a real
+    // server rather than against the panel's own arithmetic: revocation
+    // keys on the token's jti, so seat 1's new link is admitted while the
+    // link revoked out of that same seat stays refused.
+    panel.refill(MemberId(1)).expect("refill seat 1");
+    let (reissued_token, reissued_link) = link_of(&panel, "musician 1");
+    assert_ne!(
+        reissued_token, revoked_token,
+        "a reused seat must carry a new credential"
+    );
+    let reissued = LiveRuntime::join_offline(
+        &Invite::decode(&reissued_link).expect("reissued invite decodes"),
+        settings(),
+        WavBackend::new(None, None),
+    )
+    .expect("reissued join starts");
+    wait_for(
+        &reissued,
+        "reissued seat joined",
+        Duration::from_secs(15),
+        |s| s.stats.state == ConnState::Joined,
+    );
+    reissued.send(Command::Leave);
+    wait_for(
+        &reissued,
+        "reissued seat left",
+        Duration::from_secs(5),
+        |s| s.stats.state == ConnState::Idle,
+    );
+    drop(reissued);
+
+    let still_dead =
+        LiveRuntime::join_offline(&revoked_invite, settings(), WavBackend::new(None, None))
+            .expect("second attempt with the revoked link starts");
+    wait_for(
+        &still_dead,
+        "the revoked link stays refused after the seat is reissued",
+        Duration::from_secs(20),
+        |s| {
+            assert_ne!(
+                s.stats.state,
+                ConnState::Joined,
+                "reissuing a seat resurrected the invite revoked out of it"
+            );
+            s.stats.state == ConnState::TimedOut
+        },
+    );
+    drop(still_dead);
 
     // End the session for everyone: leave, destroy through the recorded
     // provider, mark the state file ended; the process must actually die.
