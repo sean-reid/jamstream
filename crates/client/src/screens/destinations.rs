@@ -286,7 +286,7 @@ impl DestinationsPanel {
 }
 
 // Rendering: the same sheet treatment as invites and the stream mix, so the
-// three host sheets are one thing in three states.
+// host sheets are one thing in several states.
 
 impl DestinationsPanel {
     pub fn ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, open: &mut bool) {

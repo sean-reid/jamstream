@@ -8,7 +8,9 @@ use egui::{Event, Key, Modifiers, PointerButton, vec2};
 use egui_kittest::{Harness, kittest::Queryable};
 use jamstream_client::creds::MemStore;
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME, RecordingRuntime};
-use jamstream_client::runtime::{Command, DestinationState, MemberId, Runtime, Snapshot};
+use jamstream_client::runtime::{
+    Command, DestinationState, MemberId, RecordState, Runtime, Snapshot,
+};
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::session::SessionScreen;
 use jamstream_client::theme::{self, Theme};
@@ -40,13 +42,18 @@ fn session_harness(is_host: bool) -> (Recorder, Harness<'static>) {
 }
 
 /// A host with everything a host has: the invite book, the destinations
-/// sheet, and the broadcast view the runtime gives a host. All three status
-/// bar toggles come from those, so this is the widest the bar ever gets.
+/// sheet, the broadcast view the runtime gives a host, and the record lamp
+/// in its widest state. The four status bar toggles come from those, so
+/// this is the widest the bar ever gets.
 fn host_harness_sized(size: egui::Vec2) -> Harness<'static> {
-    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
-        FROZEN_FRAME,
-        true,
-    )));
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, true);
+    demo.set_record(
+        RecordState::Failed {
+            reason: "multipart upload aborted".to_owned(),
+        },
+        false,
+    );
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
     let rt_ui = rt.clone();
     let mut screen = SessionScreen {
         invites: Some(empty_invites()),
@@ -100,7 +107,7 @@ const SIZES: [egui::Vec2; 8] = [
     vec2(1280.0, 800.0),
 ];
 
-/// The bar may never overlap itself. A host's carries three sheet toggles,
+/// The bar may never overlap itself. A host's carries four sheet toggles,
 /// the lamp, the session id, the timer, the cost, and Leave beside the
 /// readouts, and the readouts drop their meters or move to a row of their
 /// own to keep clear of them.
@@ -114,12 +121,17 @@ fn the_host_status_bar_never_runs_into_its_readouts() {
             .next()
             .expect("the loss readout")
             .rect();
-        for control in ["Stream mix", "Destinations", "Invites", "Leave"] {
+        for control in ["Stream mix", "Record", "Destinations", "Invites", "Leave"] {
             let rect = harness.get_by_label(control).rect();
             let clear = rect.left() >= readout.right() || rect.top() >= readout.bottom();
             assert!(
                 clear,
                 "{control} at {rect:?} runs into the readouts at {readout:?}, window {size:?}"
+            );
+            // And the right-to-left row must not run out the left edge.
+            assert!(
+                rect.left() >= 0.0,
+                "{control} at {rect:?} runs off the window at {size:?}"
             );
         }
     }
@@ -820,6 +832,155 @@ fn non_hosts_get_no_destination_controls_but_do_see_the_air() {
     assert!(harness.query_by_label("Go live").is_none());
     assert!(harness.query_by_label("1 live").is_some());
     assert!(harness.query_by_label("on air").is_some());
+}
+
+// Recording. One rule from the destinations sheet, applied whole: the
+// button sends the command and the lamp follows the snapshot; nothing on
+// this surface echoes a press optimistically.
+
+fn record_harness(
+    state: RecordState,
+    is_host: bool,
+    sheet_open: bool,
+) -> (Recorder, Harness<'static>) {
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, is_host);
+    demo.set_record(state, false);
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let rt_ui = rt.clone();
+    let mut screen = SessionScreen {
+        record_open: sheet_open,
+        ..Default::default()
+    };
+    let harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        });
+    (rt, harness)
+}
+
+/// While the sheet is open and the take is idle, "Record" is on screen
+/// twice: the bar toggle at the bottom and the sheet's control at the top.
+/// The sheet anchors top right, so the higher one is its.
+fn sheet_record_button<'h>(harness: &'h Harness<'_>) -> egui_kittest::Node<'h> {
+    harness
+        .get_all_by_role_and_label(AkRole::Button, "Record")
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .expect("the sheet's Record control")
+}
+
+#[test]
+fn record_round_trip_sends_the_commands_and_the_lamp_follows() {
+    let (rt, mut harness) = record_harness(RecordState::Idle, true, false);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("recording").is_none());
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Record")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Capturing the mix only")
+            .is_some(),
+        "the toggle must open the sheet"
+    );
+    // Opening a sheet is navigation; nothing went to the runtime.
+    assert!(rt.commands().is_empty());
+
+    sheet_record_button(&harness).click();
+    harness.run_steps(2);
+    assert_eq!(rt.commands(), vec![Command::StartRecord]);
+    // The lamp follows the snapshot, which the demo flips on the command:
+    // it says so in the bar and on the sheet's own state row.
+    assert!(harness.get_all_by_label("recording").next().is_some());
+
+    // Let the sheet settle on its recording layout and the double-click
+    // window pass; Stop sits where Record just was.
+    harness.run_steps(8);
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stop")
+        .click();
+    harness.run_steps(2);
+    assert_eq!(
+        rt.commands(),
+        vec![Command::StartRecord, Command::StopRecord]
+    );
+    assert!(harness.query_by_label("recording").is_none());
+}
+
+#[test]
+fn escape_closes_the_record_sheet_and_the_take_keeps_running() {
+    let (rt, mut harness) = record_harness(RecordState::Recording, true, true);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Stop ends the take")
+            .is_some()
+    );
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Stop ends the take")
+            .is_none(),
+        "Escape must close the sheet"
+    );
+    // Closing the sheet is navigation: nothing was sent, and the lamp
+    // still says the take is running.
+    assert!(rt.commands().is_empty());
+    assert!(harness.query_by_label("recording").is_some());
+}
+
+#[test]
+fn an_uploading_take_holds_record_and_reads_as_in_progress() {
+    let (rt, mut harness) = record_harness(RecordState::Uploading, true, true);
+    harness.run_steps(2);
+    // Its own state, not done and not failed, said in the bar and on the
+    // sheet's state row.
+    assert_eq!(harness.get_all_by_label("uploading").count(), 2);
+    // The sheet's Record control waits for the upload; a click on the
+    // disabled button sends nothing.
+    sheet_record_button(&harness).click();
+    harness.run_steps(2);
+    assert!(
+        rt.commands().is_empty(),
+        "Record must wait for the upload: {:?}",
+        rt.commands()
+    );
+}
+
+#[test]
+fn non_hosts_get_no_record_control_but_do_see_the_lamp() {
+    let (rt, mut harness) = record_harness(RecordState::Recording, false, false);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Record").is_none());
+    assert!(harness.query_by_label("recording").is_some());
+    assert!(rt.commands().is_empty());
+}
+
+#[test]
+fn a_failed_take_says_why_on_the_lamp_everyone_sees() {
+    let reason = "multipart upload aborted: connection reset by peer";
+    let (_, mut harness) = record_harness(
+        RecordState::Failed {
+            reason: reason.to_owned(),
+        },
+        false,
+        false,
+    );
+    harness.run_steps(2);
+    let lamp = harness.get_by_label("take failed").rect();
+    harness.event(Event::PointerMoved(lamp.center()));
+    // Past the tooltip delay, the recorder's reason is on the lamp.
+    harness.run_steps(20);
+    assert!(
+        harness.query_by_label(reason).is_some(),
+        "the reason must be on the lamp verbatim"
+    );
 }
 
 #[test]

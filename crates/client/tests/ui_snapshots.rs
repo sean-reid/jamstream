@@ -12,7 +12,7 @@ use jamstream_client::app::{JamApp, Screen};
 use jamstream_client::creds::{self, CredStore, EnvReader, MemStore};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
 use jamstream_client::exec::Executor;
-use jamstream_client::runtime::{DestinationState, StreamPlatform};
+use jamstream_client::runtime::{DestinationState, RecordState, StreamPlatform};
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
 use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow, RegionSurvey};
@@ -235,7 +235,7 @@ fn session_demo() {
 
 #[test]
 fn session_host() {
-    // The full host bar: three sheet toggles, the lamp, the session id, the
+    // The full host bar: four sheet toggles, the lamp, the session id, the
     // timer, the cost, and Leave, beside the readouts on one row.
     let app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
     let mut harness = app_harness(app, WIDE);
@@ -555,7 +555,7 @@ fn session_destinations_failed() {
 
 #[test]
 fn session_destinations_narrow() {
-    // At 800 px the status bar carries three toggles, the cost ticker, the
+    // At 800 px the status bar carries four toggles, the cost ticker, the
     // lamp, and the live count; nothing may overlap.
     let app = destinations_app(
         Theme::Dark,
@@ -575,6 +575,85 @@ fn session_on_air_musician() {
     let app = session_app(rt, Theme::Dark);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_on_air_musician");
+}
+
+// The record sheet and its lamp, in the states a take passes through. The
+// demo recorder flips on command, so the in-between states are pinned the
+// way destinations are; nothing here is a state the runtime cannot report.
+
+/// The host session with the record sheet open and the recorder pinned to
+/// `state`. `stems` is the launch-time choice the sheet reads back.
+fn record_app(theme: Theme, state: RecordState, stems: bool) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_record(state, stems);
+    let mut app = host_app(rt, theme);
+    app.session.record_open = true;
+    app
+}
+
+#[test]
+fn session_record() {
+    // The sheet as a host first opens it: idle, mix only, Record enabled,
+    // and the bar's lamp dark because nothing is being captured.
+    let app = record_app(Theme::Dark, RecordState::Idle, false);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_record");
+}
+
+#[test]
+fn session_record_light() {
+    // Mid-take in the light palette: the lamp and the state word have to
+    // read against the light surfaces too.
+    let app = record_app(Theme::Light, RecordState::Recording, false);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_record_light");
+}
+
+#[test]
+fn session_record_uploading() {
+    // Stop has been pressed: the take is safe-in-progress, its own state,
+    // neither done nor failed, and Record waits for the upload to finish.
+    let app = record_app(Theme::Dark, RecordState::Uploading, true);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_record_uploading");
+}
+
+#[test]
+fn session_record_failed() {
+    // The recorder died and the sheet says why, verbatim, the discipline
+    // the destinations sheet set for a dropped stream.
+    let app = record_app(
+        Theme::Dark,
+        RecordState::Failed {
+            reason: "multipart upload aborted: connection reset by peer".to_owned(),
+        },
+        false,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_record_failed");
+}
+
+#[test]
+fn session_recording_musician() {
+    // Not a host, no sheet, no button: a musician still sees the lit lamp
+    // beside the readouts, because everyone in the room is on the take.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_record(RecordState::Recording, false);
+    let app = session_app(rt, Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_recording_musician");
+}
+
+#[test]
+fn session_recording_narrow() {
+    // The bar that once overlapped itself at 1280 (#85), now with the
+    // record lamp lit and 480 fewer pixels: the readouts keep the first
+    // row with the lamp, the controls take the second, nothing overlaps.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_record(RecordState::Recording, false);
+    let app = host_app(rt, Theme::Dark);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_recording_narrow");
 }
 
 // Wizard states are constructed through the real transitions with a

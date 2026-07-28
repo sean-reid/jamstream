@@ -13,6 +13,7 @@ use crate::runtime::{
 };
 use crate::screens::destinations::{DestinationsPanel, on_air_indicator};
 use crate::screens::invites::{InvitesEvent, InvitesPanel};
+use crate::screens::record::{record_indicator, record_sheet};
 use crate::theme;
 use crate::widgets::{
     AVATAR_D_STRIP, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, on_air, pan_slider,
@@ -22,10 +23,10 @@ use crate::widgets::{
 const NARROW_BELOW_PX: f32 = 900.0;
 
 /// A host's bar stacks into two rows below this. The one-row form needs the
-/// readouts without their meters, 425, beside the full set of controls,
-/// 655: three sheet toggles, the lamp, the session id, the timer, the cost,
-/// and Leave.
-const BAR_STACK_BELOW_PX: f32 = 1100.0;
+/// readouts without their meters but with the record lamp lit, 505, beside
+/// the full set of controls, 730: four sheet toggles, the on-air lamp, the
+/// session id, the timer, the cost, and Leave.
+const BAR_STACK_BELOW_PX: f32 = 1240.0;
 
 /// What the pair of compact meters needs beside the readouts: two 52 px
 /// meters, their labels, the separator, and the gaps between them.
@@ -86,6 +87,10 @@ pub struct SessionScreen {
     /// exactly like the invites panel.
     pub destinations: Option<DestinationsPanel>,
     pub destinations_open: bool,
+    /// Host only: the record sheet. It needs nothing but the runtime, so it
+    /// hangs off the snapshot's `is_host` rather than a panel of its own;
+    /// everyone else gets the lamp in the bar.
+    pub record_open: bool,
     /// Where the status bar starts, from this frame. The settings drawer is
     /// drawn after the screen and stops here, so it never covers the
     /// mouth-to-ear readout or the meters a musician adjusts against.
@@ -122,6 +127,9 @@ impl SessionScreen {
                 // Same rule: closing the sheet is navigation and never takes
                 // the session off air.
                 self.destinations_open = false;
+            } else if self.record_open {
+                // And again: the take keeps running; only the sheet closes.
+                self.record_open = false;
             } else if self.invites_open {
                 self.invites_open = false;
             } else if narrow && self.chat_open {
@@ -176,6 +184,10 @@ impl SessionScreen {
             && let Some(panel) = &mut self.destinations
         {
             panel.ui(ui, snap, rt, &mut self.destinations_open);
+        }
+
+        if self.record_open && snap.is_host {
+            record_sheet(ui, snap, rt, &mut self.record_open);
         }
 
         self.confirm_windows(ui, rt, &mut event);
@@ -553,7 +565,7 @@ impl SessionScreen {
 
     /// Everything numeric here is monospace so the bar never wobbles.
     ///
-    /// A host's bar carries three sheet toggles, the cost ticker, and the
+    /// A host's bar carries four sheet toggles, the cost ticker, and the
     /// timer on top of everything a musician sees, and this bar may never
     /// overlap. Two rules keep it apart: below [`BAR_STACK_BELOW_PX`] a
     /// host's controls take a row of their own, and on one row the controls
@@ -578,7 +590,7 @@ impl SessionScreen {
         ui.add_space(theme::SPACE_SM);
     }
 
-    /// The control half: the three host sheets, the cost ticker, the on air
+    /// The control half: the four host sheets, the cost ticker, the on air
     /// lamp, and the way out. Laid out right to left by the caller.
     fn status_controls(&mut self, ui: &mut Ui, snap: &Snapshot) {
         {
@@ -605,6 +617,7 @@ impl SessionScreen {
                     if self.invites_open {
                         self.broadcast_open = false;
                         self.destinations_open = false;
+                        self.record_open = false;
                     }
                 }
                 if let Some(cost) = &snap.cost {
@@ -637,6 +650,22 @@ impl SessionScreen {
                     if self.destinations_open {
                         self.invites_open = false;
                         self.broadcast_open = false;
+                        self.record_open = false;
+                    }
+                }
+                // Record sits with Destinations for the same reason: a take
+                // leaves the session too. The sheet needs only the runtime,
+                // so the toggle hangs off the snapshot alone.
+                if snap.is_host
+                    && ui
+                        .add(Button::new("Record").selected(self.record_open))
+                        .clicked()
+                {
+                    self.record_open = !self.record_open;
+                    if self.record_open {
+                        self.invites_open = false;
+                        self.broadcast_open = false;
+                        self.destinations_open = false;
                     }
                 }
                 if snap.broadcast.is_some()
@@ -648,6 +677,7 @@ impl SessionScreen {
                     if self.broadcast_open {
                         self.invites_open = false;
                         self.destinations_open = false;
+                        self.record_open = false;
                     }
                 }
             }
@@ -876,6 +906,9 @@ fn status_readouts(ui: &mut Ui, snap: &Snapshot) {
         // Same place, same reason: what is leaving the room, for
         // everyone in it, whether or not a sheet is open.
         on_air_indicator(ui, snap);
+        // The record lamp keeps the on-air lamp's company: a take leaves
+        // the room too, and everyone in it is on the take.
+        record_indicator(ui, snap);
         ui.separator();
         let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
         ui.label(theme::mono(ui, format!("rtt {rtt} ms")));
