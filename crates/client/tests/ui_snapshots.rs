@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui::vec2;
-use egui_kittest::Harness;
+use egui_kittest::{Harness, kittest::Queryable};
 use jamstream_client::app::{JamApp, Screen};
 use jamstream_client::creds::{self, CredStore, EnvReader, MemStore};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
@@ -17,6 +17,7 @@ use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
 use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow, RegionSurvey};
 use jamstream_client::screens::invites::InvitesPanel;
+use jamstream_client::screens::recording::RecordingChoice;
 use jamstream_client::screens::session::SettingsTab;
 use jamstream_client::theme::{self, Theme};
 use jamstream_cloud::{Price, ProbeMatrix, ProviderKind, Region, RegionId, rank};
@@ -466,6 +467,115 @@ fn fixture_file(name: &str, bytes: &[u8]) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, bytes).expect("write the fixture");
     path
+}
+
+// The Recording tab: where takes go, and the key that writes them. Always
+// present, because a bucket is a setting for this computer rather than session
+// state. Every key here is fake and none of them is ever drawn: both fields are
+// masked, and the assertion under the typed fixture is that neither half of the
+// pair reaches the accessibility tree either.
+
+/// A key pair nothing could write a bucket with.
+const FAKE_STORAGE_ID: &str = "DO00FAKEFAKEFAKEFAKE";
+const FAKE_STORAGE_SECRET: &str = "0000000000000000000000000000000000000000fake";
+
+/// An app on a computer set up to record: a DigitalOcean bucket in the
+/// Recording tab's preferences and, when `saved`, a key in the keychain behind
+/// it. One store for the app and the wizard both, so nothing in a fixture can be
+/// armed in one half and unconfigured in the other.
+///
+/// The preferences are held in this process (`None`), so no fixture reads the
+/// bucket of whoever runs the suite and none writes theirs.
+fn configured_app(theme: Theme, saved: bool) -> (Arc<MemStore>, EnvReader, JamApp) {
+    let store = Arc::new(MemStore::default());
+    if saved {
+        creds::save_storage_credential(
+            store.as_ref(),
+            ProviderKind::DigitalOcean,
+            FAKE_STORAGE_ID,
+            FAKE_STORAGE_SECRET,
+        )
+        .expect("store the fake key");
+    }
+    let env: EnvReader = Arc::new(|_| None);
+    let mut app = JamApp::new(store.clone(), Arc::clone(&env), None);
+    app.theme = theme;
+    app.recent = Vec::new();
+    app.recording
+        .remember_bucket(ProviderKind::DigitalOcean, "our-jams", "nyc3");
+    (store, env, app)
+}
+
+/// The Recording tab over a host session.
+fn recording_app(theme: Theme, saved: bool) -> JamApp {
+    let (_, _, mut app) = configured_app(theme, saved);
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, true)));
+    app.session.invites = Some(host_invites());
+    app.session.destinations = Some(DestinationsPanel::new(saved_keys(&[])));
+    app.screen = Screen::Session;
+    drawer_app(app, SettingsTab::Recording)
+}
+
+#[test]
+fn session_settings_recording() {
+    // A computer that is set up to record: the bucket, its region, and a key
+    // already in the keychain, which is why the key fields are empty and the
+    // line above them says one is there. This is the state a host is in when
+    // they arm a launch, and the five-tab row is a real host's.
+    let mut harness = app_harness(recording_app(Theme::Dark, true), WIDE);
+    snapshot_for_docs(&mut harness, "session_settings_recording");
+}
+
+#[test]
+fn session_settings_recording_light() {
+    let mut harness = app_harness(recording_app(Theme::Light, true), WIDE);
+    snapshot(&mut harness, "session_settings_recording_light");
+}
+
+#[test]
+fn session_settings_recording_narrow() {
+    // The tab at the smallest window the app opens: the drawer keeps its width,
+    // every field and both pick lists fit inside it, and the status bar under
+    // it stays clear.
+    let mut harness = app_harness(recording_app(Theme::Dark, true), NARROW);
+    snapshot(&mut harness, "session_settings_recording_narrow");
+}
+
+#[test]
+fn session_settings_recording_empty() {
+    // Nothing set up anywhere, which is every host's first visit: the provider
+    // rows read "not set up" and the fields are empty.
+    let mut harness = app_harness(
+        drawer_app(test_app(Theme::Dark), SettingsTab::Recording),
+        WIDE,
+    );
+    snapshot(&mut harness, "session_settings_recording_empty");
+}
+
+#[test]
+fn session_settings_recording_typed() {
+    // The one surface where a storage key exists at all: a pair pasted into the
+    // fields, both masked, with the reveal off. Scrolled to the fields, which is
+    // where a host who just pasted one is looking.
+    let mut app = recording_app(Theme::Dark, false);
+    app.recording.type_key(FAKE_STORAGE_ID, FAKE_STORAGE_SECRET);
+    let mut harness = app_harness(app, WIDE);
+    scroll_drawer(&mut harness, WIDE);
+    snapshot(&mut harness, "session_settings_recording_typed");
+    // The baseline proves the pixels are dots. This proves the same about the
+    // accessibility tree, which is the other way a key gets read off a screen.
+    for secret in [FAKE_STORAGE_ID, FAKE_STORAGE_SECRET] {
+        let leaks = harness
+            .query_all_by(move |node| {
+                node.label().is_some_and(|l| l.contains(secret))
+                    || node.value().is_some_and(|v| v.contains(secret))
+            })
+            .count();
+        assert_eq!(
+            leaks, 0,
+            "the storage key reached the accessibility tree on {leaks} node(s)"
+        );
+    }
 }
 
 // The Broadcast tab: stream mix above destinations, both at the drawer's
@@ -1101,6 +1211,51 @@ fn wizard_region_light() {
 #[test]
 fn wizard_preview() {
     wizard_snapshot_for_docs(wizard_preview_app(Theme::Dark), "wizard_preview");
+}
+
+/// The preview step with recording armed on a computer that has a bucket: the
+/// mix and stems row selected, the bucket named under it, and the take's two
+/// cost lines folded into the session's own. This is the fixture that shows the
+/// five times difference stems make, because both sizes are on screen beside the
+/// rows and the total moved when the row was picked.
+fn wizard_preview_recording_app(theme: Theme) -> JamApp {
+    // Configured the way the app configures itself: the bucket in the Recording
+    // tab's preferences and the key in the keychain behind it. The wizard reads
+    // that through the app every frame, so a fixture that set the wizard's own
+    // copy would be overwritten before it drew.
+    let (store, env, mut app) = configured_app(theme, true);
+    let mut w = HostWizard::new(store, env, Arc::new(Executor::new()));
+    w.providers[1].status = ProviderStatus::Ready;
+    w.select_provider(1);
+    w.continue_to_region(fixed_regions());
+    w.continue_to_preview();
+    w.pinned = FAKE_PINS;
+    app.wizard = w;
+    app.screen = Screen::HostWizard;
+    let setup = app.recording.setup(Some(ProviderKind::DigitalOcean));
+    assert_eq!(setup.refusal(), None, "the fixture must be able to record");
+    app.wizard.set_recording_setup(setup);
+    assert!(
+        app.wizard.set_recording(RecordingChoice::MixAndStems),
+        "a configured computer must be able to arm a take"
+    );
+    app
+}
+
+#[test]
+fn wizard_preview_recording() {
+    wizard_snapshot_for_docs(
+        wizard_preview_recording_app(Theme::Dark),
+        "wizard_preview_recording",
+    );
+}
+
+#[test]
+fn wizard_preview_recording_light() {
+    wizard_snapshot(
+        wizard_preview_recording_app(Theme::Light),
+        "wizard_preview_recording_light",
+    );
 }
 
 #[test]

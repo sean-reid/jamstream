@@ -37,6 +37,18 @@ In the host wizard, select **gcp**; while no credential is saved the row reads `
 
 The key lives in your system keychain from then on; the project id is read from the key itself. You are ready to host; continue with the [quickstart](../../quickstart.md#host-on-the-internet-with-digitalocean), picking gcp in the wizard instead.
 
+## 6. Optional: a bucket and an HMAC key, for recording
+
+[Recording a cloud session](../recording.md) writes takes to a Cloud Storage bucket in your own account, through Cloud Storage's S3-compatible interoperability endpoint. The credential is an HMAC key pair, an access key id beginning `GOOG` and a secret, not the JSON key from step 4.
+
+1. Create a Standard bucket in the location you host in: **Cloud Storage**, **Buckets**, **Create**. Give recordings a bucket that holds nothing else.
+2. On that bucket's **Permissions** tab, **Grant access**, with the `jamstream` service account as the principal and one role: **Storage Admin**, `roles/storage.admin`, on this bucket alone. Arming a session writes and deletes a probe object and sets the bucket's expiry rule, and the object-only roles cannot do the last of those.
+3. Create the key: **Cloud Storage**, **Settings**, the **Interoperability** tab, **Create a key for a service account**, pick `jamstream`, then **Create key**. Copy both values; the secret is shown once.
+
+Paste both values into **Settings**, then **Recording**, in the app, and click Check. From the terminal the pair goes in `JAMSTREAM_RECORDING_ACCESS_KEY_ID` and `JAMSTREAM_RECORDING_SECRET_ACCESS_KEY`, or in `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY`; [`jamstream recordings`](../../cli/recordings.md#the-storage-key) covers every provider.
+
+Granted on one bucket, the key can do anything inside that bucket and nothing outside it, which is why recordings belong in a bucket of their own: launching a recorded session writes this key into the machine's user data, and the JSON key from step 4 must never go there.
+
 ## For the CLI and automation
 
 The CLI reads the key from the environment instead:

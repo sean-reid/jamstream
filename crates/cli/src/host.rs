@@ -402,25 +402,18 @@ fn recording_storage(
     bucket: &str,
     region: &RegionId,
 ) -> Result<RecordingStorage, CliError> {
-    if bucket.trim().is_empty() {
-        return Err(CliError::Usage("--bucket is empty".to_owned()));
-    }
-    // Priced here so a region with no bucket service (a DigitalOcean region
-    // with no Spaces endpoint) is refused before the launch rather than at
-    // the first upload.
-    jamstream_cloud::storage_price(kind, region)?;
-    Ok(RecordingStorage {
-        provider: kind,
-        bucket: bucket.to_owned(),
-        region: region.to_string(),
-        retention: args.retention,
-        credential: crate::storage::credential_from_env(kind)?,
-        stems: args.record_stems,
-    })
+    crate::storage::storage_for_launch(
+        kind,
+        bucket,
+        region,
+        args.retention,
+        || crate::storage::credential_from_env(kind),
+        args.record_stems,
+    )
 }
 
 /// What the session record keeps about the bucket: everything but the key.
-fn recording_record(storage: &RecordingStorage) -> state::RecordingRecord {
+pub fn recording_record(storage: &RecordingStorage) -> state::RecordingRecord {
     state::RecordingRecord {
         provider: storage.provider.as_str().to_owned(),
         bucket: storage.bucket.clone(),
@@ -433,19 +426,47 @@ fn recording_record(storage: &RecordingStorage) -> state::RecordingRecord {
 /// Proves the key can write this session's prefix, and applies the retention
 /// rule to it.
 ///
-/// The probe object is written and deleted under the session's own prefix, so
-/// a bucket that refuses the launch key fails here, in a configuring frame of
-/// mind, rather than at the first take.
-async fn verify_bucket(
+/// Public because both launch surfaces arm recording through it: this command,
+/// and the desktop app's wizard.
+pub async fn verify_bucket(
     storage: &RecordingStorage,
     session_hex: &str,
 ) -> Result<RetentionEnforcement, CliError> {
     let store = storage.object_store()?;
     let prefix = jamstream_cloud::session_prefix(session_hex);
+    probe_prefix(store.as_ref(), &storage.bucket, &storage.region, &prefix).await?;
+    Ok(store
+        .set_retention(&storage.bucket, &prefix, storage.retention)
+        .await?)
+}
+
+/// [`verify_bucket`] without the lifecycle rule, for a key being saved rather
+/// than a session being launched.
+///
+/// A retention rule belongs to one session's prefix, so a credential check that
+/// applied one would leave a rule behind for a session that never happened. The
+/// write is what a check is for.
+pub async fn probe_bucket(storage: &RecordingStorage, session_hex: &str) -> Result<(), CliError> {
+    let store = storage.object_store()?;
+    let prefix = jamstream_cloud::session_prefix(session_hex);
+    probe_prefix(store.as_ref(), &storage.bucket, &storage.region, &prefix).await
+}
+
+/// Writes one probe object under `prefix` and deletes it.
+///
+/// A bucket that refuses the key fails here, in a configuring frame of mind,
+/// rather than at the first take. The failure carries the provider's reason
+/// verbatim and names the prefix a key has to be able to write.
+pub async fn probe_prefix(
+    store: &dyn jamstream_cloud::ObjectStore,
+    bucket: &str,
+    region: &str,
+    prefix: &str,
+) -> Result<(), CliError> {
     let probe = format!("{prefix}.jamstream-probe");
     store
         .put(
-            &storage.bucket,
+            bucket,
             &probe,
             jamstream_cloud::JSON_CONTENT_TYPE,
             b"{\"probe\":true}",
@@ -453,15 +474,12 @@ async fn verify_bucket(
         .await
         .map_err(|err| {
             CliError::Failed(format!(
-                "cannot write to {} in {}: {err}. Recording needs a key that may write \
-                 {prefix} and set the bucket's lifecycle rule.",
-                storage.bucket, storage.region
+                "cannot write to {bucket} in {region}: {err}. Recording needs a key that \
+                 may write {prefix} and set the bucket's lifecycle rule."
             ))
         })?;
-    store.delete(&storage.bucket, &probe).await?;
-    Ok(store
-        .set_retention(&storage.bucket, &prefix, storage.retention)
-        .await?)
+    store.delete(bucket, &probe).await?;
+    Ok(())
 }
 
 /// Honors --region when given; otherwise ranks by latency and price and

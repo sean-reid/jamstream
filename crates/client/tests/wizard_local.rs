@@ -9,7 +9,7 @@
 //! One test function: the state directory and JAMSTREAMD_PATH overrides
 //! are process-global environment.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,9 +17,10 @@ use jamstream_audio_io::WavBackend;
 use jamstream_client::creds::{EnvReader, MemStore};
 use jamstream_client::exec::Executor;
 use jamstream_client::live::{AudioSettings, CostedRuntime, LiveRuntime};
-use jamstream_client::runtime::{Command, ConnState, Runtime, Snapshot, TokenId};
+use jamstream_client::runtime::{Command, ConnState, RecordState, Runtime, Snapshot, TokenId};
 use jamstream_client::screens::host::{HostWizard, WizardEvent, WizardStep};
 use jamstream_client::screens::invites::{self, InvitesPanel, Seat};
+use jamstream_client::screens::recording::RecordingChoice;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId};
 use jamstream_protocol::invite::Invite;
 
@@ -80,6 +81,18 @@ fn jamstreamd_binary() -> PathBuf {
     }
     assert!(binary.is_file(), "missing {}", binary.display());
     binary
+}
+
+/// Takes the recorder has finished writing: a `.part` is a take still in
+/// flight, and it must never be mistaken for one.
+fn finished_takes(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "flac"))
+        .collect()
 }
 
 fn settings() -> AudioSettings {
@@ -154,6 +167,20 @@ async fn wizard_hosts_a_real_local_session() {
     // wizard's counts mean what --musicians and --listeners mean.
     wizard.musicians = 3;
     wizard.listeners = 1;
+    // Arm the take. A session on this computer records to this computer's disk
+    // and needs no bucket and no key, which is why this launch can prove the
+    // whole path: the wizard arms the server it spawns, and a real take lands.
+    assert_eq!(
+        wizard.recording,
+        RecordingChoice::Off,
+        "recording is off until a host turns it on"
+    );
+    assert_eq!(
+        wizard.recording_refusal(),
+        None,
+        "a local session needs no credential to record"
+    );
+    assert!(wizard.set_recording(RecordingChoice::MixOnly));
     assert!(wizard.can_launch(), "local needs no artifact fields");
     assert!(wizard.begin_launch());
     assert_eq!(wizard.step, WizardStep::Launching);
@@ -207,6 +234,56 @@ async fn wizard_hosts_a_real_local_session() {
         .find(|m| m.id == HOST_MEMBER_ID)
         .expect("host in roster");
     assert_eq!(me.token, panel.token_of(HOST_MEMBER_ID));
+
+    // The take, through the app's own controls: Record, then Stop, then a
+    // finished .flac in the recordings directory beside the session state. This
+    // is the seam that was missing, so it is proved against a real server
+    // rather than against a runtime's own bookkeeping.
+    let record_dir = state_dir.join("recordings");
+    assert!(
+        finished_takes(&record_dir).is_empty(),
+        "nothing is captured before Record is pressed"
+    );
+    rt.send(Command::StartRecord);
+    wait_for(&rt, "the take started", Duration::from_secs(10), |s| {
+        s.record.state == RecordState::Recording
+    });
+    // Long enough for the recorder to see ticks and write frames.
+    std::thread::sleep(Duration::from_millis(500));
+    rt.send(Command::StopRecord);
+    wait_for(&rt, "the take finished", Duration::from_secs(15), |s| {
+        s.record.state == RecordState::Idle
+    });
+    // The rename off .part happens on the recorder's own task, so it is waited
+    // for rather than assumed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let takes = loop {
+        let takes = finished_takes(&record_dir);
+        if !takes.is_empty() {
+            break takes;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no finished take appeared in {}",
+            record_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        takes.len(),
+        1,
+        "one Record to one Stop is one take: {takes:?}"
+    );
+    let take = takes[0].clone();
+    let name = take.file_name().expect("a file name").to_string_lossy();
+    assert!(
+        name.contains("mix"),
+        "mix only records the mix and nothing else: {name}"
+    );
+    assert!(
+        std::fs::metadata(&take).expect("the take is on disk").len() > 0,
+        "the take is empty"
+    );
 
     // The invites panel model: one seat per non-host invite, labeled, with
     // its token; the host's own seat is never listed.
@@ -325,6 +402,10 @@ async fn wizard_hosts_a_real_local_session() {
     let ended = jamstream_cli::state::load(&outcome.state_path).expect("state reloads");
     assert_eq!(ended.status, jamstream_cli::state::SessionStatus::Ended);
     assert!(ended.ended_unix.is_some());
+    assert!(
+        take.is_file(),
+        "ending the session must never take the recording with it"
+    );
 
     #[cfg(unix)]
     {

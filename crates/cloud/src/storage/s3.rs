@@ -29,8 +29,12 @@
 //!   the crate docs on what the server half needs).
 //!
 //! AWS has the same shape for a different reason: the recording credential
-//! wants `s3:PutObject`/`s3:AbortMultipartUpload` on one prefix and
+//! wants `s3:PutObject`, `s3:DeleteObject` (the launch probe) and
+//! `s3:AbortMultipartUpload` on one prefix, plus
 //! `s3:PutLifecycleConfiguration` on the bucket, which is not the EC2 policy.
+//! It must not *be* the EC2 policy either, and nothing reads
+//! `AWS_ACCESS_KEY_ID` for it: this key is written into the session machine's
+//! user data. See `jamstream_cli::storage`.
 //! GCS is the only one where the same identity naturally does both.
 //!
 //! # Addressing

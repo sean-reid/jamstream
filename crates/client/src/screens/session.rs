@@ -90,16 +90,22 @@ pub enum SettingsTab {
     Audio,
     Broadcast,
     Invites,
+    /// Where takes go: a bucket and the key that writes it. Machine-local
+    /// preference rather than session state, so it is present whatever this
+    /// window is showing.
+    Recording,
     You,
 }
 
 impl SettingsTab {
-    /// Short enough for four of them to fit the drawer's width.
+    /// One word each; five of them wrap onto a second row at the drawer's
+    /// width, which the row is built to do.
     pub fn label(self) -> &'static str {
         match self {
             SettingsTab::Audio => "Audio",
             SettingsTab::Broadcast => "Broadcast",
             SettingsTab::Invites => "Invites",
+            SettingsTab::Recording => "Recording",
             SettingsTab::You => "You",
         }
     }
@@ -200,8 +206,8 @@ impl SessionScreen {
 
     /// Which settings tabs this session has to offer, in order. A tab that
     /// would open an empty panel is not offered at all: a plain join has no
-    /// invite book and nothing to stream, so it sees Audio and You and no gap
-    /// where the others were.
+    /// invite book and nothing to stream, so it sees the machine-local tabs and
+    /// no gap where the others were.
     pub fn settings_tabs(&self, snap: &Snapshot) -> Vec<SettingsTab> {
         let mut tabs = vec![SettingsTab::Audio];
         if snap.is_host && (snap.broadcast.is_some() || self.destinations.is_some()) {
@@ -210,6 +216,10 @@ impl SessionScreen {
         if snap.is_host && self.invites.is_some() {
             tabs.push(SettingsTab::Invites);
         }
+        // Whether this session records was fixed at launch, but the bucket it
+        // would record to belongs to the computer, so the tab is here in a
+        // session as well as before one.
+        tabs.push(SettingsTab::Recording);
         tabs.push(SettingsTab::You);
         tabs
     }

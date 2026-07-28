@@ -18,6 +18,7 @@ use crate::screens::devices::{Block, DeviceCatalog, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
+use crate::screens::recording::RecordingPanel;
 use crate::screens::session::{SessionEvent, SessionScreen, SettingsTab};
 use crate::theme::{self, Theme};
 use crate::widgets::{AVATAR_D_STRIP, avatar_disc, sweep_avatar_textures};
@@ -53,6 +54,11 @@ pub struct JamApp {
     pub devices: DevicesScreen,
     pub catalog: DeviceCatalog,
     pub wizard: HostWizard,
+    /// The Recording tab: the bucket takes go to and the key that writes it.
+    /// One per app rather than one per session, because it is a setting for this
+    /// computer. What the wizard needs from it is handed over as plain data
+    /// every frame, so the wizard holds no second copy of the answer.
+    pub recording: RecordingPanel,
     pub session: SessionScreen,
     pub runtime: Option<Box<dyn Runtime>>,
     /// Concrete handle to the live runtime when one is active; device
@@ -100,7 +106,15 @@ impl JamApp {
     /// Tests call [`JamApp::in_memory`]; production calls
     /// [`JamApp::with_system_devices`], which is the only place in the crate
     /// that names `KeyringStore`.
-    pub fn new(creds: Arc<dyn CredStore>, env: EnvReader) -> Self {
+    ///
+    /// `prefs` is where the Recording tab keeps this computer's bucket, and it
+    /// is a parameter for the same reason: `None` keeps the preferences in this
+    /// process, so a test neither reads nor overwrites the developer's own.
+    pub fn new(
+        creds: Arc<dyn CredStore>,
+        env: EnvReader,
+        prefs: Option<std::path::PathBuf>,
+    ) -> Self {
         let devices = DevicesScreen::default();
         let applied_audio = (
             devices.capture_idx,
@@ -116,6 +130,12 @@ impl JamApp {
             devices,
             catalog: DeviceCatalog::demo(),
             wizard: HostWizard::new(Arc::clone(&creds), Arc::clone(&env), Arc::clone(&exec)),
+            recording: RecordingPanel::new(
+                Arc::clone(&creds),
+                Arc::clone(&env),
+                Arc::clone(&exec),
+                prefs,
+            ),
             session: SessionScreen::default(),
             runtime: None,
             live: None,
@@ -139,14 +159,25 @@ impl JamApp {
     /// must not read what the developer has stored.
     pub fn in_memory() -> Self {
         let env: EnvReader = Arc::new(|_: &str| None);
-        Self::new(Arc::new(creds::MemStore::default()), env)
+        Self::new(Arc::new(creds::MemStore::default()), env, None)
     }
 
     /// The production entry point: the real keychain and the real
     /// environment, with the device pickers fed from the platform audio
     /// backend instead of the demo catalog.
     pub fn with_system_devices() -> Self {
-        let mut app = Self::new(Arc::new(KeyringStore), creds::system_env());
+        // A preferences path that cannot be resolved is not worth refusing to
+        // start over: the Recording tab then keeps its bucket for this run and
+        // says why it could not remember it.
+        let prefs = crate::prefs::path();
+        let mut app = Self::new(
+            Arc::new(KeyringStore),
+            creds::system_env(),
+            prefs.as_ref().ok().cloned(),
+        );
+        if let Err(err) = prefs {
+            app.recording.error = Some(err);
+        }
         match jamstream_audio_io::backend().devices() {
             Ok(devices) => app.catalog = DeviceCatalog::from_backend(&devices),
             Err(err) => {
@@ -314,6 +345,9 @@ impl JamApp {
         // Before the sheet draws, so a picture that landed while the dialog
         // was open shows in the same frame it arrived.
         self.poll_avatar_pick();
+        // Polled here rather than in the tab, so a bucket check that finishes
+        // while the host is looking at another tab lands anyway.
+        self.recording.poll();
         // Escape is consumed here, ahead of the screen, even though the sheet
         // is drawn after it: the session screen closes its own sheets on
         // Escape, and the innermost thing entered has to be the first thing
@@ -364,6 +398,12 @@ impl JamApp {
                 self.devices.ui(ui, &self.catalog, &levels, m2e);
             }
             Screen::HostWizard => {
+                // What this computer can record to, handed over as plain data
+                // every frame: a bucket saved in the Recording tab is armable
+                // in the wizard without leaving it, and the wizard keeps no
+                // copy that could go stale.
+                let setup = self.recording.setup(self.wizard.selected_provider_kind());
+                self.wizard.set_recording_setup(setup);
                 if let Some(WizardEvent::Launched(outcome)) = self.wizard.ui(ui) {
                     self.enter_hosted_session(*outcome);
                 }
@@ -482,18 +522,22 @@ impl JamApp {
     fn settings_tabs(&self) -> Vec<SettingsTab> {
         match (self.screen, self.runtime.as_deref()) {
             (Screen::Session, Some(rt)) => self.session.settings_tabs(&rt.snapshot()),
-            _ => vec![SettingsTab::Audio, SettingsTab::You],
+            _ => vec![SettingsTab::Audio, SettingsTab::Recording, SettingsTab::You],
         }
     }
 
-    /// One row of tabs, and the guard that a remembered tab cannot outlive the
+    /// The tab row, and the guard that a remembered tab cannot outlive the
     /// thing it showed: leaving a session drops Broadcast and Invites, and a
     /// drawer still pointing at one would open on nothing.
+    ///
+    /// Wrapped rather than one row: a host has five tabs and the drawer is
+    /// 340 px, so the row takes a second line rather than pushing a tab off the
+    /// edge or shortening every label to fit the widest case.
     fn tab_row(&mut self, ui: &mut Ui, tabs: &[SettingsTab]) {
         if !tabs.contains(&self.settings_tab) {
             self.settings_tab = SettingsTab::Audio;
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = theme::SPACE_SM;
             for tab in tabs {
                 if ui
@@ -528,6 +572,10 @@ impl JamApp {
                 let rt = self.runtime.as_deref()?;
                 let snap = snap?;
                 self.session.invites_tab(ui, &snap, rt)
+            }
+            SettingsTab::Recording => {
+                self.recording.ui(ui);
+                None
             }
             SettingsTab::You => {
                 self.avatar_ui(ui, snap.as_ref());
@@ -695,6 +743,7 @@ impl eframe::App for JamApp {
         // repaint until its thread answers.
         let animating = self.ending.is_some()
             || self.avatar_dialog.is_some()
+            || self.recording.busy()
             || match self.screen {
                 Screen::Session | Screen::Devices => true,
                 Screen::HostWizard => self.wizard.busy() || self.settings_open,

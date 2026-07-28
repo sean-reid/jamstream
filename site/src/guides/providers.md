@@ -14,6 +14,8 @@ JamStream hosts on three cloud providers. Each needs a one-time setup: an accoun
 
 Each page shows how to grant JamStream only what it uses: create, list, tag, and destroy one class of machine. Set up this way, the credential on your laptop can manage jam servers and nothing else. If it ever leaks, the blast radius is a few small VMs, not your storage, your DNS, or your bill.
 
+One credential per provider covers everything except one feature. [Recording a cloud session](recording.md) writes takes to a bucket, which needs a second key, scoped to that one bucket and nothing more; the last section of each provider page creates it. Recording is off unless you turn it on, so the plain path stays one credential.
+
 ## Verifying any provider
 
 The app's **Check credentials** button makes a real authenticated call before saving anything: it fetches a price and lists anything JamStream-tagged, changing nothing. A failure is shown verbatim in the pane. The same check works from the terminal:

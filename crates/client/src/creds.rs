@@ -8,11 +8,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use jamstream_cloud::Provider;
+use jamstream_cloud::cloudinit::StorageCredential;
 use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::providers::digitalocean::DigitalOceanProvider;
 use jamstream_cloud::providers::gcp::GcpProvider;
 use jamstream_cloud::providers::gcp_auth::ServiceAccountTokenSource;
+use jamstream_cloud::{Provider, ProviderKind};
 use jamstream_protocol::control::StreamPlatform;
 
 /// Keychain service name; one entry per provider field.
@@ -30,6 +31,84 @@ pub const GCP_SERVICE_ACCOUNT_JSON: (&str, &str) = ("gcp", "service_account_json
 /// memory and never writes it to the VM's disk.
 pub fn stream_key_field(platform: StreamPlatform) -> (&'static str, &'static str) {
     (platform.as_str(), "stream_key")
+}
+
+/// Where one provider's object storage key pair lives: two slots of its own,
+/// beside that provider's provisioning credential and never the same slot, with
+/// no fallback from one to the other.
+///
+/// AWS is the case that makes the distinction load bearing. `aws.access_key_id`
+/// launches instances; `aws.storage_access_key_id` writes recordings, and the
+/// second is written into the session machine's user data, where a key that
+/// could call `ec2:RunInstances` would be a far larger thing than a bucket
+/// prefix.
+pub fn storage_key_fields(
+    provider: ProviderKind,
+) -> ((&'static str, &'static str), (&'static str, &'static str)) {
+    (
+        (provider.as_str(), "storage_access_key_id"),
+        (provider.as_str(), "storage_secret_access_key"),
+    )
+}
+
+/// The storage key pair for one provider: this computer's keychain first, then
+/// the recording variables the CLI reads, so a machine set up in a terminal
+/// records from the app with nothing new to paste.
+///
+/// Both halves have to come from the same place. Half a pair is not a
+/// credential, and completing a keychain id with an environment secret is how a
+/// host ends up handing a VM a key they never chose. The environment half is the
+/// CLI's own reader, so which variables count, and the refusal when none do, are
+/// the same on both surfaces.
+///
+/// The error names what is missing and never the value of anything present.
+pub fn storage_credential(
+    creds: &dyn CredStore,
+    env: &EnvReader,
+    provider: ProviderKind,
+) -> Result<StorageCredential, String> {
+    let (id_field, secret_field) = storage_key_fields(provider);
+    if let (Some(access_key_id), Some(secret_access_key)) = (
+        creds.get(id_field.0, id_field.1),
+        creds.get(secret_field.0, secret_field.1),
+    ) {
+        return Ok(StorageCredential::KeyPair {
+            access_key_id,
+            secret_access_key,
+        });
+    }
+    jamstream_cli::storage::credential_from(provider, |key| env(key)).map_err(|err| {
+        format!("{err} The Recording tab in Settings takes a key for this computer.")
+    })
+}
+
+/// Whether recording to a bucket on `provider` has a key at all.
+pub fn has_storage_credential(
+    creds: &dyn CredStore,
+    env: &EnvReader,
+    provider: ProviderKind,
+) -> bool {
+    storage_credential(creds, env, provider).is_ok()
+}
+
+/// Writes one provider's storage key pair to the keychain. Called only after a
+/// check has proved the pair can write the bucket.
+pub fn save_storage_credential(
+    creds: &dyn CredStore,
+    provider: ProviderKind,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> Result<(), String> {
+    let (id_field, secret_field) = storage_key_fields(provider);
+    creds.set(id_field.0, id_field.1, access_key_id.trim())?;
+    creds.set(secret_field.0, secret_field.1, secret_access_key.trim())
+}
+
+/// Forgets one provider's storage key pair.
+pub fn forget_storage_credential(creds: &dyn CredStore, provider: ProviderKind) {
+    let (id_field, secret_field) = storage_key_fields(provider);
+    creds.delete(id_field.0, id_field.1);
+    creds.delete(secret_field.0, secret_field.1);
 }
 
 /// Reads one environment variable; injectable so provider readiness and
@@ -285,6 +364,111 @@ mod tests {
         assert_ne!(twitch, DO_TOKEN);
         store.delete(twitch.0, twitch.1);
         assert_eq!(store.get(twitch.0, twitch.1), None);
+    }
+
+    /// A storage key is a second credential, so it must never land in the slot
+    /// the provisioning one uses. AWS is where the two would collide.
+    #[test]
+    fn a_storage_key_shares_no_slot_with_the_credential_that_launches_machines() {
+        let store = MemStore::default();
+        let (id, secret) = storage_key_fields(ProviderKind::Aws);
+        assert_ne!(id, AWS_ACCESS_KEY_ID);
+        assert_ne!(secret, AWS_SECRET_ACCESS_KEY);
+        store
+            .set(AWS_ACCESS_KEY_ID.0, AWS_ACCESS_KEY_ID.1, "AKIA-launch")
+            .expect("set");
+        assert_eq!(
+            store.get(id.0, id.1),
+            None,
+            "the launch key must not read back as a storage key"
+        );
+        // Each provider gets its own pair, and no two providers share one.
+        let mut slots = Vec::new();
+        for provider in [
+            ProviderKind::Aws,
+            ProviderKind::DigitalOcean,
+            ProviderKind::Gcp,
+        ] {
+            let (id, secret) = storage_key_fields(provider);
+            slots.push(id);
+            slots.push(secret);
+        }
+        let unique: std::collections::BTreeSet<_> = slots.iter().collect();
+        assert_eq!(unique.len(), slots.len(), "{slots:?} has a shared slot");
+    }
+
+    #[test]
+    fn a_saved_storage_key_reads_back_and_the_environment_is_the_fallback() {
+        let store = MemStore::default();
+        assert!(!has_storage_credential(
+            &store,
+            &env_of(&[]),
+            ProviderKind::DigitalOcean
+        ));
+        save_storage_credential(&store, ProviderKind::DigitalOcean, " DO00ID ", " secret ")
+            .expect("save");
+        let credential = storage_credential(&store, &env_of(&[]), ProviderKind::DigitalOcean)
+            .expect("a saved pair");
+        let StorageCredential::KeyPair {
+            access_key_id,
+            secret_access_key,
+        } = credential;
+        // Trimmed on the way in, so a pasted key with a stray newline works.
+        assert_eq!(access_key_id, "DO00ID");
+        assert_eq!(secret_access_key, "secret");
+
+        forget_storage_credential(&store, ProviderKind::DigitalOcean);
+        assert!(!has_storage_credential(
+            &store,
+            &env_of(&[]),
+            ProviderKind::DigitalOcean
+        ));
+        // The CLI's own two variables still work, so a machine configured in a
+        // terminal needs nothing pasted here.
+        let env = env_of(&[
+            ("SPACES_ACCESS_KEY_ID", "DO00ENV"),
+            ("SPACES_SECRET_ACCESS_KEY", "s"),
+        ]);
+        assert!(has_storage_credential(
+            &store,
+            &env,
+            ProviderKind::DigitalOcean
+        ));
+    }
+
+    /// Half a pair is not a credential, and it must not complete itself from
+    /// somewhere else: a keychain id with an environment secret is a key nobody
+    /// chose. The refusal names the variables that would work and quotes
+    /// neither half of what is present.
+    #[test]
+    fn half_a_storage_key_is_refused_and_no_secret_is_in_the_reason() {
+        let store = MemStore::default();
+        let (id, _) = storage_key_fields(ProviderKind::Aws);
+        store.set(id.0, id.1, "AKIDSTORAGE").expect("set");
+        let err = storage_credential(&store, &env_of(&[]), ProviderKind::Aws)
+            .expect_err("half a pair cannot write a bucket");
+        assert!(
+            err.contains(jamstream_cli::storage::RECORDING_VARS.1),
+            "{err}"
+        );
+        assert!(err.contains("Recording tab"), "{err}");
+        assert!(
+            !err.contains("AKIDSTORAGE"),
+            "the reason quoted a key: {err}"
+        );
+        // Local has no bucket, so it has no key slot either.
+        assert!(storage_credential(&store, &env_of(&[]), ProviderKind::Local).is_err());
+
+        // And the key that launches instances is not a storage key, however it
+        // is set: this one is written into the machine's user data.
+        let launch_pair = env_of(&[
+            ("AWS_ACCESS_KEY_ID", "AKIALAUNCH"),
+            ("AWS_SECRET_ACCESS_KEY", "launch-secret"),
+        ]);
+        assert!(
+            !has_storage_credential(&store, &launch_pair, ProviderKind::Aws),
+            "the launch pair must never be read as a recording key"
+        );
     }
 
     #[test]
