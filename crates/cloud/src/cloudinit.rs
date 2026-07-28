@@ -146,9 +146,16 @@ impl fmt::Debug for SelfDestruct {
     }
 }
 
-/// The credential the VM uploads recordings with. Scope it to write-only
-/// access on one bucket under [`crate::storage::RECORDING_PREFIX`]; it never
-/// appears on argv or in a script body, only in the root-owned config file.
+/// The credential the VM uploads recordings with, and never the one that
+/// launches machines: it is written into the machine's user data, so a key that
+/// could start instances would put the whole account on a box parsing
+/// unauthenticated UDP.
+///
+/// Scope it to one bucket under [`crate::storage::RECORDING_PREFIX`]. Not
+/// strictly write-only: the launch checks write and delete a probe object under
+/// the session's prefix and set the bucket's lifecycle rule, and this is the key
+/// they use. It never appears on argv or in a script body, only in the
+/// root-owned config file.
 #[derive(Clone, PartialEq, Eq)]
 pub enum StorageCredential {
     /// SigV4 access key pair. AWS S3, DigitalOcean Spaces, and Google Cloud
