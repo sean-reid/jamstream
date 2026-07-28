@@ -756,3 +756,37 @@ async fn launch_without_a_session_tag_creates_nothing() {
     assert!(matches!(err, ProviderError::Other(_)));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_launch_403_says_it_was_creating_the_firewall() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/tags"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "tag": { "name": "jamstream-session:sess1", "resources": {} },
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/firewalls"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "id": "Forbidden",
+            "message": "You are not authorized to perform this operation",
+        })))
+        .mount(&server)
+        .await;
+    let p = provider(&server);
+    let err = p
+        .launch(LaunchSpec {
+            region: region(&p, "nyc1"),
+            instance_class: InstanceClass::Small,
+            user_data: String::new(),
+            tags: vec![session_tag("sess1")],
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("creating the session firewall"),
+        "the operation has to be named: {err}"
+    );
+}
