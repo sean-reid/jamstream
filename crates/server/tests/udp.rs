@@ -3,63 +3,27 @@
 //! deterministic scenario coverage lives in the harness crate; this test
 //! proves the socket driver.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
+use common::{Running, Session, loopback};
 use std::time::{Duration, Instant};
 
-use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
-use jamstream_protocol::invite::{Issuer, Token};
-use jamstream_protocol::transport::generate_keypair;
-use jamstream_server::config::Config;
-use jamstream_server::runtime::{Options, Server};
+use jamstream_protocol::ids::{MemberId, Role, TokenId};
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
 use tokio::net::UdpSocket;
 
-fn loopback() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
-
 #[tokio::test]
 async fn join_chat_and_leave_over_real_udp() {
-    let issuer = Issuer::generate();
-    let server_keys = generate_keypair();
-    let session_id = SessionId::generate();
+    let session = Session::new();
+    let server = Running::spawn(&session, Running::plain_options()).await;
+    let server_addr = server.addr;
 
-    let cfg = Config {
-        session_id,
-        port: 0,
-        server_private_key: server_keys.private.to_vec(),
-        issuer_public_key: issuer.public_key().to_bytes(),
-        idle_shutdown_min: 10,
-        max_duration_min: 720,
-    };
-    let server = Server::bind(
-        &cfg,
-        Options {
-            bind: loopback(),
-            activity_path: None,
-            recording: None,
-        },
-    )
-    .await
-    .unwrap();
-    let server_addr = server.local_addr().unwrap();
-
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_task = tokio::spawn(server.run(async {
-        let _ = stop_rx.await;
-    }));
-
-    let invite = issuer.mint(
-        session_id,
-        vec![server_addr],
-        server_keys.public,
-        Token {
-            member_id: MemberId(1),
-            role: Role::Musician,
-            name_hint: Some("loopback".into()),
-            expires_unix: u64::MAX,
-            jti: TokenId::generate(),
-        },
+    let invite = session.invite(
+        1,
+        Role::Musician,
+        TokenId::generate(),
+        Some("loopback".to_owned()),
+        server_addr,
     );
 
     let start = Instant::now();
@@ -113,6 +77,5 @@ async fn join_chat_and_leave_over_real_udp() {
         socket.send(&pkt).await.unwrap();
     }
 
-    let _ = stop_tx.send(());
-    server_task.await.unwrap().unwrap();
+    server.stop().await.unwrap();
 }

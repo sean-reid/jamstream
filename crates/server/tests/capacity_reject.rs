@@ -5,22 +5,19 @@
 //! deterministic rate-limit and free-seat coverage lives in
 //! crates/session/tests/loopback.rs.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
+use std::net::SocketAddr;
+
+use common::{Running, Session, loopback};
 use std::time::Duration;
 
-use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
-use jamstream_protocol::invite::{Invite, Issuer, Token};
-use jamstream_protocol::transport::{Initiator, generate_keypair};
+use jamstream_protocol::invite::Invite;
+use jamstream_protocol::transport::Initiator;
 use jamstream_protocol::wire::{self, Packet};
-use jamstream_server::config::Config;
-use jamstream_server::runtime::{Options, Server};
 use jamstream_session::MAX_MUSICIANS;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
 use tokio::net::UdpSocket;
-
-fn loopback() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
 
 /// Sends `init` from a fresh socket and returns the server's answer.
 async fn exchange(server_addr: SocketAddr, init: &[u8], what: &str) -> (UdpSocket, Vec<u8>) {
@@ -37,48 +34,11 @@ async fn exchange(server_addr: SocketAddr, init: &[u8], what: &str) -> (UdpSocke
 
 #[tokio::test]
 async fn a_full_band_tells_the_late_arrival_so() {
-    let issuer = Issuer::generate();
-    let server_keys = generate_keypair();
-    let session_id = SessionId::generate();
+    let session = Session::new();
+    let server = Running::spawn(&session, Running::plain_options()).await;
+    let server_addr = server.addr;
 
-    let cfg = Config {
-        session_id,
-        port: 0,
-        server_private_key: server_keys.private.to_vec(),
-        issuer_public_key: issuer.public_key().to_bytes(),
-        idle_shutdown_min: 10,
-        max_duration_min: 720,
-    };
-    let server = Server::bind(
-        &cfg,
-        Options {
-            bind: loopback(),
-            activity_path: None,
-            recording: None,
-        },
-    )
-    .await
-    .unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_task = tokio::spawn(server.run(async {
-        let _ = stop_rx.await;
-    }));
-
-    let mint = |member: u16| -> Invite {
-        issuer.mint(
-            session_id,
-            vec![server_addr],
-            server_keys.public,
-            Token {
-                member_id: MemberId(member),
-                role: Role::Musician,
-                name_hint: None,
-                expires_unix: u64::MAX,
-                jti: TokenId::generate(),
-            },
-        )
-    };
+    let mint = |member: u16| -> Invite { session.musician(member, server_addr) };
 
     // Fill every musician seat, the host's included. The sockets are held for
     // the rest of the test: a dropped one would be a member the server can no
@@ -135,6 +95,5 @@ async fn a_full_band_tells_the_late_arrival_so() {
     assert!(!fresh.session_full());
     assert!(fresh.events().is_empty());
 
-    let _ = stop_tx.send(());
-    server_task.await.unwrap().unwrap();
+    server.stop().await.unwrap();
 }

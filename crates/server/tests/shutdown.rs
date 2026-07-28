@@ -9,72 +9,20 @@
 //! which is the signal systemd stop, local teardown, and the cloud
 //! self-destruct all send.
 
+mod common;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
-use jamstream_protocol::invite::{Invite, Issuer, Token};
-use jamstream_protocol::transport::generate_keypair;
-use jamstream_server::config::Config;
+use common::{
+    BIND, ChildGuard, ReservedPort, Running, Session, loopback, scratch_dir, server_binary,
+};
+use jamstream_protocol::ids::{Role, TokenId};
+use jamstream_protocol::invite::Invite;
 use jamstream_server::revocations::Revocations;
-use jamstream_server::runtime::{Options, Server};
+use jamstream_server::runtime::Server;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
 use tokio::net::UdpSocket;
-
-fn loopback() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("jamstream-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-struct Fixture {
-    issuer: Issuer,
-    session_id: SessionId,
-    server_public: [u8; 32],
-    cfg: Config,
-}
-
-impl Fixture {
-    fn new() -> Fixture {
-        let issuer = Issuer::generate();
-        let keys = generate_keypair();
-        let session_id = SessionId::generate();
-        Fixture {
-            cfg: Config {
-                session_id,
-                port: 0,
-                server_private_key: keys.private.to_vec(),
-                issuer_public_key: issuer.public_key().to_bytes(),
-                idle_shutdown_min: 10,
-                max_duration_min: 720,
-            },
-            issuer,
-            session_id,
-            server_public: keys.public,
-        }
-    }
-
-    fn mint(&self, member: u16, role: Role, jti: TokenId, addr: SocketAddr) -> Invite {
-        self.issuer.mint(
-            self.session_id,
-            vec![addr],
-            self.server_public,
-            Token {
-                member_id: MemberId(member),
-                role,
-                name_hint: None,
-                expires_unix: u64::MAX,
-                jti,
-            },
-        )
-    }
-}
 
 /// One client on its own socket, pumped by hand so a test can watch for a
 /// specific event without a background task.
@@ -141,33 +89,24 @@ impl Client {
 /// restart that `Restart=on-failure` makes routine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_invite_stays_revoked_across_a_restart() {
-    let f = Fixture::new();
-    let dir = temp_dir("revoke-restart");
+    let f = Session::new();
+    let dir = scratch_dir("revoke-restart");
     let revoked_file = dir.join("revoked");
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
 
     // First process: host joins, a guest joins, the host revokes the guest.
-    let server = Server::bind(
-        &f.cfg,
-        Options {
-            bind: loopback(),
-            activity_path: None,
-            recording: None,
-        },
-    )
-    .await
-    .unwrap()
-    .with_revocations(Revocations::new(revoked_file.clone()));
-    let addr = server.local_addr().unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(server.run(async {
-        let _ = stop_rx.await;
-    }));
+    let server = Running::of(
+        Server::bind(&f.cfg, Running::plain_options())
+            .await
+            .unwrap()
+            .with_revocations(Revocations::new(revoked_file.clone())),
+    );
+    let addr = server.addr;
 
     let guest_jti = TokenId::generate();
-    let host_invite = f.mint(0, Role::Musician, TokenId::generate(), addr);
-    let guest_invite = f.mint(1, Role::Musician, guest_jti, addr);
+    let host_invite = f.invite(0, Role::Musician, TokenId::generate(), None, addr);
+    let guest_invite = f.invite(1, Role::Musician, guest_jti, None, addr);
 
     let mut host = Client::connect(&host_invite, addr, now()).await;
     let mut guest = Client::connect(&guest_invite, addr, now()).await;
@@ -182,8 +121,7 @@ async fn a_revoked_invite_stays_revoked_across_a_restart() {
         "revoked guest stayed joined"
     );
 
-    let _ = stop_tx.send(());
-    task.await.unwrap().unwrap();
+    server.stop().await.unwrap();
 
     // The revocation is on disk, not just in the dead process's memory.
     assert_eq!(
@@ -196,24 +134,15 @@ async fn a_revoked_invite_stays_revoked_across_a_restart() {
     // Second process, same session keys and same revocation file: the guest's
     // invite is refused, and refused silently, which to the client looks like
     // packet loss.
-    let server = Server::bind(
-        &f.cfg,
-        Options {
-            bind: loopback(),
-            activity_path: None,
-            recording: None,
-        },
-    )
-    .await
-    .unwrap()
-    .with_revocations(Revocations::new(revoked_file.clone()));
-    let addr2 = server.local_addr().unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(server.run(async {
-        let _ = stop_rx.await;
-    }));
+    let server = Running::of(
+        Server::bind(&f.cfg, Running::plain_options())
+            .await
+            .unwrap()
+            .with_revocations(Revocations::new(revoked_file.clone())),
+    );
+    let addr2 = server.addr;
 
-    let guest_invite2 = f.mint(1, Role::Musician, guest_jti, addr2);
+    let guest_invite2 = f.invite(1, Role::Musician, guest_jti, None, addr2);
     let mut guest = Client::connect(&guest_invite2, addr2, now()).await;
     guest.pump_for(start, Duration::from_millis(600)).await;
     assert_eq!(
@@ -224,40 +153,26 @@ async fn a_revoked_invite_stays_revoked_across_a_restart() {
 
     // A member whose token was never revoked still gets in, so the check is
     // the revocation and not a broken second boot.
-    let other = f.mint(2, Role::Musician, TokenId::generate(), addr2);
+    let other = f.musician(2, addr2);
     let mut other = Client::connect(&other, addr2, now()).await;
     assert!(
         other.pump_until_joined(start).await,
         "the second process admitted nobody"
     );
 
-    let _ = stop_tx.send(());
-    task.await.unwrap().unwrap();
+    server.stop().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A stop used to break the loop and drop the socket. Members must be told.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_graceful_stop_tells_every_member_before_exiting() {
-    let f = Fixture::new();
+    let f = Session::new();
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
 
-    let server = Server::bind(
-        &f.cfg,
-        Options {
-            bind: loopback(),
-            activity_path: None,
-            recording: None,
-        },
-    )
-    .await
-    .unwrap();
-    let addr = server.local_addr().unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(server.run(async {
-        let _ = stop_rx.await;
-    }));
+    let server = Running::spawn(&f, Running::plain_options()).await;
+    let addr = server.addr;
 
     let mut members = Vec::new();
     for (id, role) in [
@@ -265,14 +180,13 @@ async fn a_graceful_stop_tells_every_member_before_exiting() {
         (1, Role::Musician),
         (5, Role::Listener),
     ] {
-        let invite = f.mint(id, role, TokenId::generate(), addr);
+        let invite = f.invite(id, role, TokenId::generate(), None, addr);
         let mut c = Client::connect(&invite, addr, now()).await;
         assert!(c.pump_until_joined(start).await, "member {id} never joined");
         members.push(c);
     }
 
-    let _ = stop_tx.send(());
-    task.await.unwrap().unwrap();
+    server.stop().await.unwrap();
 
     // The Bye is one flight with no retransmit, so it is already on the wire
     // by the time run() returns; the clients only have to read it.
@@ -293,21 +207,14 @@ async fn a_graceful_stop_tells_every_member_before_exiting() {
 /// exists at all; without it the provider skips the graceful wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_shutdown_sentinel_exits_cleanly_and_advertises_itself() {
-    let f = Fixture::new();
-    let dir = temp_dir("shutdown-sentinel");
+    let f = Session::new();
+    let dir = scratch_dir("shutdown-sentinel");
     let sentinel = dir.join("shutdown");
 
-    let server = Server::bind(
-        &f.cfg,
-        Options {
-            bind: loopback(),
-            activity_path: None,
-            recording: None,
-        },
-    )
-    .await
-    .unwrap()
-    .with_shutdown_file(sentinel.clone());
+    let server = Server::bind(&f.cfg, Running::plain_options())
+        .await
+        .unwrap()
+        .with_shutdown_file(sentinel.clone());
     let marker = dir.join("shutdown.supported");
     assert!(
         marker.is_file(),
@@ -340,13 +247,14 @@ async fn the_shutdown_sentinel_exits_cleanly_and_advertises_itself() {
 async fn a_sigtermed_process_says_goodbye_and_exits_zero() {
     use std::process::{Command, Stdio};
 
-    let f = Fixture::new();
-    let dir = temp_dir("sigterm");
+    let f = Session::new();
+    let dir = scratch_dir("sigterm");
     let config_path = dir.join("config");
-    // A fixed port: the child owns the socket, so the test cannot ask it
-    // which one it got. 43307 is outside the ephemeral range on every
-    // platform we run on.
-    let port = 43_307u16;
+    // The child owns the socket, so the test cannot ask it which port it got:
+    // one is reserved here and held until the instant of the spawn, which is
+    // narrower than a fixed number two concurrent runs can both pick.
+    let mut reserved = ReservedPort::reserve();
+    let port = reserved.port;
     std::fs::write(
         &config_path,
         format!(
@@ -358,30 +266,35 @@ async fn a_sigtermed_process_says_goodbye_and_exits_zero() {
     )
     .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jamstreamd"))
-        .arg("--config")
-        .arg(&config_path)
-        .arg("--activity-file")
-        .arg(dir.join("last-active"))
-        .arg("--revoked-file")
-        .arg(dir.join("revoked"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    reserved.release();
+    let mut child = ChildGuard(
+        Command::new(server_binary())
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--bind")
+            .arg(BIND.to_string())
+            .arg("--activity-file")
+            .arg(dir.join("last-active"))
+            .arg("--revoked-file")
+            .arg(dir.join("revoked"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
-    let invite = f.mint(0, Role::Musician, TokenId::generate(), addr);
+    let invite = f.invite(0, Role::Musician, TokenId::generate(), None, addr);
     let mut client = Client::connect(&invite, addr, now()).await;
-    if !client.pump_until_joined(start).await {
-        let _ = child.kill();
-        panic!("client never joined the spawned jamstreamd on port {port}");
-    }
+    assert!(
+        client.pump_until_joined(start).await,
+        "client never joined the spawned jamstreamd on port {port}"
+    );
 
-    send_sigterm(child.id());
+    send_sigterm(child.0.id());
 
     // Read the Bye and then confirm a clean exit. The Bye is sent before the
     // process returns from run(), so it is already in the socket buffer.
@@ -395,7 +308,7 @@ async fn a_sigtermed_process_says_goodbye_and_exits_zero() {
         client.events
     );
 
-    let status = wait_with_deadline(&mut child, Duration::from_secs(5));
+    let status = wait_with_deadline(&mut child.0, Duration::from_secs(5));
     assert_eq!(
         status.code(),
         Some(0),
