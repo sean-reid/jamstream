@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use jamstream_cloud::cloudinit::{RECORDING_CONFIG_PATH, RecordingStorage};
 use jamstream_server::config::Config;
 use jamstream_server::revocations::Revocations;
 use jamstream_server::runtime::{Options, RecordingOptions, Server};
@@ -79,12 +80,18 @@ fn main() -> ExitCode {
             arg_value("--activity-file")
                 .map_or_else(|| PathBuf::from(DEFAULT_ACTIVITY), PathBuf::from),
         ),
-        // Recording is off unless the launcher names a directory; a record
-        // request without one fails visibly in the session.
-        recording: arg_value("--record-dir").map(|dir| RecordingOptions {
-            dir: PathBuf::from(dir),
-            stems: has_flag("--record-stems"),
-        }),
+        // Recording is off unless a launcher configured it; a record
+        // request without configuration fails visibly in the session.
+        // Local mode names a directory with --record-dir; a cloud launch
+        // writes the storage config beside the server config, and its
+        // presence is what turns cloud recording on.
+        recording: match recording_options() {
+            Ok(recording) => recording,
+            Err(err) => {
+                tracing::error!(%err, "recording config rejected");
+                return ExitCode::FAILURE;
+            }
+        },
     };
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -272,6 +279,27 @@ fn arg_value(flag: &str) -> Option<String> {
 
 fn has_flag(flag: &str) -> bool {
     std::env::args().any(|arg| arg == flag)
+}
+
+/// Disk when --record-dir names a directory, cloud when the launch wrote a
+/// storage config, off when neither. A config that exists but does not
+/// parse is an error, not silently-off: the host paid for recording.
+fn recording_options() -> Result<Option<RecordingOptions>, String> {
+    if let Some(dir) = arg_value("--record-dir") {
+        return Ok(Some(RecordingOptions::Disk {
+            dir: PathBuf::from(dir),
+            stems: has_flag("--record-stems"),
+        }));
+    }
+    let path = arg_value("--record-config")
+        .map_or_else(|| PathBuf::from(RECORDING_CONFIG_PATH), PathBuf::from);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let storage = RecordingStorage::parse_flat_config(&text)?;
+    Ok(Some(RecordingOptions::Cloud { storage }))
 }
 
 #[cfg(test)]

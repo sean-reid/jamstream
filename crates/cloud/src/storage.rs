@@ -487,6 +487,52 @@ async fn feed_parts<B: MultipartBackend + ?Sized>(
     }
 }
 
+impl crate::cloudinit::RecordingStorage {
+    /// The store this config points at, ready for [`ObjectSink::open`]. One
+    /// factory so the VM and any probe build the same client from the same
+    /// file.
+    pub fn object_store(&self) -> Result<std::sync::Arc<dyn ObjectStore>> {
+        use crate::cloudinit::StorageCredential;
+        match (&self.provider, &self.credential) {
+            (
+                ProviderKind::Aws,
+                StorageCredential::KeyPair {
+                    access_key_id,
+                    secret_access_key,
+                },
+            ) => Ok(std::sync::Arc::new(S3Store::aws(
+                self.region.clone(),
+                access_key_id.clone(),
+                secret_access_key.clone(),
+            ))),
+            (
+                ProviderKind::DigitalOcean,
+                StorageCredential::KeyPair {
+                    access_key_id,
+                    secret_access_key,
+                },
+            ) => Ok(std::sync::Arc::new(S3Store::spaces(
+                self.region.clone(),
+                access_key_id.clone(),
+                secret_access_key.clone(),
+            ))),
+            (ProviderKind::Gcp, StorageCredential::ServiceAccountJson(json)) => {
+                let token = crate::providers::gcp_auth::ServiceAccountTokenSource::from_json(json)?;
+                Ok(std::sync::Arc::new(GcsStore::new(std::sync::Arc::new(
+                    token,
+                ))))
+            }
+            (provider, credential) => Err(ProviderError::Other(format!(
+                "recording config pairs provider {provider:?} with a {} credential, which no store accepts",
+                match credential {
+                    StorageCredential::KeyPair { .. } => "key-pair",
+                    StorageCredential::ServiceAccountJson(_) => "service-account",
+                }
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

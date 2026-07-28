@@ -420,6 +420,7 @@ write_files:
       bucket = my-jams
       region = us-east-1
       retention = 30d
+      stems = true
       access_key_id = AKIDRECORD
       secret_access_key_b64 = cmVjb3JkLXNlY3JldA==
 runcmd:

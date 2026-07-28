@@ -162,6 +162,9 @@ pub struct RecordingStorage {
     pub region: String,
     pub retention: Retention,
     pub credential: StorageCredential,
+    /// Capture per-member stereo stems alongside the mix; fixed for the
+    /// session at launch.
+    pub stems: bool,
 }
 
 impl RecordingStorage {
@@ -170,11 +173,12 @@ impl RecordingStorage {
     /// convention in the server config.
     pub fn render_flat_config(&self) -> String {
         let mut out = format!(
-            "provider = {}\nbucket = {}\nregion = {}\nretention = {}\n",
+            "provider = {}\nbucket = {}\nregion = {}\nretention = {}\nstems = {}\n",
             self.provider.as_str(),
             self.bucket,
             self.region,
             self.retention,
+            self.stems,
         );
         match &self.credential {
             StorageCredential::KeyPair {
@@ -197,6 +201,61 @@ impl RecordingStorage {
             }
         }
         out
+    }
+
+    /// Parses what [`RecordingStorage::render_flat_config`] wrote, on the
+    /// machine that received it. The two live in one impl so they cannot
+    /// drift apart unnoticed; the round-trip test holds them together.
+    pub fn parse_flat_config(text: &str) -> Result<RecordingStorage, String> {
+        let want = |key: &str| {
+            flat_config_value(text, key)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("recording config is missing {key}"))
+        };
+        let provider = match want("provider")?.as_str() {
+            "aws" => ProviderKind::Aws,
+            "digitalocean" => ProviderKind::DigitalOcean,
+            "gcp" => ProviderKind::Gcp,
+            other => return Err(format!("recording config names provider {other:?}")),
+        };
+        let retention: Retention = want("retention")?
+            .parse()
+            .map_err(|e| format!("recording config retention: {e}"))?;
+        let stems = match flat_config_value(text, "stems") {
+            None => false,
+            Some("true") => true,
+            Some("false") => false,
+            Some(other) => return Err(format!("recording config stems is {other:?}")),
+        };
+        let decode = |key: &str, b64: &str| {
+            BASE64
+                .decode(b64.as_bytes())
+                .map_err(|_| format!("recording config {key} is not base64"))
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|_| format!("{key} is not utf-8"))
+                })
+        };
+        let credential = if let Some(id) = flat_config_value(text, "access_key_id") {
+            StorageCredential::KeyPair {
+                access_key_id: id.to_owned(),
+                secret_access_key: decode(
+                    "secret_access_key_b64",
+                    &want("secret_access_key_b64")?,
+                )?,
+            }
+        } else if let Some(json) = flat_config_value(text, "service_account_json_b64") {
+            StorageCredential::ServiceAccountJson(decode("service_account_json_b64", json)?)
+        } else {
+            return Err("recording config carries no credential".to_owned());
+        };
+        Ok(RecordingStorage {
+            provider,
+            bucket: want("bucket")?,
+            region: want("region")?,
+            retention,
+            credential,
+            stems,
+        })
     }
 }
 
@@ -895,6 +954,7 @@ mod tests {
                 access_key_id: "AKIDRECORD".to_owned(),
                 secret_access_key: "record-secret".to_owned(),
             },
+            stems: true,
         }
     }
 
@@ -1101,6 +1161,20 @@ mod tests {
     #[test]
     fn recording_flat_config_round_trips() {
         let text = recording_storage().render_flat_config();
+        // The structured parse is what the VM runs; it must reproduce the
+        // exact value that was rendered, both credential shapes.
+        assert_eq!(
+            RecordingStorage::parse_flat_config(&text).unwrap(),
+            recording_storage()
+        );
+        // A config written before the stems key reads as stems off, not as
+        // an error: the file on a machine outlives the code that wrote it.
+        let legacy: String = text
+            .lines()
+            .filter(|l| !l.starts_with("stems"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(!RecordingStorage::parse_flat_config(&legacy).unwrap().stems);
         assert_eq!(flat_config_value(&text, "provider"), Some("aws"));
         assert_eq!(flat_config_value(&text, "bucket"), Some("my-jams"));
         assert_eq!(flat_config_value(&text, "region"), Some("us-east-1"));
