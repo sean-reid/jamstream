@@ -56,6 +56,9 @@ impl FrameDuration {
 const FLAG_STEREO: u8 = 1 << 2;
 const FLAG_REDUNDANT: u8 = 1 << 3;
 
+/// Channel byte, seq, timestamp, flags: everything before the payload.
+pub const HEADER_BYTES: usize = 14;
+
 /// One Opus frame plus optionally the previous one.
 #[derive(Debug, PartialEq)]
 pub struct MediaFrame<'a> {
@@ -97,7 +100,7 @@ impl<'a> MediaFrame<'a> {
     }
 
     pub fn decode(buf: &'a [u8]) -> Result<Self, Error> {
-        if buf.len() < 14 || buf[0] != CHANNEL_MEDIA {
+        if buf.len() < HEADER_BYTES || buf[0] != CHANNEL_MEDIA {
             return Err(Error::Malformed);
         }
         let seq = u32::from_le_bytes(buf[1..5].try_into().unwrap());
@@ -105,7 +108,7 @@ impl<'a> MediaFrame<'a> {
         let flags = buf[13];
         let duration = FrameDuration::from_bits(flags);
         let stereo = flags & FLAG_STEREO != 0;
-        let body = &buf[14..];
+        let body = &buf[HEADER_BYTES..];
         if flags & FLAG_REDUNDANT != 0 {
             if body.len() < 2 {
                 return Err(Error::Malformed);
@@ -211,6 +214,141 @@ mod tests {
         .encode();
         ok[0] = 9;
         assert!(MediaFrame::decode(&ok).is_err());
+    }
+
+    /// The same fence as the invite and reject vectors, for the one layout
+    /// that had none: media is the hot path, hand-packed, and every other
+    /// test of it encodes and decodes with the same code, so endianness, the
+    /// flag bit positions, the duration bits, the 14-byte header and the
+    /// redundant length prefix could all move and still round trip. These are
+    /// bytes on a wire between two builds. Fix the encoding, not the vector.
+    #[test]
+    fn media_wire_encoding_is_pinned() {
+        // Little-endian seq and timestamp, duration 0b11 with the stereo bit
+        // at 1 << 2, no length prefix without redundancy.
+        let plain = MediaFrame {
+            seq: 0x0102_0304,
+            timestamp: 48_000 * 60,
+            duration: FrameDuration::Ms20,
+            stereo: true,
+            payload: &[0xAA, 0xBB, 0xCC],
+            redundant: None,
+        };
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&plain.encode()),
+            "000403020100f22b000000000007aabbcc",
+            "plain media frame encoding drifted"
+        );
+
+        // With redundancy the payload gains a u16 little-endian length prefix
+        // and the previous frame's bytes follow it to the end of the packet.
+        let redundant = MediaFrame {
+            seq: 1,
+            timestamp: 120,
+            duration: FrameDuration::Ms2_5,
+            stereo: false,
+            payload: &[0x11, 0x22, 0x33],
+            redundant: Some(&[0x44, 0x55]),
+        };
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&redundant.encode()),
+            "000100000078000000000000000803001122334455",
+            "redundant media frame encoding drifted"
+        );
+
+        // The header is 14 bytes and the length prefix is the only thing
+        // redundancy adds before the payload.
+        assert_eq!(HEADER_BYTES, 14);
+        assert_eq!(plain.encode().len(), HEADER_BYTES + 3);
+        assert_eq!(redundant.encode().len(), HEADER_BYTES + 2 + 3 + 2);
+        assert_eq!(plain.encode()[0], CHANNEL_MEDIA);
+        assert_eq!(CHANNEL_MEDIA, 0);
+
+        // Duration in the low two bits, stereo at 1 << 2, redundancy at
+        // 1 << 3. A shifted bit would swap 5 ms for 2.5 ms on every packet.
+        let flags_of = |d: FrameDuration, stereo: bool, red: bool| -> u8 {
+            MediaFrame {
+                seq: 0,
+                timestamp: 0,
+                duration: d,
+                stereo,
+                payload: &[],
+                redundant: red.then_some(&[][..]),
+            }
+            .encode()[13]
+        };
+        for (d, bits) in [
+            (FrameDuration::Ms2_5, 0b00u8),
+            (FrameDuration::Ms5, 0b01),
+            (FrameDuration::Ms10, 0b10),
+            (FrameDuration::Ms20, 0b11),
+        ] {
+            assert_eq!(flags_of(d, false, false), bits, "{d:?} duration bits");
+            assert_eq!(flags_of(d, true, false), bits | 0x04, "{d:?} stereo bit");
+            assert_eq!(flags_of(d, false, true), bits | 0x08, "{d:?} redundant bit");
+            assert_eq!(flags_of(d, true, true), bits | 0x0C, "{d:?} both flags");
+            // And the duration a decoder reads back out of those bits is the
+            // sample and microsecond count the mix tick is scheduled on.
+            assert_eq!(FrameDuration::from_bits(bits), d);
+        }
+        assert_eq!(
+            [120u32, 240, 480, 960],
+            [
+                FrameDuration::Ms2_5.samples(),
+                FrameDuration::Ms5.samples(),
+                FrameDuration::Ms10.samples(),
+                FrameDuration::Ms20.samples()
+            ]
+        );
+        assert_eq!(
+            [2_500u32, 5_000, 10_000, 20_000],
+            [
+                FrameDuration::Ms2_5.micros(),
+                FrameDuration::Ms5.micros(),
+                FrameDuration::Ms10.micros(),
+                FrameDuration::Ms20.micros()
+            ]
+        );
+    }
+
+    /// The length prefix is attacker-supplied on any packet a member can
+    /// seal, so it is bounded by the bytes that actually arrived rather than
+    /// trusted. Nothing here indexes past the end and nothing allocates on
+    /// the strength of the claim.
+    #[test]
+    fn a_redundant_length_prefix_cannot_exceed_the_body() {
+        let good = MediaFrame {
+            seq: 1,
+            timestamp: 2,
+            duration: FrameDuration::Ms2_5,
+            stereo: false,
+            payload: &[7; 40],
+            redundant: Some(&[8; 38]),
+        }
+        .encode();
+        assert!(MediaFrame::decode(&good).is_ok());
+        let body = good.len() - HEADER_BYTES - 2;
+
+        // Every prefix from "exactly the body" upwards, including the widest
+        // a u16 can state, against a packet of 80 payload bytes.
+        for claim in [body, body + 1, 1_000, u16::MAX as usize] {
+            let mut forged = good.clone();
+            forged[HEADER_BYTES..HEADER_BYTES + 2].copy_from_slice(&(claim as u16).to_le_bytes());
+            assert_eq!(
+                MediaFrame::decode(&forged).is_ok(),
+                claim <= body,
+                "a prefix claiming {claim} of {body} bytes decoded wrongly"
+            );
+        }
+        // A prefix at the body length leaves an empty redundant copy, which is
+        // legal and distinct from no redundancy at all.
+        let mut exact = good.clone();
+        exact[HEADER_BYTES..HEADER_BYTES + 2].copy_from_slice(&(body as u16).to_le_bytes());
+        assert_eq!(
+            MediaFrame::decode(&exact).unwrap().redundant,
+            Some(&[][..]),
+            "the redundant flag must survive an empty redundant copy"
+        );
     }
 
     #[test]
