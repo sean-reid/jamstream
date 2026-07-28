@@ -34,6 +34,14 @@ const QUEUE_TICKS: usize = 400;
 /// onto create, upload part, complete, and abort.
 pub trait RecordingSink: Send {
     fn open(&mut self, name: &str) -> io::Result<Box<dyn RecordingObject>>;
+
+    /// True when finishing a take means waiting on a network rather than a
+    /// local write. It decides whether the room is told the take is
+    /// uploading: saying so about a file on the host's own disk, which
+    /// finishes instantly, would be a lie.
+    fn uploads(&self) -> bool {
+        false
+    }
 }
 
 /// One object being written. Earlier bytes are never rewritten.
@@ -128,8 +136,15 @@ impl RecordPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingState {
     Idle,
-    Recording { stems: bool },
-    Failed { reason: String },
+    Recording {
+        stems: bool,
+    },
+    /// The take has ended and its bytes are still going to storage. Only a
+    /// sink that uploads reports this; a disk take goes straight to Idle.
+    Uploading,
+    Failed {
+        reason: String,
+    },
 }
 
 /// One open file: its encoder and the sink object its bytes go to.
@@ -266,6 +281,12 @@ impl Recorder {
 
     pub fn state(&self) -> &RecordingState {
         &self.state
+    }
+
+    /// Whether a take is open and its sink uploads, so a caller knows that
+    /// the next `stop` will wait on the network and is worth announcing.
+    pub fn stop_will_upload(&self) -> bool {
+        self.take.is_some() && self.sink.uploads()
     }
 
     fn fail(&mut self, reason: String) {
@@ -504,7 +525,18 @@ fn run(
                 }
                 rec.tick(&payload);
             }
-            Msg::Stop => rec.stop(),
+            Msg::Stop => {
+                // stop() blocks until every object is finished, which for a
+                // bucket means the tail is still going over the network.
+                // Publish that first: the state is only true while the call
+                // nobody can observe is running.
+                if rec.stop_will_upload()
+                    && let Ok(mut slot) = state.lock()
+                {
+                    *slot = RecordingState::Uploading;
+                }
+                rec.stop();
+            }
             // The process is going away; the tail written so far is worth
             // more finished than aborted.
             Msg::Shutdown => break,

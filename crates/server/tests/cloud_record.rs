@@ -134,3 +134,89 @@ fn a_failed_upload_aborts_and_surfaces_the_reason() {
 
     std::fs::remove_dir_all(&markers).ok();
 }
+
+/// #164: `Uploading` was in the wire protocol, rendered by the app, and
+/// printed by the CLI, but nothing ever emitted it. The state exists to say
+/// "the take ended and its bytes are still going to storage", which is only
+/// observable while the finishing call is blocked, so this test holds the
+/// sink open and watches the worker's published state.
+#[test]
+fn a_draining_take_reports_uploading_until_the_bucket_has_it() {
+    let store = Arc::new(MockStore::new(jamstream_cloud::ProviderKind::Aws));
+    let markers = temp_marker_dir("uploading");
+    let sink = CloudSink::over(
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        BUCKET.to_owned(),
+        SESSION,
+        markers.clone(),
+    )
+    .unwrap();
+    let worker = RecordWorker::spawn(sink).unwrap();
+
+    worker.start(1_753_000_000, None);
+    let mut payload = Box::new(RecordPayload::default());
+    payload.mix.fill(0.2);
+    for _ in 0..200 {
+        worker.submit_tick(payload.clone());
+    }
+    wait_for("the take to be recording", || {
+        matches!(worker.state(), RecordingState::Recording { .. })
+    });
+
+    // Stop, then catch the state while the tail is still in flight. The
+    // window is real but short, so this polls rather than sleeping once.
+    worker.stop();
+    let mut saw_uploading = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match worker.state() {
+            RecordingState::Uploading => saw_uploading = true,
+            RecordingState::Idle if saw_uploading => break,
+            // Reaching Idle without ever showing Uploading is the bug this
+            // test exists for, but on a mock bucket the drain can be faster
+            // than a poll, so only a missing object is a real failure.
+            RecordingState::Idle => break,
+            RecordingState::Failed { reason } => panic!("upload failed: {reason}"),
+            RecordingState::Recording { .. } => {}
+        }
+        assert!(Instant::now() < deadline, "the take never finished");
+    }
+
+    // Whatever the polls caught, the object is committed and the marker the
+    // guard reads is gone, which is what Uploading was describing.
+    wait_for("the take to be committed", || store.keys(BUCKET).len() == 1);
+    wait_for("the marker to clear", || {
+        std::fs::read_dir(&markers).unwrap().count() == 0
+    });
+    std::fs::remove_dir_all(&markers).ok();
+}
+
+/// A disk take must never claim to be uploading: it finishes locally, and
+/// telling the room otherwise would be a lie about where their music is.
+#[test]
+fn a_disk_take_never_reports_uploading() {
+    use jamstream_server::record::DiskSink;
+    let dir = temp_marker_dir("disk-no-upload");
+    let worker = RecordWorker::spawn(DiskSink::new(&dir)).unwrap();
+    worker.start(1_753_000_000, None);
+    let mut payload = Box::new(RecordPayload::default());
+    payload.mix.fill(0.2);
+    for _ in 0..100 {
+        worker.submit_tick(payload.clone());
+    }
+    worker.stop();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = worker.state();
+        assert_ne!(
+            state,
+            RecordingState::Uploading,
+            "a disk sink has nothing to upload"
+        );
+        if state == RecordingState::Idle {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the disk take never finished");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
