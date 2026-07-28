@@ -249,6 +249,10 @@ impl S3Store {
         if bucket.is_empty() {
             return Err(ProviderError::Other("bucket name is empty".to_owned()));
         }
+        check_authority_part("bucket name", bucket)?;
+        // The signing region is interpolated into the host beside the bucket,
+        // so it gets the same treatment.
+        check_authority_part("region", &self.region)?;
         if key == Some("") {
             return Err(ProviderError::Other("object key is empty".to_owned()));
         }
@@ -461,6 +465,29 @@ fn canonical_query(pairs: &[(&str, String)]) -> String {
 /// path exactly as sent and must not see it double-encoded.
 fn encode_key(key: &str) -> String {
     key.split('/').map(aws_encode).collect::<Vec<_>>().join("/")
+}
+
+/// Refuses a bucket name or region that would mean something to a URL.
+///
+/// Unlike the object key, both go into the request unencoded, and on AWS and
+/// Spaces they go into the *host*: a bucket of `evil.com/x` addresses
+/// `https://evil.com/x.s3.eu-west-1.amazonaws.com/...`, which sends a request
+/// carrying this store's access key id and a signature to somebody else's
+/// server. Encoding them is not the fix, because a real bucket name never
+/// needs it; refusing is. `.`, `-` and `_` survive, which covers every name
+/// AWS, Spaces and Cloud Storage will issue, and the same check keeps a
+/// newline out of the flat config the VM parses.
+fn check_authority_part(what: &str, value: &str) -> Result<()> {
+    match value
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    {
+        Some(bad) => Err(ProviderError::Other(format!(
+            "{what} {value:?} contains {bad:?}, which is not a character any bucket or region \
+             name uses"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Strips the quotes S3 wraps around an ETag.
@@ -961,6 +988,54 @@ mod tests {
     fn empty_bucket_or_key_is_rejected_before_signing() {
         assert!(aws_store().address("", Some("k")).is_err());
         assert!(aws_store().address("b", Some("")).is_err());
+    }
+
+    /// The bucket and the region go into the request unencoded, and on AWS and
+    /// Spaces they go into the host. A bucket that carries a `/` would address
+    /// somebody else's server and send this store's access key id and a
+    /// signature there; one that carries a `?` or a `#` splits the query or
+    /// fragment so the sent request no longer matches the signed one. Neither
+    /// is a name a bucket can have, so both are refused before anything is
+    /// signed or sent.
+    #[test]
+    fn a_bucket_or_region_that_would_redirect_the_request_is_refused() {
+        for hostile in [
+            "evil.com/x",
+            "b?acl",
+            "b#frag",
+            "b:8080",
+            "user@host",
+            "b\nregion = elsewhere",
+            "b bucket",
+            "b/../..",
+        ] {
+            let err = aws_store()
+                .address(hostile, Some("k"))
+                .expect_err("a hostile bucket was addressed")
+                .to_string();
+            assert!(err.contains("not a character"), "{hostile:?}: {err}");
+            // Path style is no safer: the same string splits the path there.
+            assert!(
+                S3Store::gcs_interop("GOOG1".to_owned(), "s".to_owned())
+                    .address(hostile, Some("k"))
+                    .is_err(),
+                "{hostile:?} was addressed path style"
+            );
+        }
+        // A hostile region is refused with any bucket, since it lands in the
+        // host beside it.
+        assert!(
+            S3Store::spaces("nyc3/../..", "DO00KEY".to_owned(), "s".to_owned())
+                .address("my-jams", Some("k"))
+                .is_err()
+        );
+        // Every name a real bucket can have still addresses.
+        for fine in ["my-jams", "my.jams.2026", "MyJams", "a_b-c.d", "jams1"] {
+            assert!(
+                aws_store().address(fine, Some("a/b.flac")).is_ok(),
+                "{fine:?} was refused"
+            );
+        }
     }
 
     #[test]
