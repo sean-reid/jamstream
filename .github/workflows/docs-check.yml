@@ -14,9 +14,9 @@
 # - palette: crates/client/src/theme.rs is the single source of truth for
 #   JamStream's colors. The docs theme's custom properties, the docs
 #   theme-color meta, and the app icon's fills are generated from it by
-#   scripts/render-palette.sh. A change to a palette value that is not
-#   propagated (run the script, then scripts/render-icon.sh when the icon
-#   moved) fails this job.
+#   scripts/render-palette.sh, and the icon's derived assets (icns, ico,
+#   the tarball PNG, the favicons) by scripts/render-icon.sh. A palette
+#   change that has not reached either of them fails this job.
 
 name: docs-check
 
@@ -64,6 +64,13 @@ jobs:
         run: shellcheck scripts/render-palette.sh scripts/render-icon.sh
       - name: Check the generated palette consumers against theme.rs
         run: scripts/render-palette.sh --check
+      # render-palette leaves jamstream.svg recoloured; the assets rendered
+      # FROM it (icns, ico, jamstream-512.png, the two favicons) were the half
+      # nothing checked, so a recolour shipped old-coloured icons with this job
+      # green. --check needs no rendering tools, which is why it runs here on
+      # ubuntu rather than needing a macOS runner.
+      - name: Check the derived icon assets against the icon
+        run: scripts/render-icon.sh --check
 
   install-scripts:
     runs-on: ubuntu-latest

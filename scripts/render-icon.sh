@@ -18,25 +18,102 @@
 #       mdBook 0.5 picks both up from theme/ automatically)
 #
 # The .icns, .ico, favicon files, and 512 png are committed so release
-# builds and docs need no render step; CI never runs this script.
+# builds and docs need no render step.
 #
-# Requires rsvg-convert. The .icns step needs iconutil (macOS) and the
-# .ico step needs magick; each is skipped with a warning when its tool is
-# missing so the PNG/favicon outputs still regenerate anywhere.
+# Modes:
+#   (no args)  render everything in place. Needs rsvg-convert; the .icns
+#              step needs iconutil (macOS) and the .ico step needs magick,
+#              and each is skipped with a warning when its tool is absent
+#              so the PNG and favicon outputs still regenerate anywhere.
+#   --check    assert the committed assets were rendered from the SVG as it
+#              stands. Needs no rendering tools at all, which is what lets
+#              docs-check run it on a Linux runner. This is what CI runs.
+#
+# WHAT --check ACTUALLY PROVES, because the difference matters:
+# scripts/render-palette.sh already fails when a palette change has not
+# reached jamstream.svg, so after any recolour the SVG has moved. The gap
+# was between the SVG and the assets derived from it: an old-coloured
+# icns, ico, tarball PNG and favicon shipped with docs-check green.
+#
+# theme/favicon.svg is a verbatim copy of the source SVG, so it is a
+# content stamp for the whole render pass: the script writes every output
+# in one go, so a favicon.svg that matches means the pass ran on this SVG,
+# and one that does not means it did not. Comparing the rasters byte for
+# byte was the other option and it was rejected: rsvg output is not stable
+# across librsvg versions, so that gate would go red whenever GitHub
+# updated a runner image, and a gate that cries wolf is worse than none.
+#
+# So the honest limit: hand-copying the SVG over favicon.svg without
+# rerunning the render defeats this, the same way editing any stamp does.
+# Everything short of that it catches.
 set -eu
+
+MODE=render
+case "${1:-}" in
+  '') ;;
+  --check) MODE=check ;;
+  *)
+    echo "usage: $0 [--check]" >&2
+    exit 2
+    ;;
+esac
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SVG="$ROOT/crates/client/assets/icon/jamstream.svg"
 ICON_DIR="$ROOT/crates/client/assets/icon"
 THEME_DIR="$ROOT/site/theme"
 
-if ! command -v rsvg-convert >/dev/null 2>&1; then
-  echo "error: rsvg-convert is required (brew install librsvg)" >&2
+if [ ! -f "$SVG" ]; then
+  echo "error: source SVG not found: $SVG" >&2
   exit 1
 fi
 
-if [ ! -f "$SVG" ]; then
-  echo "error: source SVG not found: $SVG" >&2
+if [ "$MODE" = check ]; then
+  STATUS=0
+  # The stamp. Everything else in the render pass is written beside it.
+  if ! cmp -s "$SVG" "$THEME_DIR/favicon.svg"; then
+    echo "render-icon: site/theme/favicon.svg is not a copy of" \
+      "crates/client/assets/icon/jamstream.svg, so the icns, the ico," \
+      "jamstream-512.png and favicon.png were all rendered from an older" \
+      "icon. Run scripts/render-icon.sh (on macOS, with librsvg and" \
+      "imagemagick installed, so the icns and the ico are rendered too) and" \
+      "commit the result." >&2
+    STATUS=1
+  fi
+  # Each committed asset exists, is not empty, and is the format its name
+  # claims. A truncated or wrong-typed asset is not something the stamp can
+  # see, and it is what a botched render leaves behind.
+  #
+  # magic <file> <od-prefix> <label>
+  magic() {
+    if [ ! -s "$1" ]; then
+      echo "render-icon: $3 is missing or empty" >&2
+      STATUS=1
+      return
+    fi
+    got=$(od -An -tx1 -N 8 "$1" | tr -d ' \n')
+    case "$got" in
+      "$2"*) ;;
+      *)
+        echo "render-icon: $3 does not start with the $2 header of its format (got $got)" >&2
+        STATUS=1
+        ;;
+    esac
+  }
+  magic "$ICON_DIR/jamstream-512.png" 89504e470d0a1a0a crates/client/assets/icon/jamstream-512.png
+  magic "$THEME_DIR/favicon.png" 89504e470d0a1a0a site/theme/favicon.png
+  # 'icns' in ascii, then the container length.
+  magic "$ICON_DIR/jamstream.icns" 69636e73 crates/client/assets/icon/jamstream.icns
+  # ICONDIR: reserved 0, type 1 (icon), then the image count, little endian.
+  magic "$ICON_DIR/jamstream.ico" 00000100 crates/client/assets/icon/jamstream.ico
+  if [ "$STATUS" -eq 0 ]; then
+    echo "icon: every committed asset was rendered from the current jamstream.svg"
+  fi
+  exit "$STATUS"
+fi
+
+if ! command -v rsvg-convert >/dev/null 2>&1; then
+  echo "error: rsvg-convert is required (brew install librsvg)" >&2
   exit 1
 fi
 
