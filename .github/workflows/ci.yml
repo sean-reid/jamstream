@@ -9,6 +9,8 @@
 #   musl      ~6 min    static server builds (both arches) + verification
 #   coverage  ~16 min   instrumented rebuild; runs on pushes to main only so
 #                       the PR path never waits on it
+#   required  seconds   the aggregator every other job feeds; see the comment
+#                       above it for why it exists
 #
 # The harness gates run as their own parallel job so unit/integration
 # feedback lands before the ~3 minute simulation suite finishes. Anything
@@ -435,3 +437,125 @@ jobs:
           name: jamstreamd-aarch64-unknown-linux-musl
           path: target/aarch64-unknown-linux-musl/release/jamstreamd
           if-no-files-found: error
+
+  # Branch protection gates on job NAMES, so a job added to this file is
+  # non-blocking until someone remembers to add its name there. Everything
+  # added since that list was written arrived non-blocking, including
+  # `features`, the job that exists because --no-default-features sat broken
+  # for weeks behind green CI.
+  #
+  # This job is the one required context that cannot go stale that way. It
+  # depends on every other job here, and it FAILS when this workflow contains
+  # a job it was not told about, so a new job blocks the branch from the
+  # moment it is added and making one non-blocking is an edit to the list
+  # below with a reason beside it: a thing a reviewer sees.
+  #
+  # `if: always()` is load bearing. A job that is skipped counts as success
+  # for branch protection, so an aggregator with any other condition would
+  # wave a run through exactly when a dependency did not finish.
+  required:
+    if: always()
+    needs: [pr-title, lint, test, release-build, harness, coverage, features, musl]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every job on the pull-request path is accounted for
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -eu
+          # Jobs deliberately outside this gate. Empty, and an entry here
+          # wants a reason written above it.
+          EXEMPT=''
+          # docs-check.yml's jobs. A job cannot depend on another workflow's
+          # jobs, so those four report their own required contexts. Listing
+          # them here is what makes a job added there fail this one, and the
+          # reverse direction catches a deleted job whose required context
+          # would otherwise leave the branch permanently unmergeable.
+          DOCS_JOBS='cli-docs screenshots palette install-scripts'
+
+          # Top-level keys of the `jobs:` block. Deliberately dumb, and it
+          # fails on an empty result rather than passing quietly, because a
+          # reformat this cannot read is the one way it could stop working.
+          job_names() {
+            awk '
+              /^jobs:[[:space:]]*$/ { injobs = 1; next }
+              injobs && /^[^[:space:]#]/ { injobs = 0 }
+              injobs && /^  [a-zA-Z0-9_-]+:[[:space:]]*$/ {
+                sub(/:.*/, ""); gsub(/[[:space:]]/, ""); print
+              }
+            ' "$1"
+          }
+
+          # Space separated, so the membership tests below can look for a word
+          # with a space on either side of it.
+          CI_JOBS=$(job_names .github/workflows/ci.yml | tr '\n' ' ')
+          FOUND_DOCS=$(job_names .github/workflows/docs-check.yml | tr '\n' ' ')
+          # A reformat the awk cannot read would yield nothing and then wave
+          # every job through, so the count is the check on the check.
+          test "$(printf '%s' "$CI_JOBS" | wc -w)" -ge 9
+          test "$(printf '%s' "$FOUND_DOCS" | wc -w)" -ge 4
+
+          GATED=$(printf '%s' "$NEEDS" | jq -r 'keys[]' | tr '\n' ' ')
+          echo "gated by this job: $GATED"
+          status=0
+          for job in $CI_JOBS; do
+            case " required $EXEMPT $GATED " in
+              *" $job "*) ;;
+              *)
+                echo "ci.yml job '$job' is not in this job's needs, so it does not block anything. Add it, or add it to EXEMPT with a reason." >&2
+                status=1
+                ;;
+            esac
+          done
+          for job in $FOUND_DOCS; do
+            case " $DOCS_JOBS " in
+              *" $job "*) ;;
+              *)
+                echo "docs-check.yml job '$job' is unknown here. Add it to DOCS_JOBS above and add '$job' to the required contexts in branch protection." >&2
+                status=1
+                ;;
+            esac
+          done
+          for job in $DOCS_JOBS; do
+            case " $FOUND_DOCS " in
+              *" $job "*) ;;
+              *)
+                echo "docs-check.yml has no job '$job' any more, so its required context can never report and nothing can merge. Drop it here and from branch protection." >&2
+                status=1
+                ;;
+            esac
+          done
+          exit $status
+      - name: Every job this event should have run is green
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -eu
+          # Jobs that run on one event only, so `skipped` is their correct
+          # result on the other one and anything else is not. Checking the
+          # expected result per event rather than just "nothing failed" is
+          # the point: a job that quietly stops running reports skipped, and
+          # a gate that accepts any skip would accept that too.
+          PUSH_ONLY='coverage release-build'
+          PR_ONLY='pr-title'
+          status=0
+          for job in $(printf '%s' "$NEEDS" | jq -r 'keys[]'); do
+            result=$(printf '%s' "$NEEDS" | jq -r --arg j "$job" '.[$j].result')
+            want=success
+            case " $PUSH_ONLY " in
+              *" $job "*) [ "$EVENT" = push ] || want=skipped ;;
+            esac
+            case " $PR_ONLY " in
+              *" $job "*) [ "$EVENT" = pull_request ] || want=skipped ;;
+            esac
+            if [ "$result" = "$want" ]; then
+              printf 'ok      %-14s %s\n' "$job" "$result"
+            else
+              printf 'NOT OK  %-14s %s, wanted %s\n' "$job" "$result" "$want" >&2
+              status=1
+            fi
+          done
+          exit $status
