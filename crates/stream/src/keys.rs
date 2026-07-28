@@ -5,8 +5,13 @@
 //! It is never an argument and never touches persistent disk.
 //!
 //! The file is created with mode 0600 by `open`, not by a later chmod, so
-//! there is no window where it is group or world readable. The host opens it
-//! and unlinks it before the child runs (see [`crate::proc::Stdin`]), which
+//! there is no window where it is group or world readable. The directory
+//! comes from `jamstream_cloud::private`, which is where the rules for a
+//! directory that holds key material live: 0700 at creation, and a directory
+//! that already exists is inspected rather than chmodded, refused outright if
+//! another account owns it or if anyone else can write to it. The host opens
+//! the file and unlinks it before the child runs (see [`crate::proc::Stdin`]),
+//! which
 //! means the path is gone by the time the spawn call returns, whether the
 //! spawn succeeded or failed. The pusher receives the ingest URL on stdin
 //! from the inherited descriptor.
@@ -42,8 +47,7 @@ impl KeyStore {
     /// Any leftover file for the same id (a previous spawn that never ran) is
     /// removed first.
     pub fn stage(&self, id: DestinationId, secret: &str) -> io::Result<PathBuf> {
-        std::fs::create_dir_all(&self.dir)?;
-        restrict_dir(&self.dir)?;
+        jamstream_cloud::private::create_private_dir(&self.dir)?;
         let path = self.path(id);
         let _ = std::fs::remove_file(&path);
         let mut file = create_0600(&path)?;
@@ -83,17 +87,6 @@ fn create_0600(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
-#[cfg(unix)]
-fn restrict_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn restrict_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -121,6 +114,25 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "rtmps://x/app/secret\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A directory anyone can write to is somebody else's to swap files in,
+    /// which is why `jamstream_cloud::private` refuses one instead of quietly
+    /// tightening it. This crate used to chmod it to 0700 and carry on, and
+    /// checked no ownership at all.
+    #[test]
+    fn a_world_writable_directory_is_refused_rather_than_chmodded() {
+        let dir = tmp_dir("exposed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let store = KeyStore::new(&dir);
+        let err = store.stage(DestinationId(1), "secret").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        // Left as whoever made it left it, and no key was written into it.
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o777, "got {mode:o}");
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

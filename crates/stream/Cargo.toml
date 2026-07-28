@@ -10,6 +10,11 @@ publish.workspace = true
 [dependencies]
 jamstream-protocol.workspace = true
 jamstream-broadcast.workspace = true
+# For `private::create_private_dir` alone: the rules for a directory that
+# holds key material are written down once, in that module, which says in its
+# own doc comment that no second copy may exist. Costs nothing in jamstreamd,
+# which links this crate already.
+jamstream-cloud.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
