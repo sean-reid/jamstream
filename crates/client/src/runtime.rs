@@ -150,6 +150,10 @@ pub enum ConnState {
     Joined,
     Ejected(String),
     TimedOut,
+    /// Every seat for this invite's role is taken. Not a dead end: the
+    /// client keeps trying, because a seat frees when somebody leaves, so
+    /// this reads as waiting rather than as a failure.
+    SessionFull,
     /// No session; also the state after a clean leave.
     Idle,
 }

@@ -22,7 +22,7 @@ If a laptop dies mid-session or a state file is lost, `jamstream sweep` finds lo
 
 ## From the terminal
 
-`jamstream host --provider local` (local is the default provider, so the flag is optional) runs the same flow: it prints one invite per seat after the handshake check and takes `--musicians`, `--listeners`, `--idle-min`, and `--port` where the app uses its defaults; see the [host reference](../cli/host.md). The app picks a free UDP port for each local session; the CLI defaults to 43210.
+`jamstream host --provider local` (local is the default provider, so the flag is optional) runs the same flow: it prints one invite per seat after the handshake check and takes `--musicians`, `--listeners`, `--idle-min`, and `--port`; the wizard offers the same seats and windows, and picks the port itself. See the [host reference](../cli/host.md). The app picks a free UDP port for each local session; the CLI defaults to 43210.
 
 Unlike the app, the CLI does not bundle the server, so local mode needs a `jamstreamd` binary already on your machine; nothing is downloaded, and the `--artifact-url` and `--artifact-sha256` flags play no part. The binary is found in this order:
 
