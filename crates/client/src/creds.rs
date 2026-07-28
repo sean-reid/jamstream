@@ -13,7 +13,7 @@ use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::providers::digitalocean::DigitalOceanProvider;
 use jamstream_cloud::providers::gcp::GcpProvider;
 use jamstream_cloud::providers::gcp_auth::ServiceAccountTokenSource;
-use jamstream_cloud::{Provider, ProviderKind};
+use jamstream_cloud::{DEFAULT_SESSION_PORT, Provider, ProviderKind};
 use jamstream_protocol::control::StreamPlatform;
 
 /// Keychain service name; one entry per provider field.
@@ -201,63 +201,98 @@ pub fn lookup(
     creds.get(field.0, field.1).or_else(|| env(var))
 }
 
-/// Builds a provider from stored or environment credentials. The error is
-/// what the wizard's "setup needed" state explains away; it never contains
-/// a secret.
+/// Builds a provider from stored or environment credentials for everything
+/// that is not a launch: readiness, the credential check, the region survey,
+/// the teardown. The error is what the wizard's "setup needed" state explains
+/// away; it never contains a secret.
 pub fn build_provider(
     name: &str,
     creds: &dyn CredStore,
     env: &EnvReader,
 ) -> Result<Box<dyn Provider>, String> {
+    build_provider_for_port(name, DEFAULT_SESSION_PORT, creds, env)
+}
+
+/// [`build_provider`] for a launch, which has to name the port the session
+/// will listen on: that is the one port the provider opens in the firewall it
+/// creates, so a provider built without it can leave the machine behind a
+/// firewall for a different port. `jamstream host` threads it through
+/// `providers::resolve_for_port` and the app dropped it (#227).
+pub fn build_provider_for_port(
+    name: &str,
+    session_port: u16,
+    creds: &dyn CredStore,
+    env: &EnvReader,
+) -> Result<Box<dyn Provider>, String> {
     match name {
+        // Local spawns a process rather than opening a firewall, and takes its
+        // port from the flat config the launch writes.
         "local" => jamstream_cli::providers::resolve("local").map_err(|e| e.to_string()),
         "digitalocean" => {
             let token = lookup(creds, env, DO_TOKEN, "DIGITALOCEAN_TOKEN")
                 .ok_or("no DigitalOcean token saved and DIGITALOCEAN_TOKEN is not set")?;
-            Ok(Box::new(DigitalOceanProvider::new(token)))
+            Ok(Box::new(
+                DigitalOceanProvider::new(token).with_session_port(session_port),
+            ))
         }
         "aws" => {
             let id = lookup(creds, env, AWS_ACCESS_KEY_ID, "AWS_ACCESS_KEY_ID")
                 .ok_or("no AWS access key saved and AWS_ACCESS_KEY_ID is not set")?;
             let secret = lookup(creds, env, AWS_SECRET_ACCESS_KEY, "AWS_SECRET_ACCESS_KEY")
                 .ok_or("no AWS secret key saved and AWS_SECRET_ACCESS_KEY is not set")?;
-            Ok(Box::new(AwsProvider::new(id, secret)))
+            Ok(Box::new(
+                AwsProvider::new(id, secret).with_session_port(session_port),
+            ))
         }
-        "gcp" => build_gcp(creds, env),
+        "gcp" => build_gcp(session_port, creds, env),
         other => Err(format!("unknown provider {other:?}")),
     }
 }
 
 /// GCP: a stored service account key first, then the same environment modes
 /// the CLI supports (project + access token pair, then a key file path).
-fn build_gcp(creds: &dyn CredStore, env: &EnvReader) -> Result<Box<dyn Provider>, String> {
+fn build_gcp(
+    session_port: u16,
+    creds: &dyn CredStore,
+    env: &EnvReader,
+) -> Result<Box<dyn Provider>, String> {
     if let Some(json) = creds.get(GCP_SERVICE_ACCOUNT_JSON.0, GCP_SERVICE_ACCOUNT_JSON.1) {
-        return gcp_from_json(&json, env);
+        return gcp_for_port(&json, session_port, env);
     }
     if let (Some(project), Some(token)) = (env("GOOGLE_CLOUD_PROJECT"), env("GCP_ACCESS_TOKEN")) {
-        return Ok(Box::new(GcpProvider::with_access_token(project, token)));
+        return Ok(Box::new(
+            GcpProvider::with_access_token(project, token).with_session_port(session_port),
+        ));
     }
     if let Some(path) = env("GOOGLE_APPLICATION_CREDENTIALS") {
         let json = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read service account key {path}: {e}"))?;
-        return gcp_from_json(&json, env);
+        return gcp_for_port(&json, session_port, env);
     }
     Err("no GCP service account key saved and no GCP credentials in the environment".to_owned())
 }
 
 /// A provider from raw pasted/loaded service account JSON, as the wizard's
-/// GCP setup pane holds it.
+/// GCP setup pane holds it. The pane checks credentials and launches nothing,
+/// so it gets the default session port.
 pub fn gcp_from_json(json: &str, env: &EnvReader) -> Result<Box<dyn Provider>, String> {
+    gcp_for_port(json, DEFAULT_SESSION_PORT, env)
+}
+
+fn gcp_for_port(
+    json: &str,
+    session_port: u16,
+    env: &EnvReader,
+) -> Result<Box<dyn Provider>, String> {
     let source = ServiceAccountTokenSource::from_json(json).map_err(|e| e.to_string())?;
     let project = env("GOOGLE_CLOUD_PROJECT")
         .or_else(|| source.project_id().map(str::to_owned))
         .ok_or(
             "the service account key has no project_id field and GOOGLE_CLOUD_PROJECT is not set",
         )?;
-    Ok(Box::new(GcpProvider::with_token_source(
-        project,
-        Arc::new(source),
-    )))
+    Ok(Box::new(
+        GcpProvider::with_token_source(project, Arc::new(source)).with_session_port(session_port),
+    ))
 }
 
 #[cfg(test)]

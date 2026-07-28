@@ -269,6 +269,43 @@ fn a_fader_never_crosses_the_name_above_it() {
     }
 }
 
+/// The other half of #70, and the whole of #173: reserving the floor is not
+/// the same as delivering it. The console counted 22 px for a button row and
+/// 16 for the dB readout, egui drew both taller, and the fader absorbed the
+/// difference: 17 px tall on a host strip at the smallest window, seven
+/// pixels of travel for 66 dB, with Ana at -3.0, Ben at -1.5 and Mira at
+/// -6.0 all putting the handle in the same place.
+#[test]
+fn a_fader_gets_its_floor_and_stays_in_the_window() {
+    use jamstream_client::screens::session::MIN_FADER_H;
+
+    for size in SIZES {
+        for host in [false, true] {
+            let mut harness = if host {
+                host_harness_sized(size)
+            } else {
+                session_harness_sized(false, size).1
+            };
+            harness.run_steps(3);
+            for member in ["Ana", "Ben", "Mira"] {
+                let fader = harness.get_by_label(&format!("{member} fader")).rect();
+                assert!(
+                    fader.height() >= MIN_FADER_H,
+                    "{member}'s fader is {:.1} px of the {MIN_FADER_H} the console reserved, \
+                     window {size:?}, host {host}",
+                    fader.height()
+                );
+                // And the console does not answer the floor by scrolling the
+                // strip half out of the window at the sizes the app opens at.
+                assert!(
+                    fader.top() >= 0.0 && fader.bottom() <= size.y,
+                    "{member}'s fader at {fader:?} runs outside the {size:?} window, host {host}"
+                );
+            }
+        }
+    }
+}
+
 /// The whole shell with the settings drawer open over a host session, which
 /// is the tallest sheet in the app over the shortest status bar it can sit
 /// above. `in_memory` for the same reason every fixture uses it: the real
@@ -597,6 +634,169 @@ fn escape_closes_the_settings_drawer_before_a_session_sheet() {
     assert!(
         harness.query_by_label_contains("Buffer size").is_none(),
         "Escape must close the drawer"
+    );
+}
+
+/// #180, the other end of the same ladder: with the drawer open, Revoke on a
+/// strip puts a confirmation on top of it, and Escape used to close the drawer
+/// underneath and leave the confirmation standing. The innermost thing entered
+/// is the first thing left, and the drawer is not the innermost thing here.
+#[test]
+fn escape_leaves_a_confirmation_over_the_drawer_before_the_drawer() {
+    let mut harness = settings_harness_sized(vec2(1280.0, 800.0));
+    harness.run_steps(2);
+    // Any strip's Revoke; there is one per member and they behave alike.
+    harness
+        .get_all_by_role_and_label(AkRole::Button, "Revoke")
+        .next()
+        .expect("a strip carries Revoke")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("They will be disconnected")
+            .is_some(),
+        "the confirmation must be up"
+    );
+
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("They will be disconnected")
+            .is_none(),
+        "the first Escape belongs to the confirmation"
+    );
+    assert!(
+        harness.query_by_label_contains("Buffer size").is_some(),
+        "and it must not have taken the drawer with it"
+    );
+
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label_contains("Buffer size").is_none(),
+        "the second Escape closes the drawer"
+    );
+}
+
+/// The record sheet and the settings drawer share one right-hand anchor, so
+/// opening either closes the other. With both open, 44 px of the wider sheet
+/// stuck out to the left of the drawer showing chopped words, and a truncated
+/// Stop in that fragment was still clickable, so a stray click there ended the
+/// take (#175).
+#[test]
+fn the_record_sheet_and_the_drawer_are_never_open_at_once() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(rt));
+    app.screen = Screen::Session;
+    app.session.invites = Some(empty_invites());
+    app.session.destinations = Some(DestinationsPanel::new(Arc::new(MemStore::default())));
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(2);
+
+    // The sheet first, then the drawer over it.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Record")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("kept in the session's storage")
+            .is_some()
+    );
+    harness
+        .get_by_role_and_label(AkRole::Button, "Settings")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label_contains("Buffer size").is_some(),
+        "the drawer must have opened"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("kept in the session's storage")
+            .is_none(),
+        "the record sheet must not still be behind the drawer"
+    );
+    // And the other way round: the sheet takes the anchor back.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Record")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("kept in the session's storage")
+            .is_some()
+    );
+    assert!(
+        harness.query_by_label_contains("Buffer size").is_none(),
+        "the drawer must have closed for the sheet"
+    );
+}
+
+/// #174: a strip's dot is about that member. The runtime reports one musician
+/// away while your own link is fine, so a dot that carried your rtt would read
+/// the same on every strip. What is on screen is one dot per musician saying
+/// where they are, and the link numbers stay in the bar, where they are yours.
+#[test]
+fn a_strips_dot_follows_the_member_not_your_own_link() {
+    use jamstream_client::widgets::{PRESENCE_AWAY, PRESENCE_HERE};
+
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, false);
+    demo.set_away(2, true); // Ben's client went quiet
+    let snap = demo.snapshot();
+    assert!(
+        snap.stats.rtt_ms.is_some_and(|rtt| rtt < 25.0),
+        "your own link has to be reading well for this test to mean anything"
+    );
+    let musicians = snap
+        .members
+        .iter()
+        .filter(|m| m.role == jamstream_client::runtime::Role::Musician)
+        .count();
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let rt_ui = rt.clone();
+    let mut screen = SessionScreen::default();
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        });
+    harness.run_steps(3);
+
+    let here = harness.get_all_by_label(PRESENCE_HERE).count();
+    let away = harness.get_all_by_label(PRESENCE_AWAY).count();
+    assert_eq!(
+        away, 1,
+        "exactly the member the roster reports away reads away"
+    );
+    assert_eq!(
+        here + away,
+        musicians,
+        "one dot per musician, each saying where that member is"
+    );
+    // The link numbers belong to one place, and it is not a strip.
+    assert!(
+        harness.query_by_label_contains("mouth to ear").is_some(),
+        "your own link stays in the bar"
     );
 }
 
@@ -1074,6 +1274,70 @@ fn a_pasted_key_reaches_the_server_once_and_then_going_live() {
     // and the bar's centre cluster says so.
     assert!(rt.snapshot().stream.on_air());
     assert!(harness.query_by_label("ON AIR").is_some());
+}
+
+/// The key pane's two keystrokes, both of which it was missing (#180): Enter
+/// saves, the way the join field and the chat field do, and Escape dismisses a
+/// half typed key without sending it. Escape reaches the pane before the
+/// drawer the pane is in.
+#[test]
+fn the_key_pane_saves_on_enter_and_leaves_on_escape() {
+    let (rt, mut harness) = destinations_harness(&[]);
+    harness.run_steps(2);
+    harness
+        .get_all_by_role_and_label(AkRole::Button, "Add key")
+        .next()
+        .expect("Twitch add key")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_role(AkRole::PasswordInput).click();
+    harness.run_steps(1);
+    harness.get_by_role(AkRole::PasswordInput).type_text("half");
+    harness.run_steps(2);
+
+    // Escape dismisses the pane, and stops there: the drawer it is in is the
+    // next thing out, not the first.
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_role(AkRole::PasswordInput).is_none(),
+        "Escape must dismiss the key pane"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("Where this session streams")
+            .is_some(),
+        "and must not have reached past it to the drawer"
+    );
+    assert!(
+        destination_commands(&rt).is_empty(),
+        "a dismissed key is not a sent key"
+    );
+
+    // Reopen, type, and press Enter: the same command Save key sends.
+    harness
+        .get_all_by_role_and_label(AkRole::Button, "Add key")
+        .next()
+        .expect("Twitch add key")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_role(AkRole::PasswordInput).click();
+    harness.run_steps(1);
+    harness
+        .get_by_role(AkRole::PasswordInput)
+        .type_text(FAKE_KEY);
+    harness.run_steps(2);
+    harness.key_press(Key::Enter);
+    harness.run_steps(2);
+    let sent = destination_commands(&rt);
+    assert_eq!(sent.len(), 1, "commands were {sent:?}");
+    match &sent[0] {
+        Command::AddDestination { platform, key, .. } => {
+            assert_eq!(*platform, jamstream_client::runtime::StreamPlatform::Twitch);
+            assert_eq!(key.expose(), FAKE_KEY, "the key must arrive verbatim");
+        }
+        other => panic!("expected AddDestination, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1661,4 +1925,162 @@ fn jpeg_bytes(w: u32, h: u32) -> Vec<u8> {
         .encode_image(&img)
         .expect("encode jpeg");
     buf.into_inner()
+}
+
+// The host wizard's card. The steps are reached through the real transitions
+// with an in-memory credential store and a pinned (empty) environment, so a
+// fixture never reads what the developer running it has stored.
+
+/// Server artifacts that could not exist, so the preview step is the one a
+/// release build shows: nothing to configure and Launch live.
+const FAKE_PINS: jamstream_cloud::PinnedServerArtifacts = jamstream_cloud::PinnedServerArtifacts {
+    x86_64: Some(jamstream_cloud::PinnedServerArtifact {
+        url: "https://example.invalid/jamstream/jamstreamd-linux-x86_64-musl",
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+    }),
+    aarch64: Some(jamstream_cloud::PinnedServerArtifact {
+        url: "https://example.invalid/jamstream/jamstreamd-linux-aarch64-musl",
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+    }),
+};
+
+/// The whole shell on the wizard's cost preview, the tallest card it has.
+fn wizard_preview_harness(size: egui::Vec2) -> Harness<'static> {
+    wizard_harness(size, jamstream_client::screens::host::WizardStep::Preview)
+}
+
+/// The wizard on `step`, reached through the real transitions as far as the
+/// preview. Launching is set rather than launched: a fixture that pressed
+/// Launch would ask a real provider for a real machine.
+fn wizard_harness(
+    size: egui::Vec2,
+    step: jamstream_client::screens::host::WizardStep,
+) -> Harness<'static> {
+    use jamstream_client::app::{JamApp, Screen};
+    use jamstream_client::screens::host::{RegionRow, WizardStep};
+    use jamstream_cloud::{Price, ProviderKind, Region, RegionId};
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.wizard.providers[1].status = jamstream_client::screens::host::ProviderStatus::Ready;
+    app.wizard.select_provider(1);
+    app.wizard.continue_to_region(vec![RegionRow {
+        region: Region {
+            provider: ProviderKind::DigitalOcean,
+            id: RegionId::new("nyc3"),
+            display: "New York 3".to_owned(),
+            country: "US".to_owned(),
+        },
+        price: Price {
+            hourly_microusd: 26_790,
+            egress_microusd_per_gb: 10_000,
+            included_egress_gb: 3000,
+        },
+        worst_rtt_ms: 21.0,
+    }]);
+    app.wizard.continue_to_preview();
+    app.wizard.pinned = FAKE_PINS;
+    assert_eq!(app.wizard.step, WizardStep::Preview);
+    assert!(app.wizard.can_launch(), "the fixture must be launchable");
+    app.wizard.step = step;
+    app.screen = Screen::HostWizard;
+    Harness::builder()
+        .with_size(size)
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let fill = theme::palette(Theme::Dark).surface0;
+            egui::CentralPanel::default_margins()
+                .frame(
+                    egui::Frame::new()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::same(10)),
+                )
+                .show(ui, |ui| app.root_ui(ui));
+        })
+}
+
+/// #179: the step's actions belong to the card's bottom edge, not to the end
+/// of its body. At 800x600 the cost preview is taller than the window, and
+/// Back and Launch sat past the bottom edge with a 6 px scrollbar as the only
+/// cue that the step had a primary action at all.
+#[test]
+fn the_wizards_actions_are_on_screen_at_every_window_size() {
+    for size in SIZES {
+        let mut harness = wizard_preview_harness(size);
+        harness.run_steps(4);
+        for label in ["Back", "Launch"] {
+            let node = harness
+                .query_by_role_and_label(AkRole::Button, label)
+                .unwrap_or_else(|| panic!("{label} is missing at {size:?}"));
+            let rect = node.rect();
+            assert!(
+                rect.top() >= 0.0 && rect.bottom() <= size.y,
+                "{label} at {rect:?} is outside the {size:?} window"
+            );
+            assert!(
+                rect.left() >= 0.0 && rect.right() <= size.x,
+                "{label} at {rect:?} is outside the {size:?} window"
+            );
+        }
+        // And the step's own top is on screen, rather than pushed down by a
+        // lead the window cannot spare.
+        let title = harness
+            .query_by_label_contains("Step 3 of 4")
+            .expect("the step counter")
+            .rect();
+        assert!(
+            title.top() >= 0.0 && title.bottom() <= size.y,
+            "the step counter at {title:?} is outside the {size:?} window"
+        );
+        // Reachable is not the whole claim: this step's body is taller than
+        // every one of these windows, so the card has to spend the window on
+        // it. A body that collapsed to its floor would satisfy every assertion
+        // above and show two rows of a six row step.
+        let launch = harness
+            .query_by_role_and_label(AkRole::Button, "Launch")
+            .expect("Launch")
+            .rect();
+        let card = launch.bottom() - title.top();
+        assert!(
+            card >= size.y * 0.6,
+            "the card is {card:.0} px of a {size:?} window, so the step is showing a \
+             fraction of itself with the rest behind a scrollbar"
+        );
+    }
+}
+
+/// #177: the launching step used to draw a spinner and nothing else until an
+/// error arrived, so a reachability check that never passed left quitting the
+/// app as the only way out. Stop waiting has to come back to the preview with
+/// the note about what may be running out there.
+///
+/// The step is entered without a job behind it, which is the state a launch
+/// nobody can interrupt leaves the wizard in; a fixture that pressed Launch
+/// would be asking a real provider for a real machine.
+#[test]
+fn the_launching_step_has_a_way_back_while_it_is_still_waiting() {
+    let mut harness = wizard_harness(
+        vec2(1280.0, 800.0),
+        jamstream_client::screens::host::WizardStep::Launching,
+    );
+    harness.run_steps(3);
+    assert!(
+        harness.query_by_label_contains("Step 4 of 4").is_some(),
+        "the fixture must be on the launching step"
+    );
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stop waiting")
+        .click();
+    harness.run_steps(3);
+    assert!(
+        harness.query_by_label_contains("Step 3 of 4").is_some(),
+        "Stop waiting must come back to the preview"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("You stopped waiting")
+            .is_some(),
+        "and the preview must say a machine may be running"
+    );
 }

@@ -128,7 +128,9 @@ fn state_row(ui: &mut Ui, snap: &Snapshot) {
             RecordState::Uploading => ("uploading", p.meter_amber),
             RecordState::Failed { .. } => ("failed", p.danger),
         };
-        ui.label(RichText::new(word).color(color));
+        // The lamp beside it keeps the palette colour, which is data; the word
+        // is text and takes the step of that colour that reads on the sheet.
+        ui.label(RichText::new(word).color(theme::readable(color, p.surface1, p)));
         if matches!(state, RecordState::Uploading) {
             // Its own state, said plainly: the take left the session and
             // is neither done nor lost until the lamp goes dark.

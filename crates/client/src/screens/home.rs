@@ -50,7 +50,8 @@ pub struct HomeScreen {
 impl HomeScreen {
     pub fn ui(&mut self, ui: &mut Ui, recent: &[RecentSession]) -> Option<HomeAction> {
         let mut action = None;
-        theme::focused_column(ui, 560.0, |ui| {
+        let room = ui.available_height();
+        theme::focused_column(ui, 560.0, room, |ui, _| {
             theme::wordmark(ui, 26.0);
             ui.add_space(theme::SPACE_XS);
             ui.label(theme::muted(

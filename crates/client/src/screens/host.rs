@@ -22,7 +22,7 @@ use jamstream_cloud::{
 use jamstream_protocol::ids::SessionId;
 use jamstream_protocol::invite::{Invite, Issuer};
 use jamstream_protocol::transport::generate_keypair;
-use jamstream_session::client::{ClientCore, ClientState};
+use jamstream_session::client::{ClientCore, ClientState, ServerCandidates};
 // The session shape, defined once for the CLI and this wizard alike; see
 // jamstream_session::limits.
 use jamstream_session::{
@@ -41,7 +41,11 @@ use crate::widgets::{PICK_INDENT, pick_row, row_cell};
 /// is deliberately absent; `--demo` exercises the fake session elsewhere.
 pub const WIZARD_PROVIDERS: &[&str] = &["local", "digitalocean", "aws", "gcp"];
 
-const SESSION_PORT: u16 = 43210;
+/// The UDP port a cloud session listens on. It is the provider's own default
+/// rather than a second copy of the number, because it is also the only port
+/// the per-session firewall opens: the two have to be the same value or the
+/// machine comes up behind a firewall for a port nothing is listening on.
+const SESSION_PORT: u16 = jamstream_cloud::DEFAULT_SESSION_PORT;
 const IP_WAIT_CAP: Duration = Duration::from_secs(180);
 const IP_POLL_PERIOD: Duration = Duration::from_secs(2);
 const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
@@ -231,6 +235,9 @@ pub struct HostWizard {
     pub artifact_url: String,
     pub artifact_sha256: String,
     pub launch_error: Option<String>,
+    /// Set once the host has stopped waiting on a launch, so the preview step
+    /// says what may be running out there. Cleared by the next launch.
+    pub launch_abandoned: bool,
     /// What this session records. Off unless the host says otherwise, every
     /// time: nothing is captured by surprise and an unused recorder costs
     /// nothing.
@@ -277,6 +284,7 @@ impl HostWizard {
             artifact_url: String::new(),
             artifact_sha256: String::new(),
             launch_error: None,
+            launch_abandoned: false,
             recording: RecordingChoice::Off,
             recording_setup: RecordingSetup::default(),
             check_job: None,
@@ -710,9 +718,29 @@ impl HostWizard {
         };
         *self.launch_phase.lock().expect("launch phase") = LaunchPhase::Launching;
         self.launch_error = None;
+        self.launch_abandoned = false;
         self.step = WizardStep::Launching;
         let phase = Arc::clone(&self.launch_phase);
         self.launch_job = Some(self.exec.run(launch_session(provider, params, phase)));
+        true
+    }
+
+    /// Stops waiting on a launch and goes back to the preview. The step used
+    /// to have no Cancel and no Back until an error arrived, so a reachability
+    /// check that never passed left quitting the app as the only way out
+    /// (#177).
+    ///
+    /// The work itself cannot be interrupted: it is a future on the executor
+    /// and it may still bring a machine up. So this drops the result rather
+    /// than pretending to cancel, and the preview step says a machine may be
+    /// running and how to remove it.
+    pub fn abandon_launch(&mut self) -> bool {
+        if self.step != WizardStep::Launching || self.launch_error.is_some() {
+            return false;
+        }
+        self.launch_job = None;
+        self.launch_abandoned = true;
+        self.step = WizardStep::Preview;
         true
     }
 
@@ -720,12 +748,15 @@ impl HostWizard {
     /// armed with the record directory, because a local take goes through the
     /// spawned server's own flags rather than the boot config, exactly as
     /// `jamstream host --record --provider local` arms it.
+    ///
+    /// A cloud provider is built with the session port, which is the one port
+    /// it opens in the firewall it creates for the session.
     fn launch_provider(&self, name: &str) -> Result<Box<dyn Provider>, String> {
         if name == "local" && self.recording.is_on() {
             return jamstream_cli::providers::resolve_local_recording(self.recording.stems())
                 .map_err(|e| e.to_string());
         }
-        creds::build_provider(name, self.creds.as_ref(), &self.env)
+        creds::build_provider_for_port(name, SESSION_PORT, self.creds.as_ref(), &self.env)
     }
 
     /// The bucket config a cloud launch carries, or None when this session
@@ -1145,18 +1176,15 @@ async fn wait_for_ip(
 
 /// Proves the server is actually serving: a genuine ClientCore handshake
 /// with the host invite over UDP, driven until Joined, exactly like the
-/// CLI's reachability check.
+/// CLI's reachability check, including its address rotation.
+///
+/// Every address in the invite gets a turn, so this reports what a joining
+/// musician will actually experience rather than what the first entry alone
+/// would. A host whose invite lists a LAN address first used to get a false
+/// "not reachable" on a session the CLI would have connected to (#227).
 async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), String> {
-    let bind: SocketAddr = if invite.addresses[0].is_ipv4() {
-        "0.0.0.0:0".parse().expect("static addr")
-    } else {
-        "[::]:0".parse().expect("static addr")
-    };
-    let socket = tokio::net::UdpSocket::bind(bind)
-        .await
-        .map_err(|e| e.to_string())?;
-    socket
-        .connect(invite.addresses[0])
+    let mut candidates = ServerCandidates::new(invite).map_err(|e| e.to_string())?;
+    let mut socket = jamstream_cli::host::connected_socket(candidates.current())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1195,7 +1223,15 @@ async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), String> 
             }
             // The core gives up after its own 10 s window; keep trying
             // fresh handshakes until our cap, the VM may still be booting.
+            // Each retry moves to the next address the invite offers and comes
+            // back round, so a slow boot and a filtered interface both get
+            // answered by the time the cap runs out.
             ClientState::TimedOut => {
+                if candidates.has_alternatives() {
+                    socket = jamstream_cli::host::connected_socket(candidates.advance())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
                 let init = core.reconnect(now()).map_err(|e| e.to_string())?;
                 socket.send(&init).await.map_err(|e| e.to_string())?;
             }
@@ -1203,8 +1239,14 @@ async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), String> 
         }
     }
     Err(format!(
-        "server did not complete a handshake within {} s",
-        cap.as_secs()
+        "server did not complete a handshake within {} s on {}",
+        cap.as_secs(),
+        invite
+            .addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
@@ -1282,27 +1324,47 @@ pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-// Rendering. One focused card per step: the step counter and title live
-// inside the card, back and continue at the bottom. Numbers are monospace
-// throughout.
+// Rendering. One focused card per step: the step counter and title at the top,
+// the step's own body between them and the actions, and the actions on the
+// card's bottom edge. Numbers are monospace throughout.
+
+/// The card's width; every step's content is laid out against it.
+const CARD_W: f32 = 620.0;
+
+/// What the actions row and the gap above it need. The body is bounded by
+/// what is left, so the row keeps the card's bottom edge rather than
+/// scrolling off it.
+const ACTIONS_H: f32 = 34.0;
+
+/// The body never shrinks past this, whatever the window does; below that it
+/// is the card that scrolls.
+const MIN_BODY_H: f32 = 120.0;
+
+/// What the card keeps below its body: the panel's own bottom margin and its
+/// hairline.
+const CARD_BOTTOM_H: f32 = 17.0;
 
 impl HostWizard {
     pub fn ui(&mut self, ui: &mut Ui) -> Option<WizardEvent> {
         let event = self.poll();
-        // The card is taller than a short window: at 800x600, the app's
-        // smallest, the setup pane and the cost preview both run past the
-        // bottom edge, and Back and Continue live down there.
+        // Measured here and handed down, because inside the scroll area below
+        // it a Ui can no longer say how much window there is.
+        let room = ui.available_height();
+        // A card taller than the window scrolls inside itself, so this outer
+        // one only ever moves in a window too short for even the floor the
+        // body keeps.
         egui::ScrollArea::vertical()
             .id_salt("wizard-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.card_ui(ui);
+                self.card_ui(ui, room);
             });
         event
     }
 
-    fn card_ui(&mut self, ui: &mut Ui) {
-        theme::focused_column(ui, 620.0, |ui| {
+    fn card_ui(&mut self, ui: &mut Ui, room: f32) {
+        theme::focused_column(ui, CARD_W, room, |ui, room| {
+            let card_top = ui.cursor().top();
             theme::panel(ui)
                 .inner_margin(egui::Margin::same(16))
                 .show(ui, |ui| {
@@ -1334,13 +1396,123 @@ impl HostWizard {
                     let title_font = egui::FontId::new(16.0, theme::semibold(ui));
                     ui.label(RichText::new(title).font(title_font));
                     ui.add_space(theme::SPACE_LG);
-                    match self.step {
-                        WizardStep::Provider => self.provider_ui(ui),
-                        WizardStep::Region => self.region_ui(ui),
-                        WizardStep::Preview => self.preview_ui(ui),
-                        WizardStep::Launching => self.launching_ui(ui),
-                    }
+                    // The body scrolls and the actions do not. At 800x600 the
+                    // preview step is taller than the window, and Back and
+                    // Launch used to sit past the bottom edge with a 6 px
+                    // scrollbar as the only cue that they were there (#179).
+                    // Each step keeps its own offset, so a step opens at its
+                    // own top.
+                    let header_h = ui.cursor().top() - card_top;
+                    let room_for_body =
+                        (room - header_h - ACTIONS_H - CARD_BOTTOM_H).max(MIN_BODY_H);
+                    // What the step's own content wants, from the last frame.
+                    // A scroll area inside this card cannot be left to size
+                    // itself: everything here is inside the outer scroll area,
+                    // where a Ui's available height is zero and anything that
+                    // sizes to it collapses. So the box is allocated exactly,
+                    // and the content's own height is what decides whether a
+                    // short step still gets a short card.
+                    let natural_key = ui.id().with(("wizard-body-natural", num));
+                    let natural: f32 = ui
+                        .ctx()
+                        .data(|d| d.get_temp(natural_key))
+                        .unwrap_or(f32::INFINITY);
+                    let body_h = room_for_body.min(natural.max(MIN_BODY_H));
+                    let body = ui.allocate_ui(vec2(ui.available_width(), body_h), |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("wizard-body", num))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                match self.step {
+                                    WizardStep::Provider => self.provider_ui(ui),
+                                    WizardStep::Region => self.region_ui(ui),
+                                    WizardStep::Preview => self.preview_ui(ui),
+                                    WizardStep::Launching => self.launching_ui(ui),
+                                }
+                            })
+                            .content_size
+                            .y
+                    });
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(natural_key, body.inner));
+                    ui.add_space(theme::SPACE_SM);
+                    self.actions_ui(ui);
                 });
+        });
+    }
+
+    /// The step's actions, on the card's bottom edge whatever the body above
+    /// them is doing. Every step has a way on and, past the first, a way back;
+    /// the launch has a way to stop waiting, which is the one that used to be
+    /// missing (#177).
+    fn actions_ui(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| match self.step {
+            WizardStep::Provider => {
+                let can_continue = self.provider_ready();
+                if ui
+                    .add_enabled(can_continue, egui::Button::new("Continue"))
+                    .clicked()
+                {
+                    self.advance_from_provider();
+                }
+                if !can_continue && self.selected_provider.is_some() {
+                    ui.label(theme::muted(
+                        ui,
+                        "Add credentials above, or pick local to host without an account.",
+                    ));
+                }
+            }
+            WizardStep::Region => {
+                // Nothing to go back from while the probe job runs; once it
+                // lands, rows or an error, Back is live again.
+                if ui
+                    .add_enabled(self.regions_job.is_none(), egui::Button::new("Back"))
+                    .clicked()
+                {
+                    self.back();
+                }
+                let can_continue = self.selected_region.is_some();
+                if ui
+                    .add_enabled(can_continue, egui::Button::new("Continue"))
+                    .clicked()
+                {
+                    self.continue_to_preview();
+                }
+            }
+            WizardStep::Preview => {
+                if ui.button("Back").clicked() {
+                    self.back();
+                }
+                let label = if self.is_local() {
+                    "Start the session"
+                } else {
+                    "Launch"
+                };
+                if ui
+                    .add_enabled(self.can_launch(), egui::Button::new(label))
+                    .clicked()
+                {
+                    self.begin_launch();
+                }
+            }
+            WizardStep::Launching => {
+                if self.launch_error.is_some() {
+                    if ui.button("Back").clicked() {
+                        self.back();
+                    }
+                } else if ui
+                    .button("Stop waiting")
+                    .on_hover_text(if self.is_local() {
+                        "goes back to the preview; the server process may already be up"
+                    } else {
+                        "goes back to the preview; the machine may already be up"
+                    })
+                    .clicked()
+                {
+                    self.abandon_launch();
+                }
+            }
         });
     }
 
@@ -1374,22 +1546,6 @@ impl HostWizard {
             ui.add_space(theme::SPACE_MD);
             self.setup_ui(ui);
         }
-        ui.add_space(theme::SPACE_LG);
-        ui.horizontal(|ui| {
-            let can_continue = self.provider_ready();
-            if ui
-                .add_enabled(can_continue, egui::Button::new("Continue"))
-                .clicked()
-            {
-                self.advance_from_provider();
-            }
-            if !can_continue && self.selected_provider.is_some() {
-                ui.label(theme::muted(
-                    ui,
-                    "Add credentials above, or pick local to host without an account.",
-                ));
-            }
-        });
     }
 
     /// Inline credential setup for the selected cloud. Guidance matches
@@ -1557,10 +1713,6 @@ impl HostWizard {
         if let Some(err) = self.regions_error.clone() {
             let p = theme::palette_of(ui);
             ui.label(RichText::new(err).color(p.danger));
-            ui.add_space(theme::SPACE_LG);
-            if ui.button("Back").clicked() {
-                self.back();
-            }
             return;
         }
         // The solver sorts by coverage, then worst round trip bucketed to
@@ -1649,19 +1801,6 @@ impl HostWizard {
                 self.select_region(i);
             }
         }
-        ui.add_space(theme::SPACE_LG);
-        ui.horizontal(|ui| {
-            if ui.button("Back").clicked() {
-                self.back();
-            }
-            let can_continue = self.selected_region.is_some();
-            if ui
-                .add_enabled(can_continue, egui::Button::new("Continue"))
-                .clicked()
-            {
-                self.continue_to_preview();
-            }
-        });
     }
 
     fn preview_ui(&mut self, ui: &mut Ui) {
@@ -1822,23 +1961,19 @@ impl HostWizard {
                 }
             }
         }
-        ui.add_space(theme::SPACE_SM);
-        ui.horizontal(|ui| {
-            if ui.button("Back").clicked() {
-                self.back();
-            }
-            let label = if self.is_local() {
-                "Start the session"
-            } else {
-                "Launch"
-            };
-            if ui
-                .add_enabled(self.can_launch(), egui::Button::new(label))
-                .clicked()
-            {
-                self.begin_launch();
-            }
-        });
+        if self.launch_abandoned {
+            ui.add_space(theme::SPACE_SM);
+            ui.add(egui::Label::new(theme::muted(
+                ui,
+                if self.is_local() {
+                    "You stopped waiting for the last start. If the server process came up, \
+                     jamstream sweep finds and removes it."
+                } else {
+                    "You stopped waiting for the last launch. If a machine came up, \
+                     jamstream sweep finds and removes it."
+                },
+            )));
+        }
     }
 
     /// The recording choice for this launch: off, the mix, or the mix and
@@ -2370,6 +2505,42 @@ mod tests {
         assert_eq!(w.step, WizardStep::Preview);
         assert!(w.back());
         assert_eq!(w.step, WizardStep::Provider);
+    }
+
+    /// #177: the launching step had no way out until an error arrived, and a
+    /// reachability check that never passes produces no error for 60 seconds.
+    /// Stopping the wait goes back to the preview and says what may be
+    /// running, and the job that cannot be interrupted is dropped rather than
+    /// left to drag the wizard back into the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_a_wait_returns_to_the_preview_and_says_what_may_be_running() {
+        let mut w = wizard();
+        w.select_provider(0); // local, which needs no artifact
+        assert!(w.advance_from_provider());
+        assert_eq!(w.step, WizardStep::Preview);
+        // A launch that never lands, which is the state the issue is about.
+        let outcome: Job<Result<LaunchOutcome, String>> = w.exec.run(async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Err("never".to_owned())
+        });
+        w.launch_job = Some(outcome);
+        w.step = WizardStep::Launching;
+        assert!(!w.back(), "no error yet, so Back is not the way out");
+
+        assert!(w.abandon_launch());
+        assert_eq!(w.step, WizardStep::Preview);
+        assert!(
+            w.launch_abandoned,
+            "the preview has to say a machine may be up"
+        );
+        assert!(!w.busy(), "the abandoned job is no longer waited on");
+        assert!(
+            w.poll().is_none(),
+            "and cannot pull the wizard into a session"
+        );
+        // Launching again clears the note and is not refused by the old job.
+        assert!(w.begin_launch());
+        assert!(!w.launch_abandoned);
     }
 
     #[tokio::test]

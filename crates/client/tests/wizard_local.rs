@@ -395,13 +395,22 @@ async fn wizard_hosts_a_real_local_session() {
     });
     let instance_pid = panel.state.instance_id.clone();
     let provider = jamstream_cli::providers::resolve("local").expect("local provider");
-    invites::end_session(provider, panel.state.clone(), panel.path.clone())
+    invites::end_session(provider.as_ref(), panel.state.clone(), panel.path.clone())
         .await
         .expect("end session");
 
     let ended = jamstream_cli::state::load(&outcome.state_path).expect("state reloads");
     assert_eq!(ended.status, jamstream_cli::state::SessionStatus::Ended);
     assert!(ended.ended_unix.is_some());
+    // #195, asserted on the file rather than on the status word: the server
+    // this key authenticated against is gone, so the key that signs the
+    // session's invites has no reason to still be in the state directory.
+    // Ending from the terminal has always taken it; ending from the app did
+    // not, and the test on this side only ever read the status.
+    assert!(
+        ended.issuer_private_key_b64.is_empty(),
+        "the issuer private key is still on disk after ending from the app"
+    );
     assert!(
         take.is_file(),
         "ending the session must never take the recording with it"

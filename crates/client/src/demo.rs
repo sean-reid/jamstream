@@ -111,6 +111,10 @@ struct DemoState {
     extra_chat: Vec<ChatLine>,
     metronome: MetronomeView,
     revoked: Vec<u16>,
+    /// Members the roster no longer counts as present. Nothing else in the
+    /// demo produces one, so the strip's disconnected note and its presence
+    /// dot had no fixture at all.
+    away: Vec<u16>,
     left: bool,
     audition: bool,
     destinations: Vec<Destination>,
@@ -263,6 +267,7 @@ impl DemoRuntime {
                     you_hear_click: true,
                 },
                 revoked: Vec::new(),
+                away: Vec::new(),
                 left: false,
                 audition: false,
                 destinations: Vec::new(),
@@ -293,6 +298,16 @@ impl DemoRuntime {
                 },
             })
             .collect();
+    }
+
+    /// Marks one member as no longer connected, the way the roster does when
+    /// somebody's client goes quiet without leaving.
+    pub fn set_away(&self, member: u16, away: bool) {
+        let mut s = self.state.lock().expect("demo state");
+        s.away.retain(|id| *id != member);
+        if away {
+            s.away.push(member);
+        }
     }
 
     /// Pins the recorder's reported state, the way [`Self::set_destinations`]
@@ -377,7 +392,7 @@ impl Runtime for DemoRuntime {
                 id: MemberId(m.id),
                 name: m.name.to_owned(),
                 role: m.role,
-                connected: true,
+                connected: !s.away.contains(&m.id),
                 is_you: m.id == 0,
                 fader: m.fader,
                 token: self.is_host.then_some(TokenId([m.id as u8; 16])),

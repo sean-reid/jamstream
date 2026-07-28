@@ -76,6 +76,10 @@ pub fn state_lamp_width(ui: &mut Ui, label: &str) -> f32 {
 /// One lit state in the status bar's centre cluster: a bigger lamp and its
 /// label, both in `color`. Only ever drawn for a state that is actually on,
 /// so there is no unlit form and an idle bar shows no cluster at all.
+///
+/// The circle carries the palette colour and the label carries the step of it
+/// that reads as text on the bar: ON AIR set in the light accent measured
+/// 3.77:1 against the bar and looked switched off.
 pub fn state_lamp(ui: &mut Ui, label: &str, color: Color32) -> Response {
     let font = state_font(ui);
     let width = state_lamp_width(ui, label);
@@ -98,7 +102,7 @@ pub fn state_lamp(ui: &mut Ui, label: &str, color: Color32) -> Response {
         egui::Align2::LEFT_CENTER,
         label,
         font,
-        color,
+        theme::readable(color, p.surface0, p),
     );
     response
 }
