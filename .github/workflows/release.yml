@@ -13,14 +13,19 @@
 #   - Linux: plain tarballs; AppImage/deb/rpm are named placeholders.
 #
 # Server artifact pinning: server-musl runs FIRST, uploads the static
-# jamstreamd, and exports its tag-pinned download URL and sha256 as job
-# outputs. Every client/CLI build below compiles with those in the
-# environment (JAMSTREAM_SERVER_URL / JAMSTREAM_SERVER_SHA256, read by
-# option_env! in jamstream-cloud), so release binaries carry their own
-# server download baked in and cloud hosting needs no artifact flags.
-# The bare binary asset exists exactly for this: cloud-init curls the URL
-# straight to /usr/local/bin and sha256sums the file, no tar step on the
-# VM. The tarball stays for humans and the install script.
+# jamstreamd for BOTH architectures, and exports the tag-pinned download
+# URLs and sha256s as job outputs. Two architectures because the providers
+# disagree on a CPU: AWS launches Graviton (arm64) instances while GCP and
+# DigitalOcean launch x86_64, and a launch selects the pin matching its
+# provider (#139 was every AWS launch downloading the x86_64 binary).
+# Every client/CLI build below compiles with all four values in the
+# environment (JAMSTREAM_SERVER_URL_X86_64 / JAMSTREAM_SERVER_SHA256_X86_64
+# and the _AARCH64 pair, read by option_env! in jamstream-cloud), so
+# release binaries carry their own server downloads baked in and cloud
+# hosting needs no artifact flags. The bare binary assets exist exactly
+# for this: cloud-init curls the URL straight to /usr/local/bin and
+# sha256sums the file, no tar step on the VM. The tarballs stay for
+# humans and the install script.
 #
 # Desktop bundling: each app artifact ships a platform-native jamstreamd
 # beside the app binary (inside JamStream.app/Contents/MacOS on macOS, in
@@ -38,9 +43,14 @@
 #   jamstream-app-linux-x86_64.tar.gz    app (gnu; bundles jamstreamd)
 #   jamstreamd-linux-x86_64-musl         static session server, bare
 #                                        binary; what pinned clients tell
-#                                        cloud VMs to download at boot
+#                                        x86_64 cloud VMs (GCP,
+#                                        DigitalOcean) to download at boot
 #   jamstreamd-linux-x86_64-musl.tar.gz  the same server, tarred for
 #                                        humans and the install script
+#   jamstreamd-linux-aarch64-musl        the arm64 build of the same
+#                                        server, for the machines AWS
+#                                        launches (Graviton)
+#   jamstreamd-linux-aarch64-musl.tar.gz the arm64 server, tarred
 #   SHA256SUMS                           checksums of all of the above
 #   jamstream-packaging.tar.gz           the rendered Homebrew, winget, and
 #                                        AUR manifests for this release,
@@ -72,15 +82,17 @@ env:
   TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
-  # Static musl server: the artifact session VMs download at boot. Runs
-  # first because its URL and sha256 are compiled into every client and
-  # CLI build below.
+  # Static musl servers, one per architecture the providers launch: the
+  # artifacts session VMs download at boot. Runs first because the URLs
+  # and sha256s are compiled into every client and CLI build below.
   server-musl:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
-      server_url: ${{ steps.pin.outputs.url }}
-      server_sha256: ${{ steps.pin.outputs.sha256 }}
+      server_url_x86_64: ${{ steps.pin.outputs.url_x86_64 }}
+      server_sha256_x86_64: ${{ steps.pin.outputs.sha256_x86_64 }}
+      server_url_aarch64: ${{ steps.pin.outputs.url_aarch64 }}
+      server_sha256_aarch64: ${{ steps.pin.outputs.sha256_aarch64 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -96,9 +108,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-          targets: x86_64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # musl-tools carries the native musl-gcc; gcc-aarch64-linux-gnu is the
+      # cross linker and C compiler for the arm64 build, where rustc's
+      # self-contained musl libc does the rest.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
       # Fetch, then compile with the network off. Two things this buys over a
       # bare `cargo build`: --locked means the graph cargo-deny audited is the
       # graph that ships (no silent version bump, no lockfile fix-up), and
@@ -107,35 +122,55 @@ jobs:
       # back. `cargo fetch` with no --target covers every architecture.
       - run: cargo fetch --locked
       - run: cargo build --locked --offline -p jamstream-server --release --target x86_64-unknown-linux-musl
-      - name: Verify the binary is fully static
+      # The gnu-targeted cross gcc compiles the vendored C (opus, mimalloc)
+      # against glibc headers, whose fortify layer emits *_chk symbols musl
+      # does not have, so fortify is off for this target; the x86_64 build
+      # gets no fortify either, musl-gcc's headers simply never engage it.
+      - run: cargo build --locked --offline -p jamstream-server --release --target aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CFLAGS_aarch64_unknown_linux_musl: -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+      # Each binary must be fully static AND actually built for the
+      # architecture its asset name claims; #139 was a machine downloading
+      # a binary of the wrong architecture.
+      - name: Verify both binaries are fully static and the right arch
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/jamstreamd
-          file "$BIN" | grep -q 'static'
-          # A truly static binary has no NEEDED shared-library entries.
-          # (ldd is useless here: it exits zero on static-pie binaries.)
-          if readelf -d "$BIN" | grep -q 'NEEDED'; then
-            echo "jamstreamd links shared libraries:" >&2
-            readelf -d "$BIN" | grep 'NEEDED' >&2
-            exit 1
-          fi
-      # Two shapes of the same binary: the BARE binary is what cloud-init
+          set -eu
+          for PAIR in "x86_64:x86-64" "aarch64:aarch64"; do
+            TARGET="${PAIR%%:*}"
+            ELF_ARCH="${PAIR#*:}"
+            BIN="target/$TARGET-unknown-linux-musl/release/jamstreamd"
+            file "$BIN" | grep -q 'static'
+            file "$BIN" | grep -q "$ELF_ARCH"
+            # A truly static binary has no NEEDED shared-library entries.
+            # (ldd is useless here: it exits zero on static-pie binaries.)
+            if readelf -d "$BIN" | grep -q 'NEEDED'; then
+              echo "jamstreamd ($TARGET) links shared libraries:" >&2
+              readelf -d "$BIN" | grep 'NEEDED' >&2
+              exit 1
+            fi
+          done
+      # Two shapes of each binary: the BARE binary is what cloud-init
       # downloads (curl to /usr/local/bin, sha256sum of the file itself, no
       # tar on the VM) and is the asset the clients pin; the tarball is for
-      # humans and the install script. The pinned URL names the release TAG,
+      # humans and the install script. The pinned URLs name the release TAG,
       # not "latest", so a client always launches the server it shipped with.
-      - name: Package, upload, and pin the server artifact
+      - name: Package, upload, and pin the server artifacts
         id: pin
         run: |
           set -eu
-          BIN=target/x86_64-unknown-linux-musl/release/jamstreamd
-          BARE="jamstreamd-linux-x86_64-musl"
-          ARCHIVE="jamstreamd-linux-x86_64-musl.tar.gz"
-          cp "$BIN" "$BARE"
-          tar -C target/x86_64-unknown-linux-musl/release -czf "$ARCHIVE" jamstreamd
-          gh release upload "$TAG" "$BARE" "$ARCHIVE" --clobber
-          SHA=$(sha256sum "$BARE" | cut -d' ' -f1)
-          echo "url=https://github.com/${{ github.repository }}/releases/download/$TAG/$BARE" >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          for ARCH in x86_64 aarch64; do
+            DIR="target/$ARCH-unknown-linux-musl/release"
+            BARE="jamstreamd-linux-$ARCH-musl"
+            ARCHIVE="$BARE.tar.gz"
+            cp "$DIR/jamstreamd" "$BARE"
+            tar -C "$DIR" -czf "$ARCHIVE" jamstreamd
+            gh release upload "$TAG" "$BARE" "$ARCHIVE" --clobber
+            SHA=$(sha256sum "$BARE" | cut -d' ' -f1)
+            echo "url_$ARCH=https://github.com/${{ github.repository }}/releases/download/$TAG/$BARE" >> "$GITHUB_OUTPUT"
+            echo "sha256_$ARCH=$SHA" >> "$GITHUB_OUTPUT"
+          done
       # Placeholder: artifact signing (signature published beside the
       # tarball; cloud-init verifies it before boot) lands with the
       # signing milestone.
@@ -152,8 +187,10 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     env:
-      JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
-      JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
+      JAMSTREAM_SERVER_URL_X86_64: ${{ needs.server-musl.outputs.server_url_x86_64 }}
+      JAMSTREAM_SERVER_SHA256_X86_64: ${{ needs.server-musl.outputs.server_sha256_x86_64 }}
+      JAMSTREAM_SERVER_URL_AARCH64: ${{ needs.server-musl.outputs.server_url_aarch64 }}
+      JAMSTREAM_SERVER_SHA256_AARCH64: ${{ needs.server-musl.outputs.server_sha256_aarch64 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -168,11 +205,13 @@ jobs:
           toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - name: Verify the pinned server artifact reached this job
+      - name: Verify the pinned server artifacts reached this job
         run: |
           set -eu
-          printf '%s\n' "$JAMSTREAM_SERVER_URL" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
-          printf '%s\n' "$JAMSTREAM_SERVER_SHA256" | grep -qE '^[0-9a-f]{64}$'
+          printf '%s\n' "$JAMSTREAM_SERVER_URL_X86_64" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256_X86_64" | grep -qE '^[0-9a-f]{64}$'
+          printf '%s\n' "$JAMSTREAM_SERVER_URL_AARCH64" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-aarch64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256_AARCH64" | grep -qE '^[0-9a-f]{64}$'
       # See the server-musl job for why release builds fetch first and then
       # compile offline.
       - run: cargo fetch --locked
@@ -373,8 +412,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     env:
-      JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
-      JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
+      JAMSTREAM_SERVER_URL_X86_64: ${{ needs.server-musl.outputs.server_url_x86_64 }}
+      JAMSTREAM_SERVER_SHA256_X86_64: ${{ needs.server-musl.outputs.server_sha256_x86_64 }}
+      JAMSTREAM_SERVER_URL_AARCH64: ${{ needs.server-musl.outputs.server_url_aarch64 }}
+      JAMSTREAM_SERVER_SHA256_AARCH64: ${{ needs.server-musl.outputs.server_sha256_aarch64 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -388,12 +429,14 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - name: Verify the pinned server artifact reached this job
+      - name: Verify the pinned server artifacts reached this job
         shell: bash
         run: |
           set -eu
-          printf '%s\n' "$JAMSTREAM_SERVER_URL" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
-          printf '%s\n' "$JAMSTREAM_SERVER_SHA256" | grep -qE '^[0-9a-f]{64}$'
+          printf '%s\n' "$JAMSTREAM_SERVER_URL_X86_64" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256_X86_64" | grep -qE '^[0-9a-f]{64}$'
+          printf '%s\n' "$JAMSTREAM_SERVER_URL_AARCH64" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-aarch64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256_AARCH64" | grep -qE '^[0-9a-f]{64}$'
       # See the server-musl job for why release builds fetch first and then
       # compile offline.
       - run: cargo fetch --locked
@@ -426,8 +469,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      JAMSTREAM_SERVER_URL: ${{ needs.server-musl.outputs.server_url }}
-      JAMSTREAM_SERVER_SHA256: ${{ needs.server-musl.outputs.server_sha256 }}
+      JAMSTREAM_SERVER_URL_X86_64: ${{ needs.server-musl.outputs.server_url_x86_64 }}
+      JAMSTREAM_SERVER_SHA256_X86_64: ${{ needs.server-musl.outputs.server_sha256_x86_64 }}
+      JAMSTREAM_SERVER_URL_AARCH64: ${{ needs.server-musl.outputs.server_url_aarch64 }}
+      JAMSTREAM_SERVER_SHA256_AARCH64: ${{ needs.server-musl.outputs.server_sha256_aarch64 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -441,11 +486,13 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - name: Verify the pinned server artifact reached this job
+      - name: Verify the pinned server artifacts reached this job
         run: |
           set -eu
-          printf '%s\n' "$JAMSTREAM_SERVER_URL" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
-          printf '%s\n' "$JAMSTREAM_SERVER_SHA256" | grep -qE '^[0-9a-f]{64}$'
+          printf '%s\n' "$JAMSTREAM_SERVER_URL_X86_64" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-x86_64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256_X86_64" | grep -qE '^[0-9a-f]{64}$'
+          printf '%s\n' "$JAMSTREAM_SERVER_URL_AARCH64" | grep -q "^https://github.com/.*/$TAG/jamstreamd-linux-aarch64-musl$"
+          printf '%s\n' "$JAMSTREAM_SERVER_SHA256_AARCH64" | grep -qE '^[0-9a-f]{64}$'
       # Same desktop build deps ci.yml uses (alsa, wayland/xkb for eframe,
       # pipewire + dbus).
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev

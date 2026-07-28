@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::artifact::ServerArch;
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
     ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Price,
@@ -207,6 +208,15 @@ impl MockProvider {
 impl Provider for MockProvider {
     fn kind(&self) -> ProviderKind {
         self.kind
+    }
+
+    /// Mirrors the real provider of this kind, so artifact selection under
+    /// test picks what a real launch would.
+    fn server_arch(&self) -> ServerArch {
+        match self.kind {
+            ProviderKind::Aws => ServerArch::Aarch64,
+            _ => ServerArch::X86_64,
+        }
     }
 
     fn regions(&self) -> Vec<Region> {

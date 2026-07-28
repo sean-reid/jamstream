@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::OnceCell;
 
+use crate::artifact::ServerArch;
 use crate::http::{client, error_body, send_retrying};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
@@ -595,6 +596,11 @@ impl Provider for DigitalOceanProvider {
         ProviderKind::DigitalOcean
     }
 
+    /// The s-2vcpu droplet slugs are x86_64 machines.
+    fn server_arch(&self) -> ServerArch {
+        ServerArch::X86_64
+    }
+
     fn regions(&self) -> Vec<Region> {
         CATALOG
             .iter()
@@ -787,6 +793,14 @@ mod tests {
     fn size_slugs() {
         assert_eq!(size_slug(InstanceClass::Small), "s-1vcpu-2gb");
         assert_eq!(size_slug(InstanceClass::Standard), "s-2vcpu-2gb");
+    }
+
+    /// The shared s- droplet slugs are x86_64 machines, so this provider
+    /// must select the x86_64 artifact.
+    #[test]
+    fn launches_x86_64_machines_and_says_so() {
+        let p = DigitalOceanProvider::new("t".into());
+        assert_eq!(p.server_arch(), ServerArch::X86_64);
     }
 
     #[test]
