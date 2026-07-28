@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.3](https://github.com/sean-reid/jamstream/compare/v0.1.2...v0.1.3) (2026-07-28)
+
+
+### Bug Fixes
+
+* **ci:** freshen armed pull requests by commit count, not BEHIND ([#136](https://github.com/sean-reid/jamstream/issues/136)) ([fd74f8a](https://github.com/sean-reid/jamstream/commit/fd74f8af1ce4cef194cbddb223bfae4885354b62))
+* **cli:** a loopback session must not claim a LAN address ([#135](https://github.com/sean-reid/jamstream/issues/135)) ([eb307f8](https://github.com/sean-reid/jamstream/commit/eb307f8bb773f991a7920b26ac28f422ecae947d))
+* **client:** settings becomes a drawer that fits the window ([#131](https://github.com/sean-reid/jamstream/issues/131)) ([b8b735a](https://github.com/sean-reid/jamstream/commit/b8b735a2a410ff3c1b1d517ce29593ca179c6c17))
+* **client:** stop the test binaries reading the real keychain ([#119](https://github.com/sean-reid/jamstream/issues/119)) ([f3cd9b0](https://github.com/sean-reid/jamstream/commit/f3cd9b0c6abc350092ec3d9a3a5bb83e91cf1c32))
+* **cli:** let a local session bind an address from the environment ([#134](https://github.com/sean-reid/jamstream/issues/134)) ([040efc0](https://github.com/sean-reid/jamstream/commit/040efc02be8b955e6777bc697b9c36178f66b11f))
+* **cloud:** a region fact that is absent is neither zero nor fatal ([#120](https://github.com/sean-reid/jamstream/issues/120)) ([c907238](https://github.com/sean-reid/jamstream/commit/c907238debedf29ebd8a87c51dba30022173e13e))
+* **cloud:** grant the security group permissions AWS launches need ([#118](https://github.com/sean-reid/jamstream/issues/118)) ([9f59e6c](https://github.com/sean-reid/jamstream/commit/9f59e6c81cad8573cf4f539fa5352914c0e8f013)), closes [#114](https://github.com/sean-reid/jamstream/issues/114)
+* **cloud:** hold the closed port instead of hoping nobody takes it ([#109](https://github.com/sean-reid/jamstream/issues/109)) ([aa44ace](https://github.com/sean-reid/jamstream/commit/aa44acecbd4a1c1314f851e97d00881a3e8f1bba))
+* **cloud:** make the local dead man's switch fail closed ([#130](https://github.com/sean-reid/jamstream/issues/130)) ([4a71166](https://github.com/sean-reid/jamstream/commit/4a7116645661e211ab8f654523e5b14747d8fcf4))
+* **cloud:** offer loopback alongside the LAN address in local invites ([#132](https://github.com/sean-reid/jamstream/issues/132)) ([afba727](https://github.com/sean-reid/jamstream/commit/afba7273d20fee6e3e59317b0f496749dc05b0ef))
+* **server:** let jamstreamd be told which address to listen on ([#128](https://github.com/sean-reid/jamstream/issues/128)) ([da6b92a](https://github.com/sean-reid/jamstream/commit/da6b92a32c0aba4e5eee856cc7731fd6d8ff6b08))
+
 ## [0.1.2](https://github.com/sean-reid/jamstream/compare/v0.1.1...v0.1.2) (2026-07-28)
 
 
