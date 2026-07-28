@@ -42,7 +42,10 @@ pub mod sweeper;
 pub mod types;
 
 pub use artifact::{PinnedServerArtifact, pinned, validate_pair};
-pub use cloudinit::{BootConfig, MediaArtifact, MediaArtifacts, MediaTool, SelfDestruct};
+pub use cloudinit::{
+    BootConfig, MediaArtifact, MediaArtifacts, MediaTool, RecordingStorage, SelfDestruct,
+    StorageCredential,
+};
 pub use contract::assert_provider_contract;
 pub use cost::{CostPreview, LineItem};
 pub use mock::MockProvider;
@@ -53,9 +56,9 @@ pub use regions::{RegionTable, priced_regions};
 pub use retention::{Retention, RetentionEnforcement};
 pub use solver::{MemberId, ProbeMatrix, RegionScore, rank};
 pub use storage::{
-    BytesSource, GcsStore, JSON_CONTENT_TYPE, MockStore, ObjectMeta, ObjectStore, PartSource,
-    ReadSource, S3Store, WAV_CONTENT_TYPE, assert_object_store_contract, manifest_key, mix_key,
-    session_prefix, stem_key,
+    BytesSource, FLAC_CONTENT_TYPE, GcsStore, JSON_CONTENT_TYPE, MockStore, ObjectMeta, ObjectSink,
+    ObjectStore, PartSource, ReadSource, S3Store, WAV_CONTENT_TYPE, assert_object_store_contract,
+    manifest_key, mix_key, session_prefix, stem_key,
 };
 pub use sweeper::{SweepFilter, SweepReport, sweep};
 pub use types::{

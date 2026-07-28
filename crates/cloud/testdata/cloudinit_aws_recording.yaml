@@ -393,5 +393,15 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
+  - path: /etc/jamstream/recording
+    owner: root:root
+    permissions: "0600"
+    content: |
+      provider = aws
+      bucket = my-jams
+      region = us-east-1
+      retention = 30d
+      access_key_id = AKIDRECORD
+      secret_access_key_b64 = cmVjb3JkLXNlY3JldA==
 runcmd:
   - [/usr/local/sbin/jamstream-bootstrap]

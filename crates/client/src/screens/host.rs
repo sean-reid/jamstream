@@ -798,6 +798,8 @@ async fn launch_session(
         idle_shutdown_min: params.idle_min,
         max_duration_min: params.max_hours * 60,
         self_destruct: self_destruct_for(provider.kind(), params.do_token)?,
+        // Recording is off until the host configures a storage key.
+        recording: None,
     };
     let user_data = if is_local {
         boot.render_flat_config()

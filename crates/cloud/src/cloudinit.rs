@@ -6,7 +6,11 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::sync::OnceLock;
 
+use data_encoding::BASE64;
 use serde::Deserialize;
+
+use crate::retention::Retention;
+use crate::types::ProviderKind;
 
 /// Pinned, checksummed static builds of the broadcast subprocesses. See
 /// data/media_artifacts.json for the licensing and refresh notes.
@@ -18,6 +22,22 @@ const SERVICE_USER: &str = "jamstream";
 /// tmpfs working directory: the activity file the guard reads, the staged
 /// stream keys, and the guard's own uptime bookkeeping.
 const RUN_DIR: &str = "/run/jamstream";
+
+/// Upload-in-flight markers. The recorder drops one file here per object it
+/// is uploading and the guard defers self-destruct while any remain.
+pub const UPLOAD_MARKER_DIR: &str = "/run/jamstream/uploads";
+
+/// Hard ceiling, in uptime seconds, on how long in-flight uploads may defer
+/// self-destruct. The upload streams during the session, so what remains at
+/// teardown is the tail plus the completion calls; ten minutes covers the
+/// retry budget, and past it the upload is abandoned, because a VM that
+/// never dies costs more than a lost recording.
+pub const UPLOAD_DEFER_CEILING_SECS: u32 = 600;
+
+/// Where cloud-init writes the recording storage config, when there is one.
+/// Same flat key=value format and the same root-then-chgrp handling as
+/// /etc/jamstream/config.
+pub const RECORDING_CONFIG_PATH: &str = "/etc/jamstream/recording";
 
 /// The jamstreamd download and the hash it must match, each in its own
 /// file so the bootstrap script takes them as data rather than as text
@@ -101,6 +121,85 @@ impl fmt::Debug for SelfDestruct {
     }
 }
 
+/// The credential the VM uploads recordings with. Scope it to write-only
+/// access on one bucket under [`crate::storage::RECORDING_PREFIX`]; it never
+/// appears on argv or in a script body, only in the root-owned config file.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StorageCredential {
+    /// SigV4 access key pair: AWS S3 and DigitalOcean Spaces.
+    KeyPair {
+        access_key_id: String,
+        secret_access_key: String,
+    },
+    /// GCS service account key JSON.
+    ServiceAccountJson(String),
+}
+
+/// Secrets stay out of Debug; the key id alone is worth seeing in a log.
+impl fmt::Debug for StorageCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageCredential::KeyPair { access_key_id, .. } => f
+                .debug_struct("KeyPair")
+                .field("access_key_id", access_key_id)
+                .field("secret_access_key", &"<redacted>")
+                .finish(),
+            StorageCredential::ServiceAccountJson(_) => {
+                f.write_str("ServiceAccountJson(<redacted>)")
+            }
+        }
+    }
+}
+
+/// The bucket a session records to, carried to the VM with the other launch
+/// parameters. Absent when the host has not turned recording on; local
+/// sessions record to disk and never carry one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingStorage {
+    pub provider: ProviderKind,
+    pub bucket: String,
+    /// The bucket's region: an AWS region, a Spaces slug, or a GCS location.
+    pub region: String,
+    pub retention: Retention,
+    pub credential: StorageCredential,
+}
+
+impl RecordingStorage {
+    /// The flat key=value file cloud-init writes to
+    /// [`RECORDING_CONFIG_PATH`]. Secrets travel base64, matching the key
+    /// convention in the server config.
+    pub fn render_flat_config(&self) -> String {
+        let mut out = format!(
+            "provider = {}\nbucket = {}\nregion = {}\nretention = {}\n",
+            self.provider.as_str(),
+            self.bucket,
+            self.region,
+            self.retention,
+        );
+        match &self.credential {
+            StorageCredential::KeyPair {
+                access_key_id,
+                secret_access_key,
+            } => {
+                let _ = writeln!(out, "access_key_id = {access_key_id}");
+                let _ = writeln!(
+                    out,
+                    "secret_access_key_b64 = {}",
+                    BASE64.encode(secret_access_key.as_bytes())
+                );
+            }
+            StorageCredential::ServiceAccountJson(json) => {
+                let _ = writeln!(
+                    out,
+                    "service_account_json_b64 = {}",
+                    BASE64.encode(json.as_bytes())
+                );
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct BootConfig {
     pub artifact_url: String,
@@ -112,6 +211,8 @@ pub struct BootConfig {
     pub idle_shutdown_min: u32,
     pub max_duration_min: u32,
     pub self_destruct: SelfDestruct,
+    /// Storage the VM records to; None means recording is off.
+    pub recording: Option<RecordingStorage>,
 }
 
 /// Redacts the server's private key. Everything else here is either
@@ -128,6 +229,7 @@ impl fmt::Debug for BootConfig {
             .field("idle_shutdown_min", &self.idle_shutdown_min)
             .field("max_duration_min", &self.max_duration_min)
             .field("self_destruct", &self.self_destruct)
+            .field("recording", &self.recording)
             .finish()
     }
 }
@@ -222,6 +324,24 @@ systemctl stop jamstreamd.service mediamtx.service 2>/dev/null || true
 }
 
 fn guard_script(cfg: &BootConfig) -> String {
+    guard_script_at(
+        cfg,
+        RUN_DIR,
+        UPLOAD_MARKER_DIR,
+        "/proc/uptime",
+        "/usr/local/sbin/jamstream-self-destruct",
+    )
+}
+
+/// [`guard_script`] with its paths as parameters, so the tests below can run
+/// the script for real against a scratch directory on any OS.
+fn guard_script_at(
+    cfg: &BootConfig,
+    state: &str,
+    uploads: &str,
+    uptime: &str,
+    self_destruct: &str,
+) -> String {
     format!(
         "#!/bin/sh
 # Dead man's switch. jamstreamd touches /run/jamstream/last-active while
@@ -233,8 +353,8 @@ fn guard_script(cfg: &BootConfig) -> String {
 # minute later; a wall-clock idle window reads that step as a dead session
 # and destroys a VM with musicians playing on it.
 set -eu
-up=$(cut -d. -f1 /proc/uptime)
-stamp=$(stat -c %Y /run/jamstream/last-active 2>/dev/null || echo none)
+up=$(cut -d. -f1 {uptime})
+stamp=$(stat -c %Y {state}/last-active 2>/dev/null || echo none)
 # The mtime is only ever compared for equality, so no clock step can fake
 # activity or hide it. What the idle window measures is the uptime at which
 # the mtime last changed.
@@ -244,16 +364,35 @@ if [ \"$stamp\" != \"$(cat {state}/guard-stamp 2>/dev/null || echo none)\" ]; th
 fi
 active_up=$(cat {state}/guard-active-up 2>/dev/null || echo 0)
 idle=$((up - active_up))
+reason=\"\"
 if [ \"$idle\" -ge {idle_secs} ]; then
-  exec /usr/local/sbin/jamstream-self-destruct \"idle for ${{idle}}s\"
+  reason=\"idle for ${{idle}}s\"
 fi
 if [ \"$up\" -ge {max_secs} ]; then
-  exec /usr/local/sbin/jamstream-self-destruct \"max session duration reached\"
+  reason=\"max session duration reached\"
 fi
+if [ -z \"$reason\" ]; then
+  rm -f {state}/guard-defer-up
+  exit 0
+fi
+# A recording upload in flight (a marker file under {uploads}) defers
+# destruction, but never past the ceiling: a stuck upload keeping a VM
+# alive forever is a worse failure than a lost recording.
+if [ -n \"$(ls -A {uploads} 2>/dev/null || true)\" ]; then
+  if [ ! -f {state}/guard-defer-up ]; then
+    printf '%s\\n' \"$up\" > {state}/guard-defer-up
+  fi
+  deferred=$((up - $(cat {state}/guard-defer-up)))
+  if [ \"$deferred\" -lt {ceiling_secs} ]; then
+    exit 0
+  fi
+  exec {self_destruct} \"$reason; upload still in flight after ${{deferred}}s, abandoning it to the lifecycle cleanup rule\"
+fi
+exec {self_destruct} \"$reason\"
 ",
-        state = RUN_DIR,
         idle_secs = cfg.idle_shutdown_min as u64 * 60,
         max_secs = cfg.max_duration_min as u64 * 60,
+        ceiling_secs = UPLOAD_DEFER_CEILING_SECS,
     )
 }
 
@@ -386,6 +525,13 @@ trap 'rc=$?; [ \"$rc\" -eq 0 ] || /usr/local/sbin/jamstream-self-destruct \"boot
 id {user} >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin {user}
 chgrp {user} /etc/jamstream/config
 chmod 0640 /etc/jamstream/config
+# The recording storage key, present only when the host turned recording
+# on. Same handling as the config: root writes it, the service account
+# reads it, nobody else sees it.
+if [ -f {recording_cfg} ]; then
+  chgrp {user} {recording_cfg}
+  chmod 0640 {recording_cfg}
+fi
 install -d -o {user} -g {user} -m 0750 {run}
 # jamstreamd updates this file's mtime while musicians are connected and the
 # guard reads it, so the server has to own it.
@@ -393,6 +539,9 @@ install -o {user} -g {user} -m 0644 /dev/null {run}/last-active
 # Stream keys are staged here for the instant it takes to spawn a pusher.
 # /run is tmpfs, so nothing reaches persistent disk.
 install -d -o {user} -g {user} -m 0700 {run}/keys
+# The recorder drops one marker file per in-flight upload; the guard defers
+# self-destruct while any remain.
+install -d -o {user} -g {user} -m 0700 {uploads}
 # A pusher's ffmpeg receives its ingest URL on stdin, but execs with it in
 # argv, so hide other processes' command lines from non-root. The VM has no
 # other users; this is the belt.
@@ -432,6 +581,8 @@ fi
         download = ARTIFACT_DOWNLOAD,
         user = SERVICE_USER,
         run = RUN_DIR,
+        uploads = UPLOAD_MARKER_DIR,
+        recording_cfg = RECORDING_CONFIG_PATH,
     )
 }
 
@@ -611,7 +762,7 @@ ExecStart=/usr/local/sbin/jamstream-self-destruct \"dead man's switch failed\"
 ";
 
 pub fn render(cfg: &BootConfig) -> String {
-    let files: Vec<(&str, &str, String)> = vec![
+    let mut files: Vec<(&str, &str, String)> = vec![
         // Written root-only; the bootstrap hands the group to the service
         // account once that account exists.
         ("/etc/jamstream/config", "0600", cfg.render_flat_config()),
@@ -674,6 +825,14 @@ pub fn render(cfg: &BootConfig) -> String {
             mediamtx_unit(),
         ),
     ];
+    if let Some(recording) = &cfg.recording {
+        // Root-only like the config; the bootstrap chgrps it.
+        files.push((
+            RECORDING_CONFIG_PATH,
+            "0600",
+            recording.render_flat_config(),
+        ));
+    }
 
     let mut out = String::from("#cloud-config\nwrite_files:\n");
     for (path, mode, content) in files {
@@ -703,6 +862,20 @@ mod tests {
             idle_shutdown_min: 10,
             max_duration_min: 720,
             self_destruct,
+            recording: None,
+        }
+    }
+
+    fn recording_storage() -> RecordingStorage {
+        RecordingStorage {
+            provider: ProviderKind::Aws,
+            bucket: "my-jams".to_owned(),
+            region: "us-east-1".to_owned(),
+            retention: Retention::default(),
+            credential: StorageCredential::KeyPair {
+                access_key_id: "AKIDRECORD".to_owned(),
+                secret_access_key: "record-secret".to_owned(),
+            },
         }
     }
 
@@ -826,6 +999,107 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn snapshot_aws_with_recording() {
+        let mut cfg = base_config(SelfDestruct::AwsShutdown);
+        cfg.recording = Some(recording_storage());
+        let out = render(&cfg);
+        check_snapshot("cloudinit_aws_recording.yaml", &out);
+        assert!(out.contains("path: /etc/jamstream/recording"));
+    }
+
+    /// The storage key is a secret: it travels as a root-owned file the
+    /// bootstrap chgrps to the service account, and it must never appear on
+    /// argv, in a script body, or anywhere twice.
+    #[test]
+    fn recording_key_is_a_root_file_never_argv_or_script() {
+        let mut cfg = base_config(SelfDestruct::AwsShutdown);
+        cfg.recording = Some(recording_storage());
+        let out = render(&cfg);
+
+        assert!(out.contains(
+            "path: /etc/jamstream/recording\n    owner: root:root\n    permissions: \"0600\""
+        ));
+        // The plaintext secret is nowhere; its base64 form appears exactly
+        // once, inside the config file content.
+        let secret_b64 = BASE64.encode(b"record-secret");
+        assert!(!out.contains("record-secret"));
+        assert_eq!(out.matches(secret_b64.as_str()).count(), 1);
+        assert_eq!(out.matches("AKIDRECORD").count(), 1);
+        // No script interpolates it: every script body is checked, not just
+        // the ones that exist today.
+        for script in [
+            self_destruct_script(&cfg),
+            guard_script(&cfg),
+            firewall_script(&cfg),
+            media_script(),
+            bootstrap_script(&cfg),
+        ] {
+            assert!(!script.contains("AKIDRECORD") && !script.contains(&secret_b64));
+        }
+        // The bootstrap locks the file down exactly like the server config.
+        let script = bootstrap_script(&cfg);
+        assert!(script.contains("if [ -f /etc/jamstream/recording ]; then"));
+        assert!(script.contains("chgrp jamstream /etc/jamstream/recording"));
+        assert!(script.contains("chmod 0640 /etc/jamstream/recording"));
+
+        // No recording, no file.
+        let out = render(&base_config(SelfDestruct::AwsShutdown));
+        assert!(!out.contains("path: /etc/jamstream/recording"));
+    }
+
+    /// The VM reads the recording config back with [`flat_config_value`],
+    /// so both credential shapes have to round trip through the flat format.
+    #[test]
+    fn recording_flat_config_round_trips() {
+        let text = recording_storage().render_flat_config();
+        assert_eq!(flat_config_value(&text, "provider"), Some("aws"));
+        assert_eq!(flat_config_value(&text, "bucket"), Some("my-jams"));
+        assert_eq!(flat_config_value(&text, "region"), Some("us-east-1"));
+        assert_eq!(flat_config_value(&text, "retention"), Some("30d"));
+        assert_eq!(
+            flat_config_value(&text, "access_key_id"),
+            Some("AKIDRECORD")
+        );
+        let secret = flat_config_value(&text, "secret_access_key_b64").unwrap();
+        assert_eq!(BASE64.decode(secret.as_bytes()).unwrap(), b"record-secret");
+
+        // A service account key is JSON, which the flat format cannot carry
+        // raw; base64 makes it one line.
+        let gcp = RecordingStorage {
+            provider: ProviderKind::Gcp,
+            credential: StorageCredential::ServiceAccountJson(
+                "{\"type\": \"service_account\"}\n".to_owned(),
+            ),
+            ..recording_storage()
+        };
+        let text = gcp.render_flat_config();
+        assert_eq!(flat_config_value(&text, "provider"), Some("gcp"));
+        assert!(flat_config_value(&text, "access_key_id").is_none());
+        let json = flat_config_value(&text, "service_account_json_b64").unwrap();
+        assert_eq!(
+            BASE64.decode(json.as_bytes()).unwrap(),
+            b"{\"type\": \"service_account\"}\n"
+        );
+    }
+
+    #[test]
+    fn recording_debug_redacts_the_secret() {
+        let mut cfg = base_config(SelfDestruct::AwsShutdown);
+        cfg.recording = Some(recording_storage());
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("record-secret"));
+        assert!(rendered.contains("AKIDRECORD"), "the key id is loggable");
+        assert!(rendered.contains("my-jams"));
+
+        let sa = format!(
+            "{:?}",
+            StorageCredential::ServiceAccountJson("{\"private_key\": \"x\"}".to_owned())
+        );
+        assert_eq!(sa, "ServiceAccountJson(<redacted>)");
+        assert!(!sa.contains("private_key"));
+    }
+
     /// The three providers all redact their credentials from Debug and
     /// have a test saying so; the boot config and the self-destruct spec
     /// hold the same class of secret and were missed.
@@ -894,11 +1168,17 @@ mod tests {
             assert!(out.contains("-A INPUT -p udp --dport 43210 -j ACCEPT"));
             assert!(out.contains("for ipt in iptables ip6tables; do"));
             assert!(out.contains("\"$ipt\" -P INPUT DROP"));
-            // Guard thresholds in seconds.
+            // Guard thresholds in seconds, plus the upload deferral ceiling.
             assert!(out.contains("-ge 600 ]"));
             assert!(out.contains("-ge 43200 ]"));
+            assert!(out.contains("-lt 600 ]"));
             assert!(out.contains("systemctl enable --now jamstreamd.service"));
             assert!(out.contains("systemctl enable --now jamstream-guard.timer"));
+            // The marker directory the recorder writes and the guard reads.
+            assert!(
+                out.contains("install -d -o jamstream -g jamstream -m 0700 /run/jamstream/uploads")
+            );
+            assert!(out.contains("ls -A /run/jamstream/uploads"));
         }
     }
 
@@ -979,6 +1259,209 @@ mod tests {
         // A guard that cannot run destroys the VM instead of logging.
         assert!(out.contains("OnFailure=jamstream-self-destruct.service"));
         assert!(out.contains("path: /etc/systemd/system/jamstream-self-destruct.service"));
+    }
+
+    /// Runs the rendered guard script for real against a scratch directory:
+    /// a fake uptime file stands in for /proc/uptime and a stub self-destruct
+    /// records the reason it was invoked with. What the snapshots cannot
+    /// prove, this does.
+    #[cfg(unix)]
+    mod guard_behavior {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        struct Guard {
+            dir: PathBuf,
+        }
+
+        impl Guard {
+            fn new(name: &str) -> Guard {
+                let dir = std::env::temp_dir()
+                    .join(format!("jamstream-guard-{}-{name}", std::process::id()));
+                let _ = fs::remove_dir_all(&dir);
+                let state = dir.join("state");
+                let uploads = dir.join("uploads");
+                fs::create_dir_all(&state).unwrap();
+                fs::create_dir_all(&uploads).unwrap();
+                let stub = dir.join("self-destruct");
+                fs::write(
+                    &stub,
+                    format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$1\" > {}/destroyed\n",
+                        dir.display()
+                    ),
+                )
+                .unwrap();
+                fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+                let script = guard_script_at(
+                    &base_config(SelfDestruct::AwsShutdown),
+                    &state.display().to_string(),
+                    &uploads.display().to_string(),
+                    &dir.join("uptime").display().to_string(),
+                    &stub.display().to_string(),
+                );
+                fs::write(dir.join("guard"), script).unwrap();
+                Guard { dir }
+            }
+
+            fn state(&self) -> PathBuf {
+                self.dir.join("state")
+            }
+
+            fn uploads(&self) -> PathBuf {
+                self.dir.join("uploads")
+            }
+
+            fn seed(&self, file: &str, content: &str) {
+                fs::write(self.state().join(file), content).unwrap();
+            }
+
+            fn marker(&self) {
+                fs::write(self.uploads().join("mix.flac"), "").unwrap();
+            }
+
+            /// One guard tick at `up` uptime seconds: (clean exit, the
+            /// self-destruct reason if it fired).
+            fn run(&self, up: u64) -> (bool, Option<String>) {
+                let _ = fs::remove_file(self.dir.join("destroyed"));
+                // /proc/uptime shape: seconds.hundredths, twice.
+                fs::write(self.dir.join("uptime"), format!("{up}.55 {up}.00\n")).unwrap();
+                let status = Command::new("sh")
+                    .arg(self.dir.join("guard"))
+                    .status()
+                    .expect("run guard under sh");
+                let destroyed = fs::read_to_string(self.dir.join("destroyed"))
+                    .ok()
+                    .map(|s| s.trim().to_owned());
+                (status.success(), destroyed)
+            }
+        }
+
+        #[test]
+        fn an_active_session_lives() {
+            let g = Guard::new("active");
+            assert_eq!(g.run(100), (true, None));
+            assert_eq!(g.run(599), (true, None));
+        }
+
+        #[test]
+        fn an_idle_session_without_uploads_is_destroyed() {
+            let g = Guard::new("idle");
+            let (ok, destroyed) = g.run(700);
+            assert!(ok);
+            let reason = destroyed.expect("idle past the window must destroy");
+            assert_eq!(reason, "idle for 700s");
+        }
+
+        #[test]
+        fn an_upload_in_flight_defers_destruction_up_to_the_ceiling() {
+            let g = Guard::new("defer");
+            g.marker();
+            // Overdue, but an upload is in flight: a clean exit, and the
+            // deferral start is recorded in uptime seconds.
+            assert_eq!(g.run(700), (true, None));
+            assert_eq!(
+                fs::read_to_string(g.state().join("guard-defer-up")).unwrap(),
+                "700\n"
+            );
+            // Still inside the ceiling.
+            assert_eq!(g.run(1250), (true, None));
+            // Past it: destroyed, and the reason says what was abandoned.
+            let (ok, destroyed) = g.run(1301);
+            assert!(ok);
+            let reason = destroyed.expect("the ceiling must end the deferral");
+            assert!(reason.contains("idle for 1301s"), "{reason}");
+            assert!(
+                reason.contains("upload still in flight after 601s"),
+                "{reason}"
+            );
+            assert!(reason.contains("abandoning"), "{reason}");
+        }
+
+        #[test]
+        fn a_finished_upload_ends_the_deferral() {
+            let g = Guard::new("finished");
+            g.marker();
+            assert_eq!(g.run(700), (true, None));
+            fs::remove_file(g.uploads().join("mix.flac")).unwrap();
+            let (_, destroyed) = g.run(1250);
+            let reason = destroyed.expect("no marker, no mercy");
+            assert_eq!(reason, "idle for 1250s");
+        }
+
+        #[test]
+        fn resumed_activity_clears_the_deferral_bookkeeping() {
+            let g = Guard::new("resumed");
+            g.marker();
+            assert_eq!(g.run(700), (true, None));
+            // A changed activity stamp resets the idle window; the stale
+            // deferral must not survive to shorten a later one.
+            g.seed("guard-stamp", "stale\n");
+            assert_eq!(g.run(1200), (true, None));
+            assert!(!g.state().join("guard-defer-up").exists());
+        }
+
+        #[test]
+        fn the_hard_cap_is_deferred_but_bounded_too() {
+            let g = Guard::new("cap");
+            // Recent activity, but past the session hard cap.
+            g.seed("guard-active-up", "43100\n");
+            g.marker();
+            assert_eq!(g.run(43200), (true, None));
+            let (_, destroyed) = g.run(43801);
+            let reason = destroyed.expect("the cap must win in the end");
+            assert!(reason.contains("max session duration reached"), "{reason}");
+            assert!(reason.contains("upload still in flight"), "{reason}");
+        }
+
+        #[test]
+        fn an_empty_or_missing_marker_dir_does_not_defer() {
+            let g = Guard::new("empty-dir");
+            // Empty directory: no deferral.
+            let (_, destroyed) = g.run(700);
+            assert!(destroyed.is_some());
+            // Missing directory reads as absent, not as an error.
+            fs::remove_dir_all(g.uploads()).unwrap();
+            let (ok, destroyed) = g.run(700);
+            assert!(ok);
+            assert!(destroyed.is_some());
+        }
+
+        /// Corrupt bookkeeping must never keep the VM alive: a defer stamp
+        /// that is not a number makes the tick fail, and a failed tick is
+        /// destruction by the OnFailure= on the guard unit.
+        #[test]
+        fn corrupt_deferral_bookkeeping_fails_closed() {
+            let g = Guard::new("corrupt");
+            g.marker();
+            g.seed("guard-defer-up", "12abc\n");
+            let (ok, destroyed) = g.run(700);
+            assert!(!ok, "a broken tick must not exit 0");
+            assert!(destroyed.is_none());
+        }
+
+        /// Same fail-closed shape when the state dir cannot be written.
+        #[test]
+        fn an_unwritable_state_dir_fails_closed() {
+            let g = Guard::new("readonly");
+            if fs::metadata(&g.dir)
+                .map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0)
+                .unwrap_or(false)
+            {
+                // root ignores directory modes; nothing to prove here.
+                return;
+            }
+            // Force the write path, then take the permission away.
+            g.seed("guard-stamp", "different\n");
+            fs::set_permissions(g.state(), fs::Permissions::from_mode(0o500)).unwrap();
+            let (ok, destroyed) = g.run(100);
+            fs::set_permissions(g.state(), fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(!ok, "a tick that cannot keep its books must not exit 0");
+            assert!(destroyed.is_none());
+        }
     }
 
     /// #41, the half of it that lives in the guest: user-data holds the

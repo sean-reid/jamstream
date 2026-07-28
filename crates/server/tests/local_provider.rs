@@ -66,6 +66,8 @@ fn session_material(idle_shutdown_min: u32) -> SessionMaterial {
         idle_shutdown_min,
         max_duration_min: 720,
         self_destruct: SelfDestruct::AwsShutdown,
+        // Local sessions record to disk, never to a bucket.
+        recording: None,
     };
     SessionMaterial {
         server_public: server_keys.public,
