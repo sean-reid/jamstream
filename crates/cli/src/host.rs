@@ -177,6 +177,9 @@ pub async fn run<W: Write>(
         idle_shutdown_min: args.idle_min,
         max_duration_min: args.max_hours * 60,
         self_destruct: self_destruct_for(provider.kind())?,
+        // Recording is off until the host configures a storage key; the
+        // flags that will set this land with the recording surface.
+        recording: None,
     };
 
     // The local provider consumes the flat key=value server config
