@@ -261,6 +261,10 @@ pub struct LocalProvider {
     /// instead of every interface and the primary LAN address. See
     /// [`LocalProvider::with_bind`].
     bind: Option<IpAddr>,
+    /// Where the spawned server writes takes, and whether stems are
+    /// captured alongside the mix; None means the session cannot record.
+    /// See [`LocalProvider::with_record`].
+    record: Option<(PathBuf, bool)>,
 }
 
 impl LocalProvider {
@@ -271,6 +275,7 @@ impl LocalProvider {
             registry_gate: Mutex::new(()),
             children: Mutex::new(HashMap::new()),
             bind: None,
+            record: None,
         }
     }
 
@@ -297,6 +302,14 @@ impl LocalProvider {
     /// loopback and never meets it.
     pub fn with_bind(mut self, ip: IpAddr) -> Self {
         self.bind = Some(ip);
+        self
+    }
+
+    /// Arms recording for the sessions this provider launches: the spawned
+    /// server gets `--record-dir dir`, plus `--record-stems` when `stems`
+    /// is set, and every take the host then starts lands in `dir` as FLAC.
+    pub fn with_record(mut self, dir: PathBuf, stems: bool) -> Self {
+        self.record = Some((dir, stems));
         self
     }
 
@@ -574,6 +587,23 @@ impl Provider for LocalProvider {
         // interface, which is what a band on one network needs.
         if let Some(ip) = self.bind {
             command.arg("--bind").arg(ip.to_string());
+        }
+        // Recording is armed here and started by the host in session. The
+        // directory is created now, so a session never launches whose first
+        // take would fail on a directory that cannot exist, and it lives
+        // outside the per-session directory because destroy removes that
+        // and a take has to outlive its session.
+        if let Some((record_dir, stems)) = &self.record {
+            std::fs::create_dir_all(record_dir).map_err(|e| {
+                ProviderError::Other(format!(
+                    "cannot create record dir {}: {e}",
+                    record_dir.display()
+                ))
+            })?;
+            command.arg("--record-dir").arg(record_dir);
+            if *stems {
+                command.arg("--record-stems");
+            }
         }
         let child = command
             .stdin(Stdio::null())
@@ -1741,10 +1771,56 @@ mod tests {
             value_of("--max-duration-min"),
             Some(DEFAULT_MAX_DURATION_MIN.to_string().as_str())
         );
+        // Recording stays opt-in: an unconfigured provider arms nothing.
+        assert!(!args.contains(&"--record-dir"));
+        assert!(!args.contains(&"--record-stems"));
         provider
             .destroy(&RegionId::new(REGION_ID), &instance.id)
             .await
             .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recording half of the same spawn contract: `with_record` reaches
+    /// the process as the flags jamstreamd's argument scan reads, and the
+    /// directory exists before the first take could need it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn with_record_reaches_the_spawned_server_as_flags() {
+        let dir = temp_dir("record");
+        let args_file = dir.join("argv");
+        let record_dir = dir.join("takes");
+        let provider = LocalProvider::new(dir.join("state"))
+            .with_server_binary(recording_server(&dir, &args_file))
+            .with_record(record_dir.clone(), true);
+        let spec = LaunchSpec {
+            region: LocalProvider::local_region(),
+            instance_class: InstanceClass::Small,
+            user_data: "port = 43210\n".to_owned(),
+            tags: vec![session_tag("recorded")],
+        };
+        let instance = provider.launch(spec).await.unwrap();
+        let argv = read_when_written(&args_file).await;
+        // Torn down before anything is asserted, so a failure here never
+        // leaves a process behind.
+        provider
+            .destroy(&RegionId::new(REGION_ID), &instance.id)
+            .await
+            .unwrap();
+
+        let args: Vec<&str> = argv.lines().collect();
+        let value_of = |flag: &str| {
+            args.iter()
+                .position(|a| *a == flag)
+                .and_then(|i| args.get(i + 1))
+                .copied()
+        };
+        assert_eq!(value_of("--record-dir"), record_dir.to_str());
+        assert!(args.contains(&"--record-stems"), "stems were asked for");
+        assert!(
+            record_dir.is_dir(),
+            "the record dir is created at launch, not at the first take"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

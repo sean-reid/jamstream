@@ -82,6 +82,22 @@ pub async fn run<W: Write>(
 ) -> Result<(), CliError> {
     let is_mock = args.provider == "mock";
     let is_local = provider.kind() == ProviderKind::Local;
+    // Recording here means this machine's disk, which only a local session
+    // has; a cloud session records to a bucket, configured in the desktop
+    // app's host wizard, and pretending otherwise would lose the take.
+    if args.wants_recording() && !is_local {
+        return Err(CliError::Usage(
+            "--record and --record-stems write takes to this computer's disk, so they \
+             need --provider local; recording a cloud session is set up in the desktop \
+             app's host wizard"
+                .to_owned(),
+        ));
+    }
+    let record_dir = if args.wants_recording() {
+        Some(state::recordings_dir()?)
+    } else {
+        None
+    };
     let regions = provider.regions();
     if regions.is_empty() {
         return Err(CliError::Failed(format!(
@@ -186,8 +202,9 @@ pub async fn run<W: Write>(
         idle_shutdown_min: args.idle_min,
         max_duration_min: args.max_hours * 60,
         self_destruct: self_destruct_for(provider.kind())?,
-        // Recording is off until the host configures a storage key; the
-        // flags that will set this land with the recording surface.
+        // Cloud recording needs a storage key and lands with the wizard; a
+        // local session records through the provider's own spawn flags
+        // (see LocalProvider::with_record), not the boot config.
         recording: None,
     };
 
@@ -273,6 +290,7 @@ pub async fn run<W: Write>(
             "hourly_microusd": price.hourly_microusd,
             "estimated_total_microusd": preview.total_microusd,
             "reachability": reachability,
+            "record_dir": record_dir,
             "invites": session_state.invites,
             "state_file": state_path,
             "preexisting_instances": preexisting
@@ -292,6 +310,11 @@ pub async fn run<W: Write>(
         writeln!(out)?;
         writeln!(out, "Session {} is running.", &session_hex[..8])?;
         writeln!(out, "{:<12} {address}", "server")?;
+        // The take is the point of --record, so where it lands is printed
+        // where the invites are, not buried in a log.
+        if let Some(dir) = &record_dir {
+            writeln!(out, "{:<12} {}", "record dir", dir.display())?;
+        }
         for (label, invite) in &invites {
             writeln!(out, "{:<12} {}", label, invite.encode())?;
         }
@@ -672,6 +695,39 @@ mod tests {
     use super::*;
     use jamstream_cloud::MockProvider;
     use jamstream_session::MAX_MUSICIANS;
+
+    /// --record means this machine's disk, so a cloud host asking for it is
+    /// refused before anything launches, rather than billed for a session
+    /// that records nowhere. Stems alone must trip it too, since they imply
+    /// recording.
+    #[tokio::test]
+    async fn a_cloud_host_with_record_is_refused_before_launch() {
+        let provider = MockProvider::with_default_regions(ProviderKind::Aws);
+        let args = HostArgs {
+            provider: "mock".to_owned(),
+            region: None,
+            musicians: 2,
+            listeners: 0,
+            hours: 1.0,
+            destinations: 0,
+            port: 43210,
+            idle_min: 10,
+            max_hours: 12,
+            record: false,
+            record_stems: true,
+            artifact_url: None,
+            artifact_sha256: None,
+            yes: true,
+            json: true,
+        };
+        let mut out = Vec::new();
+        let err = run(&args, &provider, &mut out)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--provider local"), "error was: {err}");
+        assert!(out.is_empty(), "the refusal must come before any output");
+    }
 
     #[test]
     fn fabricated_rtts_are_deterministic_and_in_range() {

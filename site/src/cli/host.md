@@ -23,6 +23,8 @@ With `--provider local` (the default) there is nothing to rank or bill: the serv
 | `--port <PORT>` | `43210` | UDP port the session server listens on. |
 | `--idle-min <IDLE_MIN>` | `10` | Minutes without musicians before the server shuts itself down. |
 | `--max-hours <MAX_HOURS>` | `12` | Hard cap on session length in hours. Invites expire at the cap. |
+| `--record` | off | Let this session record to this computer: takes land as FLAC files in a recordings folder, and the launch output prints its path. Local sessions only. |
+| `--record-stems` | off | Also capture a stereo stem per musician alongside the mix, named for them. Implies `--record`. |
 | `--artifact-url <ARTIFACT_URL>` | pinned into release builds | Override the URL of the `jamstreamd` artifact the VM downloads at boot. Release builds carry the release's own server build pinned in, so cloud hosting normally needs no flag; a source build has no pin and must pass both artifact flags to host on a cloud provider. Local mode runs a binary already on this machine and downloads nothing. |
 | `--artifact-sha256 <ARTIFACT_SHA256>` | pinned into release builds | Override the expected sha256 of the `jamstreamd` artifact. Must be passed together with `--artifact-url`; the VM refuses to start on a mismatch. |
 | `--yes` | off | Skip the launch confirmation. |
@@ -34,6 +36,12 @@ A session on this computer, for the people in the room:
 
 ```console
 $ jamstream host --provider local --yes
+```
+
+The same session able to record, with the folder takes land in printed at launch:
+
+```console
+$ jamstream host --record --yes
 ```
 
 A two hour duo session (you and one other player) with two spare listener seats, on DigitalOcean, unattended:
@@ -58,5 +66,6 @@ The [quickstart](../quickstart.md#from-the-terminal) shows a full run end to end
 
 - `--musicians` counts the host. A session of N musician seats is you plus N-1 guests, and N is also what the server admits: it refuses an eleventh musician, so there is never an invite in hand that cannot get in. The desktop app's host wizard offers the same range with the same meaning, and its "musicians, including you" dial defaults to the same 4.
 - If JamStream-tagged machines already exist on the provider, they are listed with a warning before anything launches; run [`jamstream sweep`](sweep.md) if they are strays.
-- `--json` prints the session id, address, invites, cost estimate, and state file path as one object, for scripts.
+- `--record` arms recording, it does not start it. Nothing is captured until you press record in the session, each press-to-stop is one take, and finished takes are FLAC files named by date and time in the printed folder (`record_dir` in the `--json` output). They stay there after `jamstream end`.
+- `--json` prints the session id, address, invites, cost estimate, recording folder, and state file path as one object, for scripts.
 - The state file lands under your platform's data directory in `jamstream/sessions/` and is what [`jamstream status`](status.md) and [`jamstream end`](end.md) read.

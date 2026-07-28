@@ -85,6 +85,15 @@ pub fn state_dir() -> Result<PathBuf, CliError> {
     Ok(data_dir()?.join("sessions"))
 }
 
+/// Where a recorded local session's takes land: a `recordings` directory
+/// beside the session state, honoring the same [`STATE_DIR_ENV`] override.
+pub fn recordings_dir() -> Result<PathBuf, CliError> {
+    if let Some(dir) = std::env::var_os(STATE_DIR_ENV) {
+        return Ok(PathBuf::from(dir).join("recordings"));
+    }
+    Ok(data_dir()?.join("recordings"))
+}
+
 /// `<platform data dir>/jamstream`, the root of everything this machine
 /// keeps about its sessions. The local provider's registry and per-session
 /// server configs live here too.
@@ -246,6 +255,27 @@ mod tests {
             resolve_data_dir(Some(home.clone())).unwrap(),
             home.join("jamstream")
         );
+    }
+
+    /// The printed record dir has to sit beside the session state so takes
+    /// survive `jamstream end`, which removes the per-session server
+    /// directory but must never touch a recording. Read-only against the
+    /// live environment, like the provider state dir test.
+    #[test]
+    fn recordings_sit_beside_the_session_state() {
+        match std::env::var_os(STATE_DIR_ENV) {
+            Some(dir) => assert_eq!(
+                recordings_dir().unwrap(),
+                PathBuf::from(dir).join("recordings")
+            ),
+            None => match recordings_dir() {
+                Ok(dir) => {
+                    assert!(dir.ends_with("jamstream/recordings"));
+                    assert_eq!(dir.parent(), state_dir().unwrap().parent());
+                }
+                Err(err) => assert!(err.to_string().contains(STATE_DIR_ENV)),
+            },
+        }
     }
 
     /// The issuer key mints and revokes every invite to the session, so it
