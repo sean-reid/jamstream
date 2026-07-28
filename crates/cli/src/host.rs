@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use data_encoding::{BASE64, HEXLOWER};
 use jamstream_cloud::{
     BootConfig, CostPreview, InstanceClass, LaunchSpec, Price, ProbeMatrix, ProbeTarget, Provider,
-    ProviderKind, Region, RegionId, RegionScore, SelfDestruct, rank, session_tag,
+    ProviderKind, RecordingStorage, Region, RegionId, RegionScore, RetentionEnforcement,
+    SelfDestruct, rank, session_tag,
 };
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
@@ -82,18 +83,25 @@ pub async fn run<W: Write>(
 ) -> Result<(), CliError> {
     let is_mock = args.provider == "mock";
     let is_local = provider.kind() == ProviderKind::Local;
-    // Recording here means this machine's disk, which only a local session
-    // has; a cloud session records to a bucket, configured in the desktop
-    // app's host wizard, and pretending otherwise would lose the take.
-    if args.wants_recording() && !is_local {
+    // A local session records to this machine's disk, because the server is
+    // already here; a cloud session records to a bucket, because the take has
+    // to outlive a VM that deletes itself. Naming both in one flag pair and
+    // resolving it here is what stops a launch that records nowhere.
+    if args.bucket.is_some() && is_local {
         return Err(CliError::Usage(
-            "--record and --record-stems write takes to this computer's disk, so they \
-             need --provider local; recording a cloud session is set up in the desktop \
-             app's host wizard"
+            "a local session records to this computer's disk, so it takes no --bucket; \
+             drop the flag and the takes land in the directory this prints"
                 .to_owned(),
         ));
     }
-    let record_dir = if args.wants_recording() {
+    if args.wants_recording() && !is_local && args.bucket.is_none() {
+        return Err(CliError::Usage(
+            "a cloud session records to a bucket, so --record needs --bucket <name>: the \
+             VM is destroyed at the end of the session and a take on its disk goes with it"
+                .to_owned(),
+        ));
+    }
+    let record_dir = if args.wants_recording() && is_local {
         Some(state::recordings_dir()?)
     } else {
         None
@@ -144,6 +152,19 @@ pub async fn run<W: Write>(
 
     let (region, price) = choose_region(args, provider, &candidates, is_mock, out).await?;
 
+    // The bucket is in the session's own region, so this waits for the region
+    // to be chosen; the credential is read here rather than after the launch,
+    // because a missing key must not cost a machine.
+    let recording = match &args.bucket {
+        Some(bucket) => Some(recording_storage(
+            args,
+            provider.kind(),
+            bucket,
+            &region.id,
+        )?),
+        None => None,
+    };
+
     let preview = CostPreview::compute(
         &price,
         args.hours,
@@ -166,6 +187,16 @@ pub async fn run<W: Write>(
             for row in preview.display_table() {
                 writeln!(out, "{row}")?;
             }
+        }
+        if let Some(storage) = &recording {
+            writeln!(
+                out,
+                "Takes go to {} in {} ({}). Downloading them later costs egress, which \
+                 jamstream recordings get prices before it starts.",
+                storage.bucket,
+                storage.region,
+                storage.retention.label().to_lowercase()
+            )?;
         }
     }
 
@@ -202,11 +233,22 @@ pub async fn run<W: Write>(
         idle_shutdown_min: args.idle_min,
         max_duration_min: args.max_hours * 60,
         self_destruct: self_destruct_for(provider.kind())?,
-        // Cloud recording needs a storage key and lands with the wizard; a
-        // local session records through the provider's own spawn flags
-        // (see LocalProvider::with_record), not the boot config.
-        recording: None,
+        // A local session records through the provider's own spawn flags
+        // (see LocalProvider::with_record) rather than the boot config, so
+        // this is set for a bucket and nothing else.
+        recording: recording.clone(),
     };
+
+    // Proved before the machine exists: a take must never fail mid-song
+    // because the bucket was wrong, and the retention rule has to be in place
+    // before the first byte is uploaded. The lifecycle call is the host's to
+    // make, not the VM's, whose key is scoped to writing one prefix.
+    if let Some(storage) = &recording {
+        let applied = verify_bucket(storage, &session_hex).await?;
+        if !args.json {
+            writeln!(out, "{}", applied.describe())?;
+        }
+    }
 
     // The local provider consumes the flat key=value server config
     // directly; cloud providers get cloud-init YAML that writes the same
@@ -279,6 +321,12 @@ pub async fn run<W: Write>(
         ended_unix: None,
     };
     let state_path = state::save(&session_state)?;
+    // Written beside the session record, because `jamstream recordings` has
+    // no other way to find the bucket once the VM that wrote to it is gone.
+    let recording_record = recording.as_ref().map(recording_record);
+    if let Some(record) = &recording_record {
+        state::save_recording(&session_hex, record)?;
+    }
 
     if args.json {
         let value = serde_json::json!({
@@ -291,6 +339,7 @@ pub async fn run<W: Write>(
             "estimated_total_microusd": preview.total_microusd,
             "reachability": reachability,
             "record_dir": record_dir,
+            "recording": recording_record,
             "invites": session_state.invites,
             "state_file": state_path,
             "preexisting_instances": preexisting
@@ -315,6 +364,15 @@ pub async fn run<W: Write>(
         if let Some(dir) = &record_dir {
             writeln!(out, "{:<12} {}", "record dir", dir.display())?;
         }
+        if let Some(record) = &recording_record {
+            writeln!(
+                out,
+                "{:<12} {}/{}",
+                "takes",
+                record.bucket,
+                jamstream_cloud::session_prefix(&session_hex)
+            )?;
+        }
         for (label, invite) in &invites {
             writeln!(out, "{:<12} {}", label, invite.encode())?;
         }
@@ -325,8 +383,85 @@ pub async fn run<W: Write>(
             "End the session with: jamstream end {}",
             &session_hex[..8]
         )?;
+        if recording_record.is_some() {
+            writeln!(
+                out,
+                "Fetch the takes with:  jamstream recordings get {}",
+                &session_hex[..8]
+            )?;
+        }
     }
     Ok(())
+}
+
+/// The bucket config a cloud launch carries to the VM, from the flags plus
+/// the storage key in this machine's environment.
+fn recording_storage(
+    args: &HostArgs,
+    kind: ProviderKind,
+    bucket: &str,
+    region: &RegionId,
+) -> Result<RecordingStorage, CliError> {
+    if bucket.trim().is_empty() {
+        return Err(CliError::Usage("--bucket is empty".to_owned()));
+    }
+    // Priced here so a region with no bucket service (a DigitalOcean region
+    // with no Spaces endpoint) is refused before the launch rather than at
+    // the first upload.
+    jamstream_cloud::storage_price(kind, region)?;
+    Ok(RecordingStorage {
+        provider: kind,
+        bucket: bucket.to_owned(),
+        region: region.to_string(),
+        retention: args.retention,
+        credential: crate::storage::credential_from_env(kind)?,
+        stems: args.record_stems,
+    })
+}
+
+/// What the session record keeps about the bucket: everything but the key.
+fn recording_record(storage: &RecordingStorage) -> state::RecordingRecord {
+    state::RecordingRecord {
+        provider: storage.provider.as_str().to_owned(),
+        bucket: storage.bucket.clone(),
+        region: storage.region.clone(),
+        retention: storage.retention.to_string(),
+        stems: storage.stems,
+    }
+}
+
+/// Proves the key can write this session's prefix, and applies the retention
+/// rule to it.
+///
+/// The probe object is written and deleted under the session's own prefix, so
+/// a bucket that refuses the launch key fails here, in a configuring frame of
+/// mind, rather than at the first take.
+async fn verify_bucket(
+    storage: &RecordingStorage,
+    session_hex: &str,
+) -> Result<RetentionEnforcement, CliError> {
+    let store = storage.object_store()?;
+    let prefix = jamstream_cloud::session_prefix(session_hex);
+    let probe = format!("{prefix}.jamstream-probe");
+    store
+        .put(
+            &storage.bucket,
+            &probe,
+            jamstream_cloud::JSON_CONTENT_TYPE,
+            b"{\"probe\":true}",
+        )
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "cannot write to {} in {}: {err}. Recording needs a key that may write \
+                 {prefix} and set the bucket's lifecycle rule.",
+                storage.bucket, storage.region
+            ))
+        })?;
+    store.delete(&storage.bucket, &probe).await?;
+    Ok(store
+        .set_retention(&storage.bucket, &prefix, storage.retention)
+        .await?)
 }
 
 /// Honors --region when given; otherwise ranks by latency and price and
@@ -696,14 +831,8 @@ mod tests {
     use jamstream_cloud::MockProvider;
     use jamstream_session::MAX_MUSICIANS;
 
-    /// --record means this machine's disk, so a cloud host asking for it is
-    /// refused before anything launches, rather than billed for a session
-    /// that records nowhere. Stems alone must trip it too, since they imply
-    /// recording.
-    #[tokio::test]
-    async fn a_cloud_host_with_record_is_refused_before_launch() {
-        let provider = MockProvider::with_default_regions(ProviderKind::Aws);
-        let args = HostArgs {
+    fn recording_args() -> HostArgs {
+        HostArgs {
             provider: "mock".to_owned(),
             region: None,
             musicians: 2,
@@ -715,18 +844,111 @@ mod tests {
             max_hours: 12,
             record: false,
             record_stems: true,
+            bucket: None,
+            retention: jamstream_cloud::Retention::Days30,
             artifact_url: None,
             artifact_sha256: None,
             yes: true,
             json: true,
+        }
+    }
+
+    /// A cloud session's VM deletes itself, so a take on its disk is a take
+    /// nobody gets. Asking to record without a bucket is refused before
+    /// anything launches rather than billed for a session that records
+    /// nowhere, and stems alone must trip it too, since they imply recording.
+    #[tokio::test]
+    async fn a_cloud_host_recording_to_no_bucket_is_refused_before_launch() {
+        let provider = MockProvider::with_default_regions(ProviderKind::Aws);
+        let mut out = Vec::new();
+        let err = run(&recording_args(), &provider, &mut out)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--bucket"), "error was: {err}");
+        assert!(out.is_empty(), "the refusal must come before any output");
+    }
+
+    /// The other way round: a local session's takes land on this machine's
+    /// own disk, so a bucket for one is a flag with nowhere to apply.
+    #[tokio::test]
+    async fn a_local_host_with_a_bucket_is_refused_before_launch() {
+        let provider = MockProvider::with_default_regions(ProviderKind::Local);
+        let args = HostArgs {
+            provider: "local".to_owned(),
+            bucket: Some("my-jams".to_owned()),
+            ..recording_args()
         };
         let mut out = Vec::new();
         let err = run(&args, &provider, &mut out)
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--provider local"), "error was: {err}");
+        assert!(err.contains("no --bucket"), "error was: {err}");
         assert!(out.is_empty(), "the refusal must come before any output");
+    }
+
+    /// The record kept beside the session is where `jamstream recordings`
+    /// looks, and the storage key must not be in it.
+    #[test]
+    fn the_session_record_carries_the_bucket_and_never_the_key() {
+        let args = HostArgs {
+            bucket: Some("my-jams".to_owned()),
+            retention: jamstream_cloud::Retention::Days90,
+            ..recording_args()
+        };
+        // Built directly rather than through recording_storage, which reads
+        // the key out of this process's environment.
+        let storage = RecordingStorage {
+            provider: ProviderKind::Aws,
+            bucket: "my-jams".to_owned(),
+            region: "eu-west-1".to_owned(),
+            retention: args.retention,
+            credential: jamstream_cloud::StorageCredential::KeyPair {
+                access_key_id: "AKIDTEST".to_owned(),
+                secret_access_key: "hunter2".to_owned(),
+            },
+            stems: args.record_stems,
+        };
+        let record = recording_record(&storage);
+        assert_eq!(record.provider, "aws");
+        assert_eq!(record.bucket, "my-jams");
+        assert_eq!(record.region, "eu-west-1");
+        assert_eq!(record.retention, "90d");
+        assert!(record.stems);
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
+        assert!(!json.contains("AKID"), "{json}");
+        // And it reads back as the choice it was, which is what the download
+        // prompt prints.
+        assert_eq!(
+            crate::storage::retention_label(&record),
+            "Delete after 90 days"
+        );
+    }
+
+    /// A DigitalOcean region with no Spaces endpoint has no bucket to record
+    /// to, and that is cheaper to learn before the launch than at the first
+    /// upload.
+    #[test]
+    fn a_region_with_no_bucket_service_is_refused() {
+        let args = HostArgs {
+            bucket: Some("my-jams".to_owned()),
+            ..recording_args()
+        };
+        let err = recording_storage(
+            &args,
+            ProviderKind::DigitalOcean,
+            "my-jams",
+            &RegionId::new("nyc1"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not available in nyc1"), "{err}");
+        // An empty bucket name is a typo, not a bucket.
+        assert!(
+            recording_storage(&args, ProviderKind::Aws, "  ", &RegionId::new("eu-west-1")).is_err()
+        );
     }
 
     #[test]

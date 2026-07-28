@@ -6,8 +6,9 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use clap::Parser;
-use jamstream_cli::cli::{Cli, Command};
-use jamstream_cli::{CliError, end, host, join, providers, status, sweep};
+use jamstream_cli::cli::{Cli, Command, RecordingsCommand};
+use jamstream_cli::storage::EnvStores;
+use jamstream_cli::{CliError, end, host, join, providers, recordings, status, sweep};
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -30,7 +31,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn dispatch<W: Write>(cli: Cli, out: &mut W) -> Result<(), CliError> {
+async fn dispatch<W: Write + Send>(cli: Cli, out: &mut W) -> Result<(), CliError> {
     match cli.command {
         Command::Host(args) => {
             let provider = providers::resolve_for_host(&args)?;
@@ -50,6 +51,14 @@ async fn dispatch<W: Write>(cli: Cli, out: &mut W) -> Result<(), CliError> {
             sweep::run(&providers, args.dry_run, out).await
         }
         Command::Join(args) => join::run(&args, out).await,
+        Command::Recordings(args) => match args.command {
+            Some(RecordingsCommand::Get(get)) => {
+                let mut ask = |out: &mut W| recordings::ask(out);
+                let mut prompt = recordings::Prompt::stdin(&mut ask);
+                recordings::get(&get, &EnvStores, &mut prompt, out).await
+            }
+            None => recordings::list(&args.list, &EnvStores, out).await,
+        },
         Command::Completions(args) => {
             use clap::CommandFactory;
             clap_complete::generate(args.shell, &mut Cli::command(), "jamstream", out);

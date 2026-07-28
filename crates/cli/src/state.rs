@@ -26,6 +26,26 @@ pub enum SessionStatus {
     Ended,
 }
 
+/// The bucket a cloud session recorded to: enough to find its takes again,
+/// and no credential.
+///
+/// The storage key stays in the environment, where the host already keeps the
+/// keys they launched with, so a stolen state directory yields no bucket
+/// access. `jamstream recordings` rebuilds the client from these fields plus
+/// that key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordingRecord {
+    /// Provider holding the bucket, as [`jamstream_cloud::ProviderKind`]
+    /// spells it: aws, digitalocean, or gcp.
+    pub provider: String,
+    pub bucket: String,
+    /// The bucket's region: an AWS region, a Spaces slug, or a GCS location.
+    pub region: String,
+    /// The retention rule applied to this session's prefix, for display.
+    pub retention: String,
+    pub stems: bool,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id_hex: String,
@@ -118,6 +138,53 @@ fn resolve_data_dir(platform: Option<PathBuf>) -> Result<PathBuf, CliError> {
 
 pub fn path_for(session_id_hex: &str) -> Result<PathBuf, CliError> {
     Ok(state_dir()?.join(format!("{session_id_hex}.json")))
+}
+
+/// Where a session's bucket details live: a file of their own under
+/// `buckets`, beside the session records.
+///
+/// A sidecar rather than a field on [`SessionState`]: takes outlive the
+/// session, a session that never recorded carries no file at all, and the
+/// subdirectory keeps [`list`] from ever having to sort one kind of record
+/// from the other.
+pub fn recording_path_for(session_id_hex: &str) -> Result<PathBuf, CliError> {
+    Ok(state_dir()?
+        .join("buckets")
+        .join(format!("{session_id_hex}.json")))
+}
+
+/// Records where a session's takes are going. Called at launch, once.
+pub fn save_recording(
+    session_id_hex: &str,
+    recording: &RecordingRecord,
+) -> Result<PathBuf, CliError> {
+    let path = recording_path_for(session_id_hex)?;
+    write_recording_to(&path, recording)?;
+    Ok(path)
+}
+
+pub fn write_recording_to(path: &Path, recording: &RecordingRecord) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    write_private(path, serde_json::to_string_pretty(recording)?.as_bytes())?;
+    Ok(())
+}
+
+/// The bucket a session recorded to, or None when it recorded nowhere.
+pub fn load_recording(session_id_hex: &str) -> Result<Option<RecordingRecord>, CliError> {
+    read_recording_at(&recording_path_for(session_id_hex)?)
+}
+
+/// A file that cannot be decoded is an error, not a session with no takes:
+/// silently reporting no recording for a session that made one is how a band
+/// loses a take.
+pub fn read_recording_at(path: &Path) -> Result<Option<RecordingRecord>, CliError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Writes to the canonical location for the session id. Returns the path.
@@ -306,6 +373,61 @@ mod tests {
         assert_eq!(reloaded.session_id_hex, state.session_id_hex);
         assert_eq!(reloaded.hourly_microusd, state.hourly_microusd);
         assert_eq!(reloaded.invites.len(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The sidecar round trips, holds no credential, and lives one directory
+    /// below the session records so the session listing never sees it.
+    #[test]
+    fn the_bucket_sidecar_round_trips_and_carries_no_key() {
+        let path = temp_path("bucket");
+        let record = RecordingRecord {
+            provider: "aws".to_owned(),
+            bucket: "my-jams".to_owned(),
+            region: "eu-west-1".to_owned(),
+            retention: "30d".to_owned(),
+            stems: true,
+        };
+        assert_eq!(read_recording_at(&path).unwrap(), None);
+        write_recording_to(&path, &record).unwrap();
+        assert_eq!(read_recording_at(&path).unwrap(), Some(record));
+        let text = std::fs::read_to_string(&path).unwrap();
+        for secret in ["access", "secret", "key"] {
+            assert!(
+                !text.contains(secret),
+                "the sidecar must carry no credential: {text}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_file(&path).unwrap();
+
+        // Read-only against the live environment, like the state dir tests
+        // above: the sidecar is a directory below the session records, which
+        // is what keeps it out of the listing.
+        match recording_path_for("deadbeef") {
+            Ok(resolved) => {
+                assert!(resolved.ends_with("buckets/deadbeef.json"));
+                assert_eq!(
+                    resolved.parent().unwrap().parent(),
+                    Some(&*state_dir().unwrap())
+                );
+            }
+            Err(err) => assert!(err.to_string().contains(STATE_DIR_ENV)),
+        }
+    }
+
+    /// Corrupt bucket details must not read as a session with no takes.
+    #[test]
+    fn an_undecodable_sidecar_is_an_error() {
+        let path = temp_path("bucket-corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(read_recording_at(&path).is_err());
         std::fs::remove_file(&path).unwrap();
     }
 

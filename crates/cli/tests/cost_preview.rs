@@ -38,6 +38,8 @@ async fn host_json_preview_matches_the_library_computation() {
         max_hours: 12,
         record: false,
         record_stems: false,
+        bucket: None,
+        retention: jamstream_cloud::Retention::Days30,
         artifact_url: None,
         artifact_sha256: None,
         yes: true,
