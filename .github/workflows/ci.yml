@@ -321,6 +321,26 @@ jobs:
   # the artifacts a VM downloads at boot, so they must run on any Linux
   # with no shared libs. Building both here means a dependency that breaks
   # the cross build fails the PR, not the release.
+  # jamstreamd takes jamstream-cloud with default-features off, so the
+  # gcp-less shape of that crate is what actually ships on every session VM.
+  # Nothing built it: #158 gated the modules and left two test files and one
+  # in-crate test reaching for providers::gcp, so `--no-default-features`
+  # did not compile for weeks while every default-features job stayed green.
+  # A configuration nobody builds is a configuration nobody has tested.
+  features:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      - name: The crate as jamstreamd takes it, without gcp
+        run: cargo test --locked -p jamstream-cloud --no-default-features --all-targets
+      - name: And with every feature on
+        run: cargo test --locked -p jamstream-cloud --all-features --all-targets
+
   musl:
     runs-on: ubuntu-latest
     timeout-minutes: 15

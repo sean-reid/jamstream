@@ -3,6 +3,11 @@
 //! cancel), the lifecycle patch, and the head/list/delete paths. Every
 //! request must carry the bearer token from the shared GCP token source.
 
+// Every test here is about GCP, which sits behind the `gcp` feature so
+// jamstreamd can build without aws-lc. With the feature off this file is
+// empty rather than broken.
+#![cfg(feature = "gcp")]
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

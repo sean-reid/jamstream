@@ -1,5 +1,10 @@
 //! Wiremock-backed integration tests for the GCP Compute Engine provider.
 
+// Every test here is about GCP, which sits behind the `gcp` feature so
+// jamstreamd can build without aws-lc. With the feature off this file is
+// empty rather than broken.
+#![cfg(feature = "gcp")]
+
 use std::sync::Arc;
 
 use jamstream_cloud::providers::gcp::{GcpProvider, ServiceAccountTokenSource};
