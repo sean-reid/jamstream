@@ -69,8 +69,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Shellcheck the POSIX installer
-        run: shellcheck site/src/install.sh
+      - name: Shellcheck the POSIX installer and uninstaller
+        run: shellcheck site/src/install.sh site/src/uninstall.sh
       - name: Parse the PowerShell installer and uninstaller
         run: |
           pwsh -NoProfile -Command '
