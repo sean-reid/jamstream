@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use egui::{Align, Align2, Button, Layout, RichText, TextEdit, Ui, vec2};
+use egui::{Align, Button, Layout, RichText, TextEdit, Ui};
 use jamstream_stream::PlatformCatalog;
 use zeroize::Zeroize;
 
@@ -289,47 +289,45 @@ impl DestinationsPanel {
 // host sheets are one thing in several states.
 
 impl DestinationsPanel {
-    pub fn ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, open: &mut bool) {
-        egui::Window::new("Destinations")
-            .title_bar(false)
-            .frame(theme::sheet_frame(theme::palette_of(ui)))
-            .anchor(Align2::RIGHT_TOP, theme::SHEET_OFFSET)
-            .fixed_size(vec2(460.0, 0.0))
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(theme::title(ui, "Destinations"));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
-                            *open = false;
-                        }
-                    });
-                });
-                ui.label(theme::muted(
-                    ui,
-                    "Where this session streams. Keys are never shown and never \
-                     written to the server's disk.",
-                ));
-                ui.add_space(theme::SPACE_SM);
-                for index in 0..self.rows.len() {
-                    self.row_ui(ui, index, snap, rt);
-                }
-                ui.add_space(theme::SPACE_SM);
-                ui.label(theme::muted(ui, self.encode.clone()).small());
-                if let Some(err) = &self.error {
-                    let p = theme::palette_of(ui);
-                    ui.add_space(theme::SPACE_XS);
-                    ui.label(RichText::new(err.clone()).color(p.danger));
-                }
-                ui.add_space(theme::SPACE_MD);
-                ui.separator();
-                self.go_live_ui(ui, snap, rt);
-            });
+    /// The destinations section of the Broadcast tab. Laid out in the
+    /// drawer's width rather than a sheet's: every row stacks its actions
+    /// under the name instead of beside it, so nothing here needs a wider
+    /// column than the drawer has.
+    pub fn ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) {
+        ui.label(theme::title(ui, "Destinations"));
+        ui.label(
+            theme::muted(
+                ui,
+                "Where this session streams. Keys are never shown and never \
+                 written to the server's disk.",
+            )
+            .small(),
+        );
+        ui.add_space(theme::SPACE_SM);
+        for index in 0..self.rows.len() {
+            // A gap between platforms wider than the gap inside one, so the
+            // two lines of a row read as one thing rather than four lines.
+            if index > 0 {
+                ui.add_space(theme::SPACE_LG);
+            }
+            self.row_ui(ui, index, snap, rt);
+        }
+        ui.add_space(theme::SPACE_SM);
+        ui.label(theme::muted(ui, self.encode.clone()).small());
+        if let Some(err) = &self.error {
+            let p = theme::palette_of(ui);
+            ui.add_space(theme::SPACE_XS);
+            ui.add(egui::Label::new(RichText::new(err.clone()).color(p.danger)).wrap());
+        }
+        ui.add_space(theme::SPACE_MD);
+        ui.separator();
+        self.go_live_ui(ui, snap, rt);
     }
 
-    /// One platform: lamp, name, what it is doing, the numbers, its actions,
-    /// and the key pane when it is open. Every row is laid out on the same
-    /// columns whatever state it is in, so nothing moves as a stream comes up.
+    /// One platform, stacked to fit the drawer: the lamp, the name, and what
+    /// it is doing on the first line, then the numbers and the actions on the
+    /// second. Both lines keep fixed cells, so nothing moves as a stream
+    /// comes up.
     fn row_ui(&mut self, ui: &mut Ui, index: usize, snap: &Snapshot, rt: &dyn Runtime) {
         let p = theme::palette_of(ui);
         let state = self.row_state(index, snap);
@@ -382,6 +380,8 @@ impl DestinationsPanel {
             row_cell(ui, STATE_W, |ui| {
                 ui.label(RichText::new(word).color(color));
             });
+        });
+        ui.horizontal(|ui| {
             row_cell(ui, DROP_W, |ui| {
                 if let Some(n) = dropped {
                     // The meter's own color language: dropped frames are the
@@ -441,10 +441,7 @@ impl DestinationsPanel {
         if let Some(reason) = reason {
             // The reason the pipeline gave, verbatim and full width. It never
             // contains a key; the server strips that by construction.
-            ui.horizontal(|ui| {
-                ui.add_space(NAME_W);
-                ui.add(egui::Label::new(RichText::new(reason).color(p.danger)).wrap());
-            });
+            ui.add(egui::Label::new(RichText::new(reason).color(p.danger)).wrap());
         }
         if self.rows[index].entering {
             self.entry_ui(ui, index, rt);
@@ -477,34 +474,30 @@ impl DestinationsPanel {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
             ui.add_space(theme::SPACE_SM);
-            ui.horizontal(|ui| {
-                let mut label = None;
-                row_cell(ui, 88.0, |ui| {
-                    label = Some(ui.label(theme::muted(ui, "stream key")).id);
-                });
-                let field = ui.add(
-                    TextEdit::singleline(&mut self.rows[index].key_input)
-                        .desired_width(200.0)
-                        .password(true)
-                        .hint_text("paste the key"),
-                );
-                // A masked field has no visible text to take a name from, so
-                // it takes one from the label beside it. Its accessible role
-                // is a password input and its accessible value is the mask,
-                // so the key is not in the accessibility tree either.
-                if let Some(label) = label {
-                    field.labelled_by(label);
-                }
-                // A masked field cannot be proofread, so the count stands in
-                // for reading it back.
-                ui.label(theme::mono_muted(
-                    ui,
-                    format!(
-                        "{} characters",
-                        self.rows[index].key_input.trim().chars().count()
-                    ),
-                ));
-            });
+            // The label sits above the field rather than beside it: a key is
+            // long, the drawer is narrow, and the field is the one control
+            // here that must never be the thing that gets squeezed.
+            let label = ui.label(theme::muted(ui, "stream key")).id;
+            let field = ui.add(
+                TextEdit::singleline(&mut self.rows[index].key_input)
+                    .desired_width(f32::INFINITY)
+                    .password(true)
+                    .hint_text("paste the key"),
+            );
+            // A masked field has no visible text to take a name from, so it
+            // takes one from the label above it. Its accessible role is a
+            // password input and its accessible value is the mask, so the key
+            // is not in the accessibility tree either.
+            field.labelled_by(label);
+            // A masked field cannot be proofread, so the count stands in for
+            // reading it back.
+            ui.label(theme::mono_muted(
+                ui,
+                format!(
+                    "{} characters",
+                    self.rows[index].key_input.trim().chars().count()
+                ),
+            ));
             ui.checkbox(
                 &mut self.rows[index].remember,
                 "keep this key in this computer's keychain",
@@ -536,6 +529,10 @@ impl DestinationsPanel {
             )
         });
         let configured = self.configured_count(snap);
+        // The control and its counts on one line, the sentence wrapped under
+        // them: at the drawer's width a button and a sentence side by side is
+        // how a row runs off the edge.
+        let mut note = None;
         ui.horizontal(|ui| {
             if running {
                 if ui.button("Stop streaming").clicked() {
@@ -552,17 +549,14 @@ impl DestinationsPanel {
                 {
                     rt.send(Command::StartStream);
                 }
-                ui.label(theme::muted(
-                    ui,
-                    match configured {
-                        0 => "Add a key to stream somewhere.".to_owned(),
-                        1 => "Everyone in the session sees the on air lamp.".to_owned(),
-                        n => format!("{n} destinations, one at a time or all at once."),
-                    },
-                ));
+                note = Some(match configured {
+                    0 => "Add a key to stream somewhere.".to_owned(),
+                    1 => "Everyone in the session sees the on air lamp.".to_owned(),
+                    n => format!("{n} destinations, one at a time or all at once."),
+                });
             }
             // Counted in both states: every destination failing at once puts
-            // the sheet back on Go live, and that is exactly when the count
+            // the section back on Go live, and that is exactly when the count
             // must not disappear.
             let failed = snap.stream.failed_count();
             if failed > 0 {
@@ -574,6 +568,9 @@ impl DestinationsPanel {
                 );
             }
         });
+        if let Some(note) = note {
+            ui.add(egui::Label::new(theme::muted(ui, note).small()).wrap());
+        }
     }
 }
 
@@ -582,33 +579,6 @@ enum RowAction {
     UseSaved,
     Forget,
     ToggleEntry,
-}
-
-/// The reminder the whole room gets: the lamp plus what it is doing, beside
-/// the mouth-to-ear readout, for as long as anything is on air. Not host
-/// only, and not hidden behind a sheet.
-pub fn on_air_indicator(ui: &mut Ui, snap: &Snapshot) {
-    let live = snap.stream.live_count();
-    let failed = snap.stream.failed_count();
-    if live == 0 && failed == 0 {
-        return;
-    }
-    let p = theme::palette_of(ui);
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 5.0;
-        if live > 0 {
-            ui.label(theme::mono(ui, format!("{live} live")))
-                .on_hover_text("destinations currently receiving the broadcast");
-        }
-        if failed > 0 {
-            ui.label(
-                RichText::new(format!("{failed} failed"))
-                    .monospace()
-                    .color(p.danger),
-            )
-            .on_hover_text("a destination stopped; open destinations for the reason");
-        }
-    });
 }
 
 #[cfg(test)]

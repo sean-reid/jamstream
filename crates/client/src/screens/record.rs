@@ -1,14 +1,14 @@
-//! The record sheet and its lamp. The status bar has no room for a fifth
-//! button (it overlapped itself at 1280 once already), so Record follows
-//! the pattern Destinations established: a host-only sheet carrying the
-//! control, and a lamp beside the on-air lamp that everyone in the room
-//! sees whenever a take is running, uploading, or failed.
+//! The record sheet and the words its lamp uses. Record is the session's one
+//! performance action, so it keeps a button in the status bar and a sheet
+//! behind it; the lamp itself lives in the bar's centre cluster next to ON
+//! AIR, because a take and a broadcast are the two states everyone in the
+//! room needs to see at once.
 //!
-//! Nothing here echoes optimistically: the button sends the command and
-//! the lamp follows the snapshot, exactly as the destinations sheet
-//! follows its stream.
+//! Nothing here echoes optimistically: the button sends the command and the
+//! lamp follows the snapshot, exactly as the destinations section follows
+//! its stream.
 
-use egui::{Align, Align2, Button, Color32, Layout, RichText, Sense, Stroke, Ui, WidgetInfo, vec2};
+use egui::{Align, Align2, Button, Color32, Layout, RichText, Sense, Stroke, Ui, vec2};
 
 use crate::runtime::{Command, RecordState, Runtime, Snapshot};
 use crate::theme;
@@ -26,6 +26,27 @@ fn lamp_fill(state: &RecordState, p: &theme::Palette) -> Option<Color32> {
     }
 }
 
+/// What the centre cluster shows for the recorder: the word, its colour, and
+/// the sentence on hover. None while idle, which is what keeps an idle bar
+/// free of a cluster.
+pub fn record_state_lamp(
+    state: &RecordState,
+    p: &theme::Palette,
+) -> Option<(&'static str, Color32, String)> {
+    let color = lamp_fill(state, p)?;
+    let (label, hover) = match state {
+        // Never reached: lamp_fill answers None for idle.
+        RecordState::Idle => return None,
+        RecordState::Recording => ("REC", "this session is being recorded".to_owned()),
+        RecordState::Uploading => (
+            "UPLOADING",
+            "the take is on its way to storage; not done, not lost".to_owned(),
+        ),
+        RecordState::Failed { reason } => ("REC FAILED", reason.clone()),
+    };
+    Some((label, color, hover))
+}
+
 /// One record lamp at `center`, the on-air lamp's construction in the
 /// state's own color, so the two read as siblings in the bar.
 fn paint_lamp(ui: &Ui, center: egui::Pos2, fill: Option<Color32>) {
@@ -41,54 +62,6 @@ fn paint_lamp(ui: &Ui, center: egui::Pos2, fill: Option<Color32>) {
             .painter()
             .circle(center, 4.0, p.surface2, Stroke::new(1.0, p.border)),
     };
-}
-
-/// The reminder the whole room gets, beside the on-air lamp: nothing while
-/// idle, then the lamp and the state's word. A failure carries the
-/// recorder's reason verbatim on hover, because a recording that fails
-/// quietly is worse than one that never started.
-pub fn record_indicator(ui: &mut Ui, snap: &Snapshot) {
-    let state = &snap.record.state;
-    let p = theme::palette_of(ui);
-    let (label, color, hover) = match state {
-        RecordState::Idle => return,
-        RecordState::Recording => (
-            "recording",
-            p.text_primary,
-            "this session is being recorded".to_owned(),
-        ),
-        RecordState::Uploading => (
-            "uploading",
-            p.text_primary,
-            "the take is on its way to storage; not done, not lost".to_owned(),
-        ),
-        RecordState::Failed { reason } => ("take failed", p.danger, reason.clone()),
-    };
-    let font = egui::FontId::new(11.5, egui::FontFamily::Proportional);
-    let text_w = ui.fonts_mut(|f| {
-        f.layout_no_wrap(label.to_owned(), font.clone(), Color32::PLACEHOLDER)
-            .size()
-            .x
-    });
-    let (rect, response) = ui.allocate_exact_size(vec2(13.0 + text_w, 16.0), Sense::hover());
-    // The lamp is painted, so its state reaches a screen reader only if it
-    // is said out loud here, the same as the on-air lamp.
-    response.widget_info(|| WidgetInfo::labeled(egui::WidgetType::Label, true, label));
-    if ui.is_rect_visible(rect) {
-        paint_lamp(
-            ui,
-            egui::pos2(rect.left() + 5.0, rect.center().y),
-            lamp_fill(state, p),
-        );
-        ui.painter().text(
-            egui::pos2(rect.left() + 13.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            font,
-            color,
-        );
-    }
-    response.on_hover_text(hover);
 }
 
 /// The host's record sheet: the take's state, whether stems are being

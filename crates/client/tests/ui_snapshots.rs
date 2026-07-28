@@ -17,6 +17,7 @@ use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
 use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow, RegionSurvey};
 use jamstream_client::screens::invites::InvitesPanel;
+use jamstream_client::screens::session::SettingsTab;
 use jamstream_client::theme::{self, Theme};
 use jamstream_cloud::{Price, ProbeMatrix, ProviderKind, Region, RegionId, rank};
 
@@ -302,27 +303,104 @@ fn session_long_names() {
     snapshot(&mut harness, "session_long_names");
 }
 
+/// The drawer open on one tab. Every settings fixture goes through here, so
+/// the tab row in each of them is the one the app really builds for that
+/// role and screen.
+fn drawer_app(mut app: JamApp, tab: SettingsTab) -> JamApp {
+    app.settings_open = true;
+    app.settings_tab = tab;
+    app
+}
+
+/// Scrolls the drawer's panel to the end, for the tabs whose content is
+/// taller than the drawer. A fixture that did not scroll would show the top
+/// of a panel and call it the panel.
+fn scroll_drawer(harness: &mut Harness<'_>, size: egui::Vec2) {
+    harness.run_steps(2);
+    harness.event(egui::Event::PointerMoved(egui::pos2(
+        size.x - 100.0,
+        size.y / 2.0,
+    )));
+    harness.run_steps(1);
+    harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: vec2(0.0, -2000.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(3);
+    // The pointer leaves before the render: egui paints the cursor, and a
+    // published screenshot with an arrow parked in a text field in it is a
+    // screenshot of the test rather than of the product.
+    harness.event(egui::Event::PointerGone);
+    harness.run_steps(2);
+}
+
 #[test]
 fn session_settings() {
-    // The settings sheet anchors top right and must leave the strips and
-    // the status readout visible. Sam has no picture, so the avatar row
-    // shows the initials disc and the empty path field.
-    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
-    app.settings_open = true;
+    // The drawer anchors top right and must leave the strips and the status
+    // readout visible. A plain musician's tab row is Audio and You: the two
+    // session-scoped tabs are not rendered as dead slots, they are absent.
+    // Sam has no picture, so the You tab would show the initials disc.
+    let app = drawer_app(
+        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
+        SettingsTab::Audio,
+    );
     let mut harness = app_harness(app, WIDE);
     snapshot_for_docs(&mut harness, "session_settings");
+}
+
+#[test]
+fn session_settings_host_tabs() {
+    // The other tab row: a host this app launched has all four, so this is
+    // the fixture that proves the row adapts rather than greys out.
+    let app = drawer_app(
+        host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark),
+        SettingsTab::Audio,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_host_tabs");
 }
 
 #[test]
 fn session_settings_narrow() {
     // The drawer at the smallest window the app opens, over the busiest
     // session there is: buffer size and input level are both on screen with
-    // the two-row host bar under them, and the mouth-to-ear readout the
-    // buffer is traded against is visible in both places at once.
-    let mut app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
-    app.settings_open = true;
+    // the host bar under them, and the mouth-to-ear readout the buffer is
+    // traded against is visible in both places at once.
+    let app = drawer_app(
+        host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark),
+        SettingsTab::Audio,
+    );
     let mut harness = app_harness(app, NARROW);
     snapshot(&mut harness, "session_settings_narrow");
+}
+
+#[test]
+fn home_settings() {
+    // Settings from the home screen, outside any session: Audio and You, and
+    // no Broadcast or Invites, because there is no broadcast to mix and no
+    // seat to invite anyone into.
+    //
+    // The faint marks at the left edge are egui's, not ours: an anchored
+    // window's first pass lays out at the origin and is painted, which every
+    // other fixture hides behind session content. Identical on the commit
+    // before this one, so it is not a regression here.
+    let app = drawer_app(test_app(Theme::Dark), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "home_settings");
+}
+
+#[test]
+fn session_settings_you() {
+    // The You tab: the avatar row above the theme picker, which is where the
+    // two things you set once ended up.
+    let app = drawer_app(
+        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
+        SettingsTab::You,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_you");
 }
 
 #[test]
@@ -330,8 +408,10 @@ fn session_settings_avatar() {
     // The other half of the avatar row: a photograph picked this run,
     // through the same read, fit, and decode a picked file goes through, so
     // the disc, the file name, and the two sizes are all the real ones.
-    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Light);
-    app.settings_open = true;
+    let mut app = drawer_app(
+        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Light),
+        SettingsTab::You,
+    );
     app.load_avatar_from(avatar_fixture("rehearsal.jpg"));
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_avatar");
@@ -343,8 +423,10 @@ fn session_settings_avatar_refused() {
     // use: a .png that is really a GIF, which is the shape every refusal
     // takes on screen. The disc stays on the initials and the reason sits
     // under the row in the danger colour.
-    let mut app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark);
-    app.settings_open = true;
+    let mut app = drawer_app(
+        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
+        SettingsTab::You,
+    );
     app.load_avatar_from(fixture_file(
         "poster.png",
         b"GIF89a\x01\x00\x01\x00\x00\x00\x00;",
@@ -386,8 +468,9 @@ fn fixture_file(name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
-// The stream mix sheet over the host session: the frozen demo carries
-// distinct broadcast fader values, so rows show gain, pan, and a mute.
+// The Broadcast tab: stream mix above destinations, both at the drawer's
+// width. The frozen demo carries distinct broadcast fader values, so the mix
+// rows show gain, pan, and a mute rather than four identical rows.
 
 fn stream_mix_app(theme: Theme, audition: bool) -> JamApp {
     use jamstream_client::runtime::{Command, Runtime};
@@ -395,9 +478,7 @@ fn stream_mix_app(theme: Theme, audition: bool) -> JamApp {
     if audition {
         rt.send(Command::SetBroadcastAudition(true));
     }
-    let mut app = host_app(rt, theme);
-    app.session.broadcast_open = true;
-    app
+    drawer_app(host_app(rt, theme), SettingsTab::Broadcast)
 }
 
 #[test]
@@ -410,6 +491,32 @@ fn session_stream_mix() {
 fn session_stream_mix_light() {
     let mut harness = app_harness(stream_mix_app(Theme::Light, false), WIDE);
     snapshot(&mut harness, "session_stream_mix_light");
+}
+
+#[test]
+fn session_stream_mix_full_band() {
+    // Ten musicians, which is the design maximum and the real test of the
+    // mix rows at the drawer's width: ten names, ten gains, ten pans and ten
+    // mutes, none of them truncated into uselessness or off the edge.
+    let app = drawer_app(
+        host_app(DemoRuntime::full(FROZEN_FRAME, true, true), Theme::Dark),
+        SettingsTab::Broadcast,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_stream_mix_full_band");
+}
+
+#[test]
+fn session_stream_mix_long_names() {
+    // Names at the 64-character protocol cap in a cell 84 px wide: they
+    // truncate, and the full name is on hover, the same treatment a strip
+    // gives one.
+    let app = drawer_app(
+        host_app(DemoRuntime::long_names(FROZEN_FRAME, true), Theme::Dark),
+        SettingsTab::Broadcast,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_stream_mix_long_names");
 }
 
 #[test]
@@ -440,9 +547,11 @@ fn saved_keys(platforms: &[StreamPlatform]) -> Arc<MemStore> {
     store
 }
 
-/// The host session with the destinations sheet open: `saved` platforms have
-/// a key on this computer, `reported` is what the server says each
-/// destination is doing.
+/// The host session with the Broadcast tab open: `saved` platforms have a key
+/// on this computer, `reported` is what the server says each destination is
+/// doing. The destinations section sits under the stream mix, so these
+/// fixtures are scrolled to it, which is what a host looking at destinations
+/// is actually seeing.
 fn destinations_app(
     theme: Theme,
     saved: &[StreamPlatform],
@@ -452,8 +561,7 @@ fn destinations_app(
     rt.set_destinations(reported);
     let mut app = host_app(rt, theme);
     app.session.destinations = Some(DestinationsPanel::new(saved_keys(saved)));
-    app.session.destinations_open = true;
-    app
+    drawer_app(app, SettingsTab::Broadcast)
 }
 
 fn live(platform: StreamPlatform) -> (StreamPlatform, DestinationState) {
@@ -484,8 +592,8 @@ fn session_destinations_key() {
     // Publishable: this is a host who clicked Add key and typed one. The
     // keychain behind it is empty, which is a first-time host's real state,
     // and it is why Twitch still reads "no key" and Go live is still off.
-    // Nothing else is stubbed: the status bar carries Invites, Stream mix,
-    // and Destinations, because the fixture is a real host.
+    // Nothing else is stubbed: the tab row carries all four tabs and the bar
+    // carries Record, because the fixture is a real host.
     let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
     let mut app = host_app(rt, Theme::Dark);
     app.session.destinations = Some(DestinationsPanel::with_key_entry(
@@ -493,8 +601,12 @@ fn session_destinations_key() {
         StreamPlatform::Twitch,
         FAKE_KEY,
     ));
-    app.session.destinations_open = true;
+    let app = drawer_app(app, SettingsTab::Broadcast);
     let mut harness = app_harness(app, WIDE);
+    // Scrolled to the key pane, which is where a host who just pressed Add
+    // key is looking. Unscrolled, the field would be on screen and the Save
+    // that sends it would not, which is not the state anyone is ever in.
+    scroll_drawer(&mut harness, WIDE);
     snapshot_for_docs(&mut harness, "session_destinations_key");
 }
 
@@ -522,12 +634,16 @@ fn session_destinations_live() {
 
 #[test]
 fn session_destinations_live_two() {
+    // Scrolled to the destinations themselves, so the published image shows
+    // both live rows and the control that takes them off air rather than the
+    // stream mix above them.
     let app = destinations_app(
         Theme::Dark,
         &[],
         &[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)],
     );
     let mut harness = app_harness(app, WIDE);
+    scroll_drawer(&mut harness, WIDE);
     snapshot_for_docs(&mut harness, "session_destinations_live_two");
 }
 
@@ -550,13 +666,15 @@ fn session_destinations_failed() {
         ],
     );
     let mut harness = app_harness(app, WIDE);
+    scroll_drawer(&mut harness, WIDE);
     snapshot_for_docs(&mut harness, "session_destinations_failed");
 }
 
 #[test]
 fn session_destinations_narrow() {
-    // At 800 px the status bar carries four toggles, the cost ticker, the
-    // lamp, and the live count; nothing may overlap.
+    // The Broadcast tab in the smallest window the app opens, over a bar
+    // that is on air: the drawer keeps its width, the sections stack inside
+    // it, and nothing may overlap the readouts underneath.
     let app = destinations_app(
         Theme::Dark,
         &[],
@@ -568,13 +686,81 @@ fn session_destinations_narrow() {
 
 #[test]
 fn session_on_air_musician() {
-    // Not a host, no sheet, no controls: a musician still sees that the room
-    // is on air and to how many places.
+    // Not a host, no drawer, no controls: a musician still sees the ON AIR
+    // lamp in the centre of the bar, because a musician is the one being
+    // broadcast.
     let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
     rt.set_destinations(&[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)]);
     let app = session_app(rt, Theme::Dark);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_on_air_musician");
+}
+
+// The bar's centre cluster, in the four combinations that matter. The lamps
+// are the loudest thing in the bar when lit and absent when not, so these
+// four are the fixtures the restructure lives or dies on.
+
+#[test]
+fn session_bar_idle() {
+    // Neither lamp lit: the cluster reserves nothing and the bar is calm.
+    let app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_bar_idle");
+}
+
+#[test]
+fn session_bar_on_air() {
+    // On air and not recording: one lamp, centred.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_destinations(&[live(StreamPlatform::Twitch)]);
+    let app = host_app(rt, Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_bar_on_air");
+}
+
+#[test]
+fn session_bar_both_lamps() {
+    // Both: being broadcast and being recorded, side by side in the middle of
+    // the bar, in their own colours. This is the state the restructure exists
+    // for, and the one that used to have its two halves at opposite ends.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_destinations(&[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)]);
+    rt.set_record(RecordState::Recording, false);
+    let app = host_app(rt, Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_bar_both_lamps");
+}
+
+#[test]
+fn session_bar_both_lamps_narrow() {
+    // The same pair at the smallest window the app opens, which is where the
+    // bar overflowed itself in #85.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_destinations(&[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)]);
+    rt.set_record(RecordState::Recording, false);
+    let app = host_app(rt, Theme::Dark);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_bar_both_lamps_narrow");
+}
+
+#[test]
+fn session_bar_stream_failed() {
+    // A destination stopped while a take runs: the failure is in the cluster
+    // with the take, in the danger colour, and it says where the reason is.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_destinations(&[
+        live(StreamPlatform::Twitch),
+        (
+            StreamPlatform::YouTube,
+            DestinationState::Failed {
+                reason: "pusher exited: rtmp connection refused".to_owned(),
+            },
+        ),
+    ]);
+    rt.set_record(RecordState::Uploading, false);
+    let app = host_app(rt, Theme::Dark);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_bar_stream_failed");
 }
 
 // The record sheet and its lamp, in the states a take passes through. The
@@ -1020,8 +1206,7 @@ fn session_invites_app(theme: Theme) -> JamApp {
     panel.revoke(revoked, Some("Ben".to_owned()));
     let mut app = host_app(rt, theme);
     app.session.invites = Some(panel);
-    app.session.invites_open = true;
-    app
+    drawer_app(app, SettingsTab::Invites)
 }
 
 #[test]
@@ -1034,4 +1219,12 @@ fn session_invites() {
 fn session_invites_light() {
     let mut harness = app_harness(session_invites_app(Theme::Light), WIDE);
     snapshot(&mut harness, "session_invites_light");
+}
+
+#[test]
+fn session_invites_narrow() {
+    // The Invites tab at the smallest window: every seat's two lines and its
+    // own actions inside the drawer's width, with the bar clear underneath.
+    let mut harness = app_harness(session_invites_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "session_invites_narrow");
 }

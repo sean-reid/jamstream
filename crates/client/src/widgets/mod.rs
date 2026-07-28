@@ -15,7 +15,7 @@ pub use avatar::{
 };
 pub use db_drag::db_drag;
 pub use fader::{FADER_DEFAULT_DB, FADER_MAX_DB, FADER_MIN_DB, db_to_t, fader, t_to_db};
-pub use lamp::{lamp, lamp_toggle, on_air};
+pub use lamp::{lamp, lamp_toggle, state_lamp, state_lamp_width};
 pub use meter::{Meter, meter};
 pub use pan::pan_slider;
 pub use pick::{PICK_DOT, PICK_INDENT, PICK_ROW_H, pick_row, row_cell};

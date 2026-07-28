@@ -1,36 +1,51 @@
 //! The session screen: mixer strips on the left, chat on the right, and a
-//! status bar where latency, cost, and connection quality live in the same
-//! place every session. Below 900 px the chat collapses behind a toggle so
-//! nothing overlaps.
+//! status bar in three zones. Below 900 px the chat collapses behind a toggle
+//! so nothing overlaps.
+//!
+//! # The bar's three zones
+//!
+//! Health on the left, state in the centre, meter and action on the right.
+//! The centre is the point of it: ON AIR and REC are the two states in the
+//! product with consequences outside the room, and they used to sit at
+//! opposite ends of the bar with the session id and the cost ticker between
+//! them. They are one cluster now, in the middle, in their own colours, and
+//! the cluster takes no space at all while both are off.
+//!
+//! What the link is doing beyond the headline number, rtt and buffer depth
+//! and loss, is on that number's hover. It is diagnostic: worth reading when
+//! something sounds wrong, not worth a permanent five words in the one place
+//! a musician looks mid-song.
 
 use egui::{
-    Align, Align2, Button, CornerRadius, Layout, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui,
-    vec2,
+    Align, Align2, Button, CornerRadius, FontFamily, FontId, Layout, RichText, ScrollArea, Sense,
+    Stroke, TextEdit, Ui, UiBuilder, vec2,
 };
 
 use crate::runtime::{
     BroadcastView, ChatLine, Command, ConnState, FaderView, MemberView, Role, Runtime, Snapshot,
 };
-use crate::screens::destinations::{DestinationsPanel, on_air_indicator};
+use crate::screens::destinations::DestinationsPanel;
 use crate::screens::invites::{InvitesEvent, InvitesPanel};
-use crate::screens::record::{record_indicator, record_sheet};
+use crate::screens::record::{record_sheet, record_state_lamp};
 use crate::theme;
 use crate::widgets::{
-    AVATAR_D_STRIP, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, on_air, pan_slider,
-    status_dot,
+    AVATAR_D_STRIP, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, pan_slider, state_lamp,
+    state_lamp_width, status_dot,
 };
 
 const NARROW_BELOW_PX: f32 = 900.0;
 
-/// A host's bar stacks into two rows below this. The one-row form needs the
-/// readouts without their meters but with the record lamp lit, 505, beside
-/// the full set of controls, 730: four sheet toggles, the on-air lamp, the
-/// session id, the timer, the cost, and Leave.
-const BAR_STACK_BELOW_PX: f32 = 1240.0;
-
 /// What the pair of compact meters needs beside the readouts: two 52 px
 /// meters, their labels, the separator, and the gaps between them.
 const BAR_METERS_W: f32 = 180.0;
+
+/// What the health zone needs with its meters dropped: the connection dot,
+/// the mouth-to-ear number, and the two lines of unit beside it. The bar
+/// stacks rather than squeeze this.
+const BAR_HEALTH_MIN_W: f32 = 132.0;
+
+/// The gap each zone keeps from the centre cluster.
+const BAR_ZONE_GAP: f32 = theme::SPACE_LG;
 
 // Console geometry: every strip is exactly this wide regardless of content.
 const STRIP_W: f32 = 104.0;
@@ -67,6 +82,29 @@ pub enum SessionEvent {
     EndSession,
 }
 
+/// A tab in the settings drawer. Which of these exist depends on the role
+/// and on whether there is a session at all, so the row is built per frame
+/// rather than fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Audio,
+    Broadcast,
+    Invites,
+    You,
+}
+
+impl SettingsTab {
+    /// Short enough for four of them to fit the drawer's width.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Audio => "Audio",
+            SettingsTab::Broadcast => "Broadcast",
+            SettingsTab::Invites => "Invites",
+            SettingsTab::You => "You",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SessionScreen {
     pub chat_input: String,
@@ -75,18 +113,13 @@ pub struct SessionScreen {
     pub confirm_revoke: Option<(crate::runtime::MemberId, String)>,
     /// Narrow layout only: chat shown instead of the mixer.
     pub chat_open: bool,
-    /// Host sessions launched by this app carry the invite book; plain
-    /// joins have none and show no panel.
+    /// Host sessions launched by this app carry the invite book; plain joins
+    /// have none, and the settings drawer shows them no Invites tab.
     pub invites: Option<InvitesPanel>,
-    pub invites_open: bool,
-    /// Host only: the stream mix sheet. Snapshots without a broadcast view
-    /// never show the toggle, so this stays false for everyone else.
-    pub broadcast_open: bool,
-    /// Host sessions this app launched carry the destinations sheet; it needs
-    /// the credential store, so plain joins have none and show no toggle,
-    /// exactly like the invites panel.
+    /// Host sessions this app launched carry the destinations panel; it needs
+    /// the credential store, so plain joins have none, exactly like the
+    /// invite book.
     pub destinations: Option<DestinationsPanel>,
-    pub destinations_open: bool,
     /// Host only: the record sheet. It needs nothing but the runtime, so it
     /// hangs off the snapshot's `is_host` rather than a panel of its own;
     /// everyone else gets the lamp in the bar.
@@ -119,19 +152,9 @@ impl SessionScreen {
                     panel.confirm_revoke = None;
                     panel.confirm_end = false;
                 }
-            } else if self.broadcast_open {
-                // Closing the sheet is navigation; audition keeps playing
-                // until it is switched off.
-                self.broadcast_open = false;
-            } else if self.destinations_open {
-                // Same rule: closing the sheet is navigation and never takes
-                // the session off air.
-                self.destinations_open = false;
             } else if self.record_open {
-                // And again: the take keeps running; only the sheet closes.
+                // Closing the sheet is navigation: the take keeps running.
                 self.record_open = false;
-            } else if self.invites_open {
-                self.invites_open = false;
             } else if narrow && self.chat_open {
                 self.chat_open = false;
             }
@@ -167,31 +190,55 @@ impl SessionScreen {
             }
         }
 
-        if self.invites_open
-            && snap.is_host
-            && let Some(panel) = &mut self.invites
-            && let Some(InvitesEvent::EndSession) = panel.ui(ui, snap, rt, &mut self.invites_open)
-        {
-            event = Some(SessionEvent::EndSession);
-        }
-
-        if self.broadcast_open && snap.broadcast.is_some() {
-            self.stream_mix_ui(ui, snap, rt);
-        }
-
-        if self.destinations_open
-            && snap.is_host
-            && let Some(panel) = &mut self.destinations
-        {
-            panel.ui(ui, snap, rt, &mut self.destinations_open);
-        }
-
         if self.record_open && snap.is_host {
             record_sheet(ui, snap, rt, &mut self.record_open);
         }
 
         self.confirm_windows(ui, rt, &mut event);
         event
+    }
+
+    /// Which settings tabs this session has to offer, in order. A tab that
+    /// would open an empty panel is not offered at all: a plain join has no
+    /// invite book and nothing to stream, so it sees Audio and You and no gap
+    /// where the others were.
+    pub fn settings_tabs(&self, snap: &Snapshot) -> Vec<SettingsTab> {
+        let mut tabs = vec![SettingsTab::Audio];
+        if snap.is_host && (snap.broadcast.is_some() || self.destinations.is_some()) {
+            tabs.push(SettingsTab::Broadcast);
+        }
+        if snap.is_host && self.invites.is_some() {
+            tabs.push(SettingsTab::Invites);
+        }
+        tabs.push(SettingsTab::You);
+        tabs
+    }
+
+    /// The Broadcast tab: what listeners hear, then where it goes. That order
+    /// is the signal's own, and it is the order a host sets them up in.
+    pub fn broadcast_tab(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) {
+        if snap.broadcast.is_some() {
+            self.stream_mix_ui(ui, snap, rt);
+        }
+        if let Some(panel) = &mut self.destinations {
+            if snap.broadcast.is_some() {
+                ui.add_space(theme::SPACE_XL);
+            }
+            panel.ui(ui, snap, rt);
+        }
+    }
+
+    /// The Invites tab, which exists only for a host this app launched.
+    pub fn invites_tab(
+        &mut self,
+        ui: &mut Ui,
+        snap: &Snapshot,
+        rt: &dyn Runtime,
+    ) -> Option<SessionEvent> {
+        let panel = self.invites.as_mut()?;
+        panel
+            .ui(ui, snap, rt)
+            .map(|InvitesEvent::EndSession| SessionEvent::EndSession)
     }
 
     fn mixer_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) {
@@ -417,59 +464,44 @@ impl SessionScreen {
         }
     }
 
-    /// The host's broadcast mix sheet: one compact row per musician, the
-    /// host's own channel included (listeners hear it too), plus the
-    /// audition switch. Deliberately unlike the monitor strips: horizontal
-    /// rows on a sheet, so the two mixes are never mistaken for each other.
+    /// The host's broadcast mix: one compact row per musician, the host's own
+    /// channel included (listeners hear it too), plus the audition switch.
+    /// Deliberately unlike the monitor strips: horizontal rows, so the two
+    /// mixes are never mistaken for each other.
     fn stream_mix_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) {
         let Some(broadcast) = &snap.broadcast else {
             return;
         };
-        egui::Window::new("Stream mix")
-            .title_bar(false)
-            .frame(theme::sheet_frame(theme::palette_of(ui)))
-            .anchor(Align2::RIGHT_TOP, theme::SHEET_OFFSET)
-            .fixed_size(vec2(384.0, 0.0))
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(theme::title(ui, "Stream mix"));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
-                            self.broadcast_open = false;
-                        }
-                    });
-                });
-                ui.label(theme::muted(
-                    ui,
-                    "What listeners and the stream hear. Your monitor mix is unaffected.",
-                ));
-                ui.add_space(theme::SPACE_SM);
-                egui::Grid::new("stream-mix-grid")
-                    .num_columns(4)
-                    .spacing(vec2(theme::SPACE_MD, 4.0))
-                    .show(ui, |ui| {
-                        for member in snap.members.iter().filter(|m| m.role == Role::Musician) {
-                            stream_mix_row(ui, member, broadcast, rt);
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(theme::SPACE_MD);
-                ui.separator();
-                let lit = broadcast.audition;
-                let response = lamp_toggle(ui, "audition stream mix", lit).on_hover_text(if lit {
-                    "you are hearing the stream mix; switch off to get your monitor mix back"
-                } else {
-                    "swap your monitor for the exact mix listeners hear, your own voice included"
-                });
-                if response.clicked() {
-                    rt.send(Command::SetBroadcastAudition(!lit));
-                }
-                ui.label(theme::muted(
-                    ui,
-                    "While on, your monitor is the stream mix, your own voice included.",
-                ));
-            });
+        ui.label(theme::title(ui, "Stream mix"));
+        ui.label(
+            theme::muted(
+                ui,
+                "What listeners and the stream hear. Your monitor mix is unaffected.",
+            )
+            .small(),
+        );
+        ui.add_space(theme::SPACE_SM);
+        for member in snap.members.iter().filter(|m| m.role == Role::Musician) {
+            stream_mix_row(ui, member, broadcast, rt);
+        }
+        ui.add_space(theme::SPACE_MD);
+        ui.separator();
+        let lit = broadcast.audition;
+        let response = lamp_toggle(ui, "audition stream mix", lit).on_hover_text(if lit {
+            "you are hearing the stream mix; switch off to get your monitor mix back"
+        } else {
+            "swap your monitor for the exact mix listeners hear, your own voice included"
+        });
+        if response.clicked() {
+            rt.send(Command::SetBroadcastAudition(!lit));
+        }
+        ui.add(egui::Label::new(
+            theme::muted(
+                ui,
+                "While on, your monitor is the stream mix, your own voice included.",
+            )
+            .small(),
+        ));
     }
 
     fn metronome_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, row_w: f32) {
@@ -565,123 +597,117 @@ impl SessionScreen {
 
     /// Everything numeric here is monospace so the bar never wobbles.
     ///
-    /// A host's bar carries four sheet toggles, the cost ticker, and the
-    /// timer on top of everything a musician sees, and this bar may never
-    /// overlap. Two rules keep it apart: below [`BAR_STACK_BELOW_PX`] a
-    /// host's controls take a row of their own, and on one row the controls
-    /// are measured first so the readouts get only what is left over.
+    /// The zones are placed rather than flowed: the cluster is centred on the
+    /// bar, and health and controls get the halves on either side of it. Two
+    /// rules keep each zone inside its own half: health drops its meters below
+    /// [`BAR_METERS_W`], and the bar stacks into two rows when either zone
+    /// needs more than a half. For a host that lands at about 850 px with the
+    /// cluster empty, 910 with one lamp lit and 960 with both, measured by
+    /// `the_one_row_threshold_is_where_the_zones_stop_fitting`; a musician's
+    /// narrower controls keep one row down past the 800 px minimum window.
     fn status_bar(&mut self, ui: &mut Ui, snap: &Snapshot) {
         ui.add_space(theme::SPACE_SM);
-        if snap.is_host && ui.available_width() < BAR_STACK_BELOW_PX {
-            ui.horizontal(|ui| status_readouts(ui, snap));
+        let cluster_w = state_cluster_width(ui, snap);
+        let controls_w = self.controls_width(ui, snap);
+        let full = ui.available_width();
+        // A centred cluster splits what is left into two equal halves, so one
+        // row needs the WIDER of the two zones to fit in a half, not the sum
+        // of them to fit in the whole. Summing was wrong and it showed: at 800
+        // the id and the timer were drawn straight through both lamps, because
+        // a right-to-left layout given a rect too narrow for its content runs
+        // out of the left edge of it rather than clipping.
+        let half = (full - cluster_w) / 2.0 - BAR_ZONE_GAP;
+        let one_row = controls_w <= half && BAR_HEALTH_MIN_W <= half;
+        if one_row {
+            let row_h = ui.spacing().interact_size.y.max(28.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(full, row_h), Sense::hover());
+            let centre = rect.center().x;
+            let cluster = egui::Rect::from_min_max(
+                egui::pos2(centre - cluster_w / 2.0, rect.top()),
+                egui::pos2(centre + cluster_w / 2.0, rect.bottom()),
+            );
+            let health = rect.with_max_x(cluster.left() - BAR_ZONE_GAP);
+            let controls = rect.with_min_x(cluster.right() + BAR_ZONE_GAP);
+            ui.scope_builder(UiBuilder::new().max_rect(health), |ui| {
+                ui.horizontal_centered(|ui| status_readouts(ui, snap));
+            });
+            if cluster_w > 0.0 {
+                ui.scope_builder(UiBuilder::new().max_rect(cluster), |ui| {
+                    ui.horizontal_centered(|ui| state_cluster(ui, snap));
+                });
+            }
+            ui.scope_builder(UiBuilder::new().max_rect(controls), |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.status_controls(ui, snap);
+                    });
+                });
+            });
+        } else {
+            // Two rows, and the cluster keeps the readouts' company rather
+            // than the controls': both halves of that row are about what the
+            // session is doing, not what to press.
+            ui.horizontal(|ui| {
+                status_readouts(ui, snap);
+                state_cluster(ui, snap);
+            });
             ui.add_space(theme::SPACE_SM);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     self.status_controls(ui, snap);
                 });
             });
-        } else {
-            egui::containers::Sides::new().shrink_left().show(
-                ui,
-                |ui| status_readouts(ui, snap),
-                |ui| self.status_controls(ui, snap),
-            );
         }
         ui.add_space(theme::SPACE_SM);
     }
 
-    /// The control half: the four host sheets, the cost ticker, the on air
-    /// lamp, and the way out. Laid out right to left by the caller.
+    /// The action zone, right to left: the way out, a divider, the one
+    /// performance action, and the meter a host is spending against. Leave
+    /// keeps its own colour and never sits flush against Record: one ends the
+    /// session for you, the other is pressed between songs.
     fn status_controls(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        let p = theme::palette_of(ui);
+        if ui
+            .add(Button::new(RichText::new("Leave").color(egui::Color32::WHITE)).fill(p.danger))
+            .clicked()
         {
-            {
-                let p = theme::palette_of(ui);
-                if ui
-                    .add(
-                        Button::new(RichText::new("Leave").color(egui::Color32::WHITE))
-                            .fill(p.danger),
-                    )
-                    .clicked()
-                {
-                    self.confirm_leave = true;
-                }
-                if snap.is_host
-                    && self.invites.is_some()
-                    && ui
-                        .add(Button::new("Invites").selected(self.invites_open))
-                        .clicked()
-                {
-                    self.invites_open = !self.invites_open;
-                    // The host sheets share one anchor; only one is ever
-                    // open.
-                    if self.invites_open {
-                        self.broadcast_open = false;
-                        self.destinations_open = false;
-                        self.record_open = false;
-                    }
-                }
-                if let Some(cost) = &snap.cost {
-                    ui.label(theme::mono(
-                        ui,
-                        format!("{} so far", theme::microusd(cost.accrued_microusd)),
-                    ));
-                    ui.label(theme::mono_muted(
-                        ui,
-                        format!(
-                            "{:02}:{:02}:{:02}",
-                            cost.elapsed_secs / 3600,
-                            (cost.elapsed_secs / 60) % 60,
-                            cost.elapsed_secs % 60
-                        ),
-                    ));
-                }
-                ui.label(theme::mono_muted(ui, snap.session_short.clone()));
-                // The lamp everyone in the room can see, host or not.
-                on_air(ui, snap.stream.on_air());
-                // Both toggles sit with the lamp: they are about what leaves
-                // the session, not what anyone monitors.
-                if snap.is_host
-                    && self.destinations.is_some()
-                    && ui
-                        .add(Button::new("Destinations").selected(self.destinations_open))
-                        .clicked()
-                {
-                    self.destinations_open = !self.destinations_open;
-                    if self.destinations_open {
-                        self.invites_open = false;
-                        self.broadcast_open = false;
-                        self.record_open = false;
-                    }
-                }
-                // Record sits with Destinations for the same reason: a take
-                // leaves the session too. The sheet needs only the runtime,
-                // so the toggle hangs off the snapshot alone.
-                if snap.is_host
-                    && ui
-                        .add(Button::new("Record").selected(self.record_open))
-                        .clicked()
-                {
-                    self.record_open = !self.record_open;
-                    if self.record_open {
-                        self.invites_open = false;
-                        self.broadcast_open = false;
-                        self.destinations_open = false;
-                    }
-                }
-                if snap.broadcast.is_some()
-                    && ui
-                        .add(Button::new("Stream mix").selected(self.broadcast_open))
-                        .clicked()
-                {
-                    self.broadcast_open = !self.broadcast_open;
-                    if self.broadcast_open {
-                        self.invites_open = false;
-                        self.destinations_open = false;
-                        self.record_open = false;
-                    }
-                }
-            }
+            self.confirm_leave = true;
         }
+        bar_divider(ui);
+        if snap.is_host
+            && ui
+                .add(Button::new("Record").selected(self.record_open))
+                .on_hover_text("start or end a take")
+                .clicked()
+        {
+            self.record_open = !self.record_open;
+        }
+        if let Some(cost) = &snap.cost {
+            ui.label(theme::mono(
+                ui,
+                format!("{} so far", theme::microusd(cost.accrued_microusd)),
+            ));
+            ui.label(theme::mono_muted(ui, elapsed(cost.elapsed_secs)));
+        }
+        ui.label(theme::mono_muted(ui, snap.session_short.clone()))
+            .on_hover_text("this session's id");
+    }
+
+    /// What the action zone needs, measured rather than guessed, because the
+    /// one-row decision is made before any of it is drawn.
+    fn controls_width(&self, ui: &mut Ui, snap: &Snapshot) -> f32 {
+        let gap = ui.spacing().item_spacing.x;
+        let pad = 2.0 * ui.spacing().button_padding.x;
+        let mut w = button_text_width(ui, "Leave") + pad + gap + SEPARATOR_W;
+        if snap.is_host {
+            w += gap + button_text_width(ui, "Record") + pad;
+        }
+        if let Some(cost) = &snap.cost {
+            let money = format!("{} so far", theme::microusd(cost.accrued_microusd));
+            w += gap + mono_text_width(ui, &money);
+            w += gap + mono_text_width(ui, &elapsed(cost.elapsed_secs));
+        }
+        w + gap + mono_text_width(ui, &snap.session_short)
     }
 
     fn confirm_windows(&mut self, ui: &mut Ui, rt: &dyn Runtime, event: &mut Option<SessionEvent>) {
@@ -763,11 +789,17 @@ impl SessionScreen {
     }
 }
 
-/// One compact broadcast row: name, dB drag-value, pan, mute. Everything
-/// is enabled, the host's own channel included; listeners hear that too.
-/// Any change sends the row's full fader state.
+/// One compact broadcast row: name, dB drag-value, pan, mute, on one line at
+/// the drawer's width with ten of them possible. Everything is enabled, the
+/// host's own channel included; listeners hear that too. Any change sends the
+/// row's full fader state.
 fn stream_mix_row(ui: &mut Ui, member: &MemberView, broadcast: &BroadcastView, rt: &dyn Runtime) {
-    const NAME_W: f32 = 116.0;
+    /// The four cells, sized so the row fits the drawer with the gaps between
+    /// them: a name that truncates with the full one on hover, and three
+    /// controls that may not shrink, because a 40 px fader is not a control.
+    const NAME_W: f32 = 84.0;
+    const GAIN_W: f32 = 58.0;
+    const MUTE_W: f32 = 52.0;
     let view = broadcast
         .faders
         .iter()
@@ -781,47 +813,50 @@ fn stream_mix_row(ui: &mut Ui, member: &MemberView, broadcast: &BroadcastView, r
             |(_, f)| *f,
         );
 
-    ui.allocate_ui_with_layout(
-        vec2(NAME_W, ROW_H),
-        Layout::left_to_right(Align::Center),
-        |ui| {
-            ui.set_min_width(NAME_W);
-            let you_w = if member.is_you { 34.0 } else { 0.0 };
-            let name_w = (NAME_W - you_w).max(10.0);
-            let response = ui
-                .allocate_ui_with_layout(
-                    vec2(name_w, 18.0),
-                    Layout::left_to_right(Align::Center),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(member.name.clone()).strong())
-                                .truncate(),
-                        )
-                    },
-                )
-                .inner;
-            if member.name.chars().count() > 12 {
-                response.on_hover_text(member.name.clone());
-            }
-            if member.is_you {
-                ui.label(theme::muted(ui, "you"));
-            }
-        },
-    );
-
     let mut gain = view.gain_db;
     let mut pan = view.pan;
     let mut muted = view.muted;
     let mut changed = false;
-    changed |= db_drag(
-        ui,
-        &format!("{} stream gain", member.name),
-        &mut gain,
-        vec2(68.0, ROW_H),
-    )
-    .changed();
-    changed |= pan_slider(ui, &format!("{} stream pan", member.name), &mut pan).changed();
-    changed |= mute_button(ui, &mut muted, 52.0, MUTE_STREAM_HOVER);
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            vec2(NAME_W, ROW_H),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_min_width(NAME_W);
+                let you_w = if member.is_you { 30.0 } else { 0.0 };
+                let name_w = (NAME_W - you_w).max(10.0);
+                let response = ui
+                    .allocate_ui_with_layout(
+                        vec2(name_w, 18.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(member.name.clone()).strong())
+                                    .truncate(),
+                            )
+                        },
+                    )
+                    .inner;
+                // The cell truncates past about eight characters here, so the
+                // hover is the full name from that point on.
+                if member.name.chars().count() > 8 {
+                    response.on_hover_text(member.name.clone());
+                }
+                if member.is_you {
+                    ui.label(theme::muted(ui, "you").small());
+                }
+            },
+        );
+        changed |= db_drag(
+            ui,
+            &format!("{} stream gain", member.name),
+            &mut gain,
+            vec2(GAIN_W, ROW_H),
+        )
+        .changed();
+        changed |= pan_slider(ui, &format!("{} stream pan", member.name), &mut pan).changed();
+        changed |= mute_button(ui, &mut muted, MUTE_W, MUTE_STREAM_HOVER);
+    });
     if changed {
         rt.send(Command::SetBroadcastFader {
             member: member.id,
@@ -865,23 +900,60 @@ fn chat_line(ui: &mut Ui, line: &ChatLine) {
     });
 }
 
-/// The instrument half: connection, the headline latency, what is leaving
-/// the room, and the link numbers.
+/// The health zone: the connection dot, the one number worth a glance
+/// mid-song, and the input and output meters when there is room for them.
 fn status_readouts(ui: &mut Ui, snap: &Snapshot) {
-    {
-        let s = &snap.stats;
-        status_dot(
+    let s = &snap.stats;
+    status_dot(
+        ui,
+        matches!(s.state, ConnState::Joined),
+        s.rtt_ms,
+        s.loss_pct,
+    );
+    latency_readout(ui, snap);
+    // The audition reminder lives beside the headline readout so the host can
+    // never forget what they are hearing.
+    if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
+        audition_indicator(ui);
+    }
+    // The compact meters are the first thing to go when the bar gets tight.
+    // What is left here is the room the zone was given, so this is the real
+    // question: do the meters fit in it, or not.
+    if ui.available_width() > BAR_METERS_W {
+        ui.separator();
+        ui.label(theme::muted(ui, "in"));
+        meter(
             ui,
-            matches!(s.state, ConnState::Joined),
-            s.rtt_ms,
-            s.loss_pct,
+            "bar-in",
+            snap.levels.input_peak,
+            snap.levels.input_rms,
+            vec2(52.0, 10.0),
+            Meter::Horizontal,
         );
-        // Mouth to ear is the headline number: an instrument readout,
-        // fixed-width digits so nothing wobbles.
-        let p = theme::palette_of(ui);
-        let m2e = s
-            .mouth_to_ear_ms
-            .map_or("--.-".to_owned(), |v| format!("{v:>4.1}"));
+        ui.label(theme::muted(ui, "out"));
+        meter(
+            ui,
+            "bar-out",
+            snap.levels.output_peak,
+            snap.levels.output_rms,
+            vec2(52.0, 10.0),
+            Meter::Horizontal,
+        );
+    }
+}
+
+/// Mouth to ear, the headline number, with everything else the link reports
+/// on its hover: rtt, buffer depth against target, and loss. Those three are
+/// what someone reads when the sound is wrong, and reading them is a
+/// deliberate act; carrying them permanently cost the bar the space its two
+/// lamps now use.
+fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
+    let s = &snap.stats;
+    let p = theme::palette_of(ui);
+    let m2e = s
+        .mouth_to_ear_ms
+        .map_or("--.-".to_owned(), |v| format!("{v:>4.1}"));
+    let group = ui.horizontal(|ui| {
         ui.label(
             RichText::new(m2e)
                 .monospace()
@@ -898,51 +970,131 @@ fn status_readouts(ui: &mut Ui, snap: &Snapshot) {
             );
             ui.label(RichText::new("mouth to ear").size(9.5).color(p.text_muted));
         });
-        // The audition reminder lives beside the headline readout so
-        // the host can never forget what they are hearing.
-        if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
-            audition_indicator(ui);
-        }
-        // Same place, same reason: what is leaving the room, for
-        // everyone in it, whether or not a sheet is open.
-        on_air_indicator(ui, snap);
-        // The record lamp keeps the on-air lamp's company: a take leaves
-        // the room too, and everyone in it is on the take.
-        record_indicator(ui, snap);
-        ui.separator();
-        let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
-        ui.label(theme::mono(ui, format!("rtt {rtt} ms")));
-        ui.label(theme::mono(
-            ui,
-            format!("buffer {}/{}", s.jitter_depth, s.jitter_target),
-        ));
-        ui.label(theme::mono(ui, format!("loss {:.1}%", s.loss_pct)));
-        // The compact meters are the first thing to go when the bar
-        // gets tight. What is left here is the room the controls did
-        // not take, so this is the real question: do the meters fit
-        // beside everything else, or not.
-        if ui.available_width() > BAR_METERS_W {
-            ui.separator();
-            ui.label(theme::muted(ui, "in"));
-            meter(
-                ui,
-                "bar-in",
-                snap.levels.input_peak,
-                snap.levels.input_rms,
-                vec2(52.0, 10.0),
-                Meter::Horizontal,
-            );
-            ui.label(theme::muted(ui, "out"));
-            meter(
-                ui,
-                "bar-out",
-                snap.levels.output_peak,
-                snap.levels.output_rms,
-                vec2(52.0, 10.0),
-                Meter::Horizontal,
-            );
-        }
+    });
+    let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
+    ui.interact(
+        group.response.rect,
+        ui.id().with("latency-detail"),
+        Sense::hover(),
+    )
+    .on_hover_text(format!(
+        "rtt {rtt} ms\nbuffer {}/{} frames\nloss {:.1}%",
+        s.jitter_depth, s.jitter_target, s.loss_pct
+    ));
+}
+
+/// The centre cluster: the two states with consequences outside this room,
+/// side by side in the middle of the bar. Nothing is drawn while both are
+/// off, so an idle session has a calm bar and a live one cannot be misread.
+fn state_cluster(ui: &mut Ui, snap: &Snapshot) {
+    for entry in cluster_entries(ui, snap) {
+        state_lamp(ui, entry.label, entry.color).on_hover_text(entry.hover);
     }
+}
+
+/// What the cluster will occupy, or zero when nothing is lit. Measured before
+/// the bar is laid out, because the cluster's width decides how much room the
+/// zones on either side of it get.
+fn state_cluster_width(ui: &mut Ui, snap: &Snapshot) -> f32 {
+    let entries = cluster_entries(ui, snap);
+    if entries.is_empty() {
+        return 0.0;
+    }
+    let gap = ui.spacing().item_spacing.x;
+    let labels: Vec<&'static str> = entries.iter().map(|e| e.label).collect();
+    labels
+        .iter()
+        .map(|label| state_lamp_width(ui, label))
+        .sum::<f32>()
+        + gap * (labels.len() as f32 - 1.0)
+}
+
+/// One lit state in the cluster.
+struct ClusterEntry {
+    label: &'static str,
+    color: egui::Color32,
+    hover: String,
+}
+
+/// The cluster's contents, in a fixed order so a lamp never moves as the
+/// other one comes and goes: broadcast, then take, then the failure count
+/// that says a destination stopped.
+fn cluster_entries(ui: &Ui, snap: &Snapshot) -> Vec<ClusterEntry> {
+    let p = theme::palette_of(ui);
+    let mut entries = Vec::new();
+    let live = snap.stream.live_count();
+    if live > 0 {
+        entries.push(ClusterEntry {
+            label: "ON AIR",
+            color: p.accent,
+            hover: match live {
+                1 => "this session is being broadcast to 1 destination".to_owned(),
+                n => format!("this session is being broadcast to {n} destinations"),
+            },
+        });
+    }
+    if let Some((label, color, hover)) = record_state_lamp(&snap.record.state, p) {
+        entries.push(ClusterEntry {
+            label,
+            color,
+            hover,
+        });
+    }
+    if snap.stream.failed_count() > 0 {
+        entries.push(ClusterEntry {
+            label: "STREAM FAILED",
+            color: p.danger,
+            hover: "a destination stopped; the reason is in Settings, under Broadcast".to_owned(),
+        });
+    }
+    entries
+}
+
+/// A separator's own width in a horizontal layout.
+const SEPARATOR_W: f32 = 6.0;
+
+/// The one divider in the bar, between Leave and everything routine beside
+/// it. Painted rather than `ui.separator()`, which takes its height from the
+/// row and reads as a hairline lost in the gap; this is meant to be seen.
+fn bar_divider(ui: &mut Ui) {
+    let p = theme::palette_of(ui);
+    let (rect, _) = ui.allocate_exact_size(vec2(SEPARATOR_W, 22.0), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let x = rect.center().x.round() + 0.5;
+        ui.painter().line_segment(
+            [
+                egui::pos2(x, rect.top() + 2.0),
+                egui::pos2(x, rect.bottom() - 2.0),
+            ],
+            Stroke::new(1.0, p.border),
+        );
+    }
+}
+
+/// "00:47:32" from seconds, the timer's one format.
+fn elapsed(secs: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
+fn text_width(ui: &mut Ui, text: &str, font: FontId) -> f32 {
+    ui.fonts_mut(|f| {
+        f.layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    })
+}
+
+fn button_text_width(ui: &mut Ui, text: &str) -> f32 {
+    text_width(ui, text, FontId::new(13.5, FontFamily::Proportional))
+}
+
+fn mono_text_width(ui: &mut Ui, text: &str) -> f32 {
+    text_width(ui, text, FontId::new(12.5, FontFamily::Monospace))
 }
 
 /// The persistent audition reminder: a lit lamp and its sentence, beside

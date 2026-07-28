@@ -2,14 +2,14 @@
 
 The host can put a session on air to Twitch and YouTube Live, either one alone or both at once. One platform dropping out never interrupts the other.
 
-Only the host can start or stop a broadcast. Everyone in the session sees the on air lamp, because everyone in the session is in the broadcast.
+Only the host can start or stop a broadcast. Everyone in the session sees the ON AIR lamp in the middle of the status bar, because everyone in the session is in the broadcast.
 
-![Destinations sheet over the session screen, both Twitch and YouTube Live reading live with zero dropped frames](../images/session_destinations_live_two.png)
+![The Broadcast tab of Settings, both Twitch and YouTube Live reading live with zero dropped frames, and ON AIR lit in the status bar](../images/session_destinations_live_two.png)
 *On air to both platforms.*
 
 ## What goes out
 
-The broadcast mix, over a card showing everyone in the session. The host shapes that mix in the **Stream mix** sheet, and it is not the same as anyone's monitor mix: to hear exactly what the stream carries, switch on **audition stream mix** there.
+The broadcast mix, over a card showing everyone in the session. The host shapes that mix at the top of the **Broadcast** tab in Settings, and it is not the same as anyone's monitor mix: to hear exactly what the stream carries, switch on **audition stream mix** there.
 
 ## Getting a stream key
 
@@ -18,22 +18,22 @@ Both platforms give you a key that keeps working session after session.
 - **Twitch**: Creator Dashboard, Settings, Stream, Primary Stream key.
 - **YouTube Live**: YouTube Studio, Go Live, Stream, Stream key. A channel needs live streaming enabled once before this appears, which can take 24 hours on a new account. Do it before the band is waiting.
 
-**Add key** in the Destinations sheet shows these steps and opens the right page.
+**Add key** under Destinations shows these steps and opens the right page.
 
 ## Going live
 
-**Destinations** in the session's status bar opens the sheet.
+**Settings**, then the **Broadcast** tab: the stream mix is at the top and Destinations under it.
 
 1. **Add key**, paste the key, **Save key**. The row reads `ready`.
 2. Repeat for the second platform if you want both.
 3. **Go live**.
 
-![Destinations sheet with the Twitch key being entered: the field is masked and reads 24 characters beside it, with a keychain checkbox and Go live still disabled](../images/session_destinations_key.png)
+![The Broadcast tab with the Twitch key being entered: the field is masked and reads 24 characters under it, with a keychain checkbox and Go live still disabled](../images/session_destinations_key.png)
 *Adding a Twitch key. The field never shows the key back, so a paste is checked by the character count.*
 
-The lamp turns amber for everyone in the session. You can add or drop a platform while you are on air; **Remove** stops that one and leaves the others streaming.
+ON AIR lights for everyone in the session. You can add or drop a platform while you are on air; **Remove** stops that one and leaves the others streaming.
 
-Your key is treated as a credential. The field is masked and there is no reveal button, so a paste is checked by the character count beside it rather than by reading it back. Leave **keep this key in this computer's keychain** on and the next session starts with **Use saved key** instead of a paste; **Forget key** deletes it again.
+Your key is treated as a credential. The field is masked and there is no reveal button, so a paste is checked by the character count under it rather than by reading it back. Leave **keep this key in this computer's keychain** on and the next session starts with **Use saved key** instead of a paste; **Forget key** deletes it again.
 
 ## While you are on air
 
@@ -53,10 +53,10 @@ Each row says what that platform is actually doing:
 
 ## When a platform fails
 
-![Destinations sheet with Twitch live and YouTube Live failed, showing the reason and a red dropped frame count](../images/session_destinations_failed.png)
+![The Broadcast tab with Twitch live and YouTube Live failed, showing the reason and a red dropped frame count, and STREAM FAILED lit in the status bar](../images/session_destinations_failed.png)
 *One platform died, the other kept streaming.*
 
-A stream that dies quietly is worse than one that never started, so a failure shows in three places: the row goes red with the reason under it, the sheet counts the failures, and the status bar says `1 failed` beside the latency readout even with the sheet closed.
+A stream that dies quietly is worse than one that never started, so a failure shows in three places: the row goes red with the reason under it, the tab counts the failures, and the status bar lights STREAM FAILED beside ON AIR even with Settings closed.
 
 A platform that hiccups is retried and comes back on its own: the row returns to `connecting`, then `live`. A key the platform rejects fails every time, and the reason says so: **Remove** that destination and add the key again. `connection refused` or `authentication failed` means the key is wrong, was reset, or belongs to another channel.
 

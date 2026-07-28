@@ -18,12 +18,12 @@ Click **Host a session**. The wizard's first step asks where the session server 
 
 Pick **local** and click Continue. Local has no region to pick, so the wizard jumps to a "Before you start" step where you set the number of musician and listener seats and it confirms the session costs nothing. Click **Start the session**.
 
-The app starts a real `jamstreamd` process on your machine, completes a full encrypted handshake with it before showing you anything, joins you automatically, and opens the invites panel.
+The app starts a real `jamstreamd` process on your machine, completes a full encrypted handshake with it before showing you anything, joins you automatically, and opens Settings on the Invites tab.
 
 ## 3. Share the invites
 
-![Invites panel showing one seat per link: two connected musicians, a free seat that reads was Ben with a New link button, and a seat count of 3 of 10 musicians](images/session_invites.png)
-*The invites panel, open the moment you are hosting. Each link admits one person.*
+![The Invites tab of Settings showing one seat per link: two connected musicians, a free seat that reads was Ben with a New link button, and a seat count of 3 of 10 musicians](images/session_invites.png)
+*The Invites tab, open the moment you are hosting. Each link admits one person.*
 
 Each row is one seat. Click **Copy link** on a row and send that link to exactly one person, over any channel you trust. Rows read `not joined`, `connected`, or `revoked` as people come and go, and **Mint invite** adds seats mid-session. Details in [Hosting a session](guides/hosting.md).
 
@@ -35,13 +35,13 @@ Local invites carry your machine's network address (192.168.1.12 style), so they
 
 ## 5. End it
 
-In the invites panel, click **End session for everyone**. The server process is killed and every invite is dead from that moment. A forgotten local session costs nothing, and the server also exits on its own after 10 minutes with no musicians connected.
+On the Invites tab, click **End session for everyone**. The server process is killed and every invite is dead from that moment. A forgotten local session costs nothing, and the server also exits on its own after 10 minutes with no musicians connected.
 
 That is the whole local loop. The rest of this page is the internet path.
 
 ## Put it on air
 
-Any session, local or cloud, can stream live to Twitch, YouTube Live, or both at once while you play. **Destinations** in the status bar takes a stream key per platform, and the on air lamp lights for everyone in the session. Dropping one platform leaves the other streaming. See [Streaming to Twitch and YouTube](guides/streaming.md).
+Any session, local or cloud, can stream live to Twitch, YouTube Live, or both at once while you play. The **Broadcast** tab of Settings takes a stream key per platform, and ON AIR lights in the status bar for everyone in the session. Dropping one platform leaves the other streaming. See [Streaming to Twitch and YouTube](guides/streaming.md).
 
 ## Host on the internet with DigitalOcean
 
@@ -64,13 +64,13 @@ The token lands in your system keychain, so this is a one-time step; next sessio
 
 Click Continue. The app fetches live prices and times the network from your computer to each of the provider's regions, then sorts them by worst round trip in 5 ms steps, with price breaking ties inside a step. Take the top row unless you know your bandmates sit far from you; [Hosting a session](guides/hosting.md#the-region-table) explains how to pick fairly.
 
-The next step is the cost preview: set the expected hours and seats, read the estimate (a three hour four musician session on DigitalOcean is about $0.08), and click **Launch**. The wizard boots the machine, waits for its address, proves the server answers a real encrypted handshake, joins you, and opens the invites panel. There is no server to find or upload: release builds carry their release's own `jamstreamd` build pinned in, and the machine verifies the download at boot.
+The next step is the cost preview: set the expected hours and seats, read the estimate (a three hour four musician session on DigitalOcean is about $0.08), and click **Launch**. The wizard boots the machine, waits for its address, proves the server answers a real encrypted handshake, joins you, and opens Settings on the Invites tab. There is no server to find or upload: release builds carry their release's own `jamstreamd` build pinned in, and the machine verifies the download at boot.
 
 The meter is now running. The droplet bills by the second until you end the session, and it shuts itself down after 10 minutes with no musicians connected, or at the 12 hour hard cap, whichever comes first.
 
 ### Share, check, end
 
-The invites panel works exactly as in the local path; the links now work from anywhere. While the session runs, cost so far sits in the status bar next to latency. **End session for everyone** destroys the droplet and confirms with DigitalOcean that nothing tagged with the session is still listed. If you ever doubt that everything is gone, [Understanding cost](guides/cost.md#the-guardrails) covers the sweeper.
+The Invites tab works exactly as in the local path; the links now work from anywhere. While the session runs, cost so far sits in the status bar next to latency. **End session for everyone** destroys the droplet and confirms with DigitalOcean that nothing tagged with the session is still listed. If you ever doubt that everything is gone, [Understanding cost](guides/cost.md#the-guardrails) covers the sweeper.
 
 ## From the terminal
 

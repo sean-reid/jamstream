@@ -18,7 +18,7 @@ use crate::screens::devices::{Block, DeviceCatalog, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
-use crate::screens::session::{SessionEvent, SessionScreen};
+use crate::screens::session::{SessionEvent, SessionScreen, SettingsTab};
 use crate::theme::{self, Theme};
 use crate::widgets::{AVATAR_D_STRIP, avatar_disc, sweep_avatar_textures};
 
@@ -61,6 +61,11 @@ pub struct JamApp {
     /// state).
     pub live: Option<Arc<LiveRuntime>>,
     pub settings_open: bool,
+    /// Which drawer tab is showing. Kept for as long as the app runs, so a
+    /// host working through destinations reopens on Broadcast rather than back
+    /// on Audio, and deliberately not persisted: a fresh launch opens on
+    /// Audio, which is what a musician sets up first.
+    pub settings_tab: SettingsTab,
     /// Why the last avatar load failed, shown inline under the row.
     pub avatar_error: Option<String>,
     /// The picture picked this run: its file name and what it became, for
@@ -115,6 +120,7 @@ impl JamApp {
             runtime: None,
             live: None,
             settings_open: false,
+            settings_tab: SettingsTab::Audio,
             avatar_error: None,
             avatar_picture: None,
             avatar_dialog: None,
@@ -214,8 +220,11 @@ impl JamApp {
                 self.runtime = Some(Box::new(costed));
                 self.session = SessionScreen::default();
                 self.session.invites = Some(panel);
-                self.session.invites_open = true;
-                // Hosting is the only role that can stream, so the sheet
+                // A session with nobody in it: open the drawer on the tab
+                // holding the links, because sharing them is the next act.
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::Invites;
+                // Hosting is the only role that can stream, so the panel
                 // exists only here. It reads the keychain for saved stream
                 // keys on construction and holds no key of its own.
                 self.session.destinations = Some(DestinationsPanel::new(Arc::clone(&self.creds)));
@@ -381,8 +390,11 @@ impl JamApp {
 
         self.ending_progress(ui.ctx());
         // Last, so a session has already drawn its status bar and the drawer
-        // knows where to stop.
-        self.settings_drawer(ui.ctx());
+        // knows where to stop. Ending the session is reached from in here now,
+        // so the drawer answers with the same event the screen does.
+        if let Some(SessionEvent::EndSession) = self.settings_drawer(ui.ctx()) {
+            self.end_session();
+        }
 
         // Device picks apply immediately: mid-session the live runtime
         // reopens its stream, otherwise the selection just waits for the
@@ -427,11 +439,12 @@ impl JamApp {
     /// opens, the content is taller than the window. The body scrolls inside
     /// it, so what a short window puts out of sight is whatever the body puts
     /// last, and never the buffer picks or the input meter.
-    fn settings_drawer(&mut self, ctx: &Context) {
+    fn settings_drawer(&mut self, ctx: &Context) -> Option<SessionEvent> {
         if !self.settings_open {
-            return;
+            return None;
         }
         let body_h = theme::sheet_body_height(ctx, self.drawer_floor(ctx));
+        let mut event = None;
         egui::Window::new("Settings")
             .title_bar(false)
             .frame(theme::sheet_frame(theme::palette(self.theme)))
@@ -448,34 +461,88 @@ impl JamApp {
                     });
                 });
                 ui.add_space(theme::SPACE_SM);
-                // The header stays put and the rest scrolls, so Close is
-                // never the control that scrolled away.
+                let tabs = self.settings_tabs();
+                self.tab_row(ui, &tabs);
+                ui.add_space(theme::SPACE_SM);
+                // The header and the tab row stay put and only the panel
+                // scrolls, so Close and the way between tabs are never what
+                // scrolled away. The salt is the tab's own, so each panel
+                // keeps its own offset and opens at its own top.
                 egui::ScrollArea::vertical()
-                    .id_salt("settings-scroll")
+                    .id_salt(("settings-scroll", self.settings_tab.label()))
                     .auto_shrink([false, false])
-                    .show(ui, |ui| self.settings_body(ui));
+                    .show(ui, |ui| event = self.settings_body(ui));
             });
+        event
     }
 
-    /// Ordered by how often a control is reached for: the two a musician
-    /// touches mid session, then the devices behind them, then the things
-    /// set once.
-    fn settings_body(&mut self, ui: &mut Ui) {
+    /// The tabs this app can show right now. Session-scoped ones exist only
+    /// inside a session, and only for a host: from the home screen there is no
+    /// broadcast to mix and no seat to invite anyone into.
+    fn settings_tabs(&self) -> Vec<SettingsTab> {
+        match (self.screen, self.runtime.as_deref()) {
+            (Screen::Session, Some(rt)) => self.session.settings_tabs(&rt.snapshot()),
+            _ => vec![SettingsTab::Audio, SettingsTab::You],
+        }
+    }
+
+    /// One row of tabs, and the guard that a remembered tab cannot outlive the
+    /// thing it showed: leaving a session drops Broadcast and Invites, and a
+    /// drawer still pointing at one would open on nothing.
+    fn tab_row(&mut self, ui: &mut Ui, tabs: &[SettingsTab]) {
+        if !tabs.contains(&self.settings_tab) {
+            self.settings_tab = SettingsTab::Audio;
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = theme::SPACE_SM;
+            for tab in tabs {
+                if ui
+                    .add(egui::Button::new(tab.label()).selected(*tab == self.settings_tab))
+                    .clicked()
+                {
+                    self.settings_tab = *tab;
+                }
+            }
+        });
+    }
+
+    /// The selected tab's panel, and nothing else: one thing at a time in a
+    /// drawer this narrow beats five sections in one scroll.
+    fn settings_body(&mut self, ui: &mut Ui) -> Option<SessionEvent> {
         let snap = self.runtime.as_deref().map(|rt| rt.snapshot());
-        let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
-        let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
-        self.devices
-            .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e);
-        ui.add_space(theme::SPACE_MD);
-        self.avatar_ui(ui, snap.as_ref());
-        ui.add_space(theme::SPACE_MD);
-        ui.label(theme::title(ui, "Theme"));
-        for (value, label) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
-            let response = crate::widgets::pick_row(ui, label, self.theme == value, true, |ui| {
-                ui.label(label);
-            });
-            if response.clicked() {
-                self.theme = value;
+        match self.settings_tab {
+            SettingsTab::Audio => {
+                let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
+                let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
+                self.devices
+                    .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e);
+                None
+            }
+            SettingsTab::Broadcast => {
+                let rt = self.runtime.as_deref()?;
+                let snap = snap?;
+                self.session.broadcast_tab(ui, &snap, rt);
+                None
+            }
+            SettingsTab::Invites => {
+                let rt = self.runtime.as_deref()?;
+                let snap = snap?;
+                self.session.invites_tab(ui, &snap, rt)
+            }
+            SettingsTab::You => {
+                self.avatar_ui(ui, snap.as_ref());
+                ui.add_space(theme::SPACE_XL);
+                ui.label(theme::title(ui, "Theme"));
+                for (value, label) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+                    let response =
+                        crate::widgets::pick_row(ui, label, self.theme == value, true, |ui| {
+                            ui.label(label);
+                        });
+                    if response.clicked() {
+                        self.theme = value;
+                    }
+                }
+                None
             }
         }
     }

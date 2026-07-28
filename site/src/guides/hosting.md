@@ -1,6 +1,6 @@
 # Hosting a session
 
-Hosting means launching one small server, minting the invites, and ending the session when you are done. In the app, **Host a session** on the home screen walks four steps: where the server runs, which region, a cost preview, and the launch itself. The wizard stores your provider credentials in the system keychain, joins you automatically once the server answers, and opens the invites panel. The CLI does the same three jobs from the terminal, and both record the session in the same place, so a session hosted in the app shows up in `jamstream status` and can be ended from either side.
+Hosting means launching one small server, minting the invites, and ending the session when you are done. In the app, **Host a session** on the home screen walks four steps: where the server runs, which region, a cost preview, and the launch itself. The wizard stores your provider credentials in the system keychain, joins you automatically once the server answers, and opens Settings on the Invites tab. The CLI does the same three jobs from the terminal, and both record the session in the same place, so a session hosted in the app shows up in `jamstream status` and can be ended from either side.
 
 Hosting does not have to involve a cloud at all: picking **local** in the wizard's first step runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; [Playing on the same network](local.md) covers local mode.
 
@@ -38,7 +38,7 @@ Under the numbers, release builds show one line naming the exact `jamstreamd` bu
 
 ## Invites are minted at launch
 
-One invite per seat is minted up front, on your machine, and the wizard opens the invites panel the moment you are in:
+One invite per seat is minted up front, on your machine, and the wizard opens Settings on the Invites tab the moment you are in:
 
 ![Invites panel over the session screen: one seat per link, a freed seat reading was Ben with a New link button, and a seat count of 3 of 10 musicians](../images/session_invites.png)
 *Each link admits one person. Copy, revoke, or mint more, and end the session for everyone from here.*
@@ -60,13 +60,13 @@ The app uses the defaults; the CLI can change both (`--idle-min` and `--max-hour
 
 ## While it runs
 
-The host's status bar shows cost so far next to the latency readout, with elapsed time beside it; nothing accrues silently. Two sheets open from the same bar: **Destinations** puts the session on air to Twitch and YouTube Live, and **Stream mix** sets what those platforms and the listeners hear. Devices and buffer size can change mid-session from Settings in the top bar, and the change applies immediately; [Joining a session](joining.md#the-session-screen) walks the whole screen. `jamstream status` lists the same sessions from the terminal, with elapsed time, cost accrued so far, and a projection.
+The host's status bar shows cost so far next to the latency readout, with elapsed time beside it; nothing accrues silently. The **Broadcast** tab of Settings holds both halves of streaming: **Stream mix** sets what the platforms and the listeners hear, and **Destinations** puts the session on air to Twitch and YouTube Live. **Record** is the one action in the bar itself. Devices and buffer size can change mid-session from Settings in the top bar, and the change applies immediately; [Joining a session](joining.md#the-session-screen) walks the whole screen. `jamstream status` lists the same sessions from the terminal, with elapsed time, cost accrued so far, and a projection.
 
 If tagged machines already exist in your account when you host again, the CLI warns at host time, so a stray session does not hide behind a new one.
 
 ## Ending
 
-**End session for everyone** in the invites panel destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended, with a progress sheet until the provider confirms. The invites are dead from that moment. Leaving is not ending: **Leave** disconnects you and the server keeps running until the host ends it or the idle exit fires.
+**End session for everyone** on the Invites tab destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended, with a progress sheet until the provider confirms. The invites are dead from that moment. Leaving is not ending: **Leave** disconnects you and the server keeps running until the host ends it or the idle exit fires.
 
 ## From the terminal
 
