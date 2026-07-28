@@ -76,13 +76,12 @@
 //! passed `--shutdown-file` at spawn, is expected to poll for it and exit
 //! cleanly. One mechanism, identical everywhere, no new dependency.
 //!
-//! The server half of that contract is not implemented yet, so the
-//! provider only *waits* for the sentinel to work when jamstreamd has left
-//! a `<session dir>/shutdown.supported` marker to prove it polls. Without
-//! the marker, teardown is exactly what it is today: SIGTERM on unix, an
-//! immediate forced kill on Windows. Nothing regresses while the two
-//! halves are out of step, and the marker is the switch that turns the
-//! graceful path on.
+//! The provider waits for the sentinel only when jamstreamd has left a
+//! `<session dir>/shutdown.supported` marker to prove it polls. Without the
+//! marker, teardown falls back to SIGTERM on unix and an immediate forced
+//! kill on Windows, so an older binary costs nothing. The server half is
+//! shipped: `--shutdown-file` in `jamstream_server`'s `main`, the marker and
+//! the poll in its `runtime`.
 //!
 //! # Platform notes
 //!
@@ -576,7 +575,7 @@ impl Provider for LocalProvider {
             .arg("--config")
             .arg(&config_path)
             .arg("--activity-file")
-            .arg(dir.join("last-active"))
+            .arg(dir.join(crate::cloudinit::ACTIVITY_FILE_NAME))
             .arg("--shutdown-file")
             .arg(shutdown_path(&dir))
             .arg("--idle-exit-min")

@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use jamstream_cloud::cloudinit::{RECORDING_CONFIG_PATH, RecordingStorage};
+use jamstream_cloud::cloudinit::{
+    ACTIVITY_FILE, RECORDING_CONFIG_PATH, RecordingStorage, SERVER_CONFIG_PATH,
+};
 use jamstream_server::config::Config;
 use jamstream_server::revocations::Revocations;
 use jamstream_server::runtime::{Options, RecordingOptions, Server};
@@ -13,8 +15,13 @@ use jamstream_stream::pipeline::StreamConfig;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const DEFAULT_CONFIG: &str = "/etc/jamstream/config";
-const DEFAULT_ACTIVITY: &str = "/run/jamstream/last-active";
+/// Both paths come from the crate that writes them into the VM. The unit
+/// passes `--config`, but nothing passes `--activity-file`, so this default is
+/// the only thing that puts the file jamstreamd touches and the file the guard
+/// stats in the same place. Two spellings is a dead man's switch that destroys
+/// a live session: the guard reads an mtime that never changes.
+const DEFAULT_CONFIG: &str = SERVER_CONFIG_PATH;
+const DEFAULT_ACTIVITY: &str = ACTIVITY_FILE;
 /// Revoked token ids, reloaded at startup. On the session VM this is tmpfs,
 /// which is what the restart this defends against needs: `Restart=on-failure`
 /// with `RestartSec=2` brings the process back, not the machine. A host who

@@ -16,10 +16,12 @@ use tokio::time::MissedTickBehavior;
 use crate::CliError;
 use crate::cli::JoinArgs;
 
-pub const SAMPLE_RATE: u32 = 48_000;
+pub use jamstream_protocol::SAMPLE_RATE;
 const TICK: Duration = Duration::from_micros(2_500);
-const FRAME_MONO: usize = 120;
-const FRAME_STEREO: usize = 240;
+/// One tick's worth of capture, and of playout. The session's own frame, not
+/// a second copy of it.
+const FRAME_MONO: usize = jamstream_session::TICK_SAMPLES;
+const FRAME_STEREO: usize = FRAME_MONO * 2;
 /// How long a lone client waits before sending --chat into an empty room.
 const CHAT_ALONE_DELAY: Duration = Duration::from_secs(1);
 /// Longest invite text read from a file or a pipe. A real invite is a couple

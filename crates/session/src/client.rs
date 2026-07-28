@@ -25,7 +25,9 @@ use crate::avatar::{
 };
 use crate::limits::TokenBucket;
 
-const TICK_SAMPLES: u64 = 120;
+/// The mix tick, in this file's units. The server's constant, not a second
+/// copy of it: the two halves of one session count the same samples.
+const TICK_SAMPLES: u64 = crate::server::TICK_SAMPLES as u64;
 const UPLINK_BITRATE: u32 = 128_000;
 const CONNECTION_TIMEOUT_MS: u64 = 10_000;
 const PING_INTERVAL_MS: u64 = 1_000;

@@ -42,13 +42,12 @@ use crate::provider::{ProviderError, Result};
 use crate::providers::gcp::TokenSource;
 use crate::retention::{Retention, RetentionEnforcement, gcs_lifecycle_patch};
 use crate::storage::{
-    ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
-    drain_body, drive_upload,
+    ChunkSink, DEFAULT_PART_SIZE, JSON_CONTENT_TYPE, MultipartBackend, ObjectMeta, ObjectStore,
+    Part, PartSource, drain_body, drive_upload,
 };
 use crate::types::ProviderKind;
 
 const DEFAULT_BASE_URL: &str = "https://storage.googleapis.com";
-const JSON_CONTENT_TYPE: &str = "application/json";
 /// 308 Resume Incomplete: every intermediate chunk of a resumable upload.
 const RESUME_INCOMPLETE: u16 = 308;
 /// 499 Client Closed Request: GCS's answer to a cancelled upload session.

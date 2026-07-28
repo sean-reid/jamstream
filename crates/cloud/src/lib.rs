@@ -10,17 +10,17 @@
 //! the S3/Spaces/GCS clients, the multipart upload with its abort guarantee
 //! ([`storage`]), the retention rules that make "delete after 30 days" a real
 //! server-side lifecycle rule ([`retention`]), and the up-front cost estimate
-//! ([`recording`]). The writer that produces the WAV, and the ordering
-//! against VM teardown, belong to the server.
+//! ([`recording`]). The encoder that produces the FLAC, the names the takes
+//! get, and the ordering against VM teardown belong to the server.
 //!
-//! The whole storage-side flow is four calls:
+//! The storage-side flow, as the server drives it:
 //!
 //! ```text
-//! let store: Box<dyn ObjectStore> = /* per the host's provider */;
-//! store.set_retention(&bucket, &session_prefix(&session_id), retention).await?;   // before recording
-//! store.put_stream(&bucket, &mix_key(&session_id), WAV_CONTENT_TYPE, &mut ReadSource::new(file)).await?;
-//! store.put_stream(&bucket, &stem_key(&session_id, &member), WAV_CONTENT_TYPE, &mut ReadSource::new(file)).await?;
-//! store.put(&bucket, &manifest_key(&session_id), JSON_CONTENT_TYPE, &manifest).await?;   // then tear down
+//! let store: Arc<dyn ObjectStore> = storage.object_store()?;                      // per the host's provider
+//! store.set_retention(&bucket, &session_prefix(&session_id), retention).await?;    // before recording
+//! let sink = ObjectSink::open(store, bucket, key, FLAC_CONTENT_TYPE);              // one per take, key named
+//! sink.write(chunk).await?;                                                        // by the recorder
+//! sink.finish().await?;                                                            // then tear down
 //! ```
 
 pub mod artifact;

@@ -27,6 +27,31 @@ const RUN_DIR: &str = "/run/jamstream";
 /// is uploading and the guard defers self-destruct while any remain.
 pub const UPLOAD_MARKER_DIR: &str = "/run/jamstream/uploads";
 
+/// The file jamstreamd touches while musicians are connected, and the one the
+/// guard stats to decide the session is idle.
+///
+/// Public because jamstreamd is in another crate and the unit does not pass
+/// `--activity-file`: both ends spell this path from here, or the dead man's
+/// switch fails in the direction that destroys a live session. A guard that
+/// stats a path nobody touches reads one mtime forever, so the idle window
+/// runs from boot with musicians playing.
+pub const ACTIVITY_FILE: &str = "/run/jamstream/last-active";
+
+/// [`ACTIVITY_FILE`] without its directory, for the two scripts that build
+/// the path from a directory they were handed (the guard, so its tests can
+/// run against a scratch dir, and the local provider).
+pub const ACTIVITY_FILE_NAME: &str = "last-active";
+
+/// Root-owned tmpfs directory the stream pipeline stages one-shot key files
+/// in. The bootstrap creates it 0700; `jamstream_stream`'s `StreamConfig`
+/// names the same path from the other side of a crate boundary it cannot
+/// import across, so the seam is held by a test in the server crate.
+pub const STREAM_KEY_DIR: &str = "/run/jamstream/keys";
+
+/// The flat key=value server config. Written here, read by
+/// `jamstream_server::config::Config`.
+pub const SERVER_CONFIG_PATH: &str = "/etc/jamstream/config";
+
 /// Hard ceiling, in uptime seconds, on how long in-flight uploads may defer
 /// self-destruct. The upload streams during the session, so what remains at
 /// teardown is the tail plus the completion calls; ten minutes covers the
@@ -36,7 +61,7 @@ pub const UPLOAD_DEFER_CEILING_SECS: u32 = 600;
 
 /// Where cloud-init writes the recording storage config, when there is one.
 /// Same flat key=value format and the same root-then-chgrp handling as
-/// /etc/jamstream/config.
+/// [`SERVER_CONFIG_PATH`].
 pub const RECORDING_CONFIG_PATH: &str = "/etc/jamstream/recording";
 
 /// The jamstreamd download and the hash it must match, each in its own
@@ -386,7 +411,7 @@ fn guard_script_at(
 ) -> String {
     format!(
         "#!/bin/sh
-# Dead man's switch. jamstreamd touches /run/jamstream/last-active while
+# Dead man's switch. jamstreamd touches {state}/{activity} while
 # musicians are connected; staleness past the idle window, or exceeding the
 # session hard cap, triggers self-destruct.
 #
@@ -396,7 +421,7 @@ fn guard_script_at(
 # and destroys a VM with musicians playing on it.
 set -eu
 up=$(cut -d. -f1 {uptime})
-stamp=$(stat -c %Y {state}/last-active 2>/dev/null || echo none)
+stamp=$(stat -c %Y {state}/{activity} 2>/dev/null || echo none)
 # The mtime is only ever compared for equality, so no clock step can fake
 # activity or hide it. What the idle window measures is the uptime at which
 # the mtime last changed.
@@ -432,6 +457,7 @@ if [ -n \"$(ls -A {uploads} 2>/dev/null || true)\" ]; then
 fi
 exec {self_destruct} \"$reason\"
 ",
+        activity = ACTIVITY_FILE_NAME,
         idle_secs = cfg.idle_shutdown_min as u64 * 60,
         max_secs = cfg.max_duration_min as u64 * 60,
         ceiling_secs = UPLOAD_DEFER_CEILING_SECS,
@@ -565,8 +591,8 @@ trap 'rc=$?; [ \"$rc\" -eq 0 ] || /usr/local/sbin/jamstream-self-destruct \"boot
 # it does not run as root. The config holds the server private key and stays
 # unreadable to everything but root and this account.
 id {user} >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin {user}
-chgrp {user} /etc/jamstream/config
-chmod 0640 /etc/jamstream/config
+chgrp {user} {server_cfg}
+chmod 0640 {server_cfg}
 # The recording storage key, present only when the host turned recording
 # on. Same handling as the config: root writes it, the service account
 # reads it, nobody else sees it.
@@ -577,10 +603,10 @@ fi
 install -d -o {user} -g {user} -m 0750 {run}
 # jamstreamd updates this file's mtime while musicians are connected and the
 # guard reads it, so the server has to own it.
-install -o {user} -g {user} -m 0644 /dev/null {run}/last-active
+install -o {user} -g {user} -m 0644 /dev/null {activity}
 # Stream keys are staged here for the instant it takes to spawn a pusher.
 # /run is tmpfs, so nothing reaches persistent disk.
-install -d -o {user} -g {user} -m 0700 {run}/keys
+install -d -o {user} -g {user} -m 0700 {keys}
 # The recorder drops one marker file per in-flight upload; the guard defers
 # self-destruct while any remain.
 install -d -o {user} -g {user} -m 0700 {uploads}
@@ -642,7 +668,10 @@ fi
         download = ARTIFACT_DOWNLOAD,
         user = SERVICE_USER,
         run = RUN_DIR,
+        activity = ACTIVITY_FILE,
+        keys = STREAM_KEY_DIR,
         uploads = UPLOAD_MARKER_DIR,
+        server_cfg = SERVER_CONFIG_PATH,
         recording_cfg = RECORDING_CONFIG_PATH,
     )
 }
@@ -699,7 +728,7 @@ User={user}
 Group={user}
 # The guard is the cap that actually destroys the VM. These two make the
 # server stop serving on its own if the guard ever stops running.
-ExecStart=/usr/local/bin/jamstreamd --config /etc/jamstream/config \
+ExecStart=/usr/local/bin/jamstreamd --config {server_cfg} \
 --idle-exit-min {idle_min} --max-duration-min {max_min}
 Restart=on-failure
 RestartSec=2
@@ -715,6 +744,7 @@ WantedBy=multi-user.target
 ",
         user = SERVICE_USER,
         run = RUN_DIR,
+        server_cfg = SERVER_CONFIG_PATH,
         idle_min = cfg.idle_shutdown_min,
         max_min = cfg.max_duration_min,
         hardening = SERVICE_HARDENING,
@@ -826,7 +856,7 @@ pub fn render(cfg: &BootConfig) -> String {
     let mut files: Vec<(&str, &str, String)> = vec![
         // Written root-only; the bootstrap hands the group to the service
         // account once that account exists.
-        ("/etc/jamstream/config", "0600", cfg.render_flat_config()),
+        (SERVER_CONFIG_PATH, "0600", cfg.render_flat_config()),
         (ARTIFACT_URL_FILE, "0644", format!("{}\n", cfg.artifact_url)),
         (
             ARTIFACT_SHA_FILE,
@@ -1029,6 +1059,24 @@ mod tests {
         }
         assert_eq!(flat_config_value("# port = 1\n", "port"), None);
         assert_eq!(flat_config_value("#cloud-config\n", "port"), None);
+    }
+
+    /// Rust cannot concatenate two `&'static str` constants in a const, so
+    /// the tmpfs paths spell out a directory that is also its own constant.
+    /// Two spellings of one path is the defect these constants exist to
+    /// remove, so the relationship is asserted rather than assumed.
+    #[test]
+    fn every_run_dir_path_is_under_the_run_dir() {
+        assert_eq!(ACTIVITY_FILE, format!("{RUN_DIR}/{ACTIVITY_FILE_NAME}"));
+        assert_eq!(STREAM_KEY_DIR, format!("{RUN_DIR}/keys"));
+        assert_eq!(UPLOAD_MARKER_DIR, format!("{RUN_DIR}/uploads"));
+        // The unit grants write access to RUN_DIR alone, so anything outside
+        // it is a path the hardened service cannot create.
+        for path in [ACTIVITY_FILE, STREAM_KEY_DIR, UPLOAD_MARKER_DIR] {
+            assert!(path.starts_with(RUN_DIR), "{path} escapes {RUN_DIR}");
+        }
+        assert!(RECORDING_CONFIG_PATH.starts_with("/etc/jamstream/"));
+        assert!(SERVER_CONFIG_PATH.starts_with("/etc/jamstream/"));
     }
 
     /// The bootstrap script runs as root, and the artifact pair is the one

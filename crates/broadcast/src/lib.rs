@@ -14,7 +14,7 @@ mod render;
 mod text;
 
 pub use avatar::{AvatarError, AvatarImage};
-pub use render::{Renderer, initials};
+pub use render::{MAX_CARDS, Renderer, initials};
 
 /// Fixed per-stream scene parameters. Everything sized off these is
 /// preallocated in [`Renderer::new`].

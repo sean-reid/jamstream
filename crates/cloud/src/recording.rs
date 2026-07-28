@@ -27,8 +27,11 @@
 //! stereo FLAC, which overstated a mix by about 2x and understated a four
 //! piece's stems by about 2x, in a figure a host reads before agreeing to
 //! spend money. If the recorder's format changes, this is the second place
-//! that has to change, and the test asserting the per-hour figures is what
-//! notices.
+//! that has to change. What notices is
+//! `crates/server/tests/seams.rs::the_cost_model_prices_the_format_the_encoder_writes`,
+//! which decodes a real take's header and compares it with the constants
+//! below; the per-hour figures asserted in this file's own tests can only
+//! agree with those constants.
 //!
 //! # What the estimate deliberately does not do
 //!
@@ -83,7 +86,9 @@ pub const FLAC_PERCENT_OF_PCM: u64 = 60;
 
 const PRICES_JSON: &str = include_str!("../data/storage_prices.json");
 
-/// Bit depth of the recorded WAV.
+/// Bit depth of the recorded take. Note that the shipped encoder writes
+/// [`BitDepth::Sixteen`] and nothing plumbs a choice to it, so a plan built
+/// with the other arm quotes a take the recorder cannot produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitDepth {
     /// CD depth. The default: half the bytes, and past the point where a
@@ -180,13 +185,13 @@ impl RecordingPlan {
         self.track_bytes(STEM_CHANNELS, seconds)
     }
 
-    /// Every WAV together, mix plus stems. The manifest is a few hundred
+    /// Every track together, mix plus stems. The manifest is a few hundred
     /// bytes and is not counted.
     pub fn total_bytes(&self, seconds: u64) -> u64 {
         self.mix_bytes(seconds) + self.stems as u64 * self.stem_bytes(seconds)
     }
 
-    /// Number of WAV objects uploaded.
+    /// Number of objects uploaded.
     pub fn object_count(&self) -> u32 {
         1 + self.stems as u32
     }
