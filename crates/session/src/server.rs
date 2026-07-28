@@ -20,7 +20,7 @@ use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId
 use jamstream_protocol::invite::verify_token;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
 use jamstream_protocol::transport::{self, Responder, Session, Welcome};
-use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet};
+use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, COOKIE_BYTES, Packet};
 
 use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
 use crate::limits::{
@@ -68,6 +68,32 @@ const INIT_BURST: u32 = 64;
 /// together with a resend each is 20 inits.
 const INIT_SLOT_RATE_PER_SEC: u32 = 8;
 const INIT_SLOT_BURST: u32 = 24;
+/// How long one cookie secret is good for, and therefore the longest a stolen
+/// cookie is worth carrying. Two minutes, WireGuard's interval: a joining
+/// client's whole run of resends fits inside one, so the round trip is paid
+/// once.
+const COOKIE_ROTATION_MS: u64 = 120_000;
+/// Inbound inits per second above which the cookie round trip engages, and
+/// the burst allowed before it does.
+///
+/// Below the Diffie-Hellman budget on purpose, so cookies come on before that
+/// budget starts dropping honest inits rather than after. A full session is 30
+/// members and all 30 arriving at once fits the burst, so the case anyone
+/// actually has stays a single round trip; sustained traffic above the rate is
+/// not a band arriving.
+const COOKIE_TRIGGER_RATE_PER_SEC: u32 = 24;
+const COOKIE_TRIGGER_BURST: u32 = 48;
+/// Ceiling on cookie challenges per second.
+///
+/// A ceiling, not a fair share. A limiter keyed on the source cannot tell an
+/// honest init from a spoofed one, so a cap low enough to matter to a flood
+/// would starve exactly the client the cookie exists to let through. What it
+/// bounds is an unbounded send loop on the task that owns the mix tick: at
+/// 17 bytes a challenge this is under 280 KB/s, inside what the session
+/// already sends to a full gallery, and always less than the flood that drew
+/// it. Past the ceiling an init draws silence, which is what it drew before
+/// any of this existed.
+const CHALLENGE_RATE_PER_SEC: u32 = 16_384;
 /// Shortest handshake init that earns a reject. A reject is 21 bytes and a
 /// real Noise IK first message is over 90, so answering anything shorter
 /// would make the server an amplifier by size: `[1, 9, 0]` in, 21 bytes out.
@@ -361,6 +387,13 @@ pub struct ServerCore {
     /// Inits this core has paid a Diffie-Hellman for. The quantity the budget
     /// exists to bound, so a test can assert it rather than infer it.
     init_reads: u64,
+    /// Drains as inits arrive; empty means the cookie round trip is engaged.
+    /// A detector, not a limiter: nothing is dropped for failing to take one.
+    cookie_trigger: TokenBucket,
+    challenge_budget: TokenBucket,
+    /// Cookie challenges emitted, so a test can assert the round trip
+    /// engaged rather than infer it from an absence.
+    challenges: u64,
     events: Vec<ServerEvent>,
     last_musician_count: usize,
     last_stats_ms: u64,
@@ -413,6 +446,9 @@ impl ServerCore {
             ],
             init_budget: TokenBucket::new(INIT_BURST, INIT_RATE_PER_SEC),
             init_reads: 0,
+            cookie_trigger: TokenBucket::new(COOKIE_TRIGGER_BURST, COOKIE_TRIGGER_RATE_PER_SEC),
+            challenge_budget: TokenBucket::new(CHALLENGE_RATE_PER_SEC, CHALLENGE_RATE_PER_SEC),
+            challenges: 0,
             events: Vec::new(),
             last_musician_count: 0,
             last_stats_ms: 0,
@@ -437,8 +473,32 @@ impl ServerCore {
         match wire::parse(data) {
             Ok(Packet::HandshakeInit { version, noise }) => {
                 if version != PROTOCOL_VERSION {
+                    // Left outside the cookie gate: this path has its own,
+                    // much tighter budget, and a client on the wrong version
+                    // has to be told so even while the server is under load.
                     self.version_reject(now_ms, src, version, noise, data, &mut out);
+                } else if self.cookie_required(now_ms) {
+                    // Under handshake load an unauthenticated init buys a
+                    // 16-byte MAC and not an X25519: whoever sent it has to
+                    // come back from the address it claims first.
+                    self.cookie_challenge(now_ms, src, data, &mut out);
                 } else {
+                    self.admit(now_ms, now_unix, src, noise, &mut out);
+                }
+            }
+            Ok(Packet::CookiedInit {
+                cookie,
+                version,
+                noise,
+            }) => {
+                // Spent whether or not the cookie holds, so a flood of
+                // cookied inits keeps the round trip engaged rather than
+                // letting it switch itself back off.
+                self.cookie_required(now_ms);
+                // A wrong version draws nothing here: the reject's MAC covers
+                // the exact bytes the sender sent, and a client that reached
+                // this point sent a plain init too, which is what draws one.
+                if version == PROTOCOL_VERSION && self.cookie_valid(now_ms, src, &cookie) {
                     self.admit(now_ms, now_unix, src, noise, &mut out);
                 }
             }
@@ -450,7 +510,11 @@ impl ServerCore {
                 self.handle_transport(now_ms, src, member, counter, ciphertext, &mut out);
             }
             // The server never receives these legitimately.
-            Ok(Packet::HandshakeResp { .. }) | Ok(Packet::VersionReject { .. }) | Err(_) => {}
+            Ok(Packet::HandshakeResp { .. })
+            | Ok(Packet::VersionReject { .. })
+            | Ok(Packet::CapacityReject { .. })
+            | Ok(Packet::CookieChallenge { .. })
+            | Err(_) => {}
         }
         out
     }
@@ -984,9 +1048,106 @@ impl ServerCore {
         self.init_reads
     }
 
+    /// Cookie challenges emitted. Zero on a session nobody is flooding,
+    /// which is the property that keeps an ordinary join at one round trip.
+    pub fn cookie_challenges(&self) -> u64 {
+        self.challenges
+    }
+
+    /// Whether the cookie round trip is engaged, spending one init's worth of
+    /// the trigger.
+    ///
+    /// Rate-triggered rather than always on because the round trip costs a
+    /// joining client a whole extra flight, and a session nobody is attacking
+    /// should not pay for one. The bucket drains on inits that would
+    /// otherwise reach admission, so it measures exactly the pressure the
+    /// cookie relieves, and refills when the flood stops.
+    fn cookie_required(&mut self, now_ms: u64) -> bool {
+        !self.cookie_trigger.take(now_ms)
+    }
+
+    /// Answers an init with a cookie instead of reading it.
+    ///
+    /// The challenge carries no proof of who sent it, and cannot: proving it
+    /// would cost the Diffie-Hellman the cookie exists to avoid. WireGuard has
+    /// the same hole and the same answer, which is that a client keeps
+    /// offering its plain init alongside the cookied one, so a forged
+    /// challenge buys an attacker nothing they could not get by dropping the
+    /// packet instead.
+    fn cookie_challenge(
+        &mut self,
+        now_ms: u64,
+        src: SocketAddr,
+        init_packet: &[u8],
+        out: &mut Outgoing,
+    ) {
+        // Same floor as the version reject, for the same reason: answering a
+        // 3-byte `[1, 1, 0]` with 17 bytes would make the server an amplifier
+        // by size. Above the floor the challenge is always the smaller packet.
+        if init_packet.len() < REJECT_MIN_INIT_BYTES {
+            return;
+        }
+        if !self.challenge_budget.take(now_ms) {
+            return;
+        }
+        self.challenges += 1;
+        let key = transport::cookie_key(&self.cfg.server_private, cookie_epoch(now_ms));
+        let cookie = wire::cookie_for(&key, src.ip());
+        out.push((src, wire::build_cookie_challenge(&cookie)));
+    }
+
+    /// Whether a cookie is one this server handed to this address.
+    ///
+    /// The previous epoch is accepted as well as the current one, so a
+    /// rotation does not invalidate a cookie already in flight. Nothing was
+    /// stored when the cookie was issued, so both are recomputed: two hashes
+    /// over a few dozen bytes, against the 30 to 50 microseconds of the
+    /// Diffie-Hellman this stands in front of.
+    fn cookie_valid(&self, now_ms: u64, src: SocketAddr, cookie: &[u8; COOKIE_BYTES]) -> bool {
+        let epoch = cookie_epoch(now_ms);
+        [epoch, epoch.saturating_sub(1)].iter().any(|&e| {
+            let key = transport::cookie_key(&self.cfg.server_private, e);
+            wire::cookie_matches(&key, src.ip(), cookie)
+        })
+    }
+
+    /// Emits an authenticated capacity reject, through the same per-source
+    /// gate and global budget as the version reject.
+    ///
+    /// Both are packets the server sends in answer to an inbound one, and the
+    /// total reflected volume is exactly what those limits exist to bound, so
+    /// they share them rather than each getting an allowance. A suppressed
+    /// reject costs an honest client one more resend, which it was going to
+    /// send anyway. The key comes out of the handshake the caller already
+    /// read: one X25519, no second pass over the Noise message.
+    fn capacity_reject(
+        &mut self,
+        now_ms: u64,
+        src: SocketAddr,
+        responder: &Responder,
+        init_packet: &[u8],
+        out: &mut Outgoing,
+    ) {
+        let slot = reject_slot(src.ip());
+        if self.reject_seen[slot].is_some_and(|t| now_ms.saturating_sub(t) < REJECT_INTERVAL_MS) {
+            return;
+        }
+        // Left unstamped when the budget refuses, as on the version reject
+        // path, so an exhausted budget does not consume a client's turn.
+        if !self.reject_budget.take(now_ms) {
+            return;
+        }
+        self.reject_seen[slot] = Some(now_ms);
+        let Some(key) = responder.reject_key(&self.cfg.server_private) else {
+            return;
+        };
+        out.push((src, wire::build_capacity_reject(&key, init_packet)));
+    }
+
     /// Full admission path for a version-matched handshake init. Every
-    /// refusal is silent: to an unauthenticated peer the server looks like
-    /// packet loss.
+    /// refusal upstream of the token check is silent: to an unauthenticated
+    /// peer the server looks like packet loss. Capacity is checked after it,
+    /// so that one refusal is answered.
     fn admit(
         &mut self,
         now_ms: u64,
@@ -1079,6 +1240,19 @@ impl ServerCore {
         };
         if connected_in_role >= cap {
             tracing::debug!(member = id.0, "admission refused: role at capacity");
+            // This peer's token verified, so it holds an invite this session
+            // issued and telling it the truth makes the server no kind of
+            // oracle: everything upstream of the token check is still
+            // answered with silence. Without this a listener joining a full
+            // gallery waited out its own 10 s timeout and could not tell a
+            // sold-out session from a server that was down, so its next move
+            // was to retry a join that could never succeed.
+            //
+            // The MAC covers the plain init's bytes whichever framing carried
+            // the Noise message here, so a client that offered both the plain
+            // and the cookied form verifies the reject either way.
+            let init_packet = wire::build_handshake_init(PROTOCOL_VERSION, noise);
+            self.capacity_reject(now_ms, src, &responder, &init_packet, out);
             return;
         }
         // One encoder serves every listener, built on the first one to join.
@@ -1772,6 +1946,12 @@ impl ServerCore {
 /// cores must replay identically under the harness; the worst an attacker
 /// buys by computing a collision is one second of suppressed reject for the
 /// address they collided with.
+/// Which cookie secret is current. Derived from the caller's clock like
+/// everything else in the core, so the harness replays a rotation exactly.
+fn cookie_epoch(now_ms: u64) -> u64 {
+    now_ms / COOKIE_ROTATION_MS
+}
+
 fn reject_slot(ip: IpAddr) -> usize {
     let network = match ip {
         IpAddr::V4(v4) => u128::from(u32::from_be_bytes(v4.octets())),
@@ -1914,55 +2094,364 @@ mod tests {
 
     /// `Responder::read_init` performs an X25519 before anything about the
     /// sender is known, on the task that also runs the 2.5 ms mix tick. A
-    /// flood must not be able to buy more of that than the budget allows,
+    /// flood must not be able to buy more of that than the budgets allow,
     /// however widely it spreads its source addresses.
     #[test]
     fn an_init_flood_cannot_buy_unbounded_asymmetric_crypto() {
         let (mut core, _issuer, _public) = server_with_issuer();
         let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
         // 40,000 distinct sources at one instant, far more than the table has
-        // slots, so only the global budget can hold this down.
-        for a in 0..160u16 {
-            for b in 0..250u16 {
-                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
-                core.handle_datagram(0, 0, src, &init);
+        // slots, so no per-source key can hold this down.
+        let flood = |core: &mut ServerCore, now_ms: u64| {
+            for a in 0..160u16 {
+                for b in 0..250u16 {
+                    let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
+                    core.handle_datagram(now_ms, 0, src, &init);
+                }
             }
-        }
-        assert_eq!(core.handshake_reads(), u64::from(INIT_BURST));
-        // A second later the allowance is back, so an honest client that
-        // resent through the flood is read: 8 from one source, inside both
-        // the refilled global budget and that source's own.
-        for _ in 0..8 {
-            core.handle_datagram(1_000, 0, addr(9), &init);
-        }
-        assert_eq!(core.handshake_reads(), u64::from(INIT_BURST) + 8);
-        // And no faster than the rate: the flood cannot buy more by waiting.
-        for a in 0..160u16 {
-            for b in 0..250u16 {
-                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
-                core.handle_datagram(1_000, 0, src, &init);
-            }
-        }
+        };
+        flood(&mut core, 0);
+        // The cookie trigger empties first, so what a spoofed flood buys is
+        // its burst and then a 17-byte MAC per packet instead of an X25519.
+        assert_eq!(core.handshake_reads(), u64::from(COOKIE_TRIGGER_BURST));
+        assert!(
+            core.cookie_challenges() > 0,
+            "the flood was never asked for a cookie"
+        );
+        // And no faster than the trigger rate: the flood cannot buy more by
+        // waiting, because it never comes back from the addresses it claims.
+        flood(&mut core, 1_000);
         assert_eq!(
             core.handshake_reads(),
-            u64::from(INIT_BURST) + u64::from(INIT_RATE_PER_SEC)
+            u64::from(COOKIE_TRIGGER_BURST) + u64::from(COOKIE_TRIGGER_RATE_PER_SEC)
+        );
+        flood(&mut core, 2_000);
+        assert_eq!(
+            core.handshake_reads(),
+            u64::from(COOKIE_TRIGGER_BURST) + 2 * u64::from(COOKIE_TRIGGER_RATE_PER_SEC)
         );
     }
 
     /// A single host cannot spend the whole allowance and leave a band
-    /// arriving from anywhere else with nothing.
+    /// arriving from anywhere else with nothing. Below the cookie trigger, so
+    /// this is the per-network share of the Diffie-Hellman budget on its own.
     #[test]
     fn one_source_cannot_spend_the_whole_handshake_budget() {
         let (mut core, _issuer, _public) = server_with_issuer();
         let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
-        for port in 1_024..3_024u16 {
+        // Walking source ports, which is what a limiter keyed on ip:port
+        // would see as a fresh peer every time.
+        for port in 1_024..1_064u16 {
             let src: SocketAddr = format!("203.0.113.7:{port}").parse().unwrap();
             core.handle_datagram(0, 0, src, &init);
         }
         assert_eq!(core.handshake_reads(), u64::from(INIT_SLOT_BURST));
+        assert_eq!(core.cookie_challenges(), 0, "40 inits is not a flood");
         // And the rest of the budget is still there for everybody else.
         core.handle_datagram(0, 0, addr(9), &init);
         assert_eq!(core.handshake_reads(), u64::from(INIT_SLOT_BURST) + 1);
+    }
+
+    /// The cookie proves a source address is real, which is what makes the
+    /// per-network share of the Diffie-Hellman budget bite: a spoofed flood
+    /// spreads over every slot, a cookie holder cannot.
+    #[test]
+    fn a_cookie_holder_is_still_capped_at_its_networks_share() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        let src: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+
+        // Drain the trigger so the round trip is engaged, then take the
+        // cookie the server offers this address.
+        for _ in 0..COOKIE_TRIGGER_BURST {
+            core.handle_datagram(0, 0, src, &init);
+        }
+        let out = core.handle_datagram(0, 0, src, &init);
+        let Ok(Packet::CookieChallenge { cookie }) = wire::parse(&out[0].1) else {
+            panic!("expected a challenge, got {:?}", wire::parse(&out[0].1));
+        };
+        let cookied = wire::build_cookied_init(&cookie, PROTOCOL_VERSION, &[0xAA; 96]);
+        let before = core.handshake_reads();
+
+        // A thousand cookied inits from the address the cookie names, over a
+        // whole second, walking ports the way a flood does.
+        for i in 0..1_000u64 {
+            let port = 5_000 + (i % 500) as u16;
+            let from: SocketAddr = format!("203.0.113.7:{port}").parse().unwrap();
+            core.handle_datagram(1_000 + i, 0, from, &cookied);
+        }
+        let bought = core.handshake_reads() - before;
+        // One network's second: its refill, plus at most whatever the burst
+        // had left when the run started.
+        assert!(
+            bought <= u64::from(INIT_SLOT_BURST) + u64::from(INIT_SLOT_RATE_PER_SEC),
+            "a cookie holder bought {bought} Diffie-Hellmans in a second"
+        );
+
+        // The same cookie is no use from a different address: it is a MAC over
+        // the source, so spoofing one does not carry the cookie with it.
+        let elsewhere: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let before = core.handshake_reads();
+        for i in 0..50u64 {
+            core.handle_datagram(3_000 + i, 0, elsewhere, &cookied);
+        }
+        assert_eq!(
+            core.handshake_reads(),
+            before,
+            "a cookie was accepted from an address it was not issued to"
+        );
+    }
+
+    /// Under load a valid invite is not enough on its own: the round trip is
+    /// the point, so the plain init draws a challenge and no join, and only the
+    /// cookied form is read. Real invite, real handshake, real core.
+    #[test]
+    fn under_load_only_a_cookied_init_is_read() {
+        let (mut core, issuer, public) = server_with_issuer();
+        let filler = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        for _ in 0..COOKIE_TRIGGER_BURST {
+            core.handle_datagram(0, 0, addr(2), &filler);
+        }
+        let invite = issuer.mint(
+            SessionId([7u8; 16]),
+            vec![addr(1)],
+            public,
+            Token {
+                member_id: MemberId(1),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId([1u8; 16]),
+            },
+        );
+        let (_, init) = Initiator::new(&invite).unwrap();
+        let honest = addr(9);
+
+        // The plain init: a challenge, no read, no member.
+        let reads = core.handshake_reads();
+        let out = core.handle_datagram(0, 0, honest, &init);
+        let Ok(Packet::CookieChallenge { cookie }) = wire::parse(&out[0].1) else {
+            panic!("expected a challenge, got {:?}", wire::parse(&out[0].1));
+        };
+        assert_eq!(core.handshake_reads(), reads, "the init was read anyway");
+        assert_eq!(core.musicians_connected(), 0);
+
+        // A cookie that was not issued to this address, and a cookie with a
+        // bit flipped: both silent, neither read.
+        let elsewhere = wire::build_cookied_init(&cookie, PROTOCOL_VERSION, &[0xAA; 96]);
+        assert!(core.handle_datagram(0, 0, addr(8), &elsewhere).is_empty());
+        let mut tampered = cookie;
+        tampered[0] ^= 0x01;
+        let Ok(Packet::HandshakeInit { noise, .. }) = wire::parse(&init) else {
+            panic!("expected an init");
+        };
+        let bad = wire::build_cookied_init(&tampered, PROTOCOL_VERSION, noise);
+        assert!(core.handle_datagram(0, 0, honest, &bad).is_empty());
+        assert_eq!(core.handshake_reads(), reads);
+
+        // The genuine cookied init joins, even with the flood still running.
+        let cookied = wire::build_cookied_init(&cookie, PROTOCOL_VERSION, noise);
+        let out = core.handle_datagram(0, 0, honest, &cookied);
+        assert!(matches!(
+            wire::parse(&out[0].1),
+            Ok(Packet::HandshakeResp { .. })
+        ));
+        assert_eq!(core.musicians_connected(), 1);
+        assert_eq!(core.handshake_reads(), reads + 1);
+    }
+
+    /// A client offering both forms sends one handshake, not two. The Noise
+    /// message is identical, so the second arrival is the idempotent-retry path
+    /// and hands back the cached response rather than building fresh state.
+    #[test]
+    fn both_forms_of_one_init_are_one_handshake() {
+        let (mut core, issuer, public) = server_with_issuer();
+        let invite = issuer.mint(
+            SessionId([7u8; 16]),
+            vec![addr(1)],
+            public,
+            Token {
+                member_id: MemberId(1),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId([1u8; 16]),
+            },
+        );
+        let (_, init) = Initiator::new(&invite).unwrap();
+        let Ok(Packet::HandshakeInit { noise, .. }) = wire::parse(&init) else {
+            panic!("expected an init");
+        };
+        let cookied = wire::build_cookied_init(&[0u8; COOKIE_BYTES], PROTOCOL_VERSION, noise);
+
+        // Not under load, so the plain one is admitted.
+        let first = core.handle_datagram(0, 0, addr(9), &init);
+        assert_eq!(core.handshake_reads(), 1);
+        // The cookied one that followed it carries a cookie this server never
+        // issued, so it is dropped without a second read.
+        assert!(core.handle_datagram(0, 0, addr(9), &cookied).is_empty());
+        assert_eq!(core.handshake_reads(), 1);
+        // A resent plain init gets the cached response, byte for byte, and
+        // creates no second member. It does cost a second read: the member the
+        // cache is keyed on is inside the encrypted payload, so the message has
+        // to be opened before the cache can be consulted.
+        let again = core.handle_datagram(1, 0, addr(9), &init);
+        assert_eq!(first[0].1, again[0].1);
+        assert_eq!(core.handshake_reads(), 2);
+        assert_eq!(core.musicians_connected(), 1);
+    }
+
+    /// A capacity reject drawn by a cookied init has to verify against the
+    /// plain init, because the client sends both forms and holds only one set
+    /// of bytes to check a MAC against. Getting this wrong would leave the
+    /// reject silently unverifiable under load, which is the shape of bug that
+    /// passes both halves' own tests.
+    #[test]
+    fn a_capacity_reject_drawn_by_a_cookied_init_verifies_against_the_plain_one() {
+        let issuer = Issuer::generate();
+        let kp = generate_keypair();
+        let public = kp.public;
+        let mut core = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(0, 0),
+        );
+        let invite = issuer.mint(
+            SessionId([7u8; 16]),
+            vec![addr(1)],
+            public,
+            Token {
+                member_id: MemberId(1),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId([1u8; 16]),
+            },
+        );
+        let (initiator, init) = Initiator::new(&invite).unwrap();
+        let src = addr(9);
+
+        // Take a real cookie, then answer with the cookied form.
+        let filler = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        for _ in 0..COOKIE_TRIGGER_BURST {
+            core.handle_datagram(0, 0, addr(2), &filler);
+        }
+        let out = core.handle_datagram(0, 0, src, &init);
+        let Ok(Packet::CookieChallenge { cookie }) = wire::parse(&out[0].1) else {
+            panic!("expected a challenge");
+        };
+        let Ok(Packet::HandshakeInit { noise, .. }) = wire::parse(&init) else {
+            panic!("expected an init");
+        };
+        let cookied = wire::build_cookied_init(&cookie, PROTOCOL_VERSION, noise);
+        // Past the per-source reject interval the challenge stamped.
+        let out = core.handle_datagram(2_000, 0, src, &cookied);
+        let Ok(Packet::CapacityReject { mac }) = wire::parse(&out[0].1) else {
+            panic!(
+                "expected a capacity reject, got {:?}",
+                wire::parse(&out[0].1)
+            );
+        };
+        assert!(
+            wire::verify_capacity_reject(initiator.reject_key().unwrap(), &mac, &init),
+            "the reject did not verify against the plain init the client holds"
+        );
+    }
+
+    /// A cookie is a MAC over one source address under a secret that rotates,
+    /// so the previous epoch's cookie still works across a rotation and one
+    /// from two epochs back does not.
+    #[test]
+    fn a_cookie_expires_one_rotation_after_the_secret_that_made_it() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        let src: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        for _ in 0..COOKIE_TRIGGER_BURST {
+            core.handle_datagram(0, 0, src, &init);
+        }
+        let out = core.handle_datagram(0, 0, src, &init);
+        let Ok(Packet::CookieChallenge { cookie }) = wire::parse(&out[0].1) else {
+            panic!("expected a challenge");
+        };
+        let cookied = wire::build_cookied_init(&cookie, PROTOCOL_VERSION, &[0xAA; 96]);
+
+        // Still the current epoch, and then the previous one: a rotation must
+        // not invalidate a cookie already in flight.
+        let read = |core: &mut ServerCore, now_ms: u64| {
+            let before = core.handshake_reads();
+            core.handle_datagram(now_ms, 0, src, &cookied);
+            core.handshake_reads() > before
+        };
+        assert!(read(&mut core, COOKIE_ROTATION_MS - 1));
+        assert!(read(&mut core, COOKIE_ROTATION_MS + 1));
+        // Two rotations on, it is gone. Nothing was stored to expire; the
+        // secret it was made under is simply no longer computed.
+        assert!(!read(&mut core, 2 * COOKIE_ROTATION_MS + 1));
+        assert!(!read(&mut core, 9 * COOKIE_ROTATION_MS));
+    }
+
+    /// A cookie challenge is 17 bytes. Answering a 3-byte `[1, 1, 0]` with one
+    /// would make the server an amplifier by size, and a challenge is the one
+    /// thing here that is not otherwise rate limited per source.
+    #[test]
+    fn a_challenge_is_never_larger_than_the_init_it_answers() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let long = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        for _ in 0..COOKIE_TRIGGER_BURST {
+            core.handle_datagram(0, 0, addr(2), &long);
+        }
+        for noise_len in [0usize, 1, 8, 44] {
+            let short = wire::build_handshake_init(PROTOCOL_VERSION, &vec![0xAA; noise_len]);
+            assert!(
+                core.handle_datagram(0, 0, addr(3), &short).is_empty(),
+                "{}-byte init drew a challenge",
+                short.len()
+            );
+        }
+        let out = core.handle_datagram(0, 0, addr(4), &long);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].1.len() < long.len(),
+            "challenge {} bytes vs init {} bytes",
+            out[0].1.len(),
+            long.len()
+        );
+    }
+
+    /// The challenge is the only answer with no per-source gate in front of
+    /// it, so the ceiling on it is what stops an unbounded send loop on the
+    /// task that owns the mix tick.
+    #[test]
+    fn challenge_volume_has_a_ceiling() {
+        let (mut core, _issuer, _public) = server_with_issuer();
+        let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        // Comfortably more inits at one instant than the ceiling allows.
+        let flood = usize::try_from(CHALLENGE_RATE_PER_SEC).unwrap() * 2;
+        for i in 0..flood {
+            let src: SocketAddr = format!("198.18.{}.{}:9000", (i >> 8) & 0xFF, i & 0xFF)
+                .parse()
+                .unwrap();
+            core.handle_datagram(0, 0, src, &init);
+        }
+        assert_eq!(core.cookie_challenges(), u64::from(CHALLENGE_RATE_PER_SEC));
+        // Past the ceiling an init draws silence, which is what it drew before
+        // any of this existed.
+        assert!(core.handle_datagram(0, 0, addr(9), &init).is_empty());
+        // A second on, the allowance is back and no faster than the rate.
+        for i in 0..flood {
+            let src: SocketAddr = format!("198.18.{}.{}:9000", (i >> 8) & 0xFF, i & 0xFF)
+                .parse()
+                .unwrap();
+            core.handle_datagram(1_000, 0, src, &init);
+        }
+        assert_eq!(
+            core.cookie_challenges(),
+            2 * u64::from(CHALLENGE_RATE_PER_SEC)
+        );
     }
 
     /// The reject is 21 bytes. Answering a 3-byte `[1, 9, 0]` would make the
@@ -1997,6 +2486,248 @@ mod tests {
         let (mut core, _issuer, _public) = server_with_issuer();
         let garbage = wire::build_handshake_init(9, &[0xAA; 96]);
         assert!(core.handle_datagram(0, 0, addr(2), &garbage).is_empty());
+    }
+
+    /// The capacity check runs after the token verifies, so the peer has
+    /// already proven it holds an invite this session issued and can safely
+    /// be told the truth. Before this, a listener joining a full gallery
+    /// waited out its own 10 s timeout and could not tell a sold-out session
+    /// from a server that was down.
+    #[test]
+    fn a_full_role_draws_an_authenticated_capacity_reject() {
+        let issuer = Issuer::generate();
+        let kp = generate_keypair();
+        let public = kp.public;
+        // One listener seat, so the second listener is over capacity.
+        let mut core = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(4, 1),
+        );
+        let listener = |member: u16| {
+            issuer.mint(
+                SessionId([7u8; 16]),
+                vec![addr(1)],
+                public,
+                Token {
+                    member_id: MemberId(member),
+                    role: Role::Listener,
+                    name_hint: None,
+                    expires_unix: u64::MAX,
+                    jti: TokenId([member as u8; 16]),
+                },
+            )
+        };
+
+        // The first listener is admitted and gets a handshake response.
+        let (_, first_init) = Initiator::new(&listener(10)).unwrap();
+        let out = core.handle_datagram(0, 0, addr(10), &first_init);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            wire::parse(&out[0].1),
+            Ok(Packet::HandshakeResp { .. })
+        ));
+
+        // The second draws a capacity reject its own handshake authenticates.
+        let over = listener(11);
+        let (initiator, init) = Initiator::new(&over).unwrap();
+        let out = core.handle_datagram(0, 0, addr(11), &init);
+        assert_eq!(out.len(), 1, "a full role must not answer with silence");
+        assert_eq!(out[0].0, addr(11));
+        let Ok(Packet::CapacityReject { mac }) = wire::parse(&out[0].1) else {
+            panic!("expected a capacity reject, got {:?}", out[0].1);
+        };
+        assert!(wire::verify_capacity_reject(
+            initiator.reject_key().unwrap(),
+            &mac,
+            &init
+        ));
+        assert!(out[0].1.len() < init.len(), "never an amplifier");
+        // Refused means refused: no seat was taken.
+        assert_eq!(core.broadcast_tick().listeners, 1);
+
+        // Nobody else can forge one. An invite carries the server's public
+        // key and nothing more, so a second handshake with the same invite
+        // derives a different key.
+        let (other, _) = Initiator::new(&over).unwrap();
+        assert!(!wire::verify_capacity_reject(
+            other.reject_key().unwrap(),
+            &mac,
+            &init
+        ));
+
+        // A musician seat is still free, and a musician still gets in: the
+        // reject is about one role, not about the session.
+        let musician = issuer.mint(
+            SessionId([7u8; 16]),
+            vec![addr(1)],
+            public,
+            Token {
+                member_id: MemberId(0),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId([99u8; 16]),
+            },
+        );
+        let (_, m_init) = Initiator::new(&musician).unwrap();
+        // A second later, past the per-source reject interval.
+        let out = core.handle_datagram(2_000, 0, addr(12), &m_init);
+        assert!(matches!(
+            wire::parse(&out[0].1),
+            Ok(Packet::HandshakeResp { .. })
+        ));
+    }
+
+    /// Everything upstream of the token check still gets silence: answering
+    /// an arbitrary init would make the server an oracle for which invites
+    /// exist and a reflector for whoever spoofed the source.
+    #[test]
+    fn an_unverified_peer_is_never_told_the_session_is_full() {
+        let issuer = Issuer::generate();
+        let stranger = Issuer::generate();
+        let kp = generate_keypair();
+        let public = kp.public;
+        let mut core = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(1, 0),
+        );
+        let token = |member: u16| Token {
+            member_id: MemberId(member),
+            role: Role::Musician,
+            name_hint: None,
+            expires_unix: u64::MAX,
+            jti: TokenId([member as u8; 16]),
+        };
+        // Fill the one musician seat.
+        let host = issuer.mint(SessionId([7u8; 16]), vec![addr(1)], public, token(0));
+        let (_, init) = Initiator::new(&host).unwrap();
+        assert_eq!(core.handle_datagram(0, 0, addr(1), &init).len(), 1);
+
+        // Signed by somebody else's issuer: silence, though the session is
+        // as full for this peer as for anyone.
+        let forged = stranger.mint(SessionId([7u8; 16]), vec![addr(1)], public, token(3));
+        let (_, forged_init) = Initiator::new(&forged).unwrap();
+        assert!(
+            core.handle_datagram(2_000, 0, addr(3), &forged_init)
+                .is_empty(),
+            "an unsigned token drew a reject"
+        );
+
+        // Expired, and revoked: same silence.
+        let mut expiring = token(4);
+        expiring.expires_unix = 100;
+        let expired = issuer.mint(SessionId([7u8; 16]), vec![addr(1)], public, expiring);
+        let (_, expired_init) = Initiator::new(&expired).unwrap();
+        assert!(
+            core.handle_datagram(4_000, 200, addr(4), &expired_init)
+                .is_empty(),
+            "an expired token drew a reject"
+        );
+
+        let revoked = issuer.mint(SessionId([7u8; 16]), vec![addr(1)], public, token(5));
+        core.restore_revoked(vec![revoked.token.jti]);
+        let (_, revoked_init) = Initiator::new(&revoked).unwrap();
+        assert!(
+            core.handle_datagram(6_000, 0, addr(5), &revoked_init)
+                .is_empty(),
+            "a revoked token drew a reject"
+        );
+
+        // And garbage that never reaches a token at all.
+        let garbage = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        assert!(core.handle_datagram(8_000, 0, addr(6), &garbage).is_empty());
+    }
+
+    /// The reject is a packet the server sends because a packet arrived, so
+    /// it shares the version reject's per-source gate and global budget. One
+    /// invite holder replaying its own init cannot make the server a
+    /// reflector.
+    #[test]
+    fn capacity_rejects_are_rate_limited_like_version_rejects() {
+        let issuer = Issuer::generate();
+        let kp = generate_keypair();
+        let public = kp.public;
+        let mut core = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(0, 0),
+        );
+        let invite = issuer.mint(
+            SessionId([7u8; 16]),
+            vec![addr(1)],
+            public,
+            Token {
+                member_id: MemberId(1),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId([1u8; 16]),
+            },
+        );
+        let (_, init) = Initiator::new(&invite).unwrap();
+
+        // Counted by type, not by datagram: under load the same init draws a
+        // cookie challenge, which is not a reject.
+        let count = |out: &Outgoing| {
+            out.iter()
+                .filter(|(_, dg)| matches!(wire::parse(dg), Ok(Packet::CapacityReject { .. })))
+                .count()
+        };
+
+        assert_eq!(count(&core.handle_datagram(0, 0, addr(2), &init)), 1);
+        // Within the interval, the same source gets nothing back.
+        assert!(core.handle_datagram(500, 0, addr(2), &init).is_empty());
+        // Walking source ports does not buy another: the gate is keyed on the
+        // network, and the port is chosen by whoever sends the packet.
+        let mut answered = 0;
+        for port in 1_024..1_124u16 {
+            let src: SocketAddr = format!("10.0.0.2:{port}").parse().unwrap();
+            answered += count(&core.handle_datagram(600, 0, src, &init));
+        }
+        assert_eq!(answered, 0, "{answered} rejects from one network in 100 ms");
+        // Past the interval it is answered again.
+        assert_eq!(count(&core.handle_datagram(1_500, 0, addr(2), &init)), 1);
+
+        // And the total is capped however wide the sources are spread, which
+        // is what a spoofed flood does.
+        let mut fresh = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(0, 0),
+        );
+        let mut rejects = 0;
+        for a in 0..40u16 {
+            for b in 0..40u16 {
+                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
+                rejects += count(&fresh.handle_datagram(0, 0, src, &init));
+            }
+        }
+        // The cookie trigger and the init budget both bite before the reject
+        // budget does: an init has to be read before its token can verify, and
+        // that read is what those price.
+        assert!(
+            rejects <= REJECT_BURST as usize,
+            "1600 sources drew {rejects} rejects"
+        );
+        assert!(rejects > 0, "the burst answered nobody");
     }
 
     #[test]

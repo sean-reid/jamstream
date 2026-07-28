@@ -26,7 +26,8 @@ fn temp_path(name: &str) -> PathBuf {
 
 fn join_args(invite: String, input: PathBuf, output: PathBuf, chat: &str) -> JoinArgs {
     JoinArgs {
-        invite,
+        invite: Some(invite),
+        invite_file: None,
         headless: true,
         input,
         output,
@@ -34,6 +35,7 @@ fn join_args(invite: String, input: PathBuf, output: PathBuf, chat: &str) -> Joi
         chat: Some(chat.to_owned()),
         name: None,
         revoke_invite: None,
+        revoke_invite_file: None,
         revoke_after_secs: None,
     }
 }
