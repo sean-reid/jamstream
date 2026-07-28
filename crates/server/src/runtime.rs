@@ -370,9 +370,13 @@ impl Server {
             return;
         }
         let mut payload = Box::new(RecordPayload::default());
-        let tick = self.core.broadcast_tick();
-        let n = tick.audio.len().min(payload.mix.len());
-        payload.mix[..n].copy_from_slice(&tick.audio[..n]);
+        // The audio tap, not the full broadcast tick: the recorder wants
+        // samples, and building the card roster beside them costs an
+        // allocation and an avatar cache lookup per musician that this
+        // function would drop on the floor 400 times a second.
+        let audio = self.core.broadcast_audio();
+        let n = audio.len().min(payload.mix.len());
+        payload.mix[..n].copy_from_slice(&audio[..n]);
         let stems = self.recording_opts.as_ref().is_some_and(|c| c.stems());
         if stems {
             for stem in self.core.stems() {

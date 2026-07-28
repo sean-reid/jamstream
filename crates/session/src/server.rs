@@ -871,11 +871,20 @@ impl ServerCore {
         self.bcast_tap
     }
 
+    /// The last tick's broadcast audio on its own, for a consumer that wants
+    /// the samples and nothing else. [`ServerCore::broadcast_tick`] also
+    /// builds the card roster, which costs an allocation and an avatar cache
+    /// lookup per musician; the recorder wants none of it and used to pay for
+    /// it 400 times a second.
+    pub fn broadcast_audio(&self) -> &[f32] {
+        let start = self.bcast_slot * MIX_LEN;
+        &self.bcast_accum[start..start + MIX_LEN]
+    }
+
     /// The last tick's broadcast audio and card state, for the stream
     /// pipeline. Call it right after [`ServerCore::tick`]: the audio slice is
     /// the accumulator slot that tick wrote.
     pub fn broadcast_tick(&self) -> BroadcastTick<'_> {
-        let start = self.bcast_slot * MIX_LEN;
         let members =
             self.members
                 .iter()
@@ -894,7 +903,7 @@ impl ServerCore {
                 })
                 .collect();
         BroadcastTick {
-            audio: &self.bcast_accum[start..start + MIX_LEN],
+            audio: self.broadcast_audio(),
             members,
             listeners: self
                 .members
