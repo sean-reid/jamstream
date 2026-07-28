@@ -30,6 +30,40 @@ fn local_state_dir() -> Result<PathBuf, CliError> {
     state::data_dir()
 }
 
+/// The local provider, honouring `JAMSTREAM_BIND` if it names an address.
+///
+/// A real session binds every interface, because bandmates on the same
+/// network have to reach it. A test does not, and on macOS binding
+/// `0.0.0.0` makes the firewall ask about every freshly built binary, which
+/// parks the process behind a dialog nobody answers. That is not a
+/// hypothetical: it hung the local end to end tests for hours and read as a
+/// protocol regression, because the client only sees a handshake that never
+/// completes.
+///
+/// Same shape as `JAMSTREAMD_PATH`, which the same tests already set.
+fn local_provider() -> Result<LocalProvider, CliError> {
+    let provider = LocalProvider::new(local_state_dir()?);
+    let Some(ip) = bind_override(std::env::var_os("JAMSTREAM_BIND").as_deref())? else {
+        return Ok(provider);
+    };
+    Ok(provider.with_bind(ip))
+}
+
+/// Parses `JAMSTREAM_BIND`. Separate from the reader so it can be tested
+/// without setting a variable, which tests running in parallel would share.
+fn bind_override(raw: Option<&std::ffi::OsStr>) -> Result<Option<std::net::IpAddr>, CliError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let raw = raw.to_string_lossy();
+    // Unset and set-but-empty both mean every interface, so a shell that
+    // exports an empty variable does not turn into a usage error.
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse()
+        .map(Some)
+        .map_err(|_| CliError::Usage(format!("JAMSTREAM_BIND is {raw:?}, not an IP address")))
+}
+
 pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
     resolve_for_port(name, DEFAULT_SESSION_PORT)
 }
@@ -40,7 +74,7 @@ pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
 /// behind a firewall for a different port.
 pub fn resolve_for_port(name: &str, session_port: u16) -> Result<Box<dyn Provider>, CliError> {
     match name {
-        "local" => Ok(Box::new(LocalProvider::new(local_state_dir()?))),
+        "local" => Ok(Box::new(local_provider()?)),
         // The mock needs some underlying kind for its instances; Aws is
         // arbitrary and never leaves the process.
         "mock" => Ok(Box::new(
@@ -85,6 +119,24 @@ fn creds_error(name: &str, detail: &str) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_override_reads_an_address_and_refuses_nonsense() {
+        use std::ffi::OsStr;
+        assert_eq!(bind_override(None).unwrap(), None);
+        assert_eq!(bind_override(Some(OsStr::new(""))).unwrap(), None);
+        assert_eq!(
+            bind_override(Some(OsStr::new("127.0.0.1"))).unwrap(),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            bind_override(Some(OsStr::new("::1"))).unwrap(),
+            Some("::1".parse().unwrap())
+        );
+        // A hostname is the plausible mistake, and quietly falling back to
+        // every interface would put the firewall dialog back in the way.
+        assert!(bind_override(Some(OsStr::new("localhost"))).is_err());
+    }
 
     #[test]
     fn mock_resolves() {
