@@ -30,6 +30,14 @@ Cloud providers charge for data leaving their network, per gigabyte, and call it
 
 Broadcasting is the exception: one Twitch or YouTube destination is about 1.2 GB per hour, more than four musicians' audio combined. Two of them for three hours is about 7 GB, still inside DigitalOcean's and AWS's allowances, and about $0.80 on GCP. See [Streaming to Twitch and YouTube](streaming.md).
 
+## Recording
+
+[Recording a session](recording.md) on your own computer costs nothing but disk: about 0.4 GB per hour for the mix, or about 1.8 GB per hour with stems for a four piece.
+
+A cloud session records to a bucket, which adds two charges. Storage is the small one. A three hour take is about 1.1 GB for the mix or about 5.5 GB with stems, and at $0.023 per GB-month on S3 and about $0.02 on Cloud Storage, keeping the stems for the default 30 days is about $0.13. A DigitalOcean Spaces subscription is $5 a month including 250 GB, so a take fits inside what you already pay. Uploading costs nothing, because the machine and the bucket are at the same provider.
+
+**The egress lands on the download.** Pulling 5.5 GB of stems out of S3 is about $0.49, out of Cloud Storage about $0.66, and free inside the 1 TB Spaces includes. That is the one cost in JamStream that arrives after a session has finished pricing itself, which is why `jamstream recordings get` prints the figure and waits for a yes before it moves a byte.
+
 ## The guardrails
 
 Ephemeral cloud machines have one classic failure: you forget one and it bills for a month. JamStream treats that as a design problem:

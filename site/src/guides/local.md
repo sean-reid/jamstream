@@ -35,3 +35,5 @@ Every desktop app artifact bundles `jamstreamd` in that app-adjacent spot, which
 ## What lands on disk
 
 Under your platform's data directory in `jamstream/`: a `local.json` registry of running server processes, and `jamstream/sessions/`, holding one directory per session with the server's config and its log (`server.log`, the first place to look if a local server exits at startup) alongside the session state files that `status` and `end` read.
+
+A session launched with `--record` writes its takes to `jamstream/recordings/` instead, outside the per-session directory that ending a session deletes. See [Recording a session](recording.md).
