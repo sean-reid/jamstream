@@ -106,11 +106,41 @@ fn app_harness(mut app: JamApp, size: egui::Vec2) -> Harness<'static> {
 }
 
 /// A JamApp with environment-dependent state pinned for reproducibility.
+/// `in_memory` is the whole point of the helper existing: it pins the
+/// credential store and the environment reader alongside the theme and the
+/// recent list, so no fixture can render what one machine has stored, and
+/// no fixture can make the test binary ask the developer running it for
+/// their real keychain.
 fn test_app(theme: Theme) -> JamApp {
-    let mut app = JamApp::new();
+    let mut app = JamApp::in_memory();
     app.theme = theme;
     app.recent = Vec::new();
     app
+}
+
+/// The guard behind [`test_app`]. Every cloud provider must read "setup
+/// needed" in a fixture, on every machine, because the fixture has no
+/// credentials and cannot go looking for any. This fails on a developer
+/// machine with a saved DigitalOcean token the moment a fixture reaches the
+/// real keychain or the real environment again, which is what the snapshot
+/// binary used to do: `JamApp::new()` built a `KeyringStore`, the wizard
+/// read it while constructing itself, and macOS put up a dialog asking to
+/// unlock the developer's stored cloud tokens and stream keys.
+#[test]
+fn fixtures_cannot_see_the_machine_that_runs_them() {
+    let app = test_app(Theme::Dark);
+    for row in &app.wizard.providers {
+        let expected = if row.name == "local" {
+            ProviderStatus::NoAccountNeeded
+        } else {
+            ProviderStatus::SetupNeeded
+        };
+        assert_eq!(
+            row.status, expected,
+            "provider {} read as {:?}: the fixture reached real credentials",
+            row.name, row.status
+        );
+    }
 }
 
 fn sample_recent() -> Vec<RecentSession> {
