@@ -65,6 +65,27 @@ fn reject_key_from_dh(private: &[u8], public: &[u8]) -> Option<wire::RejectKey> 
     Some(wire::RejectKey::from_bytes(h.finalize().into()))
 }
 
+/// Domain separator for the cookie secret, so nothing derived from the static
+/// private key can ever be mistaken for anything else derived from it.
+const COOKIE_KEY_DOMAIN: &[u8] = b"jamstream-cookie-secret-v1";
+
+/// The cookie secret for one epoch: a hash of the server's static private key
+/// and the epoch number.
+///
+/// No random state and no stored table, which is the whole point of a
+/// stateless cookie: the server can recompute what it handed out without
+/// remembering that it handed anything out, and the core stays deterministic
+/// under the harness. Rotating on an epoch bounds how long a cookie is worth
+/// stealing; the caller accepts the previous epoch too so a rotation does not
+/// invalidate a cookie in flight.
+pub fn cookie_key(server_private: &[u8], epoch: u64) -> wire::CookieKey {
+    let mut h = Blake2s256::new();
+    h.update(COOKIE_KEY_DOMAIN);
+    h.update(server_private);
+    h.update(epoch.to_le_bytes());
+    wire::CookieKey::from_bytes(h.finalize().into())
+}
+
 /// The key that authenticates a version reject for an init this server will
 /// not otherwise process, recovered from the init itself.
 ///
@@ -249,6 +270,10 @@ impl Initiator {
 /// expiry, revocation list) before spending anything on a response.
 pub struct Responder {
     hs: HandshakeState,
+    /// The initiator's per-connection static key, taken out of the first
+    /// message. Kept so a reject can be authenticated without reading that
+    /// message a second time.
+    remote_static: [u8; 32],
 }
 
 impl Responder {
@@ -271,7 +296,25 @@ impl Responder {
         let mut payload = vec![0u8; noise_msg.len()];
         let len = hs.read_message(noise_msg, &mut payload)?;
         let hp: HandshakePayload = postcard::from_bytes(&payload[..len])?;
-        Ok((hp, Self { hs }))
+        // IK carries the initiator's static in the first message, so a
+        // successful read always has one.
+        let remote_static: [u8; 32] = hs
+            .get_remote_static()
+            .ok_or(Error::Malformed)?
+            .try_into()
+            .map_err(|_| Error::Malformed)?;
+        Ok((hp, Self { hs, remote_static }))
+    }
+
+    /// The key that authenticates a reject answering this handshake, for a
+    /// caller that read the init and then found it cannot admit the peer.
+    ///
+    /// One X25519 rather than the whole of [`reject_key_for_init`], since the
+    /// initiator's static key is already out of the message. Deliberately not
+    /// derived at construction: the happy path never wants it, and this runs
+    /// on the task that also owns the 2.5 ms mix tick.
+    pub fn reject_key(&self, server_private: &[u8]) -> Option<wire::RejectKey> {
+        reject_key_from_dh(server_private, &self.remote_static)
     }
 
     /// Called only after the token checks out. Produces the wire datagram
@@ -626,6 +669,77 @@ mod tests {
         // Nor one whose claimed version does not match the prologue it was
         // written under, which is what a replayed init relabelled looks like.
         assert!(reject_key_for_init(&server.private, &invite.session_id, 8, noise).is_none());
+    }
+
+    /// A capacity reject is produced after the init has been read, so the
+    /// server takes the key out of the handshake it already has rather than
+    /// reading the message again. It has to be the same key the client
+    /// derived, or a full session would look like silence to it.
+    #[test]
+    fn a_responder_recovers_the_same_reject_key_the_initiator_holds() {
+        let (_, server, invite) = setup();
+        let (initiator, init_packet) = Initiator::new(&invite).unwrap();
+        let wire::Packet::HandshakeInit { version, noise } = wire::parse(&init_packet).unwrap()
+        else {
+            panic!("expected init");
+        };
+        let (_, responder) =
+            Responder::read_init(&server.private, &invite.session_id, version, noise).unwrap();
+
+        let key = responder
+            .reject_key(&server.private)
+            .expect("the responder holds the initiator static");
+        let reject = wire::build_capacity_reject(&key, &init_packet);
+        let wire::Packet::CapacityReject { mac } = wire::parse(&reject).unwrap() else {
+            panic!("expected a capacity reject");
+        };
+        assert!(wire::verify_capacity_reject(
+            initiator.reject_key().expect("client derives the key"),
+            &mac,
+            &init_packet
+        ));
+
+        // Another connection attempt with the same invite derives another
+        // key, so one session's reject is not another's.
+        let (other, _) = Initiator::new(&invite).unwrap();
+        assert!(!wire::verify_capacity_reject(
+            other.reject_key().unwrap(),
+            &mac,
+            &init_packet
+        ));
+        // And a server without the static private key gets no key at all,
+        // which is every invite holder.
+        let imposter = generate_keypair();
+        let imposter_key = responder
+            .reject_key(&imposter.private)
+            .expect("a well-formed key still produces a secret");
+        assert!(!wire::verify_capacity_reject(
+            &imposter_key,
+            &mac,
+            &init_packet
+        ));
+    }
+
+    /// The cookie secret is a hash of the static private key and the epoch,
+    /// which is what makes the cookie stateless: the server recomputes what it
+    /// handed out without having remembered handing anything out, and the core
+    /// stays deterministic under the harness because there is no RNG in it.
+    #[test]
+    fn the_cookie_secret_is_a_pure_function_of_the_key_and_the_epoch() {
+        let server = generate_keypair();
+        let other = generate_keypair();
+        let src: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+
+        let cookie =
+            |private: &[u8], epoch: u64| wire::cookie_for(&cookie_key(private, epoch), src);
+        // Same inputs, same cookie, every time and in any process.
+        assert_eq!(cookie(&server.private, 7), cookie(&server.private, 7));
+        // A rotation changes it, and so does a different server.
+        assert_ne!(cookie(&server.private, 7), cookie(&server.private, 8));
+        assert_ne!(cookie(&server.private, 7), cookie(&other.private, 7));
+        // Nothing an invite carries produces one: the private key is the only
+        // input, so no client can mint a cookie for itself.
+        assert_ne!(cookie(&server.private, 7), cookie(&server.public, 7));
     }
 
     #[test]

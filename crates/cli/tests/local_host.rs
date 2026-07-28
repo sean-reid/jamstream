@@ -160,8 +160,18 @@ async fn local_host_join_and_end_story() {
     // self, so silence in the output is correct; Joined plus a clean exit
     // is the assertion.
     let output_wav = state_dir.join("local-mix.wav");
+    // Through --invite-file, which is how a real join should carry a bearer
+    // credential: argv is readable by every local process. The written file
+    // has a trailing newline, as a shell redirect leaves it.
+    let invite_file = state_dir.join("invite.txt");
+    std::fs::write(
+        &invite_file,
+        format!("{}\n", invites[0]["invite"].as_str().unwrap()),
+    )
+    .unwrap();
     let join_args = JoinArgs {
-        invite: invites[0]["invite"].as_str().unwrap().to_owned(),
+        invite: None,
+        invite_file: Some(invite_file.clone()),
         headless: true,
         input: fixture("sine-440-48k.wav"),
         output: output_wav.clone(),
@@ -169,6 +179,7 @@ async fn local_host_join_and_end_story() {
         chat: None,
         name: None,
         revoke_invite: None,
+        revoke_invite_file: None,
         revoke_after_secs: None,
     };
     let mut out = Vec::new();
@@ -176,6 +187,10 @@ async fn local_host_join_and_end_story() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("joined"), "join output: {text}");
     assert!(text.contains("left after 2 s"), "join output: {text}");
+    assert!(
+        !text.contains("warning:"),
+        "the file form must not warn: {text}"
+    );
 
     // End destroys the spawned process through the recorded provider.
     let (path, session) = end::select(&EndArgs {

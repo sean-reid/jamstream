@@ -23,6 +23,7 @@ use crate::SessionError;
 use crate::avatar::{
     AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep, avatar_hash,
 };
+use crate::limits::TokenBucket;
 
 const TICK_SAMPLES: u64 = 120;
 const UPLINK_BITRATE: u32 = 128_000;
@@ -37,6 +38,17 @@ const INIT_RESEND_MAX_MS: u64 = 2_000;
 /// a client that gave up for good would need the user to restart it.
 const REJECT_RETRY_MS: u64 = 5_000;
 const REJECT_RETRY_MAX_MS: u64 = 60_000;
+/// Cookied inits this client will send the instant a challenge arrives,
+/// and how fast that allowance comes back.
+///
+/// Answering at once saves up to a whole resend interval, so it is worth
+/// doing, but a cookie challenge is unauthenticated by construction: anyone
+/// who can see this client's address can forge one. Without a budget that
+/// would be a lever for making this client emit a packet per forged
+/// challenge, at whatever rate the attacker chose. Four covers a rotation and
+/// a retry; past that the resend timer carries it.
+const COOKIE_ANSWER_BURST: u32 = 4;
+const COOKIE_ANSWER_PER_SEC: u32 = 1;
 /// Reports of clean link required before redundancy turns back off.
 const REDUNDANCY_OFF_HOLD: u32 = 10;
 /// Playout steering samples the local jitter buffer this often, matching the
@@ -149,6 +161,11 @@ pub enum ClientEvent {
         ours: u16,
         theirs: u16,
     },
+    /// The server says, in a packet only it could have produced, that the
+    /// role this invite names has no free seat. Emitted at most once per
+    /// connection attempt; the client keeps trying, because a seat frees
+    /// when somebody leaves. See [`ClientCore::session_full`].
+    SessionFull,
     TimedOut,
 }
 
@@ -164,6 +181,9 @@ pub struct ClientStats {
     pub uplink_recovered_pct: Option<f32>,
     /// Whether capture frames currently carry the previous payload.
     pub redundancy_active: bool,
+    /// Whether the server has said this invite's role is full. Still
+    /// `Connecting`: the retry is what gets this client in when a seat frees.
+    pub session_full: bool,
 }
 
 pub struct ClientCore {
@@ -172,9 +192,17 @@ pub struct ClientCore {
     initiator: Option<Initiator>,
     /// The exact init bytes on the wire; the version reject MAC covers them.
     init_packet: Vec<u8>,
-    /// Authenticates a version reject answering this connection attempt.
+    /// Authenticates either reject answering this connection attempt.
     /// Derived from the handshake, so it changes on every reconnect.
     reject_key: Option<RejectKey>,
+    /// Set by an authenticated capacity reject: the role this invite names
+    /// is full. Suppresses the connection timeout, because a timeout would
+    /// report the wrong thing about a session that is answering.
+    session_full: bool,
+    /// The same first flight wrapped in the cookie a challenge handed over,
+    /// sent alongside the plain init and never instead of it.
+    cookied_init: Option<Vec<u8>>,
+    cookie_answers: TokenBucket,
     session: Option<Session>,
     welcome: Option<Welcome>,
     link: ControlLink,
@@ -300,6 +328,9 @@ impl ClientCore {
             initiator: Some(initiator),
             init_packet: init_packet.clone(),
             reject_key,
+            session_full: false,
+            cookied_init: None,
+            cookie_answers: TokenBucket::new(COOKIE_ANSWER_BURST, COOKIE_ANSWER_PER_SEC),
             session: None,
             welcome: None,
             link: ControlLink::new(),
@@ -344,6 +375,12 @@ impl ClientCore {
         let (encoder, decoder, decode_len) = Self::media_state(self.invite.token.role)?;
         self.state = ClientState::Connecting;
         self.reject_key = initiator.reject_key().cloned();
+        self.session_full = false;
+        // A cookie is bound to an address, not to a handshake, but the init it
+        // wraps is gone; the next challenge supplies another. The answer
+        // budget deliberately survives, so a reconnect loop is not a way
+        // round it.
+        self.cookied_init = None;
         self.initiator = Some(initiator);
         self.init_packet = init_packet.clone();
         self.session = None;
@@ -400,6 +437,8 @@ impl ClientCore {
                         self.session = Some(session);
                         self.welcome = Some(welcome);
                         self.state = ClientState::Joined;
+                        // A seat freed and the retry caught it.
+                        self.session_full = false;
                         self.last_server_ms = now_ms;
                         self.last_ping_ms = now_ms;
                         self.events.push(ClientEvent::Joined);
@@ -444,6 +483,29 @@ impl ClientCore {
                     self.init_resend_ms = REJECT_RETRY_MS;
                 }
             }
+            Packet::CapacityReject { mac } => {
+                // Same MAC key as the version reject and the same reason to
+                // trust it: only the server, holding the static private key,
+                // and this one client, holding the per-connection key behind
+                // the init, can derive it. An invite carries neither, so no
+                // on-path attacker can invent fullness.
+                //
+                // Acted on at most once per connection attempt. A capacity
+                // reject can be replayed by anyone who saw it, and a second
+                // one that reset the retry timer would let a replayer hold
+                // this client off the session indefinitely.
+                let ok = !self.session_full
+                    && self.state == ClientState::Connecting
+                    && self.reject_key.as_ref().is_some_and(|key| {
+                        wire::verify_capacity_reject(key, &mac, &self.init_packet)
+                    });
+                if ok {
+                    self.session_full = true;
+                    self.events.push(ClientEvent::SessionFull);
+                    self.last_init_ms = now_ms;
+                    self.init_resend_ms = REJECT_RETRY_MS;
+                }
+            }
             Packet::Transport {
                 counter,
                 ciphertext,
@@ -479,8 +541,36 @@ impl ClientCore {
                     _ => {}
                 }
             }
-            // Clients never receive an init.
-            Packet::HandshakeInit { .. } => {}
+            Packet::CookieChallenge { cookie } => {
+                // The server is under handshake load and wants the address
+                // proved before it spends a Diffie-Hellman. Nothing
+                // authenticates this packet, and nothing can: authenticating
+                // it would cost the server exactly what the cookie saves. So
+                // the cookied init is an addition, never a replacement, and a
+                // forged challenge buys an attacker no more than dropping the
+                // packet would have.
+                if self.state != ClientState::Connecting {
+                    return out;
+                }
+                let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(&self.init_packet)
+                else {
+                    return out;
+                };
+                let cookied = wire::build_cookied_init(&cookie, version, noise);
+                // A repeated challenge carrying the cookie already held costs
+                // nothing at all, which is most replays. The budget covers the
+                // rest.
+                let changed = self.cookied_init.as_deref() != Some(cookied.as_slice());
+                self.cookied_init = Some(cookied);
+                if changed && self.cookie_answers.take(now_ms) {
+                    out.push(self.init_packet.clone());
+                    if let Some(c) = self.cookied_init.as_ref() {
+                        out.push(c.clone());
+                    }
+                }
+            }
+            // Clients never receive either of these.
+            Packet::HandshakeInit { .. } | Packet::CookiedInit { .. } => {}
         }
         out
     }
@@ -631,15 +721,32 @@ impl ClientCore {
         let mut out = Vec::new();
         match self.state {
             ClientState::Connecting => {
-                if now_ms.saturating_sub(self.last_server_ms) >= CONNECTION_TIMEOUT_MS {
+                // A full session is an authenticated statement about one
+                // moment, so it draws the reject backoff and no timeout at
+                // all: the server is answering, and a seat frees when
+                // somebody leaves. Reporting a timeout instead would be the
+                // one thing this client knows to be false.
+                let (timeout, backoff_cap) = if self.session_full {
+                    (false, REJECT_RETRY_MAX_MS)
+                } else {
+                    (true, INIT_RESEND_MAX_MS)
+                };
+                if timeout && now_ms.saturating_sub(self.last_server_ms) >= CONNECTION_TIMEOUT_MS {
                     self.state = ClientState::TimedOut;
                     self.events.push(ClientEvent::TimedOut);
                 } else if now_ms.saturating_sub(self.last_init_ms) >= self.init_resend_ms {
                     // Same bytes every time: the server answers a resent
                     // identical init with its cached response.
                     self.last_init_ms = now_ms;
-                    self.init_resend_ms = (self.init_resend_ms * 2).min(INIT_RESEND_MAX_MS);
+                    self.init_resend_ms = (self.init_resend_ms * 2).min(backoff_cap);
                     out.push(self.init_packet.clone());
+                    // Both forms while a cookie is held. A server not under
+                    // load takes the plain one; a server that is takes the
+                    // cookied one; a forged cookie costs one wasted datagram
+                    // rather than the join.
+                    if let Some(cookied) = self.cookied_init.as_ref() {
+                        out.push(cookied.clone());
+                    }
                 }
             }
             ClientState::Joined => {
@@ -716,6 +823,14 @@ impl ClientCore {
         &self.state
     }
 
+    /// Whether the server has told this client, in a packet only it could
+    /// have produced, that the role its invite names is full. True only while
+    /// `Connecting`: the client keeps offering the same init, so a seat that
+    /// frees is taken without anybody restarting anything.
+    pub fn session_full(&self) -> bool {
+        self.session_full
+    }
+
     pub fn member_id(&self) -> Option<MemberId> {
         self.welcome.as_ref().map(|w| w.member_id)
     }
@@ -729,6 +844,7 @@ impl ClientCore {
             uplink_jitter_depth: self.uplink_report.map(|(_, depth, _)| depth),
             uplink_recovered_pct: self.uplink_report.map(|(_, _, rec)| rec),
             redundancy_active: self.redundancy.active(),
+            session_full: self.session_full,
         }
     }
 
@@ -1094,7 +1210,9 @@ mod tests {
     use super::*;
     use jamstream_protocol::ids::SessionId;
     use jamstream_protocol::invite::{Issuer, Token};
-    use jamstream_protocol::transport::{Keypair, generate_keypair, reject_key_for_init};
+    use jamstream_protocol::transport::{
+        Keypair, Responder, generate_keypair, reject_key_for_init,
+    };
     use jamstream_protocol::wire::TYPE_HANDSHAKE_INIT;
 
     fn invite(role: Role) -> Invite {
@@ -1117,6 +1235,24 @@ mod tests {
             },
         );
         (invite, kp)
+    }
+
+    /// The real server's handshake response to `init`, so a test can prove a
+    /// client actually gets in rather than asserting about state alone.
+    fn handshake_response(server: &Keypair, inv: &Invite, init: &[u8]) -> Vec<u8> {
+        let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(init) else {
+            panic!("expected an init");
+        };
+        let (hp, responder) =
+            Responder::read_init(&server.private, &inv.session_id, version, noise)
+                .expect("the server reads the init it was sent");
+        let (_, packet) = responder
+            .respond(&Welcome {
+                member_id: hp.token.member_id,
+                sample_clock: 0,
+            })
+            .expect("respond");
+        packet
     }
 
     /// The reject a real server would send in answer to `init`, keyed the way
@@ -1222,6 +1358,197 @@ mod tests {
         // client that gave up for good would need the user to restart it.
         core.poll(600_000);
         assert!(matches!(core.state(), ClientState::Rejected { .. }));
+    }
+
+    /// The reject a real server sends when the role is full, keyed the way
+    /// the server keys it: on the secret it shares with the client that sent
+    /// this exact init.
+    fn genuine_capacity_reject(server: &Keypair, inv: &Invite, init: &[u8]) -> Vec<u8> {
+        let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(init) else {
+            panic!("expected an init");
+        };
+        let key = reject_key_for_init(&server.private, &inv.session_id, version, noise)
+            .expect("server derives the reject key");
+        wire::build_capacity_reject(&key, init)
+    }
+
+    /// A sold-out session used to be indistinguishable from a server that was
+    /// down: the init was dropped and the client reported its own 10 s
+    /// timeout. It now says what is true, keeps the same init on offer, and
+    /// joins when a seat frees, with no timeout in between.
+    #[test]
+    fn a_full_session_is_reported_and_kept_trying_for() {
+        let (inv, server) = invite_and_server(Role::Listener);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+
+        assert!(
+            core.handle_datagram(1, &genuine_capacity_reject(&server, &inv, &init))
+                .is_empty()
+        );
+        assert!(core.session_full());
+        assert!(core.stats().session_full);
+        assert_eq!(core.events(), vec![ClientEvent::SessionFull]);
+        // Still Connecting: this is a report about a moment, not an ending.
+        assert_eq!(*core.state(), ClientState::Connecting);
+
+        // The reject backoff, and the same bytes every time, so the server's
+        // cached response still pairs with what this client sent.
+        assert!(core.poll(4_000).is_empty());
+        assert_eq!(core.poll(5_002), vec![init.clone()]);
+        assert!(core.poll(12_000).is_empty());
+        assert_eq!(core.poll(15_003), vec![init.clone()]);
+        // And no timeout: the server is answering, so a timeout would report
+        // the one thing this client knows to be false.
+        core.poll(600_000);
+        assert_eq!(*core.state(), ClientState::Connecting);
+        assert!(core.session_full());
+        assert!(core.events().is_empty());
+
+        // A seat frees and the retry catches it.
+        let resp = handshake_response(&server, &inv, &init);
+        core.handle_datagram(600_001, &resp);
+        assert_eq!(*core.state(), ClientState::Joined);
+        assert!(!core.session_full());
+    }
+
+    /// Nothing an invite carries produces the MAC, and a reject that is not
+    /// about the init this client sent is somebody else's.
+    #[test]
+    fn a_forged_or_stale_capacity_reject_is_ignored() {
+        let (inv, server) = invite_and_server(Role::Listener);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+
+        // Everything an invite holder has: the server public key, the session
+        // id, and the victim's init off the wire. Their own handshake derives
+        // a different key.
+        let (other, other_init) = Initiator::new(&inv).unwrap();
+        let forged = wire::build_capacity_reject(other.reject_key().unwrap(), &init);
+        assert!(core.handle_datagram(1, &forged).is_empty());
+        assert!(!core.session_full());
+        assert!(core.events().is_empty());
+
+        // The server's own, but about a different connection attempt.
+        let stale = genuine_capacity_reject(&server, &inv, &other_init);
+        assert!(core.handle_datagram(2, &stale).is_empty());
+        assert!(!core.session_full());
+
+        // A version reject's MAC is not a capacity reject's, even though the
+        // two share a key.
+        let Ok(Packet::VersionReject { mac, .. }) =
+            wire::parse(&genuine_reject(&server, &inv, &init, 2))
+        else {
+            panic!("expected a version reject");
+        };
+        let mut swapped = vec![wire::TYPE_CAPACITY_REJECT];
+        swapped.extend_from_slice(&mac);
+        assert!(core.handle_datagram(3, &swapped).is_empty());
+        assert!(!core.session_full());
+        assert_eq!(*core.state(), ClientState::Connecting);
+
+        // The genuine article still lands.
+        core.handle_datagram(4, &genuine_capacity_reject(&server, &inv, &init));
+        assert!(core.session_full());
+    }
+
+    /// A capacity reject can be replayed by anybody who saw one, so it is
+    /// acted on once per connection attempt. A second that reset the retry
+    /// timer would let a replayer hold this client off the session for as
+    /// long as it cared to keep sending.
+    #[test]
+    fn a_replayed_capacity_reject_cannot_hold_a_client_off_the_session() {
+        let (inv, server) = invite_and_server(Role::Listener);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+        let reject = genuine_capacity_reject(&server, &inv, &init);
+        core.handle_datagram(0, &reject);
+        assert_eq!(core.events(), vec![ClientEvent::SessionFull]);
+
+        // Sprayed for the whole backoff window: one event, and the resend due
+        // at 5 s still happens on time.
+        for ms in 1..5_000u64 {
+            assert!(core.handle_datagram(ms, &reject).is_empty());
+        }
+        assert!(core.events().is_empty());
+        assert_eq!(core.poll(5_001), vec![init]);
+    }
+
+    /// A challenge carries no proof of who sent it, so a client that swapped
+    /// its plain init for a cookied one would have lost its join to exactly
+    /// the trick a forged handshake response used to play. Both forms go out,
+    /// always, and the server takes whichever it can use.
+    #[test]
+    fn a_cookie_is_offered_alongside_the_plain_init_never_instead_of_it() {
+        let (mut core, init) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
+        let cookie = [0x5Au8; wire::COOKIE_BYTES];
+        let answer = core.handle_datagram(10, &wire::build_cookie_challenge(&cookie));
+
+        // Answered at once, because waiting for the resend timer would cost up
+        // to two seconds, and the plain init goes with it.
+        let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(&init) else {
+            panic!("expected an init");
+        };
+        let cookied = wire::build_cookied_init(&cookie, version, noise);
+        assert_eq!(answer, vec![init.clone(), cookied.clone()]);
+        // The Noise message is byte-identical in both forms, so the server's
+        // cached response still pairs with whichever one it read.
+        let Ok(Packet::CookiedInit { noise: cn, .. }) = wire::parse(&cookied) else {
+            panic!("expected a cookied init");
+        };
+        assert_eq!(cn, noise);
+
+        // And every resend from here carries both.
+        assert_eq!(core.poll(500), vec![init.clone(), cookied.clone()]);
+        assert_eq!(core.poll(1_500), vec![init, cookied]);
+        assert_eq!(*core.state(), ClientState::Connecting);
+    }
+
+    /// A forged challenge is free to send for anyone who can see this client's
+    /// address, so answering one must not be a lever for making the client
+    /// emit packets at whatever rate the attacker picks.
+    #[test]
+    fn forged_challenges_cannot_pump_a_client_for_packets() {
+        let (mut core, _init) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
+        let mut sent = 0;
+        for i in 0..2_000u32 {
+            // A different cookie every time, which is the expensive case: an
+            // unchanged one costs nothing at all.
+            let mut cookie = [0u8; wire::COOKIE_BYTES];
+            cookie[..4].copy_from_slice(&i.to_le_bytes());
+            sent += core
+                .handle_datagram(1, &wire::build_cookie_challenge(&cookie))
+                .len();
+        }
+        // Two datagrams per answer, and the burst is all an attacker gets in
+        // an instant.
+        assert_eq!(sent, 2 * COOKIE_ANSWER_BURST as usize);
+        // And no faster than the refill from there.
+        let mut later = 0;
+        for i in 0..2_000u32 {
+            let mut cookie = [0xFFu8; wire::COOKIE_BYTES];
+            cookie[..4].copy_from_slice(&i.to_le_bytes());
+            later += core
+                .handle_datagram(1_500, &wire::build_cookie_challenge(&cookie))
+                .len();
+        }
+        assert_eq!(later, 2 * COOKIE_ANSWER_PER_SEC as usize);
+        // Nothing about the handshake moved: the state is still usable and the
+        // plain init on the wire is still the one the server will answer.
+        assert_eq!(*core.state(), ClientState::Connecting);
+    }
+
+    /// A challenge is only meaningful while a handshake is in flight. Joined,
+    /// it is either stale or somebody probing, and either way it must not put
+    /// a second init on the wire.
+    #[test]
+    fn a_challenge_after_joining_is_ignored() {
+        let (inv, server) = invite_and_server(Role::Musician);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+        core.handle_datagram(1, &handshake_response(&server, &inv, &init));
+        assert_eq!(*core.state(), ClientState::Joined);
+        let cookie = [7u8; wire::COOKIE_BYTES];
+        assert!(
+            core.handle_datagram(2, &wire::build_cookie_challenge(&cookie))
+                .is_empty()
+        );
     }
 
     #[test]

@@ -221,9 +221,21 @@ pub struct SweepArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("revoke_target").args(["revoke_invite", "revoke_invite_file"])
+))]
 pub struct JoinArgs {
     /// Invite string, with or without the jamstream://join/ prefix.
-    pub invite: String,
+    /// Deprecated: on Linux any local user can read it out of the process
+    /// list, and it stays in shell history. Use --invite-file, or pipe it in.
+    #[arg(conflicts_with = "invite_file")]
+    pub invite: Option<String>,
+
+    /// File holding the invite, one line, or - for standard input. Omit both
+    /// this and the positional invite and the invite is read from standard
+    /// input.
+    #[arg(long = "invite-file", value_name = "PATH")]
+    pub invite_file: Option<PathBuf>,
 
     /// Run without a UI. Required; the desktop app is the interactive client.
     #[arg(long)]
@@ -251,13 +263,24 @@ pub struct JoinArgs {
     pub name: Option<String>,
 
     /// Test hook, host invite only: another member's invite whose token is
-    /// revoked mid-session. Hidden; the desktop app owns interactive
-    /// revocation.
+    /// revoked mid-session. Deprecated for the same reason as the positional
+    /// invite; use --revoke-invite-file. Hidden; the desktop app owns
+    /// interactive revocation.
     #[arg(long = "revoke-invite", hide = true, requires = "revoke_after_secs")]
     pub revoke_invite: Option<String>,
 
-    /// Test hook: seconds after joining before --revoke-invite fires.
-    #[arg(long = "revoke-after-secs", hide = true, requires = "revoke_invite")]
+    /// Test hook: file holding the invite to revoke, one line, or - for
+    /// standard input.
+    #[arg(
+        long = "revoke-invite-file",
+        hide = true,
+        value_name = "PATH",
+        requires = "revoke_after_secs"
+    )]
+    pub revoke_invite_file: Option<PathBuf>,
+
+    /// Test hook: seconds after joining before the revocation fires.
+    #[arg(long = "revoke-after-secs", hide = true, requires = "revoke_target")]
     pub revoke_after_secs: Option<u64>,
 }
 
@@ -624,11 +647,96 @@ mod tests {
             panic!("expected join");
         };
         assert!(args.headless);
+        assert_eq!(args.invite.as_deref(), Some("jamstream://join/blob"));
+        assert!(args.invite_file.is_none());
         assert_eq!(args.duration_secs, 3);
         assert_eq!(args.chat.as_deref(), Some("hi"));
         assert_eq!(args.name.as_deref(), Some("ana"));
         assert!(args.revoke_invite.is_none());
+        assert!(args.revoke_invite_file.is_none());
         assert!(args.revoke_after_secs.is_none());
+    }
+
+    /// The invite is a bearer credential and argv is world readable on Linux,
+    /// so the file form has to exist and has to be usable without the
+    /// positional argument at all. Passing both would be ambiguous about
+    /// which one wins, so it is refused at parse time.
+    #[test]
+    fn the_invite_can_come_from_a_file_instead_of_argv() {
+        let cli = Cli::parse_from([
+            "jamstream",
+            "join",
+            "--invite-file",
+            "/run/secrets/invite",
+            "--headless",
+            "--input",
+            "in.wav",
+            "--output",
+            "out.wav",
+            "--duration-secs",
+            "3",
+        ]);
+        let Command::Join(args) = cli.command else {
+            panic!("expected join");
+        };
+        assert!(args.invite.is_none());
+        assert_eq!(
+            args.invite_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/invite"))
+        );
+
+        // Neither form: the invite comes from stdin, which is the shape that
+        // keeps it out of argv and out of the filesystem both.
+        let cli = Cli::parse_from([
+            "jamstream",
+            "join",
+            "--headless",
+            "--input",
+            "in.wav",
+            "--output",
+            "out.wav",
+            "--duration-secs",
+            "3",
+        ]);
+        let Command::Join(args) = cli.command else {
+            panic!("expected join");
+        };
+        assert!(args.invite.is_none() && args.invite_file.is_none());
+
+        assert!(
+            Cli::try_parse_from([
+                "jamstream",
+                "join",
+                "blob",
+                "--invite-file",
+                "/run/secrets/invite",
+                "--headless",
+                "--input",
+                "in.wav",
+                "--output",
+                "out.wav",
+                "--duration-secs",
+                "3",
+            ])
+            .is_err()
+        );
+    }
+
+    /// The positional invite is what the security issue is about, so --help
+    /// has to say why not to use it rather than only offering an alternative.
+    #[test]
+    fn join_help_warns_about_the_invite_on_the_command_line() {
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("join")
+            .expect("join subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--invite-file"), "help was: {help}");
+        assert!(
+            help.contains("local user can read it"),
+            "the positional invite must say why it is deprecated: {help}"
+        );
     }
 
     #[test]
@@ -661,5 +769,28 @@ mod tests {
         let mut only_delay = base.to_vec();
         only_delay.extend(["--revoke-after-secs", "2"]);
         assert!(Cli::try_parse_from(only_delay).is_err());
+
+        // The file form pairs with the delay the same way. It is a second
+        // member's invite, so it has the same argv problem as the first one.
+        let mut file_form = base.to_vec();
+        file_form.extend([
+            "--revoke-invite-file",
+            "/run/secrets/other",
+            "--revoke-after-secs",
+            "2",
+        ]);
+        let cli = Cli::parse_from(file_form);
+        let Command::Join(args) = cli.command else {
+            panic!("expected join");
+        };
+        assert!(args.revoke_invite.is_none());
+        assert_eq!(
+            args.revoke_invite_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/other"))
+        );
+
+        let mut only_file = base.to_vec();
+        only_file.extend(["--revoke-invite-file", "/run/secrets/other"]);
+        assert!(Cli::try_parse_from(only_file).is_err());
     }
 }

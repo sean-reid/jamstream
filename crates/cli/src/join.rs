@@ -2,7 +2,7 @@
 //! capture audio from a WAV, writes the received stereo mix to a WAV, and
 //! prints session events as plain lines.
 
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,10 @@ const FRAME_MONO: usize = 120;
 const FRAME_STEREO: usize = 240;
 /// How long a lone client waits before sending --chat into an empty room.
 const CHAT_ALONE_DELAY: Duration = Duration::from_secs(1);
+/// Longest invite text read from a file or a pipe. A real invite is a couple
+/// of hundred characters; the cap is what stops a mistyped path (a log, a
+/// device) from being pulled into memory whole.
+const MAX_INVITE_TEXT_BYTES: u64 = 4 * 1024;
 
 /// Mono 48 kHz capture feed from a WAV file; silence after EOF.
 pub struct WavSource {
@@ -100,8 +104,9 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
                 .to_owned(),
         ));
     }
-    let invite = Invite::decode(&args.invite)?;
-    let revoke = revoke_plan(args, &invite)?;
+    let source = invite_source(args.invite.as_deref(), args.invite_file.as_deref());
+    let invite = Invite::decode(&load_invite(source, "invite-file", out)?)?;
+    let revoke = revoke_plan(args, &invite, out)?;
     let mut source = WavSource::load(&args.input)?;
 
     // The invite offers candidates, not one address: a locally hosted
@@ -209,6 +214,16 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
                     "timed out waiting for the server".to_owned(),
                 ));
             }
+            // The core keeps offering its init at a widening interval, which
+            // is right for a UI a person is watching. A rig is not watching:
+            // a session that has no seat for this invite is a final answer
+            // here, and it exits naming it rather than sitting on a retry.
+            ClientState::Connecting if core.session_full() => {
+                write_stereo_wav(&args.output, &received)?;
+                return Err(CliError::Failed(
+                    "session full: no free seat for this invite's role".to_owned(),
+                ));
+            }
             ClientState::Connecting => {}
         }
 
@@ -231,21 +246,113 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
     Ok(())
 }
 
+/// Where an invite is read from.
+///
+/// The invite is the session's only credential, and argv is world readable:
+/// `/proc/<pid>/cmdline` is mode 0444 on Linux, so any local user can lift a
+/// bandmate's seat out of `ps auxww` while their client runs, and the string
+/// stays in shell history for good. The file and pipe forms are the ones to
+/// use; the positional form stays, with a warning, because it is in every
+/// existing script.
+#[derive(Debug, PartialEq)]
+enum InviteSource<'a> {
+    Argv(&'a str),
+    File(&'a Path),
+    Stdin,
+}
+
+/// Picks the source from one flag pair. clap already forbids passing both
+/// forms, so the file wins if one somehow arrives anyway.
+fn invite_source<'a>(argv: Option<&'a str>, file: Option<&'a Path>) -> InviteSource<'a> {
+    match (argv, file) {
+        (_, Some(path)) if path.as_os_str() == "-" => InviteSource::Stdin,
+        (_, Some(path)) => InviteSource::File(path),
+        (Some(text), None) => InviteSource::Argv(text),
+        (None, None) => InviteSource::Stdin,
+    }
+}
+
+/// Reads the invite text a source names, warning on the argv form. `flag`
+/// names the file flag to suggest instead.
+fn load_invite<W: Write>(
+    source: InviteSource<'_>,
+    flag: &str,
+    out: &mut W,
+) -> Result<String, CliError> {
+    match source {
+        InviteSource::Argv(text) => {
+            writeln!(
+                out,
+                "warning: an invite on the command line is readable by every local \
+                 process and stays in shell history; pass --{flag} <PATH> instead"
+            )?;
+            Ok(text.to_owned())
+        }
+        InviteSource::File(path) => {
+            let file = std::fs::File::open(path).map_err(|e| {
+                CliError::Usage(format!("cannot read invite from {}: {e}", path.display()))
+            })?;
+            read_invite_line(std::io::BufReader::new(file), &path.display().to_string())
+        }
+        InviteSource::Stdin => {
+            let stdin = std::io::stdin();
+            // A terminal would just look hung, and the person at it has no
+            // way to know what is being waited for.
+            if stdin.is_terminal() {
+                return Err(CliError::Usage(format!(
+                    "no invite given: pass --{flag} <PATH>, or pipe the invite in on stdin"
+                )));
+            }
+            read_invite_line(stdin.lock(), "stdin")
+        }
+    }
+}
+
+/// One line, at most [`MAX_INVITE_TEXT_BYTES`] of it. Bounded before the read
+/// rather than after: the path is whatever the caller typed, and a line-free
+/// file would otherwise be read into memory whole.
+fn read_invite_line<R: BufRead>(reader: R, from: &str) -> Result<String, CliError> {
+    let mut line = String::new();
+    let read = reader
+        .take(MAX_INVITE_TEXT_BYTES + 1)
+        .read_line(&mut line)
+        .map_err(|e| CliError::Usage(format!("cannot read invite from {from}: {e}")))?;
+    if read as u64 > MAX_INVITE_TEXT_BYTES {
+        return Err(CliError::Usage(format!(
+            "invite from {from} is longer than {MAX_INVITE_TEXT_BYTES} bytes"
+        )));
+    }
+    let line = line.trim();
+    if line.is_empty() {
+        return Err(CliError::Usage(format!("no invite found in {from}")));
+    }
+    Ok(line.to_owned())
+}
+
 /// Validates the hidden revocation test hook. The wire protocol revokes by
 /// token id, so the flag takes the target's full invite (which the host, who
 /// minted every invite, has at hand) and extracts the jti from it. Only the
 /// host invite may carry the flags: the server treats revoke-by-non-host as
 /// a protocol violation, so refusing early gives a readable error instead.
-fn revoke_plan(args: &JoinArgs, own: &Invite) -> Result<Option<(TokenId, Duration)>, CliError> {
-    match (&args.revoke_invite, args.revoke_after_secs) {
-        (None, None) => Ok(None),
-        (Some(target), Some(secs)) => {
+fn revoke_plan<W: Write>(
+    args: &JoinArgs,
+    own: &Invite,
+    out: &mut W,
+) -> Result<Option<(TokenId, Duration)>, CliError> {
+    let named = args.revoke_invite.is_some() || args.revoke_invite_file.is_some();
+    match (named, args.revoke_after_secs) {
+        (false, None) => Ok(None),
+        (true, Some(secs)) => {
             if own.token.member_id != HOST_MEMBER_ID {
                 return Err(CliError::Usage(
                     "--revoke-invite is only usable with the host invite".to_owned(),
                 ));
             }
-            let target = Invite::decode(target)?;
+            let source = invite_source(
+                args.revoke_invite.as_deref(),
+                args.revoke_invite_file.as_deref(),
+            );
+            let target = Invite::decode(&load_invite(source, "revoke-invite-file", out)?)?;
             Ok(Some((target.token.jti, Duration::from_secs(secs))))
         }
         _ => Err(CliError::Usage(
@@ -273,6 +380,7 @@ fn print_event<W: Write>(out: &mut W, event: &ClientEvent) -> std::io::Result<()
             out,
             "rejected: this client speaks protocol {ours}, the server speaks {theirs}"
         ),
+        ClientEvent::SessionFull => writeln!(out, "session full"),
         ClientEvent::TimedOut => writeln!(out, "timed out"),
         ClientEvent::StreamStatus(destinations) => {
             let live = destinations
@@ -383,7 +491,8 @@ mod tests {
         let host = mint(0);
         let target = mint(2);
         let args = |revoke_invite: Option<String>, revoke_after_secs: Option<u64>| JoinArgs {
-            invite: host.encode(),
+            invite: Some(host.encode()),
+            invite_file: None,
             headless: true,
             input: PathBuf::from("in.wav"),
             output: PathBuf::from("out.wav"),
@@ -391,11 +500,17 @@ mod tests {
             chat: None,
             name: None,
             revoke_invite,
+            revoke_invite_file: None,
             revoke_after_secs,
         };
 
-        assert!(revoke_plan(&args(None, None), &host).unwrap().is_none());
-        let (jti, after) = revoke_plan(&args(Some(target.encode()), Some(2)), &host)
+        let mut out = Vec::new();
+        assert!(
+            revoke_plan(&args(None, None), &host, &mut out)
+                .unwrap()
+                .is_none()
+        );
+        let (jti, after) = revoke_plan(&args(Some(target.encode()), Some(2)), &host, &mut out)
             .unwrap()
             .expect("a plan");
         assert_eq!(jti, target.token.jti);
@@ -403,13 +518,124 @@ mod tests {
 
         // Half a pair is a usage error even when clap is bypassed.
         assert!(matches!(
-            revoke_plan(&args(Some(target.encode()), None), &host),
+            revoke_plan(&args(Some(target.encode()), None), &host, &mut out),
             Err(CliError::Usage(_))
         ));
         // A non-host invite may not carry the hook.
         assert!(matches!(
-            revoke_plan(&args(Some(host.encode()), Some(1)), &target),
+            revoke_plan(&args(Some(host.encode()), Some(1)), &target, &mut out),
             Err(CliError::Usage(msg)) if msg.contains("host invite")
+        ));
+
+        // The file form reaches the same plan, and warns about nothing.
+        let path = temp_wav("revoke-invite.txt");
+        std::fs::write(&path, format!("{}\n", target.encode())).unwrap();
+        let mut file_args = args(None, Some(2));
+        file_args.revoke_invite_file = Some(path.clone());
+        let mut quiet = Vec::new();
+        let (jti, _) = revoke_plan(&file_args, &host, &mut quiet)
+            .unwrap()
+            .expect("a plan");
+        assert_eq!(jti, target.token.jti);
+        assert!(quiet.is_empty(), "the file form must not warn");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The argv form is the defect: `/proc/<pid>/cmdline` is world readable,
+    /// so a bandmate's seat is one `ps auxww` away while their client runs.
+    /// It still works, because every existing script passes it, but it says
+    /// so on the way past.
+    #[test]
+    fn the_command_line_form_warns_and_the_file_form_does_not() {
+        let mut out = Vec::new();
+        let text = load_invite(
+            InviteSource::Argv("jamstream://join/blob"),
+            "invite-file",
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(text, "jamstream://join/blob");
+        let warning = String::from_utf8(out).unwrap();
+        assert!(
+            warning.contains("readable by every local process"),
+            "{warning}"
+        );
+        assert!(warning.contains("--invite-file"), "{warning}");
+
+        let path = temp_wav("invite.txt");
+        // Trailing newline and surrounding blanks are what a file written by
+        // `jamstream host --json | jq -r` actually contains.
+        std::fs::write(&path, "  jamstream://join/blob \n").unwrap();
+        let mut quiet = Vec::new();
+        assert_eq!(
+            load_invite(InviteSource::File(&path), "invite-file", &mut quiet).unwrap(),
+            "jamstream://join/blob"
+        );
+        assert!(quiet.is_empty());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `-` means stdin, a path means that path, and nothing named means
+    /// stdin as well, so `... | jamstream join --headless` works with no
+    /// credential anywhere in argv.
+    #[test]
+    fn the_invite_source_is_the_file_then_the_pipe_then_argv() {
+        let dash = PathBuf::from("-");
+        let path = PathBuf::from("/tmp/invite");
+        assert_eq!(
+            invite_source(None, Some(dash.as_path())),
+            InviteSource::Stdin
+        );
+        assert_eq!(
+            invite_source(Some("blob"), Some(path.as_path())),
+            InviteSource::File(path.as_path())
+        );
+        assert_eq!(
+            invite_source(Some("blob"), None),
+            InviteSource::Argv("blob")
+        );
+        assert_eq!(invite_source(None, None), InviteSource::Stdin);
+    }
+
+    /// An invite is a couple of hundred characters. A file with no newline in
+    /// it at all is a mistyped path, and reading it whole is how a mistyped
+    /// path becomes an out-of-memory kill.
+    #[test]
+    fn an_oversized_invite_file_is_refused_without_being_read_whole() {
+        let path = temp_wav("huge-invite.txt");
+        let huge = "A".repeat(MAX_INVITE_TEXT_BYTES as usize + 1);
+        std::fs::write(&path, &huge).unwrap();
+        let mut out = Vec::new();
+        assert!(matches!(
+            load_invite(InviteSource::File(&path), "invite-file", &mut out),
+            Err(CliError::Usage(msg)) if msg.contains("longer than")
+        ));
+        // Exactly at the cap still reads.
+        std::fs::write(&path, "B".repeat(MAX_INVITE_TEXT_BYTES as usize)).unwrap();
+        assert_eq!(
+            load_invite(InviteSource::File(&path), "invite-file", &mut out)
+                .unwrap()
+                .len(),
+            MAX_INVITE_TEXT_BYTES as usize
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_empty_or_missing_invite_file_is_a_usage_error() {
+        let path = temp_wav("empty-invite.txt");
+        std::fs::write(&path, "\n\n").unwrap();
+        let mut out = Vec::new();
+        assert!(matches!(
+            load_invite(InviteSource::File(&path), "invite-file", &mut out),
+            Err(CliError::Usage(msg)) if msg.contains("no invite found")
+        ));
+        std::fs::remove_file(&path).unwrap();
+
+        let missing = temp_wav("not-here-invite.txt");
+        assert!(matches!(
+            load_invite(InviteSource::File(&missing), "invite-file", &mut out),
+            Err(CliError::Usage(msg)) if msg.contains("cannot read invite")
         ));
     }
 
