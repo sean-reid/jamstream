@@ -9,7 +9,7 @@ pub mod client;
 pub mod limits;
 pub mod server;
 
-pub use client::{ClientCore, ClientEvent, ClientState, ClientStats};
+pub use client::{ClientCore, ClientEvent, ClientState, ClientStats, ServerCandidates};
 /// Session capacity and the host-surface defaults, defined once in
 /// [`limits`] and re-exported here because every crate that offers seats
 /// needs them: `jamstream_session::MAX_MUSICIANS` is the number.

@@ -3,6 +3,7 @@
 //! datagrams and capture frames in, and pull playout audio and events out.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::SocketAddr;
 
 use jamstream_engine::{
     Channels, CodecError, Decoder, DriftCompensator, Encoder, JitterBuffer, JitterStats,
@@ -216,6 +217,66 @@ pub struct ClientCore {
     init_resend_ms: u64,
     rtt_ms_last: Option<f32>,
     ping_nonce: u32,
+}
+
+/// The invite's candidate server addresses, tried in order until one
+/// answers.
+///
+/// Sans-io like the rest of this file: it owns no socket and no clock. It
+/// only says which address the driver should be talking to, and moves on
+/// when the driver reports that the current one timed out.
+///
+/// An invite has carried a list since the beginning and nothing offered a
+/// second entry, so every driver read `addresses[0]` and stopped. A locally
+/// hosted session now offers loopback as well as the LAN address, which is
+/// what lets a same-machine join stay on the machine, so the second entry
+/// has to be reachable from somewhere.
+///
+/// Rotation is cyclic. The window a driver gives each address is its own
+/// business, and a driver with a long overall deadline should come back
+/// round rather than give up on an address that was merely slow to boot.
+///
+/// Trying an address that turns out to belong to a stranger is safe: the
+/// handshake is Noise IK against the server static key in the invite, so
+/// nothing but that server can complete it. A wrong address costs one
+/// timeout, not a wrong session.
+#[derive(Debug, Clone)]
+pub struct ServerCandidates {
+    addresses: Vec<SocketAddr>,
+    idx: usize,
+}
+
+impl ServerCandidates {
+    /// Fails on an invite with no addresses at all. `Invite::decode`
+    /// already refuses those, so this is for an invite built in memory.
+    pub fn new(invite: &Invite) -> Result<Self, SessionError> {
+        if invite.addresses.is_empty() {
+            return Err(SessionError::Protocol(jamstream_protocol::Error::Invite(
+                "no server address",
+            )));
+        }
+        Ok(ServerCandidates {
+            addresses: invite.addresses.clone(),
+            idx: 0,
+        })
+    }
+
+    /// The address to be talking to now.
+    pub fn current(&self) -> SocketAddr {
+        self.addresses[self.idx]
+    }
+
+    /// True when there is more than one address, so a timeout is worth
+    /// answering with a different destination rather than the same one.
+    pub fn has_alternatives(&self) -> bool {
+        self.addresses.len() > 1
+    }
+
+    /// Moves to the next candidate and returns it, wrapping at the end.
+    pub fn advance(&mut self) -> SocketAddr {
+        self.idx = (self.idx + 1) % self.addresses.len();
+        self.current()
+    }
 }
 
 impl ClientCore {
@@ -1164,6 +1225,62 @@ mod tests {
         core.poll(10_000);
         assert_eq!(*core.state(), ClientState::TimedOut);
         assert!(core.events().contains(&ClientEvent::TimedOut));
+    }
+
+    /// One address behaves exactly as it always did: the driver has nothing
+    /// to fail over to and should not pretend otherwise.
+    #[test]
+    fn a_single_address_offers_no_alternatives() {
+        let inv = invite(Role::Musician);
+        let mut candidates = ServerCandidates::new(&inv).unwrap();
+        let only: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        assert_eq!(candidates.current(), only);
+        assert!(!candidates.has_alternatives());
+        // Advancing anyway is not an error, it just stays put.
+        assert_eq!(candidates.advance(), only);
+    }
+
+    /// A locally hosted session offers loopback and the LAN address, and a
+    /// driver walks them in order and comes back round: a long overall
+    /// deadline should not be spent on one address that was slow to boot.
+    #[test]
+    fn candidates_are_walked_in_order_and_wrap() {
+        let mut inv = invite(Role::Musician);
+        let loopback: SocketAddr = "127.0.0.1:43210".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.12:43210".parse().unwrap();
+        inv.addresses = vec![loopback, lan];
+
+        let mut candidates = ServerCandidates::new(&inv).unwrap();
+        assert!(candidates.has_alternatives());
+        assert_eq!(candidates.current(), loopback);
+        assert_eq!(candidates.advance(), lan);
+        assert_eq!(candidates.current(), lan);
+        assert_eq!(candidates.advance(), loopback);
+        assert_eq!(candidates.advance(), lan);
+    }
+
+    /// Invite::decode refuses an empty list, so this only happens to an
+    /// invite built in memory, and it must not panic on an index.
+    #[test]
+    fn an_invite_with_no_addresses_is_an_error_not_a_panic() {
+        let mut inv = invite(Role::Musician);
+        inv.addresses.clear();
+        assert!(ServerCandidates::new(&inv).is_err());
+    }
+
+    /// The addresses are not part of what the issuer signs, and the
+    /// handshake authenticates the server by its static key, so adding one
+    /// changes nothing about who can answer.
+    #[test]
+    fn a_second_address_does_not_change_what_the_invite_proves() {
+        let (mut inv, _) = invite_and_server(Role::Musician);
+        let signed = inv.signature;
+        inv.addresses
+            .insert(0, "127.0.0.1:5000".parse::<SocketAddr>().unwrap());
+        assert_eq!(inv.signature, signed);
+        let round_trip = Invite::decode(&inv.encode()).unwrap();
+        assert_eq!(round_trip.addresses, inv.addresses);
+        assert_eq!(round_trip.server_pk, inv.server_pk);
     }
 
     #[test]

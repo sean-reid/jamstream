@@ -881,7 +881,11 @@ fn udp_probe(port: Option<u16>) -> bool {
 /// Primary LAN address via the UDP-connect trick: connect() sends no
 /// packets but makes the OS pick the outbound interface. 203.0.113.1 is
 /// TEST-NET-3, guaranteed not to be a neighbor.
-fn primary_lan_ip() -> IpAddr {
+///
+/// Public because minting needs the same answer: an invite naming this
+/// address is an invite to a server on this machine, which is what lets
+/// the host offer loopback alongside it.
+pub fn primary_lan_ip() -> IpAddr {
     let discover = || -> std::io::Result<IpAddr> {
         let s = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         s.connect(("203.0.113.1", 9))?;
