@@ -78,7 +78,11 @@ jobs:
   # correspondingly slower (measured locally, sanitizer off: transport_open
   # 700-1000/s, avatar_reassembly ~630/s, handshake_read_init 4500-6000/s),
   # which is the price of fuzzing anything past the first parse. Each still
-  # gets hundreds of thousands of executions per night.
+  # gets hundreds of thousands of executions per night. avatar_rx_push skips
+  # the handshake and drives AvatarRx::push directly through the session
+  # crate's fuzzing feature (~1800/s locally, mostly Blake2s over the
+  # synthetic preimages), so the reassembly interleavings get depth while
+  # avatar_reassembly keeps the production entry point covered.
   #
   # avatar_reassembly reaches the session core, so this job now builds
   # jamstream-session and jamstream-engine (and libopus through cmake, which
@@ -103,6 +107,7 @@ jobs:
           - handshake_read_init
           - transport_open
           - avatar_reassembly
+          - avatar_rx_push
           - opus_decode
     steps:
       - uses: actions/checkout@v7

@@ -93,6 +93,16 @@ pub struct HostArgs {
     #[arg(long = "max-hours", default_value_t = DEFAULT_MAX_HOURS)]
     pub max_hours: u32,
 
+    /// Record the session's takes as FLAC to this computer's disk, in a
+    /// directory printed at launch (local sessions only).
+    #[arg(long)]
+    pub record: bool,
+
+    /// Record a stereo stem per musician alongside the mix, implying
+    /// --record.
+    #[arg(long = "record-stems")]
+    pub record_stems: bool,
+
     /// Override the URL of the jamstreamd artifact the VM downloads at
     /// boot. Release builds pin the release's own server build; without
     /// that pin (a source build) cloud providers require this flag.
@@ -111,6 +121,14 @@ pub struct HostArgs {
     /// Emit one JSON object instead of human-readable output.
     #[arg(long)]
     pub json: bool,
+}
+
+impl HostArgs {
+    /// True when this launch should be able to record, since stems imply
+    /// recording.
+    pub fn wants_recording(&self) -> bool {
+        self.record || self.record_stems
+    }
 }
 
 #[derive(Debug, Args)]
@@ -229,8 +247,31 @@ mod tests {
         assert_eq!(args.port, 43210);
         assert_eq!(args.idle_min, DEFAULT_IDLE_MIN);
         assert_eq!(args.max_hours, DEFAULT_MAX_HOURS);
+        assert!(!args.record);
+        assert!(!args.record_stems);
+        assert!(!args.wants_recording());
         assert!(!args.yes);
         assert!(!args.json);
+    }
+
+    // Stems without --record still means a recording session: a host who
+    // asked for the bigger capture did not opt out of the smaller one.
+    #[test]
+    fn record_stems_implies_record() {
+        let cli = Cli::parse_from(["jamstream", "host", "--record-stems"]);
+        let Command::Host(args) = cli.command else {
+            panic!("expected host");
+        };
+        assert!(!args.record);
+        assert!(args.record_stems);
+        assert!(args.wants_recording());
+
+        let cli = Cli::parse_from(["jamstream", "host", "--record"]);
+        let Command::Host(args) = cli.command else {
+            panic!("expected host");
+        };
+        assert!(args.wants_recording());
+        assert!(!args.record_stems);
     }
 
     /// The local provider spawns the server with these windows when the
@@ -272,6 +313,8 @@ mod tests {
             "5",
             "--max-hours",
             "6",
+            "--record",
+            "--record-stems",
             "--artifact-url",
             "https://example.com/jamstreamd",
             "--artifact-sha256",
@@ -290,6 +333,7 @@ mod tests {
         assert_eq!(args.port, 50000);
         assert_eq!(args.idle_min, 5);
         assert_eq!(args.max_hours, 6);
+        assert!(args.record && args.record_stems);
         assert!(args.yes && args.json);
     }
 

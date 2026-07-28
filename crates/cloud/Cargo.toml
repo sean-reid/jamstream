@@ -26,6 +26,9 @@ flate2.workspace = true
 default = ["gcp"]
 gcp = ["dep:aws-lc-rs"]
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 wiremock.workspace = true

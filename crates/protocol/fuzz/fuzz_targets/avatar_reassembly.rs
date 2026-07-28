@@ -5,13 +5,13 @@
 //! the server accumulate megabytes across many datagrams, so the index/total
 //! arithmetic, the size checks, and the cache accounting all matter.
 //!
-//! `AvatarRx::push` itself is `pub(crate)` inside a private module, so a fuzz
-//! target cannot call it. This target drives the reassembler through the
-//! entry point production actually uses: `ServerCore::handle_datagram`, fed
-//! sealed control frames from a real member over a real handshake. Slower per
-//! op than calling `push` directly, but it fuzzes the dispatch, the per-member
-//! `AvatarRx` lifecycle, the content cache with its pin set, and the waiter
-//! fanout as well as the reassembler.
+//! The sibling `avatar_rx_push` target calls `AvatarRx::push` directly. This
+//! one drives the reassembler through the entry point production actually
+//! uses: `ServerCore::handle_datagram`, fed sealed control frames from a real
+//! member over a real handshake. Slower per op than calling `push` directly,
+//! but it fuzzes the dispatch, the per-member `AvatarRx` lifecycle, the
+//! content cache with its pin set, and the waiter fanout as well as the
+//! reassembler.
 //!
 //! Op program (little-endian, short reads end the program):
 //!

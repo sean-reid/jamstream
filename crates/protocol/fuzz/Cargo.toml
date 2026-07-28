@@ -10,12 +10,13 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 jamstream-protocol = { path = ".." }
-# avatar_reassembly drives the session core, because the reassembler itself
-# is pub(crate) behind a private module and the only way in from outside the
-# crate is ServerCore::handle_datagram. blake2 lets the target announce a
-# content hash it can also produce chunks for; without that, everything past
-# the hash check is unreachable.
-jamstream-session = { path = "../../session" }
+# avatar_reassembly drives the session core end to end through
+# ServerCore::handle_datagram; avatar_rx_push drives the reassembler and its
+# cache directly through the crate's fuzzing feature, which exists for that
+# target alone. blake2 lets both announce a content hash they can also
+# produce chunks for; without that, everything past the hash check is
+# unreachable.
+jamstream-session = { path = "../../session", features = ["fuzzing"] }
 blake2 = "0.10"
 # opus_decode needs the codec wrappers directly. It arrives transitively
 # through jamstream-session already; naming it keeps the target honest about
@@ -74,6 +75,13 @@ bench = false
 [[bin]]
 name = "opus_decode"
 path = "fuzz_targets/opus_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avatar_rx_push"
+path = "fuzz_targets/avatar_rx_push.rs"
 test = false
 doc = false
 bench = false

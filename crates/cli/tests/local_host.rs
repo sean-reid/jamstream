@@ -6,122 +6,19 @@
 //!
 //! # Server binary location
 //!
-//! CARGO_BIN_EXE_<name> only covers binaries of the package under test, so
-//! the cli tests cannot ask Cargo for jamstreamd directly. Instead the test
-//! derives the profile directory from its own executable path
-//! (target/<profile>/deps/<test>-<hash>), runs `cargo build -p
-//! jamstream-server --bin jamstreamd` against the workspace to guarantee
-//! the binary exists and is fresh (a no-op when it already is), and points
-//! JAMSTREAMD_PATH at target/<profile>/jamstreamd.
+//! See `common::jamstreamd_binary`, which builds jamstreamd for this
+//! profile and returns the path JAMSTREAMD_PATH should name.
 //!
 //! One test function: the state directory override is process-global env.
 
 mod common;
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
-use common::fixture;
+use common::{ServerGuard, fixture, free_udp_port, jamstreamd_binary};
 use jamstream_cli::cli::{EndArgs, HostArgs, JoinArgs};
 use jamstream_cli::{end, host, join, providers, state, sweep};
 use jamstream_cloud::providers::local::LocalProvider;
-
-#[cfg(windows)]
-const BIN_NAME: &str = "jamstreamd.exe";
-#[cfg(not(windows))]
-const BIN_NAME: &str = "jamstreamd";
-
-/// Builds (if needed) and returns the jamstreamd binary for this profile.
-fn jamstreamd_binary() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let profile_dir = exe
-        .parent() // deps/
-        .and_then(|d| d.parent()) // target/<profile>/
-        .expect("test executable must sit in target/<profile>/deps")
-        .to_path_buf();
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..");
-
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut build = std::process::Command::new(cargo);
-    build.args(["build", "-p", "jamstream-server", "--bin", "jamstreamd"]);
-    if profile_dir.file_name().is_some_and(|n| n == "release") {
-        build.arg("--release");
-    }
-    let status = build.current_dir(&workspace).status();
-
-    let binary = profile_dir.join(BIN_NAME);
-    match status {
-        Ok(s) if s.success() => {}
-        // A failed or unavailable cargo is tolerable if an earlier build
-        // already produced the binary; without one the test cannot run.
-        _ if binary.is_file() => eprintln!(
-            "warning: cargo build -p jamstream-server failed; using the existing {}",
-            binary.display()
-        ),
-        _ => panic!(
-            "cannot build jamstreamd and none exists at {}; \
-             run `cargo build -p jamstream-server` first",
-            binary.display()
-        ),
-    }
-    assert!(
-        binary.is_file(),
-        "cargo build succeeded but {} is missing; unusual target layout?",
-        binary.display()
-    );
-    binary
-}
-
-/// Bind-then-drop; racy in principle, unique enough in practice.
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// Kills the spawned server if this test leaves without ending its session.
-/// The failure path is the one that matters: a test about processes that
-/// outlive their launcher must not leave one behind when it fails, and a
-/// panic anywhere below drops this on the way out.
-struct ServerGuard(Arc<Mutex<Option<String>>>);
-
-impl ServerGuard {
-    fn new() -> Self {
-        ServerGuard(Arc::new(Mutex::new(None)))
-    }
-
-    fn watch(&self, pid: &str) {
-        *self.0.lock().expect("guard") = Some(pid.to_owned());
-    }
-
-    /// The session ended cleanly; there is nothing left to kill.
-    fn disarm(&self) {
-        self.0.lock().expect("guard").take();
-    }
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let Some(pid) = self.0.lock().map(|mut g| g.take()).unwrap_or(None) else {
-            return;
-        };
-        eprintln!("test left jamstreamd {pid} running; killing it");
-        #[cfg(unix)]
-        let mut kill = std::process::Command::new("/bin/kill");
-        #[cfg(unix)]
-        kill.args(["-9", &pid]);
-        #[cfg(windows)]
-        let mut kill = std::process::Command::new("taskkill");
-        #[cfg(windows)]
-        kill.args(["/PID", &pid, "/T", "/F"]);
-        let _ = kill.status();
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_host_join_and_end_story() {
@@ -156,6 +53,8 @@ async fn local_host_join_and_end_story() {
         port: free_udp_port(),
         idle_min: 10,
         max_hours: 12,
+        record: false,
+        record_stems: false,
         artifact_url: None,
         artifact_sha256: None,
         yes: true,
@@ -203,6 +102,9 @@ async fn local_host_join_and_end_story() {
     assert_eq!(json["hourly_microusd"], 0);
     assert_eq!(json["estimated_total_microusd"], 0);
     assert_eq!(json["reachability"], "ok");
+    // Recording was not asked for, so there is no directory to go looking
+    // in; the recording story itself lives in local_record.rs.
+    assert!(json["record_dir"].is_null(), "output: {json}");
     // One invite per seat, the host's included: --musicians 2 mints exactly
     // two musician invites, never three, so no invite exists that the
     // server's capacity check would refuse.

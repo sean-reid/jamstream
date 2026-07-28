@@ -20,6 +20,8 @@ fn host_args(json: bool) -> HostArgs {
         port: 43210,
         idle_min: 10,
         max_hours: 12,
+        record: false,
+        record_stems: false,
         artifact_url: None,
         artifact_sha256: None,
         yes: true,
