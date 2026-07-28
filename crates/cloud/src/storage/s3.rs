@@ -30,8 +30,10 @@
 //!
 //! AWS has the same shape for a different reason: the recording credential
 //! wants `s3:PutObject`, `s3:DeleteObject` (the launch probe) and
-//! `s3:AbortMultipartUpload` on one prefix, plus
-//! `s3:PutLifecycleConfiguration` on the bucket, which is not the EC2 policy.
+//! `s3:AbortMultipartUpload` on one prefix, plus `s3:GetLifecycleConfiguration`
+//! and `s3:PutLifecycleConfiguration` on the bucket (the retention rule is
+//! merged into the bucket's existing rules, so it is read before it is
+//! written), which is not the EC2 policy.
 //! It must not *be* the EC2 policy either, and nothing reads
 //! `AWS_ACCESS_KEY_ID` for it: this key is written into the session machine's
 //! user data. See `jamstream_cli::storage`.
@@ -56,7 +58,10 @@ use reqwest::{Method, Response};
 use crate::http;
 use crate::provider::{ProviderError, Result};
 use crate::providers::aws::{amz_date_now, aws_encode, sigv4, take_tag, xml_unescape, xml_value};
-use crate::retention::{LifecycleDialect, Retention, RetentionEnforcement, s3_lifecycle_xml};
+use crate::retention::{
+    LifecycleDialect, Retention, RetentionEnforcement, S3_MAX_LIFECYCLE_RULES, at_capacity_note,
+    merge_s3_lifecycle, rule_id, unreadable_note,
+};
 use crate::storage::{
     ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
     drain_body, drive_upload,
@@ -386,6 +391,34 @@ impl S3Store {
         };
 
         http::send_retrying(build).await
+    }
+
+    /// The bucket's current lifecycle document, empty when it has none, None
+    /// when this key may not read it.
+    ///
+    /// Reading is `s3:GetLifecycleConfiguration`, a separate permission from
+    /// the `s3:PutLifecycleConfiguration` that writes. A key with only the
+    /// write half must not blind-write, because the PUT replaces the whole
+    /// document and would delete rules the host set themselves.
+    async fn lifecycle_document(&self, bucket: &str) -> Result<Option<String>> {
+        let request = S3Request::new("GET", bucket, None).query("lifecycle", "");
+        match self.send(request).await {
+            Ok(resp) => Self::text(resp, "GetBucketLifecycleConfiguration")
+                .await
+                .map(Some),
+            // A bucket with no configuration answers 404
+            // NoSuchLifecycleConfiguration, which is an empty document.
+            Err(ProviderError::NotFound(_)) => Ok(Some(String::new())),
+            Err(ProviderError::Auth(err)) => {
+                tracing::warn!(
+                    bucket,
+                    error = %err,
+                    "cannot read the bucket's lifecycle rules, so no retention rule was written"
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Reads a response body as text, for the XML-bearing calls.
@@ -762,7 +795,27 @@ impl ObjectStore for S3Store {
         prefix: &str,
         retention: Retention,
     ) -> Result<RetentionEnforcement> {
-        let xml = s3_lifecycle_xml(prefix, retention, self.dialect);
+        // Read first: the PUT replaces the bucket's whole configuration, so
+        // the document has to carry every rule that is already there. See
+        // crate::retention.
+        let Some(existing) = self.lifecycle_document(bucket).await? else {
+            return Ok(RetentionEnforcement::Manual {
+                retention,
+                note: unreadable_note(retention, "s3:GetLifecycleConfiguration"),
+            });
+        };
+        let Some(xml) = merge_s3_lifecycle(
+            &existing,
+            prefix,
+            retention,
+            self.dialect,
+            S3_MAX_LIFECYCLE_RULES,
+        ) else {
+            return Ok(RetentionEnforcement::Manual {
+                retention,
+                note: at_capacity_note(retention, S3_MAX_LIFECYCLE_RULES),
+            });
+        };
         let body = xml.clone().into_bytes();
         // PutBucketLifecycleConfiguration is one of the few S3 calls that
         // wants a body integrity header; Content-MD5 is the form both AWS
@@ -778,6 +831,7 @@ impl ObjectStore for S3Store {
         Ok(RetentionEnforcement::ServerSide {
             provider: self.kind,
             retention,
+            rule_id: rule_id(prefix),
             rule: xml,
         })
     }

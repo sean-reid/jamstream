@@ -50,13 +50,38 @@
 //! implying a rule exists. An unenforceable retention choice must never be
 //! reported as enforced.
 //!
-//! # Scoping
+//! # Scoping, and why the document is merged rather than written
 //!
 //! Every rule is filtered to the JamStream key prefix. The bucket belongs to
 //! the host and may hold anything; an expiration rule with no prefix filter
 //! would be a data-loss bug, not a feature. This is why
-//! [`crate::storage::stem_key`] sanitizes member names: a key that escaped
-//! the prefix would also escape the retention rule.
+//! [`crate::storage::sanitize_component`] sanitizes the parts of a key: a key
+//! that escaped the prefix would also escape the retention rule.
+//!
+//! Retention is a per-session choice, so the rule is per session too: its id
+//! is [`rule_id`] of that session's prefix. Both provider calls replace the
+//! bucket's whole rule list, so applying one session's choice by writing one
+//! rule deleted every other rule on the bucket, JamStream's and the host's
+//! alike. The second recorded session in a bucket silently removed the
+//! first's expiry rule and those takes then lived forever, billing. So
+//! [`merge_s3_lifecycle`] and [`merge_gcs_lifecycle`] read the document that
+//! is there, keep every rule that is not this session's verbatim, and add
+//! ours. Reading is a separate permission from writing on S3
+//! (`s3:GetLifecycleConfiguration`); without it nothing is written, because a
+//! blind write would take the host's own rules with it.
+//!
+//! Two consequences worth knowing:
+//!
+//! * Two hosts applying retention to one bucket at the same instant can lose
+//!   one of the two rules, because neither API has a compare-and-set. The
+//!   window is one round trip and the loss is a rule, never an object: the
+//!   takes are kept and keep billing until someone re-arms recording.
+//! * Providers cap the rule list ([`S3_MAX_LIFECYCLE_RULES`],
+//!   [`GCS_MAX_LIFECYCLE_RULES`]). At the cap the merge evicts JamStream's
+//!   own oldest rule to make room, which is almost always a rule whose
+//!   objects the provider already deleted, and never a rule of the host's. A
+//!   bucket filled to the cap with the host's own rules gets
+//!   [`RetentionEnforcement::Manual`] and a note saying so.
 //!
 //! Each rule set additionally carries an abort-incomplete-multipart-upload
 //! action ([`ABORT_INCOMPLETE_DAYS`]). A recording upload that dies with the
@@ -74,12 +99,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::provider::{ProviderError, Result};
+use crate::providers::aws::{take_tag, xml_unescape, xml_value};
 use crate::types::ProviderKind;
 
-/// Id carried by the lifecycle rule JamStream writes, so a host can see at a
-/// glance which rule is ours and so re-applying a choice replaces it instead
-/// of stacking up duplicates.
+/// Id prefix every lifecycle rule JamStream writes carries, so a host can see
+/// at a glance which rules are ours and so the merge knows which rules it may
+/// evict.
 pub const RULE_ID: &str = "jamstream-recording-retention";
+
+/// S3 and Spaces cap a bucket's lifecycle configuration at 1000 rules.
+pub const S3_MAX_LIFECYCLE_RULES: usize = 1000;
+
+/// Cloud Storage caps a bucket's lifecycle configuration at 100 rules.
+pub const GCS_MAX_LIFECYCLE_RULES: usize = 100;
 
 /// Days after which an incomplete multipart upload is abandoned by the
 /// provider. One day is plenty: a recording upload either finishes minutes
@@ -198,11 +230,29 @@ pub enum LifecycleDialect {
     SpacesV1,
 }
 
-/// The lifecycle document for `PUT /{bucket}?lifecycle`.
-///
-/// One rule, scoped to `prefix`, carrying an expiration when the choice has
-/// one and always carrying the incomplete-multipart cleanup.
-pub fn s3_lifecycle_xml(prefix: &str, retention: Retention, dialect: LifecycleDialect) -> String {
+/// The id of JamStream's rule for one key prefix. Per session, because the
+/// retention choice is: `jamstream-recording-retention-<session>`, and plain
+/// [`RULE_ID`] for the recordings prefix as a whole.
+pub fn rule_id(prefix: &str) -> String {
+    let tail = prefix
+        .strip_prefix(crate::storage::RECORDING_PREFIX)
+        .unwrap_or(prefix)
+        .trim_matches('/');
+    if tail.is_empty() {
+        return RULE_ID.to_owned();
+    }
+    format!("{RULE_ID}-{}", crate::storage::sanitize_component(tail))
+}
+
+/// True for a rule id JamStream wrote, which is the only kind the merge may
+/// drop.
+fn is_ours(id: Option<&str>) -> bool {
+    id.is_some_and(|id| id == RULE_ID || id.starts_with(&format!("{RULE_ID}-")))
+}
+
+/// One `<Rule>` element, scoped to `prefix`, carrying an expiration when the
+/// choice has one and always carrying the incomplete-multipart cleanup.
+fn s3_rule(prefix: &str, retention: Retention, dialect: LifecycleDialect) -> String {
     let filter = match dialect {
         LifecycleDialect::S3v2 => {
             format!("<Filter><Prefix>{}</Prefix></Filter>", xml_escape(prefix))
@@ -214,49 +264,177 @@ pub fn s3_lifecycle_xml(prefix: &str, retention: Retention, dialect: LifecycleDi
         None => String::new(),
     };
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<LifecycleConfiguration>\
-<Rule>\
-<ID>{RULE_ID}</ID>\
+        "<Rule>\
+<ID>{id}</ID>\
 {filter}\
 <Status>Enabled</Status>\
 {expiration}\
 <AbortIncompleteMultipartUpload><DaysAfterInitiation>{ABORT_INCOMPLETE_DAYS}</DaysAfterInitiation></AbortIncompleteMultipartUpload>\
-</Rule>\
-</LifecycleConfiguration>"
+</Rule>",
+        id = xml_escape(&rule_id(prefix))
     )
 }
 
-/// The bucket patch body for `PATCH /storage/v1/b/{bucket}`.
+/// The lifecycle document for a bucket that has none: JamStream's rule for
+/// `prefix` and nothing else.
+pub fn s3_lifecycle_xml(prefix: &str, retention: Retention, dialect: LifecycleDialect) -> String {
+    merge_s3_lifecycle("", prefix, retention, dialect, S3_MAX_LIFECYCLE_RULES)
+        .expect("one rule always fits in an empty document")
+}
+
+/// The document for `PUT /{bucket}?lifecycle`: JamStream's rule for `prefix`
+/// merged into `existing`, which is whatever `GET /{bucket}?lifecycle`
+/// returned (empty when the bucket has no configuration).
 ///
-/// GCS lifecycle is a whole-bucket field, so the patch replaces the rule
-/// list. `matchesPrefix` keeps the rule off everything the host stores
-/// outside the JamStream prefix. "Keep forever" sends an empty rule list,
-/// which clears a previously applied expiration rather than leaving a stale
-/// one behind.
-///
-/// GCS has no incomplete-multipart lifecycle action; it garbage-collects
-/// abandoned resumable upload sessions itself after a week, which is why the
-/// document has one rule where S3's has two actions.
+/// Every other rule survives verbatim, JamStream's rules for other sessions
+/// included, because the call replaces the bucket's whole configuration. None
+/// when `max_rules` is already full of rules that are not ours; see the module
+/// docs.
+pub fn merge_s3_lifecycle(
+    existing: &str,
+    prefix: &str,
+    retention: Retention,
+    dialect: LifecycleDialect,
+    max_rules: usize,
+) -> Option<String> {
+    let id = rule_id(prefix);
+    let mut kept: Vec<&str> = Vec::new();
+    let mut rest = existing;
+    while let Some((rule, after)) = take_tag(rest, "Rule") {
+        rest = after;
+        let rule_id_value = xml_value(rule, "ID").map(xml_unescape);
+        // This session's rule is the one being replaced. The bare id is
+        // matched by prefix too, because that is what a JamStream older than
+        // per-session ids wrote for this same prefix.
+        let replaced = rule_id_value.as_deref() == Some(id.as_str())
+            || (is_ours(rule_id_value.as_deref())
+                && xml_value(rule, "Prefix").map(xml_unescape).as_deref() == Some(prefix));
+        if !replaced {
+            kept.push(rule);
+        }
+    }
+    // Room for ours. Only ever at the expense of one of ours, oldest first:
+    // by the time a bucket holds a thousand rules, the objects the earliest
+    // ones named were expired by those same rules long ago.
+    while kept.len() >= max_rules {
+        // No rule of ours left to drop means no room, and a rule of the host's
+        // is not ours to take: None, and the caller says so.
+        let index = kept
+            .iter()
+            .position(|rule| is_ours(xml_value(rule, "ID").map(xml_unescape).as_deref()))?;
+        let dropped = kept.remove(index);
+        tracing::warn!(
+            rule = xml_value(dropped, "ID").unwrap_or("<no id>"),
+            max_rules,
+            "the bucket is at its lifecycle rule limit; dropping JamStream's oldest \
+             expiry rule to make room for this session's"
+        );
+    }
+    let mut document =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration>");
+    for rule in kept {
+        document.push_str("<Rule>");
+        document.push_str(rule);
+        document.push_str("</Rule>");
+    }
+    document.push_str(&s3_rule(prefix, retention, dialect));
+    document.push_str("</LifecycleConfiguration>");
+    Some(document)
+}
+
+/// The bucket patch body for `PATCH /storage/v1/b/{bucket}` for a bucket with
+/// no lifecycle rules yet.
 pub fn gcs_lifecycle_patch(prefix: &str, retention: Retention) -> Value {
-    let rules = match retention.days() {
-        Some(days) => vec![json!({
+    merge_gcs_lifecycle(&Value::Null, prefix, retention, GCS_MAX_LIFECYCLE_RULES)
+        .expect("one rule always fits in an empty rule list")
+}
+
+/// The patch body for `PATCH /storage/v1/b/{bucket}`: JamStream's rule for
+/// `prefix` merged into `bucket`, the JSON `GET /storage/v1/b/{bucket}`
+/// returned.
+///
+/// GCS lifecycle is a whole-bucket field, so the patch replaces the rule list
+/// and everything not this prefix's rule has to be carried across. GCS rules
+/// have no id, so ours are recognized by their `matchesPrefix`.
+///
+/// "Keep forever" contributes no rule at all: GCS has no
+/// incomplete-multipart lifecycle action (it collects abandoned resumable
+/// sessions itself after a week), so there is nothing left to say once the
+/// expiration is gone.
+pub fn merge_gcs_lifecycle(
+    bucket: &Value,
+    prefix: &str,
+    retention: Retention,
+    max_rules: usize,
+) -> Option<Value> {
+    let existing = bucket
+        .get("lifecycle")
+        .and_then(|l| l.get("rule"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut kept: Vec<Value> = existing
+        .iter()
+        .filter(|rule| !gcs_rule_matches_prefix(rule, prefix))
+        .cloned()
+        .collect();
+    let mine = retention.days().map(|days| {
+        json!({
             "action": { "type": "Delete" },
             "condition": { "age": days, "matchesPrefix": [prefix] },
-        })],
-        None => Vec::new(),
-    };
-    json!({ "lifecycle": { "rule": rules } })
+        })
+    });
+    if mine.is_some() {
+        while kept.len() >= max_rules {
+            // No rule of ours left to drop means no room, and a rule of the
+            // host's is not ours to take: None, and the caller says so.
+            let index = kept.iter().position(gcs_rule_is_ours)?;
+            kept.remove(index);
+            tracing::warn!(
+                max_rules,
+                "the bucket is at its lifecycle rule limit; dropping JamStream's oldest \
+                 expiry rule to make room for this session's"
+            );
+        }
+    }
+    kept.extend(mine);
+    Some(json!({ "lifecycle": { "rule": kept } }))
+}
+
+/// True for a GCS rule that is JamStream's rule for exactly `prefix`.
+fn gcs_rule_matches_prefix(rule: &Value, prefix: &str) -> bool {
+    gcs_rule_is_ours(rule)
+        && rule["condition"]["matchesPrefix"]
+            .as_array()
+            .is_some_and(|prefixes| prefixes.iter().all(|p| p.as_str() == Some(prefix)))
+}
+
+/// True for a GCS rule JamStream wrote: a Delete keyed on prefixes that are
+/// all inside the recordings prefix. Nothing else may be evicted or replaced.
+fn gcs_rule_is_ours(rule: &Value) -> bool {
+    let prefixes = rule["condition"]["matchesPrefix"].as_array();
+    rule["action"]["type"].as_str() == Some("Delete")
+        && prefixes.is_some_and(|prefixes| {
+            !prefixes.is_empty()
+                && prefixes.iter().all(|p| {
+                    p.as_str()
+                        .is_some_and(|p| p.starts_with(crate::storage::RECORDING_PREFIX))
+                })
+        })
 }
 
 /// What actually happened when a retention choice was applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetentionEnforcement {
-    /// The provider now enforces the choice itself. `rule` is the document
-    /// that was accepted, for display and for support requests.
+    /// The provider now enforces the choice itself.
     ServerSide {
         provider: ProviderKind,
         retention: Retention,
+        /// Id of the rule carrying this session's choice, so a host can find
+        /// it among their own.
+        rule_id: String,
+        /// The whole document that was accepted: this session's rule plus
+        /// every rule the merge preserved. For display and support requests.
         rule: String,
     },
     /// No lifecycle API on this target. Nothing is enforced; `note` is the
@@ -283,13 +461,14 @@ impl RetentionEnforcement {
             RetentionEnforcement::ServerSide {
                 provider,
                 retention: r,
+                rule_id,
                 ..
             } => match r.days() {
                 Some(days) => format!(
-                    "{provider} will delete this recording {days} days from now (lifecycle rule {RULE_ID})"
+                    "{provider} will delete this recording {days} days from now (lifecycle rule {rule_id})"
                 ),
                 None => format!(
-                    "kept until you delete it; no expiration rule set on {provider} (rule {RULE_ID} only cleans up failed uploads)"
+                    "kept until you delete it; no expiration rule set on {provider} (rule {rule_id} only cleans up failed uploads)"
                 ),
             },
             RetentionEnforcement::Manual { note, .. } => note.clone(),
@@ -311,6 +490,47 @@ pub fn manual_note(retention: Retention) -> String {
                  anyway: the recording stays until you delete it."
             .to_owned(),
     }
+}
+
+/// The note to show when the bucket's existing rules could not be read, so
+/// nothing was written.
+///
+/// `permission` is the provider's name for the missing one. Writing without
+/// reading would replace the host's own lifecycle rules with ours, which is
+/// data loss on a bucket JamStream does not own, so this path writes nothing.
+pub fn unreadable_note(retention: Retention, permission: &str) -> String {
+    let consequence = match retention.days() {
+        Some(days) => format!(
+            "\"{}\" was not applied and nothing will delete the recording after {days} days \
+             unless you do",
+            retention.label()
+        ),
+        None => "no cleanup rule for failed uploads was applied".to_owned(),
+    };
+    format!(
+        "JamStream could not read this bucket's lifecycle rules ({permission} was refused). \
+         Setting a rule replaces the whole list, so writing one without reading first would \
+         delete any rule you set yourself: {consequence}. Grant {permission} on the bucket and \
+         arm recording again."
+    )
+}
+
+/// The note to show when the bucket is at the provider's lifecycle rule limit
+/// and every rule there belongs to the host.
+pub fn at_capacity_note(retention: Retention, max_rules: usize) -> String {
+    let consequence = match retention.days() {
+        Some(days) => format!(
+            "so \"{}\" is not enforced: nothing will delete the recording after {days} days \
+             unless you do",
+            retention.label()
+        ),
+        None => "so failed uploads will not be cleaned up for you".to_owned(),
+    };
+    format!(
+        "This bucket already has {max_rules} lifecycle rules, which is the provider's limit, and \
+         none of them are JamStream's, {consequence}. Remove a rule you no longer need, or point \
+         recording at another bucket."
+    )
 }
 
 /// Minimal XML text escaping for values interpolated into a lifecycle
@@ -451,6 +671,7 @@ mod tests {
         let server = RetentionEnforcement::ServerSide {
             provider: ProviderKind::Aws,
             retention: Retention::Days30,
+            rule_id: rule_id("jamstream/recordings/s1/"),
             rule: "<xml/>".to_owned(),
         };
         assert!(server.is_server_side());
@@ -459,10 +680,20 @@ mod tests {
                 .describe()
                 .contains("aws will delete this recording 30 days")
         );
+        // The id names the session, so a host with several can tell the rules
+        // apart in their own console.
+        assert!(
+            server
+                .describe()
+                .contains("jamstream-recording-retention-s1"),
+            "{}",
+            server.describe()
+        );
 
         let forever = RetentionEnforcement::ServerSide {
             provider: ProviderKind::Gcp,
             retention: Retention::KeepForever,
+            rule_id: RULE_ID.to_owned(),
             rule: "{}".to_owned(),
         };
         assert!(forever.describe().contains("kept until you delete it"));
@@ -483,5 +714,332 @@ mod tests {
         let note = manual_note(Retention::KeepForever);
         assert!(note.contains("stays until you delete it"));
         assert!(!note.contains("cannot be enforced"));
+    }
+
+    // ---- Merging into a document that is already there ----
+
+    #[test]
+    fn a_rule_id_names_the_session_and_the_whole_prefix_keeps_the_bare_id() {
+        assert_eq!(
+            rule_id("jamstream/recordings/deadbeef/"),
+            "jamstream-recording-retention-deadbeef"
+        );
+        assert_eq!(rule_id("jamstream/recordings/"), RULE_ID);
+        assert_eq!(rule_id(""), RULE_ID);
+        // Two sessions, two ids: the bug this fixes was one id for all of them.
+        assert_ne!(
+            rule_id("jamstream/recordings/s1/"),
+            rule_id("jamstream/recordings/s2/")
+        );
+        // A prefix outside the recordings tree still gets a usable id, and
+        // nothing in an id can break the XML around it.
+        assert_eq!(
+            rule_id("other/place/"),
+            "jamstream-recording-retention-other-place"
+        );
+        assert!(!rule_id("<>&/").contains('<'));
+    }
+
+    /// The document a JamStream one version older wrote for session s1, plus a
+    /// rule of the host's own.
+    fn existing_document() -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration>\
+<Rule><ID>archive-my-masters</ID><Filter><Prefix>masters/</Prefix></Filter>\
+<Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule>\
+{}</LifecycleConfiguration>",
+            s3_rule(
+                "jamstream/recordings/s1/",
+                Retention::Days90,
+                LifecycleDialect::S3v2
+            )
+        )
+    }
+
+    #[test]
+    fn a_second_session_leaves_the_first_sessions_rule_alone() {
+        let merged = merge_s3_lifecycle(
+            &existing_document(),
+            "jamstream/recordings/s2/",
+            Retention::Days7,
+            LifecycleDialect::S3v2,
+            S3_MAX_LIFECYCLE_RULES,
+        )
+        .expect("two rules fit");
+        // The defect: session two's document replaced session one's rule, and
+        // session one's takes then lived forever.
+        assert!(
+            merged.contains("<ID>jamstream-recording-retention-s1</ID>"),
+            "{merged}"
+        );
+        assert!(merged.contains("<Prefix>jamstream/recordings/s1/</Prefix>"));
+        assert!(merged.contains("<Expiration><Days>90</Days></Expiration>"));
+        // And the host's own rule, which is not ours to touch either.
+        assert!(merged.contains("<ID>archive-my-masters</ID>"), "{merged}");
+        assert!(merged.contains("<StorageClass>GLACIER</StorageClass>"));
+        // Session two's own rule is there once.
+        assert_eq!(
+            merged
+                .matches("<ID>jamstream-recording-retention-s2</ID>")
+                .count(),
+            1
+        );
+        assert!(merged.contains("<Expiration><Days>7</Days></Expiration>"));
+        assert_eq!(merged.matches("<Rule>").count(), 3);
+    }
+
+    #[test]
+    fn re_applying_a_session_replaces_its_own_rule_rather_than_stacking() {
+        let merged = merge_s3_lifecycle(
+            &existing_document(),
+            "jamstream/recordings/s1/",
+            Retention::Days7,
+            LifecycleDialect::S3v2,
+            S3_MAX_LIFECYCLE_RULES,
+        )
+        .expect("one replacement fits");
+        assert_eq!(merged.matches("<Rule>").count(), 2, "{merged}");
+        assert_eq!(
+            merged
+                .matches("<ID>jamstream-recording-retention-s1</ID>")
+                .count(),
+            1
+        );
+        assert!(merged.contains("<Expiration><Days>7</Days></Expiration>"));
+        assert!(
+            !merged.contains("<Days>90</Days>"),
+            "the old choice survived: {merged}"
+        );
+    }
+
+    #[test]
+    fn the_shared_rule_an_older_jamstream_wrote_for_this_prefix_is_replaced() {
+        // Before per-session ids there was one rule id for every session, and
+        // it named whichever prefix was recorded last. Leaving it in place
+        // would keep expiring this session's takes on the old schedule.
+        let legacy = format!(
+            "<LifecycleConfiguration><Rule><ID>{RULE_ID}</ID>\
+<Filter><Prefix>jamstream/recordings/s1/</Prefix></Filter><Status>Enabled</Status>\
+<Expiration><Days>7</Days></Expiration></Rule></LifecycleConfiguration>"
+        );
+        let merged = merge_s3_lifecycle(
+            &legacy,
+            "jamstream/recordings/s1/",
+            Retention::Days90,
+            LifecycleDialect::S3v2,
+            S3_MAX_LIFECYCLE_RULES,
+        )
+        .unwrap();
+        assert_eq!(merged.matches("<Rule>").count(), 1, "{merged}");
+        assert!(merged.contains("<Days>90</Days>"));
+        assert!(!merged.contains("<Days>7</Days>"), "{merged}");
+        // The same legacy rule scoped to another session's prefix is that
+        // session's choice and stays.
+        let merged = merge_s3_lifecycle(
+            &legacy,
+            "jamstream/recordings/s2/",
+            Retention::Days90,
+            LifecycleDialect::S3v2,
+            S3_MAX_LIFECYCLE_RULES,
+        )
+        .unwrap();
+        assert_eq!(merged.matches("<Rule>").count(), 2, "{merged}");
+        assert!(merged.contains("<Days>7</Days>"));
+    }
+
+    #[test]
+    fn an_empty_or_junk_document_still_yields_our_rule() {
+        for existing in ["", "<LifecycleConfiguration/>", "not xml at all", "<Rule>"] {
+            let merged = merge_s3_lifecycle(
+                existing,
+                "jamstream/recordings/s1/",
+                Retention::Days30,
+                LifecycleDialect::S3v2,
+                S3_MAX_LIFECYCLE_RULES,
+            )
+            .unwrap_or_else(|| panic!("{existing:?} produced no document"));
+            assert_eq!(merged.matches("<Rule>").count(), 1, "{merged}");
+            assert!(merged.contains("<ID>jamstream-recording-retention-s1</ID>"));
+        }
+    }
+
+    #[test]
+    fn at_the_rule_cap_only_our_own_rules_are_evicted() {
+        let ours = |n: usize| {
+            s3_rule(
+                &format!("jamstream/recordings/s{n}/"),
+                Retention::Days7,
+                LifecycleDialect::S3v2,
+            )
+        };
+        // A bucket at the cap, all of them ours: the oldest goes.
+        let full: String = (0..S3_MAX_LIFECYCLE_RULES).map(ours).collect();
+        let merged = merge_s3_lifecycle(
+            &full,
+            "jamstream/recordings/new/",
+            Retention::Days30,
+            LifecycleDialect::S3v2,
+            S3_MAX_LIFECYCLE_RULES,
+        )
+        .expect("room is made by dropping ours");
+        assert_eq!(merged.matches("<Rule>").count(), S3_MAX_LIFECYCLE_RULES);
+        assert!(merged.contains("<ID>jamstream-recording-retention-new</ID>"));
+        assert!(
+            !merged.contains("<ID>jamstream-recording-retention-s0</ID>"),
+            "the oldest of ours should have been the one dropped"
+        );
+        assert!(merged.contains("<ID>jamstream-recording-retention-s1</ID>"));
+
+        // A bucket at the cap with nothing of ours: no rule of the host's is
+        // ever touched, so there is no rule to write and the caller has to say
+        // so.
+        let theirs: String = (0..S3_MAX_LIFECYCLE_RULES)
+            .map(|n| format!("<Rule><ID>host-rule-{n}</ID><Status>Enabled</Status></Rule>"))
+            .collect();
+        assert!(
+            merge_s3_lifecycle(
+                &theirs,
+                "jamstream/recordings/new/",
+                Retention::Days30,
+                LifecycleDialect::S3v2,
+                S3_MAX_LIFECYCLE_RULES,
+            )
+            .is_none()
+        );
+        let note = at_capacity_note(Retention::Days30, S3_MAX_LIFECYCLE_RULES);
+        assert!(note.contains("1000 lifecycle rules"), "{note}");
+        assert!(note.contains("nothing will delete the recording"), "{note}");
+    }
+
+    #[test]
+    fn the_unreadable_note_says_nothing_was_written_and_why() {
+        let note = unreadable_note(Retention::Days7, "s3:GetLifecycleConfiguration");
+        assert!(note.contains("s3:GetLifecycleConfiguration"), "{note}");
+        assert!(note.contains("was not applied"), "{note}");
+        assert!(note.contains("7 days unless you do"), "{note}");
+        // It must not claim a rule exists, and it must say why writing blind
+        // is not an option.
+        assert!(note.contains("delete any rule you set yourself"), "{note}");
+    }
+
+    #[test]
+    fn gcs_merge_keeps_other_sessions_and_the_hosts_own_rules() {
+        let bucket = json!({
+            "lifecycle": { "rule": [
+                // The host's own: not a Delete, and outside our prefix.
+                { "action": { "type": "SetStorageClass", "storageClass": "NEARLINE" },
+                  "condition": { "age": 10, "matchesPrefix": ["masters/"] } },
+                { "action": { "type": "Delete" },
+                  "condition": { "age": 400, "matchesPrefix": ["scratch/"] } },
+                // Session one's.
+                { "action": { "type": "Delete" },
+                  "condition": { "age": 90, "matchesPrefix": ["jamstream/recordings/s1/"] } },
+            ] }
+        });
+        let patch = merge_gcs_lifecycle(
+            &bucket,
+            "jamstream/recordings/s2/",
+            Retention::Days7,
+            GCS_MAX_LIFECYCLE_RULES,
+        )
+        .unwrap();
+        let rules = patch["lifecycle"]["rule"].as_array().unwrap();
+        assert_eq!(rules.len(), 4, "{patch}");
+        assert_eq!(rules[0]["action"]["type"], "SetStorageClass");
+        assert_eq!(rules[1]["condition"]["matchesPrefix"][0], "scratch/");
+        assert_eq!(rules[2]["condition"]["age"], 90);
+        assert_eq!(rules[3]["condition"]["age"], 7);
+        assert_eq!(
+            rules[3]["condition"]["matchesPrefix"][0],
+            "jamstream/recordings/s2/"
+        );
+
+        // Re-applying replaces that session's rule and nothing else.
+        let patch = merge_gcs_lifecycle(
+            &bucket,
+            "jamstream/recordings/s1/",
+            Retention::Days30,
+            GCS_MAX_LIFECYCLE_RULES,
+        )
+        .unwrap();
+        let rules = patch["lifecycle"]["rule"].as_array().unwrap();
+        assert_eq!(rules.len(), 3, "{patch}");
+        assert_eq!(rules[2]["condition"]["age"], 30);
+
+        // Keep forever drops this session's rule and leaves the rest, where
+        // the old code sent an empty list and cleared the whole bucket.
+        let patch = merge_gcs_lifecycle(
+            &bucket,
+            "jamstream/recordings/s1/",
+            Retention::KeepForever,
+            GCS_MAX_LIFECYCLE_RULES,
+        )
+        .unwrap();
+        let rules = patch["lifecycle"]["rule"].as_array().unwrap();
+        assert_eq!(rules.len(), 2, "{patch}");
+        assert!(
+            !patch.to_string().contains("jamstream/recordings/s1/"),
+            "{patch}"
+        );
+    }
+
+    #[test]
+    fn gcs_merge_evicts_only_our_rules_at_the_cap() {
+        let ours = |n: usize| {
+            json!({ "action": { "type": "Delete" },
+                    "condition": { "age": 7, "matchesPrefix": [format!("jamstream/recordings/s{n}/")] } })
+        };
+        let bucket = json!({ "lifecycle": { "rule": (0..GCS_MAX_LIFECYCLE_RULES).map(ours).collect::<Vec<_>>() } });
+        let patch = merge_gcs_lifecycle(
+            &bucket,
+            "jamstream/recordings/new/",
+            Retention::Days30,
+            GCS_MAX_LIFECYCLE_RULES,
+        )
+        .unwrap();
+        let rules = patch["lifecycle"]["rule"].as_array().unwrap();
+        assert_eq!(rules.len(), GCS_MAX_LIFECYCLE_RULES);
+        assert_eq!(
+            rules[0]["condition"]["matchesPrefix"][0], "jamstream/recordings/s1/",
+            "the oldest of ours should have been the one dropped"
+        );
+
+        let theirs = json!({ "lifecycle": { "rule": (0..GCS_MAX_LIFECYCLE_RULES)
+            .map(|n| json!({ "action": { "type": "Delete" },
+                             "condition": { "age": 1, "matchesPrefix": [format!("host/{n}/")] } }))
+            .collect::<Vec<_>>() } });
+        assert!(
+            merge_gcs_lifecycle(
+                &theirs,
+                "jamstream/recordings/new/",
+                Retention::Days30,
+                GCS_MAX_LIFECYCLE_RULES,
+            )
+            .is_none()
+        );
+        // Keep forever adds no rule, so a full bucket is no obstacle to it.
+        assert!(
+            merge_gcs_lifecycle(
+                &theirs,
+                "jamstream/recordings/new/",
+                Retention::KeepForever,
+                GCS_MAX_LIFECYCLE_RULES,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn gcs_merge_tolerates_a_bucket_with_no_lifecycle_field() {
+        for bucket in [json!({}), Value::Null, json!({ "lifecycle": {} })] {
+            let patch = merge_gcs_lifecycle(
+                &bucket,
+                "jamstream/recordings/s1/",
+                Retention::Days30,
+                GCS_MAX_LIFECYCLE_RULES,
+            )
+            .unwrap();
+            assert_eq!(patch["lifecycle"]["rule"].as_array().unwrap().len(), 1);
+        }
     }
 }

@@ -750,10 +750,44 @@ async fn delete_is_idempotent() {
 
 // ---- Lifecycle configuration ----
 
+/// Answers the read half of set_retention with `document`, or with S3's
+/// no-configuration error when there is none.
+async fn mount_lifecycle_get(server: &MockServer, document: Option<&str>) {
+    let response = match document {
+        Some(document) => ResponseTemplate::new(200).set_body_string(document.to_owned()),
+        None => ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchLifecycleConfiguration</Code>\
+             <Message>The lifecycle configuration does not exist</Message></Error>",
+        ),
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/{BUCKET}")))
+        .and(query_param("lifecycle", ""))
+        .and(signed_for_any())
+        .respond_with(response)
+        .expect(1)
+        .named("the read before the write")
+        .mount(server)
+        .await;
+}
+
+/// The body of the one lifecycle PUT the store made.
+async fn lifecycle_put_body(server: &MockServer) -> String {
+    let requests = server.received_requests().await.unwrap();
+    let put = requests
+        .iter()
+        .find(|r| {
+            r.method.as_str() == "PUT" && r.url.query().is_some_and(|q| q.contains("lifecycle"))
+        })
+        .expect("a lifecycle PUT");
+    String::from_utf8(put.body.clone()).unwrap()
+}
+
 #[tokio::test]
 async fn aws_lifecycle_put_sends_the_filter_form_with_a_content_md5() {
     let server = MockServer::start().await;
     let prefix = session_prefix("s1");
+    mount_lifecycle_get(&server, None).await;
     Mock::given(method("PUT"))
         .and(path(format!("/{BUCKET}")))
         .and(query_param("lifecycle", ""))
@@ -761,8 +795,9 @@ async fn aws_lifecycle_put_sends_the_filter_form_with_a_content_md5() {
         .and(header("content-type", "application/xml"))
         // PutBucketLifecycleConfiguration wants a body integrity header.
         .and(header_exists("content-md5"))
+        // Per session, so a second session's document can carry both.
         .and(body_string_contains(
-            "<ID>jamstream-recording-retention</ID>",
+            "<ID>jamstream-recording-retention-s1</ID>",
         ))
         .and(body_string_contains(format!(
             "<Filter><Prefix>{prefix}</Prefix></Filter>"
@@ -789,6 +824,13 @@ async fn aws_lifecycle_put_sends_the_filter_form_with_a_content_md5() {
         "{}",
         applied.describe()
     );
+    assert!(
+        applied
+            .describe()
+            .contains("jamstream-recording-retention-s1"),
+        "{}",
+        applied.describe()
+    );
 }
 
 #[tokio::test]
@@ -796,6 +838,7 @@ async fn the_content_md5_matches_the_body_that_was_sent() {
     // A wrong Content-MD5 is a 400 from real S3, so the header has to be the
     // digest of this exact document.
     let server = MockServer::start().await;
+    mount_lifecycle_get(&server, None).await;
     Mock::given(method("PUT"))
         .and(query_param("lifecycle", ""))
         .respond_with(ResponseTemplate::new(200))
@@ -806,7 +849,11 @@ async fn the_content_md5_matches_the_body_that_was_sent() {
         .await
         .unwrap();
 
-    let request = &server.received_requests().await.unwrap()[0];
+    let requests = server.received_requests().await.unwrap();
+    let request = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .expect("a lifecycle PUT");
     let sent_md5 = request
         .headers
         .get("content-md5")
@@ -821,6 +868,7 @@ async fn the_content_md5_matches_the_body_that_was_sent() {
 #[tokio::test]
 async fn keep_forever_omits_the_expiration_but_keeps_the_cleanup_rule() {
     let server = MockServer::start().await;
+    mount_lifecycle_get(&server, None).await;
     Mock::given(method("PUT"))
         .and(query_param("lifecycle", ""))
         .respond_with(ResponseTemplate::new(200))
@@ -831,8 +879,7 @@ async fn keep_forever_omits_the_expiration_but_keeps_the_cleanup_rule() {
         .set_retention(BUCKET, "jamstream/recordings/", Retention::KeepForever)
         .await
         .unwrap();
-    let body =
-        String::from_utf8(server.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    let body = lifecycle_put_body(&server).await;
     assert!(!body.contains("<Expiration>"), "{body}");
     assert!(body.contains("<AbortIncompleteMultipartUpload>"), "{body}");
 }
@@ -841,6 +888,7 @@ async fn keep_forever_omits_the_expiration_but_keeps_the_cleanup_rule() {
 async fn spaces_lifecycle_put_uses_the_bare_prefix_dialect() {
     let server = MockServer::start().await;
     let prefix = session_prefix("s1");
+    mount_lifecycle_get(&server, None).await;
     Mock::given(method("PUT"))
         .and(path(format!("/{BUCKET}")))
         .and(query_param("lifecycle", ""))
@@ -865,12 +913,137 @@ async fn spaces_lifecycle_put_uses_the_bare_prefix_dialect() {
         "{}",
         applied.describe()
     );
-    let body =
-        String::from_utf8(server.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    let body = lifecycle_put_body(&server).await;
     assert!(
         !body.contains("<Filter>"),
         "Spaces rejects the Filter form: {body}"
     );
+}
+
+/// The defect in #226: the second recorded session in a bucket wrote a
+/// document holding only its own rule, so the first session's takes lost their
+/// expiry and lived on, billing.
+#[tokio::test]
+async fn a_second_recorded_session_keeps_the_first_ones_expiry_rule() {
+    let server = MockServer::start().await;
+    // Stateful lifecycle: the fake holds the document the way the bucket does,
+    // so the second call reads what the first one actually wrote.
+    server
+        .register(Mock::given(FakeS3Matcher).respond_with(FakeS3::default()))
+        .await;
+    let store = store(&server);
+
+    let first = store
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::KeepForever)
+        .await
+        .unwrap();
+    let second = store
+        .set_retention(BUCKET, &session_prefix("s2"), Retention::Days7)
+        .await
+        .unwrap();
+    assert!(second.is_server_side());
+
+    // The document the bucket now holds is the second PUT's body.
+    let requests = server.received_requests().await.unwrap();
+    let document = requests
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "PUT" && r.url.query().is_some_and(|q| q.contains("lifecycle"))
+        })
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .next_back()
+        .expect("two lifecycle PUTs");
+    assert!(
+        document.contains("<ID>jamstream-recording-retention-s1</ID>"),
+        "session one's rule is gone: {document}"
+    );
+    assert!(
+        document.contains("<ID>jamstream-recording-retention-s2</ID>"),
+        "{document}"
+    );
+    assert!(
+        document.contains(&format!(
+            "<Filter><Prefix>{}</Prefix></Filter>",
+            session_prefix("s1")
+        )),
+        "{document}"
+    );
+    // Session one chose "keep forever" and session two seven days; neither
+    // choice may end up applied to the other's prefix.
+    assert_eq!(document.matches("<Expiration>").count(), 1, "{document}");
+    assert_eq!(document.matches("<Rule>").count(), 2, "{document}");
+    // And the first call's own document, read back, is still what it was.
+    assert!(first.describe().contains("kept until you delete it"));
+}
+
+#[tokio::test]
+async fn the_hosts_own_lifecycle_rules_survive_a_retention_apply() {
+    let server = MockServer::start().await;
+    // A bucket the host uses for their own masters, with their own rule.
+    let theirs = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration>\
+<Rule><ID>archive-my-masters</ID><Filter><Prefix>masters/</Prefix></Filter>\
+<Status>Enabled</Status>\
+<Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule>\
+</LifecycleConfiguration>";
+    mount_lifecycle_get(&server, Some(theirs)).await;
+    Mock::given(method("PUT"))
+        .and(query_param("lifecycle", ""))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::Days30)
+        .await
+        .unwrap();
+    let body = lifecycle_put_body(&server).await;
+    assert!(
+        body.contains("<ID>archive-my-masters</ID>"),
+        "a rule of the host's was deleted: {body}"
+    );
+    assert!(
+        body.contains("<StorageClass>GLACIER</StorageClass>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<ID>jamstream-recording-retention-s1</ID>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_bucket_whose_rules_cannot_be_read_is_left_alone() {
+    // A key with the write half of the lifecycle permission and not the read
+    // half must write nothing: the PUT replaces the whole document, so a blind
+    // write would delete rules the host set themselves.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(query_param("lifecycle", ""))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>no GetLifecycleConfiguration</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(query_param("lifecycle", ""))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("nothing may be written when the existing rules are unknown")
+        .mount(&server)
+        .await;
+
+    let applied = store(&server)
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::Days7)
+        .await
+        .unwrap();
+    assert!(
+        !applied.is_server_side(),
+        "an unwritten rule must not be reported as enforced"
+    );
+    let note = applied.describe();
+    assert!(note.contains("s3:GetLifecycleConfiguration"), "{note}");
+    assert!(note.contains("7 days unless you do"), "{note}");
 }
 
 #[tokio::test]
@@ -1024,6 +1197,20 @@ fn signed_for_any_s3(request: &Request) -> bool {
         && request.headers.get("x-amz-date").is_some()
 }
 
+/// [`signed_for_any_s3`] as a matcher, for the mocks shared by the AWS and
+/// Spaces stores, whose regions and keys differ.
+struct SignedForAnyS3;
+
+impl Match for SignedForAnyS3 {
+    fn matches(&self, request: &Request) -> bool {
+        signed_for_any_s3(request)
+    }
+}
+
+fn signed_for_any() -> SignedForAnyS3 {
+    SignedForAnyS3
+}
+
 /// Matches everything, so the fake sees every request.
 struct FakeS3Matcher;
 
@@ -1055,6 +1242,11 @@ struct FakeState {
     /// upload id -> in-flight upload.
     uploads: std::collections::BTreeMap<String, FakeUpload>,
     next_upload: u64,
+    /// The bucket's lifecycle document, absent until one is written. Held
+    /// because PutBucketLifecycleConfiguration replaces it: a fake that
+    /// answered every write with 200 and forgot the body could not show that
+    /// the rule a previous session wrote is gone.
+    lifecycle: Option<String>,
 }
 
 impl Respond for FakeS3 {
@@ -1089,8 +1281,18 @@ impl Respond for FakeS3 {
                         "<Error><Code>MissingContentMD5</Code><Message>md5</Message></Error>",
                     );
                 }
+                // The document replaces whatever was there, as S3 does.
+                state.lifecycle = Some(String::from_utf8_lossy(&request.body).into_owned());
                 ResponseTemplate::new(200)
             }
+            ("GET", None) if query.contains_key("lifecycle") => match &state.lifecycle {
+                Some(document) => ResponseTemplate::new(200).set_body_string(document.clone()),
+                // What S3 answers for a bucket with no configuration.
+                None => ResponseTemplate::new(404).set_body_string(
+                    "<Error><Code>NoSuchLifecycleConfiguration</Code>\
+                     <Message>The lifecycle configuration does not exist</Message></Error>",
+                ),
+            },
             ("GET", None) if query.get("list-type").map(String::as_str) == Some("2") => {
                 let prefix = query.get("prefix").cloned().unwrap_or_default();
                 let mut xml = String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");
