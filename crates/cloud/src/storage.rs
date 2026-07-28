@@ -128,14 +128,23 @@ pub fn session_prefix(session_id: &str) -> String {
     format!("{RECORDING_PREFIX}/{}/", sanitize_component(session_id))
 }
 
-/// Key of the broadcast mix for a session.
+/// A stable object key under a session's prefix, for tests and for callers
+/// that need somewhere to put one object.
+///
+/// This is NOT the name a recording gets. A session holds one object per
+/// take and every take carries its own timestamp, so no function of the
+/// session id alone can name a recording; the real names are built where the
+/// take is (`Recorder` in the server crate) and handed to the sink. These
+/// helpers once claimed to be the naming contract while saying `.wav`, which
+/// left two answers on record and the tests believing the wrong one.
 pub fn mix_key(session_id: &str) -> String {
     format!("{}mix.wav", session_prefix(session_id))
 }
 
-/// Key of one member's stem. `member` is a display name or member id and is
-/// sanitized: a `/` or `..` in a member name would place the object outside
-/// the session prefix, where the retention rule does not reach.
+/// A stable per-member key under a session's prefix; see [`mix_key`] on why
+/// this is not a recording's name. `member` is sanitized, because a `/` or
+/// `..` would place the object outside the session prefix where the
+/// retention rule does not reach.
 pub fn stem_key(session_id: &str, member: &str) -> String {
     format!(
         "{}stems/{}.wav",

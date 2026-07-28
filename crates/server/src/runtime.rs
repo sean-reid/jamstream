@@ -406,6 +406,7 @@ impl Server {
         let (state, stems) = match worker.state() {
             RecordingState::Idle => (ProtoRecordingState::Idle, stems_cfg),
             RecordingState::Recording { stems } => (ProtoRecordingState::Recording, stems),
+            RecordingState::Uploading => (ProtoRecordingState::Uploading, stems_cfg),
             RecordingState::Failed { reason } => {
                 (ProtoRecordingState::Failed { reason }, stems_cfg)
             }

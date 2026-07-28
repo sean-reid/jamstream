@@ -6,20 +6,29 @@
 //!
 //! # The audio arithmetic
 //!
-//! Recording captures uncompressed WAV, because a rehearsal recording people
-//! might actually mix should not be pre-damaged by a codec. At 48 kHz that
-//! makes the size entirely predictable:
+//! Recording captures 16-bit 48 kHz FLAC, lossless so a take is worth mixing
+//! later, and the mix and every stem are stereo. The PCM arithmetic is exact
+//! and the encoded size is an estimate from it, at
+//! [`FLAC_PERCENT_OF_PCM`]:
 //!
 //! | Track | Channels | 16-bit | 24-bit |
 //! |---|---|---|---|
-//! | Broadcast mix | stereo | 691.2 MB/h | 1.037 GB/h |
-//! | Per-member stem | mono | 345.6 MB/h | 518.4 MB/h |
+//! | Broadcast mix | stereo | 414.7 MB/h | 622.1 MB/h |
+//! | Per-member stem | stereo | 414.7 MB/h | 622.1 MB/h |
 //!
-//! So the headline number: a two-hour session records a 1.38 GB mix, and each
-//! member's stem adds 691 MB on top. A five-piece band recording stems for
-//! two hours produces about 4.8 GB. That is the whole reason
+//! So the headline number: a two-hour session records about a 830 MB mix, and
+//! each member's stem adds as much again. A five-piece band recording stems
+//! for two hours produces about 5 GB. That is the whole reason
 //! [`crate::storage`] needs multipart uploads and the reason this estimate
 //! exists at all.
+//!
+//! This model and the recorder have disagreed once already: it described
+//! uncompressed WAV with mono stems long after the recorder was writing
+//! stereo FLAC, which overstated a mix by about 2x and understated a four
+//! piece's stems by about 2x, in a figure a host reads before agreeing to
+//! spend money. If the recorder's format changes, this is the second place
+//! that has to change, and the test asserting the per-hour figures is what
+//! notices.
 //!
 //! # What the estimate deliberately does not do
 //!
@@ -58,13 +67,19 @@ use crate::types::{ProviderKind, RegionId, format_microusd};
 pub const SAMPLE_RATE_HZ: u64 = 48_000;
 /// The broadcast mix is stereo.
 pub const MIX_CHANNELS: u64 = 2;
-/// A per-member stem is that member's own mono capture.
-pub const STEM_CHANNELS: u64 = 1;
-/// Canonical 44-byte WAV header, counted so the numbers reconcile with what
-/// a host sees in their bucket rather than being off by a hair.
-pub const WAV_HEADER_BYTES: u64 = 44;
-/// A plain WAV cannot address past 4 GiB: the RIFF size fields are 32-bit.
-pub const WAV_MAX_BYTES: u64 = u32::MAX as u64;
+/// A stem is stereo, like the mix. It costs the same per hour as the mix and
+/// that is the point: a stem a band can pan and place is worth more than a
+/// mono one that saves half the bytes.
+pub const STEM_CHANNELS: u64 = 2;
+/// Encoded size as a percentage of the same audio uncompressed, used to turn
+/// the exact PCM arithmetic into a FLAC estimate.
+///
+/// FLAC is lossless, so the ratio is a property of the music rather than a
+/// setting: dense loud material lands near 70 to 80 percent, sparse quiet
+/// material nearer 40 to 50. This is deliberately on the high side of the
+/// middle, because a host who is shown a number before agreeing to spend
+/// money should find the bill smaller than the estimate rather than larger.
+pub const FLAC_PERCENT_OF_PCM: u64 = 60;
 
 const PRICES_JSON: &str = include_str!("../data/storage_prices.json");
 
@@ -137,26 +152,30 @@ impl RecordingPlan {
         self
     }
 
+    /// Encoded bytes for one track: exact PCM arithmetic, then the FLAC
+    /// estimate. Integer maths throughout, so the figure is reproducible by
+    /// hand from the constants.
     fn track_bytes(&self, channels: u64, seconds: u64) -> u64 {
-        seconds * SAMPLE_RATE_HZ * channels * self.bit_depth.bytes_per_sample() + WAV_HEADER_BYTES
+        let pcm = seconds * SAMPLE_RATE_HZ * channels * self.bit_depth.bytes_per_sample();
+        pcm * FLAC_PERCENT_OF_PCM / 100
     }
 
     /// Bytes the broadcast mix accumulates per hour of session.
     pub fn mix_bytes_per_hour(&self) -> u64 {
-        3600 * SAMPLE_RATE_HZ * MIX_CHANNELS * self.bit_depth.bytes_per_sample()
+        self.track_bytes(MIX_CHANNELS, 3600)
     }
 
     /// Bytes one member's stem accumulates per hour of session.
     pub fn stem_bytes_per_hour(&self) -> u64 {
-        3600 * SAMPLE_RATE_HZ * STEM_CHANNELS * self.bit_depth.bytes_per_sample()
+        self.track_bytes(STEM_CHANNELS, 3600)
     }
 
-    /// Size of the finished mix WAV.
+    /// Size of the finished mix.
     pub fn mix_bytes(&self, seconds: u64) -> u64 {
         self.track_bytes(MIX_CHANNELS, seconds)
     }
 
-    /// Size of one finished stem WAV.
+    /// Size of one finished stem.
     pub fn stem_bytes(&self, seconds: u64) -> u64 {
         self.track_bytes(STEM_CHANNELS, seconds)
     }
@@ -175,23 +194,6 @@ impl RecordingPlan {
     /// The largest single object, which is always the stereo mix.
     pub fn largest_object_bytes(&self, seconds: u64) -> u64 {
         self.mix_bytes(seconds)
-    }
-
-    /// Warns when the mix would outgrow what a plain WAV can address. Not an
-    /// upload problem — the object store handles any size — but the writer
-    /// on the server side has to switch container (RF64/W64) or split the
-    /// file, so the constraint belongs next to the size arithmetic.
-    pub fn wav_size_warning(&self, seconds: u64) -> Option<String> {
-        let mix = self.largest_object_bytes(seconds);
-        (mix > WAV_MAX_BYTES).then(|| {
-            let hours = WAV_MAX_BYTES / self.mix_bytes_per_hour();
-            format!(
-                "a {}-bit stereo mix passes the 4 GiB limit of a plain WAV after about {hours} \
-                 hours ({} at this length), so the recorder has to split the file or write RF64",
-                self.bit_depth.bits(),
-                gb_display(mix)
-            )
-        })
     }
 }
 
@@ -370,9 +372,6 @@ impl RecordingEstimate {
                 .to_owned(),
         );
         notes.push(price.note.clone());
-        if let Some(warning) = plan.wav_size_warning(seconds) {
-            notes.push(format!("Heads up: {warning}."));
-        }
 
         RecordingEstimate {
             plan: *plan,
@@ -517,53 +516,39 @@ mod tests {
     fn per_hour_rates_are_the_documented_figures() {
         let plan = RecordingPlan::mix_only();
         // 3600 * 48000 * 2ch * 2 bytes.
-        assert_eq!(plan.mix_bytes_per_hour(), 691_200_000);
-        assert_eq!(plan.stem_bytes_per_hour(), 345_600_000);
+        // Stereo FLAC at the planning ratio: 691.2 MB of PCM per hour, of
+        // which 60 percent is the estimate, and a stem costs the same as the
+        // mix because both are stereo.
+        assert_eq!(plan.mix_bytes_per_hour(), 414_720_000);
+        assert_eq!(plan.stem_bytes_per_hour(), 414_720_000);
         let hi = RecordingPlan::mix_only().bit_depth(BitDepth::TwentyFour);
-        assert_eq!(hi.mix_bytes_per_hour(), 1_036_800_000);
-        assert_eq!(hi.stem_bytes_per_hour(), 518_400_000);
+        assert_eq!(hi.mix_bytes_per_hour(), 622_080_000);
+        assert_eq!(hi.stem_bytes_per_hour(), 622_080_000);
     }
 
     #[test]
-    fn a_two_hour_stereo_mix_is_about_one_point_four_gigabytes() {
-        // 7200 s * 48 kHz * 2 ch * 2 B + 44 B header. The product brief's
-        // "about 1.3 GB" is this number in GiB.
+    fn a_two_hour_stereo_mix_is_about_eight_hundred_megabytes() {
+        // 7200 s * 48 kHz * 2 ch * 2 B is 1.3824 GB of PCM; 60 percent of it
+        // is the FLAC estimate. A stem is stereo too, so it costs the same.
         let plan = RecordingPlan::mix_only();
-        assert_eq!(plan.mix_bytes(TWO_HOURS_SECS), 1_382_400_044);
-        assert_eq!(gb_display(plan.mix_bytes(TWO_HOURS_SECS)), "1.38 GB");
-        assert_eq!(plan.stem_bytes(TWO_HOURS_SECS), 691_200_044);
-        assert_eq!(plan.total_bytes(TWO_HOURS_SECS), 1_382_400_044);
+        assert_eq!(plan.mix_bytes(TWO_HOURS_SECS), 829_440_000);
+        assert_eq!(gb_display(plan.mix_bytes(TWO_HOURS_SECS)), "0.83 GB");
+        assert_eq!(plan.stem_bytes(TWO_HOURS_SECS), 829_440_000);
+        assert_eq!(plan.total_bytes(TWO_HOURS_SECS), 829_440_000);
         assert_eq!(plan.object_count(), 1);
     }
 
     #[test]
     fn stems_multiply_the_total() {
         let plan = RecordingPlan::with_stems(4);
-        // mix + 4 * stem.
-        assert_eq!(
-            plan.total_bytes(TWO_HOURS_SECS),
-            1_382_400_044 + 4 * 691_200_044
-        );
-        assert_eq!(plan.total_bytes(TWO_HOURS_SECS), 4_147_200_220);
+        // mix + 4 * stem, every one of them stereo.
+        assert_eq!(plan.total_bytes(TWO_HOURS_SECS), 5 * 829_440_000);
+        assert_eq!(plan.total_bytes(TWO_HOURS_SECS), 4_147_200_000);
         assert_eq!(gb_display(plan.total_bytes(TWO_HOURS_SECS)), "4.15 GB");
         assert_eq!(plan.object_count(), 5);
         // The largest single object is still the mix, which is what bounds
         // the WAV container.
-        assert_eq!(plan.largest_object_bytes(TWO_HOURS_SECS), 1_382_400_044);
-    }
-
-    #[test]
-    fn wav_size_warning_fires_only_past_four_gibibytes() {
-        let plan = RecordingPlan::mix_only();
-        assert!(plan.wav_size_warning(TWO_HOURS_SECS).is_none());
-        // 16-bit stereo hits 4 GiB after ~6.2 hours.
-        assert!(plan.wav_size_warning(6 * 3600).is_none());
-        let warning = plan.wav_size_warning(7 * 3600).expect("7 h must warn");
-        assert!(warning.contains("4 GiB"), "{warning}");
-        assert!(warning.contains("RF64"), "{warning}");
-        // 24-bit runs out sooner.
-        let hi = RecordingPlan::mix_only().bit_depth(BitDepth::TwentyFour);
-        assert!(hi.wav_size_warning(5 * 3600).is_some());
+        assert_eq!(plan.largest_object_bytes(TWO_HOURS_SECS), 829_440_000);
     }
 
     // ---- Price table ----
@@ -654,9 +639,9 @@ mod tests {
 
     #[test]
     fn aws_two_hours_mix_only_thirty_days() {
-        // bytes   = 1_382_400_044
-        // storage = 1_382_400_044 * 23_000 * 30 / (1e9 * 30) = 31_795.20 -> 31_795
-        // egress  = 1_382_400_044 * 90_000 / 1e9            = 124_416.00 -> 124_416
+        // bytes   = 829_440_000
+        // storage = 829_440_000 * 23_000 * 30 / (1e9 * 30) = 19_077.12 -> 19_077
+        // egress  = 829_440_000 * 90_000 / 1e9            = 74_649.60 -> 74_650
         let est = RecordingEstimate::compute(
             ProviderKind::Aws,
             &RegionId::new("us-east-1"),
@@ -664,19 +649,19 @@ mod tests {
             2.0,
         )
         .unwrap();
-        assert_eq!(est.total_bytes, 1_382_400_044);
-        assert_eq!(est.billable_storage_bytes, 1_382_400_044);
-        assert_eq!(est.storage_microusd, 31_795);
-        assert_eq!(est.download_egress_microusd, 124_416);
-        assert_eq!(est.total_microusd, 156_211);
+        assert_eq!(est.total_bytes, 829_440_000);
+        assert_eq!(est.billable_storage_bytes, 829_440_000);
+        assert_eq!(est.storage_microusd, 19_077);
+        assert_eq!(est.download_egress_microusd, 74_650);
+        assert_eq!(est.total_microusd, 93_727);
         assert_eq!(est.object_count, 1);
     }
 
     #[test]
     fn aws_two_hours_with_four_stems_thirty_days() {
-        // bytes   = 4_147_200_220
-        // storage = 4_147_200_220 * 23_000 / 1e9 = 95_385.61 -> 95_386
-        // egress  = 4_147_200_220 * 90_000 / 1e9 = 373_248.02 -> 373_248
+        // bytes   = 5 * 829_440_000 = 4_147_200_000
+        // storage = 4_147_200_000 * 23_000 / 1e9 = 95_385.6 -> 95_386
+        // egress  = 4_147_200_000 * 90_000 / 1e9 = 373_248
         let est = RecordingEstimate::compute(
             ProviderKind::Aws,
             &RegionId::new("us-east-1"),
@@ -684,9 +669,9 @@ mod tests {
             2.0,
         )
         .unwrap();
-        assert_eq!(est.total_bytes, 4_147_200_220);
-        assert_eq!(est.mix_bytes, 1_382_400_044);
-        assert_eq!(est.stem_bytes, 2_764_800_176);
+        assert_eq!(est.total_bytes, 4_147_200_000);
+        assert_eq!(est.mix_bytes, 829_440_000);
+        assert_eq!(est.stem_bytes, 3_317_760_000);
         assert_eq!(est.storage_microusd, 95_386);
         assert_eq!(est.download_egress_microusd, 373_248);
         assert_eq!(est.total_microusd, 468_634);
@@ -696,8 +681,8 @@ mod tests {
     #[test]
     fn gcp_two_hours_with_and_without_stems() {
         // us-central1: storage 20_000/GB-month, egress 120_000/GB.
-        // mix only: storage 1_382_400_044*20_000/1e9 = 27_648.00 -> 27_648
-        //           egress  1_382_400_044*120_000/1e9 = 165_888.01 -> 165_888
+        // mix only: storage 829_440_000*20_000/1e9 = 16_588.80 -> 16_589
+        //           egress  829_440_000*120_000/1e9 = 99_532.80 -> 99_533
         let mix = RecordingEstimate::compute(
             ProviderKind::Gcp,
             &RegionId::new("us-central1"),
@@ -705,12 +690,12 @@ mod tests {
             2.0,
         )
         .unwrap();
-        assert_eq!(mix.storage_microusd, 27_648);
-        assert_eq!(mix.download_egress_microusd, 165_888);
-        assert_eq!(mix.total_microusd, 193_536);
+        assert_eq!(mix.storage_microusd, 16_589);
+        assert_eq!(mix.download_egress_microusd, 99_533);
+        assert_eq!(mix.total_microusd, 116_122);
 
-        // stems: storage 4_147_200_220*20_000/1e9 = 82_944.00 -> 82_944
-        //        egress  4_147_200_220*120_000/1e9 = 497_664.03 -> 497_664
+        // stems: storage 4_147_200_000*20_000/1e9 = 82_944
+        //        egress  4_147_200_000*120_000/1e9 = 497_664
         let stems = RecordingEstimate::compute(
             ProviderKind::Gcp,
             &RegionId::new("us-central1"),
@@ -736,8 +721,8 @@ mod tests {
         .unwrap();
         assert_eq!(mix.billable_storage_bytes, 0);
         assert_eq!(mix.storage_microusd, 0);
-        assert_eq!(mix.download_egress_microusd, 13_824);
-        assert_eq!(mix.total_microusd, 13_824);
+        assert_eq!(mix.download_egress_microusd, 8_294);
+        assert_eq!(mix.total_microusd, 8_294);
         assert!(
             mix.notes.iter().any(|n| n.contains("already includes")),
             "the free-allowance reason must be stated: {:?}",
@@ -778,20 +763,20 @@ mod tests {
                 2.0,
             );
             // The download price cannot depend on how long we keep it.
-            assert_eq!(est.download_egress_microusd, 124_416, "{retention}");
+            assert_eq!(est.download_egress_microusd, 74_650, "{retention}");
             totals.push((retention, est.storage_microusd));
         }
-        // 7d:  1_382_400_044 * 23_000 * 7  / 30e9 = 7_418.88  -> 7_419
-        // 30d: ... * 30 / 30e9                    = 31_795.20 -> 31_795
-        // 90d: ... * 90 / 30e9                    = 95_385.60 -> 95_386
+        // 7d:  829_440_000 * 23_000 * 7  / 30e9 = 4_451.33  -> 4_451
+        // 30d: ... * 30 / 30e9                   = 19_077.12 -> 19_077
+        // 90d: ... * 90 / 30e9                   = 57_231.36 -> 57_231
         // forever: quoted as one month, and flagged recurring.
         assert_eq!(
             totals,
             vec![
-                (Retention::Days7, 7_419),
-                (Retention::Days30, 31_795),
-                (Retention::Days90, 95_386),
-                (Retention::KeepForever, 31_795),
+                (Retention::Days7, 4_451),
+                (Retention::Days30, 19_077),
+                (Retention::Days90, 57_231),
+                (Retention::KeepForever, 19_077),
             ]
         );
     }
@@ -819,8 +804,8 @@ mod tests {
             &RecordingPlan::mix_only().bit_depth(BitDepth::TwentyFour),
             2.0,
         );
-        assert_eq!(twenty_four.total_bytes, 2_073_600_044);
-        // 1.5x the samples, so 1.5x the bill to within the header.
+        assert_eq!(twenty_four.total_bytes, 1_244_160_000);
+        // 1.5x the samples, so 1.5x the bill.
         assert!(twenty_four.total_microusd > sixteen.total_microusd * 149 / 100);
         assert!(twenty_four.total_microusd < sixteen.total_microusd * 151 / 100);
     }
@@ -828,8 +813,8 @@ mod tests {
     #[test]
     fn zero_and_fractional_lengths_behave() {
         let empty = RecordingEstimate::with_price(aws(), &RecordingPlan::mix_only(), 0.0);
-        // Only the WAV header exists, which rounds to nothing billable.
-        assert_eq!(empty.total_bytes, WAV_HEADER_BYTES);
+        // A take of no length is no bytes at all.
+        assert_eq!(empty.total_bytes, 0);
         assert_eq!(empty.storage_microusd, 0);
         assert_eq!(empty.total_microusd, 0);
 
@@ -839,7 +824,7 @@ mod tests {
 
         // Half an hour is exactly a quarter of the two-hour mix.
         let half = RecordingEstimate::with_price(aws(), &RecordingPlan::mix_only(), 0.5);
-        assert_eq!(half.total_bytes, 1800 * 48_000 * 2 * 2 + 44);
+        assert_eq!(half.total_bytes, 1800 * 48_000 * 2 * 2 * 60 / 100);
     }
 
     #[test]

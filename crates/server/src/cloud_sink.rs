@@ -72,6 +72,13 @@ impl CloudSink {
 }
 
 impl RecordingSink for CloudSink {
+    /// Finishing here waits on the bucket, so the room is told the take is
+    /// uploading rather than left watching a stopped session that is not
+    /// done yet.
+    fn uploads(&self) -> bool {
+        true
+    }
+
     fn open(&mut self, name: &str) -> io::Result<Box<dyn RecordingObject>> {
         // ObjectSink spawns its driver task, which needs the runtime
         // entered; the task then runs on the worker thread regardless of
