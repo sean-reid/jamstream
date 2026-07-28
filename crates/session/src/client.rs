@@ -968,13 +968,16 @@ impl ClientCore {
             ControlMsg::StreamStatus { destinations } => {
                 self.events.push(ClientEvent::StreamStatus(destinations));
             }
+            // Dropped until the recording surfaces land; nothing sends it yet.
+            ControlMsg::RecordStatus { .. } => {}
             // The server never sends these; ignore.
             ControlMsg::MixerSet { .. }
             | ControlMsg::ClickEnable { .. }
             | ControlMsg::BroadcastAudition { .. }
             | ControlMsg::Revoke { .. }
             | ControlMsg::SetAvatar { .. }
-            | ControlMsg::StreamCtl { .. } => {}
+            | ControlMsg::StreamCtl { .. }
+            | ControlMsg::RecordCtl { .. } => {}
         }
     }
 
