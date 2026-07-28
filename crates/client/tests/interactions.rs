@@ -447,7 +447,8 @@ fn each_settings_tab_shows_its_own_panel_and_the_choice_sticks() {
 
 /// The tab row is built from what exists. A plain join has no invite book and
 /// no destinations panel, so it has no Broadcast or Invites tab, and no dead
-/// slot where they would have been.
+/// slot where they would have been. Audio, Recording and You are settings for
+/// this computer, so they are there whatever the window is showing.
 #[test]
 fn a_musician_and_the_home_screen_get_only_the_tabs_that_mean_anything() {
     use jamstream_client::app::{JamApp, Screen};
@@ -491,8 +492,14 @@ fn a_musician_and_the_home_screen_get_only_the_tabs_that_mean_anything() {
             .is_none(),
         "a musician has no seats to hand out"
     );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Recording")
+            .is_some(),
+        "where takes go is a setting for this computer, not for this session"
+    );
 
-    // And outside a session entirely, from home, the same two.
+    // And outside a session entirely, from home, the machine-local three.
     let mut app = JamApp::in_memory();
     app.recent = Vec::new();
     app.settings_open = true;
@@ -515,6 +522,65 @@ fn a_musician_and_the_home_screen_get_only_the_tabs_that_mean_anything() {
             .is_none(),
         "there is no session to broadcast from the home screen"
     );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Recording")
+            .is_some(),
+        "a bucket is set up before the session that needs it, so the tab is here too"
+    );
+}
+
+/// The Recording tab, driven the way a host does: open it, paste a pair, and
+/// press Check with no bucket named. The refusal is on screen, nothing was
+/// spawned, and neither half of the pair is readable anywhere.
+#[test]
+fn the_recording_tab_refuses_a_check_with_no_bucket_and_never_shows_the_key() {
+    use jamstream_client::app::JamApp;
+    use jamstream_client::screens::session::SettingsTab;
+
+    const ID: &str = "DO00FAKEFAKEFAKEFAKE";
+    const SECRET: &str = "0000000000000000000000000000000000000000fake";
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.settings_open = true;
+    app.settings_tab = SettingsTab::Recording;
+    app.recording.type_key(ID, SECRET);
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(3);
+    assert!(
+        harness.query_by_label_contains("bucket region").is_some(),
+        "the tab must be showing"
+    );
+    harness
+        .get_by_role_and_label(AkRole::Button, "Check")
+        .click();
+    harness.run_steps(3);
+    assert!(
+        harness
+            .query_all_by_label_contains("name the bucket")
+            .count()
+            > 0,
+        "a check with no bucket must say so rather than reaching the network"
+    );
+    for secret in [ID, SECRET] {
+        assert_eq!(
+            harness
+                .query_all_by(move |node| {
+                    node.label().is_some_and(|l| l.contains(secret))
+                        || node.value().is_some_and(|v| v.contains(secret))
+                })
+                .count(),
+            0,
+            "the storage key is readable on screen"
+        );
+    }
 }
 
 /// Escape closes the drawer before the session screen sees the key, so the

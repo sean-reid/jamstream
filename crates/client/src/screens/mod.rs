@@ -4,4 +4,5 @@ pub mod home;
 pub mod host;
 pub mod invites;
 pub mod record;
+pub mod recording;
 pub mod session;

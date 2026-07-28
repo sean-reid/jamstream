@@ -32,6 +32,7 @@ use jamstream_session::{
 
 use crate::creds::{self, CredStore, EnvReader};
 use crate::exec::{Executor, Job};
+use crate::screens::recording::{RecordingChoice, RecordingSetup};
 use crate::theme;
 use crate::widgets::{PICK_INDENT, pick_row, row_cell};
 
@@ -230,6 +231,14 @@ pub struct HostWizard {
     pub artifact_url: String,
     pub artifact_sha256: String,
     pub launch_error: Option<String>,
+    /// What this session records. Off unless the host says otherwise, every
+    /// time: nothing is captured by surprise and an unused recorder costs
+    /// nothing.
+    pub recording: RecordingChoice,
+    /// What this computer can record to, refreshed by the app from the
+    /// Recording tab each frame. Default is nothing configured, which is what a
+    /// wizard nobody has handed one to must assume.
+    pub recording_setup: RecordingSetup,
     check_job: Option<Job<Result<(), String>>>,
     regions_job: Option<Job<Result<RegionSurvey, String>>>,
     launch_job: Option<Job<Result<LaunchOutcome, String>>>,
@@ -268,6 +277,8 @@ impl HostWizard {
             artifact_url: String::new(),
             artifact_sha256: String::new(),
             launch_error: None,
+            recording: RecordingChoice::Off,
+            recording_setup: RecordingSetup::default(),
             check_job: None,
             regions_job: None,
             launch_job: None,
@@ -290,6 +301,76 @@ impl HostWizard {
 
     pub fn is_local(&self) -> bool {
         self.selected_provider_name() == Some("local")
+    }
+
+    /// The selected provider as the cloud crate names it, for the storage
+    /// lookups that are keyed by provider.
+    pub fn selected_provider_kind(&self) -> Option<ProviderKind> {
+        match self.selected_provider_name()? {
+            "local" => Some(ProviderKind::Local),
+            "digitalocean" => Some(ProviderKind::DigitalOcean),
+            "aws" => Some(ProviderKind::Aws),
+            "gcp" => Some(ProviderKind::Gcp),
+            _ => None,
+        }
+    }
+
+    /// Why this session cannot record, if it cannot. A local session records to
+    /// this computer's disk and needs no credential, so it never refuses; a
+    /// cloud session needs a bucket and a key, and the reason names which is
+    /// missing and where to fix it.
+    pub fn recording_refusal(&self) -> Option<String> {
+        if self.is_local() {
+            return None;
+        }
+        self.recording_setup.refusal()
+    }
+
+    pub fn can_record(&self) -> bool {
+        self.recording_refusal().is_none()
+    }
+
+    /// Turns recording on or off for this launch. Refused while the session
+    /// cannot record at all, so the control and the state cannot disagree.
+    pub fn set_recording(&mut self, choice: RecordingChoice) -> bool {
+        if choice.is_on() && !self.can_record() {
+            return false;
+        }
+        self.recording = choice;
+        true
+    }
+
+    /// Takes what this computer can record to, from the Recording tab.
+    ///
+    /// A take that was armed and then lost its bucket or its key goes back to
+    /// off here, rather than leaving a lit control over a refusal: a host who
+    /// deletes the key they armed with must see recording off, not find out at
+    /// the launch.
+    pub fn set_recording_setup(&mut self, setup: RecordingSetup) {
+        self.recording_setup = setup;
+        if self.recording.is_on() && !self.can_record() {
+            self.recording = RecordingChoice::Off;
+        }
+    }
+
+    /// The recording plan the cost preview prices: one stereo stem per musician
+    /// when stems are on, and the retention this computer defaults to.
+    fn recording_plan(&self) -> Option<jamstream_cloud::RecordingPlan> {
+        if !self.recording.is_on() {
+            return None;
+        }
+        let stems = if self.recording.stems() {
+            self.musicians
+        } else {
+            0
+        };
+        Some(
+            jamstream_cloud::RecordingPlan {
+                stems,
+                ..jamstream_cloud::RecordingPlan::default()
+            }
+            .retention(self.recording_setup.retention),
+        )
     }
 
     /// True while any background job is in flight; the app keeps repainting.
@@ -514,15 +595,38 @@ impl HostWizard {
         }
     }
 
+    /// The session's cost, with the recording folded in when the host has turned
+    /// it on. Turning stems on is roughly five times the bytes, and this is
+    /// where that shows up: the preview is recomputed from the choice every
+    /// frame, so the figure moves as the choice does.
     pub fn preview(&self) -> Option<CostPreview> {
         let row = self.selected_region.and_then(|i| self.regions.get(i))?;
-        Some(CostPreview::compute(
+        let preview = CostPreview::compute(
             &row.price,
             self.hours,
             self.musicians,
             self.destinations,
             self.listeners,
-        ))
+        );
+        Some(match self.recording_estimate() {
+            Some(recording) => preview.with_recording(&recording),
+            None => preview,
+        })
+    }
+
+    /// What the take itself costs: storage for the retention period, and the one
+    /// download. Priced in the bucket's own region, which is the region the key
+    /// was checked against.
+    pub fn recording_estimate(&self) -> Option<jamstream_cloud::RecordingEstimate> {
+        let plan = self.recording_plan()?;
+        let bucket = self.recording_setup.bucket.as_ref()?;
+        jamstream_cloud::RecordingEstimate::compute(
+            self.selected_provider_kind()?,
+            &RegionId::new(&bucket.region),
+            &plan,
+            self.hours,
+        )
+        .ok()
     }
 
     /// Launch preconditions: a region, and for clouds a verified artifact
@@ -550,8 +654,19 @@ impl HostWizard {
         let Some(row) = self.selected_region.and_then(|i| self.regions.get(i)) else {
             return false;
         };
-        let provider = match creds::build_provider(&name, self.creds.as_ref(), &self.env) {
+        let provider = match self.launch_provider(&name) {
             Ok(p) => p,
+            Err(err) => {
+                self.launch_error = Some(err);
+                self.step = WizardStep::Launching;
+                return true;
+            }
+        };
+        // A cloud take goes to the bucket this computer has a checked key for.
+        // Built before anything is launched, so a key that vanished from the
+        // keychain since the preview costs no machine.
+        let recording = match self.storage_for_launch() {
+            Ok(storage) => storage,
             Err(err) => {
                 self.launch_error = Some(err);
                 self.step = WizardStep::Launching;
@@ -591,6 +706,7 @@ impl HostWizard {
                 creds::DO_TOKEN,
                 "DIGITALOCEAN_TOKEN",
             ),
+            recording,
         };
         *self.launch_phase.lock().expect("launch phase") = LaunchPhase::Launching;
         self.launch_error = None;
@@ -598,6 +714,47 @@ impl HostWizard {
         let phase = Arc::clone(&self.launch_phase);
         self.launch_job = Some(self.exec.run(launch_session(provider, params, phase)));
         true
+    }
+
+    /// The provider this launch runs on. A local session that records gets one
+    /// armed with the record directory, because a local take goes through the
+    /// spawned server's own flags rather than the boot config, exactly as
+    /// `jamstream host --record --provider local` arms it.
+    fn launch_provider(&self, name: &str) -> Result<Box<dyn Provider>, String> {
+        if name == "local" && self.recording.is_on() {
+            return jamstream_cli::providers::resolve_local_recording(self.recording.stems())
+                .map_err(|e| e.to_string());
+        }
+        creds::build_provider(name, self.creds.as_ref(), &self.env)
+    }
+
+    /// The bucket config a cloud launch carries, or None when this session
+    /// records nothing or records to this computer's disk.
+    fn storage_for_launch(&self) -> Result<Option<jamstream_cloud::RecordingStorage>, String> {
+        if !self.recording.is_on() || self.is_local() {
+            return Ok(None);
+        }
+        let kind = self
+            .selected_provider_kind()
+            .ok_or("this provider has no recording storage")?;
+        let bucket = self
+            .recording_setup
+            .bucket
+            .as_ref()
+            .ok_or_else(|| self.recording_setup.refusal().unwrap_or_default())?;
+        jamstream_cli::storage::storage_for_launch(
+            kind,
+            &bucket.name,
+            &RegionId::new(&bucket.region),
+            self.recording_setup.retention,
+            || {
+                creds::storage_credential(self.creds.as_ref(), &self.env, kind)
+                    .map_err(jamstream_cli::CliError::Usage)
+            },
+            self.recording.stems(),
+        )
+        .map(Some)
+        .map_err(|e| e.to_string())
     }
 
     /// One step back; Launching only goes back after a failure.
@@ -798,6 +955,9 @@ struct LaunchParams {
     /// For the DigitalOcean self-destruct arm; read from the credential
     /// store or environment before the job leaves the UI thread.
     do_token: Option<String>,
+    /// The bucket a cloud take goes to, absent when the host left recording off
+    /// and when the session runs on this computer.
+    recording: Option<jamstream_cloud::RecordingStorage>,
 }
 
 /// The launch itself, mirroring `jamstream host`: boot config, flat config
@@ -851,9 +1011,19 @@ async fn launch_session(
         idle_shutdown_min: params.idle_min,
         max_duration_min: params.max_hours * 60,
         self_destruct: self_destruct_for(provider.kind(), params.do_token)?,
-        // Recording is off until the host configures a storage key.
-        recording: None,
+        // A local session records through the provider's own spawn flags, so
+        // this carries a bucket and nothing else, exactly as the CLI's does.
+        recording: params.recording.clone(),
     };
+    // Proved before the machine exists, through the same call `jamstream host
+    // --bucket` makes: the key writes and deletes a probe object under this
+    // session's prefix, and the retention rule is in place before the first
+    // byte is uploaded.
+    if let Some(storage) = &params.recording {
+        jamstream_cli::host::verify_bucket(storage, &session_hex)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let user_data = if is_local {
         boot.render_flat_config()
     } else {
@@ -909,6 +1079,15 @@ async fn launch_session(
         ended_unix: None,
     };
     let state_path = jamstream_cli::state::save(&state).map_err(|e| e.to_string())?;
+    // Written beside the session record, because `jamstream recordings` has no
+    // other way to find the bucket once the VM that wrote to it is gone.
+    if let Some(storage) = &params.recording {
+        jamstream_cli::state::save_recording(
+            &state.session_id_hex,
+            &jamstream_cli::host::recording_record(storage),
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(LaunchOutcome { state, state_path })
 }
 
@@ -1552,6 +1731,8 @@ impl HostWizard {
             ),
         ));
         ui.add_space(theme::SPACE_MD);
+        self.recording_ui(ui);
+        ui.add_space(theme::SPACE_MD);
         if self.is_local() {
             ui.label("This session runs on this computer and costs nothing.");
             ui.label(theme::muted(
@@ -1660,6 +1841,80 @@ impl HostWizard {
         });
     }
 
+    /// The recording choice for this launch: off, the mix, or the mix and
+    /// stems. Fixed for the session once it starts, which is why it is here and
+    /// not in the session's own Record sheet.
+    ///
+    /// Off is the top row and the state this arrives in. A session that cannot
+    /// record shows the other two disabled with the reason under them, rather
+    /// than a control that looks live and does nothing.
+    fn recording_ui(&mut self, ui: &mut Ui) {
+        ui.label(theme::title(ui, "Recording"));
+        let refusal = self.recording_refusal();
+        let enabled = refusal.is_none();
+        let mut pick = None;
+        for choice in RecordingChoice::ALL {
+            let size = match choice {
+                RecordingChoice::Off => String::new(),
+                RecordingChoice::MixOnly => size_hint(self.hours, 0),
+                RecordingChoice::MixAndStems => size_hint(self.hours, self.musicians),
+            };
+            let response = pick_row(
+                ui,
+                choice.label(),
+                self.recording == choice,
+                enabled || choice == RecordingChoice::Off,
+                |ui| {
+                    row_cell(ui, 150.0, |ui| {
+                        ui.label(choice.label());
+                    });
+                    row_cell(ui, 120.0, |ui| {
+                        ui.label(theme::mono_muted(ui, size.clone()));
+                    });
+                },
+            );
+            if response.clicked() {
+                pick = Some(choice);
+            }
+        }
+        if let Some(choice) = pick {
+            self.set_recording(choice);
+        }
+        match (&refusal, self.recording.is_on()) {
+            (Some(reason), _) => {
+                ui.label(theme::muted(ui, reason.clone()));
+            }
+            (None, true) if self.is_local() => {
+                let dir = jamstream_cli::state::recordings_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|_| "this computer's recordings folder".to_owned());
+                ui.add(egui::Label::new(theme::muted(ui, format!("Takes land in {dir}."))).wrap());
+            }
+            (None, true) => {
+                if let Some(bucket) = &self.recording_setup.bucket {
+                    ui.add(
+                        egui::Label::new(theme::muted(
+                            ui,
+                            format!(
+                                "Takes go to {} in {}, {}.",
+                                bucket.name,
+                                bucket.region,
+                                self.recording_setup.retention.label().to_lowercase()
+                            ),
+                        ))
+                        .wrap(),
+                    );
+                }
+            }
+            (None, false) => {
+                ui.label(theme::muted(
+                    ui,
+                    "Nothing is captured unless you turn this on.",
+                ));
+            }
+        }
+    }
+
     fn launching_ui(&mut self, ui: &mut Ui) {
         if let Some(err) = self.launch_error.clone() {
             let p = theme::palette_of(ui);
@@ -1715,6 +1970,19 @@ impl HostWizard {
             "You join automatically the moment the server answers.",
         ));
     }
+}
+
+/// How big a take of `hours` is with `stems` stems, from the same arithmetic
+/// that prices it, so the size beside a row and the money below it cannot
+/// disagree. Stems are stereo like the mix, which is why turning them on for a
+/// four piece is about five times the bytes.
+fn size_hint(hours: f32, stems: u8) -> String {
+    let plan = jamstream_cloud::RecordingPlan {
+        stems,
+        ..jamstream_cloud::RecordingPlan::default()
+    };
+    let bytes = plan.total_bytes((hours.max(0.0) * 3600.0).round() as u64);
+    format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
 }
 
 fn guidance(ui: &mut Ui, lines: &[&str]) {
@@ -2155,6 +2423,182 @@ mod tests {
         assert!(!w.begin_check());
         assert!(matches!(w.check_result, Some(Err(_))));
         assert!(!w.busy());
+    }
+
+    /// A cloud bucket this computer has a key for, as the app hands one over.
+    fn armed_setup() -> RecordingSetup {
+        RecordingSetup {
+            bucket: Some(crate::prefs::Bucket {
+                name: "my-jams".to_owned(),
+                region: "nyc3".to_owned(),
+            }),
+            has_key: true,
+            retention: jamstream_cloud::Retention::Days30,
+        }
+    }
+
+    /// A wizard on the preview step for a DigitalOcean session.
+    fn cloud_preview() -> HostWizard {
+        let mut w = wizard();
+        w.providers[1].status = ProviderStatus::Ready;
+        w.select_provider(1);
+        w.continue_to_region(vec![region_row("nyc3", 26_790, 21.0)]);
+        w.continue_to_preview();
+        w
+    }
+
+    /// Recording is off in a fresh wizard and stays off unless a host says
+    /// otherwise. Nothing is captured by surprise, and an unused recorder costs
+    /// nothing, so the default is the whole feature's safety property.
+    #[test]
+    fn recording_is_off_by_default_and_a_session_with_no_key_cannot_turn_it_on() {
+        let mut w = cloud_preview();
+        assert_eq!(w.recording, RecordingChoice::Off);
+        assert!(!w.can_record());
+        let refusal = w.recording_refusal().expect("no bucket, no key");
+        assert!(refusal.contains("Recording tab"), "{refusal}");
+        assert!(!w.set_recording(RecordingChoice::MixOnly));
+        assert_eq!(w.recording, RecordingChoice::Off);
+        // And nothing is armed, so the launch carries no bucket.
+        assert_eq!(w.storage_for_launch(), Ok(None));
+
+        w.recording_setup = armed_setup();
+        assert!(w.can_record());
+        assert!(w.set_recording(RecordingChoice::MixAndStems));
+        assert_eq!(w.recording, RecordingChoice::MixAndStems);
+    }
+
+    /// A local session records to this computer's disk, so it needs no bucket
+    /// and no key: the credential that a cloud take requires does not exist in
+    /// this path at all.
+    #[test]
+    fn a_local_session_can_record_with_no_credential_and_carries_no_bucket() {
+        let mut w = wizard();
+        w.select_provider(0);
+        w.advance_from_provider();
+        assert_eq!(w.recording_refusal(), None);
+        assert!(w.set_recording(RecordingChoice::MixAndStems));
+        // Local recording goes through the spawned server's flags, not the boot
+        // config, so no storage config is built for it.
+        assert_eq!(w.storage_for_launch(), Ok(None));
+        // And the provider it launches is the one with the record directory
+        // armed, which is what makes the take happen at all.
+        assert!(w.launch_provider("local").is_ok());
+    }
+
+    /// The launch config a cloud take carries: the bucket from the Recording
+    /// tab, the key from the keychain, and the stems choice from this screen.
+    #[test]
+    fn arming_a_cloud_launch_carries_the_bucket_the_key_and_the_stems_choice() {
+        let store = Arc::new(MemStore::default());
+        let mut w = HostWizard::new(store.clone(), no_env(), test_exec());
+        w.providers[1].status = ProviderStatus::Ready;
+        w.select_provider(1);
+        w.recording_setup = armed_setup();
+        w.recording = RecordingChoice::MixAndStems;
+        // A bucket with no key in the keychain must not launch: the VM would
+        // come up with nothing to sign uploads with.
+        let err = w.storage_for_launch().expect_err("no key is saved");
+        assert!(err.contains("SPACES_ACCESS_KEY_ID"), "{err}");
+
+        creds::save_storage_credential(
+            store.as_ref(),
+            ProviderKind::DigitalOcean,
+            "DO00ID",
+            "0000-fake-secret",
+        )
+        .expect("save");
+        let storage = w
+            .storage_for_launch()
+            .expect("a checked key arms the launch")
+            .expect("a bucket");
+        assert_eq!(storage.bucket, "my-jams");
+        assert_eq!(storage.region, "nyc3");
+        assert_eq!(storage.provider, ProviderKind::DigitalOcean);
+        assert!(storage.stems);
+        assert_eq!(storage.retention, jamstream_cloud::Retention::Days30);
+        // The key is in the config and out of its Debug, which is where a
+        // launch failure would print one.
+        let debug = format!("{storage:?}");
+        assert!(!debug.contains("0000-fake-secret"), "{debug}");
+    }
+
+    /// The 5x that has to be visible at the moment of the decision: stems for a
+    /// four piece are about five times the mix, and the preview moves when the
+    /// choice does rather than at launch.
+    #[test]
+    fn the_cost_preview_moves_when_the_recording_choice_changes() {
+        let mut w = cloud_preview();
+        w.recording_setup = armed_setup();
+        w.musicians = 4;
+        let session_only = w.preview().expect("a preview").total_microusd;
+        let rows_without = w.preview().expect("a preview").line_items.len();
+
+        assert!(w.set_recording(RecordingChoice::MixOnly));
+        let mix = w.preview().expect("a preview");
+        assert!(
+            mix.total_microusd > session_only,
+            "recording must show up in the total"
+        );
+        assert_eq!(
+            mix.line_items.len(),
+            rows_without + 2,
+            "the storage line and the download line both belong on screen"
+        );
+        let mix_bytes = w.recording_estimate().expect("an estimate").total_bytes;
+
+        assert!(w.set_recording(RecordingChoice::MixAndStems));
+        let stems = w.preview().expect("a preview");
+        assert!(
+            stems.total_microusd > mix.total_microusd,
+            "stems cost more than the mix alone: {} vs {}",
+            stems.total_microusd,
+            mix.total_microusd
+        );
+        let stems_bytes = w.recording_estimate().expect("an estimate").total_bytes;
+        // Four stereo stems beside a stereo mix: five times the bytes, which is
+        // the figure the design says has to be visible here.
+        assert_eq!(stems_bytes, mix_bytes * 5);
+        // And the size beside the row says the same thing as the estimate.
+        assert_eq!(
+            size_hint(w.hours, w.musicians),
+            format!("{:.1} GB", stems_bytes as f64 / 1_000_000_000.0)
+        );
+
+        // Off again and the recording lines go with it.
+        assert!(w.set_recording(RecordingChoice::Off));
+        assert_eq!(w.preview().expect("a preview").total_microusd, session_only);
+        assert!(w.recording_estimate().is_none());
+    }
+
+    /// A bucket in a region the provider has no bucket service in is refused
+    /// before a machine is paid for, with the region named.
+    #[test]
+    fn a_bucket_in_a_region_with_no_storage_service_refuses_the_launch() {
+        let store = Arc::new(MemStore::default());
+        let mut w = HostWizard::new(store.clone(), no_env(), test_exec());
+        w.providers[1].status = ProviderStatus::Ready;
+        w.select_provider(1);
+        w.recording_setup = RecordingSetup {
+            bucket: Some(crate::prefs::Bucket {
+                name: "my-jams".to_owned(),
+                region: "atl1".to_owned(),
+            }),
+            has_key: true,
+            retention: jamstream_cloud::Retention::Days30,
+        };
+        w.recording = RecordingChoice::MixOnly;
+        creds::save_storage_credential(
+            store.as_ref(),
+            ProviderKind::DigitalOcean,
+            "DO00ID",
+            "0000-fake-secret",
+        )
+        .expect("save");
+        let err = w
+            .storage_for_launch()
+            .expect_err("Spaces is not in every region");
+        assert!(err.contains("atl1"), "{err}");
     }
 
     #[test]
