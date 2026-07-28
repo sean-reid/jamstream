@@ -94,6 +94,16 @@ fn data() -> &'static AwsData {
     })
 }
 
+/// Gzips the rendered cloud-init so it fits RunInstances' 16384-byte user
+/// data cap; see the call site.
+fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    enc.write_all(bytes)
+        .and_then(|()| enc.finish())
+        .map_err(|e| ProviderError::Other(format!("gzip user data: {e}")))
+}
+
 /// Maps the provider-agnostic size hint to a concrete Graviton type.
 fn instance_type(class: InstanceClass) -> &'static str {
     match class {
@@ -615,9 +625,15 @@ impl Provider for AwsProvider {
                 "MetadataOptions.HttpPutResponseHopLimit".to_owned(),
                 "1".to_owned(),
             ),
+            // Gzipped, not for transfer size: RunInstances caps user data at
+            // 16384 bytes and the rendered cloud-init crossed it, which
+            // rejected every launch. cloud-init detects the compression from
+            // the magic bytes on the machine. The other providers take user
+            // data as a plain JSON string, so they could not carry gzip and
+            // do not need it: their caps are 64 KB and 256 KB.
             (
                 "UserData".to_owned(),
-                BASE64.encode(spec.user_data.as_bytes()),
+                BASE64.encode(&gzip(spec.user_data.as_bytes())?),
             ),
             (
                 "TagSpecification.1.ResourceType".to_owned(),

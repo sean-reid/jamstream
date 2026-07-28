@@ -2934,6 +2934,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "data-encoding",
+ "flate2",
  "proptest",
  "reqwest",
  "serde",

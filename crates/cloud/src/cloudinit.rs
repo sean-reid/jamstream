@@ -1012,6 +1012,35 @@ mod tests {
         assert!(out.contains("path: /etc/jamstream/recording"));
     }
 
+    /// The provider caps this document can never cross. EC2 refuses user
+    /// data past 16384 bytes, which rejected every AWS launch the day the
+    /// rendered cloud-init reached about 17 KB; the AWS provider now gzips
+    /// it, so what must fit is the compressed form, with headroom because
+    /// the failure mode is a launch error in a musician's face. Raw size is
+    /// held under DigitalOcean's 64 KB for the same reason.
+    #[test]
+    fn the_rendered_cloudinit_fits_every_providers_cap() {
+        use std::io::Write;
+        for sd in all_variants() {
+            let mut cfg = base_config(sd);
+            cfg.recording = Some(recording_storage());
+            let out = render(&cfg);
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            enc.write_all(out.as_bytes()).unwrap();
+            let gz = enc.finish().unwrap().len();
+            assert!(
+                gz < 12_288,
+                "gzipped cloud-init is {gz} bytes; EC2 refuses past 16384 and \
+                 this floor keeps a quarter of it in reserve"
+            );
+            assert!(
+                out.len() < 49_152,
+                "raw cloud-init is {} bytes; DigitalOcean refuses past 65536",
+                out.len()
+            );
+        }
+    }
+
     /// The storage key is a secret: it travels as a root-owned file the
     /// bootstrap chgrps to the service account, and it must never appear on
     /// argv, in a script body, or anywhere twice.

@@ -118,8 +118,11 @@ async fn run_instances_happy_path() {
         .and(body_string_contains(
             "MetadataOptions.HttpPutResponseHopLimit=1",
         ))
-        // base64("#cloud-config\n") with '=' percent-encoded.
-        .and(body_string_contains("UserData=I2Nsb3VkLWNvbmZpZwo%3D"))
+        // The user data itself is asserted after the launch, by decoding
+        // what was actually sent: it travels gzipped for the 16384-byte
+        // RunInstances cap, and a byte-pinned matcher would really be
+        // pinning flate2's output.
+        .and(body_string_contains("UserData="))
         .and(body_string_contains(
             "TagSpecification.1.ResourceType=instance",
         ))
@@ -151,6 +154,48 @@ async fn run_instances_happy_path() {
     assert_eq!(inst.region.id.as_str(), "us-east-1");
     assert_eq!(inst.public_ip, None);
     assert_eq!(inst.session_id(), Some("sess1"));
+
+    // What actually went over the wire round-trips back to the exact
+    // cloud-init: urldecode, base64-decode, gunzip. cloud-init does the
+    // same from the gzip magic bytes on the machine.
+    let sent = user_data_param(&server).await;
+    let compressed = data_encoding::BASE64.decode(sent.as_bytes()).unwrap();
+    assert_eq!(&compressed[..2], [0x1f, 0x8b], "not gzip: {compressed:?}");
+    let mut plain = String::new();
+    std::io::Read::read_to_string(
+        &mut flate2::read::GzDecoder::new(compressed.as_slice()),
+        &mut plain,
+    )
+    .unwrap();
+    assert_eq!(plain, "#cloud-config\n");
+}
+
+/// The percent-decoded UserData parameter of the one RunInstances request
+/// the mock server received.
+async fn user_data_param(server: &MockServer) -> String {
+    let requests = server.received_requests().await.unwrap();
+    let body = requests
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .find(|b| b.contains("Action=RunInstances"))
+        .expect("a RunInstances request was received");
+    let raw = body
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("UserData="))
+        .expect("RunInstances carries UserData");
+    // Percent-decode the form encoding ('+' for space never appears in
+    // base64, but '%2B' and '%3D' do).
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            out.push(u8::from_str_radix(&hex, 16).expect("valid escape") as char);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[tokio::test]
