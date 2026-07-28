@@ -56,16 +56,16 @@ jamstream-cli-linux-x86_64.tar.gz: OK
 
 ## Package managers
 
-None of these channels is live yet: the manifests are generated from each release's own checksums, but the Homebrew tap does not exist, the winget package has not been submitted, and the AUR packages have not been published, so none of the commands below works today. Use the platform downloads above until each one lands.
+Homebrew is live; winget and the AUR are not yet (the winget package has not been submitted and the AUR packages have not been published), so those two commands do not work today. Every manifest is generated from each release's own checksums either way.
 
-Homebrew, once the tap exists:
+Homebrew:
 
 ```console
 $ brew install --cask sean-reid/jamstream/jamstream
 $ brew install sean-reid/jamstream/jamstream-cli
 ```
 
-The first line installs the desktop app, the second the CLI. The formula also works with brew on Linux x86_64, from the same tarball this page links.
+The first line installs the desktop app, the second the CLI with shell completions set up for you. The [tap](https://github.com/sean-reid/homebrew-jamstream) is updated by the release pipeline, so `brew upgrade` tracks releases on its own. The formula also works with brew on Linux x86_64, from the same tarball this page links.
 
 winget, once the package is accepted into the community repository:
 
