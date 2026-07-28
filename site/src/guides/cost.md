@@ -35,6 +35,8 @@ Broadcasting is the exception: one Twitch or YouTube destination is about 1.2 GB
 Ephemeral cloud machines have one classic failure: you forget one and it bills for a month. JamStream treats that as a design problem:
 
 - **The self-destruct timers.** Every server shuts itself down after `--idle-min` minutes with no musicians (default 10) and destroys itself at the `--max-hours` hard cap (default 12) no matter what. The cap is enforced on the machine itself, not by your laptop, so it works even if your laptop is in a lake.
+
+  GCP is the exception, and it costs money if you walk away. There the idle window stops the server but cannot delete the machine, so an abandoned session keeps billing until the hard cap: roughly $0.39 on an e2-medium if everyone leaves at twenty minutes and nobody comes back. End the session when you are done, or run `jamstream sweep` afterwards, and you pay for the time you played. Shortening `--max-hours` bounds it too.
 - **The cost ticker.** While a session runs, cost so far sits in the app's status bar next to latency, and `jamstream status` prints accrued and projected cost per session. You always know the meter's reading; nothing accrues silently.
 - **The sweeper.** Every machine JamStream launches is tagged. `jamstream sweep` finds everything with the tag across all configured providers and destroys it; `--dry-run` lists without destroying. `jamstream host` also warns you at launch if tagged machines already exist. When in doubt, sweep.
 
