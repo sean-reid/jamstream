@@ -82,15 +82,22 @@ pub struct JamApp {
 }
 
 impl JamApp {
-    pub fn new() -> Self {
+    /// Builds the app around a credential store and an environment reader.
+    /// Both are parameters rather than defaults on purpose. [`KeyringStore`]
+    /// talks to the operating system's keychain, and the host wizard reads
+    /// it while it is being constructed to decide which providers are ready;
+    /// a test that got one by default would prompt the developer running it
+    /// for their real cloud tokens and stream keys, and could write to them.
+    /// Tests call [`JamApp::in_memory`]; production calls
+    /// [`JamApp::with_system_devices`], which is the only place in the crate
+    /// that names `KeyringStore`.
+    pub fn new(creds: Arc<dyn CredStore>, env: EnvReader) -> Self {
         let devices = DevicesScreen::default();
         let applied_audio = (
             devices.capture_idx,
             devices.playback_idx,
             devices.buffer_frames,
         );
-        let creds: Arc<dyn CredStore> = Arc::new(KeyringStore);
-        let env = creds::system_env();
         let exec = Arc::new(Executor::new());
         JamApp {
             theme: Theme::Dark,
@@ -117,11 +124,19 @@ impl JamApp {
         }
     }
 
-    /// The production entry point: like [`new`](Self::new) but with the
-    /// device pickers fed from the platform audio backend instead of the
-    /// demo catalog.
+    /// An app whose credentials and environment live in this process and
+    /// nowhere else. The constructor for tests and for any surface that
+    /// must not read what the developer has stored.
+    pub fn in_memory() -> Self {
+        let env: EnvReader = Arc::new(|_: &str| None);
+        Self::new(Arc::new(creds::MemStore::default()), env)
+    }
+
+    /// The production entry point: the real keychain and the real
+    /// environment, with the device pickers fed from the platform audio
+    /// backend instead of the demo catalog.
     pub fn with_system_devices() -> Self {
-        let mut app = Self::new();
+        let mut app = Self::new(Arc::new(KeyringStore), creds::system_env());
         match jamstream_audio_io::backend().devices() {
             Ok(devices) => app.catalog = DeviceCatalog::from_backend(&devices),
             Err(err) => {
@@ -135,12 +150,12 @@ impl JamApp {
         app
     }
 
-    /// `--demo`: straight into a live fake session as the host.
+    /// `--demo`: straight into a live fake session as the host. It reaches
+    /// no platform and provisions nothing, so it keeps everything in memory
+    /// rather than touching the real keychain.
     pub fn demo() -> Self {
-        let mut app = Self::new();
+        let mut app = Self::in_memory();
         app.runtime = Some(Box::new(DemoRuntime::host()));
-        // The demo reaches no platform, so its destinations sheet keeps keys
-        // in memory for the run instead of touching the real keychain.
         app.session.destinations =
             Some(DestinationsPanel::new(Arc::new(creds::MemStore::default())));
         app.screen = Screen::Session;
@@ -569,11 +584,9 @@ impl JamApp {
     }
 }
 
-impl Default for JamApp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// No Default impl on purpose: which credential store the app gets is a
+// choice, and `JamApp::default()` would be a silent way back to the real
+// keychain. Callers name `in_memory` or `with_system_devices`.
 
 impl eframe::App for JamApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {

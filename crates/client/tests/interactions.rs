@@ -849,7 +849,7 @@ fn settings_avatar_pick_and_remove_send_the_right_commands() {
         FROZEN_FRAME,
         false,
     )));
-    let mut app = JamApp::new();
+    let mut app = JamApp::in_memory();
     app.recent = Vec::new();
     app.runtime = Some(Box::new(rt.clone()));
     app.screen = Screen::Session;
@@ -916,7 +916,7 @@ fn settings_avatar_sends_the_fitted_photo_not_the_file() {
         FROZEN_FRAME,
         false,
     )));
-    let mut app = JamApp::new();
+    let mut app = JamApp::in_memory();
     app.recent = Vec::new();
     app.runtime = Some(Box::new(rt.clone()));
     app.screen = Screen::Session;
@@ -959,7 +959,7 @@ fn settings_avatar_reports_an_unreadable_file_inline() {
         FROZEN_FRAME,
         false,
     )));
-    let mut app = JamApp::new();
+    let mut app = JamApp::in_memory();
     app.recent = Vec::new();
     app.runtime = Some(Box::new(rt.clone()));
     app.screen = Screen::Session;
