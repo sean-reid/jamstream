@@ -98,10 +98,18 @@ pub fn rank(matrix: &ProbeMatrix, candidates: &[(Region, Price)]) -> Vec<RegionS
                 .iter()
                 .filter_map(|m| matrix.probes[m].get(&region.id).copied())
                 .collect();
-            let (worst, mean, coverage) = if eligible.is_empty() {
-                // No members at all: rank on price alone.
-                (0.0, 0.0, 1.0)
-            } else if rtts.is_empty() {
+            // Nobody has a probe for this region, either because nobody
+            // probed it or because nobody probed anything. Both are
+            // "unknown", and unknown is not zero: this branch used to
+            // return 0.0 with full coverage when the matrix was empty,
+            // which rendered as "0 ms" for every region, including
+            // sa-east-1 from North America, and sorted the regions we know
+            // least about to the top of the table. INFINITY keeps unknown
+            // out of the 5 ms bucket arithmetic entirely (see rtt_bucket)
+            // and sends it to the end of the order; price still decides
+            // among rows that are all unknown, which is the only signal
+            // left when no probe answered.
+            let (worst, mean, coverage) = if rtts.is_empty() {
                 (f32::INFINITY, f32::INFINITY, 0.0)
             } else {
                 let worst = rtts.iter().fold(0.0f32, |a, &b| a.max(b));
@@ -265,8 +273,11 @@ mod tests {
         assert_eq!(ranked[0].worst_rtt_ms, 200.0);
     }
 
+    /// Issue 115's first half. Every probe failing leaves an empty matrix,
+    /// and every region then read `0 ms` in the wizard and sorted as though
+    /// it were the fastest thing on the internet.
     #[test]
-    fn empty_matrix_ranks_by_price() {
+    fn empty_matrix_ranks_by_price_and_reports_nothing_measured() {
         let m = ProbeMatrix::new();
         let ranked = rank(
             &m,
@@ -276,6 +287,44 @@ mod tests {
             ],
         );
         assert_eq!(ranked[0].region.id.as_str(), "cheap");
+        for score in &ranked {
+            assert!(
+                !score.worst_rtt_ms.is_finite(),
+                "{} claims a {} ms measurement nobody took",
+                score.region.id,
+                score.worst_rtt_ms
+            );
+            assert_eq!(score.coverage, 0.0);
+        }
+    }
+
+    /// The ordering half: a region nobody could probe goes behind every
+    /// region somebody could, however slow that one was and however cheap
+    /// the unmeasured one is.
+    #[test]
+    fn an_unmeasured_region_sorts_behind_a_slow_measured_one() {
+        let mut m = ProbeMatrix::new();
+        m.insert(1, "slow".into(), 380.0);
+        let ranked = rank(
+            &m,
+            &[
+                (region("unmeasured"), price(1_000)),
+                (region("slow"), price(90_000)),
+            ],
+        );
+        assert_eq!(ranked[0].region.id.as_str(), "slow");
+        assert_eq!(ranked[0].worst_rtt_ms, 380.0);
+        assert_eq!(ranked[1].region.id.as_str(), "unmeasured");
+        assert!(!ranked[1].worst_rtt_ms.is_finite());
+    }
+
+    /// Unknown is its own bucket rather than a large number: no arithmetic
+    /// on it can land it next to a real measurement.
+    #[test]
+    fn unknown_has_its_own_bucket_at_the_end() {
+        assert_eq!(rtt_bucket(f32::INFINITY), u64::MAX);
+        assert!(rtt_bucket(100_000.0) < rtt_bucket(f32::INFINITY));
+        assert_eq!(rtt_bucket(0.0), 0);
     }
 
     proptest! {
