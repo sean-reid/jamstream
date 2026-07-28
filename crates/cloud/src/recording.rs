@@ -639,6 +639,7 @@ mod tests {
             assert_eq!(p.class, "S3 Standard");
             assert_eq!(p.included_egress_gb, 100);
         }
+        #[cfg(feature = "gcp")]
         for region in crate::providers::gcp::GcpProvider::with_access_token("p".into(), "t".into())
             .regions()
             .iter()
