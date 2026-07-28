@@ -15,6 +15,11 @@ ed25519-dalek.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+# Re-exports the avatar reassembly internals so the fuzz workspace can drive
+# them without a handshake. No shipped build enables it.
+fuzzing = []
+
 [dev-dependencies]
 # A version reject can only be drawn by a readable init this build refuses.
 jamstream-protocol = { workspace = true, features = ["testing"] }
