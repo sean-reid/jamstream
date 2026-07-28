@@ -127,6 +127,14 @@ pub struct RecordingPanel {
     /// Why the preferences file could not be read or written, if it could not.
     pub error: Option<String>,
     check_job: Option<Job<Result<(), String>>>,
+    /// Which providers have a key on this computer, in
+    /// [`STORAGE_PROVIDERS`] order.
+    ///
+    /// Cached because reading it is an operating system call: the tab asks the
+    /// question of three providers, and the wizard asks it of one, on every
+    /// frame either is on screen. Refreshed when the answer can have changed,
+    /// which is a save, a forget, and construction.
+    saved: [bool; STORAGE_PROVIDERS.len()],
     prefs: RecordingPrefs,
     /// Where the preferences are kept, or None when they last only as long as
     /// this process: a test or a fixture must not read the bucket the developer
@@ -191,6 +199,7 @@ impl RecordingPanel {
             check_result: None,
             error,
             check_job: None,
+            saved: [false; STORAGE_PROVIDERS.len()],
             prefs,
             prefs_path,
             creds,
@@ -198,7 +207,18 @@ impl RecordingPanel {
             exec,
         };
         panel.load_fields();
+        panel.refresh_saved();
         panel
+    }
+
+    /// Asks the keychain and the environment which providers have a key. The
+    /// only place either is read for that answer, and public so a key that
+    /// arrived from outside this panel can be noticed on demand rather than on
+    /// the next frame.
+    pub fn refresh_saved(&mut self) {
+        for (slot, provider) in self.saved.iter_mut().zip(STORAGE_PROVIDERS) {
+            *slot = creds::has_storage_credential(self.creds.as_ref(), &self.env, provider);
+        }
     }
 
     /// Pulls the selected provider's saved bucket into the fields.
@@ -228,7 +248,10 @@ impl RecordingPanel {
     }
 
     fn has_key(&self, provider: ProviderKind) -> bool {
-        creds::has_storage_credential(self.creds.as_ref(), &self.env, provider)
+        STORAGE_PROVIDERS
+            .iter()
+            .position(|p| *p == provider)
+            .is_some_and(|i| self.saved[i])
     }
 
     pub fn busy(&self) -> bool {
@@ -345,14 +368,16 @@ impl RecordingPanel {
             return;
         }
         let (id, secret) = (self.key_id.trim().to_owned(), self.secret.trim().to_owned());
-        if !id.is_empty()
-            && let Err(err) =
-                creds::save_storage_credential(self.creds.as_ref(), self.provider, &id, &secret)
-        {
-            self.check_result = Some(Err(format!(
-                "the key works but saving it on this computer failed: {err}"
-            )));
-            return;
+        if !id.is_empty() {
+            let saved =
+                creds::save_storage_credential(self.creds.as_ref(), self.provider, &id, &secret);
+            self.refresh_saved();
+            if let Err(err) = saved {
+                self.check_result = Some(Err(format!(
+                    "the key works but saving it on this computer failed: {err}"
+                )));
+                return;
+            }
         }
         // Kept nowhere but the keychain from here on.
         self.key_id.zeroize();
@@ -385,6 +410,7 @@ impl RecordingPanel {
     /// Forgets the key and the bucket for the selected provider.
     pub fn forget(&mut self) {
         creds::forget_storage_credential(self.creds.as_ref(), self.provider);
+        self.refresh_saved();
         self.prefs.set_bucket(self.provider.as_str(), "", "");
         self.bucket.clear();
         self.region.clear();
@@ -756,6 +782,10 @@ mod tests {
 
         creds::save_storage_credential(&*store, ProviderKind::DigitalOcean, "DO00ID", SECRET)
             .expect("save");
+        // A key that arrived from outside the panel is noticed when it is asked
+        // for rather than on every frame; the keychain is an operating system
+        // call and the drawer would make five of them per frame.
+        panel.refresh_saved();
         let setup = panel.setup(Some(ProviderKind::DigitalOcean));
         assert_eq!(setup.refusal(), None);
         assert_eq!(setup.bucket.expect("a bucket").name, "our-takes");
