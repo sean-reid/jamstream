@@ -29,7 +29,7 @@ use crate::limits::{
 };
 
 /// Samples per mix tick: 2.5 ms at 48 kHz.
-const TICK_SAMPLES: usize = 120;
+pub const TICK_SAMPLES: usize = 120;
 /// Interleaved stereo floats per tick.
 const MIX_LEN: usize = TICK_SAMPLES * 2;
 /// Broadcast frames span this many ticks (20 ms).
@@ -220,6 +220,17 @@ pub struct BroadcastTick<'a> {
     /// Bumps on every roster change, so a caller can skip resending an
     /// unchanged roster to the renderer.
     pub roster_epoch: u64,
+}
+
+/// One musician's decoded audio from the last tick, pre-mix, with the
+/// broadcast fader it mixes through. What the recorder's stem tap reads.
+#[derive(Debug, Clone, Copy)]
+pub struct Stem<'a> {
+    pub id: MemberId,
+    /// Decoded mono uplink for this tick.
+    pub pcm: &'a [f32; TICK_SAMPLES],
+    /// Host-set broadcast fader, unity when unset.
+    pub fader: Fader,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -810,6 +821,18 @@ impl ServerCore {
                 .count(),
             roster_epoch: self.roster_epoch,
         }
+    }
+
+    /// The last tick's decoded musician audio, for the recorder's stem tap.
+    /// Call it right after [`ServerCore::tick`], like
+    /// [`ServerCore::broadcast_tick`]; it reads state the tick already built,
+    /// so it costs nothing when nobody records.
+    pub fn stems(&self) -> impl Iterator<Item = Stem<'_>> {
+        self.decoded.iter().map(|(id, pcm)| Stem {
+            id: *id,
+            pcm,
+            fader: self.bcast_faders.get(id).copied().unwrap_or_default(),
+        })
     }
 
     /// Publishes the broadcast pipeline's per-destination status. Fans out
