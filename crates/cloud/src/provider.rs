@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::artifact::ServerArch;
 use crate::types::{
     DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Price, ProviderKind, Region, RegionId,
 };
@@ -64,6 +65,10 @@ impl Default for WaitOpts {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
+
+    /// CPU architecture of the machines this provider launches, which
+    /// decides the `jamstreamd` build the launch path hands the VM.
+    fn server_arch(&self) -> ServerArch;
 
     /// Static region catalog; must not touch the network.
     fn regions(&self) -> Vec<Region>;

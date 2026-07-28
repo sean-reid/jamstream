@@ -41,7 +41,9 @@ pub mod storage;
 pub mod sweeper;
 pub mod types;
 
-pub use artifact::{PinnedServerArtifact, pinned, validate_pair};
+pub use artifact::{
+    PinnedServerArtifact, PinnedServerArtifacts, ServerArch, pinned, validate_pair,
+};
 pub use cloudinit::{
     BootConfig, MediaArtifact, MediaArtifacts, MediaTool, RecordingStorage, SelfDestruct,
     StorageCredential,

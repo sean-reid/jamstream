@@ -9,7 +9,7 @@
 #
 # Options and environment:
 #   --with-server           also install the jamstreamd session server
-#                           (published for Linux x86_64, musl, only)
+#                           (published for Linux, musl, x86_64 and aarch64)
 #   JAMSTREAM_INSTALL_DIR   install into this directory instead of the
 #                           default (/usr/local/bin when writable,
 #                           otherwise ~/.local/bin)
@@ -42,7 +42,7 @@ usage() {
   say ""
   say "Installs the jamstream CLI from the latest release."
   say "  --with-server   also install the jamstreamd session server"
-  say "                  (published for Linux x86_64, musl, only)"
+  say "                  (published for Linux, musl, x86_64 and aarch64)"
   say ""
   say "Set JAMSTREAM_INSTALL_DIR to choose the install directory."
 }
@@ -180,8 +180,10 @@ install_binary "$cli_asset" jamstream "$dest"
 if [ "$with_server" -eq 1 ]; then
   if [ "$os" = linux ] && [ "$arch" = x86_64 ]; then
     install_binary "jamstreamd-linux-x86_64-musl.tar.gz" jamstreamd "$dest"
+  elif [ "$os" = linux ] && [ "$arch" = arm64 ]; then
+    install_binary "jamstreamd-linux-aarch64-musl.tar.gz" jamstreamd "$dest"
   else
-    say "jamstreamd binaries are published for Linux x86_64 (musl) only."
+    say "jamstreamd binaries are published for Linux (musl, x86_64 and aarch64) only."
     say "On this platform, local mode uses the jamstreamd that ships next to"
     say "the desktop app, or a from-source build: cargo install --path crates/server"
   fi

@@ -6,7 +6,7 @@
 #   lint      ~4 min    fmt + clippy + cargo-deny
 #   test      ~6-8 min  unit + property + integration + E2E stories, per OS
 #   harness   ~4 min    simulation gate suite (~3 min of test runtime)
-#   musl      ~4 min    static server build + verification
+#   musl      ~6 min    static server builds (both arches) + verification
 #   coverage  ~16 min   instrumented rebuild; runs on pushes to main only so
 #                       the PR path never waits on it
 #
@@ -316,8 +316,11 @@ jobs:
             echo '::endgroup::'
           done
 
-  # Static musl build of the session server: this is the artifact a session
-  # VM downloads at boot, so it must run on any Linux with no shared libs.
+  # Static musl builds of the session server, both architectures a session
+  # VM can be (AWS launches arm64, GCP and DigitalOcean x86_64): these are
+  # the artifacts a VM downloads at boot, so they must run on any Linux
+  # with no shared libs. Building both here means a dependency that breaks
+  # the cross build fails the PR, not the release.
   musl:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -326,24 +329,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-          targets: x86_64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
       - run: cargo build --locked -p jamstream-server --release --target x86_64-unknown-linux-musl
-      - name: Verify the binary is fully static
+      # See release.yml for why fortify is off: the gnu-targeted cross gcc
+      # compiles the vendored C against glibc headers, whose fortify layer
+      # emits *_chk symbols musl does not have.
+      - run: cargo build --locked -p jamstream-server --release --target aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CFLAGS_aarch64_unknown_linux_musl: -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+      # Each binary must be fully static AND actually built for the
+      # architecture its name claims; #139 was a machine downloading a
+      # binary of the wrong architecture.
+      - name: Verify both binaries are fully static and the right arch
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/jamstreamd
-          file "$BIN"
-          file "$BIN" | grep -q 'static'
-          # A truly static binary has no NEEDED shared-library entries.
-          # (ldd is useless here: it exits zero on static-pie binaries.)
-          if readelf -d "$BIN" | grep -q 'NEEDED'; then
-            echo "jamstreamd links shared libraries:" >&2
-            readelf -d "$BIN" | grep 'NEEDED' >&2
-            exit 1
-          fi
+          set -eu
+          for PAIR in "x86_64:x86-64" "aarch64:aarch64"; do
+            TARGET="${PAIR%%:*}"
+            ELF_ARCH="${PAIR#*:}"
+            BIN="target/$TARGET-unknown-linux-musl/release/jamstreamd"
+            file "$BIN"
+            file "$BIN" | grep -q 'static'
+            file "$BIN" | grep -q "$ELF_ARCH"
+            # A truly static binary has no NEEDED shared-library entries.
+            # (ldd is useless here: it exits zero on static-pie binaries.)
+            if readelf -d "$BIN" | grep -q 'NEEDED'; then
+              echo "jamstreamd ($TARGET) links shared libraries:" >&2
+              readelf -d "$BIN" | grep 'NEEDED' >&2
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: jamstreamd-x86_64-unknown-linux-musl
           path: target/x86_64-unknown-linux-musl/release/jamstreamd
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jamstreamd-aarch64-unknown-linux-musl
+          path: target/aarch64-unknown-linux-musl/release/jamstreamd
           if-no-files-found: error

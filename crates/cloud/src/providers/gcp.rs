@@ -87,6 +87,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
+use crate::artifact::ServerArch;
 use crate::http::{client, send_retrying};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
@@ -518,6 +519,11 @@ impl Provider for GcpProvider {
         ProviderKind::Gcp
     }
 
+    /// The e2 machine types are x86_64, as is the Debian 12 image family.
+    fn server_arch(&self) -> ServerArch {
+        ServerArch::X86_64
+    }
+
     fn regions(&self) -> Vec<Region> {
         CATALOG
             .iter()
@@ -923,6 +929,13 @@ mod tests {
 
     fn provider() -> GcpProvider {
         GcpProvider::with_access_token("test-project".to_owned(), "super-secret".to_owned())
+    }
+
+    /// The e2 machine types are x86_64, so this provider must select the
+    /// x86_64 artifact.
+    #[test]
+    fn launches_x86_64_machines_and_says_so() {
+        assert_eq!(provider().server_arch(), ServerArch::X86_64);
     }
 
     #[test]
