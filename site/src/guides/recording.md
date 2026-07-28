@@ -12,7 +12,7 @@ A cloud session records to a bucket in your own account, because the machine del
 *Set up once per computer. The key is masked and never shown again.*
 
 1. Pick the provider holding the bucket, and name the bucket and the region it is in. Host in that region and the upload costs nothing.
-2. Paste the storage key pair. **This is not the credential that launches machines**; the last section of your [provider's page](providers.md) creates it.
+2. Paste the storage key pair. **This is not the credential that launches machines**, and it must not be: launching a recorded session writes this key into the session machine, so scope it to writing the recordings prefix of one bucket. The last section of your [provider's page](providers.md) makes exactly that key, and the app keeps it in a keychain slot of its own.
 3. Click **Check**. It writes one small object to the bucket and deletes it. A pass saves the key in your system keychain and says so; a failure shows the bucket's own reason and saves nothing, so a wrong key fails while you are pasting rather than mid-song.
 4. **Keep takes for** is the default retention for new sessions: 7, 30 or 90 days, or forever. The default is 30 days, and it is a rule on the bucket itself, so it keeps being enforced long after the machine is gone.
 
@@ -35,7 +35,7 @@ Launching proves the key can write this session's own prefix and puts the retent
 
 ## From the terminal
 
-`--record` records a local session; `--bucket` names a bucket and implies it. The CLI reads the storage key from the environment rather than the keychain, and [`jamstream recordings`](../cli/recordings.md#the-storage-key) names the two variables per provider.
+`--record` records a local session; `--bucket` names a bucket and implies it. The CLI reads the storage key from `JAMSTREAM_RECORDING_ACCESS_KEY_ID` and `JAMSTREAM_RECORDING_SECRET_ACCESS_KEY` rather than from the keychain, and [`jamstream recordings`](../cli/recordings.md#the-storage-key) says why it is those and not a provider's launch pair.
 
 ```console
 $ jamstream host --provider local --record --yes

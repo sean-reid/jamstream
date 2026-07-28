@@ -62,15 +62,18 @@ Pass `--yes` in a script. Progress is whole lines at fixed percentages, so a log
 
 ## The storage key
 
-The object stores want an access key pair, which is not the token that launches machines. Set the pair for the provider holding the bucket:
+The object stores want an access key pair, which is not the credential that launches machines. It goes in two variables of its own, on every provider:
 
-| Provider | Variables |
-|---|---|
-| AWS | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
-| DigitalOcean | `SPACES_ACCESS_KEY_ID`, `SPACES_SECRET_ACCESS_KEY` |
-| GCP | `GCS_ACCESS_KEY_ID`, `GCS_SECRET_ACCESS_KEY` |
+```console
+$ export JAMSTREAM_RECORDING_ACCESS_KEY_ID=...
+$ export JAMSTREAM_RECORDING_SECRET_ACCESS_KEY=...
+```
 
-These are the same keys you set to launch a recorded session, so a host reading takes back on their own machine has nothing new to configure. The key is never written to disk: only the bucket, region, and retention are kept beside the session record.
+Variables of its own because launching a recorded session writes this key into the machine's user data. On AWS the obvious names, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, are the pair that launches instances, so they are deliberately not read here: a key that could start machines does not belong on one. Scope this key to writing the recordings prefix of one bucket; the last section of your [provider's page](../guides/providers.md) creates it.
+
+`SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY` on DigitalOcean, and `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY` on GCP, are read as well: neither pair is a launch credential on its provider.
+
+The app keeps the same key in your system keychain instead, in a slot of its own; see [Recording a session](../guides/recording.md). The key is never written to disk here: only the bucket, region, and retention are kept beside the session record.
 
 ## Notes
 

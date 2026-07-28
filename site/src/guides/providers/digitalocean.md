@@ -58,7 +58,9 @@ The token lives in your system keychain from then on; the pane does not appear a
 2. Still under **Spaces Object Storage**, open the **Access Keys** tab and click **Create Access Key**. Name it `jamstream-recording`. Arming a session sets the bucket's expiry rule as well as writing to it, so the key needs full access to that bucket: a read-only or write-only key fails the check while you are configuring.
 3. Copy the secret immediately; it is shown once.
 
-Paste both values into **Settings**, then **Recording**, in the app, and click Check. From the terminal the pair goes in `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY`, which [`jamstream recordings`](../../cli/recordings.md#the-storage-key) lists for every provider.
+Keep it to the recording bucket. Launching a recorded session writes this key into the droplet's user data, so its worst case should be junk in a folder the retention rule empties anyway.
+
+Paste both values into **Settings**, then **Recording**, in the app, and click Check. From the terminal the pair goes in `JAMSTREAM_RECORDING_ACCESS_KEY_ID` and `JAMSTREAM_RECORDING_SECRET_ACCESS_KEY`, or in `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY`; [`jamstream recordings`](../../cli/recordings.md#the-storage-key) covers every provider.
 
 Spaces is not offered in every droplet region. If the check says so, it names the regions that have it.
 

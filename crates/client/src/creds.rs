@@ -34,11 +34,14 @@ pub fn stream_key_field(platform: StreamPlatform) -> (&'static str, &'static str
 }
 
 /// Where one provider's object storage key pair lives: two slots of its own,
-/// beside that provider's provisioning credential and never the same slot.
+/// beside that provider's provisioning credential and never the same slot, with
+/// no fallback from one to the other.
 ///
-/// AWS is the case that makes the distinction visible. `aws.access_key_id`
+/// AWS is the case that makes the distinction load bearing. `aws.access_key_id`
 /// launches instances; `aws.storage_access_key_id` writes recordings, and the
-/// second is scoped to one bucket prefix precisely because it rides on the VM.
+/// second is written into the session machine's user data, where a key that
+/// could call `ec2:RunInstances` would be a far larger thing than a bucket
+/// prefix.
 pub fn storage_key_fields(
     provider: ProviderKind,
 ) -> ((&'static str, &'static str), (&'static str, &'static str)) {
@@ -49,8 +52,14 @@ pub fn storage_key_fields(
 }
 
 /// The storage key pair for one provider: this computer's keychain first, then
-/// the two variables the CLI reads, so a machine set up in a terminal records
-/// from the app with nothing new to paste.
+/// the recording variables the CLI reads, so a machine set up in a terminal
+/// records from the app with nothing new to paste.
+///
+/// Both halves have to come from the same place. Half a pair is not a
+/// credential, and completing a keychain id with an environment secret is how a
+/// host ends up handing a VM a key they never chose. The environment half is the
+/// CLI's own reader, so which variables count, and the refusal when none do, are
+/// the same on both surfaces.
 ///
 /// The error names what is missing and never the value of anything present.
 pub fn storage_credential(
@@ -58,20 +67,18 @@ pub fn storage_credential(
     env: &EnvReader,
     provider: ProviderKind,
 ) -> Result<StorageCredential, String> {
-    let (id_var, secret_var) =
-        jamstream_cli::storage::credential_vars(provider).map_err(|e| e.to_string())?;
     let (id_field, secret_field) = storage_key_fields(provider);
-    let missing = |var: &str| {
-        format!(
-            "no {} storage key saved on this computer and {var} is not set; the Recording \
-             tab in Settings takes one",
-            provider.as_str()
-        )
-    };
-    Ok(StorageCredential::KeyPair {
-        access_key_id: lookup(creds, env, id_field, id_var).ok_or_else(|| missing(id_var))?,
-        secret_access_key: lookup(creds, env, secret_field, secret_var)
-            .ok_or_else(|| missing(secret_var))?,
+    if let (Some(access_key_id), Some(secret_access_key)) = (
+        creds.get(id_field.0, id_field.1),
+        creds.get(secret_field.0, secret_field.1),
+    ) {
+        return Ok(StorageCredential::KeyPair {
+            access_key_id,
+            secret_access_key,
+        });
+    }
+    jamstream_cli::storage::credential_from(provider, |key| env(key)).map_err(|err| {
+        format!("{err} The Recording tab in Settings takes a key for this computer.")
     })
 }
 
@@ -429,8 +436,10 @@ mod tests {
         ));
     }
 
-    /// Half a pair is not a credential, and the refusal has to name the half
-    /// that is missing without quoting the half that is present.
+    /// Half a pair is not a credential, and it must not complete itself from
+    /// somewhere else: a keychain id with an environment secret is a key nobody
+    /// chose. The refusal names the variables that would work and quotes
+    /// neither half of what is present.
     #[test]
     fn half_a_storage_key_is_refused_and_no_secret_is_in_the_reason() {
         let store = MemStore::default();
@@ -438,7 +447,10 @@ mod tests {
         store.set(id.0, id.1, "AKIDSTORAGE").expect("set");
         let err = storage_credential(&store, &env_of(&[]), ProviderKind::Aws)
             .expect_err("half a pair cannot write a bucket");
-        assert!(err.contains("AWS_SECRET_ACCESS_KEY"), "{err}");
+        assert!(
+            err.contains(jamstream_cli::storage::RECORDING_VARS.1),
+            "{err}"
+        );
         assert!(err.contains("Recording tab"), "{err}");
         assert!(
             !err.contains("AKIDSTORAGE"),
@@ -446,6 +458,17 @@ mod tests {
         );
         // Local has no bucket, so it has no key slot either.
         assert!(storage_credential(&store, &env_of(&[]), ProviderKind::Local).is_err());
+
+        // And the key that launches instances is not a storage key, however it
+        // is set: this one is written into the machine's user data.
+        let launch_pair = env_of(&[
+            ("AWS_ACCESS_KEY_ID", "AKIALAUNCH"),
+            ("AWS_SECRET_ACCESS_KEY", "launch-secret"),
+        ]);
+        assert!(
+            !has_storage_credential(&store, &launch_pair, ProviderKind::Aws),
+            "the launch pair must never be read as a recording key"
+        );
     }
 
     #[test]

@@ -551,8 +551,9 @@ impl RecordingPanel {
             egui::Label::new(
                 theme::muted(
                     ui,
-                    "Not the token that launches machines. Each provider's page says where \
-                     this one is made.",
+                    "Never the key that launches machines: this one is written to the session \
+                     machine, so scope it to writing the recordings prefix of one bucket. Each \
+                     provider's page makes exactly that key.",
                 )
                 .small(),
             )

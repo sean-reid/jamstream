@@ -107,7 +107,7 @@ The keys live in your system keychain from then on. You are ready to host; conti
 
 ## 5. Optional: a bucket and a second key, for recording
 
-[Recording a cloud session](../recording.md) writes takes to an S3 bucket in your own account, and the key that writes them is not the key from step 3. Leave recording off and everything above is all there is.
+[Recording a cloud session](../recording.md) writes takes to an S3 bucket in your own account, and the key that writes them must not be the key from step 3. Launching a recorded session writes this key into the session machine's user data, so it has to be a key whose worst case is junk in one bucket prefix: the key from step 3 can start and destroy EC2 instances. Leave recording off and everything above is all there is.
 
 1. In the S3 console, **Create bucket**, in the same region you host in, with the default settings. Give recordings a bucket that holds nothing else: the lifecycle permission below is bucket-wide.
 2. Create a second IAM user, `jamstream-recording`, the same way as step 2, with only this policy. Name your bucket in both places:
@@ -138,11 +138,11 @@ The keys live in your system keychain from then on. You are ready to host; conti
 
 3. Give that user its own access key, exactly as in step 3.
 
-The key can write under one prefix of one bucket and set that bucket's expiry rule, and nothing else: it cannot read a take back, list the bucket, or touch EC2. `DeleteObject` is on the prefix because arming a session writes one small probe object there and removes it, which is how a bucket that refuses the key fails while you are configuring rather than mid-song.
+The key can write under one prefix of one bucket and set that bucket's expiry rule, and nothing else: it cannot read a take back, list the bucket, or touch EC2. `DeleteObject` is on the prefix because arming a session writes one small probe object there and removes it, which is how a bucket that refuses the key fails while you are configuring rather than mid-song. `PutLifecycleConfiguration` is how the retention rule is applied, and it is bucket-wide, which is the other reason recordings want a bucket of their own.
 
-Paste both values into **Settings**, then **Recording**, in the app, and click Check. The app keeps the recording key in its own keychain slot, so the two AWS keys stay separate.
+Paste both values into **Settings**, then **Recording**, in the app, and click Check. The app keeps this key in a keychain slot of its own, so the two AWS keys never stand in for each other.
 
-The CLI reads the recording key from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, the same two variables it launches with, so hosting a recorded session from the terminal wants one user carrying both policies rather than two users. [`jamstream recordings`](../../cli/recordings.md#the-storage-key) lists the variables for every provider.
+From the terminal the pair goes in `JAMSTREAM_RECORDING_ACCESS_KEY_ID` and `JAMSTREAM_RECORDING_SECRET_ACCESS_KEY`. `AWS_ACCESS_KEY_ID` is deliberately not read for recording, for the reason at the top of this section; if only that pair is set, the launch says so rather than handing the machine your launch key. [`jamstream recordings`](../../cli/recordings.md#the-storage-key) covers every provider.
 
 ## For the CLI and automation
 
