@@ -19,6 +19,8 @@ pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_STREAM_KEY_LEN: usize = 256;
 /// Longest accepted failure reason in a [`DestinationStatus`].
 pub const MAX_STREAM_REASON_LEN: usize = 200;
+/// Longest accepted failure reason in a [`RecordingState::Failed`].
+pub const MAX_RECORD_REASON_LEN: usize = 200;
 /// Avatars are capped at 256 KB and identified by the Blake2s-256 of their
 /// bytes; the hash is the cache key on both ends.
 pub const MAX_AVATAR_BYTES: usize = 256 * 1024;
@@ -172,6 +174,29 @@ pub struct DestinationStatus {
     pub dropped_frames: u64,
 }
 
+/// What the host asks the recorder to do. Whether stems are captured is set
+/// at launch, not here; Start records whatever the session configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordOp {
+    /// Begin a take.
+    Start,
+    /// End the take. Upload may still be in flight afterwards.
+    Stop,
+}
+
+/// Recorder lifecycle. `Failed` carries a reason a musician can act on
+/// ("bucket write refused"), shown beside the on-air lamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordingState {
+    Idle,
+    Recording,
+    /// The take ended; its tail is still being written to storage.
+    Uploading,
+    Failed {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemberInfo {
     pub id: MemberId,
@@ -294,6 +319,21 @@ pub enum ControlMsg {
     /// Trailing variant, as above.
     StreamStatus {
         destinations: Vec<DestinationStatus>,
+    },
+    /// Host to server: start or stop the session recording. Host-only; the
+    /// server counts a violation against any other sender. Trailing variant,
+    /// same postcard append-safety rule as Stats.
+    RecordCtl {
+        op: RecordOp,
+    },
+    /// Server to all: the recorder's state, immediately on any transition
+    /// and to a member who joins mid-take. A full snapshot, so the latest
+    /// one is always sufficient. Trailing variant, as above.
+    RecordStatus {
+        state: RecordingState,
+        /// Whether per-member stems are captured alongside the mix, so
+        /// surfaces can show what a take holds. Fixed for the session.
+        stems: bool,
     },
 }
 
@@ -504,6 +544,10 @@ fn check_lengths(msg: &ControlMsg) -> Result<(), Error> {
             }
             Ok(())
         }
+        ControlMsg::RecordStatus {
+            state: RecordingState::Failed { reason },
+            ..
+        } if reason.len() > MAX_RECORD_REASON_LEN => Err(Error::Malformed),
         ControlMsg::Roster(members) if members.iter().any(|m| m.name.len() > MAX_NAME_LEN) => {
             Err(Error::Malformed)
         }
@@ -762,6 +806,112 @@ mod tests {
         assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
     }
 
+    #[test]
+    fn record_messages_round_trip() {
+        let msgs = [
+            ControlMsg::RecordCtl {
+                op: RecordOp::Start,
+            },
+            ControlMsg::RecordCtl { op: RecordOp::Stop },
+            ControlMsg::RecordStatus {
+                state: RecordingState::Idle,
+                stems: false,
+            },
+            ControlMsg::RecordStatus {
+                state: RecordingState::Recording,
+                stems: true,
+            },
+            ControlMsg::RecordStatus {
+                state: RecordingState::Uploading,
+                stems: true,
+            },
+            ControlMsg::RecordStatus {
+                state: RecordingState::Failed {
+                    reason: "bucket write refused".into(),
+                },
+                stems: false,
+            },
+        ];
+        for m in &msgs {
+            let bytes = postcard::to_allocvec(m).unwrap();
+            let back: ControlMsg = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(&back, m);
+        }
+        let mut a = ControlLink::new();
+        let mut b = ControlLink::new();
+        for m in &msgs {
+            a.send(m.clone()).unwrap();
+        }
+        assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
+    }
+
+    /// Exact wire bytes, pinned so a reordered field or shifted discriminant
+    /// cannot pass by encoding and decoding with the same wrong code.
+    #[test]
+    fn record_encodings_match_golden_bytes() {
+        let cases: &[(ControlMsg, &[u8])] = &[
+            (
+                ControlMsg::RecordCtl {
+                    op: RecordOp::Start,
+                },
+                &[0x11, 0x00],
+            ),
+            (ControlMsg::RecordCtl { op: RecordOp::Stop }, &[0x11, 0x01]),
+            (
+                ControlMsg::RecordStatus {
+                    state: RecordingState::Idle,
+                    stems: false,
+                },
+                &[0x12, 0x00, 0x00],
+            ),
+            (
+                ControlMsg::RecordStatus {
+                    state: RecordingState::Recording,
+                    stems: true,
+                },
+                &[0x12, 0x01, 0x01],
+            ),
+            (
+                ControlMsg::RecordStatus {
+                    state: RecordingState::Uploading,
+                    stems: true,
+                },
+                &[0x12, 0x02, 0x01],
+            ),
+            (
+                ControlMsg::RecordStatus {
+                    state: RecordingState::Failed {
+                        reason: "dry".into(),
+                    },
+                    stems: false,
+                },
+                &[0x12, 0x03, 0x03, b'd', b'r', b'y', 0x00],
+            ),
+        ];
+        for (msg, bytes) in cases {
+            assert_eq!(&postcard::to_allocvec(msg).unwrap(), bytes, "{msg:?}");
+            assert_eq!(&postcard::from_bytes::<ControlMsg>(bytes).unwrap(), msg);
+        }
+        // An unknown state discriminant is refused, not misread.
+        assert!(postcard::from_bytes::<ControlMsg>(&[0x12, 0x04, 0x00]).is_err());
+        // So is a truncated status.
+        assert!(postcard::from_bytes::<ControlMsg>(&[0x12, 0x01]).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_record_reason() {
+        let mut a = ControlLink::new();
+        assert!(
+            a.send(ControlMsg::RecordStatus {
+                state: RecordingState::Failed {
+                    reason: "x".repeat(MAX_RECORD_REASON_LEN + 1),
+                },
+                stems: false,
+            })
+            .is_err()
+        );
+    }
+
     /// The one property that matters more than the encoding: a stream key
     /// cannot leak through a log line.
     #[test]
@@ -843,6 +993,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!(status[0], 16);
+    }
+
+    /// Same rule for the recording variants: appended after StreamStatus,
+    /// leaving every earlier variant's bytes unchanged.
+    #[test]
+    fn appending_record_variants_left_earlier_encodings_alone() {
+        let ctl = postcard::to_allocvec(&ControlMsg::RecordCtl {
+            op: RecordOp::Start,
+        })
+        .unwrap();
+        assert_eq!(ctl[0], 17);
+        let status = postcard::to_allocvec(&ControlMsg::RecordStatus {
+            state: RecordingState::Idle,
+            stems: false,
+        })
+        .unwrap();
+        assert_eq!(status[0], 18);
     }
 
     #[test]
@@ -1060,6 +1227,12 @@ mod tests {
                     bitrate_kbps: 0,
                     dropped_frames: 0,
                 }],
+            },
+            ControlMsg::RecordStatus {
+                state: RecordingState::Failed {
+                    reason: "x".repeat(MAX_RECORD_REASON_LEN + 1),
+                },
+                stems: false,
             },
             ControlMsg::Roster(vec![MemberInfo {
                 id: MemberId(1),
