@@ -209,6 +209,22 @@ mod tests {
         assert!(!args.json);
     }
 
+    /// The local provider spawns the server with these windows when the
+    /// session config does not carry them, and it cannot see this crate's
+    /// constants to check. Two numbers for one policy, so something has to
+    /// hold them together, and this is the crate that sees both.
+    #[test]
+    fn the_local_providers_fallback_windows_match_the_documented_defaults() {
+        assert_eq!(
+            jamstream_cloud::providers::local::DEFAULT_IDLE_SHUTDOWN_MIN,
+            DEFAULT_IDLE_MIN
+        );
+        assert_eq!(
+            jamstream_cloud::providers::local::DEFAULT_MAX_DURATION_MIN,
+            DEFAULT_MAX_HOURS * 60
+        );
+    }
+
     #[test]
     fn host_flags_parse() {
         let cli = Cli::parse_from([

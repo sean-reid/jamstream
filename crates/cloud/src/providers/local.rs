@@ -124,13 +124,18 @@ use crate::types::{
 
 const REGION_ID: &str = "local";
 const REGISTRY_FILE: &str = "local.json";
-/// Windows used when the session config does not say. They match the
-/// defaults the host surfaces offer (`jamstream_session::limits`'
-/// `DEFAULT_IDLE_MIN` and `DEFAULT_MAX_HOURS`), which
-/// `crates/cli/tests/local_host.rs` pins, because this crate cannot see
-/// that one and a laptop is the wrong place to disagree quietly.
-const DEFAULT_IDLE_SHUTDOWN_MIN: u32 = 10;
-const DEFAULT_MAX_DURATION_MIN: u32 = 12 * 60;
+/// Idle window used when the session config does not say, in minutes.
+///
+/// It has to agree with what the host surfaces offer, which is
+/// `jamstream_session::limits::DEFAULT_IDLE_MIN`. This crate cannot see
+/// that one, so `jamstream_cli::cli` holds the test that pins the two
+/// together: a laptop is the wrong place for two defaults to disagree
+/// quietly.
+pub const DEFAULT_IDLE_SHUTDOWN_MIN: u32 = 10;
+/// Session cap used when the session config does not say, in minutes.
+/// Pinned against `jamstream_session::limits::DEFAULT_MAX_HOURS` the same
+/// way [`DEFAULT_IDLE_SHUTDOWN_MIN`] is.
+pub const DEFAULT_MAX_DURATION_MIN: u32 = 12 * 60;
 /// Cross-process guard on the registry: see [`FileLock`].
 const LOCK_FILE: &str = "local.json.lock";
 const LOCK_WAIT: Duration = Duration::from_secs(2);
