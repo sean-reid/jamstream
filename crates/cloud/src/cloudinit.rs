@@ -548,6 +548,21 @@ install -d -o {user} -g {user} -m 0700 {uploads}
 mount -o remount,hidepid=2 /proc 2>/dev/null || true
 
 systemctl daemon-reload
+# The metadata lockdown in the firewall script rides on iptables, and a
+# newer Debian cloud image may not ship it. Install it if missing, before
+# the firewall unit runs: without this the script degrades to a warning
+# and the API token in the metadata service stays readable by the process
+# that parses untrusted UDP. Failure here still only warns, because the
+# provider's own cloud firewall stands in front either way and a session
+# beats a perfect one that never starts; the warning names what was lost.
+if ! command -v iptables >/dev/null 2>&1; then
+  if timeout 120 apt-get update -qq && \\
+     timeout 120 apt-get install -y -qq --no-install-recommends iptables; then
+    echo \"jamstream: installed iptables for the in-guest filter\"
+  else
+    echo \"jamstream: cannot install iptables; in-guest filter and metadata lockdown are OFF\" >&2
+  fi
+fi
 # The firewall and the dead man's switch go in before anything that can
 # fail. In the other order a failed download leaves a VM with provider
 # default networking, no idle window, and no hard cap.
@@ -1244,6 +1259,34 @@ mod tests {
             // The broadcast tools are the one part a session can live
             // without, so their failure must not trip the trap.
             assert!(out.contains("session continues without it"));
+        }
+    }
+
+    /// The metadata lockdown rides on iptables and a newer Debian cloud
+    /// image may not ship it. The bootstrap installs it when missing,
+    /// before the firewall unit runs, and an install failure warns rather
+    /// than destroying the machine: the provider's cloud firewall stands
+    /// in front either way.
+    #[test]
+    fn a_missing_iptables_is_installed_before_the_firewall_runs() {
+        for sd in all_variants() {
+            let script = bootstrap_script(&base_config(sd));
+            let check = at(&script, "if ! command -v iptables");
+            let install = at(
+                &script,
+                "apt-get install -y -qq --no-install-recommends iptables",
+            );
+            let firewall = at(&script, "systemctl enable --now jamstream-firewall.service");
+            assert!(
+                check < install && install < firewall,
+                "install iptables, if needed, before the unit that uses it"
+            );
+            // Bounded: a hung mirror must not stall the bootstrap forever
+            // with the trap armed behind it.
+            assert!(script.contains("timeout 120 apt-get"));
+            // And survivable: the whole attempt sits in a condition, so a
+            // failed install warns instead of tripping the fail-closed trap.
+            assert!(script.contains("in-guest filter and metadata lockdown are OFF"));
         }
     }
 

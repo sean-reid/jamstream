@@ -205,6 +205,21 @@ write_files:
       mount -o remount,hidepid=2 /proc 2>/dev/null || true
 
       systemctl daemon-reload
+      # The metadata lockdown in the firewall script rides on iptables, and a
+      # newer Debian cloud image may not ship it. Install it if missing, before
+      # the firewall unit runs: without this the script degrades to a warning
+      # and the API token in the metadata service stays readable by the process
+      # that parses untrusted UDP. Failure here still only warns, because the
+      # provider's own cloud firewall stands in front either way and a session
+      # beats a perfect one that never starts; the warning names what was lost.
+      if ! command -v iptables >/dev/null 2>&1; then
+        if timeout 120 apt-get update -qq && \
+           timeout 120 apt-get install -y -qq --no-install-recommends iptables; then
+          echo "jamstream: installed iptables for the in-guest filter"
+        else
+          echo "jamstream: cannot install iptables; in-guest filter and metadata lockdown are OFF" >&2
+        fi
+      fi
       # The firewall and the dead man's switch go in before anything that can
       # fail. In the other order a failed download leaves a VM with provider
       # default networking, no idle window, and no hard cap.
