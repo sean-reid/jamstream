@@ -56,7 +56,7 @@ Every session carries two timers, both set at launch:
 - the idle exit, 10 minutes by default: with no musicians connected for that long, the server shuts itself down. On DigitalOcean and AWS the machine is destroyed with it; on GCP it stops serving and is deleted when you end the session, on your next sweep, or at the hard cap.
 - the hard cap, 12 hours by default: the machine is destroyed at the cap no matter what, and invites expire with it.
 
-The app uses the defaults; the CLI can change both (`--idle-min` and `--max-hours` in the [host reference](../cli/host.md)). There is no way to extend a running session; host a new one. The point of the caps is that a forgotten session costs a bounded, small amount, not a month of billing. [Understanding cost](cost.md) covers the other guardrails.
+Both are yours to set. The wizard has an **idle exit** and a **hard cap** field on the launch form, taking 1 to 120 minutes and 1 to 24 hours; the CLI takes `--idle-min` and `--max-hours` (in the [host reference](../cli/host.md)), which accept any value. There is no way to extend a running session; host a new one. The point of the caps is that a forgotten session costs a bounded, small amount, not a month of billing. [Understanding cost](cost.md) covers the other guardrails.
 
 ## While it runs
 

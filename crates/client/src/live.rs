@@ -1170,7 +1170,7 @@ impl Worker {
         }
         // Idle is terminal (set by shutdown); never overwrite it.
         if s.conn != ConnState::Idle {
-            s.conn = conn_state(&stats.state);
+            s.conn = conn_state_with(&stats.state, stats.session_full);
         }
         s.me = self.core.member_id();
         s.rtt_ms = stats.rtt_ms_last;
@@ -1229,6 +1229,16 @@ impl Worker {
             at_ms,
         });
     }
+}
+
+/// `session_full` rides on [`ClientStats`] rather than on the client state,
+/// because the core stays in `Connecting` while it retries a full session.
+/// So the stat decides, and only while nothing better has happened.
+fn conn_state_with(state: &ClientState, session_full: bool) -> ConnState {
+    if session_full && matches!(state, ClientState::Connecting) {
+        return ConnState::SessionFull;
+    }
+    conn_state(state)
 }
 
 fn conn_state(state: &ClientState) -> ConnState {

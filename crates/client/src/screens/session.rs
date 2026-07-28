@@ -261,6 +261,16 @@ impl SessionScreen {
                     RichText::new("connection lost: no packets for 10 seconds").color(p.danger),
                 );
             }
+            // Not danger: nothing is wrong and nothing was lost. The seat
+            // this invite names is occupied, the client is still trying, and
+            // one leaving musician is enough.
+            ConnState::SessionFull => {
+                let p = theme::palette_of(ui);
+                ui.label(
+                    RichText::new("the session is full; waiting for a seat to free")
+                        .color(p.meter_amber),
+                );
+            }
             ConnState::Joined | ConnState::Idle => {}
         }
 
