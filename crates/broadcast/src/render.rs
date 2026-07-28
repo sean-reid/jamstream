@@ -247,28 +247,29 @@ impl Renderer {
         let d = ch * 0.46;
         let cx = x + cw / 2.0;
         let cy = y + ch * 0.14 + d / 2.0;
-        match &m.avatar {
+        let drawn = match &m.avatar {
             Some(av) => draw_avatar(px, av, cx, cy, d / 2.0),
-            None => {
-                let disc = PathBuilder::from_circle(cx, cy, d / 2.0).expect("circle path");
-                fill(px, &disc, pal::disc_color(&m.name), 255);
-                let init = initials(&m.name);
-                let size = d * 0.34;
-                let tw = text::width(&self.fonts.semibold, size, 0.0, &init);
-                text::draw(
-                    px.data_mut(),
-                    self.cfg.width,
-                    self.cfg.height,
-                    &self.fonts.semibold,
-                    size,
-                    0.0,
-                    cx - tw / 2.0,
-                    cy + size * 0.36,
-                    pal::TEXT_PRIMARY,
-                    1.0,
-                    &init,
-                );
-            }
+            None => false,
+        };
+        if !drawn {
+            let disc = PathBuilder::from_circle(cx, cy, d / 2.0).expect("circle path");
+            fill(px, &disc, pal::disc_color(&m.name), 255);
+            let init = initials(&m.name);
+            let size = d * 0.34;
+            let tw = text::width(&self.fonts.semibold, size, 0.0, &init);
+            text::draw(
+                px.data_mut(),
+                self.cfg.width,
+                self.cfg.height,
+                &self.fonts.semibold,
+                size,
+                0.0,
+                cx - tw / 2.0,
+                cy + size * 0.36,
+                pal::TEXT_PRIMARY,
+                1.0,
+                &init,
+            );
         }
         if !m.connected {
             // Pull the portrait down toward the panel; the card stays.
@@ -520,9 +521,13 @@ pub fn initials(name: &str) -> String {
     out
 }
 
-fn draw_avatar(px: &mut Pixmap, av: &AvatarImage, cx: f32, cy: f32, r: f32) {
-    let src = PixmapRef::from_bytes(av.data(), av.width(), av.height())
-        .expect("avatar buffer is width*height*4");
+/// Blits the avatar into the card's circle. False when the pixel buffer does
+/// not back the dimensions it claims, which the caller answers with the
+/// initials disc: a bad avatar is not worth a panic on the render thread.
+fn draw_avatar(px: &mut Pixmap, av: &AvatarImage, cx: f32, cy: f32, r: f32) -> bool {
+    let Some(src) = PixmapRef::from_bytes(av.data(), av.width(), av.height()) else {
+        return false;
+    };
     // Cover crop: scale the short side to the diameter, center the rest.
     let scale = (2.0 * r) / av.width().min(av.height()) as f32;
     let tx = cx - av.width() as f32 * scale / 2.0;
@@ -546,6 +551,7 @@ fn draw_avatar(px: &mut Pixmap, av: &AvatarImage, cx: f32, cy: f32, r: f32) {
         Transform::identity(),
         None,
     );
+    true
 }
 
 fn fill(px: &mut Pixmap, path: &Path, rgb: Rgb, a: u8) {
