@@ -1,0 +1,76 @@
+# Keeps pull requests that are about to land current with main.
+#
+# Branch protection deliberately runs with `strict` off: with thirteen
+# required checks across three operating systems, requiring every branch to
+# be current meant one merge invalidated every other open pull request and
+# they serialised into a full run each. That trade is worth keeping.
+#
+# What it costs is semantic conflicts. Two pull requests can each be green
+# against the main they branched from and break main when they meet, because
+# neither run ever compiled the other's code. That happened twice on
+# 2026-07-27: an image added to a curated list met a gate that knew only the
+# images curated when it was written, and a benchmark met a change to the
+# signature it called. Main's own CI caught both within ten minutes, but main
+# was red in between and other pull requests failed confusingly against it.
+#
+# A merge queue is the real answer and is not available here: GitHub offers
+# it only on organisation-owned repositories, and this one belongs to a user.
+#
+# So narrow the window instead. Freshening every open pull request on every
+# merge would reinstate the serialisation we removed. Freshening only the
+# ones with auto-merge already armed targets exactly the pull requests about
+# to land, which is where a stale base actually turns into a red main. A
+# branch someone is still working on is left alone.
+#
+# This is weaker than a queue and says so: it reduces the window rather than
+# closing it, since two armed pull requests can still merge close enough
+# together that the second never rebuilt.
+name: freshen-queued
+
+on:
+  push:
+    branches: [main]
+
+# Only the newest main matters. A freshen against a superseded commit would
+# rebase onto a base that is already old.
+concurrency:
+  group: freshen-queued
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  freshen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Update every auto-merge pull request that has fallen behind
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          # BEHIND is the only state worth acting on. BLOCKED means checks
+          # are still running or failing, CONFLICTING needs a human, and
+          # CLEAN is already current.
+          gh pr list --repo "$REPO" --state open \
+            --json number,mergeStateStatus,autoMergeRequest \
+            --jq '.[] | select(.autoMergeRequest != null)
+                      | select(.mergeStateStatus == "BEHIND")
+                      | .number' > behind.txt
+          if [ ! -s behind.txt ]; then
+            echo "nothing armed and behind"
+            exit 0
+          fi
+          while read -r pr; do
+            # Never fail the job over one pull request: a branch can be
+            # deleted or merged between the list and the update, and a
+            # freshen that cannot happen is not a reason to go red.
+            if gh pr update-branch "$pr" --repo "$REPO"; then
+              echo "freshened #$pr"
+            else
+              echo "::warning::could not freshen #$pr; it will merge on a stale base or need a manual update"
+            fi
+          done < behind.txt
