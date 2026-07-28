@@ -548,9 +548,18 @@ impl ClientCore {
                 // proved before it spends a Diffie-Hellman. Nothing
                 // authenticates this packet, and nothing can: authenticating
                 // it would cost the server exactly what the cookie saves. So
-                // the cookied init is an addition, never a replacement, and a
-                // forged challenge buys an attacker no more than dropping the
+                // the cookied init is an addition, never a replacement, and
+                // answering a forged challenge costs no more than dropping the
                 // packet would have.
+                //
+                // The cookie we store is a different matter. A cookie we hold
+                // but cannot offer is a cookie the server will refuse, so a
+                // forged challenge must not evict a good one: adopt the new
+                // cookie only when the budget actually lets us answer with it.
+                // That leaves the off-path forgery, which needs the cookie
+                // encrypted the WireGuard way, under Hash(label || server_pk)
+                // with the init as AAD. That is a wire change and belongs at
+                // the next protocol version bump (issue #203).
                 if self.state != ClientState::Connecting {
                     return out;
                 }
@@ -562,14 +571,14 @@ impl ClientCore {
                 // A repeated challenge carrying the cookie already held costs
                 // nothing at all, which is most replays. The budget covers the
                 // rest.
-                let changed = self.cookied_init.as_deref() != Some(cookied.as_slice());
-                self.cookied_init = Some(cookied);
-                if changed && self.cookie_answers.take(now_ms) {
-                    out.push(self.init_packet.clone());
-                    if let Some(c) = self.cookied_init.as_ref() {
-                        out.push(c.clone());
-                    }
+                if self.cookied_init.as_deref() == Some(cookied.as_slice())
+                    || !self.cookie_answers.take(now_ms)
+                {
+                    return out;
                 }
+                self.cookied_init = Some(cookied.clone());
+                out.push(self.init_packet.clone());
+                out.push(cookied);
             }
             // Clients never receive either of these.
             Packet::HandshakeInit { .. } | Packet::CookiedInit { .. } => {}
@@ -1535,6 +1544,74 @@ mod tests {
         // Nothing about the handshake moved: the state is still usable and the
         // plain init on the wire is still the one the server will answer.
         assert_eq!(*core.state(), ClientState::Connecting);
+    }
+
+    /// Every cookie this client holds is one it answered with. The stored
+    /// cookie is what the next resend offers, so a challenge that arrives with
+    /// the answer budget already spent must not replace it: that turned an
+    /// injected challenge into a way to point the client at a cookie the server
+    /// will refuse, for free and at whatever rate the attacker liked, while the
+    /// plain init only drew another challenge (issue #203).
+    ///
+    /// This narrows the primitive rather than removing it: an eviction now
+    /// costs one of the same tokens that bound the answers. Binding a challenge
+    /// to the init it answers needs the cookie encrypted, which is a wire
+    /// change for the next protocol version.
+    #[test]
+    fn a_challenge_we_cannot_answer_does_not_replace_the_cookie_we_hold() {
+        let inv = invite(Role::Musician);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+        let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(&init) else {
+            panic!("expected an init");
+        };
+        let cookie_n = |i: u32| {
+            let mut c = [0u8; wire::COOKIE_BYTES];
+            c[..4].copy_from_slice(&i.to_le_bytes());
+            c
+        };
+
+        // A thousand distinct challenges in one instant. Only the burst is
+        // answered, so only the burst is adopted.
+        let mut answered = Vec::new();
+        for i in 0..1_000u32 {
+            if !core
+                .handle_datagram(1, &wire::build_cookie_challenge(&cookie_n(i)))
+                .is_empty()
+            {
+                answered.push(i);
+            }
+        }
+        assert_eq!(answered, (0..COOKIE_ANSWER_BURST).collect::<Vec<u32>>());
+
+        // The resend carries the last cookie this client put on the wire, not
+        // the last one somebody sent it.
+        let last_answered = *answered.last().unwrap();
+        assert_eq!(
+            core.poll(3_000),
+            vec![
+                init.clone(),
+                wire::build_cookied_init(&cookie_n(last_answered), version, noise)
+            ],
+            "an unanswerable challenge replaced the cookie on the wire"
+        );
+
+        // Once the bucket refills the next challenge is adopted, so a client
+        // whose cookie really did go stale is not stuck with it.
+        let fresh = cookie_n(9_999);
+        assert_eq!(
+            core.handle_datagram(4_000, &wire::build_cookie_challenge(&fresh)),
+            vec![
+                init.clone(),
+                wire::build_cookied_init(&fresh, version, noise)
+            ]
+        );
+        assert_eq!(
+            core.poll(9_000),
+            vec![
+                init.clone(),
+                wire::build_cookied_init(&fresh, version, noise)
+            ]
+        );
     }
 
     /// A challenge is only meaningful while a handshake is in flight. Joined,
