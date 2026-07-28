@@ -296,6 +296,7 @@ class JamstreamCli < Formula
 
   def install
     bin.install "jamstream"
+    generate_completions_from_executable(bin/"jamstream", "completions")
   end
 
   test do

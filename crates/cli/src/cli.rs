@@ -34,6 +34,15 @@ pub enum Command {
     Sweep(SweepArgs),
     /// Join a session as a headless client.
     Join(JoinArgs),
+    /// Print shell completions for jamstream.
+    Completions(CompletionsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// Shell to emit completions for.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(Debug, Args)]
@@ -187,6 +196,21 @@ mod tests {
     #[test]
     fn command_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_cover_the_commands_a_shell_would_complete() {
+        let cli = Cli::parse_from(["jamstream", "completions", "zsh"]);
+        let Command::Completions(args) = cli.command else {
+            panic!("expected completions");
+        };
+        let mut out = Vec::new();
+        clap_complete::generate(args.shell, &mut Cli::command(), "jamstream", &mut out);
+        let script = String::from_utf8(out).expect("zsh completions are text");
+        assert!(script.starts_with("#compdef jamstream"), "{script}");
+        for cmd in ["host", "status", "end", "sweep", "join", "completions"] {
+            assert!(script.contains(cmd), "zsh script never mentions {cmd}");
+        }
     }
 
     #[test]

@@ -26,6 +26,7 @@
   - [jamstream end](cli/end.md)
   - [jamstream sweep](cli/sweep.md)
   - [jamstream join](cli/join.md)
+  - [jamstream completions](cli/completions.md)
 
 # Project
 
