@@ -59,12 +59,16 @@ use crate::retention::{Retention, RetentionEnforcement};
 use crate::types::ProviderKind;
 
 pub mod contract;
+// Native GCS, which needs a service account token. Recording uses the S3
+// interop endpoint instead; see providers::mod on why that matters.
+#[cfg(feature = "gcp")]
 pub mod gcs;
 pub mod mock;
 pub mod s3;
 pub mod sink;
 
 pub use contract::assert_object_store_contract;
+#[cfg(feature = "gcp")]
 pub use gcs::GcsStore;
 pub use mock::MockStore;
 pub use s3::S3Store;
@@ -484,6 +488,34 @@ async fn feed_parts<B: MultipartBackend + ?Sized>(
         number += 1;
         current = next;
         next = source.next_part(part_size).await?;
+    }
+}
+
+impl crate::cloudinit::RecordingStorage {
+    /// The store this config points at, ready for [`ObjectSink::open`]. One
+    /// factory so the VM and any probe build the same client from the same
+    /// file. Every provider signs SigV4 with the same key pair; only the
+    /// endpoint differs, which is what keeps asymmetric crypto out of the
+    /// session server.
+    pub fn object_store(&self) -> Result<std::sync::Arc<dyn ObjectStore>> {
+        use crate::cloudinit::StorageCredential::KeyPair;
+        let KeyPair {
+            access_key_id,
+            secret_access_key,
+        } = &self.credential;
+        let (id, secret) = (access_key_id.clone(), secret_access_key.clone());
+        Ok(match self.provider {
+            ProviderKind::Aws => std::sync::Arc::new(S3Store::aws(self.region.clone(), id, secret)),
+            ProviderKind::DigitalOcean => {
+                std::sync::Arc::new(S3Store::spaces(self.region.clone(), id, secret))
+            }
+            ProviderKind::Gcp => std::sync::Arc::new(S3Store::gcs_interop(id, secret)),
+            other => {
+                return Err(ProviderError::Other(format!(
+                    "provider {other:?} has no recording storage"
+                )));
+            }
+        })
     }
 }
 

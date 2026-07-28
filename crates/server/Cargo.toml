@@ -16,6 +16,14 @@ jamstream-protocol.workspace = true
 jamstream-engine.workspace = true
 jamstream-session.workspace = true
 jamstream-stream.workspace = true
+# Real dependency, not dev-only: the recorder on a cloud VM streams takes
+# to the bucket, so jamstreamd speaks the storage API itself. This puts
+# reqwest and aws-lc-rs into the musl builds; the musl CI job builds both
+# architectures and is the gate that decides this is tenable.
+# default-features off drops the GCP provider and its RSA signing, whose
+# aws-lc-sys C does not link against musl for aarch64. Recording to GCS goes
+# through the S3 interop endpoint, which needs nothing but SigV4.
+jamstream-cloud.workspace = true
 ed25519-dalek.workspace = true
 data-encoding.workspace = true
 flacenc.workspace = true
@@ -28,7 +36,6 @@ tracing-subscriber.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
-jamstream-cloud.workspace = true
 # The version reject story sends an init claiming a version we do not speak.
 jamstream-protocol = { workspace = true, features = ["testing"] }
 # The stream integration test scans the bytes a member receives.

@@ -126,13 +126,18 @@ impl fmt::Debug for SelfDestruct {
 /// appears on argv or in a script body, only in the root-owned config file.
 #[derive(Clone, PartialEq, Eq)]
 pub enum StorageCredential {
-    /// SigV4 access key pair: AWS S3 and DigitalOcean Spaces.
+    /// SigV4 access key pair. AWS S3, DigitalOcean Spaces, and Google Cloud
+    /// Storage through its interop endpoint all take one; the provider on
+    /// the same config decides which endpoint it signs against.
+    ///
+    /// One shape for all three is deliberate. GCS could also take a service
+    /// account key, but its RSA signing pulled aws-lc-sys into jamstreamd,
+    /// whose C does not link against musl for aarch64, and an HMAC key needs
+    /// nothing the SigV4 path does not already have.
     KeyPair {
         access_key_id: String,
         secret_access_key: String,
     },
-    /// GCS service account key JSON.
-    ServiceAccountJson(String),
 }
 
 /// Secrets stay out of Debug; the key id alone is worth seeing in a log.
@@ -144,9 +149,6 @@ impl fmt::Debug for StorageCredential {
                 .field("access_key_id", access_key_id)
                 .field("secret_access_key", &"<redacted>")
                 .finish(),
-            StorageCredential::ServiceAccountJson(_) => {
-                f.write_str("ServiceAccountJson(<redacted>)")
-            }
         }
     }
 }
@@ -162,6 +164,9 @@ pub struct RecordingStorage {
     pub region: String,
     pub retention: Retention,
     pub credential: StorageCredential,
+    /// Capture per-member stereo stems alongside the mix; fixed for the
+    /// session at launch.
+    pub stems: bool,
 }
 
 impl RecordingStorage {
@@ -170,33 +175,70 @@ impl RecordingStorage {
     /// convention in the server config.
     pub fn render_flat_config(&self) -> String {
         let mut out = format!(
-            "provider = {}\nbucket = {}\nregion = {}\nretention = {}\n",
+            "provider = {}\nbucket = {}\nregion = {}\nretention = {}\nstems = {}\n",
             self.provider.as_str(),
             self.bucket,
             self.region,
             self.retention,
+            self.stems,
         );
-        match &self.credential {
-            StorageCredential::KeyPair {
-                access_key_id,
-                secret_access_key,
-            } => {
-                let _ = writeln!(out, "access_key_id = {access_key_id}");
-                let _ = writeln!(
-                    out,
-                    "secret_access_key_b64 = {}",
-                    BASE64.encode(secret_access_key.as_bytes())
-                );
-            }
-            StorageCredential::ServiceAccountJson(json) => {
-                let _ = writeln!(
-                    out,
-                    "service_account_json_b64 = {}",
-                    BASE64.encode(json.as_bytes())
-                );
-            }
-        }
+        let StorageCredential::KeyPair {
+            access_key_id,
+            secret_access_key,
+        } = &self.credential;
+        let _ = writeln!(out, "access_key_id = {access_key_id}");
+        let _ = writeln!(
+            out,
+            "secret_access_key_b64 = {}",
+            BASE64.encode(secret_access_key.as_bytes())
+        );
         out
+    }
+
+    /// Parses what [`RecordingStorage::render_flat_config`] wrote, on the
+    /// machine that received it. The two live in one impl so they cannot
+    /// drift apart unnoticed; the round-trip test holds them together.
+    pub fn parse_flat_config(text: &str) -> Result<RecordingStorage, String> {
+        let want = |key: &str| {
+            flat_config_value(text, key)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("recording config is missing {key}"))
+        };
+        let provider = match want("provider")?.as_str() {
+            "aws" => ProviderKind::Aws,
+            "digitalocean" => ProviderKind::DigitalOcean,
+            "gcp" => ProviderKind::Gcp,
+            other => return Err(format!("recording config names provider {other:?}")),
+        };
+        let retention: Retention = want("retention")?
+            .parse()
+            .map_err(|e| format!("recording config retention: {e}"))?;
+        let stems = match flat_config_value(text, "stems") {
+            None => false,
+            Some("true") => true,
+            Some("false") => false,
+            Some(other) => return Err(format!("recording config stems is {other:?}")),
+        };
+        let decode = |key: &str, b64: &str| {
+            BASE64
+                .decode(b64.as_bytes())
+                .map_err(|_| format!("recording config {key} is not base64"))
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|_| format!("{key} is not utf-8"))
+                })
+        };
+        let credential = StorageCredential::KeyPair {
+            access_key_id: want("access_key_id")?,
+            secret_access_key: decode("secret_access_key_b64", &want("secret_access_key_b64")?)?,
+        };
+        Ok(RecordingStorage {
+            provider,
+            bucket: want("bucket")?,
+            region: want("region")?,
+            retention,
+            credential,
+            stems,
+        })
     }
 }
 
@@ -895,6 +937,7 @@ mod tests {
                 access_key_id: "AKIDRECORD".to_owned(),
                 secret_access_key: "record-secret".to_owned(),
             },
+            stems: true,
         }
     }
 
@@ -1101,6 +1144,20 @@ mod tests {
     #[test]
     fn recording_flat_config_round_trips() {
         let text = recording_storage().render_flat_config();
+        // The structured parse is what the VM runs; it must reproduce the
+        // exact value that was rendered, both credential shapes.
+        assert_eq!(
+            RecordingStorage::parse_flat_config(&text).unwrap(),
+            recording_storage()
+        );
+        // A config written before the stems key reads as stems off, not as
+        // an error: the file on a machine outlives the code that wrote it.
+        let legacy: String = text
+            .lines()
+            .filter(|l| !l.starts_with("stems"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(!RecordingStorage::parse_flat_config(&legacy).unwrap().stems);
         assert_eq!(flat_config_value(&text, "provider"), Some("aws"));
         assert_eq!(flat_config_value(&text, "bucket"), Some("my-jams"));
         assert_eq!(flat_config_value(&text, "region"), Some("us-east-1"));
@@ -1112,23 +1169,15 @@ mod tests {
         let secret = flat_config_value(&text, "secret_access_key_b64").unwrap();
         assert_eq!(BASE64.decode(secret.as_bytes()).unwrap(), b"record-secret");
 
-        // A service account key is JSON, which the flat format cannot carry
-        // raw; base64 makes it one line.
+        // GCS takes the same HMAC pair through its interop endpoint, so the
+        // file has one credential shape for all three providers.
         let gcp = RecordingStorage {
             provider: ProviderKind::Gcp,
-            credential: StorageCredential::ServiceAccountJson(
-                "{\"type\": \"service_account\"}\n".to_owned(),
-            ),
             ..recording_storage()
         };
         let text = gcp.render_flat_config();
         assert_eq!(flat_config_value(&text, "provider"), Some("gcp"));
-        assert!(flat_config_value(&text, "access_key_id").is_none());
-        let json = flat_config_value(&text, "service_account_json_b64").unwrap();
-        assert_eq!(
-            BASE64.decode(json.as_bytes()).unwrap(),
-            b"{\"type\": \"service_account\"}\n"
-        );
+        assert_eq!(RecordingStorage::parse_flat_config(&text).unwrap(), gcp);
     }
 
     #[test]
@@ -1139,13 +1188,6 @@ mod tests {
         assert!(!rendered.contains("record-secret"));
         assert!(rendered.contains("AKIDRECORD"), "the key id is loggable");
         assert!(rendered.contains("my-jams"));
-
-        let sa = format!(
-            "{:?}",
-            StorageCredential::ServiceAccountJson("{\"private_key\": \"x\"}".to_owned())
-        );
-        assert_eq!(sa, "ServiceAccountJson(<redacted>)");
-        assert!(!sa.contains("private_key"));
     }
 
     /// The three providers all redact their credentials from Debug and

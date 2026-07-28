@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
+use jamstream_cloud::cloudinit::RecordingStorage;
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::control::{RecordOp, RecordingState as ProtoRecordingState, StreamOp};
 use jamstream_protocol::transport::derive_public;
@@ -26,6 +27,7 @@ use jamstream_stream::worker::{StreamWorker, TickPayload};
 use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
 
+use crate::cloud_sink::CloudSink;
 use crate::config::Config;
 use crate::record::{DiskSink, RecordPayload, RecordWorker, RecordingState};
 use crate::revocations::Revocations;
@@ -48,11 +50,22 @@ pub struct Options {
 }
 
 #[derive(Debug, Clone)]
-pub struct RecordingOptions {
-    /// Directory the disk sink writes takes into.
-    pub dir: PathBuf,
-    /// Capture per-member stereo stems alongside the mix.
-    pub stems: bool,
+pub enum RecordingOptions {
+    /// Takes land in a directory on this machine: local sessions, where
+    /// the host's own disk is already where the recording belongs.
+    Disk { dir: PathBuf, stems: bool },
+    /// Takes stream to the bucket the launch configured: cloud sessions,
+    /// where the machine is about to destroy itself.
+    Cloud { storage: RecordingStorage },
+}
+
+impl RecordingOptions {
+    fn stems(&self) -> bool {
+        match self {
+            RecordingOptions::Disk { stems, .. } => *stems,
+            RecordingOptions::Cloud { storage } => storage.stems,
+        }
+    }
 }
 
 /// Elapsed session time for the two self-exit windows, which is a different
@@ -149,6 +162,8 @@ pub struct Server {
     /// stream worker: most sessions never record.
     recorder: Option<RecordWorker>,
     recording_opts: Option<RecordingOptions>,
+    /// Lowercase hex of the session id, the prefix cloud takes live under.
+    session_hex: String,
     /// Durable revocation list. None keeps revocations in memory only, which
     /// is fine for a test and wrong for a deployment.
     revocations: Option<Revocations>,
@@ -193,6 +208,7 @@ impl Server {
             stream_roster_epoch: 0,
             recorder: None,
             recording_opts: opts.recording,
+            session_hex: data_encoding::HEXLOWER.encode(&cfg.session_id.0),
             revocations: None,
             shutdown_path: None,
             panics: 0,
@@ -300,7 +316,13 @@ impl Server {
             return;
         };
         if self.recorder.is_none() {
-            match RecordWorker::spawn(DiskSink::new(&cfg.dir)) {
+            let spawned = match &cfg {
+                RecordingOptions::Disk { dir, .. } => RecordWorker::spawn(DiskSink::new(dir)),
+                RecordingOptions::Cloud { storage } => {
+                    CloudSink::new(storage, &self.session_hex).and_then(RecordWorker::spawn)
+                }
+            };
+            match spawned {
                 Ok(worker) => self.recorder = Some(worker),
                 Err(err) => {
                     tracing::error!(error = %err, "cannot start the recorder");
@@ -308,7 +330,7 @@ impl Server {
                         ProtoRecordingState::Failed {
                             reason: format!("cannot start the recorder: {err}"),
                         },
-                        cfg.stems,
+                        cfg.stems(),
                     );
                     return;
                 }
@@ -323,7 +345,7 @@ impl Server {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let stems = cfg.stems.then(|| {
+                let stems = cfg.stems().then(|| {
                     self.core
                         .broadcast_tick()
                         .members
@@ -351,7 +373,7 @@ impl Server {
         let tick = self.core.broadcast_tick();
         let n = tick.audio.len().min(payload.mix.len());
         payload.mix[..n].copy_from_slice(&tick.audio[..n]);
-        let stems = self.recording_opts.as_ref().is_some_and(|c| c.stems);
+        let stems = self.recording_opts.as_ref().is_some_and(|c| c.stems());
         if stems {
             for stem in self.core.stems() {
                 payload.push_stem(stem.id, stem.fader, stem.pcm);
@@ -380,7 +402,7 @@ impl Server {
         let Some(worker) = self.recorder.as_ref() else {
             return;
         };
-        let stems_cfg = self.recording_opts.as_ref().is_some_and(|c| c.stems);
+        let stems_cfg = self.recording_opts.as_ref().is_some_and(|c| c.stems());
         let (state, stems) = match worker.state() {
             RecordingState::Idle => (ProtoRecordingState::Idle, stems_cfg),
             RecordingState::Recording { stems } => (ProtoRecordingState::Recording, stems),

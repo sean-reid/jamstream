@@ -19,7 +19,9 @@ path = "src/main.rs"
 jamstream-protocol.workspace = true
 jamstream-session.workspace = true
 jamstream-audio-io.workspace = true
-jamstream-cloud.workspace = true
+# gcp: this surface launches GCP sessions, so it wants the RSA signing
+# jamstreamd does without.
+jamstream-cloud = { workspace = true, features = ["gcp"] }
 jamstream-cli.workspace = true
 # The platform catalog: display names, per-platform key guidance, and the
 # encode's bitrate. The app draws no stream frames and spawns no ffmpeg; it

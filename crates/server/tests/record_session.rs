@@ -110,7 +110,7 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
         Options {
             bind: loopback(),
             activity_path: None,
-            recording: Some(RecordingOptions {
+            recording: Some(RecordingOptions::Disk {
                 dir: dir.clone(),
                 stems: false,
             }),

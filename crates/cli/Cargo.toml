@@ -14,7 +14,9 @@ path = "src/main.rs"
 [dependencies]
 jamstream-protocol.workspace = true
 jamstream-session.workspace = true
-jamstream-cloud.workspace = true
+# gcp: this surface launches GCP sessions, so it wants the RSA signing
+# jamstreamd does without.
+jamstream-cloud = { workspace = true, features = ["gcp"] }
 
 clap.workspace = true
 clap_complete.workspace = true

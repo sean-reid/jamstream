@@ -57,8 +57,10 @@ pub use recording::{BitDepth, RecordingEstimate, RecordingPlan, StoragePrice, st
 pub use regions::{RegionTable, priced_regions};
 pub use retention::{Retention, RetentionEnforcement};
 pub use solver::{MemberId, ProbeMatrix, RegionScore, rank};
+#[cfg(feature = "gcp")]
+pub use storage::GcsStore;
 pub use storage::{
-    BytesSource, FLAC_CONTENT_TYPE, GcsStore, JSON_CONTENT_TYPE, MockStore, ObjectMeta, ObjectSink,
+    BytesSource, FLAC_CONTENT_TYPE, JSON_CONTENT_TYPE, MockStore, ObjectMeta, ObjectSink,
     ObjectStore, PartSource, ReadSource, S3Store, WAV_CONTENT_TYPE, assert_object_store_contract,
     manifest_key, mix_key, session_prefix, stem_key,
 };
