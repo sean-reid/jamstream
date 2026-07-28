@@ -676,6 +676,20 @@ impl Provider for AwsProvider {
         Ok(())
     }
 
+    /// One security-group describe: the launch's first EC2 call and the
+    /// exact permission a real launch found missing from a hand-written
+    /// policy (#118). Failing it here puts the action name on screen while
+    /// the host is still pasting keys.
+    async fn preflight(&self) -> Result<()> {
+        let region = self
+            .regions()
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProviderError::Other("aws catalog is empty".to_owned()))?;
+        self.find_group(region.id.as_str(), "preflight").await?;
+        Ok(())
+    }
+
     async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>> {
         let mut base = vec![
             ("Filter.1.Name".to_owned(), "instance-state-name".to_owned()),

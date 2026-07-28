@@ -105,6 +105,17 @@ pub trait Provider: Send + Sync {
     /// session; `None` returns every jamstream-tagged instance.
     async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>>;
 
+    /// Cheapest authenticated read exercising a permission that only a
+    /// launch otherwise touches. The wizard's credential check calls this,
+    /// so a token that can price sessions but cannot launch them fails
+    /// while the host is pasting keys, not at step 4 of 4. Two real tokens
+    /// did exactly that: one missing DigitalOcean's firewall scopes, one
+    /// missing AWS's security-group actions. Providers whose credentials
+    /// cannot be scoped below launching have nothing to add.
+    async fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// UDP port the session server will listen on, and so the only port
     /// `launch` opens in the firewall it creates. It rides on the provider
     /// rather than on `LaunchSpec` because the spec is also the local

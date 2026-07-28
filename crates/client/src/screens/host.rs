@@ -717,11 +717,13 @@ fn local_region_row() -> RegionRow {
     }
 }
 
-/// The credential check: the static catalog, one live price call, and one
+/// The credential check: the static catalog, one live price call, one
 /// authenticated list of jamstream-tagged instances (the same call the
 /// docs' `jamstream sweep --dry-run` verification makes; price alone would
-/// not exercise authentication on providers with bundled price data).
-/// Errors are returned verbatim for the pane to show.
+/// not exercise authentication on providers with bundled price data), and
+/// the provider's launch preflight, so a token that can price sessions but
+/// cannot launch them fails here rather than at step 4 of 4. Errors are
+/// returned verbatim for the pane to show.
 pub async fn check_provider(provider: Box<dyn Provider>) -> Result<(), String> {
     let regions = provider.regions();
     let first = regions
@@ -734,6 +736,7 @@ pub async fn check_provider(provider: Box<dyn Provider>) -> Result<(), String> {
         .list_tagged(None)
         .await
         .map_err(|e| e.to_string())?;
+    provider.preflight().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
