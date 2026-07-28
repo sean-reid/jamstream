@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::provider::{ProviderError, Result};
-use crate::retention::{Retention, RetentionEnforcement, manual_note};
+use crate::retention::{Retention, RetentionEnforcement, manual_note, rule_id};
 use crate::storage::{
     ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
     drive_upload,
@@ -470,10 +470,21 @@ impl ObjectStore for MockStore {
         }
         s.retention
             .insert((bucket.to_owned(), prefix.to_owned()), retention);
+        // The whole bucket's rules, because that is what the real stores
+        // return: both providers replace the entire lifecycle document on
+        // every write, so a store that reported only the rule it just set
+        // would hide the bug where the rest of them vanish.
+        let rule = s
+            .retention
+            .iter()
+            .filter(|((b, _), _)| b == bucket)
+            .map(|((_, p), r)| format!("{}: {p} -> {r}\n", rule_id(p)))
+            .collect();
         Ok(RetentionEnforcement::ServerSide {
             provider: self.kind,
             retention,
-            rule: format!("mock lifecycle rule: {prefix} -> {retention}"),
+            rule_id: rule_id(prefix),
+            rule,
         })
     }
 }

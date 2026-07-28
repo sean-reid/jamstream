@@ -431,10 +431,29 @@ async fn delete_is_idempotent_despite_gcs_returning_404() {
 
 // ---- Lifecycle ----
 
+/// Answers the read half of set_retention with `rules`, or with the empty body
+/// GCS sends for a bucket that has none.
+async fn mount_bucket_get(server: &MockServer, rules: Option<Value>) {
+    let body = match rules {
+        Some(rules) => json!({ "lifecycle": { "rule": rules } }),
+        None => json!({}),
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/storage/v1/b/{BUCKET}")))
+        .and(authorized())
+        .and(query_param("fields", "lifecycle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .named("the read before the patch")
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
 async fn lifecycle_patch_scopes_the_rule_to_the_prefix() {
     let server = MockServer::start().await;
     let prefix = session_prefix("s1");
+    mount_bucket_get(&server, None).await;
     Mock::given(method("PATCH"))
         .and(path(format!("/storage/v1/b/{BUCKET}")))
         .and(authorized())
@@ -466,20 +485,85 @@ async fn lifecycle_patch_scopes_the_rule_to_the_prefix() {
 }
 
 #[tokio::test]
-async fn keep_forever_clears_the_rule_list() {
+async fn keep_forever_clears_this_sessions_rule_and_leaves_the_rest() {
     let server = MockServer::start().await;
+    let ours = json!({
+        "action": { "type": "Delete" },
+        "condition": { "age": 7, "matchesPrefix": [session_prefix("s1")] },
+    });
+    let theirs = json!({
+        "action": { "type": "SetStorageClass", "storageClass": "NEARLINE" },
+        "condition": { "age": 10, "matchesPrefix": ["masters/"] },
+    });
+    mount_bucket_get(&server, Some(json!([theirs.clone(), ours]))).await;
     Mock::given(method("PATCH"))
-        .and(body_json(json!({ "lifecycle": { "rule": [] } })))
+        // Only this session's rule goes; the host's own stays. Sending an
+        // empty list, which is what "clear the expiration" used to mean,
+        // deleted every rule on the bucket.
+        .and(body_json(json!({ "lifecycle": { "rule": [theirs] } })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
-        .named("an empty rule list clears a previous expiration")
+        .named("keep forever drops one rule, not the list")
         .mount(&server)
         .await;
     let applied = store(&server)
-        .set_retention(BUCKET, "jamstream/recordings/", Retention::KeepForever)
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::KeepForever)
         .await
         .unwrap();
     assert!(applied.describe().contains("kept until you delete it"));
+}
+
+#[tokio::test]
+async fn a_second_recorded_session_keeps_the_first_ones_expiry_rule() {
+    let server = MockServer::start().await;
+    let first = json!({
+        "action": { "type": "Delete" },
+        "condition": { "age": 90, "matchesPrefix": [session_prefix("s1")] },
+    });
+    mount_bucket_get(&server, Some(json!([first.clone()]))).await;
+    Mock::given(method("PATCH"))
+        .and(body_json(json!({ "lifecycle": { "rule": [
+            first,
+            { "action": { "type": "Delete" },
+              "condition": { "age": 7, "matchesPrefix": [session_prefix("s2")] } },
+        ] } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .named("both sessions' rules")
+        .mount(&server)
+        .await;
+    let applied = store(&server)
+        .set_retention(BUCKET, &session_prefix("s2"), Retention::Days7)
+        .await
+        .unwrap();
+    assert!(applied.is_server_side());
+}
+
+#[tokio::test]
+async fn a_bucket_whose_rules_cannot_be_read_is_left_alone() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/storage/v1/b/{BUCKET}")))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": { "code": 403, "message": "storage.buckets.get denied" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .named("nothing may be written when the existing rules are unknown")
+        .mount(&server)
+        .await;
+    let applied = store(&server)
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::Days30)
+        .await
+        .unwrap();
+    assert!(!applied.is_server_side());
+    let note = applied.describe();
+    assert!(note.contains("storage.buckets.get"), "{note}");
+    assert!(note.contains("30 days unless you do"), "{note}");
 }
 
 #[tokio::test]
@@ -545,6 +629,10 @@ struct FakeState {
     /// session id -> (object name, bytes received so far).
     sessions: std::collections::BTreeMap<String, (String, Vec<u8>)>,
     next_session: u64,
+    /// The bucket's lifecycle rules. Held because the patch replaces the whole
+    /// list: a fake that answered every patch with 200 and forgot the body
+    /// could not show that a previous session's rule is gone.
+    lifecycle: Option<Value>,
 }
 
 impl FakeGcs {
@@ -721,7 +809,17 @@ impl Respond for FakeGcs {
                 .collect();
             ResponseTemplate::new(200).set_body_json(json!({ "items": items }))
         } else if method == "PATCH" && path == format!("/storage/v1/b/{BUCKET}") {
+            let patch: Value = serde_json::from_slice(&request.body).unwrap_or_else(|_| json!({}));
+            // The patch replaces the rule list wholesale, as GCS does.
+            state.lifecycle = patch.get("lifecycle").cloned();
             ResponseTemplate::new(200).set_body_json(json!({ "kind": "storage#bucket" }))
+        } else if method == "GET" && path == format!("/storage/v1/b/{BUCKET}") {
+            // fields=lifecycle on a bucket with no rules is an empty object.
+            let body = match &state.lifecycle {
+                Some(lifecycle) => json!({ "lifecycle": lifecycle }),
+                None => json!({}),
+            };
+            ResponseTemplate::new(200).set_body_json(body)
         } else {
             ResponseTemplate::new(501).set_body_string(format!("{method} {path}"))
         }

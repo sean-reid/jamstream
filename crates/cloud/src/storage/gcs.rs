@@ -40,7 +40,10 @@ use serde_json::json;
 use crate::http;
 use crate::provider::{ProviderError, Result};
 use crate::providers::gcp::TokenSource;
-use crate::retention::{Retention, RetentionEnforcement, gcs_lifecycle_patch};
+use crate::retention::{
+    GCS_MAX_LIFECYCLE_RULES, Retention, RetentionEnforcement, at_capacity_note,
+    merge_gcs_lifecycle, rule_id, unreadable_note,
+};
 use crate::storage::{
     ChunkSink, DEFAULT_PART_SIZE, JSON_CONTENT_TYPE, MultipartBackend, ObjectMeta, ObjectStore,
     Part, PartSource, drain_body, drive_upload,
@@ -120,6 +123,44 @@ impl GcsStore {
 
     fn bucket_url(&self, bucket: &str) -> String {
         format!("{}/storage/v1/b/{}", self.base_url, encode(bucket))
+    }
+
+    /// The bucket's metadata as far as its lifecycle rules, None when this
+    /// identity may not read them.
+    ///
+    /// The patch that writes a rule replaces the whole rule list, so a
+    /// blind write would delete rules the host set themselves. Reading is
+    /// `storage.buckets.get`, which an identity scoped to writing objects need
+    /// not have.
+    async fn lifecycle_rules(&self, bucket: &str) -> Result<Option<serde_json::Value>> {
+        let url = self.bucket_url(bucket);
+        let token = self.token().await?;
+        let resp = match http::send_retrying(|| {
+            self.http
+                .get(&url)
+                .bearer_auth(&token)
+                .query(&[("fields", "lifecycle")])
+        })
+        .await
+        {
+            Ok(resp) => resp,
+            Err(ProviderError::Auth(err)) => {
+                tracing::warn!(
+                    bucket,
+                    error = %err,
+                    "cannot read the bucket's lifecycle rules, so no retention rule was written"
+                );
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        // `fields=lifecycle` on a bucket with no rules is `{}`. A body that is
+        // not JSON is an error rather than an empty rule list: treating it as
+        // empty would write a patch that deletes the host's own rules.
+        resp.json()
+            .await
+            .map(Some)
+            .map_err(|e| ProviderError::Other(format!("reading {bucket}'s lifecycle rules: {e}")))
     }
 
     fn upload_url(&self, bucket: &str) -> String {
@@ -449,7 +490,22 @@ impl ObjectStore for GcsStore {
         retention: Retention,
     ) -> Result<RetentionEnforcement> {
         let url = self.bucket_url(bucket);
-        let patch = gcs_lifecycle_patch(prefix, retention);
+        // Read first: the patch replaces the bucket's whole rule list, so the
+        // rules already there have to be carried across. See crate::retention.
+        let Some(existing) = self.lifecycle_rules(bucket).await? else {
+            return Ok(RetentionEnforcement::Manual {
+                retention,
+                note: unreadable_note(retention, "storage.buckets.get"),
+            });
+        };
+        let Some(patch) =
+            merge_gcs_lifecycle(&existing, prefix, retention, GCS_MAX_LIFECYCLE_RULES)
+        else {
+            return Ok(RetentionEnforcement::Manual {
+                retention,
+                note: at_capacity_note(retention, GCS_MAX_LIFECYCLE_RULES),
+            });
+        };
         let token = self.token().await?;
         http::send_retrying(|| {
             self.http
@@ -462,6 +518,7 @@ impl ObjectStore for GcsStore {
         Ok(RetentionEnforcement::ServerSide {
             provider: ProviderKind::Gcp,
             retention,
+            rule_id: rule_id(prefix),
             rule: patch.to_string(),
         })
     }

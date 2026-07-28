@@ -4,7 +4,7 @@
 //! unchanged.
 
 use crate::provider::ProviderError;
-use crate::retention::Retention;
+use crate::retention::{Retention, RetentionEnforcement};
 use crate::storage::{
     BytesSource, ChunkSink, ObjectStore, PartSource, WAV_CONTENT_TYPE, manifest_key, mix_key,
     session_prefix, stem_key,
@@ -13,8 +13,9 @@ use crate::storage::{
 /// Panics on the first contract violation.
 ///
 /// `bucket` must exist and hold nothing under
-/// [`crate::storage::RECORDING_PREFIX`]; the suite cleans up after itself and
-/// asserts that it did.
+/// [`crate::storage::RECORDING_PREFIX`]; the suite cleans up its objects and
+/// asserts that it did. The lifecycle rules for its two session prefixes stay,
+/// because the trait has no call that removes one.
 pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str) {
     let session = "contract-session";
     let prefix = session_prefix(session);
@@ -150,6 +151,48 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
         assert!(
             !applied.describe().is_empty(),
             "every enforcement outcome needs a line a host can read"
+        );
+    }
+
+    // A second session in the same bucket must not take the first one's rule
+    // with it. Both provider APIs replace the bucket's whole lifecycle
+    // document, so this is the whole promise of per-session retention: the
+    // document that comes back has to still carry the first session's rule.
+    let other = session_prefix("contract-session-two");
+    let first = store
+        .set_retention(bucket, &prefix, Retention::Days90)
+        .await
+        .expect("retention for the first session");
+    let second = store
+        .set_retention(bucket, &other, Retention::Days7)
+        .await
+        .expect("retention for the second session");
+    if let (
+        RetentionEnforcement::ServerSide {
+            rule_id: first_id, ..
+        },
+        RetentionEnforcement::ServerSide {
+            rule_id: second_id,
+            rule: document,
+            ..
+        },
+    ) = (&first, &second)
+    {
+        assert_ne!(
+            first_id, second_id,
+            "two sessions must not share one rule id"
+        );
+        // The prefix rather than the id, because GCS rules carry no id: what
+        // has to be true on every provider is that the document the second
+        // session left behind still says something about the first session's
+        // prefix.
+        assert!(
+            document.contains(prefix.as_str()),
+            "recording a second session deleted the rule for {prefix}: {document}"
+        );
+        assert!(
+            document.contains(other.as_str()),
+            "the second session's own rule is not in the document: {document}"
         );
     }
 
