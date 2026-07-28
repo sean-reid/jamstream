@@ -153,6 +153,7 @@ async fn a_revoked_invite_stays_revoked_across_a_restart() {
         Options {
             bind: loopback(),
             activity_path: None,
+            recording: None,
         },
     )
     .await
@@ -200,6 +201,7 @@ async fn a_revoked_invite_stays_revoked_across_a_restart() {
         Options {
             bind: loopback(),
             activity_path: None,
+            recording: None,
         },
     )
     .await
@@ -246,6 +248,7 @@ async fn a_graceful_stop_tells_every_member_before_exiting() {
         Options {
             bind: loopback(),
             activity_path: None,
+            recording: None,
         },
     )
     .await
@@ -299,6 +302,7 @@ async fn the_shutdown_sentinel_exits_cleanly_and_advertises_itself() {
         Options {
             bind: loopback(),
             activity_path: None,
+            recording: None,
         },
     )
     .await

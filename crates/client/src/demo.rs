@@ -8,7 +8,8 @@ use crate::avatar::disc_color;
 use crate::runtime::{
     AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationId,
     DestinationState, DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView,
-    Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView, TokenId,
+    RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView,
+    TokenId,
 };
 use crate::theme;
 
@@ -113,6 +114,7 @@ struct DemoState {
     left: bool,
     audition: bool,
     destinations: Vec<Destination>,
+    record: RecordView,
 }
 
 pub struct DemoRuntime {
@@ -264,6 +266,7 @@ impl DemoRuntime {
                 left: false,
                 audition: false,
                 destinations: Vec::new(),
+                record: RecordView::default(),
             }),
             is_host,
             frozen,
@@ -410,6 +413,7 @@ impl Runtime for DemoRuntime {
             metronome: s.metronome,
             broadcast,
             stream,
+            record: s.record.clone(),
             cost: self.is_host.then_some(CostView {
                 hourly_microusd: HOURLY_MICROUSD,
                 accrued_microusd: HOURLY_MICROUSD * elapsed_secs / 3600,
@@ -515,6 +519,10 @@ impl Runtime for DemoRuntime {
                     d.dropped_frames = 0;
                 }
             }
+            // The demo recorder transitions instantly; the state a fixture
+            // needs is the one the button just asked for.
+            Command::StartRecord => s.record.state = RecordState::Recording,
+            Command::StopRecord => s.record.state = RecordState::Idle,
             Command::Leave => s.left = true,
             Command::Revoke(jti) => {
                 // The demo token is the member id repeated; reverse it.

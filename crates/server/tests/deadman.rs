@@ -75,6 +75,7 @@ async fn activity_file_advances_with_musicians_and_stops_after_they_leave() {
         Options {
             bind: loopback(),
             activity_path: Some(activity.clone()),
+            recording: None,
         },
     )
     .await

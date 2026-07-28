@@ -42,6 +42,7 @@ async fn wrong_version_init_gets_a_mac_verified_reject() {
         Options {
             bind: loopback(),
             activity_path: None,
+            recording: None,
         },
     )
     .await

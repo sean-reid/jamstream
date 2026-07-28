@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
-use jamstream_protocol::control::StreamOp;
+use jamstream_protocol::control::{RecordOp, RecordingState as ProtoRecordingState, StreamOp};
 use jamstream_protocol::transport::derive_public;
 use jamstream_session::server::{ServerConfig, ServerCore, ServerEvent};
 use jamstream_stream::pipeline::{Roster, StreamConfig, StreamMember};
@@ -27,6 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::Config;
+use crate::record::{DiskSink, RecordPayload, RecordWorker, RecordingState};
 use crate::revocations::Revocations;
 
 const TICK: Duration = Duration::from_micros(2_500);
@@ -40,6 +41,18 @@ pub struct Options {
     /// Touched once a second while musicians are connected; the systemd
     /// guard treats staleness as idleness. None disables (tests, dev).
     pub activity_path: Option<PathBuf>,
+    /// Where takes go when the host presses record. None means recording
+    /// was not configured for this session, and a record request fails
+    /// visibly instead of silently.
+    pub recording: Option<RecordingOptions>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordingOptions {
+    /// Directory the disk sink writes takes into.
+    pub dir: PathBuf,
+    /// Capture per-member stereo stems alongside the mix.
+    pub stems: bool,
 }
 
 /// Elapsed session time for the two self-exit windows, which is a different
@@ -132,6 +145,10 @@ pub struct Server {
     stream_cfg: StreamConfig,
     /// Roster generation last handed to the pipeline.
     stream_roster_epoch: u64,
+    /// Recorder, started on the host's first record request, like the
+    /// stream worker: most sessions never record.
+    recorder: Option<RecordWorker>,
+    recording_opts: Option<RecordingOptions>,
     /// Durable revocation list. None keeps revocations in memory only, which
     /// is fine for a test and wrong for a deployment.
     revocations: Option<Revocations>,
@@ -174,6 +191,8 @@ impl Server {
             stream: None,
             stream_cfg,
             stream_roster_epoch: 0,
+            recorder: None,
+            recording_opts: opts.recording,
             revocations: None,
             shutdown_path: None,
             panics: 0,
@@ -266,19 +285,130 @@ impl Server {
         }
     }
 
+    /// Starts or stops the recorder on the host's request, and reports the
+    /// outcome to every member right away rather than on the next beat.
+    fn route_record_ctl(&mut self, op: RecordOp) {
+        let Some(cfg) = self.recording_opts.clone() else {
+            // Failing visibly is the recorder's contract: a host who
+            // pressed record must not find out after the song.
+            self.core.set_record_status(
+                ProtoRecordingState::Failed {
+                    reason: "recording is not configured for this session".to_owned(),
+                },
+                false,
+            );
+            return;
+        };
+        if self.recorder.is_none() {
+            match RecordWorker::spawn(DiskSink::new(&cfg.dir)) {
+                Ok(worker) => self.recorder = Some(worker),
+                Err(err) => {
+                    tracing::error!(error = %err, "cannot start the recorder");
+                    self.core.set_record_status(
+                        ProtoRecordingState::Failed {
+                            reason: format!("cannot start the recorder: {err}"),
+                        },
+                        cfg.stems,
+                    );
+                    return;
+                }
+            }
+        }
+        let Some(worker) = self.recorder.as_ref() else {
+            return;
+        };
+        match op {
+            RecordOp::Start => {
+                let unix_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let stems = cfg.stems.then(|| {
+                    self.core
+                        .broadcast_tick()
+                        .members
+                        .iter()
+                        .map(|m| (m.id, m.name.to_owned()))
+                        .collect()
+                });
+                worker.start(unix_secs, stems);
+            }
+            RecordOp::Stop => worker.stop(),
+        }
+        self.report_record_status();
+    }
+
+    /// Feeds the recorder this tick's mix and, when configured, the decoded
+    /// stems. Fixed-size copy and a try_send, exactly like the stream feed.
+    fn feed_record(&mut self) {
+        let Some(worker) = self.recorder.as_ref() else {
+            return;
+        };
+        if !worker.recording() {
+            return;
+        }
+        let mut payload = Box::new(RecordPayload::default());
+        let tick = self.core.broadcast_tick();
+        let n = tick.audio.len().min(payload.mix.len());
+        payload.mix[..n].copy_from_slice(&tick.audio[..n]);
+        let stems = self.recording_opts.as_ref().is_some_and(|c| c.stems);
+        if stems {
+            for stem in self.core.stems() {
+                payload.push_stem(stem.id, stem.fader, stem.pcm);
+            }
+        }
+        worker.submit_tick(payload);
+    }
+
+    /// Once a second: surface recorder transitions the tick path did not
+    /// (a failed sink mid-take), and say when the recorder falls behind.
+    fn beat_record(&mut self) {
+        if let Some(worker) = self.recorder.as_ref() {
+            let gaps = worker.gap_ticks();
+            if gaps > 0 {
+                tracing::warn!(gaps, "recorder fell behind the mix tick");
+            }
+        }
+        self.report_record_status();
+    }
+
+    /// Maps the recorder's own state to the wire message and hands it to the
+    /// core, which fans out on change. The two enums stay separate on
+    /// purpose: the recorder's carries what the recorder knows (stems inside
+    /// Recording), the protocol's carries what every surface shows.
+    fn report_record_status(&mut self) {
+        let Some(worker) = self.recorder.as_ref() else {
+            return;
+        };
+        let stems_cfg = self.recording_opts.as_ref().is_some_and(|c| c.stems);
+        let (state, stems) = match worker.state() {
+            RecordingState::Idle => (ProtoRecordingState::Idle, stems_cfg),
+            RecordingState::Recording { stems } => (ProtoRecordingState::Recording, stems),
+            RecordingState::Failed { reason } => {
+                (ProtoRecordingState::Failed { reason }, stems_cfg)
+            }
+        };
+        self.core.set_record_status(state, stems);
+    }
+
     /// Feeds the pipeline this tick's broadcast audio and card state. Copies a
     /// fixed-size payload and hands it off; it never waits on ffmpeg.
     fn feed_stream(&mut self, now_ms: u64) {
+        // The recorder taps the same broadcast slice the pipeline does, so
+        // the tap stays on while either consumer wants audio; the stream
+        // worker is only fed when it is the one asking.
+        let recording = self.recorder.as_ref().is_some_and(|w| w.recording());
+        let stream_wants = self.stream.as_ref().is_some_and(|w| w.wants_audio());
+        let tap = stream_wants || recording;
+        if tap != self.core.broadcast_tap() {
+            self.core.set_broadcast_tap(tap);
+        }
+        if !stream_wants {
+            return;
+        }
         let Some(worker) = self.stream.as_ref() else {
             return;
         };
-        let wants = worker.wants_audio();
-        if wants != self.core.broadcast_tap() {
-            self.core.set_broadcast_tap(wants);
-        }
-        if !wants {
-            return;
-        }
         let tick = self.core.broadcast_tick();
         let mut payload = TickPayload::default();
         let n = tick.audio.len().min(payload.audio.len());
@@ -328,6 +458,7 @@ impl Server {
             log_event(&event);
             match event {
                 ServerEvent::StreamCtl(op) => self.route_stream_ctl(now_ms, op),
+                ServerEvent::RecordCtl(op) => self.route_record_ctl(op),
                 // Written through before this call returns, so the revocation
                 // survives whatever exit comes next. Nothing is buffered:
                 // a revocation the host has been told about must already be
@@ -394,11 +525,13 @@ impl Server {
                     // Straight after the tick: the broadcast slice the tap
                     // exposes is the slot that tick just wrote.
                     self.feed_stream(now_ms);
+                    self.feed_record();
                     self.drain_events(now_ms);
                 }
                 _ = heartbeat.tick() => {
                     let now_ms = start.elapsed().as_millis() as u64;
                     self.beat_stream(now_ms);
+                    self.beat_record();
                     let musicians = self.core.musicians_connected();
                     if musicians > 0 {
                         touch(self.activity_path.as_deref());
@@ -538,6 +671,7 @@ fn log_event(event: &ServerEvent) {
         ServerEvent::TokenRevoked { jti } => tracing::info!(jti = ?jti, "token revoked"),
         // The op's Debug redacts the stream key by construction.
         ServerEvent::StreamCtl(op) => tracing::info!(op = ?op, "stream control"),
+        ServerEvent::RecordCtl(op) => tracing::info!(op = ?op, "record control"),
     }
 }
 

@@ -54,6 +54,7 @@ impl TestServer {
                 Options {
                     bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                     activity_path: None,
+                    recording: None,
                 },
             )
             .await

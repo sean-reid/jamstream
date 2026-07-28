@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use jamstream_server::config::Config;
 use jamstream_server::revocations::Revocations;
-use jamstream_server::runtime::{Options, Server};
+use jamstream_server::runtime::{Options, RecordingOptions, Server};
 use jamstream_stream::pipeline::StreamConfig;
 
 #[cfg(target_os = "linux")]
@@ -79,6 +79,12 @@ fn main() -> ExitCode {
             arg_value("--activity-file")
                 .map_or_else(|| PathBuf::from(DEFAULT_ACTIVITY), PathBuf::from),
         ),
+        // Recording is off unless the launcher names a directory; a record
+        // request without one fails visibly in the session.
+        recording: arg_value("--record-dir").map(|dir| RecordingOptions {
+            dir: PathBuf::from(dir),
+            stems: has_flag("--record-stems"),
+        }),
     };
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -262,6 +268,10 @@ fn arg_value(flag: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn has_flag(flag: &str) -> bool {
+    std::env::args().any(|arg| arg == flag)
 }
 
 #[cfg(test)]

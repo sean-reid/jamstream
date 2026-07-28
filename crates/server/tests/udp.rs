@@ -37,6 +37,7 @@ async fn join_chat_and_leave_over_real_udp() {
         Options {
             bind: loopback(),
             activity_path: None,
+            recording: None,
         },
     )
     .await

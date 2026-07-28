@@ -64,6 +64,7 @@ async fn host_revokes_musician_two_and_musician_one_plays_on() {
         Options {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             activity_path: None,
+            recording: None,
         },
     )
     .await

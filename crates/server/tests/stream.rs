@@ -140,6 +140,7 @@ async fn a_hosts_stream_request_reaches_the_pipeline_and_status_reaches_everyone
         Options {
             bind: loopback(),
             activity_path: None,
+            recording: None,
         },
     )
     .await
