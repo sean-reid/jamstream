@@ -691,13 +691,19 @@ fn wizard_setup_app(theme: Theme) -> JamApp {
     app
 }
 
-/// A server artifact that could not exist: a reserved domain and a sha of
-/// nothing but zeros. The fixture supplies it rather than the real
-/// `option_env!` pin, so the baseline shows what a release build shows
+/// Server artifacts that could not exist: a reserved domain and shas of
+/// nothing but zeros. The fixture supplies them rather than the real
+/// `option_env!` pins, so the baseline shows what a release build shows
 /// without depending on how this build was compiled.
-const FAKE_PIN: jamstream_cloud::PinnedServerArtifact = jamstream_cloud::PinnedServerArtifact {
-    url: "https://example.invalid/jamstream/jamstreamd-linux-x86_64-musl",
-    sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+const FAKE_PINS: jamstream_cloud::PinnedServerArtifacts = jamstream_cloud::PinnedServerArtifacts {
+    x86_64: Some(jamstream_cloud::PinnedServerArtifact {
+        url: "https://example.invalid/jamstream/jamstreamd-linux-x86_64-musl",
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+    }),
+    aarch64: Some(jamstream_cloud::PinnedServerArtifact {
+        url: "https://example.invalid/jamstream/jamstreamd-linux-aarch64-musl",
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+    }),
 };
 
 /// The cost preview as a release build shows it: the server binary is
@@ -705,7 +711,7 @@ const FAKE_PIN: jamstream_cloud::PinnedServerArtifact = jamstream_cloud::PinnedS
 /// the path every user of a release is on, and the published screenshot.
 fn wizard_preview_app(theme: Theme) -> JamApp {
     let mut app = wizard_preview_unpinned_app(theme);
-    app.wizard.pinned = Some(FAKE_PIN);
+    app.wizard.pinned = FAKE_PINS;
     app.wizard.advanced_open = false;
     app
 }
@@ -721,7 +727,7 @@ fn wizard_preview_unpinned_app(theme: Theme) -> JamApp {
     w.select_provider(1);
     w.continue_to_region(fixed_regions());
     w.continue_to_preview();
-    w.pinned = None;
+    w.pinned = jamstream_cloud::PinnedServerArtifacts::default();
     w.advanced_open = true;
     app.wizard = w;
     app.screen = Screen::HostWizard;

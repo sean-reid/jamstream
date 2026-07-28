@@ -1,21 +1,53 @@
-//! The server artifact pinned into this build at compile time.
+//! The server artifacts pinned into this build at compile time, one per
+//! architecture the providers launch.
 //!
-//! Release builds are compiled with `JAMSTREAM_SERVER_URL` and
-//! `JAMSTREAM_SERVER_SHA256` in the environment (release.yml computes both
-//! in its server-musl job and exports them into every client and CLI
-//! build), so [`pinned`] returns the exact `jamstreamd` download the
-//! release published, and cloud hosting works without the user ever seeing
-//! an artifact URL or hash. Development builds have neither variable set
-//! and get `None`; there the CLI's `--artifact-url`/`--artifact-sha256`
-//! overrides are the only way to host on a cloud provider.
+//! Release builds are compiled with `JAMSTREAM_SERVER_URL_X86_64` /
+//! `JAMSTREAM_SERVER_SHA256_X86_64` and `JAMSTREAM_SERVER_URL_AARCH64` /
+//! `JAMSTREAM_SERVER_SHA256_AARCH64` in the environment (release.yml
+//! computes all four in its server-musl job and exports them into every
+//! client and CLI build), so [`pinned`] returns the exact `jamstreamd`
+//! downloads the release published, and cloud hosting works without the
+//! user ever seeing an artifact URL or hash. Two pins because the
+//! providers do not agree on a CPU: AWS launches Graviton (arm64) while
+//! GCP and DigitalOcean launch x86_64, and #139 was a released app
+//! booting an arm64 machine with only an x86_64 binary to give it.
+//! Development builds have no variables set and get an empty set; there
+//! the CLI's `--artifact-url`/`--artifact-sha256` overrides are the only
+//! way to host on a cloud provider.
 //!
 //! `option_env!` is read when THIS crate compiles; cargo tracks the env
 //! dependency, so a build with the variables set recompiles the crate.
 //! That also means an already-compiled test binary cannot exercise the
-//! `Some` case: the unit tests here cover the `None` case (dev builds) and
-//! the validation helper on a sample pair, while the `Some` case is proven
-//! by the release pipeline itself, whose cloud launches would fail without
-//! a valid pinned pair.
+//! pinned case: the unit tests here cover the empty case (dev builds),
+//! per-architecture selection, and the validation helper on a sample
+//! pair, while the pinned case is proven by the release pipeline itself,
+//! whose cloud launches would fail without valid pinned pairs.
+
+use std::fmt;
+
+/// CPU architecture of the machines a provider launches, which decides
+/// which `jamstreamd` build the session VM must download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerArch {
+    X86_64,
+    Aarch64,
+}
+
+impl ServerArch {
+    /// The architecture's name as `uname -m` reports it on Linux.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServerArch::X86_64 => "x86_64",
+            ServerArch::Aarch64 => "aarch64",
+        }
+    }
+}
+
+impl fmt::Display for ServerArch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// A `jamstreamd` download baked into the binary at compile time: the URL
 /// the session VM fetches at boot and the sha256 it must match.
@@ -25,17 +57,56 @@ pub struct PinnedServerArtifact {
     pub sha256: &'static str,
 }
 
-/// The server artifact pinned into this build, or `None` for development
-/// builds. Both environment variables must be present and well formed
-/// (non-empty URL, 64 hex character sha256); a half-set or malformed pair
-/// yields `None` rather than a panic, with a `debug_assert` to catch a
-/// misconfigured pipeline in debug builds.
-pub fn pinned() -> Option<PinnedServerArtifact> {
-    let url = option_env!("JAMSTREAM_SERVER_URL");
-    let sha256 = option_env!("JAMSTREAM_SERVER_SHA256");
+/// The per-architecture pins this build carries; release builds carry
+/// both, development builds neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PinnedServerArtifacts {
+    pub x86_64: Option<PinnedServerArtifact>,
+    pub aarch64: Option<PinnedServerArtifact>,
+}
+
+impl PinnedServerArtifacts {
+    /// The pin for the machines `arch` names, if this build carries one.
+    pub fn for_arch(self, arch: ServerArch) -> Option<PinnedServerArtifact> {
+        match arch {
+            ServerArch::X86_64 => self.x86_64,
+            ServerArch::Aarch64 => self.aarch64,
+        }
+    }
+
+    /// True when this build carries any pin at all, which is how callers
+    /// tell a release build from a development one.
+    pub fn any(self) -> bool {
+        self.x86_64.is_some() || self.aarch64.is_some()
+    }
+}
+
+/// The server artifacts pinned into this build; both fields are `None`
+/// for development builds.
+pub fn pinned() -> PinnedServerArtifacts {
+    PinnedServerArtifacts {
+        x86_64: pin_from(
+            option_env!("JAMSTREAM_SERVER_URL_X86_64"),
+            option_env!("JAMSTREAM_SERVER_SHA256_X86_64"),
+        ),
+        aarch64: pin_from(
+            option_env!("JAMSTREAM_SERVER_URL_AARCH64"),
+            option_env!("JAMSTREAM_SERVER_SHA256_AARCH64"),
+        ),
+    }
+}
+
+/// One architecture's pair. Both variables must be present and well
+/// formed (non-empty URL, 64 hex character sha256); a half-set or
+/// malformed pair yields `None` rather than a panic, with a
+/// `debug_assert` to catch a misconfigured pipeline in debug builds.
+fn pin_from(
+    url: Option<&'static str>,
+    sha256: Option<&'static str>,
+) -> Option<PinnedServerArtifact> {
     debug_assert!(
         url.is_some() == sha256.is_some(),
-        "JAMSTREAM_SERVER_URL and JAMSTREAM_SERVER_SHA256 must be set together"
+        "a pinned artifact's URL and SHA256 variables must be set together"
     );
     match (url, sha256) {
         (Some(url), Some(sha256)) if is_valid_pair(url, sha256) => {
@@ -104,18 +175,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dev_builds_have_no_pinned_artifact() {
-        // This test binary was compiled without JAMSTREAM_SERVER_URL /
-        // JAMSTREAM_SERVER_SHA256; setting them at run time cannot change
-        // an already-compiled option_env!, which is exactly the guarantee
-        // dev builds rely on.
-        assert_eq!(pinned(), None);
+    fn dev_builds_have_no_pinned_artifacts() {
+        // This test binary was compiled without the JAMSTREAM_SERVER_URL_* /
+        // JAMSTREAM_SERVER_SHA256_* variables; setting them at run time
+        // cannot change an already-compiled option_env!, which is exactly
+        // the guarantee dev builds rely on.
+        assert_eq!(pinned(), PinnedServerArtifacts::default());
+        assert!(!pinned().any());
+        for arch in [ServerArch::X86_64, ServerArch::Aarch64] {
+            assert_eq!(pinned().for_arch(arch), None);
+        }
+    }
+
+    /// #139: the pin an AWS (arm64) launch selects must never be the
+    /// x86_64 build, and vice versa.
+    #[test]
+    fn each_architecture_selects_its_own_pin() {
+        let x86 = PinnedServerArtifact {
+            url: "https://example.com/jamstreamd-linux-x86_64-musl",
+            sha256: "1111111111111111111111111111111111111111111111111111111111111111",
+        };
+        let arm = PinnedServerArtifact {
+            url: "https://example.com/jamstreamd-linux-aarch64-musl",
+            sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+        };
+        let pins = PinnedServerArtifacts {
+            x86_64: Some(x86),
+            aarch64: Some(arm),
+        };
+        assert_eq!(pins.for_arch(ServerArch::X86_64), Some(x86));
+        assert_eq!(pins.for_arch(ServerArch::Aarch64), Some(arm));
+        assert!(pins.any());
+
+        // A half-pinned build reports the hole instead of substituting the
+        // other architecture's binary, which is the exact wrong-binary
+        // launch this module exists to prevent.
+        let half = PinnedServerArtifacts {
+            x86_64: Some(x86),
+            aarch64: None,
+        };
+        assert_eq!(half.for_arch(ServerArch::Aarch64), None);
+        assert!(half.any());
+    }
+
+    /// The names must match `uname -m` on Linux: they name release assets
+    /// and appear in errors a user acts on.
+    #[test]
+    fn arch_names_match_uname() {
+        assert_eq!(ServerArch::X86_64.as_str(), "x86_64");
+        assert_eq!(ServerArch::Aarch64.as_str(), "aarch64");
+        assert_eq!(format!("{}", ServerArch::Aarch64), "aarch64");
     }
 
     #[test]
     fn a_release_shaped_pair_validates() {
-        // The Some case cannot be reached from an already-compiled test
-        // binary; this covers the validation the release pair must pass.
+        // The pinned case cannot be reached from an already-compiled test
+        // binary; this covers the validation the release pairs must pass.
         let url = "https://github.com/sean-reid/jamstream/releases/download/v0.1.0/jamstreamd-linux-x86_64-musl";
         let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
         assert!(is_valid_pair(url, sha));

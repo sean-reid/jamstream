@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use data_encoding::BASE64;
 use serde::Deserialize;
 
+use crate::artifact::ServerArch;
 use crate::http;
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
@@ -528,6 +529,12 @@ impl AwsProvider {
 impl Provider for AwsProvider {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Aws
+    }
+
+    /// t4g is Graviton and the AMI is the Debian 12 arm64 build, so the
+    /// server binary must be aarch64.
+    fn server_arch(&self) -> ServerArch {
+        ServerArch::Aarch64
     }
 
     fn regions(&self) -> Vec<Region> {
@@ -1865,5 +1872,18 @@ mod tests {
     fn instance_type_mapping() {
         assert_eq!(instance_type(InstanceClass::Small), "t4g.small");
         assert_eq!(instance_type(InstanceClass::Standard), "t4g.medium");
+    }
+
+    /// #139: every instance type here is Graviton and the AMI parameter is
+    /// the arm64 build, so the artifact this provider selects must be the
+    /// aarch64 one; the x86_64 binary dies at exec on these machines.
+    #[test]
+    fn launches_arm64_machines_and_says_so() {
+        let provider = AwsProvider::new("AKIATEST".to_owned(), "secret".to_owned());
+        assert_eq!(provider.server_arch(), ServerArch::Aarch64);
+        assert!(DEBIAN_12_ARM64_PARAM.ends_with("arm64"));
+        for class in [InstanceClass::Small, InstanceClass::Standard] {
+            assert!(instance_type(class).starts_with("t4g."));
+        }
     }
 }

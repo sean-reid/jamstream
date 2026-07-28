@@ -33,16 +33,19 @@ const PLACEHOLDER_ARTIFACT_SHA256: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The artifact the boot config carries, by precedence: the explicit
-/// --artifact-url/--artifact-sha256 overrides first, then the download
-/// pinned into this build at compile time (every release build carries
-/// one), and otherwise a usage error, because a cloud VM cannot boot
-/// without something verifiable to download. Local and mock launches
-/// download nothing, so without overrides they get the inert placeholders.
+/// --artifact-url/--artifact-sha256 overrides first (they apply to
+/// whatever architecture this launch runs on), then the download pinned
+/// into this build for `arch`, the architecture of the machines the
+/// provider launches. A launch whose architecture has no pin is refused
+/// here, because the VM would download a binary that cannot execute
+/// (#139). Local and mock launches download nothing, so without
+/// overrides they get the inert placeholders.
 fn resolve_artifact(
     needs_download: bool,
+    arch: jamstream_cloud::ServerArch,
     url_flag: Option<&str>,
     sha_flag: Option<&str>,
-    pinned: Option<jamstream_cloud::PinnedServerArtifact>,
+    pinned: jamstream_cloud::PinnedServerArtifacts,
 ) -> Result<(String, String), CliError> {
     if let (Some(url), Some(sha)) = (url_flag, sha_flag) {
         // Checked here rather than on the VM, where a bad pair costs a
@@ -56,8 +59,13 @@ fn resolve_artifact(
             PLACEHOLDER_ARTIFACT_SHA256.to_owned(),
         ));
     }
-    match pinned {
+    match pinned.for_arch(arch) {
         Some(p) => Ok((p.url.to_owned(), p.sha256.to_owned())),
+        None if pinned.any() => Err(CliError::Failed(format!(
+            "this build pins no {arch} server artifact and this provider launches {arch} \
+             machines, which could only download a binary they cannot run; pass \
+             --artifact-url and --artifact-sha256 naming an {arch} jamstreamd build"
+        ))),
         None => Err(CliError::Usage(
             "this build has no pinned server artifact because it is not a release build; \
              pass --artifact-url and --artifact-sha256 naming a jamstreamd build the VM \
@@ -163,6 +171,7 @@ pub async fn run<W: Write>(
     // launches nothing; only a cloud VM downloads the artifact for real.
     let (artifact_url, artifact_sha256) = resolve_artifact(
         !is_mock && !is_local,
+        provider.server_arch(),
         args.artifact_url.as_deref(),
         args.artifact_sha256.as_deref(),
         jamstream_cloud::pinned(),
@@ -729,32 +738,114 @@ mod tests {
         }
     }
 
+    /// A release-shaped pin set with two distinct downloads, so a test that
+    /// selects the wrong one cannot pass by coincidence.
+    fn both_pins() -> jamstream_cloud::PinnedServerArtifacts {
+        jamstream_cloud::PinnedServerArtifacts {
+            x86_64: Some(jamstream_cloud::PinnedServerArtifact {
+                url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-x86_64-musl",
+                sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            }),
+            aarch64: Some(jamstream_cloud::PinnedServerArtifact {
+                url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-aarch64-musl",
+                sha256: "4444444444444444444444444444444444444444444444444444444444444444",
+            }),
+        }
+    }
+
     #[test]
     fn artifact_precedence_is_flags_then_pinned_then_error() {
-        let pinned = jamstream_cloud::PinnedServerArtifact {
-            url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-x86_64-musl",
-            sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-        };
-        // Explicit flags outrank the pin.
+        let pinned = both_pins();
+        // Explicit flags outrank the pin, on either architecture.
+        for arch in [
+            jamstream_cloud::ServerArch::X86_64,
+            jamstream_cloud::ServerArch::Aarch64,
+        ] {
+            let (url, sha) = resolve_artifact(
+                true,
+                arch,
+                Some("https://own.example/jamstreamd"),
+                Some("1111111111111111111111111111111111111111111111111111111111111111"),
+                pinned,
+            )
+            .unwrap();
+            assert_eq!(url, "https://own.example/jamstreamd");
+            assert_eq!(sha, "1".repeat(64));
+        }
+        // No flags: the pin for the launch's architecture fills in.
         let (url, sha) = resolve_artifact(
             true,
-            Some("https://own.example/jamstreamd"),
-            Some("1111111111111111111111111111111111111111111111111111111111111111"),
-            Some(pinned),
+            jamstream_cloud::ServerArch::X86_64,
+            None,
+            None,
+            pinned,
         )
         .unwrap();
-        assert_eq!(url, "https://own.example/jamstreamd");
-        assert_eq!(sha, "1".repeat(64));
-        // No flags: the pin fills in.
-        let (url, sha) = resolve_artifact(true, None, None, Some(pinned)).unwrap();
-        assert_eq!(url, pinned.url);
-        assert_eq!(sha, pinned.sha256);
-        // No flags, no pin, cloud launch: the error explains why and both
+        assert_eq!(url, pinned.x86_64.unwrap().url);
+        assert_eq!(sha, pinned.x86_64.unwrap().sha256);
+        // No flags, no pins, cloud launch: the error explains why and both
         // ways out.
-        let err = resolve_artifact(true, None, None, None).unwrap_err();
+        let err = resolve_artifact(
+            true,
+            jamstream_cloud::ServerArch::X86_64,
+            None,
+            None,
+            jamstream_cloud::PinnedServerArtifacts::default(),
+        )
+        .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("not a release build"), "error was: {text}");
         assert!(text.contains("--artifact-url"), "error was: {text}");
+    }
+
+    /// #139 root cause: the pin followed the build, not the machine. The
+    /// architecture must come from the provider doing the launching, and
+    /// the two real cloud providers with fixed instance families must pull
+    /// opposite pins from the same build.
+    #[test]
+    fn aws_selects_the_arm64_pin_and_digitalocean_the_x86_64_one() {
+        use jamstream_cloud::providers::{aws::AwsProvider, digitalocean::DigitalOceanProvider};
+        let pinned = both_pins();
+        let aws = AwsProvider::new("AKIATEST".to_owned(), "secret".to_owned());
+        let (url, _) = resolve_artifact(true, aws.server_arch(), None, None, pinned).unwrap();
+        assert!(url.ends_with("jamstreamd-linux-aarch64-musl"), "{url}");
+        let digitalocean = DigitalOceanProvider::new("t".to_owned());
+        let (url, _) =
+            resolve_artifact(true, digitalocean.server_arch(), None, None, pinned).unwrap();
+        assert!(url.ends_with("jamstreamd-linux-x86_64-musl"), "{url}");
+    }
+
+    /// A launch whose architecture has no pin must refuse before a machine
+    /// is paid for, and the error must name the architecture, because
+    /// launching would produce exactly the dead VM of #139.
+    #[test]
+    fn a_missing_arch_pin_refuses_to_launch_naming_the_architecture() {
+        let x86_only = jamstream_cloud::PinnedServerArtifacts {
+            aarch64: None,
+            ..both_pins()
+        };
+        let err = resolve_artifact(
+            true,
+            jamstream_cloud::ServerArch::Aarch64,
+            None,
+            None,
+            x86_only,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("aarch64"), "error was: {err}");
+        assert!(err.contains("--artifact-url"), "error was: {err}");
+        // The override remains the escape hatch and applies to the
+        // architecture being launched.
+        let (url, _) = resolve_artifact(
+            true,
+            jamstream_cloud::ServerArch::Aarch64,
+            Some("https://own.example/jamstreamd-arm64"),
+            Some("3333333333333333333333333333333333333333333333333333333333333333"),
+            x86_only,
+        )
+        .unwrap();
+        assert_eq!(url, "https://own.example/jamstreamd-arm64");
     }
 
     /// The overrides are the one part of the VM's root bootstrap a user
@@ -767,9 +858,15 @@ mod tests {
             ("https://own.example/a\";id;\"", sha, "url"),
             ("https://own.example/jamstreamd", "abcd", "64 hex digits"),
         ] {
-            let err = resolve_artifact(true, Some(url), Some(sha), None)
-                .unwrap_err()
-                .to_string();
+            let err = resolve_artifact(
+                true,
+                jamstream_cloud::ServerArch::X86_64,
+                Some(url),
+                Some(sha),
+                jamstream_cloud::PinnedServerArtifacts::default(),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains(what), "{url} {sha} was rejected as {err:?}");
         }
         // A valid pair still passes through untouched, on a local launch
@@ -777,9 +874,10 @@ mod tests {
         for needs_download in [true, false] {
             let (url, out_sha) = resolve_artifact(
                 needs_download,
+                jamstream_cloud::ServerArch::X86_64,
                 Some("https://own.example/d"),
                 Some(sha),
-                None,
+                jamstream_cloud::PinnedServerArtifacts::default(),
             )
             .unwrap();
             assert_eq!(url, "https://own.example/d");
@@ -790,15 +888,23 @@ mod tests {
     #[test]
     fn local_and_mock_launches_use_placeholders_unless_overridden() {
         // No download happens, so no flags and no pin is fine.
-        let (url, sha) = resolve_artifact(false, None, None, None).unwrap();
+        let (url, sha) = resolve_artifact(
+            false,
+            jamstream_cloud::ServerArch::X86_64,
+            None,
+            None,
+            jamstream_cloud::PinnedServerArtifacts::default(),
+        )
+        .unwrap();
         assert_eq!(url, PLACEHOLDER_ARTIFACT_URL);
         assert_eq!(sha, PLACEHOLDER_ARTIFACT_SHA256);
         // Explicit flags still win everywhere.
         let (url, _) = resolve_artifact(
             false,
+            jamstream_cloud::ServerArch::X86_64,
             Some("https://own.example/jamstreamd"),
             Some("2222222222222222222222222222222222222222222222222222222222222222"),
-            None,
+            jamstream_cloud::PinnedServerArtifacts::default(),
         )
         .unwrap();
         assert_eq!(url, "https://own.example/jamstreamd");
