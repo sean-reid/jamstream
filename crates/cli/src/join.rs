@@ -6,8 +6,8 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use jamstream_protocol::control::DestinationState;
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
+use jamstream_protocol::control::{DestinationState, RecordingState};
 use jamstream_protocol::ids::{HOST_MEMBER_ID, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState, ServerCandidates};
@@ -280,6 +280,16 @@ fn print_event<W: Write>(out: &mut W, event: &ClientEvent) -> std::io::Result<()
                 .filter(|d| d.state == DestinationState::Live)
                 .count();
             writeln!(out, "stream: {live} of {} live", destinations.len())
+        }
+        ClientEvent::RecordStatus { state, stems } => {
+            let what = match state {
+                RecordingState::Idle => "idle".to_owned(),
+                RecordingState::Recording if *stems => "recording (mix and stems)".to_owned(),
+                RecordingState::Recording => "recording".to_owned(),
+                RecordingState::Uploading => "uploading".to_owned(),
+                RecordingState::Failed { reason } => format!("failed: {reason}"),
+            };
+            writeln!(out, "record: {what}")
         }
         // Once a second; too chatty for line output.
         ClientEvent::RttSample { .. } => Ok(()),

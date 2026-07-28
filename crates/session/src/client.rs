@@ -10,7 +10,8 @@ use jamstream_engine::{
     MediaPacket, Pull, RedundancyPolicy,
 };
 use jamstream_protocol::control::{
-    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MemberInfo, StreamOp,
+    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MemberInfo, RecordOp,
+    RecordingState, StreamOp,
 };
 use jamstream_protocol::ids::{MemberId, Role, TokenId};
 use jamstream_protocol::invite::Invite;
@@ -128,6 +129,13 @@ pub enum ClientEvent {
     /// every member, so any client can show the room it is on air. Never
     /// carries a stream key.
     StreamStatus(Vec<DestinationStatus>),
+    /// The recorder's state, as the server sees it: a take starting or
+    /// ending, an upload draining, or a failure with the reason. Sent to
+    /// every member, so any client can show the room it is being recorded.
+    RecordStatus {
+        state: RecordingState,
+        stems: bool,
+    },
     /// A member's avatar bytes are cached and hash-verified; fetch them
     /// with `avatar_bytes`. Emitted once per (member, hash).
     AvatarReady {
@@ -829,6 +837,14 @@ impl ClientCore {
         Ok(())
     }
 
+    /// Host-only server-side: start or stop the session recording. The
+    /// server counts a violation against anyone else.
+    pub fn record_ctl(&mut self, op: RecordOp) -> Result<(), SessionError> {
+        self.require_joined()?;
+        self.link.send(ControlMsg::RecordCtl { op })?;
+        Ok(())
+    }
+
     /// Host-only server-side; the server ignores it from anyone else.
     pub fn set_metronome(
         &mut self,
@@ -968,8 +984,9 @@ impl ClientCore {
             ControlMsg::StreamStatus { destinations } => {
                 self.events.push(ClientEvent::StreamStatus(destinations));
             }
-            // Dropped until the recording surfaces land; nothing sends it yet.
-            ControlMsg::RecordStatus { .. } => {}
+            ControlMsg::RecordStatus { state, stems } => {
+                self.events.push(ClientEvent::RecordStatus { state, stems });
+            }
             // The server never sends these; ignore.
             ControlMsg::MixerSet { .. }
             | ControlMsg::ClickEnable { .. }

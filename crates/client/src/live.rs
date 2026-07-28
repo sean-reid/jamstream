@@ -22,6 +22,7 @@ use jamstream_audio_io::{
     WavStream,
 };
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
+use jamstream_protocol::control::{RecordOp, RecordingState};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
 use jamstream_protocol::invite::Invite;
 use jamstream_session::SessionError;
@@ -30,8 +31,8 @@ use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 use crate::avatar;
 use crate::runtime::{
     AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationView,
-    FaderView, LevelsView, MemberId, MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView,
-    StreamView,
+    FaderView, LevelsView, MemberId, MemberView, MetronomeView, RecordState, RecordView, Role,
+    Runtime, Snapshot, StatsView, StreamView,
 };
 use crate::screens::invites::TokenMap;
 
@@ -124,6 +125,9 @@ struct SharedState {
     /// honest one, and a destination that failed to come up must not read as
     /// live for even one frame.
     stream: Vec<DestinationView>,
+    /// Last `RecordStatus` the server sent, verbatim, for the same reason:
+    /// only the recorder knows whether a take is really being captured.
+    record: RecordView,
     chat: VecDeque<ChatLine>,
     levels: LevelsView,
     metronome: MetronomeView,
@@ -160,6 +164,7 @@ impl SharedState {
             broadcast_faders: HashMap::new(),
             audition: false,
             stream: Vec::new(),
+            record: RecordView::default(),
             chat: VecDeque::new(),
             levels: LevelsView::default(),
             metronome: MetronomeView {
@@ -497,6 +502,7 @@ impl LiveRuntime {
             stream: StreamView {
                 destinations: s.stream.clone(),
             },
+            record: s.record.clone(),
             // The wizard's [`CostedRuntime`] wrapper fills this for
             // sessions this app launched; plain joins have no meter.
             cost: None,
@@ -566,7 +572,9 @@ impl LiveRuntime {
                 | Command::AddDestination { .. }
                 | Command::RemoveDestination(_)
                 | Command::StartStream
-                | Command::StopStream => {}
+                | Command::StopStream
+                | Command::StartRecord
+                | Command::StopRecord => {}
             }
         }
         let _ = self.tx.send(ThreadMsg::Cmd(cmd));
@@ -828,6 +836,8 @@ impl Worker {
             }
             Command::StartStream => self.core.stream_ctl(StreamOp::Start),
             Command::StopStream => self.core.stream_ctl(StreamOp::Stop),
+            Command::StartRecord => self.core.record_ctl(RecordOp::Start),
+            Command::StopRecord => self.core.record_ctl(RecordOp::Stop),
             Command::SetOwnAvatar(None) => {
                 // The control protocol has no way to unset an avatar, so
                 // this is local only: your own strip falls back to the
@@ -1075,6 +1085,17 @@ impl Worker {
                             dropped_frames: d.dropped_frames,
                         })
                         .collect();
+                }
+                ClientEvent::RecordStatus { state, stems } => {
+                    s.record = RecordView {
+                        state: match state {
+                            RecordingState::Idle => RecordState::Idle,
+                            RecordingState::Recording => RecordState::Recording,
+                            RecordingState::Uploading => RecordState::Uploading,
+                            RecordingState::Failed { reason } => RecordState::Failed { reason },
+                        },
+                        stems,
+                    };
                 }
                 // rtt_ms_last rides along in stats(); Ejected, Rejected,
                 // and TimedOut land through the state mapping below.

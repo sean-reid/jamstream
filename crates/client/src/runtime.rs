@@ -101,6 +101,11 @@ pub enum Command {
     StartStream,
     /// Host only: tear the encoder and every pusher down.
     StopStream,
+    /// Host only: begin a take on the session server.
+    StartRecord,
+    /// Host only: end the take. The upload may drain afterwards; the state
+    /// in [`Snapshot::record`] says when it is done.
+    StopRecord,
 }
 
 /// Your monitor-mix settings for one member.
@@ -203,6 +208,26 @@ pub struct DestinationView {
     pub dropped_frames: u64,
 }
 
+/// The recorder as the server last reported it, for the record lamp and
+/// sheet. Default is idle with stems unknown-off, which is also what a
+/// session that never records shows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecordView {
+    pub state: RecordState,
+    pub stems: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum RecordState {
+    #[default]
+    Idle,
+    Recording,
+    Uploading,
+    Failed {
+        reason: String,
+    },
+}
+
 /// Where the broadcast is going, as everyone in the room sees it. Empty
 /// until the server reports a destination, which is also how "nothing
 /// configured" reads.
@@ -264,6 +289,9 @@ pub struct Snapshot {
     /// Where the broadcast is going. Not host-only: the on-air lamp is for
     /// everyone in the room, because everyone in it is being broadcast.
     pub stream: StreamView,
+    /// Whether the session is being recorded. Not host-only for the same
+    /// reason as the on-air lamp: everyone in the room is on the take.
+    pub record: RecordView,
     pub cost: Option<CostView>,
     /// First 8 hex characters of the session id.
     pub session_short: String,

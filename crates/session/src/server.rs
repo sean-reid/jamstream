@@ -14,7 +14,7 @@ use jamstream_engine::{
 use jamstream_protocol::PROTOCOL_VERSION;
 use jamstream_protocol::control::{
     ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN, MAX_STREAM_KEY_LEN,
-    MemberInfo, StreamOp,
+    MemberInfo, RecordOp, RecordingState, StreamOp,
 };
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::verify_token;
@@ -191,6 +191,10 @@ pub enum ServerEvent {
     /// may carry a stream key: its `Debug` is redacted, and nothing in the
     /// core logs, stores, or relays it.
     StreamCtl(StreamOp),
+    /// An accepted host request for the recorder, handed to the driver the
+    /// same way as [`ServerEvent::StreamCtl`]. The driver reports back with
+    /// [`ServerCore::set_record_status`].
+    RecordCtl(RecordOp),
 }
 
 /// One member as the broadcast card renderer needs them, borrowed from the
@@ -364,6 +368,10 @@ pub struct ServerCore {
     /// Key-free by construction: this goes to every member.
     stream_status: Vec<DestinationStatus>,
     last_stream_status_ms: u64,
+    /// Latest recorder state, as the driver reported it.
+    record_status: RecordingState,
+    /// Whether stems are captured alongside the mix; fixed for the session.
+    record_stems: bool,
     roster_epoch: u64,
     /// Set by any roster change, cleared by the next tick's fanout.
     roster_dirty: bool,
@@ -410,6 +418,8 @@ impl ServerCore {
             last_stats_ms: 0,
             stream_status: Vec::new(),
             last_stream_status_ms: 0,
+            record_status: RecordingState::Idle,
+            record_stems: false,
             roster_epoch: 0,
             roster_dirty: false,
         }
@@ -855,6 +865,29 @@ impl ServerCore {
         &self.stream_status
     }
 
+    /// Recorder state from its driver, broadcast to every member on change.
+    /// Unlike stream status there is no periodic re-send: the recorder has
+    /// no per-second numbers, only transitions, and the latest snapshot is
+    /// always sufficient by the message's contract.
+    pub fn set_record_status(&mut self, state: RecordingState, stems: bool) {
+        if state == self.record_status && stems == self.record_stems {
+            return;
+        }
+        self.record_status = state;
+        self.record_stems = stems;
+        let msg = ControlMsg::RecordStatus {
+            state: self.record_status.clone(),
+            stems: self.record_stems,
+        };
+        for m in self.members.values_mut().filter(|m| m.connected) {
+            let _ = m.link.send(msg.clone());
+        }
+    }
+
+    pub fn record_status(&self) -> &RecordingState {
+        &self.record_status
+    }
+
     /// Broadcast frames encoded since this core was built. The listener
     /// stream is encoded once per 20 ms and sealed per member, so this is the
     /// count a caller compares against ticks rather than against listeners.
@@ -1164,6 +1197,16 @@ impl ServerCore {
         {
             let _ = m.link.send(ControlMsg::StreamStatus {
                 destinations: self.stream_status.clone(),
+            });
+        }
+        // Same for a take: a mid-take joiner is being recorded and gets told
+        // so before their first note, not on the next transition.
+        if self.record_status != RecordingState::Idle
+            && let Some(m) = self.members.get_mut(&id)
+        {
+            let _ = m.link.send(ControlMsg::RecordStatus {
+                state: self.record_status.clone(),
+                stems: self.record_stems,
             });
         }
         self.note_musician_count();
@@ -1522,10 +1565,11 @@ impl ServerCore {
                 // owns the stream worker. Nothing here stores or relays it.
                 self.events.push(ServerEvent::StreamCtl(op));
             }
-            // Host-only checked from the first release that speaks the
-            // message; the recorder that acts on the op lands separately.
-            ControlMsg::RecordCtl { .. } => {
-                if from != HOST_MEMBER_ID {
+            ControlMsg::RecordCtl { op } => {
+                if from == HOST_MEMBER_ID {
+                    // Same shape as StreamCtl: the driver owns the recorder.
+                    self.events.push(ServerEvent::RecordCtl(op));
+                } else {
                     self.violation(now_ms, from, "record control by non-host");
                 }
             }

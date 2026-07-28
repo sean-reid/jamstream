@@ -57,6 +57,7 @@ async fn two_musicians_hear_each_other_and_chat() {
         Options {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             activity_path: None,
+            recording: None,
         },
     )
     .await
