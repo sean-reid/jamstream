@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.5](https://github.com/sean-reid/jamstream/compare/v0.1.4...v0.1.5) (2026-07-28)
+
+
+### Features
+
+* **cloud:** fail a token that cannot launch at the credential check ([#152](https://github.com/sean-reid/jamstream/issues/152)) ([c948825](https://github.com/sean-reid/jamstream/commit/c94882518c449c7a006758b17b061cebb650d8e1))
+
+
+### Bug Fixes
+
+* **cloud:** gzip ec2 user data, which outgrew the 16384-byte cap ([#149](https://github.com/sean-reid/jamstream/issues/149)) ([6cf4513](https://github.com/sean-reid/jamstream/commit/6cf451311a9f366fb2494a61879c3c748f6d6aed))
+* **cloud:** install iptables when the boot image ships without it ([#151](https://github.com/sean-reid/jamstream/issues/151)) ([2bd11a4](https://github.com/sean-reid/jamstream/commit/2bd11a47dd53981a0d8582e3aba6ca4d5bc31efa))
+* **cloud:** launch errors say which step was underway ([#153](https://github.com/sean-reid/jamstream/issues/153)) ([f04ec92](https://github.com/sean-reid/jamstream/commit/f04ec9257290db6c3718c8ac31288f7112867baf))
+
 ## [0.1.4](https://github.com/sean-reid/jamstream/compare/v0.1.3...v0.1.4) (2026-07-28)
 
 
