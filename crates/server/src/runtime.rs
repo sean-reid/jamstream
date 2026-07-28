@@ -42,6 +42,31 @@ pub struct Options {
     pub activity_path: Option<PathBuf>,
 }
 
+/// Elapsed session time for the two self-exit windows, which is a different
+/// question from elapsed time for the mix clock.
+///
+/// `Instant` is monotonic, and on macOS it reads `CLOCK_UPTIME_RAW`, which
+/// stops while the machine is asleep; Linux's `CLOCK_MONOTONIC` does the same
+/// across suspend. A laptop is exactly where the local dead man's switch has
+/// to work, and a lid closed between two jams holds the countdown open for as
+/// long as the nap: a ten minute idle window on a machine that sleeps
+/// overnight is ten minutes of *awake* time. That is how a local server nobody
+/// wanted survives an afternoon.
+///
+/// So the switch reads both clocks and believes whichever has seen more time.
+/// A wall clock stepped backwards leaves the monotonic reading in charge.
+/// Stepped forwards it can only end a session sooner, and sooner is the
+/// direction a dead man's switch is allowed to be wrong in.
+///
+/// The mix clock keeps using `Instant` alone: media timestamps must not jump
+/// because ntpd corrected the hour.
+fn session_elapsed(monotonic: Duration, wall: Option<Duration>) -> Duration {
+    match wall {
+        Some(wall) => monotonic.max(wall),
+        None => monotonic,
+    }
+}
+
 /// The idle-exit countdown, pure so it is testable without time: feed it
 /// (elapsed-since-start, musician count) once per heartbeat, it answers
 /// whether the server should exit.
@@ -343,6 +368,9 @@ impl Server {
     /// thread-safe and does not need to be.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> io::Result<()> {
         let start = Instant::now();
+        // Second start stamp, on the clock that keeps counting while the
+        // machine is asleep. See session_elapsed.
+        let start_wall = SystemTime::now();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Burst);
         let mut heartbeat = tokio::time::interval(ACTIVITY_PERIOD);
@@ -379,14 +407,15 @@ impl Server {
                         tracing::info!("shutdown requested on the sentinel file, exiting");
                         break "session ended";
                     }
-                    if idle_exit.observe(start.elapsed(), musicians) {
+                    let elapsed = session_elapsed(start.elapsed(), start_wall.elapsed().ok());
+                    if idle_exit.observe(elapsed, musicians) {
                         tracing::info!(
                             idle_secs = self.idle_exit.as_secs_f64(),
                             "no musicians for the idle window, exiting"
                         );
                         break "session idle";
                     }
-                    if max_duration.observe(start.elapsed()) {
+                    if max_duration.observe(elapsed) {
                         tracing::info!(
                             max_duration_secs = self.max_duration.as_secs_f64(),
                             musicians,
@@ -530,7 +559,7 @@ fn touch(path: Option<&std::path::Path>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{IdleExit, MaxDuration, guard, shutdown_supported_path};
+    use super::{IdleExit, MaxDuration, guard, session_elapsed, shutdown_supported_path};
     use std::path::Path;
     use std::time::Duration;
 
@@ -564,6 +593,42 @@ mod tests {
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    /// The laptop case: three hours of wall time passed, of which the
+    /// monotonic clock saw four minutes because the lid was shut. A ten
+    /// minute idle window has to fire on the wake, not four minutes after
+    /// the next one.
+    #[test]
+    fn a_sleeping_machine_does_not_hold_the_countdown_open() {
+        let elapsed = session_elapsed(secs(240), Some(secs(3 * 3600)));
+        assert_eq!(elapsed, secs(3 * 3600));
+        let mut ie = IdleExit::new(secs(600));
+        assert!(ie.observe(elapsed, 0));
+        assert!(
+            MaxDuration::new(secs(43_200))
+                .observe(session_elapsed(secs(240), Some(secs(13 * 3600))))
+        );
+    }
+
+    /// A wall clock that stepped backwards, or one the platform refused to
+    /// difference, leaves the monotonic reading in charge rather than
+    /// resetting the countdown.
+    #[test]
+    fn a_useless_wall_clock_falls_back_to_the_monotonic_one() {
+        assert_eq!(session_elapsed(secs(700), None), secs(700));
+        // Wall clock behind the monotonic one: the larger still wins, so a
+        // backwards step cannot buy a session extra life.
+        assert_eq!(session_elapsed(secs(700), Some(secs(5))), secs(700));
+        assert!(IdleExit::new(secs(600)).observe(session_elapsed(secs(700), Some(secs(5))), 0));
+    }
+
+    /// Awake the whole time, the two clocks agree and nothing changes.
+    #[test]
+    fn an_awake_machine_reads_the_same_either_way() {
+        for t in [0u64, 1, 59, 600, 43_200] {
+            assert_eq!(session_elapsed(secs(t), Some(secs(t))), secs(t));
+        }
     }
 
     #[test]
