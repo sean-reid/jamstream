@@ -301,7 +301,7 @@ pub async fn get<W: Write + Send>(
     let terminal = prompt.terminal;
     let mut fetched = 0u64;
     for take in &wanted {
-        let path = dir.join(&take.name);
+        let path = destination(&dir, take)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -372,13 +372,34 @@ enum Action {
     Have,
 }
 
+/// Where one take is written, refusing a name that would land outside `dir`.
+///
+/// The server writes takes under a sanitized prefix, but the bucket belongs to
+/// the host and an object store key is an arbitrary string: `..` in one is a
+/// valid key and would be a write into somebody's home directory.
+fn destination(dir: &Path, take: &Take) -> Result<PathBuf, CliError> {
+    let relative = Path::new(&take.name);
+    let contained = !take.name.is_empty()
+        && relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+    if !contained {
+        return Err(CliError::Failed(format!(
+            "refusing to download {:?}: a take has to land inside {}, and that key would not",
+            take.key,
+            dir.display()
+        )));
+    }
+    Ok(dir.join(relative))
+}
+
 /// Decides each take's fate before any egress is spent. A local file of a
 /// different size is a conflict rather than something to overwrite, because
 /// it may be the only copy of an edit.
 fn plan_downloads(takes: &[Take], dir: &Path) -> Result<Vec<Action>, CliError> {
     let mut plan = Vec::with_capacity(takes.len());
     for take in takes {
-        let path = dir.join(&take.name);
+        let path = destination(dir, take)?;
         plan.push(match std::fs::metadata(&path) {
             Ok(meta) if meta.len() == take.size => Action::Have,
             Ok(meta) => {
@@ -638,6 +659,36 @@ mod tests {
         assert!(err.contains("already exists"), "{err}");
         assert!(err.contains("--out"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key is an arbitrary string and the bucket is the host's, so a take
+    /// that would land outside the output directory is refused rather than
+    /// written.
+    #[test]
+    fn a_key_that_climbs_out_of_the_output_directory_is_refused() {
+        let dir = Path::new("/tmp/takes");
+        let take = |name: &str| Take {
+            key: format!("jamstream/recordings/s1/{name}"),
+            name: name.to_owned(),
+            size: 4,
+            last_modified: None,
+        };
+        assert_eq!(
+            destination(dir, &take("stems/bass.flac")).unwrap(),
+            dir.join("stems/bass.flac")
+        );
+        for hostile in [
+            "../../../etc/passwd",
+            "..",
+            "stems/../../out.flac",
+            "/etc/passwd",
+            "",
+        ] {
+            let err = destination(dir, &take(hostile)).unwrap_err().to_string();
+            assert!(err.contains("has to land inside"), "{hostile:?}: {err}");
+        }
+        // And the plan refuses before anything is priced or downloaded.
+        assert!(plan_downloads(&[take("../escape.flac")], dir).is_err());
     }
 
     /// Progress has to be readable in a log, so a pipe gets whole lines at
