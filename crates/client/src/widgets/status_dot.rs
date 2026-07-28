@@ -63,7 +63,11 @@ pub fn presence_dot(ui: &mut Ui, connected: bool) {
     }
     let p = theme::palette_of(ui);
     if connected {
-        ui.painter().circle_filled(rect.center(), 4.0, p.text_muted);
+        // text_primary, not text_muted. Colourless is the point; dim is not.
+        // Muted is the shade this console uses for things that are off, so a
+        // member who is here was reading as a member who had left.
+        ui.painter()
+            .circle_filled(rect.center(), 4.0, p.text_primary);
     } else {
         ui.painter()
             .circle_stroke(rect.center(), 3.5, Stroke::new(1.0, p.border));
