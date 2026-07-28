@@ -1061,6 +1061,24 @@ mod tests {
         assert_eq!(flat_config_value("#cloud-config\n", "port"), None);
     }
 
+    /// Rust cannot concatenate two `&'static str` constants in a const, so
+    /// the tmpfs paths spell out a directory that is also its own constant.
+    /// Two spellings of one path is the defect these constants exist to
+    /// remove, so the relationship is asserted rather than assumed.
+    #[test]
+    fn every_run_dir_path_is_under_the_run_dir() {
+        assert_eq!(ACTIVITY_FILE, format!("{RUN_DIR}/{ACTIVITY_FILE_NAME}"));
+        assert_eq!(STREAM_KEY_DIR, format!("{RUN_DIR}/keys"));
+        assert_eq!(UPLOAD_MARKER_DIR, format!("{RUN_DIR}/uploads"));
+        // The unit grants write access to RUN_DIR alone, so anything outside
+        // it is a path the hardened service cannot create.
+        for path in [ACTIVITY_FILE, STREAM_KEY_DIR, UPLOAD_MARKER_DIR] {
+            assert!(path.starts_with(RUN_DIR), "{path} escapes {RUN_DIR}");
+        }
+        assert!(RECORDING_CONFIG_PATH.starts_with("/etc/jamstream/"));
+        assert!(SERVER_CONFIG_PATH.starts_with("/etc/jamstream/"));
+    }
+
     /// The bootstrap script runs as root, and the artifact pair is the one
     /// part of it a caller supplies. Neither value is pasted into the
     /// script now: both are written to files and read back, so the worst a
