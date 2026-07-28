@@ -90,7 +90,17 @@ cpal = "0.18"
 rtrb = "0.3"
 hound = "3"
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+# The unix system calls std has no equivalent for. Already in the lock file
+# through tokio, mio and rustix, so taking it directly costs no build time and
+# no new supply chain; what it buys is the ability to stop shelling out for
+# things the C library answers in one call. Two waiting on it (issue #92):
+# `geteuid` for `st_uid == geteuid()` on the directory holding the issuer
+# private key, and `kill(pid, 0)` / `kill(pid, SIG*)` in the local provider's
+# liveness probe, which today spawns `ps` and `kill` for every registry entry
+# on every launch. Use it behind `#[cfg(unix)]`; there is no Windows story
+# here and windows-sys is a separate decision.
+libc = "0.2"
+tokio ={ version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json = "1"
 wiremock = "0.6"
