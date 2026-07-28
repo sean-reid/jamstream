@@ -1407,3 +1407,40 @@ async fn a_denied_call_is_not_retried() {
         .await
         .unwrap_err();
 }
+
+#[tokio::test]
+async fn a_denied_group_create_says_which_step_died() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=DescribeSecurityGroups"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<DescribeSecurityGroupsResponse><securityGroupInfo/>\
+             </DescribeSecurityGroupsResponse>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=CreateSecurityGroup"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(error_body(
+            "UnauthorizedOperation",
+            "You are not authorized to perform: ec2:CreateSecurityGroup",
+        )))
+        .mount(&server)
+        .await;
+    let p = provider(&server);
+    let err = p
+        .launch(LaunchSpec {
+            region: region_of(&p, "us-east-1"),
+            instance_class: InstanceClass::Small,
+            user_data: String::new(),
+            tags: vec![session_tag("sess1")],
+        })
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("creating the session security group")
+            && msg.contains("ec2:CreateSecurityGroup"),
+        "both the step and the action have to survive: {msg}"
+    );
+}
