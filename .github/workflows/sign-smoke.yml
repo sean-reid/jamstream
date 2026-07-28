@@ -25,35 +25,43 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - name: Check secrets are configured
-        id: gate
+      # A deleted, rotated-away, or renamed APPLE_CERT_P12 is the exact case
+      # this workflow exists for, and it used to be the one case it could not
+      # see: an empty secret published configured=false, every later step
+      # skipped on that output, and the job went green on an echo. So an absent
+      # certificate now fails, naming what is missing, and the steps below are
+      # unconditional.
+      #
+      # That does mean a fork dispatching this workflow gets a red run. It is
+      # the honest answer: with no certificate there is nothing here to smoke
+      # test, and a green tick would claim the chain is fine.
+      - name: The signing secrets exist
         env:
           CERT: ${{ secrets.APPLE_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
         run: |
-          if [ -z "$CERT" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "signing secrets absent; nothing to smoke test"
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
+          set -eu
+          missing=''
+          [ -n "$CERT" ] || missing="$missing APPLE_CERT_P12"
+          [ -n "$CERT_PASSWORD" ] || missing="$missing APPLE_CERT_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Signing secrets are missing:$missing. Releases would ship unsigned, which is the failure this workflow watches for. Set them, or delete this workflow if the project has stopped signing."
+            exit 1
           fi
+          echo "certificate and password are both present"
       # Commit pins, per the policy documented in ci.yml. It matters most
       # here: this job holds the Developer ID certificate and the notary key,
       # so anything a retargeted @stable branch or @v2 tag ran could read both
       # out of the environment.
-      - if: steps.gate.outputs.configured == 'true'
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-      - if: steps.gate.outputs.configured == 'true'
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       # The same fetch-then-build-offline shape release.yml uses, so this
       # canary exercises that too, not just the certificate.
-      - if: steps.gate.outputs.configured == 'true'
-        run: cargo fetch --locked
-      - if: steps.gate.outputs.configured == 'true'
-        run: cargo build --locked --offline -p jamstream-client --release
-      - if: steps.gate.outputs.configured == 'true'
-        name: Import certificate into a throwaway keychain
+      - run: cargo fetch --locked
+      - run: cargo build --locked --offline -p jamstream-client --release
+      - name: Import certificate into a throwaway keychain
         env:
           APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
           APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
@@ -73,8 +81,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: \
             -s -k "$KEYCHAIN_PW" smoke.keychain > /dev/null
           security list-keychains -d user -s smoke.keychain login.keychain
-      - if: steps.gate.outputs.configured == 'true'
-        name: Sign and verify
+      - name: Sign and verify
         run: |
           set -eu
           IDENTITY=$(security find-identity -v -p codesigning smoke.keychain \
@@ -92,8 +99,7 @@ jobs:
       # The notary credentials are the half that can lapse without anything
       # failing loudly, so exercise them for real: a signed binary in a zip
       # is a valid submission and takes a couple of minutes to clear.
-      - if: steps.gate.outputs.configured == 'true'
-        name: Check notarization credentials
+      - name: Check notarization credentials
         id: notary
         env:
           ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
@@ -140,6 +146,6 @@ jobs:
       - if: always()
         name: Scrub the notarization key
         run: rm -f "$RUNNER_TEMP/asc-key.p8" "$RUNNER_TEMP/smoke.zip"
-      - if: always() && steps.gate.outputs.configured == 'true'
+      - if: always()
         name: Remove the throwaway keychain
         run: security delete-keychain smoke.keychain || true
