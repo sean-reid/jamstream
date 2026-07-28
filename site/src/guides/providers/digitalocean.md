@@ -27,14 +27,17 @@ Follow [DigitalOcean's token guide](https://docs.digitalocean.com/reference/api/
 | `droplet:read` | find it and read its address |
 | `droplet:delete` | destroy it when the session ends |
 | `tag:create`, `tag:read`, `tag:delete` | every JamStream droplet is tagged, and the sweeper finds strays by tag |
+| `firewall:create`, `firewall:read`, `firewall:delete` | each session gets its own firewall, created before the droplet so the server is never exposed unfiltered |
 | `regions:read`, `sizes:read`, `actions:read`, `image:read`, `ssh_key:read` | required companions of `droplet:create` in DigitalOcean's scope system, and `sizes:read` is how live pricing is fetched |
 | `snapshot:read`, `vpc:read` | further companions the droplet scopes pull in; JamStream never reads a snapshot or a VPC itself |
 
-The scope names are from [DigitalOcean's scope reference](https://docs.digitalocean.com/reference/api/scopes/). The droplet scopes list the read scopes as requirements, so the token cannot be created without them. If the console offers to add a scope you did not pick, that is why: accept it. It shows the two in the last row as required once the others are selected, which brings the total to thirteen.
+The scope names are from [DigitalOcean's scope reference](https://docs.digitalocean.com/reference/api/scopes/). The droplet scopes list the read scopes as requirements, so the token cannot be created without them. If the console offers to add a scope you did not pick, that is why: accept it. It shows the two in the last row as required once the others are selected, which brings the total to sixteen.
 
 7. Click generate and copy the token immediately; it is shown once.
 
-Scoped this way, the token can manage droplets and tags, and nothing else in your account: no storage, no DNS, no billing.
+Scoped this way, the token can manage droplets, tags, and firewalls, and nothing else in your account: no storage, no DNS, no billing.
+
+A token missing the firewall scopes fails at launch with `403 Forbidden: You are not authorized to perform this operation`, because creating the session firewall is the first thing a launch does. Add the three firewall scopes to the existing token; nothing needs to be recreated.
 
 ## 3. Connect the app
 
