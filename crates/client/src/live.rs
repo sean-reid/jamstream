@@ -31,8 +31,9 @@ use crate::avatar;
 use crate::runtime::{
     AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationView,
     FaderView, LevelsView, MemberId, MemberView, MetronomeView, Role, Runtime, Snapshot, StatsView,
-    StreamView, TokenId,
+    StreamView,
 };
+use crate::screens::invites::TokenMap;
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
@@ -594,15 +595,20 @@ impl Runtime for Arc<LiveRuntime> {
 
 /// The host-session view over a [`LiveRuntime`] the wizard launched:
 /// injects the running cost (hourly rate from the state file, elapsed from
-/// its creation time) and the invite book's token ids into every snapshot.
-/// The wire roster carries no token ids, so revocation targeting can only
-/// come from the host's own records; this closes that gap without touching
-/// the [`Runtime`] contract or the wire protocol.
+/// its creation time) and the seats' token ids into every snapshot. The
+/// wire roster carries no token ids, so revocation targeting can only come
+/// from the host's own records; this closes that gap without touching the
+/// [`Runtime`] contract or the wire protocol.
+///
+/// The map is the invites panel's own, shared rather than copied: a seat
+/// revoked and minted into again carries a new token, and a snapshot
+/// handing the mixer the token from launch would revoke the credential that
+/// is already dead and leave the person in the seat.
 pub struct CostedRuntime {
     inner: Arc<LiveRuntime>,
     hourly_microusd: u64,
     created_unix: u64,
-    tokens: HashMap<MemberId, TokenId>,
+    tokens: TokenMap,
 }
 
 impl CostedRuntime {
@@ -610,7 +616,7 @@ impl CostedRuntime {
         inner: Arc<LiveRuntime>,
         hourly_microusd: u64,
         created_unix: u64,
-        tokens: HashMap<MemberId, TokenId>,
+        tokens: TokenMap,
     ) -> CostedRuntime {
         CostedRuntime {
             inner,
@@ -634,11 +640,13 @@ impl Runtime for CostedRuntime {
             accrued_microusd: self.hourly_microusd * elapsed_secs / 3600,
             elapsed_secs,
         });
+        let tokens = self.tokens.lock().expect("token map");
         for member in &mut snap.members {
             if member.token.is_none() {
-                member.token = self.tokens.get(&member.id).copied();
+                member.token = tokens.get(&member.id).copied();
             }
         }
+        drop(tokens);
         snap
     }
 
