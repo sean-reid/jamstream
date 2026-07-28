@@ -16,8 +16,15 @@ tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 data-encoding.workspace = true
-aws-lc-rs.workspace = true
+aws-lc-rs = { workspace = true, optional = true }
 flate2.workspace = true
+
+[features]
+# GCP launching, which is the only asymmetric crypto in the crate. Default
+# on for the CLI and the app; jamstreamd builds without it so aws-lc-sys
+# stays out of the musl binaries, where its C does not link for aarch64.
+default = ["gcp"]
+gcp = ["dep:aws-lc-rs"]
 
 [dev-dependencies]
 proptest.workspace = true

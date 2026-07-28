@@ -30,7 +30,11 @@ jamstream-session = { path = "crates/session" }
 jamstream-server = { path = "crates/server" }
 jamstream-cli = { path = "crates/cli" }
 jamstream-audio-io = { path = "crates/audio-io" }
-jamstream-cloud = { path = "crates/cloud" }
+# default-features off here so jamstreamd can take the crate without the
+# GCP provider; cargo forbids a member overriding the workspace's defaults,
+# so the opt-in lives with each consumer instead. See crates/cloud's
+# features and the note in crates/server/Cargo.toml.
+jamstream-cloud = { path = "crates/cloud", default-features = false }
 jamstream-harness = { path = "crates/harness" }
 jamstream-broadcast = { path = "crates/broadcast" }
 jamstream-stream = { path = "crates/stream" }

@@ -67,6 +67,10 @@ enum Endpoint {
     Aws,
     /// `https://{bucket}.{region}.digitaloceanspaces.com/{key}`.
     Spaces,
+    /// `https://storage.googleapis.com/{bucket}/{key}`, Cloud Storage's
+    /// S3-compatible interop endpoint. Path style, and the SigV4 region is
+    /// always `auto`: interop signing ignores the bucket's real location.
+    GcsInterop,
     /// Path-style against one base URL: `{base}/{bucket}/{key}`. Tests only.
     Override(String),
 }
@@ -144,6 +148,31 @@ impl S3Store {
     /// DigitalOcean Spaces in `region` (a Spaces region slug such as
     /// `nyc3`), signed with a **Spaces access key pair**. See the module
     /// docs: this is not the DigitalOcean API token.
+    /// Google Cloud Storage through its S3-compatible interop endpoint,
+    /// signed with an HMAC key pair rather than a service account.
+    ///
+    /// This is what lets the session server record to GCS without RSA. The
+    /// only thing that needed asymmetric crypto was signing a service
+    /// account JWT, and that pulled aws-lc-sys into jamstreamd, whose C does
+    /// not link against musl for aarch64; an HMAC key needs nothing the
+    /// SigV4 path does not already have.
+    ///
+    /// The signing region is `auto`, which is what Cloud Storage expects
+    /// from interop clients: the bucket's real location is not part of the
+    /// signature.
+    pub fn gcs_interop(access_key_id: String, secret: String) -> Self {
+        S3Store {
+            access_key_id,
+            secret_access_key: secret,
+            region: "auto".to_owned(),
+            endpoint: Endpoint::GcsInterop,
+            dialect: LifecycleDialect::S3v2,
+            kind: ProviderKind::Gcp,
+            part_size: DEFAULT_PART_SIZE,
+            http: http::client(),
+        }
+    }
+
     pub fn spaces(region: impl Into<String>, access_key_id: String, secret: String) -> Self {
         S3Store {
             access_key_id,
@@ -224,6 +253,13 @@ impl S3Store {
             Endpoint::Spaces => (
                 format!("{bucket}.{}.digitaloceanspaces.com", self.region),
                 key.map_or_else(|| "/".to_owned(), |k| format!("/{}", encode_key(k))),
+            ),
+            Endpoint::GcsInterop => (
+                "storage.googleapis.com".to_owned(),
+                match key {
+                    Some(k) => format!("/{bucket}/{}", encode_key(k)),
+                    None => format!("/{bucket}"),
+                },
             ),
             Endpoint::Override(base) => {
                 let parsed = reqwest::Url::parse(base)
@@ -783,6 +819,26 @@ mod md5 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GCS interop is path style against one fixed host, and the signing
+    /// region is `auto` regardless of where the bucket lives. Both are
+    /// requirements of Cloud Storage's S3 compatibility, not choices, and
+    /// getting either wrong yields a 403 nobody can read.
+    #[test]
+    fn gcs_interop_signs_path_style_against_one_host() {
+        let store = S3Store::gcs_interop("GOOG1EXAMPLE".to_owned(), "secret".to_owned());
+        assert_eq!(store.region, "auto");
+        assert_eq!(store.kind, ProviderKind::Gcp);
+        let (url, host, path) = store
+            .address("my-jams", Some("jamstream/recordings/abc/take-mix.flac"))
+            .unwrap();
+        assert_eq!(host, "storage.googleapis.com");
+        assert_eq!(path, "/my-jams/jamstream/recordings/abc/take-mix.flac");
+        assert_eq!(url, format!("https://{host}{path}"));
+        // The bucket-level form the lifecycle rule uses.
+        let (_, _, bucket_path) = store.address("my-jams", None).unwrap();
+        assert_eq!(bucket_path, "/my-jams");
+    }
     use data_encoding::HEXLOWER;
 
     fn aws_store() -> S3Store {
