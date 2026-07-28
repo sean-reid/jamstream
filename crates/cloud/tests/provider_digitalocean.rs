@@ -758,6 +758,41 @@ async fn launch_without_a_session_tag_creates_nothing() {
 }
 
 #[tokio::test]
+async fn preflight_403_names_the_firewall_scopes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/firewalls"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "id": "Forbidden",
+            "message": "You are not authorized to perform this operation",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = provider(&server).preflight().await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("firewall:create") && msg.contains("firewall:read"),
+        "the fix has to be on screen: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_passes_with_firewall_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/firewalls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "firewalls": [],
+            "links": {},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    provider(&server).preflight().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_launch_403_says_it_was_creating_the_firewall() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
