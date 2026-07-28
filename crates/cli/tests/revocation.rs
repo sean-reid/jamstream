@@ -33,7 +33,8 @@ fn temp_path(name: &str) -> PathBuf {
 
 fn join_args(invite: &Invite, input: PathBuf, output: PathBuf) -> JoinArgs {
     JoinArgs {
-        invite: invite.encode(),
+        invite: Some(invite.encode()),
+        invite_file: None,
         headless: true,
         input,
         output,
@@ -41,6 +42,7 @@ fn join_args(invite: &Invite, input: PathBuf, output: PathBuf) -> JoinArgs {
         chat: None,
         name: None,
         revoke_invite: None,
+        revoke_invite_file: None,
         revoke_after_secs: None,
     }
 }
@@ -101,7 +103,13 @@ async fn host_revokes_musician_two_and_musician_one_plays_on() {
     // something to hear for the whole run; musician 2 plays the other tone
     // until ejection.
     let mut host_args = join_args(&host_invite, fixture("sine-440-48k.wav"), out_host.clone());
-    host_args.revoke_invite = Some(m2_invite.encode());
+    // The target's invite goes through a file, not argv: it is a second
+    // member's bearer credential, and argv is readable by every local
+    // process. The whole story runs through the file form, so the flag is
+    // exercised by the same test that proves revocation works.
+    let revoke_file = temp_path("revoke-invite.txt");
+    std::fs::write(&revoke_file, format!("{}\n", m2_invite.encode())).unwrap();
+    host_args.revoke_invite_file = Some(revoke_file.clone());
     host_args.revoke_after_secs = Some(REVOKE_AFTER_SECS);
     let m1_args = join_args(&m1_invite, fixture("silence-48k.wav"), out_one.clone());
     let m2_args = join_args(&m2_invite, fixture("sine-880-48k.wav"), out_two.clone());
@@ -174,7 +182,7 @@ async fn host_revokes_musician_two_and_musician_one_plays_on() {
     let _ = stop_tx.send(());
     server_task.await.unwrap().unwrap();
 
-    for path in [&out_host, &out_one, &out_two] {
+    for path in [&out_host, &out_one, &out_two, &revoke_file] {
         let _ = std::fs::remove_file(path);
     }
 }
