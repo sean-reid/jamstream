@@ -16,16 +16,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use blake2::{Blake2s256, Digest};
 use jamstream_protocol::control::{AVATAR_CHUNK_BYTES, ControlMsg, MAX_AVATAR_BYTES};
 
-pub(crate) type AvatarHash = [u8; 32];
+pub type AvatarHash = [u8; 32];
 
 /// Chunks fed into a link per poll cycle; see the module comment.
 pub(crate) const AVATAR_CHUNKS_PER_POLL: usize = 2;
 
-pub(crate) fn avatar_hash(bytes: &[u8]) -> AvatarHash {
+pub fn avatar_hash(bytes: &[u8]) -> AvatarHash {
     Blake2s256::digest(bytes).into()
 }
 
-pub(crate) fn chunk_total(len: usize) -> u16 {
+pub fn chunk_total(len: usize) -> u16 {
     len.div_ceil(AVATAR_CHUNK_BYTES) as u16
 }
 
@@ -35,7 +35,7 @@ pub(crate) fn chunk_total(len: usize) -> u16 {
 /// avatar is still here and transfers zero bytes. Pinned entries never
 /// leave; the budget can overshoot by at most the pinned set, which the
 /// roster size bounds to a few dozen 256 KB entries.
-pub(crate) struct AvatarCache {
+pub struct AvatarCache {
     max_bytes: usize,
     total_bytes: usize,
     clock: u64,
@@ -108,7 +108,7 @@ impl AvatarCache {
 /// well-behaved train is exactly index 0..total, each chunk full-size except
 /// the last; anything else is an error the caller surfaces per its style
 /// (server: protocol violation, client: silent drop).
-pub(crate) struct AvatarRx {
+pub struct AvatarRx {
     hash: AvatarHash,
     /// Declared length when known (server side, from SetAvatar); the client
     /// learns the size from the train itself.
@@ -118,7 +118,7 @@ pub(crate) struct AvatarRx {
     buf: Vec<u8>,
 }
 
-pub(crate) enum RxStep {
+pub enum RxStep {
     More,
     /// Reassembled and verified against the content hash.
     Done(Vec<u8>),
@@ -137,6 +137,12 @@ impl AvatarRx {
 
     pub fn hash(&self) -> &AvatarHash {
         &self.hash
+    }
+
+    /// Bytes buffered so far; the fuzz harness asserts this stays capped.
+    #[cfg(feature = "fuzzing")]
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
     }
 
     pub fn push(&mut self, index: u16, total: u16, data: &[u8]) -> Result<RxStep, &'static str> {

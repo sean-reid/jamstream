@@ -9,6 +9,11 @@ pub mod client;
 pub mod limits;
 pub mod server;
 
+/// Reassembly internals for the fuzz workspace only; production traffic
+/// reaches them through the cores' control-message handling.
+#[cfg(feature = "fuzzing")]
+pub use avatar::{AvatarCache, AvatarHash, AvatarRx, RxStep, avatar_hash, chunk_total};
+
 pub use client::{ClientCore, ClientEvent, ClientState, ClientStats, ServerCandidates};
 /// Session capacity and the host-surface defaults, defined once in
 /// [`limits`] and re-exported here because every crate that offers seats
