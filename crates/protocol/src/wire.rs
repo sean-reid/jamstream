@@ -432,6 +432,27 @@ mod tests {
             "capacity reject encoding drifted"
         );
 
+        // The transport header is on every media and control datagram a
+        // session sends, and it is the AEAD's associated framing: a member id
+        // or counter that changed width or endianness would make every
+        // shipped build unable to open the other's packets.
+        let mut header = Vec::new();
+        append_transport_header(MemberId(0x0102), 0x0102_0304_0506_0708, &mut header);
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&header),
+            "0302010807060504030201",
+            "transport header encoding drifted"
+        );
+        assert_eq!(header.len(), 11);
+        // build_transport is the same header with the ciphertext appended, so
+        // there is one layout and not two.
+        let mut with_ct = header.clone();
+        with_ct.extend_from_slice(b"ct");
+        assert_eq!(
+            build_transport(MemberId(0x0102), 0x0102_0304_0506_0708, b"ct"),
+            with_ct
+        );
+
         let cookie_key = CookieKey::from_bytes([6u8; 32]);
         let cookie = cookie_for(&cookie_key, "203.0.113.7".parse().unwrap());
         assert_eq!(
