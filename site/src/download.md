@@ -94,6 +94,14 @@ $ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
 
 The script detects your platform, downloads the matching archive, verifies its sha256 against `SHA256SUMS`, and installs `jamstream` to `/usr/local/bin` when that is writable, otherwise to `~/.local/bin`. Set `JAMSTREAM_INSTALL_DIR` to pick the directory yourself. Appending `-s -- --with-server` also installs the `jamstreamd` session server on Linux x86_64, which [local mode](guides/local.md) with the CLI alone uses.
 
+Uninstalling is the same shape:
+
+```console
+$ curl -fsSL https://sean-reid.github.io/jamstream/uninstall.sh | sh
+```
+
+It removes what install.sh installed and nothing else. A session still running makes it stop and say so, since the binary being removed is what ends sessions; your session records are kept unless you pass `--purge`, and credentials stay in your OS keychain either way.
+
 On Windows:
 
 ```console
