@@ -9,6 +9,8 @@
 #   musl      ~6 min    static server builds (both arches) + verification
 #   coverage  ~16 min   instrumented rebuild; runs on pushes to main only so
 #                       the PR path never waits on it
+#   required  seconds   the aggregator every other job feeds; see the comment
+#                       above it for why it exists
 #
 # The harness gates run as their own parallel job so unit/integration
 # feedback lands before the ~3 minute simulation suite finishes. Anything
@@ -97,21 +99,34 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      # Third-party actions are pinned to commits repo-wide, not to tags or
-      # branches, and dependabot bumps the pins weekly. The reason starts with
-      # the jobs that hold signing secrets (release.yml, sign-smoke.yml) but
-      # applies here too: a retargeted ref in this workflow could make a
-      # malicious pull request look green on the branch that auto-merges.
+      # Actions outside the github-owned actions/* namespace are pinned to
+      # commits repo-wide, not to tags or branches, and dependabot bumps the
+      # pins weekly. The reason starts with the jobs that hold signing secrets
+      # (release.yml, sign-smoke.yml) but applies here too: a retargeted ref in
+      # this workflow could make a malicious pull request look green on the
+      # branch that auto-merges. actions/* stay on their major tags: they are
+      # published by the same account that runs the runner, so pinning them
+      # buys nothing that owning the runner does not already give away.
+      #
+      # This comment claimed the pinning was total while two actions,
+      # cargo-deny below and taiki-e/install-action, sat on @v2. The claim is
+      # what made that hard to see, so the policy is now enforced by
+      # scripts/check-action-pins.sh in this job rather than asserted here.
+      #
       # dtolnay/rust-toolchain is pinned to master, which is append-only, with
       # an explicit `toolchain: stable`; the @stable branch is only master
       # plus that default and it gets force-pushed.
       # Re-pin from: gh api repos/dtolnay/rust-toolchain/git/ref/heads/master
       #              gh api repos/Swatinem/rust-cache/git/ref/tags/v2
+      #              gh api repos/EmbarkStudios/cargo-deny-action/git/ref/tags/v2
+      #              gh api repos/taiki-e/install-action/git/ref/tags/v2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      - name: Every third-party action is pinned to a commit
+        run: scripts/check-action-pins.sh
       # Staleness gate. cargo-deny audits Cargo.lock and every cargo
       # invocation in this repo passes --locked, so a lockfile that does not
       # match Cargo.toml turns into a build failure minutes into some other
@@ -124,7 +139,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
       # release.yml's shell helpers live in scripts/; keep them
       # shellcheck-clean (shellcheck is preinstalled on ubuntu runners).
       - name: Shellcheck release scripts
@@ -161,13 +176,55 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-nextest
+      # JAMSTREAM_PERF_BUDGET_SECS was set only on the harness job, so a
+      # wall-clock deadline in any suite that runs here had nothing to scale
+      # itself by on a shared runner. That is why the absolute tick gate had to
+      # live in the harness suite even though the tighter distribution is here:
+      # loopback measures p99 647 us against a 718 us max, against p99 1558 us
+      # and a 20084 us max through the full network simulation. Same value as
+      # the harness job, so every scaled deadline in the repo agrees on one
+      # number.
       - if: runner.os == 'macOS'
         run: cargo nextest run --locked --workspace --exclude jamstream-harness
+        env:
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
       - if: runner.os != 'macOS'
         run: cargo nextest run --locked --workspace --exclude jamstream-harness --exclude jamstream-client
+        env:
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
+      # `cargo xtask fixtures` was invoked by nothing, and its WAV generator is
+      # duplicated verbatim into crates/cli/tests/common/mod.rs with "keep them
+      # in sync" written in a doc comment and enforced nowhere. The nextest run
+      # above has just made the test copy's output under target/fixtures/, so
+      # comparing the two byte for byte is the enforcement, and it also proves
+      # the xtask still runs.
+      #
+      # Only the fixtures the cli suite actually asks for exist on the test
+      # side, which today is three of the four (the impulse train has no
+      # caller), hence the floor rather than an exact count. The real fix is
+      # one generator with one caller; that needs crates/cli, so this holds the
+      # line until then.
+      - if: runner.os == 'Linux'
+        name: The xtask fixtures and the test fixtures are the same bytes
+        run: |
+          set -eu
+          cargo run --locked -p xtask -- fixtures
+          matched=0
+          for f in fixtures/audio/*.wav; do
+            mirror="target/fixtures/audio/$(basename "$f")"
+            [ -f "$mirror" ] || continue
+            if cmp -s "$f" "$mirror"; then
+              matched=$((matched + 1))
+            else
+              echo "$(basename "$f") differs between cargo xtask fixtures and the copy in crates/cli/tests/common/mod.rs; the two generators have drifted apart" >&2
+              exit 1
+            fi
+          done
+          echo "$matched fixtures generated identically by both copies"
+          test "$matched" -ge 3
       # The nextest run above already compiles the cfg(windows) WASAPI
       # exclusive-mode backend (lib and tests, with RUSTFLAGS=-D warnings), so
       # it is the Windows compile gate. Clippy, though, only runs on Linux in
@@ -221,7 +278,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-nextest
       - run: cargo nextest run --locked -p jamstream-harness
@@ -246,7 +303,7 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-llvm-cov
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
@@ -392,3 +449,125 @@ jobs:
           name: jamstreamd-aarch64-unknown-linux-musl
           path: target/aarch64-unknown-linux-musl/release/jamstreamd
           if-no-files-found: error
+
+  # Branch protection gates on job NAMES, so a job added to this file is
+  # non-blocking until someone remembers to add its name there. Everything
+  # added since that list was written arrived non-blocking, including
+  # `features`, the job that exists because --no-default-features sat broken
+  # for weeks behind green CI.
+  #
+  # This job is the one required context that cannot go stale that way. It
+  # depends on every other job here, and it FAILS when this workflow contains
+  # a job it was not told about, so a new job blocks the branch from the
+  # moment it is added and making one non-blocking is an edit to the list
+  # below with a reason beside it: a thing a reviewer sees.
+  #
+  # `if: always()` is load bearing. A job that is skipped counts as success
+  # for branch protection, so an aggregator with any other condition would
+  # wave a run through exactly when a dependency did not finish.
+  required:
+    if: always()
+    needs: [pr-title, lint, test, release-build, harness, coverage, features, musl]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every job on the pull-request path is accounted for
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -eu
+          # Jobs deliberately outside this gate. Empty, and an entry here
+          # wants a reason written above it.
+          EXEMPT=''
+          # docs-check.yml's jobs. A job cannot depend on another workflow's
+          # jobs, so those four report their own required contexts. Listing
+          # them here is what makes a job added there fail this one, and the
+          # reverse direction catches a deleted job whose required context
+          # would otherwise leave the branch permanently unmergeable.
+          DOCS_JOBS='cli-docs screenshots palette install-scripts'
+
+          # Top-level keys of the `jobs:` block. Deliberately dumb, and it
+          # fails on an empty result rather than passing quietly, because a
+          # reformat this cannot read is the one way it could stop working.
+          job_names() {
+            awk '
+              /^jobs:[[:space:]]*$/ { injobs = 1; next }
+              injobs && /^[^[:space:]#]/ { injobs = 0 }
+              injobs && /^  [a-zA-Z0-9_-]+:[[:space:]]*$/ {
+                sub(/:.*/, ""); gsub(/[[:space:]]/, ""); print
+              }
+            ' "$1"
+          }
+
+          # Space separated, so the membership tests below can look for a word
+          # with a space on either side of it.
+          CI_JOBS=$(job_names .github/workflows/ci.yml | tr '\n' ' ')
+          FOUND_DOCS=$(job_names .github/workflows/docs-check.yml | tr '\n' ' ')
+          # A reformat the awk cannot read would yield nothing and then wave
+          # every job through, so the count is the check on the check.
+          test "$(printf '%s' "$CI_JOBS" | wc -w)" -ge 9
+          test "$(printf '%s' "$FOUND_DOCS" | wc -w)" -ge 4
+
+          GATED=$(printf '%s' "$NEEDS" | jq -r 'keys[]' | tr '\n' ' ')
+          echo "gated by this job: $GATED"
+          status=0
+          for job in $CI_JOBS; do
+            case " required $EXEMPT $GATED " in
+              *" $job "*) ;;
+              *)
+                echo "ci.yml job '$job' is not in this job's needs, so it does not block anything. Add it, or add it to EXEMPT with a reason." >&2
+                status=1
+                ;;
+            esac
+          done
+          for job in $FOUND_DOCS; do
+            case " $DOCS_JOBS " in
+              *" $job "*) ;;
+              *)
+                echo "docs-check.yml job '$job' is unknown here. Add it to DOCS_JOBS above and add '$job' to the required contexts in branch protection." >&2
+                status=1
+                ;;
+            esac
+          done
+          for job in $DOCS_JOBS; do
+            case " $FOUND_DOCS " in
+              *" $job "*) ;;
+              *)
+                echo "docs-check.yml has no job '$job' any more, so its required context can never report and nothing can merge. Drop it here and from branch protection." >&2
+                status=1
+                ;;
+            esac
+          done
+          exit $status
+      - name: Every job this event should have run is green
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -eu
+          # Jobs that run on one event only, so `skipped` is their correct
+          # result on the other one and anything else is not. Checking the
+          # expected result per event rather than just "nothing failed" is
+          # the point: a job that quietly stops running reports skipped, and
+          # a gate that accepts any skip would accept that too.
+          PUSH_ONLY='coverage release-build'
+          PR_ONLY='pr-title'
+          status=0
+          for job in $(printf '%s' "$NEEDS" | jq -r 'keys[]'); do
+            result=$(printf '%s' "$NEEDS" | jq -r --arg j "$job" '.[$j].result')
+            want=success
+            case " $PUSH_ONLY " in
+              *" $job "*) [ "$EVENT" = push ] || want=skipped ;;
+            esac
+            case " $PR_ONLY " in
+              *" $job "*) [ "$EVENT" = pull_request ] || want=skipped ;;
+            esac
+            if [ "$result" = "$want" ]; then
+              printf 'ok      %-14s %s\n' "$job" "$result"
+            else
+              printf 'NOT OK  %-14s %s, wanted %s\n' "$job" "$result" "$want" >&2
+              status=1
+            fi
+          done
+          exit $status
