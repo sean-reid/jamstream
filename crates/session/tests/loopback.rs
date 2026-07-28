@@ -8,7 +8,7 @@ use blake2::{Blake2s256, Digest};
 use jamstream_protocol::Error as ProtocolError;
 use jamstream_protocol::control::{
     AVATAR_CHUNK_BYTES, ControlLink, ControlMsg, DestinationState, DestinationStatus,
-    MAX_AVATAR_BYTES, MemberInfo, StreamKey, StreamOp, StreamPlatform,
+    MAX_AVATAR_BYTES, MAX_NAME_LEN, MemberInfo, RecordOp, StreamKey, StreamOp, StreamPlatform,
 };
 use jamstream_protocol::ids::DestinationId;
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
@@ -140,6 +140,10 @@ impl Harness {
     }
 
     fn mint(&self, member: u16, role: Role) -> Invite {
+        self.mint_named(member, role, None)
+    }
+
+    fn mint_named(&self, member: u16, role: Role, name_hint: Option<String>) -> Invite {
         self.issuer.mint(
             self.session_id,
             vec![addr_of(1)],
@@ -147,7 +151,7 @@ impl Harness {
             Token {
                 member_id: MemberId(member),
                 role,
-                name_hint: None,
+                name_hint,
                 expires_unix: u64::MAX,
                 jti: TokenId::generate(),
             },
@@ -1213,6 +1217,341 @@ fn stream_ctl_from_a_non_host_is_a_violation() {
         .collect();
     assert_eq!(ops.len(), 2);
     assert!(matches!(ops[1], StreamOp::Start));
+}
+
+/// `ClientCore::record_ctl` only checks that we are joined, so this server
+/// check is the whole of what stops a listener from ending the band's take.
+#[test]
+fn record_ctl_from_a_non_host_is_a_violation() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_host, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(1_000);
+
+    // The host is recording.
+    h.clients[0].core.record_ctl(RecordOp::Start).unwrap();
+    h.run_ms(250);
+    assert_eq!(
+        record_ops(&h),
+        vec![RecordOp::Start],
+        "the host's own take never started"
+    );
+
+    // A musician and a listener both try to stop it.
+    h.clients[b].core.record_ctl(RecordOp::Stop).unwrap();
+    h.clients[l].core.record_ctl(RecordOp::Stop).unwrap();
+    h.run_ms(250);
+    let refused: Vec<MemberId> = h
+        .server_events
+        .iter()
+        .filter_map(|e| match e {
+            ServerEvent::ProtocolViolation {
+                id,
+                what: "record control by non-host",
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused, vec![MemberId(1), MemberId(5)]);
+    // And the take is untouched: nothing reached the recorder's driver.
+    assert_eq!(record_ops(&h), vec![RecordOp::Start]);
+
+    // The host's identical op is the one that ends it.
+    h.clients[0].core.record_ctl(RecordOp::Stop).unwrap();
+    h.run_ms(250);
+    assert_eq!(record_ops(&h), vec![RecordOp::Start, RecordOp::Stop]);
+}
+
+/// A revoke is the one control message whose effect outlives the session:
+/// `runtime.rs` persists the list, so a listener that could revoke would
+/// permanently invalidate somebody else's invite. `ClientCore::revoke` only
+/// checks that we are joined, so the server check is all there is.
+#[test]
+fn revoke_by_a_non_host_is_a_violation() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_host, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(1_000);
+    assert_eq!(h.server.musicians_connected(), 2);
+
+    // A musician goes for the host's invite and a listener goes for the
+    // musician's. Both are refused, and neither jti reaches the revocation
+    // list the driver persists.
+    h.clients[b].core.revoke(inv_host.token.jti).unwrap();
+    h.clients[l].core.revoke(inv_b.token.jti).unwrap();
+    h.run_ms(500);
+    let refused: Vec<MemberId> = h
+        .server_events
+        .iter()
+        .filter_map(|e| match e {
+            ServerEvent::ProtocolViolation {
+                id,
+                what: "revoke by non-host",
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused, vec![MemberId(1), MemberId(5)]);
+    assert!(
+        !h.server_events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::TokenRevoked { .. })),
+        "a non-host revoke reached the persisted list: {:?}",
+        h.server_events
+    );
+    assert!(
+        !h.server_events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::MemberRevoked { .. }))
+    );
+
+    // Everyone is still seated and still playing.
+    assert_eq!(h.server.musicians_connected(), 2);
+    for i in [0, b, l] {
+        assert_eq!(*h.clients[i].core.state(), ClientState::Joined);
+    }
+    h.clear_playouts();
+    h.run_ms(1_000);
+    assert!(
+        tail_tone(&h, b, 48_000, 440.0) > 0.1,
+        "the musician who was targeted stopped hearing the host: {}",
+        tail_tone(&h, b, 48_000, 440.0)
+    );
+
+    // The host's identical revoke is the one that lands.
+    h.clients[0].core.revoke(inv_b.token.jti).unwrap();
+    h.run_ms(500);
+    assert!(h.server_events.contains(&ServerEvent::TokenRevoked {
+        jti: inv_b.token.jti
+    }));
+    assert!(
+        h.server_events
+            .contains(&ServerEvent::MemberRevoked { id: MemberId(1) })
+    );
+}
+
+/// A NaN fader is not a rounding problem: `mix_into` multiplies by it, so one
+/// packet would silence the personal mix it lands in, and on the broadcast
+/// path the mix that goes to every listener and into the recording. Neither
+/// path can be reached through `ClientCore`, which range-checks first, so the
+/// traffic is crafted.
+#[test]
+fn a_non_finite_fader_is_refused_on_both_mix_paths() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    // The host is driven raw, because only member 0 can reach the broadcast
+    // fader set and only crafted traffic can carry a NaN there. Two ordinary
+    // musicians and a listener supply the audio the guard is protecting.
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_a = h.mint(1, Role::Musician);
+    let inv_b = h.mint(2, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    let a = h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    let l = h.add_client(&inv_l, None);
+    let mut raw_host = raw_join(&mut h, &inv_host, addr_of(90));
+    h.run_ms(1_000);
+
+    let mut expected = 0;
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for (gain, pan) in [(bad, 0.0), (0.0, bad)] {
+            for target in [MemberId(1), MemberId(2)] {
+                raw_host.send_control(
+                    &mut h,
+                    ControlMsg::MixerSet {
+                        target,
+                        gain_db: gain,
+                        pan,
+                        muted: false,
+                    },
+                );
+                raw_host.send_control(
+                    &mut h,
+                    ControlMsg::BroadcastMixSet {
+                        target,
+                        gain_db: gain,
+                        pan,
+                        muted: false,
+                    },
+                );
+                expected += 2;
+            }
+        }
+    }
+    h.run_ms(250);
+
+    // Every one of these is a violation, so the whole batch has to fit inside
+    // the burst or the member is ejected partway and the count means nothing.
+    assert!(expected < VIOLATION_BURST as usize);
+    let refused = h
+        .server_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ServerEvent::ProtocolViolation {
+                    id: MemberId(0),
+                    what: "non-finite fader",
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        refused, expected,
+        "one of the two fader paths took a non-finite value: {:?}",
+        h.server_events
+    );
+    // And neither one was relayed as an accepted change.
+    for i in [a, b, l] {
+        assert!(
+            h.clients[i]
+                .events
+                .iter()
+                .all(|e| !matches!(e, ClientEvent::BroadcastMixChanged { .. })),
+            "client {i} was told a non-finite fader had been accepted"
+        );
+    }
+
+    // Nothing went quiet: the personal mixes and the broadcast that feeds
+    // every listener and the recording still carry every tone.
+    h.clear_playouts();
+    h.run_ms(1_000);
+    let win = 48_000;
+    assert!(
+        tail_tone(&h, a, win, 660.0) > 0.1,
+        "musician 1 lost musician 2's tone: {}",
+        tail_tone(&h, a, win, 660.0)
+    );
+    assert!(
+        tail_tone(&h, b, win, 440.0) > 0.1,
+        "musician 2 lost musician 1's tone: {}",
+        tail_tone(&h, b, win, 440.0)
+    );
+    for hz in [440.0, 660.0] {
+        assert!(
+            tail_tone(&h, l, win, hz) > 0.1,
+            "the broadcast lost {hz} Hz: {}",
+            tail_tone(&h, l, win, hz)
+        );
+    }
+}
+
+/// `ControlLink` refuses to carry a roster naming anyone past MAX_NAME_LEN, so
+/// a name hint longer than the cap would not break the member who brought it,
+/// it would stop roster fanout for the whole session. The cap is applied at
+/// admission, and nothing else stands behind it.
+#[test]
+fn a_name_hint_past_the_cap_cannot_stop_the_roster() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_host = h.mint_named(0, Role::Musician, Some("ana".into()));
+    // One byte over is the case that matters: at the cap the hint is kept.
+    let long = "n".repeat(MAX_NAME_LEN + 1);
+    let inv_b = h.mint_named(1, Role::Musician, Some(long.clone()));
+    let inv_c = h.mint_named(2, Role::Musician, Some("z".repeat(MAX_NAME_LEN)));
+    h.add_client(&inv_host, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    let c = h.add_client(&inv_c, Some(0.0));
+    h.run_ms(1_000);
+
+    // Everyone joined and everyone has a roster: the oversized hint was
+    // dropped for its own member rather than charged to the session.
+    assert_eq!(h.server.musicians_connected(), 3);
+    for i in [0, b, c] {
+        let roster = h.last_roster(i).unwrap_or_else(|| {
+            panic!("client {i} never got a roster, so the oversized name broke fanout")
+        });
+        assert_eq!(roster.len(), 3, "client {i} roster {roster:?}");
+        assert!(
+            roster.iter().all(|m| m.name.len() <= MAX_NAME_LEN),
+            "client {i} was handed a name past the cap: {roster:?}"
+        );
+        let names: Vec<&str> = roster.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names[0], "ana");
+        assert_eq!(names[1], "member 1", "the oversized hint was not replaced");
+        assert_eq!(names[2], "z".repeat(MAX_NAME_LEN));
+    }
+    assert_ne!(long.len(), MAX_NAME_LEN);
+}
+
+/// The click is per member, decided by the member and not the host: enabling
+/// the metronome must not put a click in the monitor of somebody who turned it
+/// off, and turning it off must not take it away from anybody else.
+#[test]
+fn the_click_is_enabled_per_member() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_host, Some(0.0));
+    let b = h.add_client(&inv_b, Some(0.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(1_000);
+
+    // Silent musicians, so the only thing in any mix is the click.
+    h.clients[b].core.set_click(false).unwrap();
+    h.clients[0].core.set_metronome(120, 4, true).unwrap();
+    h.run_ms(500);
+    h.clear_playouts();
+    h.run_ms(2_000);
+    let win = 96_000;
+    assert!(
+        tail_rms(&h, 0, win) > 0.005,
+        "the host opted in and heard nothing: {}",
+        tail_rms(&h, 0, win)
+    );
+    assert!(
+        tail_rms(&h, b, win) < 1e-4,
+        "musician 1 turned the click off and still heard it: {}",
+        tail_rms(&h, b, win)
+    );
+    // Listeners never hear it at all: it is not in the broadcast mix.
+    assert!(
+        tail_rms(&h, l, win) < 1e-4,
+        "the click reached the broadcast: {}",
+        tail_rms(&h, l, win)
+    );
+
+    // Opting back in is enough on its own; the host does not re-send anything.
+    h.clients[b].core.set_click(true).unwrap();
+    h.run_ms(250);
+    h.clear_playouts();
+    h.run_ms(2_000);
+    assert!(
+        tail_rms(&h, b, win) > 0.005,
+        "musician 1 opted back in and heard nothing: {}",
+        tail_rms(&h, b, win)
+    );
+    assert!(tail_rms(&h, l, win) < 1e-4);
+
+    // And opting out again is not a violation, whoever does it: a listener
+    // has a click flag too, it just has no mix to put it in.
+    let before = h.server_events.len();
+    h.clients[l].core.set_click(false).unwrap();
+    h.run_ms(250);
+    assert!(
+        h.server_events[before..]
+            .iter()
+            .all(|e| !matches!(e, ServerEvent::ProtocolViolation { .. })),
+        "{:?}",
+        &h.server_events[before..]
+    );
+}
+
+fn record_ops(h: &Harness) -> Vec<RecordOp> {
+    h.server_events
+        .iter()
+        .filter_map(|e| match e {
+            ServerEvent::RecordCtl(op) => Some(*op),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
