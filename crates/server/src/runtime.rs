@@ -407,14 +407,7 @@ impl Server {
             return;
         };
         let stems_cfg = self.recording_opts.as_ref().is_some_and(|c| c.stems());
-        let (state, stems) = match worker.state() {
-            RecordingState::Idle => (ProtoRecordingState::Idle, stems_cfg),
-            RecordingState::Recording { stems } => (ProtoRecordingState::Recording, stems),
-            RecordingState::Uploading => (ProtoRecordingState::Uploading, stems_cfg),
-            RecordingState::Failed { reason } => {
-                (ProtoRecordingState::Failed { reason }, stems_cfg)
-            }
-        };
+        let (state, stems) = record_status(worker.state(), stems_cfg);
         self.core.set_record_status(state, stems);
     }
 
@@ -672,6 +665,18 @@ fn guard<T>(f: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).ok()
 }
 
+/// The recorder's state as the wire carries it. The two enums stay separate on
+/// purpose: the recorder's knows about stems, the protocol's carries what
+/// configuration asked for, which is what every surface shows.
+fn record_status(state: RecordingState, stems_cfg: bool) -> (ProtoRecordingState, bool) {
+    match state {
+        RecordingState::Idle => (ProtoRecordingState::Idle, stems_cfg),
+        RecordingState::Recording { stems } => (ProtoRecordingState::Recording, stems),
+        RecordingState::Uploading => (ProtoRecordingState::Uploading, stems_cfg),
+        RecordingState::Failed { reason } => (ProtoRecordingState::Failed { reason }, stems_cfg),
+    }
+}
+
 /// The marker jamstreamd leaves beside its shutdown sentinel, telling whoever
 /// spawned it that the sentinel has a reader. The local provider skips the
 /// graceful wait when it is absent, which is what an older build gets.
@@ -720,9 +725,46 @@ fn touch(path: Option<&std::path::Path>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{IdleExit, MaxDuration, guard, session_elapsed, shutdown_supported_path};
+    use super::{
+        IdleExit, MaxDuration, ProtoRecordingState, RecordingState, guard, record_status,
+        session_elapsed, shutdown_supported_path,
+    };
     use std::path::Path;
     use std::time::Duration;
+
+    /// Every recorder state reaches the wire. Uploading in particular: it was
+    /// rendered by the app and printed by the CLI for a release before anything
+    /// emitted it, and this arm is the only place it becomes a message.
+    #[test]
+    fn every_recorder_state_maps_to_the_wire() {
+        assert_eq!(
+            record_status(RecordingState::Idle, true),
+            (ProtoRecordingState::Idle, true)
+        );
+        assert_eq!(
+            record_status(RecordingState::Recording { stems: false }, true),
+            (ProtoRecordingState::Recording, false),
+            "the take's own stem setting wins over configuration"
+        );
+        assert_eq!(
+            record_status(RecordingState::Uploading, true),
+            (ProtoRecordingState::Uploading, true)
+        );
+        assert_eq!(
+            record_status(
+                RecordingState::Failed {
+                    reason: "bucket went away".to_owned()
+                },
+                false
+            ),
+            (
+                ProtoRecordingState::Failed {
+                    reason: "bucket went away".to_owned()
+                },
+                false
+            )
+        );
+    }
 
     /// The whole point of #47: an unwind out of the core stops here instead of
     /// leaving run(), block_on, and main, which took every member with it.

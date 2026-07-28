@@ -3,12 +3,15 @@
 //! The mock is only the far end; every byte passes through the same
 //! encoder, sink bridge, and multipart driver a real launch uses.
 
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jamstream_cloud::storage::{MockStore, ObjectStore, session_prefix};
 use jamstream_server::cloud_sink::CloudSink;
-use jamstream_server::record::{RecordPayload, RecordWorker, RecordingState};
+use jamstream_server::record::{
+    RecordPayload, RecordWorker, RecordingObject, RecordingSink, RecordingState,
+};
 
 const BUCKET: &str = "my-jams";
 const SESSION: &str = "abc123";
@@ -138,23 +141,79 @@ fn a_failed_upload_aborts_and_surfaces_the_reason() {
     std::fs::remove_dir_all(&markers).ok();
 }
 
+/// A sink that parks in `finish` until the test lets go, wrapping the real
+/// one. The window where a take is draining is short against a mock bucket,
+/// short enough that polling for it is a race the test always wins; holding
+/// the finishing call open makes the state observable instead of lucky.
+struct HeldSink {
+    inner: CloudSink,
+    hold: Arc<Mutex<mpsc::Receiver<()>>>,
+}
+
+struct HeldObject {
+    inner: Box<dyn RecordingObject>,
+    hold: Arc<Mutex<mpsc::Receiver<()>>>,
+}
+
+impl RecordingSink for HeldSink {
+    fn open(&mut self, name: &str) -> std::io::Result<Box<dyn RecordingObject>> {
+        Ok(Box::new(HeldObject {
+            inner: self.inner.open(name)?,
+            hold: Arc::clone(&self.hold),
+        }))
+    }
+
+    fn uploads(&self) -> bool {
+        self.inner.uploads()
+    }
+}
+
+impl RecordingObject for HeldObject {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        self.inner.write(chunk)
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        // Blocks until the test sends; a hung-up sender means proceed. The
+        // timeout is a backstop: a failing assertion drops the worker, which
+        // joins its thread, and waiting here forever would hang the suite
+        // instead of failing it.
+        let _ = self
+            .hold
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(20));
+        self.inner.finish()
+    }
+
+    fn abort(self: Box<Self>) -> std::io::Result<()> {
+        self.inner.abort()
+    }
+}
+
 /// #164: `Uploading` was in the wire protocol, rendered by the app, and
 /// printed by the CLI, but nothing ever emitted it. The state exists to say
 /// "the take ended and its bytes are still going to storage", which is only
-/// observable while the finishing call is blocked, so this test holds the
-/// sink open and watches the worker's published state.
+/// true while the finishing call is running, so this test holds that call open
+/// and requires the state rather than hoping to catch it.
 #[test]
 fn a_draining_take_reports_uploading_until_the_bucket_has_it() {
     let store = Arc::new(MockStore::new(jamstream_cloud::ProviderKind::Aws));
     let markers = temp_marker_dir("uploading");
-    let sink = CloudSink::over(
+    let inner = CloudSink::over(
         Arc::clone(&store) as Arc<dyn ObjectStore>,
         BUCKET.to_owned(),
         SESSION,
         markers.clone(),
     )
     .unwrap();
-    let worker = RecordWorker::spawn(sink).unwrap();
+    assert!(inner.uploads(), "a bucket take is worth announcing");
+    let (release, hold) = mpsc::channel::<()>();
+    let worker = RecordWorker::spawn(HeldSink {
+        inner,
+        hold: Arc::new(Mutex::new(hold)),
+    })
+    .unwrap();
 
     worker.start(1_753_000_000, None);
     let mut payload = Box::new(RecordPayload::default());
@@ -166,28 +225,30 @@ fn a_draining_take_reports_uploading_until_the_bucket_has_it() {
         matches!(worker.state(), RecordingState::Recording { .. })
     });
 
-    // Stop, then catch the state while the tail is still in flight. The
-    // window is real but short, so this polls rather than sleeping once.
+    // Stop. The finishing call is parked in the sink, so the room must be
+    // told the take is uploading, and must stay told until it lands.
     worker.stop();
-    let mut saw_uploading = false;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match worker.state() {
-            RecordingState::Uploading => saw_uploading = true,
-            RecordingState::Idle if saw_uploading => break,
-            // Reaching Idle without ever showing Uploading is the bug this
-            // test exists for, but on a mock bucket the drain can be faster
-            // than a poll, so only a missing object is a real failure.
-            RecordingState::Idle => break,
-            RecordingState::Failed { reason } => panic!("upload failed: {reason}"),
-            RecordingState::Recording { .. } => {}
-        }
-        assert!(Instant::now() < deadline, "the take never finished");
-    }
+    wait_for("the take to report uploading", || {
+        worker.state() == RecordingState::Uploading
+    });
+    assert!(
+        store.keys(BUCKET).is_empty(),
+        "nothing is committed while the drain is held"
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        worker.state(),
+        RecordingState::Uploading,
+        "the state holds for as long as the bytes are in flight"
+    );
 
-    // Whatever the polls caught, the object is committed and the marker the
-    // guard reads is gone, which is what Uploading was describing.
+    // Let the tail go: the object commits, the state clears to Idle, and the
+    // marker the dead man's switch reads disappears.
+    drop(release);
     wait_for("the take to be committed", || store.keys(BUCKET).len() == 1);
+    wait_for("the recorder to go idle", || {
+        worker.state() == RecordingState::Idle
+    });
     wait_for("the marker to clear", || {
         std::fs::read_dir(&markers).unwrap().count() == 0
     });

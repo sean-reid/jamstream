@@ -19,7 +19,7 @@ use jamstream_engine::{Fader, mix_into};
 use jamstream_protocol::ids::MemberId;
 use jamstream_session::{MAX_MUSICIANS, TICK_SAMPLES};
 
-use crate::flac::FlacEncoder;
+use crate::flac::{BLOCK_INTERLEAVED, FlacEncoder};
 
 /// Interleaved stereo samples per 2.5 ms tick.
 pub const TICK_STEREO_SAMPLES: usize = TICK_SAMPLES * 2;
@@ -161,6 +161,23 @@ impl Track {
         Ok(Track { enc, object })
     }
 
+    /// Opens a track whose stream starts with `head`, already-encoded frames
+    /// that the caller counts in `frames`, plus `pending` interleaved samples
+    /// of silence the encoder carries into its next block.
+    fn open_with_head(
+        sink: &mut dyn RecordingSink,
+        file: &str,
+        head: &[u8],
+        frames: usize,
+        pending: usize,
+    ) -> io::Result<Track> {
+        let mut object = sink.open(file)?;
+        let enc = FlacEncoder::resume_silent(frames, pending);
+        object.write(&enc.header()?)?;
+        object.write(head)?;
+        Ok(Track { enc, object })
+    }
+
     fn push(&mut self, samples: &[f32], buf: &mut Vec<u8>) -> io::Result<()> {
         buf.clear();
         self.enc.push(samples, buf)?;
@@ -180,11 +197,62 @@ impl Track {
     }
 }
 
+/// The take's silent head, encoded once as the take runs so a stem that opens
+/// late is backfilled by copying bytes instead of encoding minutes of silence
+/// on the recorder thread. FLAC frames here carry no state but their number,
+/// so frames 0..n of silence are the same bytes in every stem's stream.
+/// One tick of silence per tick, about 300 bytes of memory per second of take.
+struct SilentHead {
+    enc: FlacEncoder,
+    /// Every complete frame emitted so far, back to back.
+    bytes: Vec<u8>,
+    /// Byte offset in `bytes` just past each frame.
+    frame_ends: Vec<usize>,
+}
+
+impl SilentHead {
+    fn new() -> SilentHead {
+        SilentHead {
+            enc: FlacEncoder::new(),
+            bytes: Vec::new(),
+            frame_ends: Vec::new(),
+        }
+    }
+
+    /// Encodes one more tick of silence. A tick is shorter than a block, so
+    /// this completes at most one frame.
+    fn advance(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+        buf.clear();
+        self.enc.push(&[0.0; TICK_STEREO_SAMPLES], buf)?;
+        if !buf.is_empty() {
+            self.bytes.extend_from_slice(buf);
+            self.frame_ends.push(self.bytes.len());
+        }
+        Ok(())
+    }
+
+    /// Where a stem opening `ticks` into the take starts: the frames to write
+    /// as they are, how many they are, and the leftover silent samples its
+    /// encoder carries. None when the head has not been grown that far.
+    fn split(&self, ticks: u64) -> Option<(&[u8], usize, usize)> {
+        let needed = usize::try_from(ticks).ok()? * TICK_STEREO_SAMPLES;
+        let frames = needed / BLOCK_INTERLEAVED;
+        let pending = needed % BLOCK_INTERLEAVED;
+        let end = match frames.checked_sub(1) {
+            None => 0,
+            Some(last) => *self.frame_ends.get(last)?,
+        };
+        Some((&self.bytes[..end], frames, pending))
+    }
+}
+
 struct Take {
     base: String,
     mix: Track,
     /// Stem tracks by member, opened on first audio. None: stems are off.
     stems: Option<BTreeMap<MemberId, Track>>,
+    /// Silence to backfill a late stem with; only kept while stems are on.
+    silence: Option<SilentHead>,
     /// Names for stem files, as given at start; unknown members fall back to
     /// their id.
     roster: Vec<(MemberId, String)>,
@@ -238,6 +306,7 @@ impl Recorder {
             base,
             mix,
             stems: stems.as_ref().map(|_| BTreeMap::new()),
+            silence: stems.as_ref().map(|_| SilentHead::new()),
             roster: stems.unwrap_or_default(),
             names_used: vec!["mix".to_owned()],
             ticks: 0,
@@ -335,11 +404,16 @@ fn feed_take(
         }
     }
     take.ticks += 1;
+    if let Some(silence) = take.silence.as_mut() {
+        silence.advance(buf)?;
+    }
     Ok(())
 }
 
-/// Opens a stem for a member first heard now, backfilled with silence from
-/// the start of the take so it lines up with the mix.
+/// Opens a stem for a member first heard now, backfilled with silence from the
+/// start of the take so it lines up with the mix. The backfill is a copy of the
+/// take's silent head: encoding it here would stall the recorder for tens of
+/// milliseconds per minute of take, and the mix tick is queued behind it.
 fn open_stem(
     take: &mut Take,
     id: MemberId,
@@ -347,12 +421,24 @@ fn open_stem(
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
     let name = stem_name(&take.roster, &take.names_used, id);
-    take.names_used.push(name.clone());
-    let mut track = Track::open(sink, &format!("{}-{name}.flac", take.base))?;
-    let silent = [0.0f32; TICK_STEREO_SAMPLES];
-    for _ in 0..take.ticks {
-        track.push(&silent, buf)?;
-    }
+    let file = format!("{}-{name}.flac", take.base);
+    let head = take.silence.as_ref().and_then(|s| s.split(take.ticks));
+    let track = match head {
+        Some((bytes, frames, pending)) => {
+            Track::open_with_head(sink, &file, bytes, frames, pending)?
+        }
+        // The head does not reach this tick, which the loop above keeps it
+        // from happening. Correctness first: encode the silence.
+        None => {
+            let mut track = Track::open(sink, &file)?;
+            let silent = [0.0f32; TICK_STEREO_SAMPLES];
+            for _ in 0..take.ticks {
+                track.push(&silent, buf)?;
+            }
+            track
+        }
+    };
+    take.names_used.push(name);
     take.stems
         .as_mut()
         .expect("only called with stems on")
@@ -809,6 +895,129 @@ mod tests {
         assert_eq!(objects.len(), 1, "the second start must not open files");
     }
 
+    /// The backfilled head of a late stem has to be exactly the bytes the
+    /// encoder would have written for that silence, or the file is a lie about
+    /// where the audio sits. Checked twice: byte for byte against a fresh
+    /// encoder, and by decoding with claxon rather than flacenc.
+    #[test]
+    fn a_late_stem_is_byte_identical_to_encoding_its_own_silence() {
+        // Not a multiple of the FLAC block, so the copied head stops
+        // mid-block and the stem's encoder has to carry the remainder.
+        let joined_at = 1_000u64;
+        let sink = MemSink::default();
+        let mut rec = Recorder::new(sink.clone());
+        let fader = Fader {
+            gain_db: -3.0,
+            pan: -0.25,
+            muted: false,
+        };
+        rec.start(STAMP, Some(vec![(MemberId(7), "Kai".to_owned())]));
+        for tick in 0..joined_at + 300 {
+            let p = payload(tick, (tick >= joined_at).then_some((MemberId(7), fader)));
+            rec.tick(&p);
+        }
+        rec.stop();
+
+        // What a single encoder writing silence and then Kai would produce.
+        let mut enc = FlacEncoder::new();
+        let mut expected_bytes = enc.header().unwrap();
+        let mut expected_samples = Vec::new();
+        let silent = [0.0f32; TICK_STEREO_SAMPLES];
+        for _ in 0..joined_at {
+            enc.push(&silent, &mut expected_bytes).unwrap();
+            expected_samples.extend(silent.iter().map(|&s| crate::flac::to_i16(s)));
+        }
+        let mut stereo = [0.0f32; TICK_STEREO_SAMPLES];
+        for tick in joined_at..joined_at + 300 {
+            let p = payload(tick, Some((MemberId(7), fader)));
+            mix_into(
+                &[(MemberId(7), &p.stem_pcm[0][..])],
+                |_| fader,
+                None,
+                &mut stereo,
+            );
+            enc.push(&stereo, &mut expected_bytes).unwrap();
+            expected_samples.extend(stereo.iter().map(|&s| crate::flac::to_i16(s)));
+        }
+        enc.finish(&mut expected_bytes).unwrap();
+
+        let objects = sink.objects.lock().unwrap();
+        let stem = &objects["jamstream-2026-07-28-1930-Kai.flac"];
+        assert!(stem.finished && !stem.aborted);
+        let first_diff = stem
+            .bytes
+            .iter()
+            .zip(&expected_bytes)
+            .position(|(a, b)| a != b);
+        assert_eq!(
+            (stem.bytes.len(), first_diff),
+            (expected_bytes.len(), None),
+            "the copied head is not the silence an encoder would have written"
+        );
+        assert_eq!(decode(&stem.bytes), expected_samples);
+    }
+
+    /// Wall budgets scale the way the harness scales them, off one variable.
+    fn perf_budget(laptop: Duration) -> Duration {
+        let scale = std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(1.0, |v| v / 30.0);
+        Duration::from_secs_f64(laptop.as_secs_f64() * scale)
+    }
+
+    /// The one that punched a hole in the mix: open_stem used to encode the
+    /// whole take's silence inline, about 38 ms per minute of take, so past
+    /// roughly 26 minutes a musician walking in cost more than the queue's one
+    /// second and the mix recording went to gap-filled silence. Measured on
+    /// this test's take before the fix: 840 ms. After: under a millisecond.
+    #[test]
+    fn a_join_deep_into_a_take_does_not_stall_the_mix() {
+        let minutes = 45u64;
+        let ticks = minutes * 60 * 400;
+        let sink = MemSink::default();
+        let mut rec = Recorder::new(sink.clone());
+        rec.start(STAMP, Some(vec![(MemberId(0), "Ana".to_owned())]));
+        // A silent take: the backfill's cost is the same either way, and this
+        // keeps 45 minutes of ticks affordable in a test.
+        let mut quiet = RecordPayload::default();
+        quiet.push_stem(MemberId(0), Fader::default(), &[0.0; TICK_SAMPLES]);
+        // The queue the mix tick submits into, modelled: the recorder owes the
+        // mix clock a tick every 2.5 ms, and QUEUE_TICKS in flight is all the
+        // slack there is before submit_tick starts counting gaps.
+        let mut backlog = 0.0f64;
+        let mut peak_backlog = 0.0f64;
+        for _ in 0..ticks {
+            let started = Instant::now();
+            rec.tick(&quiet);
+            backlog = (backlog + started.elapsed().as_secs_f64() / 0.0025 - 1.0).max(0.0);
+            peak_backlog = peak_backlog.max(backlog);
+        }
+        let mut join = quiet;
+        join.push_stem(MemberId(1), Fader::default(), &[0.0; TICK_SAMPLES]);
+        let started = Instant::now();
+        rec.tick(&join);
+        let stall = started.elapsed();
+        rec.stop();
+        assert_eq!(rec.state(), &RecordingState::Idle);
+
+        let budget = perf_budget(Duration::from_millis(25));
+        assert!(
+            stall < budget,
+            "a join {minutes} minutes into a take stalled the recorder for {stall:?}, \
+             budget {budget:?}"
+        );
+        let peak = peak_backlog + stall.as_secs_f64() / 0.0025;
+        assert!(
+            peak < QUEUE_TICKS as f64,
+            "the recorder fell {peak:.0} ticks behind the mix clock; \
+             the queue holds {QUEUE_TICKS} and the rest is a hole in the mix"
+        );
+        let objects = sink.objects.lock().unwrap();
+        assert_eq!(objects.len(), 3, "mix and two stems");
+        assert!(objects.values().all(|o| o.finished && !o.aborted));
+    }
+
     /// A sink whose first write parks until the test releases it: the worker
     /// thread wedges exactly the way a stalled upload would.
     struct WedgedSink {
@@ -829,8 +1038,15 @@ mod tests {
 
     impl RecordingObject for WedgedObject {
         fn write(&mut self, _chunk: &[u8]) -> io::Result<()> {
-            // Blocks until the test sends; hung up means proceed freely.
-            let _ = self.hold.lock().unwrap().recv();
+            // Blocks until the test sends; hung up means proceed freely. The
+            // timeout is a backstop: a failing assertion drops the worker,
+            // which joins this thread, and waiting forever would hang the
+            // suite instead of failing it.
+            let _ = self
+                .hold
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20));
             Ok(())
         }
 
