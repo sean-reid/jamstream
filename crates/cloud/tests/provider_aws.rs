@@ -1211,3 +1211,154 @@ async fn orphan_cleanup_leaves_a_group_that_is_still_attached() {
     );
     assert_eq!(deleted.len(), p.regions().len());
 }
+
+// ---- missing IAM permissions ----
+
+/// Stand-in for the base64 blob AWS staples onto every UnauthorizedOperation.
+/// The real one is around 700 characters and is only readable with
+/// sts:DecodeAuthorizationMessage, which the documented jamstream policy
+/// does not grant.
+const ENCODED_BLOB: &str = "kV9Pz2Nz3wKQ7dJ8mYb1hV0sN5aQ2eR6tU8iO0pL4kJ3hG2fD1sA9zX8cV7bN6mM5lK4jH3gF2dS1aQ0wE9rT8yU7iO6pP5oI4uY3tR2eW1qZ0xC9vB8nM7mL6kJ5hG4fD3sA2zX1cV0bN9mM8lK7jH6gF5dS4aQ3wE2rT1yU0iO9pP8oI7uY6tR5eW4qZ3xC2vB1nM0mL9kJ8hG7fD6sA5zX4cV3bN2mM1lK0jH9gF8dS7aQ6wE5rT4yU3iO2pP1oI0uY9tR8eW7qZ6xC5vB4nM3mL2kJ1hG0fD9sA8zX7cV6bN5mM4lK3jH2gF1dS0aQ9wE8rT7yU6iO5pP4oI3uY2tR1eW0qZ9xC8vB7nM6mL5kJ4hG3fD2sA1zX0cV9bN8mM7lK6jH5gF4dS3aQ2wE1rT0yU9iO8pP7oI6uY5tR4eW3qZ2xC1vB0nM9mL8kJ7hG6fD5sA4zX3cV2bN1mM0lK9jH8gF7dS6aQ5wE4rT3yU2iO1pP0oI9uY8tR7eW6qZ5xC4vB3nM2mL1kJ0hG9fD8sA7zX6cV5bN4mM3lK2jH1gF0dS9aQ8wE7rT6yU5iO4pP3oI2uY1tR0eW9qZ8xC7vB6nM5mL4kJ3hG2fD1sA0zX";
+
+fn unauthorized_body(action: &str) -> String {
+    error_body(
+        "UnauthorizedOperation",
+        &format!(
+            "You are not authorized to perform this operation. \
+             User: arn:aws:iam::123456789012:user/jamstream is not authorized to perform: \
+             {action} on resource: arn:aws:ec2:us-west-2:123456789012:security-group/* \
+             because no identity-based policy allows the {action} action. \
+             Encoded authorization failure message: {ENCODED_BLOB}"
+        ),
+    )
+}
+
+/// The defect behind issue 114's second half: a host whose policy predates
+/// the per-session security group saw the whole 403 body, encoded blob and
+/// all, and nothing that said which action to add.
+#[tokio::test]
+async fn a_missing_permission_names_the_action_and_the_setup_page() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "AmazonSSM.GetParameter"))
+        .respond_with(ssm_parameter_response("ami-0123resolved456789"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=CreateSecurityGroup"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_string(unauthorized_body("ec2:CreateSecurityGroup")),
+        )
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let err = p.launch(launch_spec(&p, "us-west-2")).await.unwrap_err();
+    assert!(matches!(err, ProviderError::Auth(_)), "got {err:?}");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("the IAM policy is missing ec2:CreateSecurityGroup"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("guides/providers/aws.html"),
+        "the message must point at the page with the policy: {rendered}"
+    );
+    // The underlying failure survives; only the undecodable blob is dropped.
+    assert!(
+        rendered.contains("arn:aws:iam::123456789012:user/jamstream"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(ENCODED_BLOB), "{rendered}");
+    assert!(
+        !rendered.contains("<Code>"),
+        "the raw XML must not reach the wizard: {rendered}"
+    );
+    // The body this came from renders at 1133 characters, most of it blob.
+    assert!(
+        rendered.len() < 600,
+        "the message is {} characters: {rendered}",
+        rendered.len()
+    );
+}
+
+/// Every EC2 action the provider sends can come back denied; whichever one
+/// does, the message names it rather than making the host decode a blob.
+#[tokio::test]
+async fn a_denial_on_any_action_names_that_action() {
+    for action in [
+        "ec2:RunInstances",
+        "ec2:DescribeInstances",
+        "ec2:TerminateInstances",
+        "ec2:CreateSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DeleteSecurityGroup",
+        "ec2:CreateTags",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(unauthorized_body(action)))
+            .mount(&server)
+            .await;
+        let p = provider(&server);
+        let err = p
+            .destroy(&RegionId::new("us-west-2"), "i-123")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("the IAM policy is missing {action}")),
+            "{action}: {err}"
+        );
+    }
+}
+
+/// A denial AWS phrases without an action name still says what it is and
+/// where to look, and still carries what AWS said.
+#[tokio::test]
+async fn an_unattributed_denial_still_points_at_the_policy() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(error_body(
+            "UnauthorizedOperation",
+            "You are not authorized to perform this operation.",
+        )))
+        .mount(&server)
+        .await;
+    let p = provider(&server);
+    let err = p
+        .destroy(&RegionId::new("us-west-2"), "i-123")
+        .await
+        .unwrap_err();
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("the IAM policy is missing a permission this call needs"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("guides/providers/aws.html"), "{rendered}");
+    assert!(
+        rendered.contains("You are not authorized to perform this operation."),
+        "{rendered}"
+    );
+}
+
+/// A 403 is fatal, so the remap must not cost the caller a retry: the
+/// shared http layer never retries auth failures and the remap runs after
+/// it, not instead of it.
+#[tokio::test]
+async fn a_denied_call_is_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_string(unauthorized_body("ec2:TerminateInstances")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let p = provider(&server);
+    p.destroy(&RegionId::new("us-west-2"), "i-123")
+        .await
+        .unwrap_err();
+}

@@ -268,14 +268,18 @@ impl AwsProvider {
                 .text()
                 .await
                 .map_err(|e| ProviderError::Other(format!("reading {action} response: {e}"))),
-            // EC2 signals expected failures (unknown instance id, bad
-            // parameters) as HTTP 400 with an XML error code in the body,
-            // which the shared http layer now carries on the error; remap
-            // that code to a precise ProviderError.
+            // EC2 signals expected failures as an XML error code in the
+            // body, which the shared http layer carries on the error: bad
+            // parameters and unknown ids arrive as 400 (classified Other),
+            // a missing IAM permission as 403 (classified Auth). Both are
+            // fatal and both carry a code worth naming, so both get
+            // remapped. 5xx keeps its Transient classification: the code in
+            // a server-error body says nothing about whether to retry.
             Err(err) => {
                 let remapped = match http::error_body(&err) {
                     Some(body)
-                        if matches!(err, ProviderError::Other(_)) && body.contains("<Code>") =>
+                        if matches!(err, ProviderError::Other(_) | ProviderError::Auth(_))
+                            && body.contains("<Code>") =>
                     {
                         Some(map_error_body(body))
                     }
@@ -843,9 +847,34 @@ fn parse_ingress(xml: &str) -> Vec<IngressRule> {
     out
 }
 
+/// The AWS setup page in the published user reference. A missing action is
+/// a policy the host has to edit, not a bug, so the error points at the
+/// page that has the policy to paste.
+const AWS_SETUP_URL: &str = "https://sean-reid.github.io/jamstream/guides/providers/aws.html";
+
+/// AWS appends `Encoded authorization failure message: <~700 characters of
+/// base64>` to UnauthorizedOperation. Decoding it takes
+/// sts:DecodeAuthorizationMessage, which a host following our setup does
+/// not have, so in the wizard it is 700 characters that say nothing; the
+/// action name earlier in the same message is the part that says what to
+/// fix.
+const ENCODED_AUTHORIZATION_MESSAGE: &str = "Encoded authorization failure message:";
+
+/// The action an UnauthorizedOperation message names, if it names one. AWS
+/// phrases it "is not authorized to perform: ec2:CreateSecurityGroup on
+/// resource: ...".
+fn denied_action(message: &str) -> Option<&str> {
+    let action = message
+        .split_once("is not authorized to perform: ")?
+        .1
+        .split([' ', ',', '.'])
+        .next()?;
+    (!action.is_empty()).then_some(action)
+}
+
 /// Maps an EC2 error body (`<Response><Errors><Error><Code>...`) to a
-/// ProviderError. Reached for HTTP 400 responses whose body the shared
-/// http layer carried on the error; other statuses keep the shared
+/// ProviderError. Reached for the fatal statuses whose body the shared http
+/// layer carried on the error, 400 and 403; other statuses keep the shared
 /// classification.
 fn map_error_body(body: &str) -> ProviderError {
     let code = xml_value(body, "Code")
@@ -855,14 +884,29 @@ fn map_error_body(body: &str) -> ProviderError {
         .map(xml_unescape)
         .unwrap_or_default();
     let detail = format!("{code}: {message}");
+    // The one failure a host who followed the setup guide can actually act
+    // on: name the action their policy is missing and where to add it,
+    // ahead of what AWS said rather than instead of it.
+    if code == "UnauthorizedOperation" {
+        let missing = match denied_action(&message) {
+            Some(action) => format!("the IAM policy is missing {action}"),
+            None => "the IAM policy is missing a permission this call needs".to_owned(),
+        };
+        let said = message
+            .split(ENCODED_AUTHORIZATION_MESSAGE)
+            .next()
+            .unwrap_or(&message)
+            .trim();
+        return ProviderError::Auth(format!(
+            "{code}: {missing}. Update the jamstream-host policy at {AWS_SETUP_URL} \
+             (AWS said: {said})"
+        ));
+    }
     if code == "RequestLimitExceeded" || code == "Throttling" {
         ProviderError::RateLimited { retry_after: None }
     } else if code.contains("NotFound") || code == "InvalidInstanceID.Malformed" {
         ProviderError::NotFound(detail)
-    } else if code == "AuthFailure"
-        || code == "SignatureDoesNotMatch"
-        || code == "UnauthorizedOperation"
-    {
+    } else if code == "AuthFailure" || code == "SignatureDoesNotMatch" {
         ProviderError::Auth(detail)
     } else if code.contains("LimitExceeded") || code == "InsufficientInstanceCapacity" {
         ProviderError::QuotaExceeded(detail)
