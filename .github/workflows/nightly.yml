@@ -170,6 +170,15 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      # The pinned ffmpeg, not apt's, for the reason given in ci.yml: it is the
+      # binary a session VM boots with, so it is the only one whose behaviour
+      # says anything about the product. real_ffmpeg now fails on Linux rather
+      # than returning early when the encoder is missing.
+      - if: runner.os == 'Linux'
+        name: Install the ffmpeg a session VM runs
+        run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
+      - if: runner.os == 'Linux'
+        run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
       # The harness has two wall-clock gates, and their budgets are
       # calibrated on a developer laptop. ci.yml scales them for shared
       # runners; this job runs the same tests and did not, so both were
