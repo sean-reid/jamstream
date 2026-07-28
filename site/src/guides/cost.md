@@ -32,11 +32,13 @@ Broadcasting is the exception: one Twitch or YouTube destination is about 1.2 GB
 
 ## Recording
 
-[Recording a session](recording.md) on your own computer costs nothing but disk: about 0.4 GB per hour for the mix, or about 1.8 GB per hour with stems for a four piece.
+[Recording a session](recording.md) on your own computer costs nothing but disk: about 0.4 GB per hour for the mix, or about 2 GB per hour with stems for a four piece.
 
-A cloud session records to a bucket, which adds two charges. Storage is the small one. A three hour take is about 1.1 GB for the mix or about 5.5 GB with stems, and at $0.023 per GB-month on S3 and about $0.02 on Cloud Storage, keeping the stems for the default 30 days is about $0.13. A DigitalOcean Spaces subscription is $5 a month including 250 GB, so a take fits inside what you already pay. Uploading costs nothing, because the machine and the bucket are at the same provider.
+A cloud session records to a bucket, which adds two charges. Storage is the small one. A three hour take is about 1.2 GB for the mix or about 6 GB with stems, and at $0.023 per GB-month on S3 and about $0.02 on Cloud Storage, keeping the stems for the default 30 days is about $0.14. A DigitalOcean Spaces subscription is $5 a month including 250 GB, so a take fits inside what you already pay. Uploading costs nothing, because the machine and the bucket are at the same provider.
 
-**The egress lands on the download.** Pulling 5.5 GB of stems out of S3 is about $0.49, out of Cloud Storage about $0.66, and free inside the 1 TB Spaces includes. That is the one cost in JamStream that arrives after a session has finished pricing itself, which is why `jamstream recordings get` prints the figure and waits for a yes before it moves a byte.
+The wizard shows both lines before you launch, and they move when you switch between the mix and stems.
+
+**The egress lands on the download.** Pulling 6 GB of stems out of S3 is about $0.56, out of Cloud Storage about $0.75, and free inside the 1 TB Spaces includes. That is the one cost in JamStream that arrives after a session has finished pricing itself, which is why `jamstream recordings get` prints the figure and waits for a yes before it moves a byte.
 
 ## The guardrails
 
@@ -54,9 +56,9 @@ The worst case, all guardrails ignored and a session forgotten mid-jam, is 12 ho
 
 ```console
 $ jamstream status
-SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
-3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.08037 at 3.0 h
-b7e5c9b6   local/local          ended      2 h 13 min        $0.00              -
+SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED TAKES
+3f2a9c01   digitalocean/nyc3    running   1 h 04 min    $0.028576 $0.08037 at 3.0 h our-jams +stems
+b7e5c9b6   local/local          ended     2 h 13 min        $0.00              - -
 ```
 
-Accrued is hourly rate times elapsed time; it stops when the session ends. The state files behind this table live on your machine, one JSON file per session, under your platform's data directory in `jamstream/sessions/`.
+Accrued is hourly rate times elapsed time; it stops when the session ends. TAKES is the bucket the session recorded to, if it recorded to one; a take on your own disk shows a dash and lives in the folder [Recording a session](recording.md#on-this-computer) names. The state files behind this table live on your machine, one JSON file per session, under your platform's data directory in `jamstream/sessions/`.

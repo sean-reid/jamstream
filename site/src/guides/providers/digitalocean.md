@@ -50,6 +50,18 @@ Paste the token into the API token field (Show reveals it if you need to compare
 
 The token lives in your system keychain from then on; the pane does not appear again. You are ready to host; continue with the [quickstart](../../quickstart.md#host-on-the-internet-with-digitalocean).
 
+## 4. Optional: a Space and a Spaces key, for recording
+
+[Recording a cloud session](../recording.md) writes takes to a Spaces bucket in your own account. **The Spaces key is not the API token from step 2.** That is the mistake everyone makes once: the `dop_v1_...` token cannot talk to Spaces at all, because Spaces is S3-compatible and signed with an access key pair rather than a bearer token.
+
+1. In the control panel, open **Spaces Object Storage** and create a bucket in the region you host droplets in. Spaces is a flat $5 per month including 250 GB of storage and 1 TB of transfer, so a recording adds nothing if you already have one. Give recordings a bucket that holds nothing else.
+2. Still under **Spaces Object Storage**, open the **Access Keys** tab and click **Create Access Key**. Name it `jamstream-recording`. Arming a session sets the bucket's expiry rule as well as writing to it, so the key needs full access to that bucket: a read-only or write-only key fails the check while you are configuring.
+3. Copy the secret immediately; it is shown once.
+
+Paste both values into **Settings**, then **Recording**, in the app, and click Check. From the terminal the pair goes in `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY`, which [`jamstream recordings`](../../cli/recordings.md#the-storage-key) lists for every provider.
+
+Spaces is not offered in every droplet region. If the check says so, it names the regions that have it.
+
 ## For the CLI and automation
 
 The CLI reads the token from the environment instead:

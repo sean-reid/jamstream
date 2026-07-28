@@ -105,6 +105,45 @@ In the host wizard, select **aws**; while no credentials are saved the row reads
 
 The keys live in your system keychain from then on. You are ready to host; continue with the [quickstart](../../quickstart.md#host-on-the-internet-with-digitalocean), picking aws in the wizard instead.
 
+## 5. Optional: a bucket and a second key, for recording
+
+[Recording a cloud session](../recording.md) writes takes to an S3 bucket in your own account, and the key that writes them is not the key from step 3. Leave recording off and everything above is all there is.
+
+1. In the S3 console, **Create bucket**, in the same region you host in, with the default settings. Give recordings a bucket that holds nothing else: the lifecycle permission below is bucket-wide.
+2. Create a second IAM user, `jamstream-recording`, the same way as step 2, with only this policy. Name your bucket in both places:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "JamstreamWriteRecordings",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": "arn:aws:s3:::YOUR-BUCKET/jamstream/recordings/*"
+    },
+    {
+      "Sid": "JamstreamRetentionRule",
+      "Effect": "Allow",
+      "Action": "s3:PutLifecycleConfiguration",
+      "Resource": "arn:aws:s3:::YOUR-BUCKET"
+    }
+  ]
+}
+```
+
+3. Give that user its own access key, exactly as in step 3.
+
+The key can write under one prefix of one bucket and set that bucket's expiry rule, and nothing else: it cannot read a take back, list the bucket, or touch EC2. `DeleteObject` is on the prefix because arming a session writes one small probe object there and removes it, which is how a bucket that refuses the key fails while you are configuring rather than mid-song.
+
+Paste both values into **Settings**, then **Recording**, in the app, and click Check. The app keeps the recording key in its own keychain slot, so the two AWS keys stay separate.
+
+The CLI reads the recording key from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, the same two variables it launches with, so hosting a recorded session from the terminal wants one user carrying both policies rather than two users. [`jamstream recordings`](../../cli/recordings.md#the-storage-key) lists the variables for every provider.
+
 ## For the CLI and automation
 
 The CLI reads the keys from the environment instead:

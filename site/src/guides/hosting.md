@@ -33,6 +33,7 @@ Step 3 shows the expected hours, the seat counts, and the resulting estimate, al
 - **hours** shapes the estimate only; the real bill is metered. Play longer and you pay for the time played.
 - **musicians** is the number of playing seats, counting you: 4 means your own seat plus three invites to hand out. The cap is 10, which is also what the server admits. **listeners** are people who only hear the mix.
 - **stream destinations** is how many platforms you expect to broadcast to, and it is the number here that moves the estimate most: about 1.2 GB per hour each, against roughly 0.4 GB for four musicians playing. It configures nothing; platforms are set up in the session itself, in [Streaming to Twitch and YouTube](streaming.md).
+- **Recording** is off, the mix, or the mix and stems, and it is the one choice here that is fixed for the session: a session launched with it off cannot record later. A cloud take needs a bucket, which is set up once in Settings, and [Recording a session](recording.md) walks it.
 
 Under the numbers, release builds show one line naming the exact `jamstreamd` build the machine will download and verify at boot; there is nothing to configure. [Understanding cost](cost.md) explains every line of the estimate. Clicking **Launch** boots the machine, waits for its address, proves the server answers a real encrypted handshake, and joins you.
 

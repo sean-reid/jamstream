@@ -4,27 +4,45 @@ A take is the mix your listeners heard, written as 16 bit 48 kHz FLAC.
 
 Nothing is captured by surprise. Recording is armed at launch, and a take runs only while the host holds it open: each Record to Stop is one take.
 
-## Arming it at launch
+## Set up a bucket once
 
-Two things are fixed before anyone plays and cannot change once the session is running: whether the session can record at all, and whether stems are captured alongside the mix.
+A cloud session records to a bucket in your own account, because the machine deletes itself when the session ends and a take on its disk goes with it. Open **Settings**, then **Recording**:
 
-A session on your own computer records to your own disk and needs no account and no credential:
+![The Recording tab in the settings drawer: provider rows, the bucket and its region, two masked key fields, and Check](../images/session_settings_recording.png)
+*Set up once per computer. The key is masked and never shown again.*
+
+1. Pick the provider holding the bucket, and name the bucket and the region it is in. Host in that region and the upload costs nothing.
+2. Paste the storage key pair. **This is not the credential that launches machines**; the last section of your [provider's page](providers.md) creates it.
+3. Click **Check**. It writes one small object to the bucket and deletes it. A pass saves the key in your system keychain and says so; a failure shows the bucket's own reason and saves nothing, so a wrong key fails while you are pasting rather than mid-song.
+4. **Keep takes for** is the default retention for new sessions: 7, 30 or 90 days, or forever. The default is 30 days, and it is a rule on the bucket itself, so it keeps being enforced long after the machine is gone.
+
+A session on your own computer records to your own disk and needs none of this.
+
+## Arm it at launch
+
+Whether a session can record, and whether stems are captured alongside the mix, are fixed before anyone plays and cannot change once the session is running. Both are on the host wizard's cost preview:
+
+![Wizard step 3 of 4 with mix and stems selected, the bucket named under it, and the recording lines in the estimate](../images/wizard_preview_recording.png)
+*Off, the mix, or the mix and stems, with what each costs before you launch.*
+
+- **off** is where every launch starts.
+- **mix only** captures the stereo mix listeners hear: about 1.2 GB for three hours.
+- **mix and stems** adds one stereo file per musician, about five times the bytes for a four piece. The size sits beside each row and the estimate below moves as you pick, because that is the moment the difference matters.
+
+With no bucket set up, the two recording rows are disabled and say so, pointing at the Recording tab. A local session has no such requirement: the rows are live and the takes land on this computer.
+
+Launching proves the key can write this session's own prefix and puts the retention rule in place before the machine is paid for.
+
+## From the terminal
+
+`--record` records a local session; `--bucket` names a bucket and implies it. The CLI reads the storage key from the environment rather than the keychain, and [`jamstream recordings`](../cli/recordings.md#the-storage-key) names the two variables per provider.
 
 ```console
 $ jamstream host --provider local --record --yes
-```
-
-A cloud session records to a bucket in your own account, because the machine deletes itself when the session ends and a take on its disk goes with it. Name the bucket with `--bucket`, which implies `--record`, after setting a storage key in the environment; [`jamstream recordings`](../cli/recordings.md#the-storage-key) names the two variables for each provider.
-
-```console
 $ jamstream host --provider aws --region eu-west-1 --bucket my-jams --yes
 ```
 
-The launch proves that key can write the session's own prefix and puts the retention rule in place before the machine is paid for, so a bucket that refuses fails while you are still configuring rather than mid-song. `--retention` keeps takes for 7, 30 or 90 days, or forever. The default is 30 days, and it is a rule on the bucket itself, so it keeps being enforced long after the machine is gone.
-
-Stems are `--record-stems`, which implies `--record` and works either way. Every flag is in the [host reference](../cli/host.md).
-
-Arming a cloud session is a terminal job today: the app's wizard cannot point a session at a bucket, though a session the CLI launched records normally once you join it in the app.
+`--record-stems` captures stems and implies `--record`; `--retention` takes 7d, 30d, 90d or forever. Every flag is in the [host reference](../cli/host.md).
 
 A session launched without recording cannot be talked into it later. Press Record on one and it answers `recording is not configured for this session` straight away, so you find out before the song rather than after it.
 
@@ -47,7 +65,7 @@ jamstream-2026-07-28-1930-Ana.flac
 
 ### On this computer
 
-In a `recordings` folder under your platform's data directory, printed at launch:
+In a `recordings` folder under your platform's data directory, named in the wizard when you arm a local take and printed at launch by the CLI:
 
 ```console
 $ jamstream host --provider local --record --yes
@@ -72,13 +90,13 @@ A take still being written ends in `.part` and is renamed when it finishes, so a
 
 Under `jamstream/recordings/` and the session id, in the bucket you named. The take uploads while you play, so ending the session waits only for the last of it. Let the `UPLOADING` lamp clear before you end the session: the machine holds on for ten minutes to finish an upload and then shuts down regardless, and a take still in flight at that point is lost.
 
-[`jamstream recordings`](../cli/recordings.md) lists what each session recorded and fetches it, and takes outlive the session: one that ended weeks ago still lists until the retention rule deletes it. Downloading is where recording costs money, so the command prices the egress and waits for a yes before it moves a byte.
+`jamstream status` names the bucket each session recorded to, and [`jamstream recordings`](../cli/recordings.md) lists what is in it and fetches it. Takes outlive the session: one that ended weeks ago still lists until the retention rule deletes it. Downloading is where recording costs money, so the command prices the egress and waits for a yes before it moves a byte.
 
 ## The mix, and stems
 
 Without stems, a take is one stereo file. With stems it is one stereo file per musician as well, each carrying that player's own signal. The sheet reads back which of the two you launched with.
 
-Stems are stereo rather than mono, so a stem is the same size as the mix: stems turn a 1.1 GB three hour take into about 5.5 GB for a four piece. Every file in a take starts at the same zero, so they line up when you import them.
+Stems are stereo rather than mono, so a stem is the same size as the mix: stems turn a 1.2 GB three hour take into about 6 GB for a four piece. Every file in a take starts at the same zero, so they line up when you import them.
 
 ## What the room sees
 
@@ -97,7 +115,7 @@ The reason is in the sheet and on the lamp's hover, verbatim, for everyone in th
 
 | Reason begins | What to do |
 |---|---|
-| `recording is not configured for this session` | the session was launched without `--record` or `--bucket`; host a new one with it |
+| `recording is not configured for this session` | the session was launched with recording off; host a new one with it on |
 | `cannot start the recorder`, `cannot open the mix file` | the folder, or the first object in the bucket, could not be created. For a local session, check that the printed path exists and is writable |
 | `recording failed` | a write failed mid-take: a full disk, or a bucket that stopped accepting the upload. The take is abandoned rather than left half written |
 | `recording could not be finished` | the end of the take could not be written. Earlier takes in the session are unaffected |
