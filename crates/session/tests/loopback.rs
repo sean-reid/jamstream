@@ -1878,12 +1878,15 @@ fn musician_capacity_enforced() {
 /// The listener half of the same rule, which the server enforced with
 /// nothing holding it to it. It also pins the two caps as separate counters:
 /// a sold-out gallery must not cost the band a seat, which is the failure a
-/// single shared count would produce.
+/// single shared count would produce. The refusal must cost the session
+/// nothing either: the gallery keeps hearing the broadcast, and the refused
+/// client ends at its own connection timeout, since admission refusals are
+/// silent by design.
 #[test]
 fn listener_capacity_enforced() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let host = h.mint(0, Role::Musician);
-    h.add_client(&host, Some(0.0));
+    h.add_client(&host, Some(440.0));
     let over_cap = MAX_LISTENERS + 1;
     let invites: Vec<Invite> = (0..over_cap as u16)
         .map(|i| h.mint(100 + i, Role::Listener))
@@ -1902,16 +1905,41 @@ fn listener_capacity_enforced() {
     assert_eq!(joined, MAX_LISTENERS);
     // Silent refusal, as for musicians: the over-cap listener keeps retrying
     // until its own connection timeout, indistinguishable from packet loss.
-    assert_eq!(
-        *h.clients[1 + MAX_LISTENERS].core.state(),
-        ClientState::Connecting
-    );
+    let refused = 1 + MAX_LISTENERS;
+    assert_eq!(*h.clients[refused].core.state(), ClientState::Connecting);
 
     // A full gallery leaves the band's seats alone.
     let late = h.mint(1, Role::Musician);
     let i = h.add_client(&late, Some(0.0));
     h.run_ms(500);
     assert_eq!(*h.clients[i].core.state(), ClientState::Joined);
+    assert_eq!(h.server.musicians_connected(), 2);
+    assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
+
+    // And it leaves the gallery alone: the broadcast keeps flowing to every
+    // admitted listener while the refused one's retries go unanswered.
+    h.clear_playouts();
+    h.run_ms(1_000);
+    let win = 48_000; // last 0.5 s
+    for l in 1..=MAX_LISTENERS {
+        assert!(
+            tail_rms(&h, l, win) > 0.02,
+            "listener {l} lost the broadcast after the refusal, rms {}",
+            tail_rms(&h, l, win)
+        );
+    }
+    assert!(
+        tail_rms(&h, refused, win) < 1e-6,
+        "the refused listener heard audio, rms {}",
+        tail_rms(&h, refused, win)
+    );
+
+    // What the refused client surfaces is its own 10 s connection timeout,
+    // not a reject: to it, a full session is packet loss. The admitted
+    // members ride keepalives through it and stay seated.
+    h.advance_quiet(11_000);
+    assert_eq!(*h.clients[refused].core.state(), ClientState::TimedOut);
+    assert!(h.clients[refused].events.contains(&ClientEvent::TimedOut));
     assert_eq!(h.server.musicians_connected(), 2);
     assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
 }
