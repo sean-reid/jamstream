@@ -282,10 +282,10 @@ impl JamApp {
             let provider = creds::build_provider(&panel.state.provider, &*self.creds, &self.env);
             let state = panel.state;
             let path = panel.path;
-            self.ending = Some(
-                self.exec
-                    .run(async move { invites::end_session(provider?, state, path).await }),
-            );
+            self.ending = Some(self.exec.run(async move {
+                let provider = provider?;
+                invites::end_session(provider.as_ref(), state, path).await
+            }));
         }
         self.runtime = None;
         self.live = None;
@@ -329,6 +329,12 @@ impl JamApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Settings").clicked() {
                         self.settings_open = !self.settings_open;
+                        if self.settings_open {
+                            // One right-anchored sheet at a time; see
+                            // `close_the_other_sheet`.
+                            self.session.record_open = false;
+                            self.session.took_the_sheet_anchor = false;
+                        }
                     }
                     if self.screen != Screen::Home
                         && self.screen != Screen::Session
@@ -351,8 +357,12 @@ impl JamApp {
         // Escape is consumed here, ahead of the screen, even though the sheet
         // is drawn after it: the session screen closes its own sheets on
         // Escape, and the innermost thing entered has to be the first thing
-        // left.
+        // left. Which is why the drawer takes the key only when the screen has
+        // nothing inside it waiting to be left: a confirmation standing over
+        // the drawer is inside it, and closing the drawer under one was the
+        // wrong end of the ladder (#180).
         if self.settings_open
+            && !self.session_overlay_open()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.settings_open = false;
@@ -429,6 +439,7 @@ impl JamApp {
         }
 
         self.ending_progress(ui.ctx());
+        self.close_the_other_sheet();
         // Last, so a session has already drawn its status bar and the drawer
         // knows where to stop. Ending the session is reached from in here now,
         // so the drawer answers with the same event the screen does.
@@ -455,6 +466,25 @@ impl JamApp {
         // drew this frame belongs to a member who left, or to a picture that
         // was replaced. Free it.
         sweep_avatar_textures(ui.ctx());
+    }
+
+    /// The record sheet and the settings drawer are both anchored to the right
+    /// edge under the top bar, and the sheet is the wider of the two, so with
+    /// both open a 44 px sliver of chopped words stuck out to the left of the
+    /// drawer with a truncated Stop still clickable in it (#175). Whichever
+    /// was opened last keeps the anchor; this is the half that runs after the
+    /// screen, so the sheet's turn is the one recorded on the way past.
+    fn close_the_other_sheet(&mut self) {
+        if std::mem::take(&mut self.session.took_the_sheet_anchor) {
+            self.settings_open = false;
+        }
+    }
+
+    /// Whether the session screen has a confirmation, a key pane, or the
+    /// record sheet up. Only meaningful on the session screen; every other
+    /// screen has nothing that could sit over the drawer.
+    fn session_overlay_open(&self) -> bool {
+        self.screen == Screen::Session && self.runtime.is_some() && self.session.has_inner_overlay()
     }
 
     /// What the drawer has to stay above: the session's status bar, which
@@ -539,9 +569,10 @@ impl JamApp {
         }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = theme::SPACE_SM;
+            let p = theme::palette_of(ui);
             for tab in tabs {
                 if ui
-                    .add(egui::Button::new(tab.label()).selected(*tab == self.settings_tab))
+                    .add(theme::selectable(p, tab.label(), *tab == self.settings_tab))
                     .clicked()
                 {
                     self.settings_tab = *tab;

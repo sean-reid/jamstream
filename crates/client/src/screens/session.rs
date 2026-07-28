@@ -29,8 +29,8 @@ use crate::screens::invites::{InvitesEvent, InvitesPanel};
 use crate::screens::record::{record_sheet, record_state_lamp};
 use crate::theme;
 use crate::widgets::{
-    AVATAR_D_STRIP, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, pan_slider, state_lamp,
-    state_lamp_width, status_dot,
+    AVATAR_D_STRIP, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, pan_slider,
+    presence_dot, state_lamp, state_lamp_width, status_dot,
 };
 
 const NARROW_BELOW_PX: f32 = 900.0;
@@ -51,6 +51,10 @@ const BAR_ZONE_GAP: f32 = theme::SPACE_LG;
 const STRIP_W: f32 = 104.0;
 const STRIP_INNER_W: f32 = STRIP_W - 20.0;
 const STRIP_GAP: f32 = 8.0;
+/// The size a strip's button rows are asked for. What one draws at is
+/// [`button_row_h`], which is what the console reserves, because egui floors
+/// a button at its own text height plus the style's padding whatever size it
+/// is added at.
 const ROW_H: f32 = 22.0;
 const DB_H: f32 = 16.0;
 const PAN_H: f32 = 14.0;
@@ -63,9 +67,21 @@ const NOTE_ROW_H: f32 = 18.0;
 /// handed less and never takes the difference out of the portrait and the
 /// name above it. A host strip clears the floor at the smallest window the
 /// app opens at, 800x600; scrolling is for the sizes below that.
-const MIN_FADER_H: f32 = 32.0;
+pub const MIN_FADER_H: f32 = 32.0;
 /// The panel primitive's 10 px margins around the strip's content.
 const STRIP_FRAME_H: f32 = 20.0;
+/// The panel's hairline, one pixel on each edge, which the frame adds around
+/// the box the strip allocates inside it. Counted horizontally already; the
+/// reservation used to forget it vertically.
+const STRIP_FRAME_STROKE_H: f32 = 2.0;
+/// The hair a fader keeps off the readout above it.
+const FADER_INSET_H: f32 = 2.0;
+/// The gap between a strip's own rows, tighter than the app's default: eight
+/// rows of a host strip at the default spacing do not leave a fader its floor
+/// at 800x600, and the console would answer that by scrolling a strip's bottom
+/// edge out of the window. Density buys travel here, which is the one thing a
+/// fader is for.
+const STRIP_ROW_GAP: f32 = theme::SPACE_SM;
 
 // Chat columns: a monospace clock, a name gutter, then the message. The
 // message column is the one thing that must never move: every line of a
@@ -130,6 +146,10 @@ pub struct SessionScreen {
     /// hangs off the snapshot's `is_host` rather than a panel of its own;
     /// everyone else gets the lamp in the bar.
     pub record_open: bool,
+    /// Set for the frame the record sheet opens. It shares [`theme::SHEET_OFFSET`]
+    /// with the settings drawer, so the app closes the drawer instead of
+    /// letting the wider sheet stick out to the left of it (#175).
+    pub took_the_sheet_anchor: bool,
     /// Where the status bar starts, from this frame. The settings drawer is
     /// drawn after the screen and stops here, so it never covers the
     /// mouth-to-ear readout or the meters a musician adjusts against.
@@ -158,6 +178,12 @@ impl SessionScreen {
                     panel.confirm_revoke = None;
                     panel.confirm_end = false;
                 }
+            } else if self
+                .destinations
+                .as_mut()
+                .is_some_and(DestinationsPanel::close_key_entry)
+            {
+                // The key pane is inside the drawer, so it goes before it.
             } else if self.record_open {
                 // Closing the sheet is navigation: the take keeps running.
                 self.record_open = false;
@@ -182,8 +208,9 @@ impl SessionScreen {
             // label, state shown by the active fill. One click back to the
             // faders, always.
             ui.horizontal(|ui| {
+                let p = theme::palette_of(ui);
                 if ui
-                    .add(Button::new("Chat").selected(self.chat_open))
+                    .add(theme::selectable(p, "Chat", self.chat_open))
                     .clicked()
                 {
                     self.chat_open = !self.chat_open;
@@ -202,6 +229,28 @@ impl SessionScreen {
 
         self.confirm_windows(ui, rt, &mut event);
         event
+    }
+
+    /// True while this screen has something of its own that Escape has to
+    /// leave first. The settings drawer is the outer surface of the two, so
+    /// the app hands the key to the screen while any of these is up: with the
+    /// drawer open, Revoke on a strip used to put a confirmation on screen
+    /// that Escape walked straight past to close the drawer under it (#180).
+    ///
+    /// The narrow chat toggle is deliberately not in here: it is a view
+    /// switch, not something entered, and the drawer sits on top of it.
+    pub fn has_inner_overlay(&self) -> bool {
+        self.confirm_leave
+            || self.confirm_revoke.is_some()
+            || self
+                .invites
+                .as_ref()
+                .is_some_and(|p| p.confirm_revoke.is_some() || p.confirm_end)
+            || self
+                .destinations
+                .as_ref()
+                .is_some_and(DestinationsPanel::entering_key)
+            || self.record_open
     }
 
     /// Which settings tabs this session has to offer, in order. A tab that
@@ -336,12 +385,11 @@ impl SessionScreen {
         ScrollArea::both().id_salt("mixer-scroll").show(ui, |ui| {
             // Leave room for the scrollbar when the row overflows.
             let bar = if overflow { 10.0 } else { 2.0 };
-            let gap = ui.spacing().item_spacing.y;
             // Every strip is as tall as the tallest one needs to be, so
             // the rows line up across the console.
             let needed = musicians
                 .iter()
-                .map(|m| strip_content_h(gap, m, snap.is_host) + STRIP_FRAME_H)
+                .map(|m| strip_h_for(ui, STRIP_ROW_GAP, m, snap.is_host))
                 .fold(0.0_f32, f32::max);
             let strip_h = (ui.available_height() - bar).max(needed);
             ui.horizontal_top(|ui| {
@@ -369,6 +417,11 @@ impl SessionScreen {
                 Layout::top_down(Align::Min),
                 |ui| {
                     ui.set_width(STRIP_INNER_W);
+                    // The gap the reservation was computed with; the rows
+                    // stack from the bottom edge up, so a strip whose spacing
+                    // and reservation disagreed would take the difference out
+                    // of the fader.
+                    ui.spacing_mut().item_spacing.y = STRIP_ROW_GAP;
                     self.strip_body(ui, member, snap, rt);
                 },
             );
@@ -399,7 +452,11 @@ impl SessionScreen {
             },
         );
         ui.horizontal(|ui| {
-            status_dot(ui, member.connected, snap.stats.rtt_ms, snap.stats.loss_pct);
+            // Presence, not link quality: the only per-member fact this side
+            // has is whether they are here. The dot used to carry your own
+            // rtt and loss on every strip, so a green dot beside Ana said
+            // nothing about Ana (#174).
+            presence_dot(ui, member.connected);
             // Long names truncate inside the fixed strip; the full name is
             // one hover away.
             // Reserve room for the tag plus item spacing so the "you"
@@ -438,14 +495,15 @@ impl SessionScreen {
 
         // Fixed rows stack from the bottom so their positions are identical
         // in every strip; the fader takes the exact remainder.
+        let row = button_row_h(ui);
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
             meter_slot(ui);
             if snap.is_host {
                 if member.is_you {
                     // Reserves the revoke row so slots align across strips.
-                    ui.allocate_exact_size(vec2(STRIP_INNER_W, ROW_H), Sense::hover());
+                    ui.allocate_exact_size(vec2(STRIP_INNER_W, row), Sense::hover());
                 } else if ui
-                    .add_sized(vec2(STRIP_INNER_W, ROW_H), Button::new("Revoke"))
+                    .add_sized(vec2(STRIP_INNER_W, row), Button::new("Revoke"))
                     .clicked()
                 {
                     self.confirm_revoke = Some((member.id, member.name.clone()));
@@ -455,22 +513,22 @@ impl SessionScreen {
                 // Your uplink has no fader; monitoring yourself happens
                 // locally on your interface, not through the server mix.
                 ui.add_enabled_ui(false, |ui| {
-                    mute_button(ui, &mut muted, STRIP_INNER_W, MUTE_MONITOR_HOVER);
+                    mute_button(ui, &mut muted, vec2(STRIP_INNER_W, row), MUTE_MONITOR_HOVER);
                     pan_row(ui, &format!("{} pan", member.name), &mut pan);
                     db_readout(ui, gain, false);
-                    let fader_h = (ui.available_height() - 2.0).max(0.0);
+                    let fader_h = (ui.available_height() - FADER_INSET_H).max(0.0);
                     fader(ui, &label, &mut gain, vec2(STRIP_INNER_W, fader_h))
                         .on_disabled_hover_text(
                             "your own channel: self monitoring is local, not part of the mix",
                         );
                 });
             } else {
-                if mute_button(ui, &mut muted, STRIP_INNER_W, MUTE_MONITOR_HOVER) {
+                if mute_button(ui, &mut muted, vec2(STRIP_INNER_W, row), MUTE_MONITOR_HOVER) {
                     changed = true;
                 }
                 changed |= pan_row(ui, &format!("{} pan", member.name), &mut pan);
                 db_readout(ui, gain, true);
-                let fader_h = (ui.available_height() - 2.0).max(0.0);
+                let fader_h = (ui.available_height() - FADER_INSET_H).max(0.0);
                 changed |= fader(ui, &label, &mut gain, vec2(STRIP_INNER_W, fader_h)).changed();
             }
         });
@@ -696,11 +754,13 @@ impl SessionScreen {
         bar_divider(ui);
         if snap.is_host
             && ui
-                .add(Button::new("Record").selected(self.record_open))
+                .add(theme::selectable(p, "Record", self.record_open))
                 .on_hover_text("start or end a take")
                 .clicked()
         {
             self.record_open = !self.record_open;
+            // The sheet and the settings drawer share one anchor.
+            self.took_the_sheet_anchor = self.record_open;
         }
         if let Some(cost) = &snap.cost {
             ui.label(theme::mono(
@@ -875,7 +935,7 @@ fn stream_mix_row(ui: &mut Ui, member: &MemberView, broadcast: &BroadcastView, r
         )
         .changed();
         changed |= pan_slider(ui, &format!("{} stream pan", member.name), &mut pan).changed();
-        changed |= mute_button(ui, &mut muted, MUTE_W, MUTE_STREAM_HOVER);
+        changed |= mute_button(ui, &mut muted, vec2(MUTE_W, ROW_H), MUTE_STREAM_HOVER);
     });
     if changed {
         rt.send(Command::SetBroadcastFader {
@@ -1137,26 +1197,43 @@ fn audition_indicator(ui: &mut Ui) {
     });
 }
 
-/// What one strip's content needs vertically: the portrait, the name row,
-/// the disconnected note when there is one, every fixed row, and a fader
-/// that is still a fader. Items are separated by `gap`, so the count of
-/// them decides the spacing.
+/// What a strip's button rows actually draw at. egui floors a button at its
+/// text height plus the style's vertical padding whatever size it is added
+/// at, so the console asks rather than assumes: it reserved a flat 22, both
+/// rows drew 24, and the fader absorbed the difference (#173).
+fn button_row_h(ui: &Ui) -> f32 {
+    let h = (ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y)
+        .max(ui.spacing().interact_size.y)
+        .max(ROW_H);
+    // Rounded up to the pixel grid, which is where the row it draws lands. A
+    // reservation short by a third of a pixel is still short.
+    let ppp = ui.pixels_per_point();
+    (h * ppp).ceil() / ppp
+}
+
+/// What one strip needs vertically: the portrait, the name row, the
+/// disconnected note when there is one, every fixed row at the height it
+/// really draws, and a fader that is still a fader. Items are separated by
+/// `gap`, so the count of them decides the spacing, and the frame's own
+/// margins and hairline come off the outside.
 ///
 /// The mixer reserves this before drawing, because the lower rows stack
 /// from the bottom edge upward: a fader handed less than it asked for used
-/// to run its track back up through the name and the portrait.
-fn strip_content_h(gap: f32, member: &MemberView, is_host: bool) -> f32 {
-    let mut rows = AVATAR_D_STRIP + NAME_ROW_H + MIN_FADER_H + DB_H + PAN_H + ROW_H + METER_SLOT_H;
+/// to run its track back up through the name and the portrait, and once that
+/// was fixed it took the shortfall out of its own travel instead.
+fn strip_h_for(ui: &Ui, gap: f32, member: &MemberView, is_host: bool) -> f32 {
+    let row = button_row_h(ui);
+    let mut rows = AVATAR_D_STRIP + NAME_ROW_H + MIN_FADER_H + DB_H + PAN_H + row + METER_SLOT_H;
     let mut count = 7.0;
     if !member.connected {
         rows += NOTE_ROW_H;
         count += 1.0;
     }
     if is_host {
-        rows += ROW_H;
+        rows += row;
         count += 1.0;
     }
-    rows + (count - 1.0) * gap
+    rows + (count - 1.0) * gap + FADER_INSET_H + STRIP_FRAME_H + STRIP_FRAME_STROKE_H
 }
 
 /// Fixed-width monospace dB readout; the width never shifts with digits.
@@ -1197,8 +1274,8 @@ const MUTE_STREAM_HOVER: [&str; 2] = [
     "mute for listeners and the stream",
 ];
 
-/// Fixed-width mute button; state is shown by fill, the label never moves.
-fn mute_button(ui: &mut Ui, muted: &mut bool, width: f32, hover: [&str; 2]) -> bool {
+/// Fixed-size mute button; state is shown by fill, the label never moves.
+fn mute_button(ui: &mut Ui, muted: &mut bool, size: egui::Vec2, hover: [&str; 2]) -> bool {
     let p = theme::palette_of(ui);
     // Fill only; a stroke would change the button height and shift the
     // rows above it in the bottom-up stack.
@@ -1208,9 +1285,9 @@ fn mute_button(ui: &mut Ui, muted: &mut bool, width: f32, hover: [&str; 2]) -> b
         button = Button::new(RichText::new("Mute").color(p.text_primary))
             .fill(theme::blend(p.surface2, p.danger, t));
     }
-    let response = ui
-        .add_sized(vec2(width, ROW_H), button)
-        .on_hover_text(if *muted { hover[0] } else { hover[1] });
+    let response =
+        ui.add_sized(size, button)
+            .on_hover_text(if *muted { hover[0] } else { hover[1] });
     if response.clicked() {
         *muted = !*muted;
         true

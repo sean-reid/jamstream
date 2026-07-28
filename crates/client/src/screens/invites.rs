@@ -369,11 +369,18 @@ fn record_holds(record: &InviteRecord, member: MemberId, token: TokenId) -> bool
         .is_ok_and(|i| i.token.member_id == member && i.token.jti == token)
 }
 
-/// Ends the session the way `jamstream end` does: destroy the instance
-/// (already-gone is fine), verify nothing tagged remains, and rewrite the
-/// state file as ended.
+/// Ends the session the way `jamstream end` does, step for step: destroy the
+/// instance (already-gone is fine), close the firewall the launch opened for
+/// it, verify nothing tagged remains, and rewrite the state file as ended
+/// without the issuer key.
+///
+/// The two steps this used to skip are the ones with nothing on screen to
+/// notice them. A session ended from the app left its per-session firewall in
+/// the account, one per session forever (#196), and left the key that signs
+/// its invites in the state directory after the server that key authenticated
+/// against was gone (#195).
 pub async fn end_session(
-    provider: Box<dyn Provider>,
+    provider: &dyn Provider,
     mut state: SessionState,
     path: PathBuf,
 ) -> Result<(), String> {
@@ -383,6 +390,13 @@ pub async fn end_session(
         // Already gone: crashed earlier, self-destructed, or swept.
         Err(ProviderError::NotFound(_)) => {}
         Err(e) => return Err(e.to_string()),
+    }
+    // The instance is gone, so its firewall has nothing behind it. AWS can
+    // still refuse while the network interface detaches, and the next sweep
+    // collects it then, so this never fails an otherwise clean end.
+    match provider.destroy_orphan_firewalls().await {
+        Ok(closed) => tracing::info!(count = closed.len(), "closed session firewalls"),
+        Err(err) => tracing::warn!(%err, "could not close the session firewall; sweep will retry"),
     }
     let remaining = provider
         .list_tagged(Some(&state.session_id_hex))
@@ -395,6 +409,10 @@ pub async fn end_session(
         ));
     }
     state.status = SessionStatus::Ended;
+    // Nothing can be minted or revoked for a session whose server is gone, so
+    // the issuer key stops being useful at exactly this moment. The record
+    // itself is worth keeping for status and for the cost history.
+    state.forget_issuer_key();
     state.ended_unix = Some(unix_now());
     jamstream_cli::state::write_to(&path, &state).map_err(|e| e.to_string())?;
     Ok(())
@@ -541,9 +559,10 @@ impl InvitesPanel {
         // buttons and Mint invite do not share a line.
         ui.horizontal(|ui| {
             ui.label(theme::muted(ui, "new invite"));
+            let p = theme::palette_of(ui);
             for (role, label) in [(Role::Musician, "musician"), (Role::Listener, "listener")] {
                 if ui
-                    .add(Button::new(label).selected(self.mint_role == role))
+                    .add(theme::selectable(p, label, self.mint_role == role))
                     .clicked()
                 {
                     self.mint_role = role;
@@ -648,6 +667,7 @@ impl InvitesPanel {
 mod tests {
     use super::*;
     use crate::screens::host::base64;
+    use jamstream_cloud::MockProvider;
     use jamstream_protocol::transport::generate_keypair;
 
     /// A real state record with decodable invites: host, two musicians,
@@ -872,6 +892,106 @@ mod tests {
         let restarted = InvitesPanel::new(reloaded, path.clone());
         assert_eq!(restarted.taken(Role::Musician), 2, "host and musician 2");
         assert_eq!(restarted.token_of(MemberId(1)), None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A launched session on the mock, so the firewall under test is one a
+    /// launch really created and the instance is one destroy really removes.
+    async fn launched(label: &str) -> (MockProvider, SessionState, PathBuf) {
+        use jamstream_cloud::{InstanceClass, LaunchSpec, ProviderKind, session_tag};
+
+        let (mut state, path) = fixture(label);
+        let provider = MockProvider::with_default_regions(ProviderKind::DigitalOcean);
+        let region = provider.regions()[0].clone();
+        let instance = provider
+            .launch(LaunchSpec {
+                region: region.clone(),
+                instance_class: InstanceClass::Standard,
+                user_data: String::new(),
+                tags: vec![session_tag(&state.session_id_hex)],
+            })
+            .await
+            .expect("the mock launches");
+        state.instance_id = instance.id.clone();
+        state.region = region.id.to_string();
+        (provider, state, path)
+    }
+
+    /// #195 and #196, asserted where they happened: on the app's own end, at
+    /// the effects rather than at the status word. The state file lands on disk
+    /// without the issuer key, the provider is asked to collect the firewall
+    /// the launch opened, and none of that session's ingress is left.
+    ///
+    /// Both defects survived a test each. `wizard_local.rs` asserted the status
+    /// string this function writes and `host_flow.rs` asserted the key on the
+    /// CLI's path, so each surface was covered by a test that could not see the
+    /// other one's hole.
+    #[tokio::test]
+    async fn ending_a_session_from_the_app_takes_the_key_and_the_firewall_with_it() {
+        use jamstream_cloud::mock::Call;
+
+        let (provider, state, path) = launched("end").await;
+        assert!(
+            !state.issuer_private_key_b64.is_empty(),
+            "the fixture has to start with a key on disk"
+        );
+        assert_eq!(
+            provider
+                .session_ingress(&state.session_id_hex)
+                .await
+                .expect("ingress")
+                .len(),
+            1,
+            "the launch opens exactly one port for the session"
+        );
+
+        end_session(&provider, state.clone(), path.clone())
+            .await
+            .expect("end session");
+
+        let ended = jamstream_cli::state::load(&path).expect("state reloads");
+        assert_eq!(ended.status, SessionStatus::Ended);
+        assert!(
+            ended.issuer_private_key_b64.is_empty(),
+            "the key that signs this session's invites is still in the state directory"
+        );
+        // The records themselves stay: status and the cost history read them,
+        // and nothing can be minted or revoked without the issuer key.
+        assert_eq!(ended.invites.len(), 4);
+
+        assert!(
+            provider.calls().contains(&Call::DestroyOrphanFirewalls),
+            "the app never asked the provider to close the session firewall: {:?}",
+            provider.calls()
+        );
+        assert!(
+            provider
+                .session_ingress(&state.session_id_hex)
+                .await
+                .expect("ingress")
+                .is_empty(),
+            "the session's firewall is still open in the account"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A firewall that cannot be closed yet is not a failed end: AWS refuses
+    /// while the network interface detaches, and the next sweep collects it.
+    /// The session is still ended and the key is still gone.
+    #[tokio::test]
+    async fn a_firewall_that_will_not_close_yet_does_not_fail_the_end() {
+        let (provider, state, path) = launched("firewall").await;
+        // An instance the destroy cannot find leaves the firewall behind with
+        // the session still listed as live, which is the shape of the case the
+        // sweeper is there for.
+        let mut state = state;
+        state.instance_id = "not-this-one".to_owned();
+        let err = end_session(&provider, state.clone(), path.clone())
+            .await
+            .expect_err("an instance still listed must not read as a clean end");
+        assert!(err.contains("sweep"), "error was {err:?}");
 
         std::fs::remove_file(&path).ok();
     }

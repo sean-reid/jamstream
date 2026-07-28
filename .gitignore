@@ -27,3 +27,9 @@ gcp-*.json
 # files to listen to. Tests never read them; they regenerate their own under
 # target/fixtures/.
 /fixtures
+
+# Snapshot updater leftovers: UPDATE_SNAPSHOTS writes a .old and a .diff
+# beside every baseline it rewrites, and `git add -A` will take them.
+*.old.png
+*.diff.png
+*.new.png

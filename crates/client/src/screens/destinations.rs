@@ -271,6 +271,28 @@ impl DestinationsPanel {
         rt.send(Command::RemoveDestination(id));
     }
 
+    /// True while a key pane is open, which is a state Escape has to leave
+    /// before it leaves the drawer the pane is in.
+    pub fn entering_key(&self) -> bool {
+        self.rows.iter().any(|r| r.entering)
+    }
+
+    /// Closes any open key pane, wiping what was typed, and says whether
+    /// there was one. Escape reaches this; so does Cancel, one row at a time.
+    pub fn close_key_entry(&mut self) -> bool {
+        let mut closed = false;
+        for row in &mut self.rows {
+            if row.entering {
+                row.close_entry();
+                closed = true;
+            }
+        }
+        if closed {
+            self.error = None;
+        }
+        closed
+    }
+
     /// Destinations the server knows about or has been asked about. Going
     /// live with none configured does nothing, so the button says so.
     fn configured_count(&self, snap: &Snapshot) -> usize {
@@ -378,7 +400,9 @@ impl DestinationsPanel {
                 ui.label(RichText::new(self.rows[index].display_name.clone()).strong());
             });
             row_cell(ui, STATE_W, |ui| {
-                ui.label(RichText::new(word).color(color));
+                // The row's lamp carries the palette colour; the word is text
+                // and takes the step of it that reads on the drawer.
+                ui.label(RichText::new(word).color(theme::readable(color, p.surface1, p)));
             });
         });
         ui.horizontal(|ui| {
@@ -488,6 +512,10 @@ impl DestinationsPanel {
             // takes one from the label above it. Its accessible role is a
             // password input and its accessible value is the mask, so the key
             // is not in the accessibility tree either.
+            // Enter saves, as it does in the join field and the chat field. A
+            // pasted key ends in a keystroke either way; making this one the
+            // odd field out is how a host learns to distrust the return key.
+            save = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             field.labelled_by(label);
             // A masked field cannot be proofread, so the count stands in for
             // reading it back.
@@ -504,7 +532,7 @@ impl DestinationsPanel {
             );
             ui.add_space(theme::SPACE_SM);
             ui.horizontal(|ui| {
-                save = ui.button("Save key").clicked();
+                save |= ui.button("Save key").clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });

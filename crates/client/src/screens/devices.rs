@@ -113,7 +113,8 @@ impl DevicesScreen {
         levels: &LevelsView,
         mouth_to_ear_ms: Option<f32>,
     ) {
-        theme::focused_column(ui, 560.0, |ui| {
+        let room = ui.available_height();
+        theme::focused_column(ui, 560.0, room, |ui, _| {
             self.audio_ui(ui, Block::Panel, catalog, levels, mouth_to_ear_ms)
         });
     }

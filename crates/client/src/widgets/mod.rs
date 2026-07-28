@@ -19,4 +19,4 @@ pub use lamp::{lamp, lamp_toggle, state_lamp, state_lamp_width};
 pub use meter::{Meter, meter};
 pub use pan::pan_slider;
 pub use pick::{PICK_DOT, PICK_INDENT, PICK_ROW_H, pick_row, row_cell};
-pub use status_dot::status_dot;
+pub use status_dot::{PRESENCE_AWAY, PRESENCE_HERE, presence_dot, status_dot};

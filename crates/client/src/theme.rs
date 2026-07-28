@@ -95,6 +95,11 @@ pub const SPACE_XL: f32 = 20.0;
 /// Uniform corner radius; tight radii read as a tool.
 pub const RADIUS: u8 = 3;
 
+/// WCAG AA for text at our sizes, and for anything that carries state on its
+/// own. Both floors are enforced by the tests at the end of this file.
+pub const AA_TEXT: f64 = 4.5;
+pub const AA_STATE: f64 = 3.0;
+
 /// Where every right-anchored sheet sits: in from the window's right edge,
 /// and far enough down to clear the top bar. Settings, Invites,
 /// Destinations, and Stream mix share this anchor, so they stack in exactly
@@ -386,19 +391,38 @@ pub fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
 }
 
-/// A centered max-width column anchored in the upper third of the screen.
+/// The most a column is ever pushed down from the top of its space.
+const LEAD_MAX: f32 = 140.0;
+
+/// A centered max-width column in `room` points of vertical space, pushed
+/// toward the upper third by whatever height the content does not need.
 /// Content inside stays left-aligned; only the column itself is centered.
-pub fn focused_column(ui: &mut Ui, max_w: f32, add: impl FnOnce(&mut Ui)) {
+///
+/// `room` is a parameter because a Ui inside a scroll area cannot answer it:
+/// `available_height` there is the content's, not the window's, and it reads
+/// zero once anything has been laid out. The closure is handed what is left
+/// after the lead, so content that has to fit knows what it has to fit in.
+///
+/// The lead is capped by the space actually spare, measured from the column
+/// drawn last frame: a sixth of a 600 px window spent above the wizard's card
+/// is what put the card's own Launch button past the bottom edge (#179).
+pub fn focused_column(ui: &mut Ui, max_w: f32, room: f32, add: impl FnOnce(&mut Ui, f32)) {
     let w = ui.available_width().min(max_w);
     let pad = ((ui.available_width() - w) / 2.0).max(0.0);
-    ui.add_space((ui.available_height() * 0.16).min(140.0));
-    ui.horizontal(|ui| {
+    let key = ui.id().with("focused-column");
+    let drawn: f32 = ui.ctx().data(|d| d.get_temp(key)).unwrap_or(0.0);
+    let spare = (room - drawn - SPACE_MD).max(0.0);
+    let lead = (room * 0.16).min(LEAD_MAX).min(spare);
+    ui.add_space(lead);
+    let column = ui.horizontal(|ui| {
         ui.add_space(pad);
         ui.vertical(|ui| {
             ui.set_width(w);
-            add(ui);
+            add(ui, room - lead);
         });
     });
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(key, column.response.rect.height()));
 }
 
 /// Secondary text at the muted step.
@@ -463,6 +487,61 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+/// Steps in which a colour is pushed toward the text colour; 32 lands within
+/// a percent or two of the floor, which is closer than a hex value is wide.
+const READABLE_STEPS: u8 = 32;
+
+/// `color` stepped toward the primary text colour until it clears the AA
+/// text floor on `surface`, and returned untouched when it already does.
+///
+/// A meter colour is data on a meter and text in a state word, and the two
+/// have different floors: `meter_amber` on the light status bar is 3.14:1,
+/// which is a legible lamp and an illegible label. Words go through here;
+/// the lamp beside them keeps the palette value.
+pub fn readable(color: Color32, surface: Color32, p: &Palette) -> Color32 {
+    let mut out = color;
+    for step in 1..=READABLE_STEPS {
+        if contrast_ratio(out, surface) >= AA_TEXT {
+            break;
+        }
+        out = blend(
+            color,
+            p.text_primary,
+            f32::from(step) / f32::from(READABLE_STEPS),
+        );
+    }
+    out
+}
+
+/// The fill and the label a selected control carries: the accent, opaque,
+/// stepped until whichever end of the palette reads on it clears the AA text
+/// floor.
+///
+/// egui's own selected treatment is `selection.bg_fill`, the accent at alpha
+/// 70, with accent text on top of it: 2.79:1 in the light palette, which is
+/// fainter than a disabled control. That constant stays what it is for text
+/// selection, where a wash is the right thing.
+pub fn selected_pair(p: &Palette) -> (Color32, Color32) {
+    let ink = if contrast_ratio(p.surface1, p.accent) >= contrast_ratio(p.text_primary, p.accent) {
+        p.surface1
+    } else {
+        p.text_primary
+    };
+    (readable(p.accent, ink, p), ink)
+}
+
+/// A button that shows a selected state as an accent fill rather than a
+/// wash. Off is the ordinary button, so only the lit form differs.
+pub fn selectable(p: &Palette, text: &str, on: bool) -> egui::Button<'static> {
+    if !on {
+        return egui::Button::new(text.to_owned()).selected(false);
+    }
+    let (fill, ink) = selected_pair(p);
+    egui::Button::new(RichText::new(text.to_owned()).color(ink))
+        .selected(true)
+        .fill(fill)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +566,76 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Every colour a state word is set in, on every surface it can land on.
+    /// The lamps in the status bar's cluster measured 3.14:1 (UPLOADING),
+    /// 3.77:1 (ON AIR) and 3.96:1 (REC) in the light palette, and nothing
+    /// failed, because the only colours under test were the two text steps.
+    #[test]
+    fn a_state_word_reads_on_every_surface_it_can_land_on() {
+        for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            for (cname, color) in [
+                ("accent", p.accent),
+                ("meter_green", p.meter_green),
+                ("meter_amber", p.meter_amber),
+                ("meter_red", p.meter_red),
+                ("danger", p.danger),
+            ] {
+                for (sname, surface) in [
+                    ("well", p.well),
+                    ("surface0", p.surface0),
+                    ("surface1", p.surface1),
+                    ("surface2", p.surface2),
+                ] {
+                    let word = readable(color, surface, p);
+                    let ratio = contrast_ratio(word, surface);
+                    assert!(
+                        ratio >= AA_TEXT,
+                        "{name} {cname} as a word on {sname} is {ratio:.2}, below AA {AA_TEXT}"
+                    );
+                    // Still recognisably the accent or the meter colour: the
+                    // step is a correction, not a repaint.
+                    assert!(
+                        contrast_ratio(word, color) < 2.0,
+                        "{name} {cname} on {sname} was pushed off its own hue"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A selected control has to read as on, both in the label on it and
+    /// against the panel it sits on. The wash it replaces was 2.79:1 in
+    /// light and 4.31:1 in dark, on five surfaces at once.
+    #[test]
+    fn a_selected_control_reads_as_on_in_both_palettes() {
+        for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            let (fill, ink) = selected_pair(p);
+            let label = contrast_ratio(ink, fill);
+            assert!(
+                label >= AA_TEXT,
+                "{name} selected label is {label:.2}, below AA {AA_TEXT}"
+            );
+            for (sname, surface) in [
+                ("surface0", p.surface0),
+                ("surface1", p.surface1),
+                ("surface2", p.surface2),
+            ] {
+                let ratio = contrast_ratio(fill, surface);
+                assert!(
+                    ratio >= AA_STATE,
+                    "{name} selected fill on {sname} is {ratio:.2}, below {AA_STATE} for a \
+                     control that carries state"
+                );
+            }
+            // The state is the accent's, not a fourth colour: an opaque wash
+            // of something else would pass the floors and say nothing.
+            assert!(
+                contrast_ratio(fill, p.accent) < 2.0,
+                "{name} selected fill is no longer the accent"
+            );
         }
     }
 
