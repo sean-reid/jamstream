@@ -190,7 +190,7 @@ impl JamApp {
                     rt,
                     outcome.state.hourly_microusd,
                     outcome.state.created_unix,
-                    panel.token_map(),
+                    panel.tokens(),
                 );
                 self.runtime = Some(Box::new(costed));
                 self.session = SessionScreen::default();

@@ -40,10 +40,10 @@ Under the numbers, release builds show one line naming the exact `jamstreamd` bu
 
 One invite per seat is minted up front, on your machine, and the wizard opens the invites panel the moment you are in:
 
-![Invites panel over the session screen listing per-person invites with copy and revoke buttons](../images/session_invites.png)
+![Invites panel over the session screen: one seat per link, a freed seat reading was Ben with a New link button, and a seat count of 3 of 10 musicians](../images/session_invites.png)
 *Each link admits one person. Copy, revoke, or mint more, and end the session for everyone from here.*
 
-- Each row is one seat with a live status: `not joined`, `connected`, or `revoked`. **Copy link** puts that person's invite on the clipboard; send it to exactly one person over a channel you trust.
+- Each row is one seat with a live status: `not joined`, `connected`, or `free`. Revoking a seat frees it: the row keeps the name it had, greyed, and **New link** mints a replacement into the same chair. **Copy link** puts that person's invite on the clipboard; send it to exactly one person over a channel you trust.
 - **Revoke** ejects that member and kills their invite, with a confirmation step. The host also sees a Revoke button on each mixer strip.
 - **Mint invite** adds a musician or listener seat mid-session, up to 10 musicians (you included) and 20 listeners. Unused invites cost nothing.
 

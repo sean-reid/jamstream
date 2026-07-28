@@ -358,11 +358,15 @@ impl Runtime for DemoRuntime {
         let members = s
             .members
             .iter()
+            // Revoking ejects: `ServerCore` drops the member and sends a
+            // roster without them, so the demo cannot leave a strip behind
+            // or the mixer would contradict the invites panel beside it.
+            .filter(|m| !s.revoked.contains(&m.id))
             .map(|m| MemberView {
                 id: MemberId(m.id),
                 name: m.name.to_owned(),
                 role: m.role,
-                connected: !s.revoked.contains(&m.id),
+                connected: true,
                 is_you: m.id == 0,
                 fader: m.fader,
                 token: self.is_host.then_some(TokenId([m.id as u8; 16])),

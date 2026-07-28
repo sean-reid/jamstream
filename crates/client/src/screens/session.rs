@@ -695,7 +695,8 @@ impl SessionScreen {
                 .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                 .show(ui.ctx(), |ui| {
                     ui.label(format!(
-                        "Revoke {name}'s invite? They will be disconnected and their invite stops working."
+                        "Revoke {name}'s invite? They will be disconnected, their invite stops \
+                         working, and their seat is free again."
                     ));
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -704,8 +705,10 @@ impl SessionScreen {
                         let p = theme::palette_of(ui);
                         if ui
                             .add(
-                                Button::new(RichText::new("Revoke invite").color(egui::Color32::WHITE))
-                                    .fill(p.danger),
+                                Button::new(
+                                    RichText::new("Revoke invite").color(egui::Color32::WHITE),
+                                )
+                                .fill(p.danger),
                             )
                             .clicked()
                         {
@@ -718,10 +721,11 @@ impl SessionScreen {
                                 .and_then(|m| m.token);
                             if let Some(token) = token {
                                 rt.send(Command::Revoke(token));
-                                // Keep the invites panel's local record in
-                                // step with strip-side revocations.
+                                // Free the seat in the same act, so the
+                                // invites panel never counts a seat the
+                                // server has already emptied.
                                 if let Some(panel) = &mut self.invites {
-                                    panel.mark_revoked(token);
+                                    panel.revoke(token, Some(name.clone()));
                                 }
                             }
                             self.confirm_revoke = None;
