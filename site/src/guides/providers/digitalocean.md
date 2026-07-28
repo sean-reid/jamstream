@@ -28,8 +28,9 @@ Follow [DigitalOcean's token guide](https://docs.digitalocean.com/reference/api/
 | `droplet:delete` | destroy it when the session ends |
 | `tag:create`, `tag:read`, `tag:delete` | every JamStream droplet is tagged, and the sweeper finds strays by tag |
 | `regions:read`, `sizes:read`, `actions:read`, `image:read`, `ssh_key:read` | required companions of `droplet:create` in DigitalOcean's scope system, and `sizes:read` is how live pricing is fetched |
+| `snapshot:read`, `vpc:read` | further companions the droplet scopes pull in; JamStream never reads a snapshot or a VPC itself |
 
-The scope names are from [DigitalOcean's scope reference](https://docs.digitalocean.com/reference/api/scopes/); `droplet:create` lists the read scopes as requirements, so the token cannot be created without them.
+The scope names are from [DigitalOcean's scope reference](https://docs.digitalocean.com/reference/api/scopes/). The droplet scopes list the read scopes as requirements, so the token cannot be created without them. If the console offers to add a scope you did not pick, that is why: accept it. It shows the two in the last row as required once the others are selected, which brings the total to thirteen.
 
 7. Click generate and copy the token immediately; it is shown once.
 
