@@ -2882,6 +2882,7 @@ dependencies = [
 name = "jamstream-cli"
 version = "0.1.5"
 dependencies = [
+ "async-trait",
  "clap",
  "clap_complete",
  "data-encoding",
@@ -2897,6 +2898,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

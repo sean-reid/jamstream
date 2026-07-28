@@ -116,6 +116,8 @@ async fn a_recorded_local_host_puts_the_take_where_it_said_it_would() {
         max_hours: 12,
         record: true,
         record_stems: false,
+        bucket: None,
+        retention: jamstream_cloud::Retention::Days30,
         artifact_url: None,
         artifact_sha256: None,
         yes: true,

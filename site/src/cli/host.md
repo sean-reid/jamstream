@@ -23,8 +23,10 @@ With `--provider local` (the default) there is nothing to rank or bill: the serv
 | `--port <PORT>` | `43210` | UDP port the session server listens on. |
 | `--idle-min <IDLE_MIN>` | `10` | Minutes without musicians before the server shuts itself down. |
 | `--max-hours <MAX_HOURS>` | `12` | Hard cap on session length in hours. Invites expire at the cap. |
-| `--record` | off | Let this session record to this computer: takes land as FLAC files in a recordings folder, and the launch output prints its path. Local sessions only. |
+| `--record` | off | Let this session record. A local session's takes land as FLAC files in a recordings folder on this computer and the launch output prints its path; a cloud session needs `--bucket`, because the machine deletes itself at the end and a take on its disk goes with it. |
 | `--record-stems` | off | Also capture a stereo stem per musician alongside the mix, named for them. Implies `--record`. |
+| `--bucket <BUCKET>` | none | Bucket a cloud session records to, in the session's own region. Implies `--record`. The launch writes a probe object to prove the key can write, applies the retention rule, and saves the bucket beside the session record so [`jamstream recordings`](recordings.md) can find the takes later. Needs a storage key in the environment; see that page for the variables. |
+| `--retention <RETENTION>` | `30d` | How long the bucket keeps this session's takes: `7d`, `30d`, `90d`, or `forever`. Applies to `--bucket`, and is enforced by the bucket's own lifecycle rule, so it keeps working after the machine is gone. |
 | `--artifact-url <ARTIFACT_URL>` | pinned into release builds | Override the URL of the `jamstreamd` artifact the VM downloads at boot. Release builds carry the release's own server build pinned in, so cloud hosting normally needs no flag; a source build has no pin and must pass both artifact flags to host on a cloud provider. Local mode runs a binary already on this machine and downloads nothing. |
 | `--artifact-sha256 <ARTIFACT_SHA256>` | pinned into release builds | Override the expected sha256 of the `jamstreamd` artifact. Must be passed together with `--artifact-url`; the VM refuses to start on a mismatch. |
 | `--yes` | off | Skip the launch confirmation. |

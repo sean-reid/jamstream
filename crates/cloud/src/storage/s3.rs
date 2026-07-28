@@ -54,7 +54,8 @@ use crate::provider::{ProviderError, Result};
 use crate::providers::aws::{amz_date_now, aws_encode, sigv4, take_tag, xml_unescape, xml_value};
 use crate::retention::{LifecycleDialect, Retention, RetentionEnforcement, s3_lifecycle_xml};
 use crate::storage::{
-    DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource, drive_upload,
+    ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
+    drain_body, drive_upload,
 };
 use crate::types::ProviderKind;
 
@@ -87,6 +88,9 @@ pub struct S3Store {
     kind: ProviderKind,
     part_size: usize,
     http: reqwest::Client,
+    /// Used only by `get`, whose response body is a recording and cannot
+    /// finish inside the API client's 30-second deadline.
+    streaming: reqwest::Client,
 }
 
 /// The secret must never reach a log or an error message.
@@ -119,6 +123,7 @@ impl S3Store {
             kind: ProviderKind::Aws,
             part_size: DEFAULT_PART_SIZE,
             http: http::client(),
+            streaming: http::streaming_client(),
         }
     }
 
@@ -170,6 +175,7 @@ impl S3Store {
             kind: ProviderKind::Gcp,
             part_size: DEFAULT_PART_SIZE,
             http: http::client(),
+            streaming: http::streaming_client(),
         }
     }
 
@@ -183,6 +189,7 @@ impl S3Store {
             kind: ProviderKind::DigitalOcean,
             part_size: DEFAULT_PART_SIZE,
             http: http::client(),
+            streaming: http::streaming_client(),
         }
     }
 
@@ -294,6 +301,13 @@ impl S3Store {
     /// inside the builder closure. Every header signed here is also sent,
     /// except `host`, which reqwest emits from the URL.
     async fn send(&self, req: S3Request<'_>) -> Result<Response> {
+        self.send_with(&self.http, req).await
+    }
+
+    /// [`S3Store::send`] on a chosen client, so the download path can use the
+    /// one without a whole-request deadline while keeping the same signer,
+    /// retries and backoff.
+    async fn send_with(&self, client: &reqwest::Client, req: S3Request<'_>) -> Result<Response> {
         let (url, host, canonical_uri) = self.address(req.bucket, req.key)?;
         let query = canonical_query(&req.query);
         let full_url = if query.is_empty() {
@@ -346,7 +360,7 @@ impl S3Store {
                 headers: &refs,
                 payload_sha256: &payload_sha256,
             });
-            let mut rb = self.http.request(method.clone(), &full_url);
+            let mut rb = client.request(method.clone(), &full_url);
             for (name, value) in &headers {
                 // reqwest emits Host from the URL; everything else signed
                 // has to be sent explicitly.
@@ -662,6 +676,22 @@ impl ObjectStore for S3Store {
             content_type: header_string(&resp, "content-type"),
             last_modified: header_string(&resp, "last-modified"),
         })
+    }
+
+    async fn get(
+        &self,
+        bucket: &str,
+        key: &str,
+        sink: &mut (dyn ChunkSink + Send),
+    ) -> Result<ObjectMeta> {
+        // A plain signed GetObject on the streaming client: the body is a
+        // recording, so it cannot be held in memory or finished in 30 s.
+        let resp = self
+            .send_with(&self.streaming, S3Request::new("GET", bucket, Some(key)))
+            .await?;
+        let mut meta = drain_body(resp, key, sink).await?;
+        meta.etag = meta.etag.map(|e| clean_etag(&e));
+        Ok(meta)
     }
 
     async fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectMeta>> {

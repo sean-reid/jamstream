@@ -42,7 +42,8 @@ use crate::provider::{ProviderError, Result};
 use crate::providers::gcp::TokenSource;
 use crate::retention::{Retention, RetentionEnforcement, gcs_lifecycle_patch};
 use crate::storage::{
-    DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource, drive_upload,
+    ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
+    drain_body, drive_upload,
 };
 use crate::types::ProviderKind;
 
@@ -59,6 +60,9 @@ pub struct GcsStore {
     base_url: String,
     part_size: usize,
     http: reqwest::Client,
+    /// Used only by `get`, whose response body is a recording and cannot
+    /// finish inside the API client's 30-second deadline.
+    streaming: reqwest::Client,
 }
 
 impl fmt::Debug for GcsStore {
@@ -81,6 +85,7 @@ impl GcsStore {
             base_url: DEFAULT_BASE_URL.to_owned(),
             part_size: DEFAULT_PART_SIZE,
             http: http::client(),
+            streaming: http::streaming_client(),
         }
     }
 
@@ -364,6 +369,33 @@ impl ObjectStore for GcsStore {
         let token = self.token().await?;
         let resp = http::send_retrying(|| self.http.get(&url).bearer_auth(&token)).await?;
         Self::parse_object(resp, key).await
+    }
+
+    async fn get(
+        &self,
+        bucket: &str,
+        key: &str,
+        sink: &mut (dyn ChunkSink + Send),
+    ) -> Result<ObjectMeta> {
+        // alt=media is what turns the object resource URL into the bytes;
+        // without it GCS answers with the JSON metadata head reads.
+        let url = self.object_url(bucket, key);
+        let token = self.token().await?;
+        let resp = http::send_retrying(|| {
+            self.streaming
+                .get(&url)
+                .bearer_auth(&token)
+                .query(&[("alt", "media")])
+        })
+        .await?;
+        let mut meta = drain_body(resp, key, sink).await?;
+        // A media download reports the ETag as an HTTP header, quoted, where
+        // the JSON API reports it bare.
+        meta.etag = meta
+            .etag
+            .map(|e| e.trim().trim_matches('"').to_owned())
+            .filter(|e| !e.is_empty());
+        Ok(meta)
     }
 
     async fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectMeta>> {

@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use jamstream_cloud::Retention;
 // Session shape, defined once for every surface; see
 // jamstream_session::limits.
 use jamstream_session::{
@@ -34,8 +35,47 @@ pub enum Command {
     Sweep(SweepArgs),
     /// Join a session as a headless client.
     Join(JoinArgs),
+    /// List and fetch the takes a session recorded to a bucket.
+    Recordings(RecordingsArgs),
     /// Print shell completions for jamstream.
     Completions(CompletionsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RecordingsArgs {
+    #[command(subcommand)]
+    pub command: Option<RecordingsCommand>,
+
+    #[command(flatten)]
+    pub list: RecordingsListArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecordingsCommand {
+    /// Download one session's takes to this computer.
+    Get(RecordingsGetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RecordingsListArgs {
+    /// Emit a JSON array instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecordingsGetArgs {
+    /// Session id prefix of the session whose takes to download.
+    pub session: String,
+
+    /// Directory to write the takes into. Defaults to the current directory.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    /// Skip the download confirmation, which is where the egress cost is
+    /// shown.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -93,8 +133,8 @@ pub struct HostArgs {
     #[arg(long = "max-hours", default_value_t = DEFAULT_MAX_HOURS)]
     pub max_hours: u32,
 
-    /// Record the session's takes as FLAC to this computer's disk, in a
-    /// directory printed at launch (local sessions only).
+    /// Record the session's takes as FLAC: to this computer's disk for a
+    /// local session, or to --bucket for a cloud one.
     #[arg(long)]
     pub record: bool,
 
@@ -102,6 +142,16 @@ pub struct HostArgs {
     /// --record.
     #[arg(long = "record-stems")]
     pub record_stems: bool,
+
+    /// Bucket a cloud session records to, in the session's own region.
+    /// Implies --record and needs a storage key in the environment.
+    #[arg(long)]
+    pub bucket: Option<String>,
+
+    /// How long the bucket keeps this session's takes: 7d, 30d, 90d, or
+    /// forever. Applies to --bucket.
+    #[arg(long, default_value = "30d", value_parser = parse_retention)]
+    pub retention: Retention,
 
     /// Override the URL of the jamstreamd artifact the VM downloads at
     /// boot. Release builds pin the release's own server build; without
@@ -124,11 +174,17 @@ pub struct HostArgs {
 }
 
 impl HostArgs {
-    /// True when this launch should be able to record, since stems imply
-    /// recording.
+    /// True when this launch should be able to record, since stems and a
+    /// bucket each imply recording.
     pub fn wants_recording(&self) -> bool {
-        self.record || self.record_stems
+        self.record || self.record_stems || self.bucket.is_some()
     }
+}
+
+/// Retention as the four choices the object stores can enforce; a free day
+/// count is not one of them (see [`jamstream_cloud::Retention`]).
+fn parse_retention(raw: &str) -> Result<Retention, String> {
+    raw.parse::<Retention>().map_err(|err| err.to_string())
 }
 
 #[derive(Debug, Args)]
@@ -226,9 +282,109 @@ mod tests {
         clap_complete::generate(args.shell, &mut Cli::command(), "jamstream", &mut out);
         let script = String::from_utf8(out).expect("zsh completions are text");
         assert!(script.starts_with("#compdef jamstream"), "{script}");
-        for cmd in ["host", "status", "end", "sweep", "join", "completions"] {
+        for cmd in [
+            "host",
+            "status",
+            "end",
+            "sweep",
+            "join",
+            "recordings",
+            "completions",
+        ] {
             assert!(script.contains(cmd), "zsh script never mentions {cmd}");
         }
+    }
+
+    /// Bare `recordings` lists; `recordings get` fetches. The bare form takes
+    /// no session id, because listing is about every session this machine
+    /// knows.
+    #[test]
+    fn recordings_lists_by_default_and_fetches_with_get() {
+        let cli = Cli::parse_from(["jamstream", "recordings"]);
+        let Command::Recordings(args) = cli.command else {
+            panic!("expected recordings");
+        };
+        assert!(args.command.is_none());
+        assert!(!args.list.json);
+
+        let cli = Cli::parse_from(["jamstream", "recordings", "--json"]);
+        let Command::Recordings(args) = cli.command else {
+            panic!("expected recordings");
+        };
+        assert!(args.list.json);
+
+        let cli = Cli::parse_from([
+            "jamstream",
+            "recordings",
+            "get",
+            "deadbeef",
+            "--out",
+            "/tmp/takes",
+            "--yes",
+        ]);
+        let Command::Recordings(args) = cli.command else {
+            panic!("expected recordings");
+        };
+        let Some(RecordingsCommand::Get(get)) = args.command else {
+            panic!("expected recordings get");
+        };
+        assert_eq!(get.session, "deadbeef");
+        assert_eq!(get.out, Some(PathBuf::from("/tmp/takes")));
+        assert!(get.yes);
+
+        // A session id prefix is not optional: fetching every session's takes
+        // at once is a bill, not a default.
+        assert!(Cli::try_parse_from(["jamstream", "recordings", "get"]).is_err());
+        // The default output directory is the current one, decided by the
+        // command rather than by the parser.
+        let cli = Cli::parse_from(["jamstream", "recordings", "get", "abc"]);
+        let Command::Recordings(args) = cli.command else {
+            panic!("expected recordings");
+        };
+        let Some(RecordingsCommand::Get(get)) = args.command else {
+            panic!("expected recordings get");
+        };
+        assert!(get.out.is_none());
+        assert!(!get.yes);
+    }
+
+    /// Recording to a bucket is what makes `jamstream recordings` reachable,
+    /// so the flags that arm it parse together and the retention choices are
+    /// the four the object stores can enforce.
+    #[test]
+    fn a_bucket_and_a_retention_choice_parse_and_imply_recording() {
+        let cli = Cli::parse_from([
+            "jamstream",
+            "host",
+            "--provider",
+            "aws",
+            "--bucket",
+            "my-jams",
+            "--retention",
+            "90d",
+        ]);
+        let Command::Host(args) = cli.command else {
+            panic!("expected host");
+        };
+        assert_eq!(args.bucket.as_deref(), Some("my-jams"));
+        assert_eq!(args.retention, Retention::Days90);
+        assert!(
+            args.wants_recording(),
+            "a bucket is a request to record into it"
+        );
+
+        // The default is 30 days, the same default the app and the estimate
+        // use.
+        let cli = Cli::parse_from(["jamstream", "host"]);
+        let Command::Host(args) = cli.command else {
+            panic!("expected host");
+        };
+        assert_eq!(args.retention, Retention::default());
+        assert!(args.bucket.is_none());
+
+        // A free day count is not one of the choices.
+        assert!(Cli::try_parse_from(["jamstream", "host", "--retention", "45d"]).is_err());
+        assert!(Cli::try_parse_from(["jamstream", "host", "--retention", "forever"]).is_ok());
     }
 
     #[test]

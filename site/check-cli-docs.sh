@@ -17,10 +17,18 @@ fi
 "$BIN" help >/dev/null
 
 status=0
-for cmd in host status end sweep join completions; do
+for cmd in host status end sweep join recordings completions; do
   page="src/cli/$cmd.md"
   [ -f "$page" ] || { echo "missing page: $page" >&2; status=1; continue; }
   help_out="$("$BIN" "$cmd" --help)"
+  # A command with subcommands documents them on the same page, so its flag
+  # set is the union of its own and theirs.
+  case "$cmd" in
+    recordings)
+      help_out="$help_out
+$("$BIN" recordings get --help)"
+      ;;
+  esac
   help_flags="$(printf '%s' "$help_out" | grep -oE -- '--[a-z][a-z0-9-]*' | grep -vx -- --help | sort -u)"
   page_flags="$(grep -oE -- '--[a-z][a-z0-9-]*' "$page" | grep -vx -- --help | sort -u || true)"
   for f in $help_flags; do

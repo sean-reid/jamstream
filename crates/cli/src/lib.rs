@@ -8,8 +8,10 @@ pub mod end;
 pub mod host;
 pub mod join;
 pub mod providers;
+pub mod recordings;
 pub mod state;
 pub mod status;
+pub mod storage;
 pub mod sweep;
 
 #[derive(Debug, thiserror::Error)]

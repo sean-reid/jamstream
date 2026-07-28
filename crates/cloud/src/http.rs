@@ -15,6 +15,11 @@ const BACKOFF_CAP: Duration = Duration::from_secs(4);
 /// surface the error instead of stalling a session launch.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A connection that has not been established by now is not going to be.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for one read off a streaming body, not for the whole download:
+/// a provider that stops sending has to fail rather than hang forever.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Error bodies are carried on the error for diagnosis; anything past this
 /// is noise (providers put the useful code/message up front).
 const ERROR_BODY_CAP: usize = 4096;
@@ -25,6 +30,23 @@ pub fn client() -> reqwest::Client {
         .timeout(REQUEST_TIMEOUT)
         .build()
         .expect("reqwest client")
+}
+
+/// Client for responses whose bodies are recordings rather than API replies:
+/// no whole-request deadline, because a multi-gigabyte take legitimately
+/// takes minutes, but a stalled connection still fails.
+// reqwest's `timeout` covers reading the body too, so a 5 GB download on
+// client() would be killed at 30 seconds no matter how healthy the transfer
+// is. Showing that directly would need a test that outlasts REQUEST_TIMEOUT,
+// which is not worth it in a suite that runs on every commit, so the test
+// below only checks that a late body arrives intact through this client.
+pub fn streaming_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(concat!("jamstream/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(STREAM_READ_TIMEOUT)
+        .build()
+        .expect("reqwest streaming client")
 }
 
 /// Sends a request built fresh per attempt (bodies are not replayable
@@ -179,6 +201,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.text().await.unwrap(), "fine");
+    }
+
+    #[tokio::test]
+    async fn the_streaming_client_reads_a_whole_body_after_a_delay() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/take.wav"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![7u8; 64 * 1024])
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let c = streaming_client();
+        let resp = send_retrying(|| c.get(format!("{}/take.wav", server.uri())))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.bytes().await.unwrap().len(),
+            64 * 1024,
+            "the per-read timeout must not cut a healthy transfer short"
+        );
     }
 
     #[tokio::test]

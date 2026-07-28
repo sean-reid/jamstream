@@ -7,3 +7,4 @@ The `jamstream` CLI is built for automation, scripting, and headless use: it hos
 - [jamstream end](end.md): destroy a session's server and mark the session ended.
 - [jamstream sweep](sweep.md): find and destroy orphaned jamstream instances.
 - [jamstream join](join.md): join a session as a headless client.
+- [jamstream recordings](recordings.md): list and fetch the takes a session recorded to a bucket.

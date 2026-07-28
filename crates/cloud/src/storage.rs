@@ -39,6 +39,16 @@
 //! (see [`crate::retention`]), which covers the case where the VM dies before
 //! the abort can be sent.
 //!
+//! # Downloads
+//!
+//! [`ObjectStore::get`] is the other direction, and it is a stream for the
+//! same reason: the caller writes each chunk into a [`ChunkSink`] as it
+//! arrives, so a 5 GB take never sits in memory. Every backend drains its
+//! response through [`drain_body`], which refuses a body that came up short
+//! of the `content-length` the provider promised. A truncated take that
+//! reports success is the failure this path exists to prevent, and it is one
+//! guarantee in one place rather than three.
+//!
 //! # Part size
 //!
 //! [`DEFAULT_PART_SIZE`] is 16 MiB, which satisfies both providers' rules at
@@ -200,6 +210,12 @@ pub trait PartSource: Send {
     async fn next_part(&mut self, max: usize) -> Result<Vec<u8>>;
 }
 
+/// Receives an object body one chunk at a time, in order.
+#[async_trait]
+pub trait ChunkSink: Send {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()>;
+}
+
 /// A [`PartSource`] over bytes already in memory: the manifest, or a short
 /// recording.
 pub struct BytesSource {
@@ -324,6 +340,15 @@ pub trait ObjectStore: Send + Sync {
     /// Metadata for one object. [`ProviderError::NotFound`] when it is not
     /// there.
     async fn head(&self, bucket: &str, key: &str) -> Result<ObjectMeta>;
+
+    /// Streams one object into `sink`, a chunk at a time. Returns metadata
+    /// whose `size` is the number of bytes actually delivered.
+    async fn get(
+        &self,
+        bucket: &str,
+        key: &str,
+        sink: &mut (dyn ChunkSink + Send),
+    ) -> Result<ObjectMeta>;
 
     /// Every object under `prefix`, following the provider's pagination to
     /// the end. Sorted by key.
@@ -500,6 +525,67 @@ async fn feed_parts<B: MultipartBackend + ?Sized>(
     }
 }
 
+/// Writes a response body into `sink` chunk by chunk, refusing a body that
+/// came up short of the `content-length` the provider promised.
+///
+/// The whole download path shares this so the truncation guarantee is
+/// testable once, the way [`drive_upload`] centralizes the abort guarantee.
+/// Bodies are read with [`reqwest::Response::chunk`] rather than collected:
+/// a take is gigabytes, and nothing here may hold one in memory.
+pub(crate) async fn drain_body(
+    mut resp: reqwest::Response,
+    key: &str,
+    sink: &mut (dyn ChunkSink + Send),
+) -> Result<ObjectMeta> {
+    let expected = header_value(&resp, "content-length").and_then(|v| v.parse::<u64>().ok());
+    let etag = header_value(&resp, "etag");
+    let content_type = header_value(&resp, "content-type");
+    let last_modified = header_value(&resp, "last-modified");
+
+    let mut delivered = 0u64;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                delivered += chunk.len() as u64;
+                sink.write_chunk(&chunk).await?;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Err(ProviderError::Other(format!(
+                    "downloading {key} failed after {delivered} bytes: {e}"
+                )));
+            }
+        }
+    }
+    check_delivered(expected, delivered, key)?;
+    Ok(ObjectMeta {
+        key: key.to_owned(),
+        size: delivered,
+        etag,
+        content_type,
+        last_modified,
+    })
+}
+
+/// Fails when the provider promised a length and then delivered a different
+/// one, because a silently short recording is worse than no recording.
+pub(crate) fn check_delivered(expected: Option<u64>, delivered: u64, key: &str) -> Result<()> {
+    match expected {
+        Some(expected) if expected != delivered => Err(ProviderError::Other(format!(
+            "download of {key} is truncated: content-length promised {expected} bytes, \
+             {delivered} arrived"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn header_value(resp: &reqwest::Response, name: &str) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
 impl crate::cloudinit::RecordingStorage {
     /// The store this config points at, ready for [`ObjectSink::open`]. One
     /// factory so the VM and any probe build the same client from the same
@@ -643,6 +729,36 @@ mod tests {
         assert_eq!(src.next_part(4).await.unwrap(), b"4567");
         assert_eq!(src.next_part(4).await.unwrap(), b"89");
         assert!(src.next_part(4).await.unwrap().is_empty());
+    }
+
+    /// The guard behind every download: a body that came up short of the
+    /// promised length must not be reported as a recording.
+    ///
+    /// Tested here rather than over HTTP because no HTTP server will send the
+    /// mismatch. hyper panics inside its own encoder when a manually set
+    /// content-length disagrees with the payload, so a wiremock far end cannot
+    /// be made to lie; the only honest seam is the comparison itself, which is
+    /// what `drain_body` calls once the last chunk is in.
+    #[test]
+    fn a_short_body_is_refused_and_names_both_sizes() {
+        let err = check_delivered(Some(1_382_400_044), 691_200_000, "mix.wav").unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, ProviderError::Other(_)), "{err:?}");
+        assert!(msg.contains("mix.wav"), "{msg}");
+        assert!(msg.contains("1382400044"), "the expected size: {msg}");
+        assert!(msg.contains("691200000"), "the delivered size: {msg}");
+        assert!(msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn a_body_that_matches_or_promised_nothing_is_accepted() {
+        assert!(check_delivered(Some(20), 20, "k.wav").is_ok());
+        assert!(check_delivered(Some(0), 0, "empty.wav").is_ok());
+        // No content-length is a chunked response, which promises nothing;
+        // rejecting it would break downloads that are otherwise fine.
+        assert!(check_delivered(None, 4096, "k.wav").is_ok());
+        // A body longer than promised is just as wrong as a short one.
+        assert!(check_delivered(Some(20), 21, "k.wav").is_err());
     }
 
     #[tokio::test]

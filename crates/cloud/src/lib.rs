@@ -53,16 +53,18 @@ pub use cost::{CostPreview, LineItem};
 pub use mock::MockProvider;
 pub use probe::{ProbeTarget, probe_all, probe_catalog};
 pub use provider::{Provider, ProviderError, Result, Sleeper, TokioSleeper, WaitOpts};
-pub use recording::{BitDepth, RecordingEstimate, RecordingPlan, StoragePrice, storage_price};
+pub use recording::{
+    BitDepth, EgressQuote, RecordingEstimate, RecordingPlan, StoragePrice, storage_price,
+};
 pub use regions::{RegionTable, priced_regions};
 pub use retention::{Retention, RetentionEnforcement};
 pub use solver::{MemberId, ProbeMatrix, RegionScore, rank};
 #[cfg(feature = "gcp")]
 pub use storage::GcsStore;
 pub use storage::{
-    BytesSource, FLAC_CONTENT_TYPE, JSON_CONTENT_TYPE, MockStore, ObjectMeta, ObjectSink,
-    ObjectStore, PartSource, ReadSource, S3Store, WAV_CONTENT_TYPE, assert_object_store_contract,
-    manifest_key, mix_key, session_prefix, stem_key,
+    BytesSource, ChunkSink, FLAC_CONTENT_TYPE, JSON_CONTENT_TYPE, MockStore, ObjectMeta,
+    ObjectSink, ObjectStore, PartSource, ReadSource, S3Store, WAV_CONTENT_TYPE,
+    assert_object_store_contract, manifest_key, mix_key, session_prefix, stem_key,
 };
 pub use sweeper::{SweepFilter, SweepReport, sweep};
 pub use types::{

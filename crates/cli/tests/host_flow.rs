@@ -24,6 +24,8 @@ fn host_args() -> HostArgs {
         max_hours: 12,
         record: false,
         record_stems: false,
+        bucket: None,
+        retention: jamstream_cloud::Retention::Days30,
         artifact_url: None,
         artifact_sha256: None,
         yes: true,
