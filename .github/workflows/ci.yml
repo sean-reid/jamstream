@@ -168,6 +168,36 @@ jobs:
         run: cargo nextest run --locked --workspace --exclude jamstream-harness
       - if: runner.os != 'macOS'
         run: cargo nextest run --locked --workspace --exclude jamstream-harness --exclude jamstream-client
+      # `cargo xtask fixtures` was invoked by nothing, and its WAV generator is
+      # duplicated verbatim into crates/cli/tests/common/mod.rs with "keep them
+      # in sync" written in a doc comment and enforced nowhere. The nextest run
+      # above has just made the test copy's output under target/fixtures/, so
+      # comparing the two byte for byte is the enforcement, and it also proves
+      # the xtask still runs.
+      #
+      # Only the fixtures the cli suite actually asks for exist on the test
+      # side, which today is three of the four (the impulse train has no
+      # caller), hence the floor rather than an exact count. The real fix is
+      # one generator with one caller; that needs crates/cli, so this holds the
+      # line until then.
+      - if: runner.os == 'Linux'
+        name: The xtask fixtures and the test fixtures are the same bytes
+        run: |
+          set -eu
+          cargo run --locked -p xtask -- fixtures
+          matched=0
+          for f in fixtures/audio/*.wav; do
+            mirror="target/fixtures/audio/$(basename "$f")"
+            [ -f "$mirror" ] || continue
+            if cmp -s "$f" "$mirror"; then
+              matched=$((matched + 1))
+            else
+              echo "$(basename "$f") differs between cargo xtask fixtures and the copy in crates/cli/tests/common/mod.rs; the two generators have drifted apart" >&2
+              exit 1
+            fi
+          done
+          echo "$matched fixtures generated identically by both copies"
+          test "$matched" -ge 3
       # The nextest run above already compiles the cfg(windows) WASAPI
       # exclusive-mode backend (lib and tests, with RUSTFLAGS=-D warnings), so
       # it is the Windows compile gate. Clippy, though, only runs on Linux in
