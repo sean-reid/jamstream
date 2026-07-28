@@ -1,6 +1,6 @@
 //! Outer datagram framing. Anything that fails to parse is dropped by the
-//! caller without a response; the version reject is the single exception,
-//! and it is MAC'd with a key only the server and the one client that sent
+//! caller without a response; the two rejects are the only exceptions, and
+//! both are MAC'd with a key only the server and the one client that sent
 //! the init can derive (see [`RejectKey`]).
 
 use blake2::Blake2sMac;
@@ -14,12 +14,16 @@ pub const TYPE_HANDSHAKE_INIT: u8 = 1;
 pub const TYPE_HANDSHAKE_RESP: u8 = 2;
 pub const TYPE_TRANSPORT: u8 = 3;
 pub const TYPE_VERSION_REJECT: u8 = 4;
+pub const TYPE_CAPACITY_REJECT: u8 = 5;
 
 /// Channel byte inside decrypted transport plaintext.
 pub const CHANNEL_MEDIA: u8 = 0;
 pub const CHANNEL_CONTROL: u8 = 1;
 
 const REJECT_DOMAIN: &[u8] = b"jamstream-version-reject";
+/// Separate domain from the version reject: the two rejects share a key, and
+/// one must never be replayable as the other.
+const CAPACITY_DOMAIN: &[u8] = b"jamstream-capacity-reject";
 
 /// The key a version reject is authenticated with: a hash of the X25519
 /// shared secret between the server's static key and the per-connection
@@ -64,6 +68,12 @@ pub enum Packet<'a> {
         theirs: u16,
         mac: [u8; 16],
     },
+    /// The role this peer's invite names is full. Carries no fields beyond
+    /// the MAC: the client knows its own role, and anything else would be
+    /// something the server tells an unadmitted peer for no reason.
+    CapacityReject {
+        mac: [u8; 16],
+    },
 }
 
 pub fn parse(buf: &[u8]) -> Result<Packet<'_>, Error> {
@@ -100,6 +110,16 @@ pub fn parse(buf: &[u8]) -> Result<Packet<'_>, Error> {
             let theirs = u16::from_le_bytes([rest[2], rest[3]]);
             let mac = rest[4..20].try_into().unwrap();
             Ok(Packet::VersionReject { ours, theirs, mac })
+        }
+        TYPE_CAPACITY_REJECT => {
+            // Exactly the MAC, no more and no less: a trailing byte would
+            // mean two encodings of the same packet.
+            if rest.len() != 16 {
+                return Err(Error::Malformed);
+            }
+            Ok(Packet::CapacityReject {
+                mac: rest.try_into().unwrap(),
+            })
         }
         other => Err(Error::UnknownPacketType(other)),
     }
@@ -160,23 +180,56 @@ pub fn verify_version_reject(
     mac: &[u8; 16],
     init_packet_sent: &[u8],
 ) -> bool {
-    let expected = reject_mac(key, ours, theirs, init_packet_sent);
-    // Not an oracle worth constant-time care, but it costs nothing.
-    expected
-        .iter()
-        .zip(mac.iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
+    equal(&reject_mac(key, ours, theirs, init_packet_sent), mac)
+}
+
+/// Tells a peer whose token has already verified that the role its invite
+/// names is full.
+///
+/// Only reachable after the token check, so it is never an answer to an
+/// arbitrary packet. It echoes the init inside the MAC like the version
+/// reject, so it cannot be replayed at a later connection attempt, and it is
+/// 17 bytes against an init of over 90: no use as an amplifier.
+pub fn build_capacity_reject(key: &RejectKey, init_packet: &[u8]) -> Vec<u8> {
+    let mac = capacity_mac(key, init_packet);
+    let mut out = Vec::with_capacity(17);
+    out.push(TYPE_CAPACITY_REJECT);
+    out.extend_from_slice(&mac);
+    out
+}
+
+pub fn verify_capacity_reject(key: &RejectKey, mac: &[u8; 16], init_packet_sent: &[u8]) -> bool {
+    equal(&capacity_mac(key, init_packet_sent), mac)
 }
 
 fn reject_mac(key: &RejectKey, ours: u16, theirs: u16, init_packet: &[u8]) -> [u8; 16] {
-    let mut mac =
-        <Blake2sMac<U16> as KeyInit>::new_from_slice(key.0.as_slice()).expect("32-byte key");
-    mac.update(REJECT_DOMAIN);
+    let mut mac = keyed(key, REJECT_DOMAIN);
     mac.update(&ours.to_le_bytes());
     mac.update(&theirs.to_le_bytes());
     mac.update(&init_packet[..init_packet.len().min(64)]);
     mac.finalize().into_bytes().into()
+}
+
+fn capacity_mac(key: &RejectKey, init_packet: &[u8]) -> [u8; 16] {
+    let mut mac = keyed(key, CAPACITY_DOMAIN);
+    mac.update(&init_packet[..init_packet.len().min(64)]);
+    mac.finalize().into_bytes().into()
+}
+
+fn keyed(key: &RejectKey, domain: &[u8]) -> Blake2sMac<U16> {
+    let mut mac =
+        <Blake2sMac<U16> as KeyInit>::new_from_slice(key.0.as_slice()).expect("32-byte key");
+    mac.update(domain);
+    mac
+}
+
+/// Not an oracle worth constant-time care, but it costs nothing.
+fn equal(expected: &[u8; 16], got: &[u8; 16]) -> bool {
+    expected
+        .iter()
+        .zip(got.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 /// Splits decrypted transport plaintext into its channel and body.
@@ -221,6 +274,97 @@ mod tests {
         assert!(parse(&[TYPE_TRANSPORT, 0, 0, 1, 2]).is_err());
         assert!(parse(&[TYPE_VERSION_REJECT; 5]).is_err());
         assert!(parse(&[99, 1, 2, 3]).is_err());
+    }
+
+    /// A capacity reject is a tag and a 16-byte MAC and nothing else. One
+    /// byte short is a truncation and one byte long is a second encoding of
+    /// the same packet; both are refused rather than tolerated.
+    #[test]
+    fn capacity_reject_is_exactly_seventeen_bytes() {
+        let key = RejectKey::from_bytes([5u8; 32]);
+        let init = build_handshake_init(1, &[0xAB; 96]);
+        let reject = build_capacity_reject(&key, &init);
+        assert_eq!(reject.len(), 17);
+        assert!(reject.len() < init.len(), "never larger than the init");
+        for len in [0usize, 1, 15, 17, 64] {
+            let mut wrong = vec![TYPE_CAPACITY_REJECT];
+            wrong.extend(std::iter::repeat_n(0u8, len));
+            assert_eq!(
+                parse(&wrong).is_ok(),
+                len == 16,
+                "{len} MAC bytes parsed wrongly"
+            );
+        }
+    }
+
+    /// Same fence as the invite and handshake payload vectors: these are
+    /// bytes on a wire between two builds, so the encoding is pinned rather
+    /// than merely round-tripped. Fix the encoding, not the vector.
+    #[test]
+    fn reject_wire_encodings_are_pinned() {
+        let key = RejectKey::from_bytes([3u8; 32]);
+        let init = build_handshake_init(9, b"a-fixed-init-for-the-vector");
+
+        let version = build_version_reject(&key, 1, 9, &init);
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&version),
+            "0401000900935450b7abba314a3227a9d2de11fdeb",
+            "version reject encoding drifted"
+        );
+
+        let capacity = build_capacity_reject(&key, &init);
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&capacity),
+            "0500f57a286e8cad38de17443b484d60ea",
+            "capacity reject encoding drifted"
+        );
+
+        // Appending the capacity reject left the tags of every earlier packet
+        // alone: same rule as the postcard variants in control.rs.
+        assert_eq!(build_handshake_init(1, b"")[0], TYPE_HANDSHAKE_INIT);
+        assert_eq!(build_handshake_resp(b"")[0], TYPE_HANDSHAKE_RESP);
+        assert_eq!(build_transport(MemberId(0), 0, b"")[0], TYPE_TRANSPORT);
+        assert_eq!(version[0], TYPE_VERSION_REJECT);
+        assert_eq!(capacity[0], TYPE_CAPACITY_REJECT);
+        assert_eq!(
+            [
+                TYPE_HANDSHAKE_INIT,
+                TYPE_HANDSHAKE_RESP,
+                TYPE_TRANSPORT,
+                TYPE_VERSION_REJECT,
+                TYPE_CAPACITY_REJECT
+            ],
+            [1, 2, 3, 4, 5]
+        );
+    }
+
+    /// The two rejects share a key, so the MACs are domain separated: a
+    /// capacity reject must not be replayable as a version reject or the
+    /// other way round, and neither must answer a different init.
+    #[test]
+    fn capacity_reject_authenticates_and_is_not_a_version_reject() {
+        let key = RejectKey::from_bytes([3u8; 32]);
+        let other = RejectKey::from_bytes([4u8; 32]);
+        let init = build_handshake_init(1, b"the-init-being-answered");
+        let reject = build_capacity_reject(&key, &init);
+        let Packet::CapacityReject { mac } = parse(&reject).unwrap() else {
+            panic!("wrong packet type");
+        };
+        assert!(verify_capacity_reject(&key, &mac, &init));
+        // Wrong key, wrong init echo: refused.
+        assert!(!verify_capacity_reject(&other, &mac, &init));
+        assert!(!verify_capacity_reject(&key, &mac, b"another-init"));
+        // And the same MAC does not authenticate a version reject, whatever
+        // versions are claimed with it.
+        for ours in 0..4u16 {
+            assert!(!verify_version_reject(&key, ours, 1, &mac, &init));
+        }
+        let Packet::VersionReject { mac: vmac, .. } =
+            parse(&build_version_reject(&key, 1, 9, &init)).unwrap()
+        else {
+            panic!("wrong packet type");
+        };
+        assert!(!verify_capacity_reject(&key, &vmac, &init));
     }
 
     #[test]

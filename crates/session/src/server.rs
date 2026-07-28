@@ -439,7 +439,7 @@ impl ServerCore {
                 if version != PROTOCOL_VERSION {
                     self.version_reject(now_ms, src, version, noise, data, &mut out);
                 } else {
-                    self.admit(now_ms, now_unix, src, noise, &mut out);
+                    self.admit(now_ms, now_unix, src, noise, data, &mut out);
                 }
             }
             Ok(Packet::Transport {
@@ -450,7 +450,10 @@ impl ServerCore {
                 self.handle_transport(now_ms, src, member, counter, ciphertext, &mut out);
             }
             // The server never receives these legitimately.
-            Ok(Packet::HandshakeResp { .. }) | Ok(Packet::VersionReject { .. }) | Err(_) => {}
+            Ok(Packet::HandshakeResp { .. })
+            | Ok(Packet::VersionReject { .. })
+            | Ok(Packet::CapacityReject { .. })
+            | Err(_) => {}
         }
         out
     }
@@ -984,15 +987,50 @@ impl ServerCore {
         self.init_reads
     }
 
+    /// Emits an authenticated capacity reject, through the same per-source
+    /// gate and global budget as the version reject.
+    ///
+    /// Both are packets the server sends in answer to an inbound one, and the
+    /// total reflected volume is exactly what those limits exist to bound, so
+    /// they share them rather than each getting an allowance. A suppressed
+    /// reject costs an honest client one more resend, which it was going to
+    /// send anyway. The key comes out of the handshake the caller already
+    /// read: one X25519, no second pass over the Noise message.
+    fn capacity_reject(
+        &mut self,
+        now_ms: u64,
+        src: SocketAddr,
+        responder: &Responder,
+        init_packet: &[u8],
+        out: &mut Outgoing,
+    ) {
+        let slot = reject_slot(src.ip());
+        if self.reject_seen[slot].is_some_and(|t| now_ms.saturating_sub(t) < REJECT_INTERVAL_MS) {
+            return;
+        }
+        // Left unstamped when the budget refuses, as on the version reject
+        // path, so an exhausted budget does not consume a client's turn.
+        if !self.reject_budget.take(now_ms) {
+            return;
+        }
+        self.reject_seen[slot] = Some(now_ms);
+        let Some(key) = responder.reject_key(&self.cfg.server_private) else {
+            return;
+        };
+        out.push((src, wire::build_capacity_reject(&key, init_packet)));
+    }
+
     /// Full admission path for a version-matched handshake init. Every
-    /// refusal is silent: to an unauthenticated peer the server looks like
-    /// packet loss.
+    /// refusal upstream of the token check is silent: to an unauthenticated
+    /// peer the server looks like packet loss. Capacity is checked after it,
+    /// so that one refusal is answered.
     fn admit(
         &mut self,
         now_ms: u64,
         now_unix: u64,
         src: SocketAddr,
         noise: &[u8],
+        init_packet: &[u8],
         out: &mut Outgoing,
     ) {
         // Everything below this line costs asymmetric crypto, so the budget
@@ -1079,6 +1117,14 @@ impl ServerCore {
         };
         if connected_in_role >= cap {
             tracing::debug!(member = id.0, "admission refused: role at capacity");
+            // This peer's token verified, so it holds an invite this session
+            // issued and telling it the truth makes the server no kind of
+            // oracle: everything upstream of the token check is still
+            // answered with silence. Without this a listener joining a full
+            // gallery waited out its own 10 s timeout and could not tell a
+            // sold-out session from a server that was down, so its next move
+            // was to retry a join that could never succeed.
+            self.capacity_reject(now_ms, src, &responder, init_packet, out);
             return;
         }
         // One encoder serves every listener, built on the first one to join.
@@ -1997,6 +2043,239 @@ mod tests {
         let (mut core, _issuer, _public) = server_with_issuer();
         let garbage = wire::build_handshake_init(9, &[0xAA; 96]);
         assert!(core.handle_datagram(0, 0, addr(2), &garbage).is_empty());
+    }
+
+    /// The capacity check runs after the token verifies, so the peer has
+    /// already proven it holds an invite this session issued and can safely
+    /// be told the truth. Before this, a listener joining a full gallery
+    /// waited out its own 10 s timeout and could not tell a sold-out session
+    /// from a server that was down.
+    #[test]
+    fn a_full_role_draws_an_authenticated_capacity_reject() {
+        let issuer = Issuer::generate();
+        let kp = generate_keypair();
+        let public = kp.public;
+        // One listener seat, so the second listener is over capacity.
+        let mut core = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(4, 1),
+        );
+        let listener = |member: u16| {
+            issuer.mint(
+                SessionId([7u8; 16]),
+                vec![addr(1)],
+                public,
+                Token {
+                    member_id: MemberId(member),
+                    role: Role::Listener,
+                    name_hint: None,
+                    expires_unix: u64::MAX,
+                    jti: TokenId([member as u8; 16]),
+                },
+            )
+        };
+
+        // The first listener is admitted and gets a handshake response.
+        let (_, first_init) = Initiator::new(&listener(10)).unwrap();
+        let out = core.handle_datagram(0, 0, addr(10), &first_init);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            wire::parse(&out[0].1),
+            Ok(Packet::HandshakeResp { .. })
+        ));
+
+        // The second draws a capacity reject its own handshake authenticates.
+        let over = listener(11);
+        let (initiator, init) = Initiator::new(&over).unwrap();
+        let out = core.handle_datagram(0, 0, addr(11), &init);
+        assert_eq!(out.len(), 1, "a full role must not answer with silence");
+        assert_eq!(out[0].0, addr(11));
+        let Ok(Packet::CapacityReject { mac }) = wire::parse(&out[0].1) else {
+            panic!("expected a capacity reject, got {:?}", out[0].1);
+        };
+        assert!(wire::verify_capacity_reject(
+            initiator.reject_key().unwrap(),
+            &mac,
+            &init
+        ));
+        assert!(out[0].1.len() < init.len(), "never an amplifier");
+        // Refused means refused: no seat was taken.
+        assert_eq!(core.broadcast_tick().listeners, 1);
+
+        // Nobody else can forge one. An invite carries the server's public
+        // key and nothing more, so a second handshake with the same invite
+        // derives a different key.
+        let (other, _) = Initiator::new(&over).unwrap();
+        assert!(!wire::verify_capacity_reject(
+            other.reject_key().unwrap(),
+            &mac,
+            &init
+        ));
+
+        // A musician seat is still free, and a musician still gets in: the
+        // reject is about one role, not about the session.
+        let musician = issuer.mint(
+            SessionId([7u8; 16]),
+            vec![addr(1)],
+            public,
+            Token {
+                member_id: MemberId(0),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId([99u8; 16]),
+            },
+        );
+        let (_, m_init) = Initiator::new(&musician).unwrap();
+        // A second later, past the per-source reject interval.
+        let out = core.handle_datagram(2_000, 0, addr(12), &m_init);
+        assert!(matches!(
+            wire::parse(&out[0].1),
+            Ok(Packet::HandshakeResp { .. })
+        ));
+    }
+
+    /// Everything upstream of the token check still gets silence: answering
+    /// an arbitrary init would make the server an oracle for which invites
+    /// exist and a reflector for whoever spoofed the source.
+    #[test]
+    fn an_unverified_peer_is_never_told_the_session_is_full() {
+        let issuer = Issuer::generate();
+        let stranger = Issuer::generate();
+        let kp = generate_keypair();
+        let public = kp.public;
+        let mut core = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(1, 0),
+        );
+        let token = |member: u16| Token {
+            member_id: MemberId(member),
+            role: Role::Musician,
+            name_hint: None,
+            expires_unix: u64::MAX,
+            jti: TokenId([member as u8; 16]),
+        };
+        // Fill the one musician seat.
+        let host = issuer.mint(SessionId([7u8; 16]), vec![addr(1)], public, token(0));
+        let (_, init) = Initiator::new(&host).unwrap();
+        assert_eq!(core.handle_datagram(0, 0, addr(1), &init).len(), 1);
+
+        // Signed by somebody else's issuer: silence, though the session is
+        // as full for this peer as for anyone.
+        let forged = stranger.mint(SessionId([7u8; 16]), vec![addr(1)], public, token(3));
+        let (_, forged_init) = Initiator::new(&forged).unwrap();
+        assert!(
+            core.handle_datagram(2_000, 0, addr(3), &forged_init)
+                .is_empty(),
+            "an unsigned token drew a reject"
+        );
+
+        // Expired, and revoked: same silence.
+        let mut expiring = token(4);
+        expiring.expires_unix = 100;
+        let expired = issuer.mint(SessionId([7u8; 16]), vec![addr(1)], public, expiring);
+        let (_, expired_init) = Initiator::new(&expired).unwrap();
+        assert!(
+            core.handle_datagram(4_000, 200, addr(4), &expired_init)
+                .is_empty(),
+            "an expired token drew a reject"
+        );
+
+        let revoked = issuer.mint(SessionId([7u8; 16]), vec![addr(1)], public, token(5));
+        core.restore_revoked(vec![revoked.token.jti]);
+        let (_, revoked_init) = Initiator::new(&revoked).unwrap();
+        assert!(
+            core.handle_datagram(6_000, 0, addr(5), &revoked_init)
+                .is_empty(),
+            "a revoked token drew a reject"
+        );
+
+        // And garbage that never reaches a token at all.
+        let garbage = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
+        assert!(core.handle_datagram(8_000, 0, addr(6), &garbage).is_empty());
+    }
+
+    /// The reject is a packet the server sends because a packet arrived, so
+    /// it shares the version reject's per-source gate and global budget. One
+    /// invite holder replaying its own init cannot make the server a
+    /// reflector.
+    #[test]
+    fn capacity_rejects_are_rate_limited_like_version_rejects() {
+        let issuer = Issuer::generate();
+        let kp = generate_keypair();
+        let public = kp.public;
+        let mut core = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(0, 0),
+        );
+        let invite = issuer.mint(
+            SessionId([7u8; 16]),
+            vec![addr(1)],
+            public,
+            Token {
+                member_id: MemberId(1),
+                role: Role::Musician,
+                name_hint: None,
+                expires_unix: u64::MAX,
+                jti: TokenId([1u8; 16]),
+            },
+        );
+        let (_, init) = Initiator::new(&invite).unwrap();
+
+        assert_eq!(core.handle_datagram(0, 0, addr(2), &init).len(), 1);
+        // Within the interval, the same source gets nothing back.
+        assert!(core.handle_datagram(500, 0, addr(2), &init).is_empty());
+        // Walking source ports does not buy another: the gate is keyed on the
+        // network, and the port is chosen by whoever sends the packet.
+        let mut answered = 0;
+        for port in 1_024..1_124u16 {
+            let src: SocketAddr = format!("10.0.0.2:{port}").parse().unwrap();
+            answered += core.handle_datagram(600, 0, src, &init).len();
+        }
+        assert_eq!(answered, 0, "{answered} rejects from one network in 100 ms");
+        // Past the interval it is answered again.
+        assert_eq!(core.handle_datagram(1_500, 0, addr(2), &init).len(), 1);
+
+        // And the global budget caps the total however wide the sources are
+        // spread, which is what a spoofed flood does.
+        let mut fresh = ServerCore::new(
+            ServerConfig::new(
+                SessionId([7u8; 16]),
+                kp.private.to_vec(),
+                public,
+                issuer.public_key(),
+            )
+            .with_capacity(0, 0),
+        );
+        let mut rejects = 0;
+        for a in 0..40u16 {
+            for b in 0..40u16 {
+                let src: SocketAddr = format!("198.18.{a}.{b}:9000").parse().unwrap();
+                rejects += fresh.handle_datagram(0, 0, src, &init).len();
+            }
+        }
+        // The init budget bites first: an init has to be read before its
+        // token can verify, and that read is what the budget prices.
+        assert!(
+            rejects <= REJECT_BURST as usize,
+            "1600 sources drew {rejects} rejects"
+        );
+        assert!(rejects > 0, "the burst answered nobody");
     }
 
     #[test]

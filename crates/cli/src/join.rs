@@ -214,6 +214,16 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
                     "timed out waiting for the server".to_owned(),
                 ));
             }
+            // The core keeps offering its init at a widening interval, which
+            // is right for a UI a person is watching. A rig is not watching:
+            // a session that has no seat for this invite is a final answer
+            // here, and it exits naming it rather than sitting on a retry.
+            ClientState::Connecting if core.session_full() => {
+                write_stereo_wav(&args.output, &received)?;
+                return Err(CliError::Failed(
+                    "session full: no free seat for this invite's role".to_owned(),
+                ));
+            }
             ClientState::Connecting => {}
         }
 
@@ -370,6 +380,7 @@ fn print_event<W: Write>(out: &mut W, event: &ClientEvent) -> std::io::Result<()
             out,
             "rejected: this client speaks protocol {ours}, the server speaks {theirs}"
         ),
+        ClientEvent::SessionFull => writeln!(out, "session full"),
         ClientEvent::TimedOut => writeln!(out, "timed out"),
         ClientEvent::StreamStatus(destinations) => {
             let live = destinations

@@ -52,3 +52,4 @@ $ pass show band/seat | jamstream join --headless \
 - The output WAV is written even when the session ends badly (ejected, rejected, timed out), so a test run always leaves evidence.
 - Chat lines, roster changes, metronome changes, and ejection reasons print one per line; latency samples are not printed.
 - A version mismatch fails at the handshake with both versions named, never with silence.
+- A session with no free seat for the invite's role prints `session full` and exits nonzero, instead of waiting out a connection timeout. The desktop app keeps retrying instead, since a seat frees when somebody leaves.

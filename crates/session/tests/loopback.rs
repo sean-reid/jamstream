@@ -1867,11 +1867,17 @@ fn musician_capacity_enforced() {
         .filter(|c| *c.core.state() == ClientState::Joined)
         .count();
     assert_eq!(joined, MAX_MUSICIANS);
-    // Refusal is a silent drop: the over-cap client keeps retrying until its
-    // own connection timeout, indistinguishable from packet loss.
+    // The over-cap client is told the band is full and keeps its init on
+    // offer, which is what gets it in when somebody leaves.
     assert_eq!(
         *h.clients[MAX_MUSICIANS].core.state(),
         ClientState::Connecting
+    );
+    assert!(h.clients[MAX_MUSICIANS].core.session_full());
+    assert!(
+        h.clients[MAX_MUSICIANS]
+            .events
+            .contains(&ClientEvent::SessionFull)
     );
 }
 
@@ -1880,8 +1886,8 @@ fn musician_capacity_enforced() {
 /// a sold-out gallery must not cost the band a seat, which is the failure a
 /// single shared count would produce. The refusal must cost the session
 /// nothing either: the gallery keeps hearing the broadcast, and the refused
-/// client ends at its own connection timeout, since admission refusals are
-/// silent by design.
+/// client is told the gallery is full rather than left to time out, which is
+/// what it used to get.
 #[test]
 fn listener_capacity_enforced() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
@@ -1903,10 +1909,28 @@ fn listener_capacity_enforced() {
         .filter(|c| c.role == Role::Listener && *c.core.state() == ClientState::Joined)
         .count();
     assert_eq!(joined, MAX_LISTENERS);
-    // Silent refusal, as for musicians: the over-cap listener keeps retrying
-    // until its own connection timeout, indistinguishable from packet loss.
+    // The over-cap listener's token verified, so it is told the truth in a
+    // packet only this server could have produced, and it keeps its init on
+    // offer instead of waiting out a timeout it would have to misreport.
     let refused = 1 + MAX_LISTENERS;
     assert_eq!(*h.clients[refused].core.state(), ClientState::Connecting);
+    assert!(h.clients[refused].core.session_full());
+    assert!(
+        h.clients[refused]
+            .events
+            .contains(&ClientEvent::SessionFull),
+        "the refused listener was never told the gallery was full"
+    );
+    // Exactly once, however many rejects the server sends: a capacity reject
+    // is replayable by anyone who saw one.
+    assert_eq!(
+        h.clients[refused]
+            .events
+            .iter()
+            .filter(|e| **e == ClientEvent::SessionFull)
+            .count(),
+        1
+    );
 
     // A full gallery leaves the band's seats alone.
     let late = h.mint(1, Role::Musician);
@@ -1934,13 +1958,27 @@ fn listener_capacity_enforced() {
         tail_rms(&h, refused, win)
     );
 
-    // What the refused client surfaces is its own 10 s connection timeout,
-    // not a reject: to it, a full session is packet loss. The admitted
+    // Past the 10 s connection timeout the refused client is still trying,
+    // and never claims to have timed out: the server is answering it, so a
+    // timeout would be the one thing it knows to be false. The admitted
     // members ride keepalives through it and stay seated.
     h.advance_quiet(11_000);
-    assert_eq!(*h.clients[refused].core.state(), ClientState::TimedOut);
-    assert!(h.clients[refused].events.contains(&ClientEvent::TimedOut));
+    assert_eq!(*h.clients[refused].core.state(), ClientState::Connecting);
+    assert!(!h.clients[refused].events.contains(&ClientEvent::TimedOut));
+    assert!(h.clients[refused].core.session_full());
     assert_eq!(h.server.musicians_connected(), 2);
+    assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
+
+    // And the retry is the point of not giving up: one listener leaves, and
+    // the refused one takes the seat with no user restarting anything.
+    h.clients[1].core.leave("making room").unwrap();
+    h.run_ms(500);
+    assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS - 1);
+    // The retry interval has widened to tens of seconds by now, so give it
+    // room rather than assuming which resend lands.
+    h.advance_quiet(60_000);
+    assert_eq!(*h.clients[refused].core.state(), ClientState::Joined);
+    assert!(!h.clients[refused].core.session_full());
     assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
 }
 
