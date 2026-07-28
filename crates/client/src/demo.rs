@@ -295,6 +295,14 @@ impl DemoRuntime {
             .collect();
     }
 
+    /// Pins the recorder's reported state, the way [`Self::set_destinations`]
+    /// pins the broadcast: a fixture can hold a state a real take only
+    /// passes through in time, uploading included.
+    pub fn set_record(&self, state: RecordState, stems: bool) {
+        let mut s = self.state.lock().expect("demo state");
+        s.record = RecordView { state, stems };
+    }
+
     fn scripted_chat() -> Vec<ChatLine> {
         let line = |id: u16, name: &str, text: &str, at_ms: u64| ChatLine {
             from_name: name.to_owned(),

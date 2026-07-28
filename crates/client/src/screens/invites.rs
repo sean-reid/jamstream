@@ -25,6 +25,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use egui::{Align2, Button, RichText, Ui, vec2};
+
+/// The seat label's cell, so a status word lands in the same place on every
+/// row whatever the label says.
+const SEAT_LABEL_W: f32 = 92.0;
 use jamstream_cli::state::{InviteRecord, SessionState, SessionStatus};
 use jamstream_cloud::{Provider, ProviderError, RegionId};
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
@@ -33,7 +37,7 @@ use jamstream_protocol::invite::{Invite, Issuer, Token};
 use crate::runtime::{Command, Runtime, Snapshot};
 use crate::screens::host::{base64_decode, unix_now};
 use crate::theme;
-use crate::widgets::{AVATAR_D_ROW, avatar_disc};
+use crate::widgets::{AVATAR_D_ROW, avatar_disc, row_cell};
 
 /// Session capacity, host included on the musician side: the same
 /// constants the server enforces admission with and the host wizard offers
@@ -408,134 +412,113 @@ fn hex_16(text: &str) -> Result<[u8; 16], String> {
     Ok(out)
 }
 
-// Rendering: a sheet anchored under the top bar on the right, the same
-// treatment as the settings sheet, so it never covers the status readout.
+// Rendering: the Invites tab of the settings drawer. The confirmations stay
+// centre-screen dialogs, because revoking someone and ending the session for
+// everyone are not things to confirm in a corner.
 
 impl InvitesPanel {
-    pub fn ui(
-        &mut self,
-        ui: &mut Ui,
-        snap: &Snapshot,
-        rt: &dyn Runtime,
-        open: &mut bool,
-    ) -> Option<InvitesEvent> {
+    pub fn ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) -> Option<InvitesEvent> {
         let mut event = None;
-        egui::Window::new("Invites")
-            .title_bar(false)
-            .frame(theme::sheet_frame(theme::palette_of(ui)))
-            .anchor(Align2::RIGHT_TOP, theme::SHEET_OFFSET)
-            .fixed_size(vec2(430.0, 0.0))
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(theme::title(ui, "Invites"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
-                            *open = false;
-                        }
-                    });
-                });
-                ui.label(theme::muted(
-                    ui,
-                    "One seat per link. Revoking frees the seat for the next person.",
-                ));
-                ui.add_space(theme::SPACE_SM);
-                self.rows_ui(ui, snap);
-                ui.add_space(theme::SPACE_SM);
-                self.mint_ui(ui);
-                ui.add_space(theme::SPACE_MD);
-                ui.separator();
-                let p = theme::palette_of(ui);
-                if ui
-                    .add(
-                        Button::new(
-                            RichText::new("End session for everyone").color(egui::Color32::WHITE),
-                        )
-                        .fill(p.danger),
-                    )
-                    .clicked()
-                {
-                    self.confirm_end = true;
-                }
-                ui.label(theme::muted(
-                    ui,
-                    "Destroys the server; the cost meter stops.",
-                ));
-            });
+        ui.label(theme::title(ui, "Invites"));
+        ui.label(
+            theme::muted(
+                ui,
+                "One seat per link. Revoking frees the seat for the next person.",
+            )
+            .small(),
+        );
+        ui.add_space(theme::SPACE_SM);
+        self.rows_ui(ui, snap);
+        ui.add_space(theme::SPACE_SM);
+        self.mint_ui(ui);
+        ui.add_space(theme::SPACE_MD);
+        ui.separator();
+        let p = theme::palette_of(ui);
+        if ui
+            .add(
+                Button::new(RichText::new("End session for everyone").color(egui::Color32::WHITE))
+                    .fill(p.danger),
+            )
+            .clicked()
+        {
+            self.confirm_end = true;
+        }
+        ui.label(theme::muted(ui, "Destroys the server; the cost meter stops.").small());
         self.confirm_windows(ui, rt, &mut event);
         event
     }
 
+    /// One seat per pair of lines: who is in it and what it is doing above,
+    /// its actions below. A grid four columns wide does not fit the drawer,
+    /// and a seat's own actions are what a host reaches for.
     fn rows_ui(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let seats: Vec<Seat> = self.guest_seats().cloned().collect();
-        // Refilling rebuilds the seat list, so it happens after the grid
+        // Refilling rebuilds the seat list, so it happens after the rows
         // rather than under the iterator reading it.
         let mut refill = None;
-        egui::Grid::new("invites-grid")
-            .num_columns(4)
-            .min_col_width(72.0)
-            .spacing(vec2(theme::SPACE_LG, 4.0))
-            .show(ui, |ui| {
-                for seat in &seats {
-                    let label = seat.label();
-                    ui.horizontal(|ui| {
-                        // The disc slot is reserved on every row, drawn only
-                        // for whoever is actually here, so someone joining
-                        // never shoves the labels sideways.
-                        let member = snap
-                            .members
-                            .iter()
-                            .find(|m| m.id == seat.member && m.connected)
-                            .filter(|_| !seat.is_free());
-                        match member {
-                            Some(m) => {
-                                avatar_disc(ui, &m.name, m.avatar.as_ref(), AVATAR_D_ROW, false)
-                                    .on_hover_text(m.name.clone());
-                            }
-                            None => {
-                                ui.allocate_exact_size(
-                                    vec2(AVATAR_D_ROW, AVATAR_D_ROW),
-                                    egui::Sense::hover(),
-                                );
-                            }
-                        }
-                        if seat.is_free() {
-                            ui.label(theme::muted(ui, label.clone()));
-                        } else {
-                            ui.label(label.clone());
-                        }
-                    });
-                    let status = self.status_of(seat, snap);
-                    if status == "connected" {
-                        ui.label(status);
+        for seat in &seats {
+            let label = seat.label();
+            ui.horizontal(|ui| {
+                // The disc slot is reserved on every row, drawn only for
+                // whoever is actually here, so someone joining never shoves
+                // the labels sideways.
+                let member = snap
+                    .members
+                    .iter()
+                    .find(|m| m.id == seat.member && m.connected)
+                    .filter(|_| !seat.is_free());
+                match member {
+                    Some(m) => {
+                        avatar_disc(ui, &m.name, m.avatar.as_ref(), AVATAR_D_ROW, false)
+                            .on_hover_text(m.name.clone());
+                    }
+                    None => {
+                        ui.allocate_exact_size(
+                            vec2(AVATAR_D_ROW, AVATAR_D_ROW),
+                            egui::Sense::hover(),
+                        );
+                    }
+                }
+                row_cell(ui, SEAT_LABEL_W, |ui| {
+                    if seat.is_free() {
+                        ui.label(theme::muted(ui, label.clone()));
                     } else {
-                        ui.label(theme::muted(ui, status));
+                        ui.label(label.clone());
                     }
-                    match &seat.invite {
-                        Some(invite) => {
-                            if ui.button("Copy link").clicked() {
-                                ui.ctx().copy_text(invite.encoded.clone());
-                            }
-                            if ui.button("Revoke").clicked() {
-                                self.confirm_revoke = Some((invite.token, label));
-                            }
-                        }
-                        None => {
-                            // A free seat's own action: one click puts a
-                            // fresh link in the same chair.
-                            if ui
-                                .button("New link")
-                                .on_hover_text(format!("mint a new {label} link for this seat"))
-                                .clicked()
-                            {
-                                refill = Some(seat.member);
-                            }
-                            ui.label("");
-                        }
-                    }
-                    ui.end_row();
+                });
+                let status = self.status_of(seat, snap);
+                if status == "connected" {
+                    ui.label(status);
+                } else {
+                    ui.label(theme::muted(ui, status));
                 }
             });
+            ui.horizontal(|ui| {
+                ui.add_space(AVATAR_D_ROW + theme::SPACE_MD);
+                match &seat.invite {
+                    Some(invite) => {
+                        if ui.button("Copy link").clicked() {
+                            ui.ctx().copy_text(invite.encoded.clone());
+                        }
+                        if ui.button("Revoke").clicked() {
+                            self.confirm_revoke = Some((invite.token, label));
+                        }
+                    }
+                    None => {
+                        // A free seat's own action: one click puts a fresh
+                        // link in the same chair.
+                        if ui
+                            .button("New link")
+                            .on_hover_text(format!("mint a new {label} link for this seat"))
+                            .clicked()
+                        {
+                            refill = Some(seat.member);
+                        }
+                    }
+                }
+            });
+            ui.add_space(theme::SPACE_SM);
+        }
         if let Some(member) = refill {
             self.error = self.refill(member).err();
         }
@@ -554,6 +537,8 @@ impl InvitesPanel {
                 ui.add_space(theme::SPACE_MD);
             }
         });
+        // Which kind, then the act: at the drawer's width the two role
+        // buttons and Mint invite do not share a line.
         ui.horizontal(|ui| {
             ui.label(theme::muted(ui, "new invite"));
             for (role, label) in [(Role::Musician, "musician"), (Role::Listener, "listener")] {
@@ -564,6 +549,8 @@ impl InvitesPanel {
                     self.mint_role = role;
                 }
             }
+        });
+        ui.horizontal(|ui| {
             let full = self.taken(self.mint_role) >= cap(self.mint_role);
             let response = ui.add_enabled(!full, Button::new("Mint invite"));
             if full {

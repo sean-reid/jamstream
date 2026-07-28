@@ -1,6 +1,6 @@
 # Playing on the same network
 
-Picking **local** in the host wizard's first step runs the session server as a process on your own computer instead of a cloud machine. Every desktop app build bundles its own `jamstreamd`, so there is nothing to install and no account to create: local is selectable the moment the app opens, the wizard skips the region step, and the launch is **Start the session** instead of a cost preview. Everything else is the same flow: invites are minted up front, the app completes a real encrypted handshake with the server before showing them, joins you automatically, and the invites panel ends the session.
+Picking **local** in the host wizard's first step runs the session server as a process on your own computer instead of a cloud machine. Every desktop app build bundles its own `jamstreamd`, so there is nothing to install and no account to create: local is selectable the moment the app opens, the wizard skips the region step, and the launch is **Start the session** instead of a cost preview. Everything else is the same flow: invites are minted up front, the app completes a real encrypted handshake with the server before showing them, joins you automatically, and the Invites tab ends the session.
 
 ## When local is the right choice
 
@@ -16,7 +16,7 @@ An invite that names 192.168.1.12 means nothing outside your network. Reaching a
 
 ## Ending and the idle exit
 
-**End session for everyone** in the invites panel kills the server process, and the same shared state means `jamstream end` from a terminal does too; for local sessions the instance id shown in `status` and `end` output is the process id. If you forget, the server watches its own activity and exits on its own after 10 minutes with no musicians connected. There is no bill either way. The local server also exits at the 12 hour hard cap, and the invites expire with it.
+**End session for everyone** on the Invites tab kills the server process, and the same shared state means `jamstream end` from a terminal does too; for local sessions the instance id shown in `status` and `end` output is the process id. If you forget, the server watches its own activity and exits on its own after 10 minutes with no musicians connected. There is no bill either way. The local server also exits at the 12 hour hard cap, and the invites expire with it.
 
 If a laptop dies mid-session or a state file is lost, `jamstream sweep` finds local strays the same way it finds cloud ones: the local provider keeps an on-disk registry of the processes it spawned, so a later sweep from a fresh shell still sees and kills them.
 

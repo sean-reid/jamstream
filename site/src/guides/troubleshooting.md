@@ -8,7 +8,7 @@ The total is built from pieces, and you control several:
 
 | Piece | Typical | You control it with |
 |---|---|---|
-| Your capture buffer | 2.5 to 10 ms | buffer size in Settings |
+| Your capture buffer | 2.5 to 10 ms | buffer size on the Audio tab of Settings |
 | Network, both legs | 6 to 20 ms | region choice, wired ethernet |
 | Server mix and jitter buffers | 7 to 12 ms | mostly automatic |
 | Decode and playout | 3 to 5 ms | buffer size, device |
@@ -16,14 +16,14 @@ The total is built from pieces, and you control several:
 Things to check, in order of payoff:
 
 1. **Bluetooth.** Bluetooth headphones or earbuds add more delay than JamStream's entire network path. Use wired headphones, always. This is the most common cause of "it feels wrong" with a good-looking number.
-2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. The `buffer` readout in the status bar shows depth in frames; each frame is 2.5 ms. If it sits high or climbs, plug in ethernet.
-3. **Buffer size.** In Settings under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that plays clean. Crackles mean one step up.
-4. **Region.** If the session's round trip (`rtt` in the status bar) is high for you specifically, the server is far from you. The host can pick a fairer region next time; see [Hosting a session](hosting.md#the-region-table).
-5. **Loss.** The `loss` percentage should sit near 0.0%. Sustained loss above 1% points at the local network: congested wifi, a saturated uplink, a bad cable.
+2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. Hover the latency number in the status bar for the `buffer` readout, which shows depth in frames; each frame is 2.5 ms. If it sits high or climbs, plug in ethernet.
+3. **Buffer size.** On the Audio tab of Settings, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that plays clean. Crackles mean one step up.
+4. **Region.** If the session's round trip (`rtt`, on the latency number's hover) is high for you specifically, the server is far from you. The host can pick a fairer region next time; see [Hosting a session](hosting.md#the-region-table).
+5. **Loss.** The `loss` percentage, on the same hover, should sit near 0.0%. Sustained loss above 1% points at the local network: congested wifi, a saturated uplink, a bad cable.
 
 ## Device problems
 
-Input and output devices are picked in Settings, in the Devices panel: a Capture picker, a Playback picker, and an input level meter that should move when you play. If the meter is still, the wrong capture device is selected or the operating system has not granted microphone access to the app. The lists come from the platform's audio backend (CoreAudio on macOS, WASAPI on Windows, PipeWire or ALSA on Linux), with the system default listed first, and a change mid-session reopens the stream on the new device without leaving the session.
+Input and output devices are picked on the Audio tab of Settings, under Devices: a Capture picker, a Playback picker, and an input level meter that should move when you play. If the meter is still, the wrong capture device is selected or the operating system has not granted microphone access to the app. The lists come from the platform's audio backend (CoreAudio on macOS, WASAPI on Windows, PipeWire or ALSA on Linux), with the system default listed first, and a change mid-session reopens the stream on the new device without leaving the session.
 
 - "no devices found" in a picker means the platform reported nothing for that direction; check that the interface is connected and visible to other apps.
 - Sample rate is fixed at 48 kHz. Most interfaces are fine with this; set your interface to 48 kHz in its control panel if it is pinned elsewhere.

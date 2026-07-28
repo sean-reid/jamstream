@@ -8,9 +8,11 @@ use egui::{Event, Key, Modifiers, PointerButton, vec2};
 use egui_kittest::{Harness, kittest::Queryable};
 use jamstream_client::creds::MemStore;
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME, RecordingRuntime};
-use jamstream_client::runtime::{Command, DestinationState, MemberId, Runtime, Snapshot};
+use jamstream_client::runtime::{
+    Command, DestinationState, MemberId, RecordState, Runtime, Snapshot,
+};
 use jamstream_client::screens::destinations::DestinationsPanel;
-use jamstream_client::screens::session::SessionScreen;
+use jamstream_client::screens::session::{SessionScreen, SettingsTab};
 use jamstream_client::theme::{self, Theme};
 
 type Recorder = Arc<RecordingRuntime<DemoRuntime>>;
@@ -40,27 +42,10 @@ fn session_harness(is_host: bool) -> (Recorder, Harness<'static>) {
 }
 
 /// A host with everything a host has: the invite book, the destinations
-/// sheet, and the broadcast view the runtime gives a host. All three status
-/// bar toggles come from those, so this is the widest the bar ever gets.
+/// panel, and the broadcast view the runtime gives a host. Every host-only
+/// surface hangs off one of those.
 fn host_harness_sized(size: egui::Vec2) -> Harness<'static> {
-    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
-        FROZEN_FRAME,
-        true,
-    )));
-    let rt_ui = rt.clone();
-    let mut screen = SessionScreen {
-        invites: Some(empty_invites()),
-        destinations: Some(DestinationsPanel::new(Arc::new(MemStore::default()))),
-        ..Default::default()
-    };
-    Harness::builder()
-        .with_size(size)
-        .with_step_dt(0.05)
-        .build_ui(move |ui| {
-            theme::apply(ui.ctx(), Theme::Dark);
-            let snap = rt_ui.snapshot();
-            screen.ui(ui, &snap, &*rt_ui);
-        })
+    host_harness_lamps(size, Lamps::Both)
 }
 
 /// An invite book with no invites in it: enough for the toggle to render,
@@ -100,29 +85,160 @@ const SIZES: [egui::Vec2; 8] = [
     vec2(1280.0, 800.0),
 ];
 
-/// The bar may never overlap itself. A host's carries three sheet toggles,
-/// the lamp, the session id, the timer, the cost, and Leave beside the
-/// readouts, and the readouts drop their meters or move to a row of their
-/// own to keep clear of them.
+/// The bar's three zones may never touch. Health on the left, the two lamps
+/// centred, Record and Leave on the right: this walks every window size the
+/// app can be, with the cluster empty, half lit, and fully lit, and checks
+/// that no zone reaches another and nothing leaves the window. The bar
+/// overlapped itself at 1280 once (#85), and the centred cluster is the piece
+/// most able to do it again, because it grows from the middle outward.
 #[test]
-fn the_host_status_bar_never_runs_into_its_readouts() {
+fn the_bars_three_zones_never_touch_at_any_size() {
     for size in SIZES {
-        let mut harness = host_harness_sized(size);
-        harness.run_steps(3);
-        let readout = harness
-            .get_all_by_label_contains("loss ")
-            .next()
-            .expect("the loss readout")
-            .rect();
-        for control in ["Stream mix", "Destinations", "Invites", "Leave"] {
-            let rect = harness.get_by_label(control).rect();
-            let clear = rect.left() >= readout.right() || rect.top() >= readout.bottom();
-            assert!(
-                clear,
-                "{control} at {rect:?} runs into the readouts at {readout:?}, window {size:?}"
-            );
+        for lamps in [Lamps::None, Lamps::OnAir, Lamps::Both] {
+            let mut harness = host_harness_lamps(size, lamps);
+            harness.run_steps(3);
+            let health = harness
+                .get_all_by_label_contains("mouth to ear")
+                .next()
+                .expect("the mouth-to-ear readout")
+                .rect();
+            let mut cluster: Option<egui::Rect> = None;
+            for label in lamps.labels() {
+                let rect = harness
+                    .get_all_by_label(label)
+                    .next()
+                    .unwrap_or_else(|| panic!("{label} is not in the bar at {size:?}"))
+                    .rect();
+                cluster = Some(cluster.map_or(rect, |c| c.union(rect)));
+            }
+            // The buttons and the readouts beside them: the id and the timer
+            // are what the lamps were drawn straight through at 800 while a
+            // test that probed only the buttons passed.
+            for control in ["Record", "Leave", "a3f29c41", "00:47:32"] {
+                let rect = harness
+                    .get_all_by_label_contains(control)
+                    .next()
+                    .unwrap_or_else(|| panic!("{control} is not in the bar at {size:?}"))
+                    .rect();
+                assert!(
+                    rect.left() >= health.right() || rect.top() >= health.bottom(),
+                    "{control} at {rect:?} runs into the readouts at {health:?}, \
+                     window {size:?}, lamps {lamps:?}"
+                );
+                if let Some(cluster) = cluster {
+                    assert!(
+                        rect.left() >= cluster.right() || rect.top() >= cluster.bottom(),
+                        "{control} at {rect:?} runs into the lamps at {cluster:?}, \
+                         window {size:?}, lamps {lamps:?}"
+                    );
+                }
+                assert!(
+                    rect.left() >= 0.0 && rect.right() <= size.x,
+                    "{control} at {rect:?} is outside the {size:?} window"
+                );
+            }
+            if let Some(cluster) = cluster {
+                assert!(
+                    cluster.left() >= health.right() || cluster.top() >= health.bottom(),
+                    "the lamps at {cluster:?} run into the readouts at {health:?}, \
+                     window {size:?}, lamps {lamps:?}"
+                );
+                assert!(
+                    cluster.right() <= size.x,
+                    "the lamps at {cluster:?} leave the {size:?} window"
+                );
+            }
         }
     }
+}
+
+/// Where the bar stops fitting on one row, found by walking widths rather
+/// than asserted against a constant, because the threshold moves with the
+/// cluster: two lit lamps in the middle take room from both halves at once.
+/// The numbers in the doc comment on `status_bar` come from this.
+#[test]
+fn the_one_row_threshold_is_where_the_zones_stop_fitting() {
+    for (lamps, expected) in [
+        (Lamps::None, 850_i32),
+        (Lamps::OnAir, 910),
+        (Lamps::Both, 960),
+    ] {
+        let mut stacked_at: Option<i32> = None;
+        // Walk down in 10 px steps and find the first width that stacks.
+        for w in (600..=1400_i32).rev().step_by(10) {
+            let size = vec2(w as f32, 700.0);
+            let mut harness = host_harness_lamps(size, lamps);
+            harness.run_steps(3);
+            let health = harness
+                .get_all_by_label_contains("mouth to ear")
+                .next()
+                .expect("the readout")
+                .rect();
+            let leave = harness.get_by_label("Leave").rect();
+            // Two rows put Leave below the readouts instead of beside them.
+            if leave.top() >= health.bottom() {
+                stacked_at = Some(w);
+                break;
+            }
+        }
+        let stacked_at = stacked_at.expect("the bar must stack at some width");
+        assert!(
+            (stacked_at - expected).abs() <= 20,
+            "with lamps {lamps:?} the bar stacks at {stacked_at} px, expected about {expected}"
+        );
+    }
+}
+
+/// Which of the bar's two states are lit in a fixture.
+#[derive(Debug, Clone, Copy)]
+enum Lamps {
+    None,
+    OnAir,
+    Both,
+}
+
+impl Lamps {
+    fn labels(self) -> &'static [&'static str] {
+        match self {
+            Lamps::None => &[],
+            Lamps::OnAir => &["ON AIR"],
+            Lamps::Both => &["ON AIR", "REC"],
+        }
+    }
+}
+
+/// A host session with the cluster in a given state, for the layout sweep.
+fn host_harness_lamps(size: egui::Vec2, lamps: Lamps) -> Harness<'static> {
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, true);
+    match lamps {
+        Lamps::None => {}
+        Lamps::OnAir => demo.set_destinations(&[(
+            jamstream_client::runtime::StreamPlatform::Twitch,
+            DestinationState::Live,
+        )]),
+        Lamps::Both => {
+            demo.set_destinations(&[(
+                jamstream_client::runtime::StreamPlatform::Twitch,
+                DestinationState::Live,
+            )]);
+            demo.set_record(RecordState::Recording, false);
+        }
+    }
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let rt_ui = rt.clone();
+    let mut screen = SessionScreen {
+        invites: Some(empty_invites()),
+        destinations: Some(DestinationsPanel::new(Arc::new(MemStore::default()))),
+        ..Default::default()
+    };
+    Harness::builder()
+        .with_size(size)
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        })
 }
 
 /// The strip invariant behind #70: a fader's track and handle may never be
@@ -192,14 +308,19 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
         let mut harness = settings_harness_sized(size);
         harness.run_steps(4);
         let readouts = harness
-            .get_all_by_label_contains("loss ")
+            .get_all_by_label_contains("mouth to ear")
             .next()
-            .expect("the loss readout")
+            .expect("the mouth-to-ear readout")
             .rect();
         // What a musician reaches for mid session is on screen with nothing
-        // scrolled, along with the way out of the sheet.
+        // scrolled, along with the way out of the drawer and the way between
+        // its tabs. The tab row is pinned with Close for exactly this reason.
         for label in [
             "Close",
+            "Audio",
+            "Broadcast",
+            "Invites",
+            "You",
             "120 frames (2.5 ms)",
             "480 frames (10.0 ms)",
             "speak or play to check the meter moves",
@@ -218,30 +339,182 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
                 "{label} at {rect:?} is outside the {size:?} window"
             );
         }
-        // And the last thing in the sheet, which a short window has no room
-        // for, comes into view when the body is scrolled. A sheet with no
-        // height of its own has no body to scroll: it grows to its content,
-        // past the bottom edge, and this is what that leaves unreachable.
-        harness.event(Event::PointerMoved(egui::pos2(size.x - 100.0, 200.0)));
-        harness.run_steps(1);
-        harness.event(Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta: vec2(0.0, -1000.0),
-            phase: egui::TouchPhase::Move,
-            modifiers: Modifiers::NONE,
-        });
-        harness.run_steps(3);
+        // The end of the audio panel, which a short window has no room for,
+        // comes into view when the body is scrolled. A sheet with no height of
+        // its own has no body to scroll: it grows to its content, past the
+        // bottom edge, and this is what that leaves unreachable.
+        scroll_drawer(&mut harness, size);
         let last = harness
-            .get_all_by_label_contains("light")
+            .get_all_by_label_contains("Playback")
             .next()
-            .expect("the theme picker is the last thing in the sheet")
+            .expect("the playback picker is the last thing in the audio panel")
             .rect();
         assert!(
             last.top() >= 0.0 && last.bottom() <= readouts.top(),
-            "the end of the sheet is at {last:?}, out of reach above the readouts at \
+            "the end of the panel is at {last:?}, out of reach above the readouts at \
              {readouts:?}, window {size:?}"
         );
+        // The tab row is still there after the scroll: only the panel moved.
+        for label in ["Close", "Audio", "You"] {
+            let rect = harness
+                .get_all_by_label_contains(label)
+                .next()
+                .unwrap_or_else(|| panic!("{label} scrolled away at {size:?}"))
+                .rect();
+            assert!(
+                rect.top() >= 0.0 && rect.bottom() <= readouts.top(),
+                "{label} at {rect:?} left the drawer's header at {size:?}"
+            );
+        }
     }
+}
+
+/// Each tab shows its own panel and only its own, and the drawer remembers
+/// which one while the app runs. Four panels in one scroll was the shape this
+/// replaced, and a tab that carried another's scroll offset would be the same
+/// mistake one layer down.
+#[test]
+fn each_settings_tab_shows_its_own_panel_and_the_choice_sticks() {
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    let mut harness = drawer_harness(rt, SettingsTab::Audio, vec2(1280.0, 800.0));
+    harness.run_steps(3);
+
+    // Audio, the tab a fresh launch opens on.
+    assert!(harness.query_by_label_contains("Buffer size").is_some());
+    assert!(harness.query_by_label("Ana stream gain").is_none());
+    assert!(
+        harness
+            .query_by_label_contains("One seat per link")
+            .is_none()
+    );
+
+    // Broadcast: the mix and the destinations, and nothing from Audio.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Broadcast")
+        .click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Ana stream gain").is_some());
+    assert!(
+        harness
+            .query_by_label_contains("Where this session streams")
+            .is_some()
+    );
+    assert!(harness.query_by_label_contains("Buffer size").is_none());
+
+    // Invites.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Invites")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("One seat per link")
+            .is_some()
+    );
+    assert!(harness.query_by_label("Ana stream gain").is_none());
+
+    // You: the avatar row and the theme picker, the two things set once.
+    harness.get_by_role_and_label(AkRole::Button, "You").click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label_contains("Your avatar").is_some());
+    // The theme picker's row and its label both carry the word, so this is a
+    // count rather than a single match.
+    assert!(harness.get_all_by_label_contains("light").next().is_some());
+    assert!(
+        harness
+            .query_by_label_contains("One seat per link")
+            .is_none()
+    );
+
+    // Close and reopen: the drawer comes back on the tab it was left on.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Close")
+        .click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label_contains("Your avatar").is_none());
+    harness
+        .get_by_role_and_label(AkRole::Button, "Settings")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label_contains("Your avatar").is_some(),
+        "the drawer must reopen on the tab it was left on"
+    );
+}
+
+/// The tab row is built from what exists. A plain join has no invite book and
+/// no destinations panel, so it has no Broadcast or Invites tab, and no dead
+/// slot where they would have been.
+#[test]
+fn a_musician_and_the_home_screen_get_only_the_tabs_that_mean_anything() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        false,
+    )));
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(rt));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(3);
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Audio")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "You")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Broadcast")
+            .is_none(),
+        "a musician has no broadcast to mix"
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Invites")
+            .is_none(),
+        "a musician has no seats to hand out"
+    );
+
+    // And outside a session entirely, from home, the same two.
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.settings_open = true;
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(3);
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Audio")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Broadcast")
+            .is_none(),
+        "there is no session to broadcast from the home screen"
+    );
 }
 
 /// Escape closes the drawer before the session screen sees the key, so the
@@ -493,20 +766,23 @@ fn audition_commands(rt: &Recorder) -> Vec<bool> {
 }
 
 #[test]
-fn stream_mix_panel_opens_and_fader_sends_exact_values() {
-    let (rt, mut harness) = session_harness(true);
+fn the_broadcast_tab_carries_the_mix_and_a_fader_sends_exact_values() {
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    // The drawer starts on Audio, so the mix is not on screen until the tab
+    // is chosen: the tab row is the entry point now.
+    let mut harness = drawer_harness(rt.clone(), SettingsTab::Audio, vec2(1280.0, 800.0));
     harness.run_steps(2);
-    assert!(
-        harness.query_by_label("Ana stream gain").is_none(),
-        "the stream mix sheet must start closed"
-    );
+    assert!(harness.query_by_label("Ana stream gain").is_none());
 
     harness
-        .get_by_role_and_label(AkRole::Button, "Stream mix")
+        .get_by_role_and_label(AkRole::Button, "Broadcast")
         .click();
     harness.run_steps(2);
-    // Focus the gain control, then one 0.5 dB arrow step from Ana's
-    // demo broadcast fader (-2.0 dB, pan -0.3, unmuted).
+    // Focus the gain control, then one 0.5 dB arrow step from Ana's demo
+    // broadcast fader (-2.0 dB, pan -0.3, unmuted).
     harness.get_by_label("Ana stream gain").click();
     harness.run_steps(2);
     harness.key_press(Key::ArrowUp);
@@ -527,21 +803,23 @@ fn stream_mix_panel_opens_and_fader_sends_exact_values() {
         "broadcast rows must never send monitor SetFader"
     );
 
-    // The same stationary toggle closes the sheet again.
+    // And back to Audio: one panel at a time, so the mix goes away and the
+    // audio controls come back.
     harness
-        .get_by_role_and_label(AkRole::Button, "Stream mix")
+        .get_by_role_and_label(AkRole::Button, "Audio")
         .click();
     harness.run_steps(2);
     assert!(harness.query_by_label("Ana stream gain").is_none());
+    assert!(harness.query_by_label_contains("Buffer size").is_some());
 }
 
 #[test]
-fn audition_round_trip_and_escape_leaves_it_on() {
-    let (rt, mut harness) = session_harness(true);
-    harness.run_steps(2);
-    harness
-        .get_by_role_and_label(AkRole::Button, "Stream mix")
-        .click();
+fn audition_round_trip_and_closing_the_drawer_leaves_it_on() {
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    let mut harness = drawer_harness(rt.clone(), SettingsTab::Broadcast, vec2(1280.0, 800.0));
     harness.run_steps(2);
 
     harness.get_by_label("audition stream mix").click();
@@ -552,8 +830,8 @@ fn audition_round_trip_and_escape_leaves_it_on() {
         "the status bar must show the audition reminder"
     );
 
-    // Escape closes the sheet; audition is a mix state, not navigation,
-    // so it stays on and the reminder stays visible.
+    // Escape closes the drawer; audition is a mix state, not navigation, so
+    // it stays on and the reminder stays visible.
     harness.key_press(Key::Escape);
     harness.run_steps(2);
     assert!(harness.query_by_label("audition stream mix").is_none());
@@ -566,12 +844,13 @@ fn audition_round_trip_and_escape_leaves_it_on() {
     );
     assert!(
         harness.query_by_label("hearing stream mix").is_some(),
-        "closing the sheet must not hide the audition reminder"
+        "closing the drawer must not hide the audition reminder"
     );
 
-    // Reopen and switch it off.
+    // Reopen and switch it off. The drawer remembers the tab it was on, so
+    // the mix is back without choosing Broadcast again.
     harness
-        .get_by_role_and_label(AkRole::Button, "Stream mix")
+        .get_by_role_and_label(AkRole::Button, "Settings")
         .click();
     harness.run_steps(2);
     harness.get_by_label("audition stream mix").click();
@@ -584,7 +863,7 @@ fn audition_round_trip_and_escape_leaves_it_on() {
 fn non_hosts_see_no_stream_mix() {
     let (rt, mut harness) = session_harness(false);
     harness.run_steps(2);
-    assert!(harness.query_by_label("Stream mix").is_none());
+    assert!(harness.query_by_label("Ana stream gain").is_none());
     assert!(harness.query_by_label("hearing stream mix").is_none());
     assert!(rt.snapshot().broadcast.is_none());
 }
@@ -595,27 +874,52 @@ fn non_hosts_see_no_stream_mix() {
 /// A key nothing could stream with.
 const FAKE_KEY: &str = "live_000000_fakefakefake";
 
+/// The whole shell with the drawer open on the Broadcast tab, which is where
+/// destinations live now. The tab is reached through the real app rather than
+/// a screen on its own, because the entry point is part of what these tests
+/// are checking.
 fn destinations_harness(
     reported: &[(jamstream_client::runtime::StreamPlatform, DestinationState)],
 ) -> (Recorder, Harness<'static>) {
     let demo = DemoRuntime::frozen(FROZEN_FRAME, true);
     demo.set_destinations(reported);
     let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
-    let rt_ui = rt.clone();
-    let mut screen = SessionScreen {
-        destinations: Some(DestinationsPanel::new(Arc::new(MemStore::default()))),
-        destinations_open: true,
-        ..Default::default()
-    };
-    let harness = Harness::builder()
-        .with_size(vec2(1280.0, 800.0))
+    let harness = drawer_harness(rt.clone(), SettingsTab::Broadcast, vec2(1280.0, 800.0));
+    (rt, harness)
+}
+
+/// Scrolls the drawer's panel to its end, the way a pointer over it does.
+fn scroll_drawer(harness: &mut Harness<'_>, size: egui::Vec2) {
+    harness.event(Event::PointerMoved(egui::pos2(size.x - 100.0, 300.0)));
+    harness.run_steps(1);
+    harness.event(Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: vec2(0.0, -1000.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run_steps(3);
+}
+
+/// The app on a host session with the settings drawer open on `tab`.
+fn drawer_harness(rt: Recorder, tab: SettingsTab, size: egui::Vec2) -> Harness<'static> {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(rt));
+    app.screen = Screen::Session;
+    app.session.invites = Some(empty_invites());
+    app.session.destinations = Some(DestinationsPanel::new(Arc::new(MemStore::default())));
+    app.settings_open = true;
+    app.settings_tab = tab;
+    Harness::builder()
+        .with_size(size)
         .with_step_dt(0.05)
         .build_ui(move |ui| {
             theme::apply(ui.ctx(), Theme::Dark);
-            let snap = rt_ui.snapshot();
-            screen.ui(ui, &snap, &*rt_ui);
-        });
-    (rt, harness)
+            app.root_ui(ui);
+        })
 }
 
 fn destination_commands(rt: &Recorder) -> Vec<Command> {
@@ -666,6 +970,10 @@ fn a_pasted_key_reaches_the_server_once_and_then_going_live() {
         "a password field must expose the mask, not the key: {shown:?}"
     );
 
+    // The key pane makes the Broadcast tab taller than the drawer at this
+    // window, so Save key is below the fold: scroll to it, which is what a
+    // host does. Everything above it was reachable without scrolling.
+    scroll_drawer(&mut harness, vec2(1280.0, 800.0));
     harness
         .get_by_role_and_label(AkRole::Button, "Save key")
         .click();
@@ -696,10 +1004,10 @@ fn a_pasted_key_reaches_the_server_once_and_then_going_live() {
         destination_commands(&rt).last(),
         Some(&Command::StartStream)
     );
-    // The demo's stand-in server brings it up, so the whole room is on air.
+    // The demo's stand-in server brings it up, so the whole room is on air
+    // and the bar's centre cluster says so.
     assert!(rt.snapshot().stream.on_air());
-    assert!(harness.query_by_label("2 live").is_none());
-    assert!(harness.query_by_label("1 live").is_some());
+    assert!(harness.query_by_label("ON AIR").is_some());
 }
 
 #[test]
@@ -710,7 +1018,7 @@ fn removing_one_live_destination_leaves_the_other_alone() {
         (StreamPlatform::YouTube, DestinationState::Live),
     ]);
     harness.run_steps(2);
-    assert!(harness.query_by_label("2 live").is_some());
+    assert!(harness.query_by_label("ON AIR").is_some());
 
     // Twitch is the first row, so the first Remove is its own.
     harness
@@ -742,6 +1050,9 @@ fn stopping_the_stream_takes_everything_off_air() {
         (StreamPlatform::YouTube, DestinationState::Live),
     ]);
     harness.run_steps(2);
+    // Stop streaming is the last control on the Broadcast tab, under both
+    // destinations, so it is below the fold at this window.
+    scroll_drawer(&mut harness, vec2(1280.0, 800.0));
     harness
         .get_by_role_and_label(AkRole::Button, "Stop streaming")
         .click();
@@ -751,7 +1062,7 @@ fn stopping_the_stream_takes_everything_off_air() {
 }
 
 #[test]
-fn escape_closes_the_destinations_sheet_without_leaving_the_air() {
+fn escape_closes_the_drawer_without_leaving_the_air() {
     use jamstream_client::runtime::StreamPlatform;
     let (rt, mut harness) =
         destinations_harness(&[(StreamPlatform::Twitch, DestinationState::Live)]);
@@ -762,13 +1073,12 @@ fn escape_closes_the_destinations_sheet_without_leaving_the_air() {
         harness
             .query_by_role_and_label(AkRole::Button, "Stop streaming")
             .is_none(),
-        "Escape must close the sheet"
+        "Escape must close the drawer"
     );
-    // Closing a sheet is navigation: nothing was sent and the room is still
-    // on air, with the lamp and the count to say so.
+    // Closing the drawer is navigation: nothing was sent and the room is
+    // still on air, with the cluster's lamp to say so.
     assert!(destination_commands(&rt).is_empty());
-    assert!(harness.query_by_label("1 live").is_some());
-    assert!(harness.query_by_label("on air").is_some());
+    assert!(harness.query_by_label("ON AIR").is_some());
 }
 
 #[test]
@@ -790,11 +1100,12 @@ fn a_failed_destination_says_why_where_the_host_will_see_it() {
             .is_some(),
         "the pipeline's reason must be on screen verbatim"
     );
-    // And with the sheet closed, the status bar still says one died.
+    // And with the drawer closed, the bar still says one died, in the cluster
+    // beside the lamp for the one that did not.
     harness.key_press(Key::Escape);
     harness.run_steps(2);
-    assert!(harness.query_by_label("1 failed").is_some());
-    assert!(harness.query_by_label("1 live").is_some());
+    assert!(harness.query_by_label("STREAM FAILED").is_some());
+    assert!(harness.query_by_label("ON AIR").is_some());
 }
 
 #[test]
@@ -816,10 +1127,160 @@ fn non_hosts_get_no_destination_controls_but_do_see_the_air() {
             screen.ui(ui, &snap, &*rt_ui);
         });
     harness.run_steps(2);
-    assert!(harness.query_by_label("Destinations").is_none());
     assert!(harness.query_by_label("Go live").is_none());
-    assert!(harness.query_by_label("1 live").is_some());
-    assert!(harness.query_by_label("on air").is_some());
+    assert!(harness.query_by_label("Record").is_none());
+    // The lamp is not host-only: a musician is the one being broadcast.
+    assert!(harness.query_by_label("ON AIR").is_some());
+}
+
+// Recording. One rule from the destinations sheet, applied whole: the
+// button sends the command and the lamp follows the snapshot; nothing on
+// this surface echoes a press optimistically.
+
+fn record_harness(
+    state: RecordState,
+    is_host: bool,
+    sheet_open: bool,
+) -> (Recorder, Harness<'static>) {
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, is_host);
+    demo.set_record(state, false);
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let rt_ui = rt.clone();
+    let mut screen = SessionScreen {
+        record_open: sheet_open,
+        ..Default::default()
+    };
+    let harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        });
+    (rt, harness)
+}
+
+/// While the sheet is open and the take is idle, "Record" is on screen
+/// twice: the bar toggle at the bottom and the sheet's control at the top.
+/// The sheet anchors top right, so the higher one is its.
+fn sheet_record_button<'h>(harness: &'h Harness<'_>) -> egui_kittest::Node<'h> {
+    harness
+        .get_all_by_role_and_label(AkRole::Button, "Record")
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .expect("the sheet's Record control")
+}
+
+#[test]
+fn record_round_trip_sends_the_commands_and_the_lamp_follows() {
+    let (rt, mut harness) = record_harness(RecordState::Idle, true, false);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("REC").is_none());
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Record")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Capturing the mix only")
+            .is_some(),
+        "the toggle must open the sheet"
+    );
+    // Opening a sheet is navigation; nothing went to the runtime.
+    assert!(rt.commands().is_empty());
+
+    sheet_record_button(&harness).click();
+    harness.run_steps(2);
+    assert_eq!(rt.commands(), vec![Command::StartRecord]);
+    // The lamp follows the snapshot, which the demo flips on the command: the
+    // cluster lights in the middle of the bar.
+    assert!(harness.query_by_label("REC").is_some());
+
+    // Let the sheet settle on its recording layout and the double-click
+    // window pass; Stop sits where Record just was.
+    harness.run_steps(8);
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stop")
+        .click();
+    harness.run_steps(2);
+    assert_eq!(
+        rt.commands(),
+        vec![Command::StartRecord, Command::StopRecord]
+    );
+    assert!(harness.query_by_label("REC").is_none());
+}
+
+#[test]
+fn escape_closes_the_record_sheet_and_the_take_keeps_running() {
+    let (rt, mut harness) = record_harness(RecordState::Recording, true, true);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Stop ends the take")
+            .is_some()
+    );
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Stop ends the take")
+            .is_none(),
+        "Escape must close the sheet"
+    );
+    // Closing the sheet is navigation: nothing was sent, and the lamp
+    // still says the take is running.
+    assert!(rt.commands().is_empty());
+    assert!(harness.query_by_label("REC").is_some());
+}
+
+#[test]
+fn an_uploading_take_holds_record_and_reads_as_in_progress() {
+    let (rt, mut harness) = record_harness(RecordState::Uploading, true, true);
+    harness.run_steps(2);
+    // Its own state, not done and not failed: the bar's cluster carries its
+    // own word for it and the sheet's state row spells it out.
+    assert!(harness.query_by_label("UPLOADING").is_some());
+    assert!(harness.query_by_label("uploading").is_some());
+    // The sheet's Record control waits for the upload; a click on the
+    // disabled button sends nothing.
+    sheet_record_button(&harness).click();
+    harness.run_steps(2);
+    assert!(
+        rt.commands().is_empty(),
+        "Record must wait for the upload: {:?}",
+        rt.commands()
+    );
+}
+
+#[test]
+fn non_hosts_get_no_record_control_but_do_see_the_lamp() {
+    let (rt, mut harness) = record_harness(RecordState::Recording, false, false);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Record").is_none());
+    assert!(harness.query_by_label("REC").is_some());
+    assert!(rt.commands().is_empty());
+}
+
+#[test]
+fn a_failed_take_says_why_on_the_lamp_everyone_sees() {
+    let reason = "multipart upload aborted: connection reset by peer";
+    let (_, mut harness) = record_harness(
+        RecordState::Failed {
+            reason: reason.to_owned(),
+        },
+        false,
+        false,
+    );
+    harness.run_steps(2);
+    let lamp = harness.get_by_label("REC FAILED").rect();
+    harness.event(Event::PointerMoved(lamp.center()));
+    // Past the tooltip delay, the recorder's reason is on the lamp.
+    harness.run_steps(20);
+    assert!(
+        harness.query_by_label(reason).is_some(),
+        "the reason must be on the lamp verbatim"
+    );
 }
 
 #[test]
@@ -962,6 +1423,8 @@ fn settings_avatar_pick_and_remove_send_the_right_commands() {
     app.runtime = Some(Box::new(rt.clone()));
     app.screen = Screen::Session;
     app.settings_open = true;
+    // The avatar row lives on the You tab now.
+    app.settings_tab = SettingsTab::You;
     app.load_avatar_from(&path);
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
@@ -1029,6 +1492,8 @@ fn settings_avatar_sends_the_fitted_photo_not_the_file() {
     app.runtime = Some(Box::new(rt.clone()));
     app.screen = Screen::Session;
     app.settings_open = true;
+    // The avatar row lives on the You tab now.
+    app.settings_tab = SettingsTab::You;
     app.load_avatar_from(&path);
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
@@ -1072,6 +1537,8 @@ fn settings_avatar_reports_an_unreadable_file_inline() {
     app.runtime = Some(Box::new(rt.clone()));
     app.screen = Screen::Session;
     app.settings_open = true;
+    // The avatar row lives on the You tab now.
+    app.settings_tab = SettingsTab::You;
     app.load_avatar_from("/nonexistent/not-an-avatar.png");
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
