@@ -210,11 +210,13 @@ async fn local_host_join_and_end_story() {
     assert_eq!(invites.len(), 2, "two musician seats: host + 1 guest");
     assert_eq!(invites[0]["role"], "host");
     assert_eq!(invites[1]["role"], "musician 1");
-    // Every invite offers this machine before it offers the network: the
-    // same-machine join never leaves the host, and the LAN address is still
-    // there for a bandmate on the same network. A machine with no LAN
-    // address at all only has the one place to offer.
-    let lan = jamstream_cloud::providers::local::primary_lan_ip();
+    // Every invite offers loopback, and only loopback, because this session
+    // is bound to loopback: that is the one place the server is listening,
+    // so it is the only address an invite can honestly carry. A default
+    // session binds every interface and does offer the LAN address second,
+    // for the bandmate on the same network; `candidates_for` in host.rs
+    // asserts that rule directly, over v4 and v6, with no socket for a
+    // firewall to filter.
     for i in invites {
         let encoded = i["invite"].as_str().unwrap();
         let invite = jamstream_protocol::invite::Invite::decode(encoded).unwrap();
@@ -225,16 +227,13 @@ async fn local_host_join_and_end_story() {
             i["role"],
             invite.addresses
         );
-        if lan.is_loopback() {
-            assert_eq!(invite.addresses.len(), 1, "{:?}", invite.addresses);
-        } else {
-            assert_eq!(
-                invite.addresses.get(1).map(ToString::to_string),
-                Some(format!("{lan}:{}", args.port)),
-                "the LAN address has to stay: {:?}",
-                invite.addresses
-            );
-        }
+        assert_eq!(
+            invite.addresses.len(),
+            1,
+            "{} was offered somewhere nothing is listening: {:?}",
+            i["role"],
+            invite.addresses
+        );
     }
     let musician_seats = invites
         .iter()
