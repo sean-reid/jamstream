@@ -11,17 +11,20 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use common::{
-    BIND, ChildGuard, ReservedPort, Running, Session, budget, loopback, scratch_dir, server_binary,
-};
+use common::{Running, Session, budget, loopback, scratch_dir};
+// The signal half of this file is unix only, and so is everything it needs.
+#[cfg(unix)]
+use common::{BIND, ChildGuard, ReservedPort, server_binary};
 use jamstream_protocol::ids::{Role, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_server::revocations::Revocations;
 use jamstream_server::runtime::Server;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
+#[cfg(unix)]
+use std::net::{IpAddr, Ipv4Addr};
 use tokio::net::UdpSocket;
 
 /// One client on its own socket, pumped by hand so a test can watch for a
