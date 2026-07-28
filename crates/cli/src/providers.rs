@@ -74,10 +74,17 @@ pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
 /// provider is refused by `host::run`, where the refusal can say why.
 pub fn resolve_for_host(args: &crate::cli::HostArgs) -> Result<Box<dyn Provider>, CliError> {
     if args.provider == "local" && args.wants_recording() {
-        let provider = local_provider()?.with_record(state::recordings_dir()?, args.record_stems);
-        return Ok(Box::new(provider));
+        return resolve_local_recording(args.record_stems);
     }
     resolve_for_port(&args.provider, args.port)
+}
+
+/// The local provider with recording armed, for a launch surface that has no
+/// [`crate::cli::HostArgs`]: the desktop app's wizard arms a local take the
+/// same way this command does, through the spawned server's own flags.
+pub fn resolve_local_recording(stems: bool) -> Result<Box<dyn Provider>, CliError> {
+    let provider = local_provider()?.with_record(state::recordings_dir()?, stems);
+    Ok(Box::new(provider))
 }
 
 /// [`resolve`] for a host that picked its own session port. The port is the

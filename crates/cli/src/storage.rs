@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use jamstream_cloud::cloudinit::{RecordingStorage, StorageCredential};
-use jamstream_cloud::{ObjectStore, ProviderKind, Retention};
+use jamstream_cloud::{ObjectStore, ProviderKind, RegionId, Retention};
 
 use crate::CliError;
 use crate::state::RecordingRecord;
@@ -101,6 +101,42 @@ pub fn storage_for(record: &RecordingRecord) -> Result<RecordingStorage, CliErro
         retention: record.retention.parse().unwrap_or_default(),
         credential: credential_from_env(provider)?,
         stems: record.stems,
+    })
+}
+
+/// The storage config a launch carries to the VM: the bucket in the session's
+/// own region, with the key that writes it.
+///
+/// Both launch surfaces build one through here, so the empty-bucket refusal and
+/// the price check are the same wherever a session is armed.
+///
+/// The key is read last, and only once the bucket is worth having one for: a
+/// region with no bucket service has to say so rather than naming a variable
+/// that would not have helped.
+pub fn storage_for_launch(
+    provider: ProviderKind,
+    bucket: &str,
+    region: &RegionId,
+    retention: Retention,
+    credential: impl FnOnce() -> Result<StorageCredential, CliError>,
+    stems: bool,
+) -> Result<RecordingStorage, CliError> {
+    if bucket.trim().is_empty() {
+        return Err(CliError::Usage(
+            "the bucket name is empty; recording needs a bucket to write to".to_owned(),
+        ));
+    }
+    // Priced here so a region with no bucket service (a DigitalOcean region
+    // with no Spaces endpoint) is refused before the launch rather than at the
+    // first upload.
+    jamstream_cloud::storage_price(provider, region)?;
+    Ok(RecordingStorage {
+        provider,
+        bucket: bucket.trim().to_owned(),
+        region: region.to_string(),
+        retention,
+        credential: credential()?,
+        stems,
     })
 }
 
