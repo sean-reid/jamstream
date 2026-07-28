@@ -1,5 +1,5 @@
 {
-  "comment": "THROWAWAY TEST-ONLY key for JamStream unit tests. Generated locally with openssl genpkey; never uploaded to GCP, attached to no service account, grants no access anywhere.",
+  "comment": "THROWAWAY TEST-ONLY key for JamStream unit tests. Generated locally with openssl genpkey; never uploaded to GCP, attached to no service account, grants no access anywhere. Secret scanners cannot tell that, so this path is exempted in .github/secret_scanning.yml and .gitleaks.toml; generating the key at test time instead would delete both entries.",
   "type": "service_account",
   "project_id": "jamstream-test-project",
   "private_key_id": "0000000000000000000000000000000000000000",
