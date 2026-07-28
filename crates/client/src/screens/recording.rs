@@ -437,16 +437,10 @@ impl RecordingPanel {
     pub fn ui(&mut self, ui: &mut Ui) {
         self.poll();
         ui.label(theme::title(ui, "Recording"));
-        ui.add(
-            egui::Label::new(
-                theme::muted(
-                    ui,
-                    "Where a cloud session's takes go. Recording stays off until you turn \
-                     it on for a session.",
-                )
-                .small(),
-            )
-            .wrap(),
+        note(
+            ui,
+            "Where a cloud session's takes go. Recording stays off until you turn it on \
+             for a session.",
         );
         ui.add_space(theme::SPACE_MD);
         self.provider_rows(ui);
@@ -464,16 +458,9 @@ impl RecordingPanel {
             ui.add(egui::Label::new(RichText::new(err).color(p.danger)).wrap());
         }
         ui.add_space(theme::SPACE_MD);
-        ui.add(
-            egui::Label::new(
-                theme::muted(
-                    ui,
-                    "A session on this computer records to this computer's disk and needs \
-                     no bucket.",
-                )
-                .small(),
-            )
-            .wrap(),
+        note(
+            ui,
+            "A session on this computer records to this computer's disk and needs no bucket.",
         );
     }
 
@@ -526,15 +513,9 @@ impl RecordingPanel {
                     _ => "eu-west-1",
                 }),
         );
-        ui.add(
-            egui::Label::new(
-                theme::muted(
-                    ui,
-                    "Host in the bucket's own region and the upload is free.",
-                )
-                .small(),
-            )
-            .wrap(),
+        note(
+            ui,
+            "Host in the bucket's own region and the upload is free.",
         );
     }
 
@@ -544,16 +525,9 @@ impl RecordingPanel {
     fn key_fields(&mut self, ui: &mut Ui) {
         ui.label(theme::muted(ui, "storage key"));
         if self.key_saved() {
-            ui.add(
-                egui::Label::new(
-                    theme::muted(
-                        ui,
-                        "A key for this provider is on this computer. Paste a new pair to \
-                         replace it.",
-                    )
-                    .small(),
-                )
-                .wrap(),
+            note(
+                ui,
+                "A key for this provider is on this computer. Paste a new pair to replace it.",
             );
         }
         let mask = !self.reveal;
@@ -573,17 +547,11 @@ impl RecordingPanel {
                 .hint_text("paste the secret"),
         )
         .labelled_by(secret_label);
-        ui.add(
-            egui::Label::new(
-                theme::muted(
-                    ui,
-                    "Never the key that launches machines: this one is written to the session \
-                     machine, so scope it to writing the recordings prefix of one bucket. Each \
-                     provider's page makes exactly that key.",
-                )
-                .small(),
-            )
-            .wrap(),
+        note(
+            ui,
+            "Never the key that launches machines: this one is written to the session \
+             machine, so scope it to writing the recordings prefix of one bucket. Each \
+             provider's page makes exactly that key.",
         );
     }
 
@@ -670,18 +638,19 @@ impl RecordingPanel {
             self.prefs.set_retention(retention);
             self.error = self.write_prefs().err();
         }
-        ui.add(
-            egui::Label::new(
-                theme::muted(
-                    ui,
-                    "A rule on the bucket itself, so it keeps being enforced after the \
-                     machine is gone.",
-                )
-                .small(),
-            )
-            .wrap(),
+        note(
+            ui,
+            "A rule on the bucket itself, so it keeps being enforced after the machine is \
+             gone.",
         );
     }
+}
+
+/// One wrapped muted line, which is most of the prose in this tab. Wrapped
+/// rather than truncated: at the drawer's width every one of these is two lines
+/// or more, and a sentence about a credential is not something to elide.
+fn note(ui: &mut Ui, text: impl Into<String>) {
+    ui.add(egui::Label::new(theme::muted(ui, text).small()).wrap());
 }
 
 fn hex(bytes: &[u8]) -> String {
