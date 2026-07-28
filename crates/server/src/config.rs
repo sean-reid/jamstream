@@ -6,7 +6,7 @@ use std::path::Path;
 
 use jamstream_protocol::ids::SessionId;
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct Config {
     pub session_id: SessionId,
     pub port: u16,
@@ -14,6 +14,25 @@ pub struct Config {
     pub issuer_public_key: [u8; 32],
     pub idle_shutdown_min: u32,
     pub max_duration_min: u32,
+}
+
+/// Redacts the server's static private key, the one secret on the VM that a
+/// session's whole transport rests on. Everything else here is public or a
+/// number and is worth seeing in a log. `BootConfig`, which is the same fields
+/// on the host's side of the wire, redacts the same field for the same reason;
+/// a derive here would have made one `tracing::debug!(?cfg)` in jamstreamd
+/// enough to put the key in the journal.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("session_id", &self.session_id)
+            .field("port", &self.port)
+            .field("server_private_key", &"<redacted>")
+            .field("issuer_public_key", &self.issuer_public_key)
+            .field("idle_shutdown_min", &self.idle_shutdown_min)
+            .field("max_duration_min", &self.max_duration_min)
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -158,6 +177,22 @@ mod tests {
                 0xee, 0xff
             ]
         );
+    }
+
+    /// The parsed config holds the server's static private key, so the first
+    /// thing that formats one must not put it in the journal. jamstreamd runs
+    /// on a VM whose journal survives the session, and a private key there is
+    /// every future session's transport as well as this one's.
+    #[test]
+    fn debug_never_reveals_the_server_private_key() {
+        let cfg = Config::parse(&valid()).unwrap();
+        let rendered = format!("{cfg:?}");
+        let key_b64 = data_encoding::BASE64.encode(&[9u8; 32]);
+        assert!(!rendered.contains(&key_b64), "{rendered}");
+        assert!(!rendered.contains("9, 9, 9"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The fields worth seeing in a log are still there.
+        assert!(rendered.contains("43210"), "{rendered}");
     }
 
     #[test]

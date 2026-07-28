@@ -12,11 +12,25 @@ use crate::CliError;
 /// Overrides the state directory; used by integration tests.
 pub const STATE_DIR_ENV: &str = "JAMSTREAM_STATE_DIR";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct InviteRecord {
     /// "host", "musician <id>", or "listener <id>".
     pub role: String,
     pub invite: String,
+}
+
+/// Redacts the invite. An invite is a bearer credential: whoever holds one
+/// joins the session as the member it names, which is why `jamstream join`
+/// warns about passing one on argv. Redacting the issuer key on the record
+/// that carries them and then printing the invites themselves would have shut
+/// the door that mints new seats and left every existing seat open.
+impl std::fmt::Debug for InviteRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteRecord")
+            .field("role", &self.role)
+            .field("invite", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +366,13 @@ mod tests {
         let rendered = format!("{:?}", sample());
         assert!(!rendered.contains("aXNzdWVy"));
         assert!(rendered.contains("<redacted>"));
+        // Nor the invites the record carries, which are bearer credentials in
+        // their own right: each one is a seat in the session for whoever holds
+        // it, and the roles are what a log wants anyway.
+        assert!(!rendered.contains("jamstream://join/AAAA"), "{rendered}");
+        assert!(!rendered.contains("jamstream://join/BBBB"), "{rendered}");
+        assert!(!format!("{:?}", sample().invites).contains("join/AAAA"));
+        assert!(rendered.contains("musician 1"), "{rendered}");
         // The public half and the identity stay visible.
         assert!(rendered.contains("c2VydmVy"));
         assert!(rendered.contains("deadbeefcafef00d"));

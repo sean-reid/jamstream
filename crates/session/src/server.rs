@@ -40,12 +40,15 @@ const BROADCAST_BITRATE: u32 = 128_000;
 const CLICK_GAIN: f32 = 0.7;
 /// At most one version reject per source slot per this interval.
 const REJECT_INTERVAL_MS: u64 = 1_000;
-/// Slots the reject limiter keeps, indexed by a hash of the source network.
-/// Sources that collide share one slot's allowance, which costs an honest
-/// mismatched client at most a second of extra silence and buys an O(1)
+/// Slots the reject limiter keeps, indexed by a keyed hash of the source
+/// network. Sources that collide share one slot's allowance, which costs an
+/// honest mismatched client at most a second of extra silence and buys an O(1)
 /// per-packet check with no allocation and nothing to evict.
 const REJECT_SLOTS: usize = 256;
 const _: () = assert!(REJECT_SLOTS.is_power_of_two());
+/// Domain separator for the limiter's slot key, so nothing derived from the
+/// static private key can be mistaken for anything else derived from it.
+const SLOT_KEY_DOMAIN: &[u8] = b"jamstream-limiter-slot-v1";
 /// Version rejects emitted per second across every source, and the burst
 /// allowed. A client on the wrong version needs exactly one to show its user
 /// what to update, so this is generous for the honest case while capping
@@ -378,6 +381,9 @@ pub struct ServerCore {
     /// [`REJECT_SLOTS`], never resized.
     reject_seen: Vec<Option<u64>>,
     reject_budget: TokenBucket,
+    /// Blake2s with the slot key already absorbed, cloned per lookup. See
+    /// [`ServerCore::limiter_slot`] for why the slot function is keyed.
+    slot_hasher: Blake2s256,
     /// What an unauthenticated peer may spend of the handshake's asymmetric
     /// crypto, globally and per source network. Same fixed table and same
     /// slot function as the reject limiter: a source port is attacker-chosen,
@@ -412,6 +418,7 @@ pub struct ServerCore {
 
 impl ServerCore {
     pub fn new(cfg: ServerConfig) -> Self {
+        let slot_hasher = slot_hasher(&cfg.server_private);
         Self {
             cfg,
             members: BTreeMap::new(),
@@ -440,6 +447,7 @@ impl ServerCore {
             avatar_waiters: BTreeMap::new(),
             reject_seen: vec![None; REJECT_SLOTS],
             reject_budget: TokenBucket::new(REJECT_BURST, REJECT_RATE_PER_SEC),
+            slot_hasher,
             init_slot_budget: vec![
                 TokenBucket::new(INIT_SLOT_BURST, INIT_SLOT_RATE_PER_SEC);
                 REJECT_SLOTS
@@ -998,7 +1006,7 @@ impl ServerCore {
         if init_packet.len() < REJECT_MIN_INIT_BYTES {
             return;
         }
-        let slot = reject_slot(src.ip());
+        let slot = self.limiter_slot(src.ip());
         let recent =
             self.reject_seen[slot].is_some_and(|t| now_ms.saturating_sub(t) < REJECT_INTERVAL_MS);
         if recent {
@@ -1030,11 +1038,44 @@ impl ServerCore {
         ));
     }
 
+    /// Which limiter slot a source network falls in.
+    ///
+    /// [`REJECT_SLOTS`] slots for the whole internet, so sources collide by
+    /// design and a collision costs the pair an interval of each other's
+    /// allowance. That is only acceptable while nobody can choose who they
+    /// collide with: with a public hash an attacker could search offline for
+    /// addresses landing on a chosen victim's slot and spend that victim's
+    /// share on purpose, which turns a limiter meant to bound a flood into a
+    /// way to hold one client off the session, silently and at 8 packets a
+    /// second. Keyed on the server's static private key, the same address
+    /// lands somewhere different on every session and the best an attacker
+    /// can do is collide by luck.
+    ///
+    /// Granularity is one IPv4 address or one IPv6 /64, tagged by family: a
+    /// band behind one NAT is one source here, and a v6 host holding a whole
+    /// /64 cannot spread over the table by walking it.
+    fn limiter_slot(&self, ip: IpAddr) -> usize {
+        let mut h = self.slot_hasher.clone();
+        match ip {
+            IpAddr::V4(v4) => {
+                h.update([4u8]);
+                h.update(v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                h.update([6u8]);
+                h.update(&v6.octets()[..8]);
+            }
+        }
+        let out: [u8; 32] = h.finalize().into();
+        let x = u64::from_le_bytes(out[..8].try_into().expect("8 bytes"));
+        (x as usize) & (REJECT_SLOTS - 1)
+    }
+
     /// Spends one unauthenticated peer's share of the handshake budget. The
     /// per-network bucket goes first so a single flooding host cannot empty
     /// the global one, and neither is charged when the other refuses.
     fn init_budget_take(&mut self, now_ms: u64, src: SocketAddr) -> bool {
-        let slot = reject_slot(src.ip());
+        let slot = self.limiter_slot(src.ip());
         if !self.init_slot_budget[slot].available(now_ms) || !self.init_budget.available(now_ms) {
             return false;
         }
@@ -1128,7 +1169,7 @@ impl ServerCore {
         init_packet: &[u8],
         out: &mut Outgoing,
     ) {
-        let slot = reject_slot(src.ip());
+        let slot = self.limiter_slot(src.ip());
         if self.reject_seen[slot].is_some_and(|t| now_ms.saturating_sub(t) < REJECT_INTERVAL_MS) {
             return;
         }
@@ -1952,16 +1993,17 @@ fn cookie_epoch(now_ms: u64) -> u64 {
     now_ms / COOKIE_ROTATION_MS
 }
 
-fn reject_slot(ip: IpAddr) -> usize {
-    let network = match ip {
-        IpAddr::V4(v4) => u128::from(u32::from_be_bytes(v4.octets())),
-        IpAddr::V6(v6) => u128::from_be_bytes(v6.octets()) & !((1u128 << 64) - 1),
-    };
-    let mut x = (network as u64) ^ ((network >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^= x >> 31;
-    (x as usize) & (REJECT_SLOTS - 1)
+/// Blake2s with the limiter's slot key absorbed, ready to be cloned per
+/// lookup. The key is a hash of the server's static private key, so it needs
+/// no RNG and the core stays deterministic under the harness.
+fn slot_hasher(server_private: &[u8]) -> Blake2s256 {
+    let mut derive = Blake2s256::new();
+    derive.update(SLOT_KEY_DOMAIN);
+    derive.update(server_private);
+    let key: [u8; 32] = derive.finalize().into();
+    let mut hasher = Blake2s256::new();
+    hasher.update(key);
+    hasher
 }
 
 #[cfg(test)]
@@ -1994,13 +2036,22 @@ mod tests {
         Initiator::new_claiming_version(&invite, 9).unwrap()
     }
 
+    /// A fixed server keypair. [`ServerCore::limiter_slot`] is keyed on the
+    /// private key, so a test that asserts two sources have separate
+    /// allowances needs to know they do not share a slot; with a generated key
+    /// that would be true 255 runs in 256.
+    fn fixed_server_keys() -> (Vec<u8>, [u8; 32]) {
+        let private = vec![0x5Au8; 32];
+        let public = transport::derive_public(&private).expect("32-byte private key");
+        (private, public)
+    }
+
     fn server_with_issuer() -> (ServerCore, Issuer, [u8; 32]) {
         let issuer = Issuer::generate();
-        let kp = generate_keypair();
-        let public = kp.public;
+        let (private, public) = fixed_server_keys();
         let core = ServerCore::new(ServerConfig::new(
             SessionId([7u8; 16]),
-            kp.private.to_vec(),
+            private,
             public,
             issuer.public_key(),
         ));
@@ -2051,6 +2102,72 @@ mod tests {
         assert_eq!(core.handle_datagram(500, 0, addr(3), &init).len(), 1);
         // After the interval the same source is answered again.
         assert_eq!(core.handle_datagram(1_500, 0, addr(2), &init).len(), 1);
+    }
+
+    /// Which limiter slot a source lands in must not be computable from the
+    /// address alone.
+    ///
+    /// The table is [`REJECT_SLOTS`] slots for the whole internet, so sources
+    /// share slots and a slot's allowance with them. With a public hash an
+    /// attacker searches offline for addresses landing on one victim's slot,
+    /// then spends that victim's share of the reject gate and the handshake
+    /// budget on purpose: the victim's join is dropped silently and the reject
+    /// that would have told it why never comes. Keyed on the static private
+    /// key, the same address lands somewhere different on every session.
+    #[test]
+    fn a_sources_limiter_slot_is_not_computable_without_the_server_key() {
+        let issuer = Issuer::generate();
+        let core_for = |private: Vec<u8>| {
+            let public = transport::derive_public(&private).expect("32-byte private key");
+            ServerCore::new(ServerConfig::new(
+                SessionId([7u8; 16]),
+                private,
+                public,
+                issuer.public_key(),
+            ))
+        };
+        let one = core_for(vec![1u8; 32]);
+        let two = core_for(vec![2u8; 32]);
+
+        // A slot is stable within one session: the limiters would not limit
+        // anything if the same source moved between lookups.
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(one.limiter_slot(ip), one.limiter_slot(ip));
+
+        // Across sessions the mapping is a different one. Sampled over enough
+        // addresses that agreeing everywhere cannot be coincidence: two
+        // independent maps into 256 slots agree on 400 addresses with
+        // probability 256^-400.
+        let sample: Vec<IpAddr> = (0..400u32)
+            .map(|n| IpAddr::from(std::net::Ipv4Addr::from(0x1400_0000 + n)))
+            .collect();
+        let moved = sample
+            .iter()
+            .filter(|ip| one.limiter_slot(**ip) != two.limiter_slot(**ip))
+            .count();
+        assert!(
+            moved > 300,
+            "only {moved} of 400 addresses moved slot between two servers, so the slot \
+             function is not keyed on the server key"
+        );
+
+        // The whole table is still reachable, so keying did not collapse the
+        // spread that makes per-source allowances mean anything.
+        let slots: BTreeSet<usize> = sample.iter().map(|ip| one.limiter_slot(*ip)).collect();
+        assert!(
+            slots.len() > 150,
+            "400 addresses filled only {} slots",
+            slots.len()
+        );
+
+        // One v6 host holding a whole /64 is one source, and a v4 address is
+        // not its v4-mapped v6 spelling.
+        let a: IpAddr = "2001:db8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8::dead:beef".parse().unwrap();
+        assert_eq!(one.limiter_slot(a), one.limiter_slot(b));
+        let v4: IpAddr = "203.0.113.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        assert_ne!(one.limiter_slot(v4), one.limiter_slot(mapped));
     }
 
     /// A UDP source port is chosen by whoever sends the packet, so a limiter
