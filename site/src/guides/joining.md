@@ -29,7 +29,7 @@ What you are looking at:
 - Your own strip is dimmed with a "you" tag. Self monitoring is local, on your interface, not through the server, so your own channel has no fader in the mix.
 - The host additionally sees a Revoke button on every other strip. Revoking ejects that member and kills their invite, with a confirmation step.
 - Chat, with timestamps. The metronome panel shows tempo, beats per bar, and click state; the host sets them, and "hear the click" is your own choice.
-- The status bar, in the same place every session: health on the left, ON AIR and REC in the middle, and the meter and Leave on the right. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
+- The status bar, in the same place every session: latency and your meters on the left, ON AIR and REC in the middle, and the session id and Leave on the right. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
 - The **ON AIR** lamp, in the middle of the bar: absent until the host starts a broadcast, amber while one is running, with a count of how many platforms are receiving it. Only the host can start or stop one, but everyone sees the lamp, because everyone is in it. See [Streaming to Twitch and YouTube](streaming.md).
 
 A member who stops responding grays out after 10 seconds and their fader freezes; when they reconnect with their invite, they come back in the same seat.

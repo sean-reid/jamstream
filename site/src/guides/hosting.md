@@ -61,7 +61,7 @@ Both are yours to set. The wizard has an **idle exit** and a **hard cap** field 
 
 ## While it runs
 
-The host's status bar shows cost so far next to the latency readout, with elapsed time beside it; nothing accrues silently. The **Broadcast** tab of Settings holds both halves of streaming: **Stream mix** sets what the platforms and the listeners hear, and **Destinations** puts the session on air to Twitch and YouTube Live. **Record** is the one action in the bar itself, and [Recording a session](recording.md) covers takes. Devices and buffer size can change mid-session from Settings in the top bar, and the change applies immediately; [Joining a session](joining.md#the-session-screen) walks the whole screen. `jamstream status` lists the same sessions from the terminal, with elapsed time, cost accrued so far, and a projection.
+The host's status bar shows cost so far and elapsed time at its right-hand end, beside **Record** and **Leave**; nothing accrues silently. The **Broadcast** tab of Settings holds both halves of streaming: **Stream mix** sets what the platforms and the listeners hear, and **Destinations** puts the session on air to Twitch and YouTube Live. **Record** is the one action in the bar itself, and [Recording a session](recording.md) covers takes. Devices and buffer size can change mid-session from Settings in the top bar, and the change applies immediately; [Joining a session](joining.md#the-session-screen) walks the whole screen. `jamstream status` lists the same sessions from the terminal, with elapsed time, cost accrued so far, and a projection.
 
 If tagged machines already exist in your account when you host again, the CLI warns at host time, so a stray session does not hide behind a new one.
 
