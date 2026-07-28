@@ -65,6 +65,27 @@ fn reject_key_from_dh(private: &[u8], public: &[u8]) -> Option<wire::RejectKey> 
     Some(wire::RejectKey::from_bytes(h.finalize().into()))
 }
 
+/// Domain separator for the cookie secret, so nothing derived from the static
+/// private key can ever be mistaken for anything else derived from it.
+const COOKIE_KEY_DOMAIN: &[u8] = b"jamstream-cookie-secret-v1";
+
+/// The cookie secret for one epoch: a hash of the server's static private key
+/// and the epoch number.
+///
+/// No random state and no stored table, which is the whole point of a
+/// stateless cookie: the server can recompute what it handed out without
+/// remembering that it handed anything out, and the core stays deterministic
+/// under the harness. Rotating on an epoch bounds how long a cookie is worth
+/// stealing; the caller accepts the previous epoch too so a rotation does not
+/// invalidate a cookie in flight.
+pub fn cookie_key(server_private: &[u8], epoch: u64) -> wire::CookieKey {
+    let mut h = Blake2s256::new();
+    h.update(COOKIE_KEY_DOMAIN);
+    h.update(server_private);
+    h.update(epoch.to_le_bytes());
+    wire::CookieKey::from_bytes(h.finalize().into())
+}
+
 /// The key that authenticates a version reject for an init this server will
 /// not otherwise process, recovered from the init itself.
 ///
@@ -697,6 +718,28 @@ mod tests {
             &mac,
             &init_packet
         ));
+    }
+
+    /// The cookie secret is a hash of the static private key and the epoch,
+    /// which is what makes the cookie stateless: the server recomputes what it
+    /// handed out without having remembered handing anything out, and the core
+    /// stays deterministic under the harness because there is no RNG in it.
+    #[test]
+    fn the_cookie_secret_is_a_pure_function_of_the_key_and_the_epoch() {
+        let server = generate_keypair();
+        let other = generate_keypair();
+        let src: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+
+        let cookie =
+            |private: &[u8], epoch: u64| wire::cookie_for(&cookie_key(private, epoch), src);
+        // Same inputs, same cookie, every time and in any process.
+        assert_eq!(cookie(&server.private, 7), cookie(&server.private, 7));
+        // A rotation changes it, and so does a different server.
+        assert_ne!(cookie(&server.private, 7), cookie(&server.private, 8));
+        assert_ne!(cookie(&server.private, 7), cookie(&other.private, 7));
+        // Nothing an invite carries produces one: the private key is the only
+        // input, so no client can mint a cookie for itself.
+        assert_ne!(cookie(&server.private, 7), cookie(&server.public, 7));
     }
 
     #[test]

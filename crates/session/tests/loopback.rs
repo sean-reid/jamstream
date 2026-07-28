@@ -1881,6 +1881,92 @@ fn musician_capacity_enforced() {
     );
 }
 
+/// Steps the harness for `ms` while `per_step` handshake inits arrive from
+/// addresses nobody is listening at, which is what a spoofed flood looks like:
+/// the server cannot tell them from an honest first flight and cannot reach
+/// the senders to find out.
+fn flood_ms(h: &mut Harness, ms: u64, per_step: usize) {
+    let init = wire::build_handshake_init(jamstream_protocol::PROTOCOL_VERSION, &[0xAA; 96]);
+    let mut n: u32 = 0;
+    for _ in 0..(ms as f64 / STEP_MS) as usize {
+        for _ in 0..per_step {
+            n = n.wrapping_add(1);
+            let src: SocketAddr = format!("198.18.{}.{}:9000", (n >> 8) & 0xFF, n & 0xFF)
+                .parse()
+                .unwrap();
+            h.to_server.push((src, init.clone()));
+        }
+        h.step();
+    }
+}
+
+/// The whole point of the cookie round trip: a flood must not keep an honest
+/// client out of the session.
+///
+/// The rate limiter alone bounded what a flood could take out of the mix tick,
+/// which protects the people already playing, but it cannot tell a spoofed
+/// source from a real one, so an honest init was dropped along with the flood
+/// and that client joined only once the flood stopped. Real client cores, real
+/// server core, real packets: the flood is delivered to `handle_datagram` from
+/// addresses that never answer, exactly as the socket would.
+#[test]
+fn an_honest_client_joins_through_an_init_flood() {
+    let mut h = Harness::new(MAX_MUSICIANS, 0);
+    let host = h.mint(0, Role::Musician);
+    h.add_client(&host, Some(440.0));
+    h.run_ms(300);
+    assert_eq!(
+        h.server.cookie_challenges(),
+        0,
+        "an ordinary join must stay at one round trip"
+    );
+
+    // The flood starts, and the musician arrives into the middle of it.
+    flood_ms(&mut h, 500, 4);
+    assert!(
+        h.server.cookie_challenges() > 0,
+        "the flood was never asked for a cookie"
+    );
+    let late = h.mint(1, Role::Musician);
+    let i = h.add_client(&late, Some(0.0));
+    let reads_before = h.server.handshake_reads();
+    flood_ms(&mut h, 3_000, 4);
+
+    assert_eq!(
+        *h.clients[i].core.state(),
+        ClientState::Joined,
+        "the honest client did not get in through the flood"
+    );
+    assert_eq!(h.server.musicians_connected(), 2);
+    // And it is hearing the host, so it really is in the session rather than
+    // merely holding a roster entry.
+    let tail = tail_rms(&h, i, 48_000);
+    assert!(tail > 0.02, "the late musician heard nothing, rms {tail}");
+
+    // Meanwhile the flood bought almost no asymmetric crypto. It sent 1600
+    // inits a second for 3 seconds; the trigger's burst was already gone, so
+    // what is left is its refill, a couple of dozen a second.
+    let bought = h.server.handshake_reads() - reads_before;
+    assert!(
+        bought < 120,
+        "4800 spoofed inits bought {bought} Diffie-Hellmans"
+    );
+
+    // The flood stops, the trigger refills, and the next join is back to one
+    // round trip with no cookie in it.
+    h.run_ms(3_000);
+    let challenges = h.server.cookie_challenges();
+    let third = h.mint(2, Role::Musician);
+    let j = h.add_client(&third, Some(0.0));
+    h.run_ms(500);
+    assert_eq!(*h.clients[j].core.state(), ClientState::Joined);
+    assert_eq!(
+        h.server.cookie_challenges(),
+        challenges,
+        "a quiet session still asked for a cookie"
+    );
+}
+
 /// The listener half of the same rule, which the server enforced with
 /// nothing holding it to it. It also pins the two caps as separate counters:
 /// a sold-out gallery must not cost the band a seat, which is the failure a
