@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.4](https://github.com/sean-reid/jamstream/compare/v0.1.3...v0.1.4) (2026-07-28)
+
+
+### Features
+
+* **cli:** shell completions, installed for you through homebrew ([#144](https://github.com/sean-reid/jamstream/issues/144)) ([7e17ae8](https://github.com/sean-reid/jamstream/commit/7e17ae8458ac94339e83ec7b52773b400e87b5a3))
+* **cloud:** session recording storage and upload-aware teardown ([#140](https://github.com/sean-reid/jamstream/issues/140)) ([2627937](https://github.com/sean-reid/jamstream/commit/262793722c19611b26a6e6a15cb08aedbe453c43))
+* **protocol:** add session recording control messages ([#137](https://github.com/sean-reid/jamstream/issues/137)) ([2a69052](https://github.com/sean-reid/jamstream/commit/2a6905296a7131222aa7d0fac7cce777797fb244))
+* **server:** record the broadcast mix and stems to streaming FLAC ([6bfda7b](https://github.com/sean-reid/jamstream/commit/6bfda7b47726e8326855dfab1c2f0d95da19c366))
+* **server:** record the broadcast mix and stems to streaming flac ([#142](https://github.com/sean-reid/jamstream/issues/142)) ([6bfda7b](https://github.com/sean-reid/jamstream/commit/6bfda7b47726e8326855dfab1c2f0d95da19c366))
+* **site:** a windows uninstaller to pair with install.ps1 ([#146](https://github.com/sean-reid/jamstream/issues/146)) ([2d8b693](https://github.com/sean-reid/jamstream/commit/2d8b69337ce69f325bb380bac9d1cedd662a88fd))
+* **site:** an uninstaller to pair with install.sh ([#145](https://github.com/sean-reid/jamstream/issues/145)) ([6312392](https://github.com/sean-reid/jamstream/commit/6312392711430a1200ad1e7dd9089d6e54a2abe5))
+
+
+### Bug Fixes
+
+* **cloud:** resolve the digitalocean boot image instead of pinning it ([#141](https://github.com/sean-reid/jamstream/issues/141)) ([180bc24](https://github.com/sean-reid/jamstream/commit/180bc2498f5c9d87f3349a12d2cbee330993a675))
+* **cloud:** ship an arm64 server and refuse to launch without one ([#147](https://github.com/sean-reid/jamstream/issues/147)) ([601a83c](https://github.com/sean-reid/jamstream/commit/601a83cee8f378d5167f53b323de55847d1b580e))
+
 ## [0.1.3](https://github.com/sean-reid/jamstream/compare/v0.1.2...v0.1.3) (2026-07-28)
 
 
