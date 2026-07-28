@@ -43,6 +43,12 @@
 //! forwarding. Multi-address invites and UPnP are future work. With no
 //! network at all this falls back to 127.0.0.1 with a warning.
 //!
+//! [`LocalProvider::with_bind`] confines a session to one address instead:
+//! the server is told to listen on it and instances report it, so the
+//! invites point where the server is. Loopback is the case that matters,
+//! because it is the one path the macOS Application Firewall does not
+//! filter.
+//!
 //! # Idle teardown and the session cap
 //!
 //! There is no systemd guard on a laptop, so the spawned server gets
@@ -188,6 +194,10 @@ pub struct LocalProvider {
     /// children get reaped (try_wait) instead of lingering as zombies that
     /// would fool the liveness probe.
     children: Mutex<HashMap<u32, Child>>,
+    /// One address for the spawned server to listen on and be reached at,
+    /// instead of every interface and the primary LAN address. See
+    /// [`LocalProvider::with_bind`].
+    bind: Option<IpAddr>,
 }
 
 impl LocalProvider {
@@ -197,6 +207,7 @@ impl LocalProvider {
             server_binary: None,
             registry_gate: Mutex::new(()),
             children: Mutex::new(HashMap::new()),
+            bind: None,
         }
     }
 
@@ -205,6 +216,33 @@ impl LocalProvider {
     pub fn with_server_binary(mut self, path: PathBuf) -> Self {
         self.server_binary = Some(path);
         self
+    }
+
+    /// Confines the session to one address: the spawned server is told to
+    /// bind it, and it is the address the instance reports, so the invites
+    /// minted from it point at the same place the server is listening.
+    ///
+    /// Without this the server binds every interface and invites carry the
+    /// primary LAN address, which is what a band on one network needs and
+    /// what this must keep defaulting to.
+    ///
+    /// With `127.0.0.1` the whole session stays on loopback, which is the
+    /// one path the macOS Application Firewall does not filter. It filters
+    /// incoming connections per binary, so every rebuilt jamstreamd raises
+    /// a dialog, and on a managed Mac that dialog cannot be pre-answered
+    /// from the command line. A test that spawns a real server binds
+    /// loopback and never meets it.
+    pub fn with_bind(mut self, ip: IpAddr) -> Self {
+        self.bind = Some(ip);
+        self
+    }
+
+    /// The address instances report: whatever [`with_bind`] was given, else
+    /// the primary LAN address.
+    ///
+    /// [`with_bind`]: LocalProvider::with_bind
+    fn reachable_ip(&self) -> IpAddr {
+        self.bind.unwrap_or_else(primary_lan_ip)
     }
 
     /// See the module docs for the resolution order.
@@ -418,7 +456,8 @@ impl Provider for LocalProvider {
         // --shutdown-file is the graceful-exit request path. jamstreamd's
         // argument scan ignores flags it does not know, so passing it to a
         // build that predates the server half costs nothing.
-        let child = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command
             .arg("--config")
             .arg(&config_path)
             .arg("--activity-file")
@@ -428,7 +467,13 @@ impl Provider for LocalProvider {
             .arg("--idle-exit-min")
             .arg(&idle_min)
             .arg("--max-duration-min")
-            .arg(&max_duration_min)
+            .arg(&max_duration_min);
+        // Only when confined: without the flag jamstreamd binds every
+        // interface, which is what a band on one network needs.
+        if let Some(ip) = self.bind {
+            command.arg("--bind").arg(ip.to_string());
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().map_err(|e| {
                 ProviderError::Other(format!("cannot clone server log handle: {e}"))
@@ -487,7 +532,7 @@ impl Provider for LocalProvider {
             provider: ProviderKind::Local,
             region: Self::local_region(),
             id: pid.to_string(),
-            public_ip: Some(primary_lan_ip()),
+            public_ip: Some(self.reachable_ip()),
             tags: spec.tags,
         })
     }
@@ -546,7 +591,7 @@ impl Provider for LocalProvider {
             entries.retain(|e| self.pid_alive(e.pid, e.spawned()));
             entries.clone()
         })?;
-        let ip = primary_lan_ip();
+        let ip = self.reachable_ip();
         Ok(live
             .iter()
             .filter(|e| session_tag.is_none_or(|want| e.session == want))
@@ -1303,6 +1348,49 @@ mod tests {
             "failed launch must not leave a registry entry"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A confined session has to be *offered* where it listens. Reporting
+    /// the LAN address for a server bound to loopback would mint invites
+    /// pointing at a port nothing answers on, which is the same silence a
+    /// firewall produces and just as hard to read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bound_session_is_reported_at_the_address_it_listens_on() {
+        let dir = temp_dir("bind");
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let provider = LocalProvider::new(dir.join("state"))
+            .with_server_binary(fake_server(&dir))
+            .with_bind(loopback);
+        let spec = LaunchSpec {
+            region: LocalProvider::local_region(),
+            instance_class: InstanceClass::Small,
+            user_data: "port = 43210\n".to_owned(),
+            tags: vec![session_tag("bound")],
+        };
+        let instance = provider.launch(spec).await.unwrap();
+        let listed = provider.list_tagged(Some("bound")).await.unwrap();
+        // Torn down before anything is asserted: a failing assertion must
+        // not be the reason a server outlives this process.
+        provider
+            .destroy(&RegionId::new(REGION_ID), &instance.id)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(instance.public_ip, Some(loopback));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].public_ip, Some(loopback));
+    }
+
+    /// The default is the whole point of the flag being a flag: an
+    /// unconfined provider still binds every interface and still offers the
+    /// LAN address, so a band on one network is unaffected.
+    #[test]
+    fn an_unconfined_provider_still_offers_the_lan_address() {
+        let provider = LocalProvider::new(PathBuf::from("/state"));
+        assert_eq!(provider.reachable_ip(), primary_lan_ip());
+        assert!(provider.bind.is_none());
     }
 
     /// The app-bundling story: release artifacts place jamstreamd beside
