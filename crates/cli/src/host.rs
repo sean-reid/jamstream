@@ -2,7 +2,7 @@
 //! mint invites, verify reachability, and record the session on disk.
 
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use data_encoding::{BASE64, HEXLOWER};
@@ -14,7 +14,7 @@ use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
-use jamstream_session::client::{ClientCore, ClientState};
+use jamstream_session::client::{ClientCore, ClientState, ServerCandidates};
 
 use crate::CliError;
 use crate::cli::HostArgs;
@@ -422,6 +422,43 @@ pub fn invite_label(role: Role, member: MemberId) -> String {
     }
 }
 
+/// Every address an invite should offer for one server address, most
+/// direct first.
+///
+/// A locally hosted session runs on the machine doing the minting, so the
+/// address the provider reported is one of this machine's own interfaces.
+/// Loopback reaches the same server without leaving the host, and that is
+/// worth offering first: the macOS Application Firewall filters incoming
+/// connections per binary and does not govern loopback, so a same-machine
+/// join over a real interface can simply not arrive, and on a managed Mac
+/// the firewall cannot be changed from the command line at all. The
+/// symptom is no error, just a handshake that never completes.
+///
+/// The LAN address stays, second, because a bandmate on the same network
+/// joins through the same invite. They spend one connection timeout on
+/// loopback first, where either nothing answers or something that is not
+/// this session does and cannot complete the Noise handshake against the
+/// server key the invite carries.
+///
+/// A cloud VM's address is nobody's local interface, so a cloud invite is
+/// unchanged: one address, exactly as before.
+pub fn candidate_addresses(address: SocketAddr) -> Vec<SocketAddr> {
+    candidates_for(address, jamstream_cloud::providers::local::primary_lan_ip())
+}
+
+/// [`candidate_addresses`] with the local address supplied, so the rule is
+/// testable without a network.
+fn candidates_for(address: SocketAddr, this_machine: IpAddr) -> Vec<SocketAddr> {
+    if address.ip().is_loopback() || address.ip() != this_machine {
+        return vec![address];
+    }
+    let loopback = match address.ip() {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    vec![SocketAddr::new(loopback, address.port()), address]
+}
+
 /// Mints the session's invite book: the host (member 0) first, then the
 /// remaining musician seats, then the listeners.
 ///
@@ -441,6 +478,9 @@ pub fn mint_invites(
     musicians: u8,
     listeners: u8,
 ) -> Vec<(String, Invite)> {
+    // Once, not once per seat: discovering the machine's own address opens
+    // a socket, and every invite to one session offers the same places.
+    let addresses = candidate_addresses(address);
     let mint = |member: u16, role: Role| {
         let token = Token {
             member_id: MemberId(member),
@@ -449,7 +489,7 @@ pub fn mint_invites(
             expires_unix,
             jti: TokenId::generate(),
         };
-        let invite = issuer.mint(session_id, vec![address], server_pk, token);
+        let invite = issuer.mint(session_id, addresses.clone(), server_pk, token);
         (invite_label(role, MemberId(member)), invite)
     };
     let seats = u16::from(musicians).max(1);
@@ -525,14 +565,13 @@ async fn wait_for_ip(
 /// Proves the VM is actually serving: a genuine ClientCore handshake with
 /// the host invite over UDP, driven until Joined. Skipped for the mock,
 /// which launches no server.
+///
+/// Every address in the invite gets a turn, so this reports what a joining
+/// musician will actually experience rather than what the first entry
+/// alone would.
 async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), CliError> {
-    let bind: SocketAddr = if invite.addresses[0].is_ipv4() {
-        "0.0.0.0:0".parse().expect("static addr")
-    } else {
-        "[::]:0".parse().expect("static addr")
-    };
-    let socket = tokio::net::UdpSocket::bind(bind).await?;
-    socket.connect(invite.addresses[0]).await?;
+    let mut candidates = ServerCandidates::new(invite)?;
+    let mut socket = connected_socket(candidates.current()).await?;
 
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
@@ -571,7 +610,14 @@ async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), CliError
             }
             // The core gives up after its own 10 s window; keep trying
             // fresh handshakes until our cap, the VM may still be booting.
+            // Each retry moves to the next address the invite offers and
+            // comes back round, so a slow boot and a filtered interface
+            // both get answered by the time the cap runs out.
             ClientState::TimedOut => {
+                if candidates.has_alternatives() {
+                    let next = candidates.advance();
+                    socket = connected_socket(next).await?;
+                }
                 let init = core.reconnect(now())?;
                 socket.send(&init).await?;
             }
@@ -579,9 +625,27 @@ async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), CliError
         }
     }
     Err(CliError::Failed(format!(
-        "server did not complete a handshake within {} s",
-        cap.as_secs()
+        "server did not complete a handshake within {} s on {}",
+        cap.as_secs(),
+        invite
+            .addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     )))
+}
+
+/// A UDP socket bound to the right family and connected to one candidate.
+pub async fn connected_socket(server: SocketAddr) -> Result<tokio::net::UdpSocket, CliError> {
+    let bind: SocketAddr = if server.is_ipv4() {
+        "0.0.0.0:0".parse().expect("static addr")
+    } else {
+        "[::]:0".parse().expect("static addr")
+    };
+    let socket = tokio::net::UdpSocket::bind(bind).await?;
+    socket.connect(server).await?;
+    Ok(socket)
 }
 
 fn unix_now() -> u64 {
@@ -735,6 +799,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(url, "https://own.example/jamstreamd");
+    }
+
+    /// The point of #121: a session on this machine is offered on loopback
+    /// first, so a same-machine join never leaves the host and the macOS
+    /// Application Firewall never gets a vote. The LAN address stays for
+    /// the bandmate on the same network.
+    #[test]
+    fn a_session_on_this_machine_offers_loopback_first() {
+        let lan: IpAddr = "192.168.1.12".parse().unwrap();
+        assert_eq!(
+            candidates_for(SocketAddr::new(lan, 43210), lan),
+            vec![
+                "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+                "192.168.1.12:43210".parse().unwrap(),
+            ]
+        );
+        // Same for a v6 host address: ::1, not 127.0.0.1.
+        let lan6: IpAddr = "fd00::5".parse().unwrap();
+        assert_eq!(
+            candidates_for(SocketAddr::new(lan6, 43210), lan6),
+            vec![
+                "[::1]:43210".parse::<SocketAddr>().unwrap(),
+                "[fd00::5]:43210".parse().unwrap(),
+            ]
+        );
+    }
+
+    /// A cloud VM is not this machine, so a cloud invite is exactly what it
+    /// was: one address. Offering loopback there would cost every guest a
+    /// connection timeout against their own machine for nothing.
+    #[test]
+    fn a_server_elsewhere_is_offered_once() {
+        let this_machine: IpAddr = "192.168.1.12".parse().unwrap();
+        let vm: SocketAddr = "203.0.113.7:43210".parse().unwrap();
+        assert_eq!(candidates_for(vm, this_machine), vec![vm]);
+        // And a host with no network at all already carries loopback; it
+        // must not be listed twice.
+        let loopback: SocketAddr = "127.0.0.1:43210".parse().unwrap();
+        assert_eq!(
+            candidates_for(loopback, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            vec![loopback]
+        );
+    }
+
+    /// Minting spends one discovery of the machine's own address for the
+    /// whole book, and every seat is offered the same places.
+    #[test]
+    fn every_seat_in_a_session_is_offered_the_same_addresses() {
+        let invites = mint_seats(3, 1);
+        let first = invites[0].1.addresses.clone();
+        assert!(!first.is_empty());
+        for (label, invite) in &invites {
+            assert_eq!(
+                invite.addresses, first,
+                "{label} was offered {:?}",
+                invite.addresses
+            );
+        }
     }
 
     #[test]

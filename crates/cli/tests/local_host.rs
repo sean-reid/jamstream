@@ -128,6 +128,13 @@ async fn local_host_join_and_end_story() {
 
     // Zero price, local provider, and a reachability check that actually
     // ran: a real server answered a real encrypted handshake.
+    //
+    // On a machine with the macOS Application Firewall on, that handshake
+    // is only possible because the invite offers loopback: the LAN path to
+    // a freshly built jamstreamd is filtered per binary and nothing comes
+    // back until somebody answers a dialog. Loopback is not filtered, so
+    // this assertion is what makes the reachability check below meaningful
+    // rather than luck.
     assert_eq!(json["provider"], "local");
     assert_eq!(json["region"], "local");
     assert_eq!(json["hourly_microusd"], 0);
@@ -140,6 +147,32 @@ async fn local_host_join_and_end_story() {
     assert_eq!(invites.len(), 2, "two musician seats: host + 1 guest");
     assert_eq!(invites[0]["role"], "host");
     assert_eq!(invites[1]["role"], "musician 1");
+    // Every invite offers this machine before it offers the network: the
+    // same-machine join never leaves the host, and the LAN address is still
+    // there for a bandmate on the same network. A machine with no LAN
+    // address at all only has the one place to offer.
+    let lan = jamstream_cloud::providers::local::primary_lan_ip();
+    for i in invites {
+        let encoded = i["invite"].as_str().unwrap();
+        let invite = jamstream_protocol::invite::Invite::decode(encoded).unwrap();
+        assert_eq!(
+            invite.addresses.first().map(ToString::to_string),
+            Some(format!("127.0.0.1:{}", args.port)),
+            "{} was not offered loopback first: {:?}",
+            i["role"],
+            invite.addresses
+        );
+        if lan.is_loopback() {
+            assert_eq!(invite.addresses.len(), 1, "{:?}", invite.addresses);
+        } else {
+            assert_eq!(
+                invite.addresses.get(1).map(ToString::to_string),
+                Some(format!("{lan}:{}", args.port)),
+                "the LAN address has to stay: {:?}",
+                invite.addresses
+            );
+        }
+    }
     let musician_seats = invites
         .iter()
         .filter(|i| {

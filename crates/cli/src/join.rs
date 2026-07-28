@@ -3,7 +3,6 @@
 //! prints session events as plain lines.
 
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -11,8 +10,7 @@ use jamstream_protocol::control::DestinationState;
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, TokenId};
 use jamstream_protocol::invite::Invite;
-use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
-use tokio::net::UdpSocket;
+use jamstream_session::client::{ClientCore, ClientEvent, ClientState, ServerCandidates};
 use tokio::time::MissedTickBehavior;
 
 use crate::CliError;
@@ -106,14 +104,11 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
     let revoke = revoke_plan(args, &invite)?;
     let mut source = WavSource::load(&args.input)?;
 
-    let server = invite.addresses[0];
-    let bind: SocketAddr = if server.is_ipv4() {
-        "0.0.0.0:0".parse().expect("static addr")
-    } else {
-        "[::]:0".parse().expect("static addr")
-    };
-    let socket = UdpSocket::bind(bind).await?;
-    socket.connect(server).await?;
+    // The invite offers candidates, not one address: a locally hosted
+    // session names loopback as well as the LAN address so a join from the
+    // hosting machine never leaves it. A timeout below moves to the next.
+    let mut candidates = ServerCandidates::new(&invite)?;
+    let mut socket = crate::host::connected_socket(candidates.current()).await?;
 
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
@@ -195,6 +190,18 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
             ClientState::Ejected { reason } => {
                 write_stereo_wav(&args.output, &received)?;
                 return Err(CliError::Failed(format!("ejected: {reason}")));
+            }
+            // Before joining, a timeout is a statement about one address,
+            // not about the session: try the next one the invite offers
+            // with a fresh handshake. Once joined it is a real loss of the
+            // server, and the session lives on the address that admitted
+            // us.
+            ClientState::TimedOut if joined_at.is_none() && candidates.has_alternatives() => {
+                let next = candidates.advance();
+                writeln!(out, "no answer, trying {next}")?;
+                socket = crate::host::connected_socket(next).await?;
+                let init = core.reconnect(now())?;
+                socket.send(&init).await?;
             }
             ClientState::TimedOut => {
                 write_stereo_wav(&args.output, &received)?;
