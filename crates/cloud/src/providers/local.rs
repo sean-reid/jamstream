@@ -121,6 +121,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::ServerArch;
 use crate::cloudinit::flat_config_value;
 use crate::private::{create_private_dir, write_private};
 use crate::provider::{Provider, ProviderError, Result};
@@ -412,6 +413,16 @@ impl LocalProvider {
 impl Provider for LocalProvider {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Local
+    }
+
+    /// This machine's own architecture; local sessions download nothing,
+    /// so the value is never used to pick an artifact.
+    fn server_arch(&self) -> ServerArch {
+        if cfg!(target_arch = "aarch64") {
+            ServerArch::Aarch64
+        } else {
+            ServerArch::X86_64
+        }
     }
 
     fn regions(&self) -> Vec<Region> {

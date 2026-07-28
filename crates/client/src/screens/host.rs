@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui, vec2};
 use jamstream_cloud::{
-    BootConfig, CostPreview, InstanceClass, LaunchSpec, Price, ProbeMatrix, Provider, ProviderKind,
-    Region, RegionId, SelfDestruct, rank, session_tag,
+    BootConfig, CostPreview, InstanceClass, LaunchSpec, PinnedServerArtifacts, Price, ProbeMatrix,
+    Provider, ProviderKind, Region, RegionId, SelfDestruct, ServerArch, rank, session_tag,
 };
 use jamstream_protocol::ids::SessionId;
 use jamstream_protocol::invite::{Invite, Issuer};
@@ -216,14 +216,16 @@ pub struct HostWizard {
     /// that decide what a forgotten session costs.
     pub idle_min: u32,
     pub max_hours: u32,
-    /// The server artifact pinned into this build, read once at
-    /// construction. When present (every release build) the wizard shows
-    /// no artifact fields at all: cloud launches silently use the pinned
-    /// pair, and the preview step carries one quiet line saying the server
-    /// download is verified. When absent (development builds) the advanced
-    /// fields below are shown and required for cloud launches. Public so
-    /// tests can pin or unpin regardless of how the test binary was built.
-    pub pinned: Option<jamstream_cloud::PinnedServerArtifact>,
+    /// The per-architecture server artifacts pinned into this build, read
+    /// once at construction; the launch picks the one matching the
+    /// provider's machines. When any pin is present (every release build)
+    /// the wizard shows no artifact fields at all: cloud launches silently
+    /// use the pinned pair, and the preview step carries one quiet line
+    /// saying the server download is verified. When empty (development
+    /// builds) the advanced fields below are shown and required for cloud
+    /// launches. Public so tests can pin or unpin regardless of how the
+    /// test binary was built.
+    pub pinned: PinnedServerArtifacts,
     pub advanced_open: bool,
     pub artifact_url: String,
     pub artifact_sha256: String,
@@ -532,7 +534,7 @@ impl HostWizard {
         self.step == WizardStep::Preview
             && self.selected_region.is_some()
             && (self.is_local()
-                || self.pinned.is_some()
+                || self.pinned.any()
                 || (!self.artifact_url.trim().is_empty()
                     && !self.artifact_sha256.trim().is_empty()))
     }
@@ -556,6 +558,23 @@ impl HostWizard {
                 return true;
             }
         };
+        // Resolved against the architecture this provider launches, and
+        // refused here if that architecture has no pin: the machine would
+        // download a binary it cannot run (#139).
+        let (artifact_url, artifact_sha256) = match resolve_artifact(
+            provider.kind() == ProviderKind::Local,
+            provider.server_arch(),
+            &self.artifact_url,
+            &self.artifact_sha256,
+            self.pinned,
+        ) {
+            Ok(pair) => pair,
+            Err(err) => {
+                self.launch_error = Some(err);
+                self.step = WizardStep::Launching;
+                return true;
+            }
+        };
         let params = LaunchParams {
             provider_name: name,
             region: row.region.clone(),
@@ -564,12 +583,8 @@ impl HostWizard {
             listeners: self.listeners,
             idle_min: self.idle_min,
             max_hours: self.max_hours,
-            // Explicit fields (development builds) outrank the pin, same
-            // precedence as the CLI's override flags.
-            artifact_url: non_empty(&self.artifact_url)
-                .or_else(|| self.pinned.map(|p| p.url.to_owned())),
-            artifact_sha256: non_empty(&self.artifact_sha256)
-                .or_else(|| self.pinned.map(|p| p.sha256.to_owned())),
+            artifact_url,
+            artifact_sha256,
             do_token: creds::lookup(
                 self.creds.as_ref(),
                 &self.env,
@@ -646,6 +661,41 @@ impl HostWizard {
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_owned())
+}
+
+/// The artifact a launch hands the boot config: the advanced-field
+/// override first (it applies to whatever architecture this launch runs
+/// on, same precedence as the CLI's flags), then the pin for `arch`, the
+/// architecture of the machines the provider launches. A cloud launch
+/// whose architecture has no pin is refused with an error naming it,
+/// because the VM could only download a binary it cannot run. Local
+/// launches download nothing and carry no artifact.
+fn resolve_artifact(
+    is_local: bool,
+    arch: ServerArch,
+    url_field: &str,
+    sha_field: &str,
+    pinned: PinnedServerArtifacts,
+) -> Result<(Option<String>, Option<String>), String> {
+    if let (Some(url), Some(sha)) = (non_empty(url_field), non_empty(sha_field)) {
+        return Ok((Some(url), Some(sha)));
+    }
+    if is_local {
+        return Ok((None, None));
+    }
+    match pinned.for_arch(arch) {
+        Some(p) => Ok((Some(p.url.to_owned()), Some(p.sha256.to_owned()))),
+        None if pinned.any() => Err(format!(
+            "this build pins no {arch} server binary and this provider launches {arch} \
+             machines, which could only download a binary they cannot run; point the \
+             advanced fields at an {arch} jamstreamd build"
+        )),
+        None => Err(
+            "a cloud launch needs the server binary url and sha256; open the advanced \
+             section of the preview step"
+                .to_owned(),
+        ),
+    }
 }
 
 /// The local provider's single region, priced at zero, without a network
@@ -1533,7 +1583,7 @@ impl HostWizard {
         }
         if !self.is_local() {
             ui.add_space(theme::SPACE_SM);
-            if self.pinned.is_some() {
+            if self.pinned.any() {
                 // Release builds: the server download is pinned into the
                 // binary and verified by the machine at boot. One quiet
                 // factual line; no URL, no hash, nothing to interact with,
@@ -1930,7 +1980,7 @@ mod tests {
         let mut w = wizard();
         // Force the development-build state regardless of how this test
         // binary was compiled.
-        w.pinned = None;
+        w.pinned = PinnedServerArtifacts::default();
         w.providers[1].status = ProviderStatus::Ready;
         w.select_provider(1);
         w.continue_to_region(vec![region_row("nyc3", 26_790, 21.0)]);
@@ -1945,10 +1995,7 @@ mod tests {
     #[test]
     fn pinned_cloud_launch_has_nothing_to_validate() {
         let mut w = wizard();
-        w.pinned = Some(jamstream_cloud::PinnedServerArtifact {
-            url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-x86_64-musl",
-            sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-        });
+        w.pinned = both_pins();
         w.providers[1].status = ProviderStatus::Ready;
         w.select_provider(1);
         w.continue_to_region(vec![region_row("nyc3", 26_790, 21.0)]);
@@ -1957,6 +2004,78 @@ mod tests {
         // and the launch is ready anyway.
         assert!(w.artifact_url.is_empty() && w.artifact_sha256.is_empty());
         assert!(w.can_launch());
+    }
+
+    /// A release-shaped pin set with two distinct downloads, so a test
+    /// that selects the wrong one cannot pass by coincidence.
+    fn both_pins() -> PinnedServerArtifacts {
+        PinnedServerArtifacts {
+            x86_64: Some(jamstream_cloud::PinnedServerArtifact {
+                url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-x86_64-musl",
+                sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            }),
+            aarch64: Some(jamstream_cloud::PinnedServerArtifact {
+                url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-aarch64-musl",
+                sha256: "4444444444444444444444444444444444444444444444444444444444444444",
+            }),
+        }
+    }
+
+    /// #139 root cause: the pin followed the build, not the machine. The
+    /// launch must select by the provider's architecture, and the real
+    /// providers disagree (AWS launches arm64, DigitalOcean x86_64), so a
+    /// single-pin resolution cannot be right for both.
+    #[test]
+    fn the_launch_selects_the_pin_for_the_providers_architecture() {
+        let pins = both_pins();
+        let (url, _) =
+            resolve_artifact(false, ServerArch::Aarch64, "", "", pins).expect("arm64 pin");
+        assert!(url.unwrap().ends_with("jamstreamd-linux-aarch64-musl"));
+        let (url, _) =
+            resolve_artifact(false, ServerArch::X86_64, "", "", pins).expect("x86_64 pin");
+        assert!(url.unwrap().ends_with("jamstreamd-linux-x86_64-musl"));
+        // The advanced-field override applies to the architecture being
+        // launched, whatever the pins say.
+        let (url, sha) = resolve_artifact(
+            false,
+            ServerArch::Aarch64,
+            "https://own.example/jamstreamd-arm64",
+            &"3".repeat(64),
+            pins,
+        )
+        .expect("override");
+        assert_eq!(url.as_deref(), Some("https://own.example/jamstreamd-arm64"));
+        assert_eq!(sha.as_deref(), Some("3".repeat(64).as_str()));
+        // Local launches carry no artifact at all.
+        assert_eq!(
+            resolve_artifact(true, ServerArch::X86_64, "", "", pins),
+            Ok((None, None))
+        );
+    }
+
+    /// A cloud launch whose architecture has no pin must refuse before a
+    /// machine is paid for, and the error must name the architecture,
+    /// because launching would produce exactly the dead VM of #139.
+    #[test]
+    fn a_missing_arch_pin_refuses_to_launch_naming_the_architecture() {
+        let x86_only = PinnedServerArtifacts {
+            aarch64: None,
+            ..both_pins()
+        };
+        let err = resolve_artifact(false, ServerArch::Aarch64, "", "", x86_only)
+            .expect_err("an arm64 launch with only an x86_64 pin must refuse");
+        assert!(err.contains("aarch64"), "error was: {err}");
+        // An unpinned development build gets the advanced-fields message
+        // instead.
+        let err = resolve_artifact(
+            false,
+            ServerArch::Aarch64,
+            "",
+            "",
+            PinnedServerArtifacts::default(),
+        )
+        .expect_err("dev builds need the fields");
+        assert!(err.contains("advanced"), "error was: {err}");
     }
 
     #[test]
