@@ -10,7 +10,7 @@ use std::sync::Arc;
 use jamstream_cloud::ObjectSink;
 use jamstream_cloud::cloudinit::RecordingStorage;
 use jamstream_cloud::cloudinit::UPLOAD_MARKER_DIR;
-use jamstream_cloud::storage::{ObjectStore, RECORDING_PREFIX};
+use jamstream_cloud::storage::{FLAC_CONTENT_TYPE, ObjectStore, session_prefix};
 
 use crate::record::{RecordingObject, RecordingSink};
 
@@ -27,8 +27,10 @@ pub struct CloudSink {
     rt: tokio::runtime::Runtime,
     store: Arc<dyn ObjectStore>,
     bucket: String,
-    /// `jamstream/recordings/<session>`; the write-only key the provider
-    /// docs describe is scoped to exactly this.
+    /// `jamstream/recordings/<session>/`; the write-only key the provider
+    /// docs describe is scoped to exactly this. Built by the same function
+    /// `jamstream recordings` lists with, so a take is found where it was
+    /// put.
     prefix: String,
     marker_dir: PathBuf,
 }
@@ -65,7 +67,7 @@ impl CloudSink {
             rt,
             store,
             bucket,
-            prefix: format!("{RECORDING_PREFIX}/{session_hex}"),
+            prefix: session_prefix(session_hex),
             marker_dir,
         })
     }
@@ -87,8 +89,8 @@ impl RecordingSink for CloudSink {
         let sink = ObjectSink::open_with_marker_dir(
             Arc::clone(&self.store),
             self.bucket.clone(),
-            format!("{}/{name}", self.prefix),
-            "audio/flac",
+            format!("{}{name}", self.prefix),
+            FLAC_CONTENT_TYPE,
             &self.marker_dir,
         );
         Ok(Box::new(CloudObject {

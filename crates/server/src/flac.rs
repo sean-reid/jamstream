@@ -11,10 +11,13 @@ use flacenc::component::{BitRepr, StreamInfo};
 use flacenc::error::{Verified, Verify};
 use flacenc::source::{Fill, FrameBuf};
 
-/// The mix clock's sample rate.
-pub const SAMPLE_RATE: usize = 48_000;
-const CHANNELS: usize = 2;
-const BITS_PER_SAMPLE: usize = 16;
+/// The mix clock's sample rate, which is the session's.
+pub const SAMPLE_RATE: usize = jamstream_protocol::SAMPLE_RATE as usize;
+/// The shape of every take. Public because the recording cost model lives in
+/// another crate and estimates bytes from these three numbers; it once quoted
+/// mono WAV for a stereo FLAC take, so a test pins them together.
+pub const CHANNELS: usize = 2;
+pub const BITS_PER_SAMPLE: usize = 16;
 /// Samples per channel per FLAC frame: the format's customary block, ~85 ms.
 pub const BLOCK_SAMPLES: usize = 4096;
 

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use jamstream_cloud::Retention;
+use jamstream_cloud::{DEFAULT_SESSION_PORT, Retention};
 // Session shape, defined once for every surface; see
 // jamstream_session::limits.
 use jamstream_session::{
@@ -122,7 +122,11 @@ pub struct HostArgs {
     pub destinations: u8,
 
     /// UDP port the session server listens on.
-    #[arg(long, default_value_t = 43210)]
+    ///
+    /// The default is the port every provider's firewall opens, so the two
+    /// come from one constant: a session behind a rule for another port is
+    /// unreachable and looks like a broken launch.
+    #[arg(long, default_value_t = DEFAULT_SESSION_PORT)]
     pub port: u16,
 
     /// Minutes without musicians before the server shuts itself down.

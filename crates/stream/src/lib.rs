@@ -52,7 +52,9 @@ pub use platform::{PlatformCatalog, PlatformSpec};
 pub use proc::{Exit, ProcId, ProcSpec, ProcessHost, StdProcessHost, Stdin};
 pub use worker::{StreamWorker, TickPayload};
 
-/// Audio sample rate everywhere in JamStream.
-pub const SAMPLE_RATE: u32 = 48_000;
+/// Audio sample rate everywhere in JamStream. The wire protocol's own
+/// constant: the encoder is fed session audio, so a second number here is a
+/// resample nobody asked for.
+pub use jamstream_protocol::SAMPLE_RATE;
 /// Interleaved stereo samples in one 2.5 ms session tick.
 pub const TICK_STEREO_SAMPLES: usize = 240;

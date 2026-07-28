@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jamstream_cloud::storage::{MockStore, ObjectStore, RECORDING_PREFIX};
+use jamstream_cloud::storage::{MockStore, ObjectStore, session_prefix};
 use jamstream_server::cloud_sink::CloudSink;
 use jamstream_server::record::{RecordPayload, RecordWorker, RecordingState};
 
@@ -64,12 +64,15 @@ fn a_take_streams_to_the_bucket_and_the_marker_clears() {
     });
 
     // The object landed under the scoped prefix, named for people, and the
-    // upload was committed rather than abandoned.
+    // upload was committed rather than abandoned. The prefix comes from the
+    // function `jamstream recordings` lists with, not from a second copy of
+    // its format string: a take written somewhere the reader does not look is
+    // a take the band cannot fetch.
     let keys = store.keys(BUCKET);
     assert_eq!(keys.len(), 1, "one mix object: {keys:?}");
     let key = &keys[0];
     assert!(
-        key.starts_with(&format!("{RECORDING_PREFIX}/{SESSION}/")) && key.ends_with("-mix.flac"),
+        key.starts_with(&session_prefix(SESSION)) && key.ends_with("-mix.flac"),
         "scoped and human-named: {key}"
     );
     assert!(store.pending_uploads().is_empty(), "nothing left in flight");

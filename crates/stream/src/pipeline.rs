@@ -22,8 +22,10 @@ use crate::platform::PlatformCatalog;
 use crate::proc::{Exit, ProcId, ProcSpec, ProcessHost, Stdin};
 use crate::yuv;
 
-/// Cards the renderer draws, mirroring `jamstream_broadcast`'s own cap.
-pub const MAX_CARDS: usize = 10;
+/// Cards the renderer draws. The renderer's own cap, not a copy of it: this
+/// bounds the roster and the level array handed to it, so a second number
+/// here would silently truncate or overrun.
+pub use jamstream_broadcast::MAX_CARDS;
 /// A session may not point at more destinations than this. Each one is a
 /// process and a copy of the egress bill.
 pub const MAX_DESTINATIONS: usize = 8;

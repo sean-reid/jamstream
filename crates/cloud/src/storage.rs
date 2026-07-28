@@ -93,9 +93,10 @@ pub const DEFAULT_PART_SIZE: usize = 16 * 1024 * 1024;
 /// S3 caps a multipart upload at 10 000 parts.
 pub const MAX_PARTS: u32 = 10_000;
 
-/// Content type for the recorded WAV objects.
+/// Content type for WAV objects. Nothing records with it: the recorder writes
+/// FLAC. Kept for the contract suite, which uploads one of each.
 pub const WAV_CONTENT_TYPE: &str = "audio/wav";
-/// Content type for recorded FLAC objects.
+/// Content type every recorded take is uploaded with.
 pub const FLAC_CONTENT_TYPE: &str = "audio/flac";
 /// Content type for the recording manifest.
 pub const JSON_CONTENT_TYPE: &str = "application/json";
