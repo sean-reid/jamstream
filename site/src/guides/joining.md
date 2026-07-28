@@ -47,12 +47,12 @@ The headline number in the status bar is mouth to ear latency in milliseconds: f
 
 Settings in the top bar opens over the session without covering the strips or the status bar:
 
-![Settings sheet over the session screen with capture and playback pickers, buffer size choices, and an input level meter](../images/session_settings.png)
+![Settings drawer beside the session: buffer size choices with the current mouth to ear figure, an input level meter, capture and playback pickers, and the avatar row](../images/session_settings.png)
 *Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*
 
-- **Capture** and **Playback** list your machine's real audio devices, system default first. Changing one mid-session reopens the audio stream on the new device without leaving the session.
-- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that plays clean; crackles mean one step up.
+- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that plays clean; crackles mean one step up. The mouth to ear figure under the choices moves with them, because the buffer is part of it.
 - The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.
+- **Capture** and **Playback** list your machine's real audio devices, system default first. Changing one mid-session reopens the audio stream on the new device without leaving the session.
 - **Your avatar** opens a file picker: choose a PNG or JPEG and everyone in the session gets the picture over the same encrypted link as the audio. A photo is cropped square and fitted to 256x256 first, so a picture straight off a phone works as it is. The choice lasts for this run of the app; set it again after a restart. Remove drops it here and on your next join, though members already in the session keep the picture you sent them.
 
 ## From the terminal
