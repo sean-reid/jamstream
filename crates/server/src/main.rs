@@ -58,7 +58,13 @@ fn main() -> ExitCode {
         }
     };
 
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), cfg.port);
+    let bind = match bind_arg(cfg.port) {
+        Ok(bind) => bind,
+        Err(err) => {
+            tracing::error!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let opts = Options {
         bind,
         activity_path: Some(
@@ -104,11 +110,11 @@ fn main() -> ExitCode {
                 }
             }
             Err(err) => {
-                tracing::error!(%err, "bind failed");
+                tracing::error!(%err, address = %bind, hint = bind_hint(&err), "cannot listen");
                 return ExitCode::FAILURE;
             }
         };
-        tracing::info!(port = cfg.port, "session server up");
+        tracing::info!(address = %bind, "session server up");
         match server.run(shutdown_signal()).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -176,6 +182,55 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Which address to listen on, from `--bind`. The port always comes from the
+/// config: it is the provisioning contract, and the invites already name it.
+///
+/// The default is every interface, and it has to stay that way. A session is
+/// reachable from the LAN and from the internet, so a cloud VM that bound
+/// loopback would serve nobody.
+///
+/// The flag exists for the other case. The macOS Application Firewall
+/// filters incoming connections per binary and does not govern loopback, so
+/// a freshly built jamstreamd binding every interface raises a dialog, and
+/// on a managed Mac that dialog cannot be pre-answered from the command
+/// line. Every rebuild is a new binary and therefore a new dialog. Tests
+/// that spawn a real server pass `--bind 127.0.0.1` and never meet it; a
+/// host jamming alone on a locked-down laptop can do the same.
+fn bind_arg(port: u16) -> Result<SocketAddr, String> {
+    parse_bind(arg_value("--bind").as_deref(), port)
+}
+
+fn parse_bind(value: Option<&str>, port: u16) -> Result<SocketAddr, String> {
+    let Some(value) = value else {
+        return Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
+    };
+    value
+        .parse::<IpAddr>()
+        .map(|ip| SocketAddr::new(ip, port))
+        .map_err(|_| format!("--bind must be an IP address, not {value:?}"))
+}
+
+/// What a host can do about a bind that failed. Worth saying out loud: the
+/// symptom everyone else sees is a handshake that never completes, which
+/// names the wrong layer entirely.
+fn bind_hint(err: &std::io::Error) -> &'static str {
+    match err.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            "another process already holds this port; a leftover jamstreamd is the usual one, \
+             so check for one and end its session or pick another port"
+        }
+        std::io::ErrorKind::AddrNotAvailable => {
+            "no interface on this machine has that address; --bind takes one of this machine's \
+             own addresses, or 0.0.0.0 for all of them"
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            "the OS refused the port; ports below 1024 need privileges, and a local firewall \
+             can refuse one outright"
+        }
+        _ => "the socket could not be opened; nothing will reach this session until it can",
+    }
+}
+
 /// Parses a fractional-minutes window flag; an absent flag or 0 means
 /// disabled (Duration::ZERO).
 fn minutes_arg(flag: &str) -> Result<Duration, String> {
@@ -194,4 +249,53 @@ fn arg_value(flag: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bind;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// The default has to keep being every interface: a session VM that
+    /// bound loopback would serve nobody, and no released host passes the
+    /// flag.
+    #[test]
+    fn no_flag_still_binds_every_interface() {
+        assert_eq!(
+            parse_bind(None, 43210).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 43210)
+        );
+    }
+
+    /// The reason the flag exists: loopback is the one address the macOS
+    /// Application Firewall does not get a vote on.
+    #[test]
+    fn an_address_is_taken_with_the_config_port() {
+        assert_eq!(
+            parse_bind(Some("127.0.0.1"), 51205).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51205)
+        );
+        assert_eq!(
+            parse_bind(Some("::1"), 51205).unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51205)
+        );
+        assert_eq!(
+            parse_bind(Some("0.0.0.0"), 51205).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 51205)
+        );
+    }
+
+    /// The port comes from the config, so a value carrying one is a
+    /// misunderstanding worth naming rather than half-honoring.
+    #[test]
+    fn a_value_that_is_not_an_address_is_refused_by_name() {
+        for value in ["127.0.0.1:43210", "localhost", "", "0.0.0.0/0"] {
+            let err = parse_bind(Some(value), 43210).unwrap_err();
+            assert!(
+                err.contains("IP address"),
+                "{value:?} was rejected as {err}"
+            );
+            assert!(err.contains(value) || value.is_empty(), "{err}");
+        }
+    }
 }

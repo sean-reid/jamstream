@@ -18,12 +18,14 @@
 
 mod common;
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use common::fixture;
 use jamstream_cli::cli::{EndArgs, HostArgs, JoinArgs};
 use jamstream_cli::{end, host, join, providers, state, sweep};
+use jamstream_cloud::providers::local::LocalProvider;
 
 #[cfg(windows)]
 const BIN_NAME: &str = "jamstreamd.exe";
@@ -82,6 +84,45 @@ fn free_udp_port() -> u16 {
         .port()
 }
 
+/// Kills the spawned server if this test leaves without ending its session.
+/// The failure path is the one that matters: a test about processes that
+/// outlive their launcher must not leave one behind when it fails, and a
+/// panic anywhere below drops this on the way out.
+struct ServerGuard(Arc<Mutex<Option<String>>>);
+
+impl ServerGuard {
+    fn new() -> Self {
+        ServerGuard(Arc::new(Mutex::new(None)))
+    }
+
+    fn watch(&self, pid: &str) {
+        *self.0.lock().expect("guard") = Some(pid.to_owned());
+    }
+
+    /// The session ended cleanly; there is nothing left to kill.
+    fn disarm(&self) {
+        self.0.lock().expect("guard").take();
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.0.lock().map(|mut g| g.take()).unwrap_or(None) else {
+            return;
+        };
+        eprintln!("test left jamstreamd {pid} running; killing it");
+        #[cfg(unix)]
+        let mut kill = std::process::Command::new("/bin/kill");
+        #[cfg(unix)]
+        kill.args(["-9", &pid]);
+        #[cfg(windows)]
+        let mut kill = std::process::Command::new("taskkill");
+        #[cfg(windows)]
+        kill.args(["/PID", &pid, "/T", "/F"]);
+        let _ = kill.status();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_host_join_and_end_story() {
     let state_dir = std::env::temp_dir().join(format!(
@@ -100,7 +141,8 @@ async fn local_host_join_and_end_story() {
         std::env::set_var("JAMSTREAMD_PATH", &server_binary);
     }
 
-    // Host through the real provider resolution, exactly as main.rs does.
+    let guard = ServerGuard::new();
+
     let args = HostArgs {
         provider: "local".to_owned(),
         region: None,
@@ -119,12 +161,33 @@ async fn local_host_join_and_end_story() {
         yes: true,
         json: true,
     };
-    let provider = providers::resolve("local").unwrap();
+    // Confined to loopback. The provider is built here rather than through
+    // providers::resolve so the bind can be set: the macOS Application
+    // Firewall filters incoming connections per binary and every rebuild of
+    // jamstreamd is a new binary, so a server bound to every interface
+    // raises a dialog on a developer's machine and drops this test's
+    // datagrams until somebody answers it. Loopback is the one path it does
+    // not govern. Resolution itself is still covered, by the fresh provider
+    // at the end of this test.
+    let provider = LocalProvider::new(state_dir.clone()).with_bind(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let mut out = Vec::new();
-    host::run(&args, provider.as_ref(), &mut out).await.unwrap();
+    let hosted = host::run(&args, &provider, &mut out).await;
     let text = String::from_utf8(out).unwrap();
+    // The pid is in the output whether or not host::run succeeded past it,
+    // so the guard learns about the server before anything below can panic.
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(pid) = json["instance_id"].as_str()
+    {
+        guard.watch(pid);
+    }
+    hosted.unwrap();
     let json: serde_json::Value = serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("host --json must emit exactly one JSON object ({e}): {text}"));
+
+    // The session is on loopback end to end: the server listens there and
+    // the invites say so, so nothing this test does crosses an interface a
+    // firewall can filter.
+    assert_eq!(json["address"], format!("127.0.0.1:{}", args.port));
 
     // Zero price, local provider, and a reachability check that actually
     // ran: a real server answered a real encrypted handshake.
@@ -191,6 +254,7 @@ async fn local_host_join_and_end_story() {
         .await
         .unwrap();
     assert!(String::from_utf8(out).unwrap().contains("ended"));
+    guard.disarm();
 
     // The process is gone, not just deregistered. The host-time provider
     // in this very process still holds the unreaped child handle, so the
