@@ -68,6 +68,18 @@ pub fn resolve(name: &str) -> Result<Box<dyn Provider>, CliError> {
     resolve_for_port(name, DEFAULT_SESSION_PORT)
 }
 
+/// [`resolve_for_port`] plus the host's recording choice, which only the
+/// local provider consumes: its takes land in [`state::recordings_dir`],
+/// the same directory `jamstream host` prints. Recording on any other
+/// provider is refused by `host::run`, where the refusal can say why.
+pub fn resolve_for_host(args: &crate::cli::HostArgs) -> Result<Box<dyn Provider>, CliError> {
+    if args.provider == "local" && args.wants_recording() {
+        let provider = local_provider()?.with_record(state::recordings_dir()?, args.record_stems);
+        return Ok(Box::new(provider));
+    }
+    resolve_for_port(&args.provider, args.port)
+}
+
 /// [`resolve`] for a host that picked its own session port. The port is the
 /// only one the provider opens in the firewall it creates for the session,
 /// so `jamstream host --port` has to reach the provider or the VM comes up

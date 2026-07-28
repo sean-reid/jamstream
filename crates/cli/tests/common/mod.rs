@@ -1,13 +1,118 @@
 //! Shared helpers for the CLI end-to-end tests: deterministic audio
 //! fixtures regenerated on demand under target/fixtures/ (the generator
-//! mirrors `cargo xtask fixtures`; keep the two in sync), and WAV energy
-//! measurements for asserting on captured mixes.
+//! mirrors `cargo xtask fixtures`; keep the two in sync), WAV energy
+//! measurements for asserting on captured mixes, and the jamstreamd
+//! build-and-kill plumbing the local session stories share.
 
 #![allow(dead_code)] // each test binary uses a different subset
 
 use std::path::{Path, PathBuf};
 
 pub const RATE: u32 = 48_000;
+
+#[cfg(windows)]
+pub const BIN_NAME: &str = "jamstreamd.exe";
+#[cfg(not(windows))]
+pub const BIN_NAME: &str = "jamstreamd";
+
+/// Builds (if needed) and returns the jamstreamd binary for this profile.
+///
+/// CARGO_BIN_EXE_<name> only covers binaries of the package under test, so
+/// the cli tests cannot ask Cargo for jamstreamd directly. Instead this
+/// derives the profile directory from the test's own executable path
+/// (target/<profile>/deps/<test>-<hash>), runs `cargo build -p
+/// jamstream-server --bin jamstreamd` against the workspace to guarantee
+/// the binary exists and is fresh (a no-op when it already is), and returns
+/// target/<profile>/jamstreamd for JAMSTREAMD_PATH.
+pub fn jamstreamd_binary() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let profile_dir = exe
+        .parent() // deps/
+        .and_then(|d| d.parent()) // target/<profile>/
+        .expect("test executable must sit in target/<profile>/deps")
+        .to_path_buf();
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut build = std::process::Command::new(cargo);
+    build.args(["build", "-p", "jamstream-server", "--bin", "jamstreamd"]);
+    if profile_dir.file_name().is_some_and(|n| n == "release") {
+        build.arg("--release");
+    }
+    let status = build.current_dir(&workspace).status();
+
+    let binary = profile_dir.join(BIN_NAME);
+    match status {
+        Ok(s) if s.success() => {}
+        // A failed or unavailable cargo is tolerable if an earlier build
+        // already produced the binary; without one the test cannot run.
+        _ if binary.is_file() => eprintln!(
+            "warning: cargo build -p jamstream-server failed; using the existing {}",
+            binary.display()
+        ),
+        _ => panic!(
+            "cannot build jamstreamd and none exists at {}; \
+             run `cargo build -p jamstream-server` first",
+            binary.display()
+        ),
+    }
+    assert!(
+        binary.is_file(),
+        "cargo build succeeded but {} is missing; unusual target layout?",
+        binary.display()
+    );
+    binary
+}
+
+/// Bind-then-drop; racy in principle, unique enough in practice.
+pub fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Kills the spawned server if a test leaves without ending its session.
+/// The failure path is the one that matters: a test about processes that
+/// outlive their launcher must not leave one behind when it fails, and a
+/// panic anywhere below drops this on the way out.
+pub struct ServerGuard(std::sync::Mutex<Option<String>>);
+
+impl ServerGuard {
+    pub fn new() -> Self {
+        ServerGuard(std::sync::Mutex::new(None))
+    }
+
+    pub fn watch(&self, pid: &str) {
+        *self.0.lock().expect("guard") = Some(pid.to_owned());
+    }
+
+    /// The session ended cleanly; there is nothing left to kill.
+    pub fn disarm(&self) {
+        self.0.lock().expect("guard").take();
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.0.lock().map(|mut g| g.take()).unwrap_or(None) else {
+            return;
+        };
+        eprintln!("test left jamstreamd {pid} running; killing it");
+        #[cfg(unix)]
+        let mut kill = std::process::Command::new("/bin/kill");
+        #[cfg(unix)]
+        kill.args(["-9", &pid]);
+        #[cfg(windows)]
+        let mut kill = std::process::Command::new("taskkill");
+        #[cfg(windows)]
+        kill.args(["/PID", &pid, "/T", "/F"]);
+        let _ = kill.status();
+    }
+}
 
 /// Where the tests keep their regenerable fixtures. Deliberately inside
 /// target/ so no top-level fixtures directory appears from running tests.
