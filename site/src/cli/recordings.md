@@ -46,14 +46,14 @@ Downloading is the one part of recording that costs money after the session has 
 ```console
 $ jamstream recordings get 3f2a9c01 --out ~/takes
 Session 3f2a9c01 recorded 3 takes in my-jams (aws/eu-west-1), delete after 30 days.
-Download 2.76 GB at $0.09/GB                                        $0.248832
+Download 2.76 GB at $0.09/GB                    $0.248832
 Egress is billed on the download, not on the recording.
 Your plan includes 100 GB/month of free download, so this is an upper bound.
 Billed to your own cloud account at list prices; JamStream never sees it.
 Download these takes? [y/N] y
-  mix.flac                                   100%
-  stems/bass.flac                            100%
-  stems/drums.flac                           100%
+  mix.flac                                 100%
+  stems/bass.flac                          100%
+  stems/drums.flac                         100%
 3 takes in /Users/you/takes, 2.76 GB.
 Egress for this download: $0.248832.
 ```
