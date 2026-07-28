@@ -1,7 +1,13 @@
 #!/bin/sh
 # Refreshes the screenshots the book shows from the previews the snapshot
-# suite renders. Regenerate those first:
+# suite renders. Regenerate those first, from a clean directory:
+#   rm -rf target/ui-previews
 #   cargo test -p jamstream-client --test ui_snapshots
+#
+# The rm matters. publishable.txt is appended to and never truncated, so a
+# fixture demoted out of snapshot_for_docs leaves its old line behind and the
+# manifest check below keeps passing against it. docs-check.yml clears the
+# directory for the same reason.
 # Default: copy. --check: compare byte for byte and fail naming what differs,
 # so a UI change that moves a baseline must refresh the committed copy in the
 # same change.
