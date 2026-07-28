@@ -20,7 +20,9 @@
 //!
 //! A directory that already exists is inspected rather than altered: the
 //! state dir may be a path the user chose, and silently rewriting its
-//! permissions is not ours to do. World-writable is refused outright.
+//! permissions is not ours to do. On unix a directory another account owns,
+//! or one that is group- or world-writable, is refused outright: any of the
+//! three lets someone else swap the files under the keys.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -119,30 +121,45 @@ fn private_dir_builder() -> std::fs::DirBuilder {
     std::fs::DirBuilder::new()
 }
 
-/// Refuses a directory every account on the machine can write to, which is
-/// what a pre-created `/tmp/jamstream` looks like. Group-writable only
-/// warns: user-private groups make it common and usually harmless, and
-/// deciding otherwise would mean resolving group membership.
+/// Refuses a directory this account does not own or that other accounts can
+/// write to: either way somebody else controls what sits under the key
+/// files. A pre-created `/tmp/jamstream` fails the write bits; a directory
+/// another account handed over fails `st_uid == geteuid()`, the check
+/// issue #49 asked for and only libc can make.
 #[cfg(unix)]
 fn check_exposure(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
-    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o7777;
-    if mode & 0o002 != 0 {
+    let meta = std::fs::metadata(dir)?;
+    // geteuid cannot fail; the unsafe is only FFI.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} is writable by every account on this machine (mode {mode:o}); \
-                 refusing to keep key material there",
-                dir.display()
+                "{} is owned by uid {}, not by this account (uid {euid}); \
+                 refusing to keep key material in a directory someone else owns",
+                dir.display(),
+                meta.uid()
             ),
         ));
     }
-    if mode & 0o020 != 0 {
-        tracing::warn!(
-            dir = %dir.display(),
-            mode = format!("{mode:o}"),
-            "state directory is group-writable"
-        );
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        let who = if mode & 0o002 != 0 {
+            "every account on this machine"
+        } else {
+            "its group"
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is writable by {who} (mode {mode:o}); refusing to keep key \
+                 material there. Fix it with: chmod 700 {}",
+                dir.display(),
+                dir.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -353,6 +370,51 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         create_private_dir(&dir).unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Group-writable is refused the same way: whoever shares the group can
+    /// swap the files under the keys, and nothing here resolves membership
+    /// to prove nobody does.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_state_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = temp_dir("groupw");
+        let dir = root.join("jamstream");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        let err = create_private_dir(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("group"), "error was: {err}");
+        assert!(err.to_string().contains("chmod 700"), "error was: {err}");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        create_private_dir(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A real directory owned by a real other account: `/` belongs to root,
+    /// and issuer keys must not live in a directory someone else owns even
+    /// when its modes look tight. The dirs this suite creates prove the
+    /// other side: they are ours and pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_dir_owned_by_another_account_is_refused() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, everything is ours");
+            return;
+        }
+        let err = check_exposure(Path::new("/")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("owned by uid 0"),
+            "error was: {err}"
+        );
+
+        let ours = temp_dir("owned");
+        check_exposure(&ours).unwrap();
+        let _ = std::fs::remove_dir_all(&ours);
     }
 
     /// The ACL tightening must leave the directory usable by us: the worst

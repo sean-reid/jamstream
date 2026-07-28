@@ -19,9 +19,9 @@
 //! `PATH`. When none resolves, launch fails with an error naming all four.
 //!
 //! It has to be the server binary, not a wrapper that execs it: liveness
-//! compares the running image to the name that was launched (see
-//! [`ps_probe`]), and after an exec those differ, so a wrapped server reads
-//! as not ours and never gets destroyed.
+//! compares the running image to the name that was launched (see the
+//! platform notes below), and after an exec those differ, so a wrapped
+//! server reads as not ours and never gets destroyed.
 //!
 //! # Registry
 //!
@@ -31,8 +31,8 @@
 //! memory, so a fresh provider on the same state dir (the sweeper story)
 //! still finds and can destroy sessions an earlier process launched.
 //! Liveness is verified on every list and dead entries are pruned. The
-//! image name and the start time are the pid-reuse guard: see
-//! [`Spawned`] and `process::alive`.
+//! start token, the image name, and the start time are the pid-reuse
+//! guard: see [`Spawned`] and [`classify`].
 //!
 //! # Reachability
 //!
@@ -92,18 +92,30 @@
 //! names is then free to belong to anyone; killing it on the strength of
 //! the number alone is how a sweeper murders a stranger's process.
 //!
-//! On unix that is `ps -p <pid> -o stat=,etime=,comm=` parsed by
-//! [`ps_probe`]: zombies count as dead (a terminated child whose parent has
-//! not reaped it must not look alive), the command name is compared to the
-//! image recorded at launch, and the elapsed time is reconciled with the
-//! recorded start. Termination is SIGTERM with a SIGKILL fallback after
-//! 5 s.
+//! On unix liveness is `libc::kill(pid, 0)`, no subprocess and no output
+//! to parse (EPERM still reads as alive: a pid we cannot signal exists),
+//! and identity comes from the platform's own books: `/proc/<pid>/stat`
+//! plus `/proc/<pid>/exe` on Linux, `proc_pidinfo` plus `proc_pidpath` on
+//! macOS. Each launch records the start token the platform reports for the
+//! new pid (start ticks since boot on Linux, microsecond start time on
+//! macOS); a probe *corroborates* a pid by matching that token exactly,
+//! which no recycled pid can. The image name and the recorded wall-clock
+//! start stay on as contradiction checks for entries an older build wrote
+//! without a token. Zombies count as dead (a terminated child whose parent
+//! has not reaped it must not look alive). Termination is SIGTERM with a
+//! SIGKILL fallback after 5 s, both `libc::kill` - and the SIGKILL is only
+//! ever sent to a corroborated pid. An entry with nothing to corroborate
+//! (an older registry, a unix without a cheap identity read) still gets
+//! the sentinel and the SIGTERM, and destroy says exactly what it skipped.
 //!
 //! On Windows the forced step is `taskkill /PID <pid> /T /F` and liveness
 //! is an exact-match `tasklist /FI "PID eq <pid>" /NH /FO CSV` parse
-//! ([`tasklist_probe`]) cross-checked against the image name. The Windows
-//! path is exercised by the `cfg(windows)` tests below on the CI Windows
-//! runner; it has had no soak on real Windows hardware.
+//! ([`tasklist_probe`]) cross-checked against the image name, which is as
+//! much identity as the platform offers at probe cost (see the note on
+//! start times there); the match is also what corroborates a pid for the
+//! forced kill. The Windows path is exercised by the `cfg(windows)` tests
+//! below on the CI Windows runner; it has had no soak on real Windows
+//! hardware.
 //!
 //! # File permissions
 //!
@@ -181,6 +193,14 @@ struct RegistryEntry {
     /// pre-existing behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image_name: Option<String>,
+    /// Platform-native start token of the spawned process (start ticks
+    /// since boot on Linux, microsecond start time on macOS), read at spawn
+    /// and matched exactly by every later probe: it is the one field a
+    /// recycled pid cannot reproduce. Absent in a registry an older build
+    /// wrote, or on a platform with no cheap read for it; such entries are
+    /// uncorroborated and never get the forced kill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proc_start: Option<u64>,
 }
 
 impl RegistryEntry {
@@ -188,14 +208,16 @@ impl RegistryEntry {
         Spawned {
             image_name: self.image_name.as_deref(),
             started_unix: self.started_unix,
+            proc_start: self.proc_start,
         }
     }
 }
 
 /// What the registry knows about a spawn beyond its pid, which is the only
 /// thing that lets a liveness probe tell our server from whatever process
-/// inherited the number. Either field may be absent in a registry written
-/// by an older build; a probe skips the checks it cannot make.
+/// inherited the number. Any field may be absent in a registry written by
+/// an older build; a probe skips the checks it cannot make and reports the
+/// pid uncorroborated.
 #[derive(Debug, Clone, Copy)]
 struct Spawned<'a> {
     image_name: Option<&'a str>,
@@ -203,6 +225,25 @@ struct Spawned<'a> {
     /// unix reconciles it; [`tasklist_probe`] explains why Windows cannot.
     #[cfg_attr(windows, allow(dead_code))]
     started_unix: u64,
+    /// See [`RegistryEntry::proc_start`]. Windows records none, so the
+    /// field is dead weight there by design.
+    #[cfg_attr(windows, allow(dead_code))]
+    proc_start: Option<u64>,
+}
+
+/// One registry entry's pid, as the probe judged it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// No process, a zombie, or a live pid that is demonstrably not our
+    /// spawn: nothing to signal, safe to prune.
+    Dead,
+    /// Alive and corroborated as the process the entry describes, either by
+    /// the start token (image name on Windows) or by the Child handle this
+    /// very provider spawned it from.
+    Ours,
+    /// Alive with nothing recorded, or nothing obtainable, to corroborate
+    /// against: listed, asked to exit, never force-killed.
+    Unverified,
 }
 
 pub struct LocalProvider {
@@ -365,24 +406,49 @@ impl LocalProvider {
         Ok(out)
     }
 
-    /// True while the process runs. Reaps children this provider spawned so
-    /// their exit is visible immediately; foreign pids go through the
-    /// platform probe, which takes what the registry recorded so a recycled
-    /// pid cannot pass for ours.
-    fn pid_alive(&self, pid: u32, spawned: Spawned<'_>) -> bool {
+    /// What one pid is to us right now. Reaps children this provider
+    /// spawned so their exit is visible immediately (a still-running child
+    /// we hold the handle of is ours beyond doubt); foreign pids go through
+    /// the platform probe, which takes what the registry recorded so a
+    /// recycled pid cannot pass for ours.
+    fn pid_liveness(&self, pid: u32, spawned: Spawned<'_>) -> Liveness {
         let mut children = self.children.lock().unwrap();
         if let Some(child) = children.get_mut(&pid) {
             match child.try_wait() {
                 Ok(Some(_)) => {
                     children.remove(&pid);
-                    return false;
+                    return Liveness::Dead;
                 }
-                Ok(None) => return true,
+                Ok(None) => return Liveness::Ours,
                 Err(_) => {}
             }
         }
         drop(children);
-        process::alive(pid, spawned)
+        match process::probe(pid, spawned) {
+            PidProbe::Dead => Liveness::Dead,
+            PidProbe::Alive { corroborated: true } => Liveness::Ours,
+            PidProbe::Alive {
+                corroborated: false,
+            } => Liveness::Unverified,
+            // Loud, because the honest answer ("not ours") means we will
+            // never signal this pid, so a real leak of our own server would
+            // otherwise be invisible.
+            PidProbe::Mismatch { running } => {
+                tracing::warn!(
+                    pid,
+                    running = %running,
+                    expected = spawned.image_name.unwrap_or(""),
+                    "pid is alive but is not the process we launched; treating it as \
+                     dead rather than signalling an unrelated process"
+                );
+                Liveness::Dead
+            }
+        }
+    }
+
+    /// True while the process runs, whether or not it could be corroborated.
+    fn pid_alive(&self, pid: u32, spawned: Spawned<'_>) -> bool {
+        self.pid_liveness(pid, spawned) != Liveness::Dead
     }
 
     fn instance_for(entry: &RegistryEntry, ip: IpAddr) -> Instance {
@@ -520,6 +586,11 @@ impl Provider for LocalProvider {
         let pid = child.id();
         self.children.lock().unwrap().insert(pid, child);
         let image_name = binary.file_name().map(|n| n.to_string_lossy().into_owned());
+        // The start token the platform reports for the fresh pid, the exact
+        // identity every later probe corroborates against. Read while the
+        // process is certainly there: it is our unreaped child, so even an
+        // instant exit leaves the token readable.
+        let proc_start = process::start_token(pid);
 
         // Recorded before the readiness wait so even a botched startup is
         // visible to list_tagged and gets swept, never leaked.
@@ -527,6 +598,7 @@ impl Provider for LocalProvider {
         let spawned = Spawned {
             image_name: image_name.as_deref(),
             started_unix,
+            proc_start,
         };
         self.with_registry(|entries| {
             entries.push(RegistryEntry {
@@ -535,6 +607,7 @@ impl Provider for LocalProvider {
                 config_path: config_path.clone(),
                 started_unix,
                 image_name: image_name.clone(),
+                proc_start,
             })
         })?;
 
@@ -582,7 +655,8 @@ impl Provider for LocalProvider {
             return Err(ProviderError::NotFound(format!("local instance {id}")));
         };
         let spawned = entry.spawned();
-        if !self.pid_alive(pid, spawned) {
+        let liveness = self.pid_liveness(pid, spawned);
+        if liveness == Liveness::Dead {
             self.with_registry(|entries| entries.retain(|e| e.pid != pid))?;
             let _ = std::fs::remove_dir_all(self.session_dir(&entry.session));
             return Err(ProviderError::NotFound(format!(
@@ -599,6 +673,25 @@ impl Provider for LocalProvider {
         process::terminate(pid);
         let grace = process::term_grace(asked && graceful_shutdown_supported(&dir));
         if !self.wait_dead(pid, spawned, grace).await {
+            // Insisting is only for a pid the registry can prove is still
+            // our spawn. An entry with nothing to corroborate (older build,
+            // platform without a cheap identity read) got the sentinel and
+            // the polite request; a forced kill on the pid's say-so alone
+            // is how a sweeper murders a stranger's process.
+            if liveness == Liveness::Unverified {
+                tracing::warn!(
+                    pid,
+                    "identity uncorroborated; skipping the forced {}",
+                    process::FORCED_KILL
+                );
+                return Err(ProviderError::Other(format!(
+                    "local instance {id} is still running after the shutdown request, \
+                     and the registry entry cannot corroborate that pid {pid} is still \
+                     the server it launched (entry from an older build?); skipped the \
+                     forced {} - end the process by hand if it is yours",
+                    process::FORCED_KILL
+                )));
+            }
             if !grace.is_zero() {
                 tracing::warn!(pid, "graceful termination timed out, killing");
             }
@@ -918,9 +1011,11 @@ pub fn primary_lan_ip() -> IpAddr {
 enum PidProbe {
     /// No process with that pid, or one that has already exited.
     Dead,
-    /// A process with that pid matching everything the registry recorded
-    /// about our spawn (or nothing was recorded to check against).
-    Alive,
+    /// A live process that contradicts nothing the registry recorded.
+    /// `corroborated` is the stronger claim: the platform positively
+    /// matched the identity recorded at spawn (the start token on unix, the
+    /// image name on Windows), which is what earns the forced kill.
+    Alive { corroborated: bool },
     /// A live pid that is not the process we launched: it was recycled
     /// while our registry entry went stale. `running` describes what is
     /// there instead, for the log.
@@ -951,8 +1046,8 @@ enum PidProbe {
 /// tolerates a missing or extra `.exe`, because CreateProcess appends the
 /// extension the registry may not have recorded.
 ///
-/// The registry's `started_unix` is the stronger check and unix reconciles
-/// it (see [`ps_probe`]), but Windows has no column for it: `wmic process
+/// Start times are the stronger check and unix reads them (see
+/// [`classify`]), but Windows has no cheap column for them: `wmic process
 /// where processid=N get creationdate` is deprecated and gone from Windows
 /// 11 24H2, and `powershell -Command "Get-Process -Id N | Select-Object
 /// StartTime"` costs a PowerShell startup (a few hundred ms) on every
@@ -977,7 +1072,13 @@ fn tasklist_probe(stdout: &str, pid: u32, expect_image: Option<&str>) -> PidProb
             Some(want) if !same_image(image, want) => PidProbe::Mismatch {
                 running: (*image).to_owned(),
             },
-            _ => PidProbe::Alive,
+            // The image match is the identity check Windows has, so it is
+            // also what corroborates the pid; with nothing recorded the pid
+            // is alive on its own say-so and never gets the forced kill.
+            Some(_) => PidProbe::Alive { corroborated: true },
+            None => PidProbe::Alive {
+                corroborated: false,
+            },
         };
     }
     PidProbe::Dead
@@ -1023,16 +1124,15 @@ fn csv_quoted_fields(line: &str) -> Vec<&str> {
     fields
 }
 
-/// How far a process's reconstructed start time may sit after the moment
-/// the registry recorded the spawn before the entry is judged stale.
+/// How far a process's observed start time may sit after the moment the
+/// registry recorded the spawn before the entry is judged stale.
 ///
-/// The window is wide on purpose. `etime` is elapsed time, so the start it
-/// implies is derived from the current wall clock, while `started_unix` was
-/// read from the wall clock as it stood at launch: an NTP step between the
-/// two shifts one and not the other, and being wrong in that direction
-/// means refusing to destroy a session that is genuinely ours. Five minutes
-/// absorbs any correction a laptop makes after resume while still catching
-/// what this check is for, an entry that outlived a reboot.
+/// The window is wide on purpose. The platform's start time and
+/// `started_unix` were read from clocks that can step apart (an NTP
+/// correction after a laptop resume shifts one and not the other), and
+/// being wrong in that direction means refusing to destroy a session that
+/// is genuinely ours. Five minutes absorbs any such correction while still
+/// catching what this check is for, an entry that outlived a reboot.
 #[cfg(any(unix, test))]
 const START_SLACK_SECS: u64 = 300;
 
@@ -1041,76 +1141,86 @@ const START_SLACK_SECS: u64 = 300;
 #[cfg(any(unix, test))]
 const COMM_MAX: usize = 15;
 
-/// Parse of `ps -p <pid> -o stat=,etime=,comm=`, one line, three fields:
-/// process state, elapsed time, command.
-///
-/// Both identity checks come out of that single call, which is what makes
-/// them affordable in a sweeper that probes every entry on every list:
-///
-/// * the command name against the image recorded at launch. Unix reports it
-///   differently per platform (Linux gives the kernel's `comm`, a bare name
-///   truncated to [`COMM_MAX`]; macOS gives argv[0], which is the path the
-///   process was launched from), so the comparison is on file names with a
-///   truncation allowance and nothing else;
-/// * the elapsed time against `started_unix`. A pid that came back around
-///   started after we recorded ours, so a process younger than the entry by
-///   more than [`START_SLACK_SECS`] is not the process the entry describes.
-///   This is the half that catches a pid recycled by another `jamstreamd`,
-///   which the name check alone cannot see.
-///
-/// Either way a mismatch reads as dead and the caller never signals it:
-/// refusing to kill a stranger's process is the only acceptable way to be
-/// wrong here.
+/// What the platform could see about the process currently holding a pid,
+/// filled by the per-OS `identity` readers in [`process`]. Every field the
+/// platform cannot supply stays empty and [`classify`] skips its check.
 #[cfg(any(unix, test))]
-fn ps_probe(stdout: &str, spawned: Spawned<'_>, now_unix: u64) -> PidProbe {
-    let Some((stat, etime, comm)) = stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .and_then(split_ps_fields)
-    else {
-        return PidProbe::Dead;
-    };
-    // A terminated child whose parent has not reaped it is not alive.
-    if stat.starts_with('Z') {
+#[derive(Debug, Default)]
+struct Observed {
+    /// A terminated child whose parent has not reaped it: not alive.
+    zombie: bool,
+    /// Platform-native start token, comparable only to a
+    /// [`RegistryEntry::proc_start`] recorded on the same machine.
+    start_token: Option<u64>,
+    /// Wall-clock second the process started, when derivable.
+    start_unix: Option<u64>,
+    /// Every name the platform gives the running image (the kernel's comm,
+    /// the executable path); matching any one of them clears the check,
+    /// because they legitimately disagree after an exec through a symlink.
+    images: Vec<String>,
+}
+
+/// Judges what the platform observed against what the registry recorded,
+/// one platform-independent rulebook for both:
+///
+/// * the start token is the identity: an exact match is the one thing a
+///   recycled pid cannot fake, so it corroborates the pid outright, and a
+///   token that differs is a recycled pid however right the name looks;
+/// * the image name and the wall-clock start are contradiction checks for
+///   entries with no token (a registry an older build wrote): a process
+///   running some other image, or one younger than its entry by more than
+///   [`START_SLACK_SECS`], is not the process the entry describes.
+///
+/// A mismatch reads as dead and the caller never signals it: refusing to
+/// kill a stranger's process is the only acceptable way to be wrong here.
+/// Contradicting nothing while matching no token reads alive but
+/// uncorroborated, which destroy honors by never escalating past SIGTERM.
+#[cfg(any(unix, test))]
+fn classify(observed: &Observed, spawned: Spawned<'_>) -> PidProbe {
+    if observed.zombie {
         return PidProbe::Dead;
     }
+    if let (Some(seen), Some(recorded)) = (observed.start_token, spawned.proc_start) {
+        if seen == recorded {
+            return PidProbe::Alive { corroborated: true };
+        }
+        return PidProbe::Mismatch {
+            running: format!(
+                "{}, start token {seen} against recorded {recorded}",
+                observed.images.first().map_or("unknown image", |s| s)
+            ),
+        };
+    }
     if let Some(want) = spawned.image_name
-        && !comm.is_empty()
-        && !same_command(comm, want)
+        && !observed.images.is_empty()
+        && !observed
+            .images
+            .iter()
+            .any(|image| same_command(image, want))
     {
         return PidProbe::Mismatch {
-            running: comm.to_owned(),
+            running: observed.images.join(", "),
         };
     }
     if spawned.started_unix > 0
-        && let Some(elapsed) = parse_etime(etime)
+        && let Some(started) = observed.start_unix
+        && started > spawned.started_unix + START_SLACK_SECS
     {
-        let started = now_unix.saturating_sub(elapsed);
-        if started > spawned.started_unix + START_SLACK_SECS {
-            return PidProbe::Mismatch {
-                running: format!(
-                    "{comm}, started {}s after the registry entry",
-                    started - spawned.started_unix
-                ),
-            };
-        }
+        return PidProbe::Mismatch {
+            running: format!(
+                "{}, started {}s after the registry entry",
+                observed.images.first().map_or("unknown image", |s| s),
+                started - spawned.started_unix
+            ),
+        };
     }
-    PidProbe::Alive
+    PidProbe::Alive {
+        corroborated: false,
+    }
 }
 
-/// Splits one `ps` row into state, elapsed time, and command. The command
-/// is the whole remainder because a macOS argv[0] can contain spaces; a row
-/// with fewer than three fields is not one we can read.
-#[cfg(any(unix, test))]
-fn split_ps_fields(line: &str) -> Option<(&str, &str, &str)> {
-    let (stat, rest) = line.split_once(char::is_whitespace)?;
-    let (etime, comm) = rest.trim_start().split_once(char::is_whitespace)?;
-    Some((stat, etime, comm.trim()))
-}
-
-/// File-name comparison for what `ps` reported against the image recorded
-/// at launch, tolerating Linux's truncation of long names.
+/// File-name comparison for what the platform reported against the image
+/// recorded at launch, tolerating Linux's truncation of long names.
 #[cfg(any(unix, test))]
 fn same_command(observed: &str, expected: &str) -> bool {
     fn file_name(s: &str) -> &str {
@@ -1121,33 +1231,16 @@ fn same_command(observed: &str, expected: &str) -> bool {
     observed == expected || (observed.len() >= COMM_MAX && expected.starts_with(observed))
 }
 
-/// Seconds from POSIX `etime`, `[[dd-]hh:]mm:ss`.
-#[cfg(any(unix, test))]
-fn parse_etime(field: &str) -> Option<u64> {
-    let (days, hms) = match field.split_once('-') {
-        Some((days, rest)) => (days.parse::<u64>().ok()?, rest),
-        None => (0, field),
-    };
-    let mut parts = hms.rsplit(':');
-    let secs: u64 = parts.next()?.parse().ok()?;
-    let mins: u64 = parts.next()?.parse().ok()?;
-    let hours: u64 = match parts.next() {
-        Some(hours) => hours.parse().ok()?,
-        None => 0,
-    };
-    if parts.next().is_some() || secs > 59 || mins > 59 {
-        return None;
-    }
-    Some(days * 86_400 + hours * 3_600 + mins * 60 + secs)
-}
-
-/// A helper the platform provides, resolved to an absolute path.
+/// A helper the platform provides, resolved to an absolute path. Windows
+/// only, now that unix probes and signals through libc instead of spawning
+/// anything.
 ///
 /// Every one of these used to go through `PATH`, so a writable directory
 /// early in it meant code execution on every liveness probe, in a process
-/// that is about to signal something. The candidates below are where each
+/// that is about to signal something. The candidates below are where the
 /// platform actually keeps these; the bare name is the last resort, for an
 /// unusual layout, and it is the only case that reads `PATH` at all.
+#[cfg(windows)]
 fn system_tool(name: &str, candidates: &[&str]) -> PathBuf {
     candidates
         .iter()
@@ -1158,59 +1251,47 @@ fn system_tool(name: &str, candidates: &[&str]) -> PathBuf {
 
 #[cfg(unix)]
 mod process {
-    use std::path::PathBuf;
-    use std::process::Command;
-    use std::sync::OnceLock;
     use std::time::Duration;
 
-    use super::{PidProbe, Spawned, system_tool};
+    use super::{PidProbe, Spawned};
 
     /// Named in the error when a process outlives the forced step.
     pub const FORCED_KILL: &str = "SIGKILL";
 
-    fn ps() -> &'static PathBuf {
-        static PS: OnceLock<PathBuf> = OnceLock::new();
-        PS.get_or_init(|| system_tool("ps", &["/bin/ps", "/usr/bin/ps"]))
-    }
-
-    fn kill_bin() -> &'static PathBuf {
-        static KILL: OnceLock<PathBuf> = OnceLock::new();
-        KILL.get_or_init(|| system_tool("kill", &["/bin/kill", "/usr/bin/kill"]))
-    }
-
-    /// See [`super::ps_probe`] for the parse and the pid-reuse rules.
-    pub fn alive(pid: u32, spawned: Spawned<'_>) -> bool {
-        match Command::new(ps())
-            .args(["-p", &pid.to_string(), "-o", "stat=,etime=,comm="])
-            .output()
-        {
-            // ps exits nonzero when no process matches, and prints nothing.
-            Ok(out) if !out.status.success() => false,
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                match super::ps_probe(&text, spawned, super::now_unix()) {
-                    PidProbe::Alive => true,
-                    PidProbe::Dead => false,
-                    // Loud, because the honest answer ("not ours") means we
-                    // will never kill this pid, so a real leak of our own
-                    // server would otherwise be invisible.
-                    PidProbe::Mismatch { running } => {
-                        tracing::warn!(
-                            pid,
-                            running = %running,
-                            expected = spawned.image_name.unwrap_or(""),
-                            "pid is alive but is not the process we launched; treating it as \
-                             dead rather than killing an unrelated process"
-                        );
-                        false
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(pid, error = %err, "cannot run ps; treating the pid as dead");
-                false
-            }
+    /// One pid judged against one registry entry, no subprocess anywhere:
+    /// `kill(pid, 0)` answers existence and `identity` reads the rest from
+    /// the platform's own books. [`super::classify`] holds the rules.
+    pub fn probe(pid: u32, spawned: Spawned<'_>) -> PidProbe {
+        if !exists(pid) {
+            return PidProbe::Dead;
         }
+        match identity::observe(pid) {
+            Some(observed) => super::classify(&observed, spawned),
+            // Alive a moment ago but unobservable now: losing the race with
+            // an exit is the common way here, so ask existence again before
+            // settling for "alive with nothing to check".
+            None if !exists(pid) => PidProbe::Dead,
+            None => PidProbe::Alive {
+                corroborated: false,
+            },
+        }
+    }
+
+    /// Signal 0 delivers nothing but still runs the kernel's existence and
+    /// permission checks: 0 and EPERM are a live pid (EPERM is somebody
+    /// else's, which the identity checks then rule out), ESRCH is none.
+    fn exists(pid: u32) -> bool {
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// The start token to record for a fresh spawn; see
+    /// [`super::RegistryEntry::proc_start`]. None where the platform has no
+    /// cheap read for it, which leaves the entry uncorroborated.
+    pub fn start_token(pid: u32) -> Option<u64> {
+        identity::observe(pid).and_then(|observed| observed.start_token)
     }
 
     /// SIGTERM is a real request that the kernel delivers whether or not
@@ -1220,16 +1301,167 @@ mod process {
         Duration::from_secs(5)
     }
 
+    /// The polite step. An error (already gone, not ours to signal) is
+    /// handled by the wait-and-escalate above this call.
     pub fn terminate(pid: u32) {
-        let _ = Command::new(kill_bin())
-            .args(["-TERM", &pid.to_string()])
-            .status();
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     }
 
+    /// The forced step; only ever sent to a corroborated pid.
     pub fn kill(pid: u32) {
-        let _ = Command::new(kill_bin())
-            .args(["-KILL", &pid.to_string()])
-            .status();
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// What Linux keeps in `/proc`: one read of `/proc/<pid>/stat` gives
+    /// the state, the start ticks, and the comm; `/proc/<pid>/exe` adds the
+    /// untruncated executable path when the process is ours to inspect.
+    #[cfg(target_os = "linux")]
+    mod identity {
+        use std::sync::OnceLock;
+
+        use super::super::Observed;
+
+        pub fn observe(pid: u32) -> Option<Observed> {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (comm, state, start_ticks) = parse_stat(&stat)?;
+            let mut images = Vec::new();
+            if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+                let exe = exe.to_string_lossy();
+                // A rebuilt server runs on from a replaced binary, and the
+                // kernel marks the link rather than lying about it; the
+                // image is still the one the registry recorded.
+                images.push(exe.strip_suffix(" (deleted)").unwrap_or(&exe).to_owned());
+            }
+            if !comm.is_empty() {
+                images.push(comm);
+            }
+            Some(Observed {
+                zombie: state == 'Z',
+                start_token: Some(start_ticks),
+                start_unix: start_unix(start_ticks),
+                images,
+            })
+        }
+
+        /// `pid (comm) state ...` with the start ticks in field 22. The
+        /// comm may contain spaces and parentheses, so the parse anchors on
+        /// the last ')' rather than splitting the whole line.
+        fn parse_stat(stat: &str) -> Option<(String, char, u64)> {
+            let open = stat.find('(')?;
+            let close = stat.rfind(')')?;
+            let comm = stat.get(open + 1..close)?.to_owned();
+            let rest: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
+            let state = rest.first()?.chars().next()?;
+            // Field 22 of the row; the state at index 0 here is field 3.
+            let start_ticks = rest.get(19)?.parse().ok()?;
+            Some((comm, state, start_ticks))
+        }
+
+        /// Wall-clock start reconstructed from boot time plus the ticks,
+        /// for reconciling entries that recorded only `started_unix`.
+        fn start_unix(start_ticks: u64) -> Option<u64> {
+            static BTIME: OnceLock<Option<u64>> = OnceLock::new();
+            let btime = (*BTIME.get_or_init(|| {
+                let stat = std::fs::read_to_string("/proc/stat").ok()?;
+                stat.lines()
+                    .find_map(|line| line.strip_prefix("btime "))?
+                    .trim()
+                    .parse()
+                    .ok()
+            }))?;
+            let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+                .ok()
+                .filter(|&hz| hz > 0)?;
+            Some(btime + start_ticks / hz)
+        }
+    }
+
+    /// What macOS answers through libproc: `proc_pidinfo` with the BSD-info
+    /// flavor, and `proc_pidpath` for the untruncated executable path of a
+    /// process ours to inspect.
+    #[cfg(target_os = "macos")]
+    mod identity {
+        use super::super::Observed;
+
+        pub fn observe(pid: u32) -> Option<Observed> {
+            let pid = i32::try_from(pid).ok()?;
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if got != size {
+                // The kernel answers ESRCH for a zombie even while
+                // `kill(pid, 0)` still says the pid exists (measured on
+                // macOS 15; the zombie fallback in XNU's proc_info does not
+                // reach this flavor). Every caller has just proven the pid
+                // exists, so ESRCH here is an exited process, reaped or
+                // not: dead either way.
+                if got == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    return Some(Observed {
+                        zombie: true,
+                        ..Observed::default()
+                    });
+                }
+                return None;
+            }
+            let info = unsafe { info.assume_init() };
+            let mut images = Vec::new();
+            if let Some(path) = exe_path(pid) {
+                images.push(path);
+            }
+            // pbi_name is the longer of the kernel's two name fields and
+            // falls back to the 16-byte comm; either is truncated, which
+            // same_command tolerates.
+            if let Some(name) = cstr(&info.pbi_name).or_else(|| cstr(&info.pbi_comm)) {
+                images.push(name);
+            }
+            Some(Observed {
+                zombie: info.pbi_status == libc::SZOMB,
+                start_token: Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec),
+                start_unix: Some(info.pbi_start_tvsec),
+                images,
+            })
+        }
+
+        fn exe_path(pid: i32) -> Option<String> {
+            let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+            let len = usize::try_from(len).ok().filter(|&len| len > 0)?;
+            buf.truncate(len);
+            String::from_utf8(buf).ok()
+        }
+
+        /// The readable prefix of a fixed-size, NUL-terminated name field.
+        fn cstr(field: &[libc::c_char]) -> Option<String> {
+            let bytes: Vec<u8> = field
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            if bytes.is_empty() {
+                return None;
+            }
+            String::from_utf8(bytes).ok()
+        }
+    }
+
+    /// Every other unix: `kill(pid, 0)` still answers liveness, but there
+    /// is no cheap identity read, so pids are never corroborated and the
+    /// forced kill is never sent. destroy says so when it matters.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    mod identity {
+        use super::super::Observed;
+
+        pub fn observe(_pid: u32) -> Option<Observed> {
+            None
+        }
     }
 }
 
@@ -1272,36 +1504,26 @@ mod process {
     const SENTINEL_GRACE: Duration = Duration::from_secs(2);
 
     /// See [`super::tasklist_probe`] for the parse and the pid-reuse rule.
-    pub fn alive(pid: u32, spawned: Spawned<'_>) -> bool {
+    pub fn probe(pid: u32, spawned: Spawned<'_>) -> PidProbe {
         match Command::new(tasklist())
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .output()
         {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout);
-                match super::tasklist_probe(&text, pid, spawned.image_name) {
-                    PidProbe::Alive => true,
-                    PidProbe::Dead => false,
-                    // Loud, because the honest answer ("not ours") means we
-                    // will never kill this pid, so a real leak of our own
-                    // server would otherwise be invisible.
-                    PidProbe::Mismatch { running } => {
-                        tracing::warn!(
-                            pid,
-                            running = %running,
-                            expected = spawned.image_name.unwrap_or(""),
-                            "pid is alive but running another image; treating it as dead \
-                             rather than killing an unrelated process"
-                        );
-                        false
-                    }
-                }
+                super::tasklist_probe(&text, pid, spawned.image_name)
             }
             Err(err) => {
                 tracing::warn!(pid, error = %err, "cannot run tasklist; treating the pid as dead");
-                false
+                PidProbe::Dead
             }
         }
+    }
+
+    /// Windows records no start token ([`super::tasklist_probe`] explains
+    /// why start times are off the table); the image name carries identity.
+    pub fn start_token(_pid: u32) -> Option<u64> {
+        None
     }
 
     /// Windows has nothing to ask with except the sentinel file, and only a
@@ -1711,19 +1933,25 @@ mod tests {
 
     #[test]
     fn tasklist_exact_pid_match_is_alive() {
+        // The image match is Windows's identity check, so it corroborates.
         assert_eq!(
             tasklist_probe(ROW, 4242, Some("jamstreamd.exe")),
-            PidProbe::Alive
+            PidProbe::Alive { corroborated: true }
         );
         // No expectation recorded (a registry from an older build) still
-        // answers on the pid alone.
-        assert_eq!(tasklist_probe(ROW, 4242, None), PidProbe::Alive);
+        // answers on the pid alone, but nothing vouches for it.
+        assert_eq!(
+            tasklist_probe(ROW, 4242, None),
+            PidProbe::Alive {
+                corroborated: false
+            }
+        );
         // CreateProcess appends the extension the registry may not have,
         // and Windows names are case-insensitive either way.
         for expected in ["jamstreamd", "JAMSTREAMD.EXE", "JamStreamd.Exe"] {
             assert_eq!(
                 tasklist_probe(ROW, 4242, Some(expected)),
-                PidProbe::Alive,
+                PidProbe::Alive { corroborated: true },
                 "expected image {expected} should match the row"
             );
         }
@@ -1736,7 +1964,7 @@ mod tests {
                 4242,
                 Some("jamstreamd.exe")
             ),
-            PidProbe::Alive
+            PidProbe::Alive { corroborated: true }
         );
     }
 
@@ -1795,135 +2023,144 @@ mod tests {
         );
     }
 
-    /// One real row from `ps -p N -o stat=,etime=,comm=`, Linux shape
-    /// (bare command name), kept verbatim.
-    const PS_ROW: &str = "Ssl  02:17:43 jamstreamd\n";
-
-    fn spawned(image: Option<&str>, started_unix: u64) -> Spawned<'_> {
+    fn spawned(image: Option<&str>, started_unix: u64, proc_start: Option<u64>) -> Spawned<'_> {
         Spawned {
             image_name: image,
             started_unix,
+            proc_start,
         }
     }
 
-    /// The reference point for the start-time half: 2h17m43s of elapsed
-    /// time in PS_ROW means the process began at NOW minus 8263 s.
+    fn observed(images: &[&str], start_token: Option<u64>, start_unix: Option<u64>) -> Observed {
+        Observed {
+            zombie: false,
+            start_token,
+            start_unix,
+            images: images.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
     const NOW: u64 = 1_800_000_000;
-    const PS_ROW_STARTED: u64 = NOW - 8_263;
 
+    /// The start token is the identity: only the recorded process
+    /// incarnation carries it, so a match corroborates the pid outright and
+    /// anything else under the same number is a recycled pid, however right
+    /// its name looks.
     #[test]
-    fn ps_row_matching_the_entry_is_alive() {
+    fn a_start_token_settles_the_pid_either_way() {
+        let obs = observed(&["/usr/local/bin/jamstreamd"], Some(77_000), Some(NOW - 60));
         assert_eq!(
-            ps_probe(PS_ROW, spawned(Some("jamstreamd"), PS_ROW_STARTED), NOW),
-            PidProbe::Alive
+            classify(&obs, spawned(Some("jamstreamd"), NOW - 60, Some(77_000))),
+            PidProbe::Alive { corroborated: true }
         );
-        // A registry from an older build records neither; the pid alone
-        // still answers, which is the pre-existing behavior.
-        assert_eq!(ps_probe(PS_ROW, spawned(None, 0), NOW), PidProbe::Alive);
-        // The launch path records an absolute path, macOS reports argv[0],
-        // and Linux truncates its own field at 15 characters. All three
-        // have to compare equal to the same spawn.
-        for (row, image) in [
-            (
-                "S 00:04 /usr/local/bin/jamstreamd",
-                "/opt/jamstream/jamstreamd",
-            ),
-            ("S 00:04 jamstreamd", "jamstreamd"),
-            ("S 00:04 jamstreamd-head", "jamstreamd-headless"),
-        ] {
-            assert_eq!(
-                ps_probe(row, spawned(Some(image), 0), NOW),
-                PidProbe::Alive,
-                "{row:?} should match {image:?}"
-            );
+        match classify(&obs, spawned(Some("jamstreamd"), NOW - 60, Some(76_999))) {
+            PidProbe::Mismatch { running } => {
+                assert!(running.contains("start token"), "said: {running}");
+            }
+            other => panic!("a different token is a recycled pid, got {other:?}"),
         }
     }
 
+    /// A terminated child whose parent has not reaped it must not look
+    /// alive, whatever else matches.
     #[test]
-    fn ps_no_process_and_zombies_are_dead() {
-        for stdout in ["", "\n", "   \n"] {
-            assert_eq!(
-                ps_probe(stdout, spawned(Some("jamstreamd"), 0), NOW),
-                PidProbe::Dead,
-                "should be dead: {stdout:?}"
-            );
-        }
-        // A terminated child whose parent has not reaped it.
+    fn a_zombie_is_dead_even_with_a_matching_token() {
+        let obs = Observed {
+            zombie: true,
+            ..observed(&["jamstreamd"], Some(77_000), Some(NOW))
+        };
         assert_eq!(
-            ps_probe(
-                "Z+   00:01 jamstreamd",
-                spawned(Some("jamstreamd"), NOW - 1),
-                NOW
-            ),
+            classify(&obs, spawned(Some("jamstreamd"), NOW, Some(77_000))),
             PidProbe::Dead
         );
     }
 
-    /// The defect this whole probe exists for: a stale entry names a pid
-    /// that now belongs to somebody else, and `ps -p N` alone says yes.
+    /// A registry an older build wrote has no token, so the image name and
+    /// the wall-clock start carry the pid-reuse guard alone; matching them
+    /// keeps the entry alive but never corroborates it.
     #[test]
-    fn ps_recycled_pid_running_another_image_is_not_ours() {
+    fn an_entry_with_no_token_falls_back_to_the_contradiction_checks() {
+        // Nothing recorded at all: the pid answers alone, as it always has,
+        // but nothing vouches for it.
         assert_eq!(
-            ps_probe(
-                "S    00:12 /usr/bin/ssh-agent",
-                spawned(Some("jamstreamd"), NOW - 12),
-                NOW
+            classify(
+                &observed(&["jamstreamd"], Some(1), Some(NOW)),
+                spawned(None, 0, None)
             ),
-            PidProbe::Mismatch {
-                running: "/usr/bin/ssh-agent".to_owned()
+            PidProbe::Alive {
+                corroborated: false
             }
         );
+        // The defect the probe exists for: the pid now belongs to somebody
+        // else entirely.
+        match classify(
+            &observed(&["/usr/bin/ssh-agent"], Some(1), Some(NOW)),
+            spawned(Some("jamstreamd"), 0, None),
+        ) {
+            PidProbe::Mismatch { running } => assert!(running.contains("ssh-agent")),
+            other => panic!("another image under our pid must mismatch, got {other:?}"),
+        }
+        // The platform reports several names for one image (the kernel's
+        // comm and the resolved executable path disagree after an exec
+        // through a symlink); matching any one of them clears the check.
+        for (images, recorded) in [
+            (
+                &["/usr/bin/sleep", "fake-jamstreamd"][..],
+                "fake-jamstreamd",
+            ),
+            // Linux truncates its own comm field at 15 characters.
+            (&["jamstreamd-head"][..], "jamstreamd-headless"),
+            // Recorded absolute, observed from another prefix.
+            (
+                &["/usr/local/bin/jamstreamd"][..],
+                "/opt/jamstream/jamstreamd",
+            ),
+        ] {
+            assert_eq!(
+                classify(
+                    &observed(images, None, None),
+                    spawned(Some(recorded), 0, None)
+                ),
+                PidProbe::Alive {
+                    corroborated: false
+                },
+                "{images:?} should match {recorded:?}"
+            );
+        }
     }
 
     /// The half the image name cannot see: the pid came back around to
     /// another jamstreamd, so only the start time gives it away.
     #[test]
-    fn ps_recycled_pid_running_the_same_image_is_caught_by_the_start_time() {
+    fn a_tokenless_pid_younger_than_its_entry_is_a_recycled_pid() {
         // Our entry is a day old; what holds the pid started two hours ago.
-        let entry_started = NOW - 86_400;
-        let probe = ps_probe(PS_ROW, spawned(Some("jamstreamd"), entry_started), NOW);
-        match probe {
-            PidProbe::Mismatch { running } => assert!(running.contains("after the registry entry")),
+        let obs = observed(&["jamstreamd"], None, Some(NOW - 7_200));
+        match classify(&obs, spawned(Some("jamstreamd"), NOW - 86_400, None)) {
+            PidProbe::Mismatch { running } => {
+                assert!(
+                    running.contains("after the registry entry"),
+                    "said: {running}"
+                );
+            }
             other => panic!("a day-old entry on a two-hour-old process must not match: {other:?}"),
         }
         // Inside the slack it is the same process seen through a stepped
         // clock, and destroying our own session must stay possible.
         assert_eq!(
-            ps_probe(
-                PS_ROW,
-                spawned(Some("jamstreamd"), PS_ROW_STARTED - START_SLACK_SECS),
-                NOW
+            classify(
+                &obs,
+                spawned(Some("jamstreamd"), NOW - 7_200 - START_SLACK_SECS, None)
             ),
-            PidProbe::Alive
+            PidProbe::Alive {
+                corroborated: false
+            }
         );
         // A clock that went backwards leaves the process looking older than
         // its entry, which no recycled pid can be, so it is not a mismatch.
         assert_eq!(
-            ps_probe(PS_ROW, spawned(Some("jamstreamd"), NOW), NOW),
-            PidProbe::Alive
-        );
-    }
-
-    #[test]
-    fn etime_parses_every_posix_shape() {
-        assert_eq!(parse_etime("00:06"), Some(6));
-        assert_eq!(parse_etime("02:17:43"), Some(8_263));
-        assert_eq!(parse_etime("46-15:21:05"), Some(4_029_665));
-        assert_eq!(parse_etime("1-00:00:00"), Some(86_400));
-        // Anything else must not be read as a start time at all.
-        for junk in ["", "-", "12", "a:b", "1:2:3:4", "01:99"] {
-            assert_eq!(parse_etime(junk), None, "{junk:?} is not an etime");
-        }
-        // An unreadable elapsed time leaves the image name as the only
-        // check, rather than failing either way.
-        assert_eq!(
-            ps_probe("S ? jamstreamd", spawned(Some("jamstreamd"), 1), NOW),
-            PidProbe::Alive
-        );
-        assert_eq!(
-            ps_probe("S ? ssh-agent", spawned(Some("jamstreamd"), 1), NOW),
-            PidProbe::Mismatch {
-                running: "ssh-agent".to_owned()
+            classify(&obs, spawned(Some("jamstreamd"), NOW, None)),
+            PidProbe::Alive {
+                corroborated: false
             }
         );
     }
@@ -1933,7 +2170,7 @@ mod tests {
         let out = format!("\"notepad.exe\",\"7\",\"Console\",\"1\",\"1 K\"\r\n{ROW}");
         assert_eq!(
             tasklist_probe(&out, 4242, Some("jamstreamd.exe")),
-            PidProbe::Alive
+            PidProbe::Alive { corroborated: true }
         );
     }
 
@@ -2000,21 +2237,115 @@ mod tests {
         let image = exe.file_name().unwrap().to_string_lossy().into_owned();
         let me = std::process::id();
         assert!(
-            process::alive(me, spawned(Some(&image), 0)),
-            "ps did not see this test process ({me}, {image})"
+            matches!(
+                process::probe(me, spawned(Some(&image), 0, None)),
+                PidProbe::Alive { .. }
+            ),
+            "the probe did not see this test process ({me}, {image})"
         );
         assert!(
-            process::alive(me, spawned(None, 0)),
+            matches!(
+                process::probe(me, spawned(None, 0, None)),
+                PidProbe::Alive { .. }
+            ),
             "pid-only probe must see us too"
         );
         assert!(
-            !process::alive(me, spawned(Some("definitely-not-jamstreamd"), 0)),
-            "an image mismatch must read as dead so we never kill a stranger"
+            matches!(
+                process::probe(me, spawned(Some("definitely-not-jamstreamd"), 0, None)),
+                PidProbe::Mismatch { .. }
+            ),
+            "an image mismatch must read as not ours so we never kill a stranger"
         );
+        // The platforms with an identity read must produce a token, settle
+        // on it exactly, and see through a stale wall-clock start.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let token = process::start_token(me).expect("this platform reads start tokens");
+            assert_eq!(
+                process::probe(me, spawned(Some(&image), 0, Some(token))),
+                PidProbe::Alive { corroborated: true }
+            );
+            assert!(matches!(
+                process::probe(me, spawned(Some(&image), 0, Some(token + 1))),
+                PidProbe::Mismatch { .. }
+            ));
+            assert!(
+                matches!(
+                    process::probe(me, spawned(None, 1, None)),
+                    PidProbe::Mismatch { .. }
+                ),
+                "a process that started long after its entry is not that entry's"
+            );
+        }
+    }
+
+    /// A sleep binary to stand in for a child process.
+    #[cfg(unix)]
+    fn sleep_bin() -> PathBuf {
+        ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .or_else(|| find_on_path("sleep"))
+            .expect("no sleep binary on this machine")
+    }
+
+    /// The probe against a real process rather than a parsed fixture: a
+    /// spawned child reads alive under its own token, and dead once waited.
+    #[cfg(unix)]
+    #[test]
+    fn liveness_tracks_a_real_child_from_spawn_to_reaped() {
+        let mut child = Command::new(sleep_bin())
+            .arg("600")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let token = process::start_token(pid);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(token.is_some(), "this platform reads start tokens");
+        let entry = spawned(Some("sleep"), now_unix(), token);
+        match process::probe(pid, entry) {
+            PidProbe::Alive { corroborated } => assert_eq!(
+                corroborated,
+                token.is_some(),
+                "the recorded token is exactly what corroborates"
+            ),
+            other => panic!("a running child must read alive, got {other:?}"),
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let after = process::probe(pid, entry);
         assert!(
-            !process::alive(me, spawned(None, 1)),
-            "a process that started long after its entry is not that entry's"
+            !matches!(after, PidProbe::Alive { .. }),
+            "a waited child must read dead, got {after:?}"
         );
+    }
+
+    /// An exited child nobody has waited on yet: the platform must call the
+    /// zombie dead, because destroy's wait loop is exactly this observer
+    /// whenever the launching provider still holds the child handle.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreaped_child_reads_as_dead_not_alive() {
+        let mut child = Command::new(sleep_bin())
+            .arg("0")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let entry = spawned(None, 0, None);
+        // sleep 0 exits on its own; poll until the zombie shows through.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process::probe(pid, entry) != PidProbe::Dead {
+            assert!(
+                Instant::now() < deadline,
+                "an unreaped child never read as dead"
+            );
+            std::thread::sleep(POLL);
+        }
+        child.wait().unwrap();
     }
 
     /// The end-to-end shape of the same guard, and the reason it is not
@@ -2120,6 +2451,9 @@ mod tests {
     #[tokio::test]
     async fn a_recycled_pid_running_another_image_survives_the_sweeper() {
         stale_entry_leaves_the_process_alone("stale-image", |entry| {
+            // An entry an older build wrote: no token, and the image the
+            // pid now runs is not the one recorded.
+            entry.as_object_mut().unwrap().remove("proc_start");
             entry["image_name"] = serde_json::json!("someone-elses-daemon");
         })
         .await;
@@ -2129,12 +2463,109 @@ mod tests {
     #[tokio::test]
     async fn a_pid_recycled_since_the_entry_was_written_survives_the_sweeper() {
         stale_entry_leaves_the_process_alone("stale-clock", |entry| {
-            // Same image name, so only the start time separates our server
-            // from a pid that came back around to another one.
+            // An older build's entry again, and this time only the start
+            // time separates our server from a pid that came back around.
+            entry.as_object_mut().unwrap().remove("proc_start");
             let day_old = now_unix() - 86_400;
             entry["started_unix"] = serde_json::json!(day_old);
         })
         .await;
+    }
+
+    /// The strongest half of the guard: right image, believable clock, but
+    /// the platform's start token says the pid was reborn. This is the
+    /// check that catches a pid recycled by another jamstreamd.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_pid_reborn_under_a_different_start_token_survives_the_sweeper() {
+        stale_entry_leaves_the_process_alone("stale-token", |entry| {
+            let recorded = entry["proc_start"]
+                .as_u64()
+                .expect("launch records a start token on this platform");
+            entry["proc_start"] = serde_json::json!(recorded + 1);
+        })
+        .await;
+    }
+
+    /// A stand-in for a server that will not go politely: it ignores
+    /// SIGTERM and loops. What destroy may do next depends on whether the
+    /// registry can still vouch for the pid. The `.ready` marker appears
+    /// only after the trap is armed, because a TERM delivered before that
+    /// line runs would end the process the default way and prove nothing.
+    #[cfg(unix)]
+    fn stubborn_server(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("fake-jamstreamd");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ntrap '' TERM\n: > \"$0.ready\"\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The migration policy under real signals: an entry with nothing to
+    /// corroborate gets the sentinel and the SIGTERM but never the SIGKILL,
+    /// and destroy says what it skipped. The stand-in ignores the TERM, so
+    /// only the skip keeps it alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destroy_never_force_kills_a_pid_it_cannot_corroborate() {
+        let dir = temp_dir("unverified");
+        let state = dir.join("state");
+        let launcher = LocalProvider::new(state.clone()).with_server_binary(stubborn_server(&dir));
+        let instance = launcher
+            .launch(LaunchSpec {
+                region: LocalProvider::local_region(),
+                instance_class: InstanceClass::Small,
+                user_data: "#cloud-config\n".to_owned(),
+                tags: vec![session_tag("unverified")],
+            })
+            .await
+            .unwrap();
+        let pid: u32 = instance.id.parse().unwrap();
+
+        // Only once the trap is armed is the TERM below guaranteed to be
+        // ignored rather than fatal.
+        let ready = dir.join("fake-jamstreamd.ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the stand-in never armed its trap"
+            );
+            std::thread::sleep(POLL);
+        }
+
+        // Rewrite the entry as an older build would have left it: nothing
+        // recorded beyond the pid and a believable start.
+        let registry = state.join(REGISTRY_FILE);
+        let mut entries: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        let entry = entries[0].as_object_mut().unwrap();
+        entry.remove("proc_start");
+        entry.remove("image_name");
+        std::fs::write(&registry, serde_json::to_vec(&entries).unwrap()).unwrap();
+
+        // The sweeper is a fresh process in spirit: no child handle, only
+        // the registry's word for whose pid this is.
+        let sweeper = LocalProvider::new(state.clone());
+        let err = sweeper
+            .destroy(&RegionId::new(REGION_ID), &instance.id)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("skipped the forced SIGKILL"),
+            "destroy must say what it skipped, said: {err}"
+        );
+        assert!(
+            pid_is_running(pid),
+            "an uncorroborated pid was force-killed anyway"
+        );
+
+        process::kill(pid);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Windows liveness against the one process we know everything about:
@@ -2145,17 +2576,24 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let image = exe.file_name().unwrap().to_string_lossy().into_owned();
         let me = std::process::id();
-        assert!(
-            process::alive(me, spawned(Some(&image), 0)),
+        assert_eq!(
+            process::probe(me, spawned(Some(&image), 0, None)),
+            PidProbe::Alive { corroborated: true },
             "tasklist did not see this test process ({me}, {image})"
         );
-        assert!(
-            process::alive(me, spawned(None, 0)),
-            "pid-only probe must see us too"
+        assert_eq!(
+            process::probe(me, spawned(None, 0, None)),
+            PidProbe::Alive {
+                corroborated: false
+            },
+            "pid-only probe must see us too, with nothing vouching for it"
         );
         assert!(
-            !process::alive(me, spawned(Some("definitely-not-jamstreamd.exe"), 0)),
-            "an image mismatch must read as dead so we never kill a stranger"
+            matches!(
+                process::probe(me, spawned(Some("definitely-not-jamstreamd.exe"), 0, None)),
+                PidProbe::Mismatch { .. }
+            ),
+            "an image mismatch must read as not ours so we never kill a stranger"
         );
     }
 
@@ -2173,7 +2611,11 @@ mod tests {
             .unwrap();
         let pid = child.id();
         child.wait().unwrap();
-        assert!(!process::alive(pid, spawned(Some("cmd.exe"), 0)));
+        let after = process::probe(pid, spawned(Some("cmd.exe"), 0, None));
+        assert!(
+            !matches!(after, PidProbe::Alive { .. }),
+            "a waited child must read dead, got {after:?}"
+        );
     }
 
     #[test]
