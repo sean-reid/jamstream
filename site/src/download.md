@@ -109,3 +109,11 @@ On Windows:
 ```console
 > powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
 ```
+
+Uninstalling on Windows is the same shape:
+
+```console
+> powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/uninstall.ps1 | iex"
+```
+
+It removes the binaries install.ps1 put in place and nothing else. A session still running makes it stop and say so; your session records are kept unless you pass `-Purge`, and credentials stay in Credential Manager either way.

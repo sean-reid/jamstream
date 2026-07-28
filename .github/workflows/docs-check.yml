@@ -71,14 +71,16 @@ jobs:
       - uses: actions/checkout@v7
       - name: Shellcheck the POSIX installer and uninstaller
         run: shellcheck site/src/install.sh site/src/uninstall.sh
-      - name: Parse the PowerShell installer
+      - name: Parse the PowerShell installer and uninstaller
         run: |
           pwsh -NoProfile -Command '
-            $tokens = $null; $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile(
-              "site/src/install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
-            if ($errors.Count -gt 0) {
-              $errors | ForEach-Object { Write-Output $_.ToString() }
-              exit 1
-            }
-            Write-Output "install.ps1 parses cleanly"'
+            foreach ($script in "site/src/install.ps1", "site/src/uninstall.ps1") {
+              $tokens = $null; $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                $script, [ref]$tokens, [ref]$errors) | Out-Null
+              if ($errors.Count -gt 0) {
+                $errors | ForEach-Object { Write-Output $_.ToString() }
+                exit 1
+              }
+              Write-Output "$script parses cleanly"
+            }'
