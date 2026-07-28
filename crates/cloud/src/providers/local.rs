@@ -51,6 +51,15 @@
 //! gets `--max-duration-min` from the config's `max_duration_min` and
 //! exits when the session has run that long, connected musicians or not.
 //!
+//! Those two windows are the only thing that ever ends a local session
+//! nobody tears down by hand, because `jamstream host` returns as soon as
+//! it has printed the invites and the server it spawned outlives it. So
+//! reading them fails closed: a key that is missing or unreadable falls
+//! back to [`DEFAULT_IDLE_SHUTDOWN_MIN`] and
+//! [`DEFAULT_MAX_DURATION_MIN`], never to "no limit". A key that says 0
+//! still means no limit, because that is a host saying so on purpose; the
+//! absent case is the one that used to say it by accident.
+//!
 //! # Shutdown: the sentinel file
 //!
 //! Ending a session should let the server say goodbye, not shoot it. Unix
@@ -115,6 +124,13 @@ use crate::types::{
 
 const REGION_ID: &str = "local";
 const REGISTRY_FILE: &str = "local.json";
+/// Windows used when the session config does not say. They match the
+/// defaults the host surfaces offer (`jamstream_session::limits`'
+/// `DEFAULT_IDLE_MIN` and `DEFAULT_MAX_HOURS`), which
+/// `crates/cli/tests/local_host.rs` pins, because this crate cannot see
+/// that one and a laptop is the wrong place to disagree quietly.
+const DEFAULT_IDLE_SHUTDOWN_MIN: u32 = 10;
+const DEFAULT_MAX_DURATION_MIN: u32 = 12 * 60;
 /// Cross-process guard on the registry: see [`FileLock`].
 const LOCK_FILE: &str = "local.json.lock";
 const LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -404,12 +420,16 @@ impl Provider for LocalProvider {
         // become the spawned server's own dead man's switch and session
         // cap (no external guard on a laptop).
         let port = flat_config_value(&spec.user_data, "port").and_then(|v| v.parse::<u16>().ok());
-        let idle_min = flat_config_value(&spec.user_data, "idle_shutdown_min")
-            .unwrap_or("0")
-            .to_owned();
-        let max_duration_min = flat_config_value(&spec.user_data, "max_duration_min")
-            .unwrap_or("0")
-            .to_owned();
+        let idle_min = self_limit(
+            &spec.user_data,
+            "idle_shutdown_min",
+            DEFAULT_IDLE_SHUTDOWN_MIN,
+        );
+        let max_duration_min = self_limit(
+            &spec.user_data,
+            "max_duration_min",
+            DEFAULT_MAX_DURATION_MIN,
+        );
 
         // 0600 like everything else in here: a server log is a session's
         // roster, addresses, and whatever a future line decides to print.
@@ -752,6 +772,40 @@ fn clear_shutdown_files(session_dir: &Path) {
             Err(err) => {
                 tracing::warn!(error = %err, path = %path.display(), "cannot clear stale shutdown file");
             }
+        }
+    }
+}
+
+/// One self-exit window for the spawned server, as the string its flag
+/// takes. jamstreamd reads fractional minutes, so the value is passed
+/// through verbatim once it parses rather than rounded to whole minutes.
+///
+/// The fallback is the point of this function. A local server has no
+/// external guard and no parent left to notice it: whatever these two
+/// windows say is the entire lifetime policy. Reading "I could not find
+/// the key" as "run forever" put six of them on a laptop for an afternoon,
+/// so an absent or unreadable value takes the documented default and says
+/// so in the log. Zero is left alone: it means no limit, and a host who
+/// typed it meant it.
+fn self_limit(user_data: &str, key: &str, fallback: u32) -> String {
+    let Some(raw) = flat_config_value(user_data, key) else {
+        tracing::warn!(
+            key,
+            fallback,
+            "session config carries no window; using the default rather than none"
+        );
+        return fallback.to_string();
+    };
+    match raw.parse::<f64>() {
+        Ok(minutes) if minutes.is_finite() && minutes >= 0.0 => raw.to_owned(),
+        _ => {
+            tracing::warn!(
+                key,
+                value = raw,
+                fallback,
+                "session config window is not a number of minutes; using the default"
+            );
+            fallback.to_string()
         }
     }
 }
@@ -1275,12 +1329,135 @@ mod tests {
         path
     }
 
+    /// [`fake_server`] with one extra line: it writes the arguments it was
+    /// spawned with, one per line, before exec'ing. Everything else about
+    /// it, the symlinked image and why, is the same.
+    #[cfg(unix)]
+    fn recording_server(dir: &Path, args_file: &Path) -> PathBuf {
+        let script = fake_server(dir);
+        let body = std::fs::read_to_string(&script).unwrap();
+        let exec = body.lines().last().unwrap().to_owned();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n{exec}\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        script
+    }
+
+    /// Reads a file a spawned process is expected to write, waiting for it
+    /// rather than assuming it is already there.
+    #[cfg(unix)]
+    async fn read_when_written(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && !text.is_empty()
+            {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} was never written",
+                path.display()
+            );
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn local_provider_passes_contract() {
         let dir = temp_dir("contract");
         let provider = LocalProvider::new(dir.join("state")).with_server_binary(fake_server(&dir));
         assert_provider_contract(&provider).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback is the whole point: nothing else ends a local session
+    /// once `jamstream host` has returned, so "I could not read the window"
+    /// must not mean "no window". An explicit 0 is still a host saying no
+    /// limit, and fractional minutes still reach jamstreamd unrounded.
+    #[test]
+    fn an_unreadable_window_falls_back_to_the_default_not_to_forever() {
+        let present = "idle_shutdown_min = 3\nmax_duration_min = 90\n";
+        assert_eq!(self_limit(present, "idle_shutdown_min", 10), "3");
+        assert_eq!(self_limit(present, "max_duration_min", 720), "90");
+
+        // Absent, empty, and unparseable all take the default.
+        for text in [
+            "",
+            "port = 43210\n",
+            "idle_shutdown_min =\n",
+            "idle_shutdown_min = ten\n",
+            "idle_shutdown_min = -1\n",
+            "idle_shutdown_min = NaN\n",
+            "idle_shutdown_min = inf\n",
+        ] {
+            assert_eq!(
+                self_limit(text, "idle_shutdown_min", 10),
+                "10",
+                "{text:?} must not disable the idle exit"
+            );
+        }
+
+        // Zero survives: it is the one way to ask for no limit on purpose.
+        assert_eq!(
+            self_limit("idle_shutdown_min = 0\n", "idle_shutdown_min", 10),
+            "0"
+        );
+        // jamstreamd takes fractional minutes; passing the text through
+        // rather than a parsed integer is what keeps 0.05 meaning 3 s.
+        assert_eq!(
+            self_limit("idle_shutdown_min = 0.05\n", "idle_shutdown_min", 10),
+            "0.05"
+        );
+    }
+
+    /// The other half of the same contract: the resolved window has to
+    /// reach the process. A fake server that records its own argv proves
+    /// the flag is spelled the way jamstreamd's argument scan reads it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_with_no_windows_still_spawns_a_server_that_will_exit() {
+        let dir = temp_dir("windows");
+        let args_file = dir.join("argv");
+        let provider = LocalProvider::new(dir.join("state"))
+            .with_server_binary(recording_server(&dir, &args_file));
+        let spec = LaunchSpec {
+            region: LocalProvider::local_region(),
+            instance_class: InstanceClass::Small,
+            // Deliberately silent about both windows.
+            user_data: "port = 43210\n".to_owned(),
+            tags: vec![session_tag("nowindows")],
+        };
+        let instance = provider.launch(spec).await.unwrap();
+        // Readiness says the process is alive, not that the shell inside it
+        // has reached its first line; a machine busy running the rest of
+        // this suite can take a moment over that.
+        let argv = read_when_written(&args_file).await;
+        let args: Vec<&str> = argv.lines().collect();
+        let value_of = |flag: &str| {
+            args.iter()
+                .position(|a| *a == flag)
+                .and_then(|i| args.get(i + 1))
+                .copied()
+        };
+        assert_eq!(
+            value_of("--idle-exit-min"),
+            Some(DEFAULT_IDLE_SHUTDOWN_MIN.to_string().as_str())
+        );
+        assert_eq!(
+            value_of("--max-duration-min"),
+            Some(DEFAULT_MAX_DURATION_MIN.to_string().as_str())
+        );
+        provider
+            .destroy(&RegionId::new(REGION_ID), &instance.id)
+            .await
+            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
