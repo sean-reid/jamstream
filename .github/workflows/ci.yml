@@ -23,14 +23,26 @@ name: ci
 
 # A newer push supersedes any still-running ci for the same ref; finishing
 # a stale run is pure runner burn.
+#
+# Merge group runs are exempt from cancellation. Each queue entry gets its
+# own ref (gh-readonly-queue/main/pr-<n>-<base sha>), so entries cannot
+# collide today, but a cancelled merge group run reports as cancelled, which
+# the queue reads as a failed required check: the entry is dropped and every
+# entry behind it rebuilds. One stray collision would cost far more than the
+# runner minutes the cancellation saves.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue tests the actual merged result before it lands, which is
+  # what catches two pull requests that are each green alone and broken
+  # together. Every required check has to report here: one that never
+  # reports leaves the queue entry waiting forever and blocks the branch.
+  merge_group:
 
 # Nothing here writes to the repository. Without an explicit block the jobs
 # inherit the repository default, and the artifact uploads use the runner's
@@ -53,8 +65,15 @@ jobs:
   #
   # Seconds to run, so it is not worth its own workflow, and it fails fast
   # while the compile jobs are still warming up.
+  #
+  # A merge group has no pull request and so no title to check, but the job
+  # still has to run and report: this is a required check, and a required
+  # check that never reports leaves the queue entry waiting forever. So the
+  # job runs and the check step is skipped. Nothing is lost by that, because
+  # a pull request cannot enter the queue until its own required checks are
+  # green, and this one is among them.
   pr-title:
-    if: github.event_name == 'pull_request'
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -62,6 +81,7 @@ jobs:
       # title is attacker-controlled text and `${{ }}` inside run: is a shell
       # injection.
       - name: Check the title is a conventional commit
+        if: github.event_name == 'pull_request'
         env:
           TITLE: ${{ github.event.pull_request.title }}
         run: |
