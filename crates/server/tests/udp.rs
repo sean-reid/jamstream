@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Running, Session, loopback};
+use common::{Running, Session, budget, loopback};
 use std::time::{Duration, Instant};
 
 use jamstream_protocol::ids::{MemberId, Role, TokenId};
@@ -38,7 +38,7 @@ async fn join_chat_and_leave_over_real_udp() {
     let mut joined = false;
     let mut chat_echoed = false;
     let mut buf = [0u8; 2048];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
 
     while Instant::now() < deadline && !(joined && chat_echoed) {
         // Pump the client's own timers and queued control traffic.

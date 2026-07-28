@@ -11,7 +11,7 @@ mod common;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use common::{BIND, ChildGuard, ReservedPort, scratch_dir, server_binary};
+use common::{BIND, ChildGuard, ReservedPort, budget, scratch_dir, server_binary};
 
 use jamstream_cloud::providers::local::LocalProvider;
 use jamstream_cloud::{BootConfig, InstanceClass, LaunchSpec, Provider, SelfDestruct, session_tag};
@@ -101,7 +101,7 @@ async fn join_musician(mat: &SessionMaterial, name: &str) -> (ClientCore, UdpSoc
 
     let mut joined = false;
     let mut buf = [0u8; 2048];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     while Instant::now() < deadline && !joined {
         for pkt in client.poll(now()) {
             socket.send(&pkt).await.unwrap();
@@ -175,7 +175,7 @@ async fn launch_join_destroy_end_to_end() {
         .await
         .expect("destroy");
     assert!(
-        killed_at.elapsed() < Duration::from_secs(5),
+        killed_at.elapsed() < budget(Duration::from_secs(5)),
         "destroy took longer than the 5 s budget"
     );
     assert!(
@@ -243,7 +243,7 @@ fn idle_exit_terminates_an_unjoined_server() {
             .expect("spawn jamstreamd"),
     );
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + budget(Duration::from_secs(15));
     let status = loop {
         if let Some(status) = child.0.try_wait().expect("try_wait") {
             break status;
@@ -298,7 +298,7 @@ async fn max_duration_ends_an_occupied_session() {
     // exit anyway, which is exactly what idle-exit would never do here.
     let mut buf = [0u8; 2048];
     let mut told = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + budget(Duration::from_secs(15));
     let status = loop {
         if let Some(status) = child.0.try_wait().expect("try_wait") {
             break status;
@@ -329,7 +329,7 @@ async fn max_duration_ends_an_occupied_session() {
 
     // The Bye may still be in the socket buffer, and a client that missed it
     // falls back to its 10 s connection timeout.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + budget(Duration::from_secs(20));
     while Instant::now() < deadline && !told {
         for pkt in client.poll(now()) {
             let _ = socket.send(&pkt).await;

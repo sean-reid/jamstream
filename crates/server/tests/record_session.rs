@@ -8,7 +8,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Running, Session, loopback, scratch_dir};
+use common::{Running, Session, budget, loopback, scratch_dir};
 use jamstream_protocol::control::{RecordOp, RecordingState};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
 use jamstream_protocol::invite::Invite;
@@ -89,7 +89,7 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
     let mut host = Client::join(&session.musician(HOST_MEMBER_ID.0, server_addr), now()).await;
     let mut guest = Client::join(&session.musician(1, server_addr), now()).await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     while *host.core.state() != ClientState::Joined || *guest.core.state() != ClientState::Joined {
         assert!(Instant::now() < deadline, "clients never joined");
         host.pump(now()).await;
@@ -99,7 +99,7 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
     // The host presses record; the room is told, the host included, and
     // only by the server: no optimistic echo exists to fake this.
     host.core.record_ctl(RecordOp::Start).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     loop {
         host.pump(now()).await;
         guest.pump(now()).await;
@@ -118,7 +118,7 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
 
     // A mid-take joiner is told on arrival, not on the next transition.
     let mut late = Client::join(&session.musician(2, server_addr), now()).await;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     while late.last_record_state() != Some(&RecordingState::Recording) {
         assert!(
             Instant::now() < deadline,
@@ -133,7 +133,7 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
     // Let the recorder see some ticks, then stop; everyone hears Idle.
     tokio::time::sleep(Duration::from_millis(300)).await;
     host.core.record_ctl(RecordOp::Stop).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     while host.last_record_state() != Some(&RecordingState::Idle)
         || late.last_record_state() != Some(&RecordingState::Idle)
     {

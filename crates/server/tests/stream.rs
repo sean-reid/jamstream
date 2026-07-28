@@ -11,7 +11,7 @@ mod common;
 
 use std::net::SocketAddr;
 
-use common::{Running, Session, loopback};
+use common::{Running, Session, budget, loopback};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -153,7 +153,7 @@ async fn a_hosts_stream_request_reaches_the_pipeline_and_status_reaches_everyone
     let mut host = Peer::connect(&mint(0, Role::Musician), server_addr, now()).await;
     let mut listener = Peer::connect(&mint(5, Role::Listener), server_addr, now()).await;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
     let mut asked = false;
     while Instant::now() < deadline {
         host.pump(now()).await;

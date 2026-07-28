@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use common::{
-    BIND, ChildGuard, ReservedPort, Running, Session, loopback, scratch_dir, server_binary,
+    BIND, ChildGuard, ReservedPort, Running, Session, budget, loopback, scratch_dir, server_binary,
 };
 use jamstream_protocol::ids::{Role, TokenId};
 use jamstream_protocol::invite::Invite;
@@ -66,7 +66,7 @@ impl Client {
     }
 
     async fn pump_until_joined(&mut self, start: Instant) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + budget(Duration::from_secs(5));
         while Instant::now() < deadline {
             self.pump(start.elapsed().as_millis() as u64).await;
             if *self.core.state() == ClientState::Joined {
@@ -83,6 +83,30 @@ impl Client {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
+}
+
+/// The runner is described once, by the variable the harness already reads,
+/// and a deadline can only ever get longer from it. A missing or nonsense
+/// value has to leave the laptop budget alone rather than collapse to zero.
+#[test]
+fn a_deadline_scales_with_the_runner_and_never_shrinks() {
+    assert_eq!(
+        common::budget_scale(None),
+        1.0,
+        "unset is the laptop budget"
+    );
+    // What CI sets: 120 s against the harness's 30 s reference run.
+    assert_eq!(common::budget_scale(Some("120")), 4.0);
+    assert_eq!(common::budget_scale(Some("45")), 1.5);
+    for nonsense in ["0", "-30", "", "soon", "NaN", "inf"] {
+        assert_eq!(
+            common::budget_scale(Some(nonsense)),
+            1.0,
+            "{nonsense:?} must not shorten a deadline"
+        );
+    }
+    // Whatever the runner sets, a deadline is at least what it says.
+    assert!(budget(Duration::from_secs(5)) >= Duration::from_secs(5));
 }
 
 /// The one that mattered: a revoked invite must stay revoked across the
@@ -229,7 +253,7 @@ async fn the_shutdown_sentinel_exits_cleanly_and_advertises_itself() {
     std::fs::write(&sentinel, b"requested_unix=0\n").unwrap();
 
     // The sentinel is read on the one-second heartbeat.
-    let exited = tokio::time::timeout(Duration::from_secs(4), task).await;
+    let exited = tokio::time::timeout(budget(Duration::from_secs(4)), task).await;
     assert!(
         exited.is_ok(),
         "server ignored the shutdown sentinel at {}",
@@ -308,7 +332,7 @@ async fn a_sigtermed_process_says_goodbye_and_exits_zero() {
         client.events
     );
 
-    let status = wait_with_deadline(&mut child.0, Duration::from_secs(5));
+    let status = wait_with_deadline(&mut child.0, budget(Duration::from_secs(5)));
     assert_eq!(
         status.code(),
         Some(0),

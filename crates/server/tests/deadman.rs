@@ -9,7 +9,7 @@ mod common;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use common::{Running, Session, loopback, scratch_dir};
+use common::{Running, Session, budget, loopback, scratch_dir};
 use jamstream_server::runtime::{Options, Server};
 use jamstream_session::client::{ClientCore, ClientState};
 use tokio::net::UdpSocket;
@@ -78,7 +78,7 @@ async fn activity_file_advances_with_musicians_and_stops_after_they_leave() {
         socket.send(&first).await.unwrap();
         clients.push(Client { core, socket });
     }
-    let join_deadline = Instant::now() + Duration::from_secs(5);
+    let join_deadline = Instant::now() + budget(Duration::from_secs(5));
     while clients
         .iter()
         .any(|c| *c.core.state() != ClientState::Joined)

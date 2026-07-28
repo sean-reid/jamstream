@@ -9,7 +9,7 @@ mod common;
 
 use std::net::SocketAddr;
 
-use common::{Running, Session, loopback};
+use common::{Running, Session, budget, loopback};
 use std::time::Duration;
 
 use jamstream_protocol::invite::Invite;
@@ -25,7 +25,7 @@ async fn exchange(server_addr: SocketAddr, init: &[u8], what: &str) -> (UdpSocke
     socket.connect(server_addr).await.unwrap();
     socket.send(init).await.unwrap();
     let mut buf = [0u8; 2048];
-    let len = tokio::time::timeout(Duration::from_secs(3), socket.recv(&mut buf))
+    let len = tokio::time::timeout(budget(Duration::from_secs(3)), socket.recv(&mut buf))
         .await
         .unwrap_or_else(|_| panic!("server never answered {what}"))
         .unwrap();

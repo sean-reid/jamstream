@@ -10,7 +10,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Running, Session, loopback};
+use common::{Running, Session, budget, loopback};
 use jamstream_protocol::PROTOCOL_VERSION;
 use jamstream_protocol::transport::Initiator;
 use jamstream_protocol::wire::{self, Packet};
@@ -35,7 +35,7 @@ async fn wrong_version_init_gets_a_mac_verified_reject() {
     socket.send(&init).await.unwrap();
 
     let mut buf = [0u8; 2048];
-    let len = tokio::time::timeout(Duration::from_secs(3), socket.recv(&mut buf))
+    let len = tokio::time::timeout(budget(Duration::from_secs(3)), socket.recv(&mut buf))
         .await
         .expect("server never answered the wrong-version init")
         .unwrap();

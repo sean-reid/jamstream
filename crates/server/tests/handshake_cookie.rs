@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{Running, Session, loopback};
+use common::{Running, Session, budget, loopback};
 use std::time::Duration;
 
 use jamstream_protocol::PROTOCOL_VERSION;
@@ -41,7 +41,7 @@ async fn a_musician_joins_a_flooded_session() {
 
     let mut buf = [0u8; 2048];
     let mut challenged = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + budget(Duration::from_secs(5));
     let mut now_ms = 0u64;
     while *core.state() == ClientState::Connecting && tokio::time::Instant::now() < deadline {
         now_ms += 100;

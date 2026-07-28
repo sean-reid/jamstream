@@ -21,22 +21,34 @@ pub fn loopback() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
-/// What the wall budgets below are worth on a developer laptop, matching the
-/// harness so one variable describes the runner for the whole workspace.
+/// What the budgets below are worth on a quiet developer laptop, which is what
+/// `JAMSTREAM_PERF_BUDGET_SECS` is measured against in the harness. One
+/// variable describes the runner for the whole workspace.
 const REFERENCE_LAPTOP_SECS: f64 = 30.0;
 
-/// A wall-clock budget for a test deadline, scaled for the machine.
+/// A wall-clock deadline, scaled for the machine running the suite.
 ///
-/// `JAMSTREAM_PERF_BUDGET_SECS` says what the harness's 30 s reference run is
-/// allowed here, and every deadline takes the same multiplier from it. Three
-/// server deadlines were fixed 5 s bounds and were reproduced failing at about
-/// 5.0 s under a concurrent workspace run.
+/// Every deadline states what it is worth on a laptop and takes its multiplier
+/// from `JAMSTREAM_PERF_BUDGET_SECS`, the same variable and the same reference
+/// the harness uses: CI sets 120, which is 4x, against runners measured 3.7x
+/// slower than a quiet laptop. Unset means 1x, the laptop budget as written,
+/// and a value at or under the reference never shortens a deadline, so a
+/// missing or nonsense setting can only be generous.
+///
+/// Three server deadlines were fixed 5 s bounds and were reproduced failing at
+/// about 5.0 s under a concurrent workspace run.
 pub fn budget(laptop: Duration) -> Duration {
-    let scale = std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
-        .ok()
+    let raw = std::env::var("JAMSTREAM_PERF_BUDGET_SECS").ok();
+    Duration::from_secs_f64(laptop.as_secs_f64() * budget_scale(raw.as_deref()))
+}
+
+/// The multiplier `JAMSTREAM_PERF_BUDGET_SECS` names, never below 1.
+pub fn budget_scale(value: Option<&str>) -> f64 {
+    value
         .and_then(|v| v.parse::<f64>().ok())
-        .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS);
-    Duration::from_secs_f64(laptop.as_secs_f64() * scale.max(1.0))
+        .filter(|v| v.is_finite())
+        .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS)
+        .max(1.0)
 }
 
 /// An empty scratch directory, named for the test and this process, removed
