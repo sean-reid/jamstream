@@ -3,3 +3,27 @@
 *.profraw
 .DS_Store
 Thumbs.db
+
+# Credentials. Every provider here is configured from the environment, and
+# GCP's is a path: GOOGLE_APPLICATION_CREDENTIALS names a service account key
+# file, so downloading one into a clone to try a launch is the ordinary way to
+# use it. AWS and DigitalOcean take their tokens from a shell, which is where a
+# .env lands. None of these patterns matches a tracked file today, and none can
+# hide one that is already tracked, so this is only a guard against the
+# accident.
+.env
+.env.*
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+gcp-*.json
+*-service-account.json
+
+# `cargo xtask fixtures` writes the audio fixtures here for anyone who wants
+# files to listen to. Tests never read them; they regenerate their own under
+# target/fixtures/.
+/fixtures

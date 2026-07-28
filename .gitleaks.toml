@@ -1,0 +1,45 @@
+# gitleaks configuration. Nothing in CI runs gitleaks; this exists so that
+# anyone who does run it, by hand or from a pre-commit hook, gets zero findings
+# on a clean tree. A scanner whose first run reports eight false positives is a
+# scanner nobody runs twice, and the real finding is the one that then gets
+# scrolled past.
+#
+# The default rule set is kept in full. Two kinds of exemption:
+#
+# The base64 placeholders below are literal fixture values, so they are
+# exempted by value and not by file. A real secret added to any of the same
+# files still fires. Each decodes to what it says: "server-private-key",
+# "supersecret", "record-secret", and DigitalOcean's token shape with the word
+# testtoken in it.
+#
+# The two GCP paths are exempted whole, which is the blunt half.
+# testdata/gcp_test_key.json is nothing but a throwaway RSA-2048 key, and
+# gcp_auth.rs holds a throwaway EC key plus the "-----BEGIN PRIVATE KEY-----"
+# marker strings its parser compares against, which the private-key rule
+# matches on their own. Both keys were generated locally with openssl genpkey,
+# no service account was ever created for either, and they grant access
+# nowhere; the provider signs an RS256 JWT to get a token, so testing that path
+# needs a key a real RSA implementation accepts, which means a real key.
+#
+# Generating those keys at test time would delete both path entries and the
+# matching ones in .github/secret_scanning.yml. That is the better fix and it
+# belongs in the crate.
+title = "jamstream"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "fixture placeholders and the throwaway GCP test keys"
+regexes = [
+  '''c2VydmVyLXByaXZhdGUta2V5''',
+  '''c3VwZXJzZWNyZXQ=''',
+  '''cmVjb3JkLXNlY3JldA==''',
+  '''dop_v1_testtoken''',
+]
+paths = [
+  '''crates/cloud/testdata/gcp_test_key\.json''',
+  '''crates/cloud/src/providers/gcp_auth\.rs''',
+  # Build output, not source.
+  '''^target/''',
+]
