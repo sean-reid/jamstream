@@ -2,6 +2,7 @@
 //! shuttle pumps datagrams between fixed fake addresses while virtual time
 //! advances in 2.5 ms steps. No sockets, no threads, no real clock.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
 use blake2::{Blake2s256, Digest};
@@ -101,6 +102,9 @@ struct Harness {
     /// budget measurement. Two clock reads per 2.5 ms step is nothing next to
     /// the work they bracket.
     tick_nanos: Vec<u64>,
+    /// Whether each of those ticks encoded a broadcast frame, taken from the
+    /// core's own counter so the split is a fact and not an inference.
+    tick_encoded_broadcast: Vec<bool>,
 }
 
 impl Harness {
@@ -132,6 +136,7 @@ impl Harness {
             big_dgrams: 0,
             server_out_bytes: 0,
             tick_nanos: Vec::new(),
+            tick_encoded_broadcast: Vec::new(),
         }
     }
 
@@ -233,9 +238,12 @@ impl Harness {
             }
             to_clients.extend(self.server.handle_datagram(now, self.now_unix, src, &dg));
         }
+        let encodes_before = self.server.broadcast_encodes();
         let started = std::time::Instant::now();
         let ticked = self.server.tick(now);
         self.tick_nanos.push(started.elapsed().as_nanos() as u64);
+        self.tick_encoded_broadcast
+            .push(self.server.broadcast_encodes() > encodes_before);
         to_clients.extend(ticked);
         self.server_events.extend(self.server.events());
 
@@ -2407,15 +2415,26 @@ fn listener_capacity_enforced() {
     assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
 }
 
-/// Not a gate, a measurement:
-/// `cargo test -p jamstream-session --release --test loopback -- --ignored
-/// --nocapture tick_cost_at_capacity`. Release matters: the test profile's
-/// opt-level of 1 reaches libopus too, so a debug number says nothing about
-/// the shipped server. The deadline is 2500 us per tick, and the one tick in
-/// eight that also encodes the 20 ms broadcast frame is the one at risk.
+/// The tick schedule at capacity, gated on the part of it that is a fact
+/// rather than a stopwatch reading.
+///
+/// One broadcast frame per eight ticks, from the core's own counter, on the
+/// exact phase of the cycle: the 20 ms listener frame is encoded once and
+/// sealed per member, so fanning out per listener (which is what shipped
+/// before #78, at 20 x 190 us inside one 2500 us tick) or fanning out every
+/// tick both show up here without timing anything.
+///
+/// The wall-clock half of this deadline is gated in the harness suite, where
+/// `JAMSTREAM_PERF_BUDGET_SECS` names how much slower the runner is than the
+/// reference laptop. The numbers are printed here too, because this is the
+/// cheapest place to get them:
+/// `cargo test -p jamstream-session --release --test loopback --
+/// --nocapture tick_cost_at_capacity`.
 #[test]
-#[ignore = "measurement, not a gate"]
 fn tick_cost_at_capacity() {
+    // 20 ms of broadcast accumulated over 2.5 ms master ticks.
+    const TICKS_PER_BROADCAST: usize = 8;
+
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     for id in 0..MAX_MUSICIANS as u16 {
         // Distinct tones, not silence: silence is the cheapest thing Opus
@@ -2431,31 +2450,75 @@ fn tick_cost_at_capacity() {
     assert_eq!(h.server.musicians_connected(), MAX_MUSICIANS);
     assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
 
+    // Handshake and settle ticks do work no steady-state tick does.
     h.tick_nanos.clear();
+    h.tick_encoded_broadcast.clear();
+    let encodes_before = h.server.broadcast_encodes();
     h.run_ms(10_000);
     let ticks = std::mem::take(&mut h.tick_nanos);
+    let encoded = std::mem::take(&mut h.tick_encoded_broadcast);
+    let encodes = h.server.broadcast_encodes() - encodes_before;
 
-    // The broadcast frame lands on one phase of the eight-tick cycle. Find
-    // which by mean rather than assuming where the warmup left the counter.
-    let group = |p: usize| -> Vec<u64> { ticks.iter().skip(p).step_by(8).copied().collect() };
+    // Exactly one encode per eight ticks, and the encoding ticks are the ones
+    // the core says they are. 4000 ticks is a whole number of cycles, so this
+    // is an equality and not a tolerance.
+    assert_eq!(ticks.len(), 4_000);
+    assert_eq!(ticks.len() % TICKS_PER_BROADCAST, 0);
+    assert_eq!(
+        encodes as usize,
+        ticks.len() / TICKS_PER_BROADCAST,
+        "{encodes} broadcast frames over {} ticks, expected one in {TICKS_PER_BROADCAST}",
+        ticks.len()
+    );
+    assert_eq!(
+        encoded.iter().filter(|e| **e).count(),
+        encodes as usize,
+        "the per-tick flags and the core's counter disagree"
+    );
+    // On one phase of the cycle and only that one: an encode drifting between
+    // phases would mean the accumulator had lost its period.
+    let phases: BTreeSet<usize> = encoded
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| **e)
+        .map(|(i, _)| i % TICKS_PER_BROADCAST)
+        .collect();
+    assert_eq!(phases.len(), 1, "broadcast encodes landed on {phases:?}");
+
+    let bcast: Vec<u64> = ticks
+        .iter()
+        .zip(&encoded)
+        .filter(|(_, e)| **e)
+        .map(|(n, _)| *n)
+        .collect();
+    let plain: Vec<u64> = ticks
+        .iter()
+        .zip(&encoded)
+        .filter(|(_, e)| !**e)
+        .map(|(n, _)| *n)
+        .collect();
     let mean_us = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len() as f64 / 1_000.0;
-    let min_us = |v: &[u64]| *v.iter().min().unwrap() as f64 / 1_000.0;
-    let phase = (0..8)
-        .max_by(|&a, &b| mean_us(&group(a)).total_cmp(&mean_us(&group(b))))
-        .unwrap();
-    let bcast = group(phase);
-    let plain: Vec<u64> = (0..8).filter(|&p| p != phase).flat_map(group).collect();
+    let pct_us = |v: &[u64], q: f64| -> f64 {
+        let mut s = v.to_vec();
+        s.sort_unstable();
+        let rank = ((q * s.len() as f64).ceil() as usize).clamp(1, s.len()) - 1;
+        s[rank] as f64 / 1_000.0
+    };
     println!(
         "tick cost, {} musicians and {} listeners, {} ticks\n  \
-         broadcast tick: min {:.0} us, mean {:.0} us\n  \
-         other ticks:    min {:.0} us, mean {:.0} us\n  \
+         broadcast tick: p50 {:.0} us, p99 {:.0} us, max {:.0} us, mean {:.0} us\n  \
+         other ticks:    p50 {:.0} us, p99 {:.0} us, max {:.0} us, mean {:.0} us\n  \
          amortized:      {:.0} us per tick, {:.0}% of the 2500 us budget",
         MAX_MUSICIANS,
         MAX_LISTENERS,
         ticks.len(),
-        min_us(&bcast),
+        pct_us(&bcast, 0.5),
+        pct_us(&bcast, 0.99),
+        pct_us(&bcast, 1.0),
         mean_us(&bcast),
-        min_us(&plain),
+        pct_us(&plain, 0.5),
+        pct_us(&plain, 0.99),
+        pct_us(&plain, 1.0),
         mean_us(&plain),
         mean_us(&ticks),
         100.0 * mean_us(&ticks) / 2_500.0,
