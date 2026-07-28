@@ -129,6 +129,11 @@ async fn wizard_hosts_a_real_local_session() {
     unsafe {
         std::env::set_var(jamstream_cli::state::STATE_DIR_ENV, &state_dir);
         std::env::set_var("JAMSTREAMD_PATH", &server_binary);
+        // Loopback, not every interface. A real session needs the LAN so
+        // bandmates can reach it; this test only ever talks to itself, and
+        // on macOS binding 0.0.0.0 makes the firewall ask about each newly
+        // built binary, parking the run behind a dialog nobody answers.
+        std::env::set_var("JAMSTREAM_BIND", "127.0.0.1");
     }
 
     // Drive the wizard exactly as the UI does: transitions plus job polls.
