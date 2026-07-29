@@ -13,7 +13,7 @@ Each invite admits one person to one seat in one session. It carries, signed by 
 
 ## Joining
 
-Paste the invite into the **Join a session** field on the home screen (hint text: "paste an invite, jamstream://join/...") and click Join, or press Enter. A malformed or expired invite shows the reason under the field instead of joining.
+Paste the invite into the **Join a session** field on the home screen (hint text: "paste an invite, jamstream://join/...") and click Join, or press Enter. A malformed or expired invite shows the reason under the field instead of joining. If every seat for your role is taken, the screen reads "the session is full; waiting for a seat to free" and the app keeps trying, so you are in as soon as somebody leaves.
 
 ## The session screen
 
@@ -30,9 +30,9 @@ What you are looking at:
 - The host additionally sees a Revoke button on every other strip. Revoking ejects that member and kills their invite, with a confirmation step.
 - Chat, with timestamps. The metronome panel shows tempo, beats per bar, and click state; the host sets them, and "hear the click" is your own choice.
 - The status bar, in the same place every session: latency and your meters on the left, ON AIR and REC in the middle, and the session id and Leave on the right. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
-- The **ON AIR** lamp, in the middle of the bar: absent until the host starts a broadcast, amber while one is running, with a count of how many platforms are receiving it. Only the host can start or stop one, but everyone sees the lamp, because everyone is in it. See [Streaming to Twitch and YouTube](streaming.md).
+- The **ON AIR** lamp, in the middle of the bar: absent until the host starts a broadcast, amber while one is running, with how many platforms are receiving it on its hover. Only the host can start or stop one, but everyone sees the lamp, because everyone is in it. See [Streaming to Twitch and YouTube](streaming.md).
 
-A member who stops responding grays out after 10 seconds and their fader freezes; when they reconnect with their invite, they come back in the same seat.
+A member who stops responding grays out after 10 seconds; when they reconnect with their invite, they come back in the same seat.
 
 At ten musicians the strips extend past the window and scroll horizontally:
 
@@ -45,7 +45,7 @@ The headline number on the left of the status bar is mouth to ear latency in mil
 
 ## Devices and buffer size, mid-session
 
-Settings in the top bar opens over the session without covering the strips or the status bar. It is in tabs: **Audio** for devices and buffer size, **You** for your avatar and the theme, and, for a host, **Broadcast** and **Invites**.
+Settings in the top bar opens over the session without covering the strips or the status bar. It is in tabs, in this order: **Audio** for devices and buffer size, then **Broadcast** and **Invites** for a host whose own app launched the session, then **Recording** for where takes go, which is a setting of this computer and is there whatever the session is, and **You** for your avatar and the theme.
 
 ![The Audio tab of the Settings drawer beside the session: buffer size choices with the current mouth to ear figure, an input level meter, and capture and playback pickers](../images/session_settings.png)
 *Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*

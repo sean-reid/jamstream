@@ -30,12 +30,14 @@ Both forms read the bucket details [`jamstream host`](host.md) saved beside each
 ```console
 $ jamstream recordings
 SESSION    TAKE                                           SIZE  MODIFIED
-3f2a9c01   mix.flac                                    1.38 GB  2026-07-28 19:30
-3f2a9c01   stems/bass.flac                            691.2 MB  2026-07-28 19:30
-3f2a9c01   stems/drums.flac                           691.2 MB  2026-07-28 19:31
+3f2a9c01   jamstream-2026-07-28-1930-mix.flac          1.38 GB  2026-07-28 19:30
+3f2a9c01   jamstream-2026-07-28-1930-Ana.flac         691.2 MB  2026-07-28 19:30
+3f2a9c01   jamstream-2026-07-28-1930-Bo.flac          691.2 MB  2026-07-28 19:31
 
 Fetch a session's takes with: jamstream recordings get <session>
 ```
+
+A take is named for the minute it started, in UTC: `jamstream-YYYY-MM-DD-HHMM-mix.flac` for the mix, and one `jamstream-YYYY-MM-DD-HHMM-<name>.flac` per musician when the session recorded stems. They all sit side by side under the session's own prefix; there is no stems folder.
 
 A session that recorded nothing says so on its own line rather than showing an empty table.
 
@@ -51,9 +53,9 @@ Egress is billed on the download, not on the recording.
 Your plan includes 100 GB/month of free download, so this is an upper bound.
 Billed to your own cloud account at list prices; JamStream never sees it.
 Download these takes? [y/N] y
-  mix.flac                                 100%
-  stems/bass.flac                          100%
-  stems/drums.flac                         100%
+  jamstream-2026-07-28-1930-mix.flac       100%
+  jamstream-2026-07-28-1930-Ana.flac       100%
+  jamstream-2026-07-28-1930-Bo.flac        100%
 3 takes in /Users/you/takes, 2.76 GB.
 Egress for this download: $0.248832.
 ```

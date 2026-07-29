@@ -49,7 +49,7 @@ $ pass show band/seat | jamstream join --headless \
 
 - The invite file is read one line at a time and capped at 4 KiB; a trailing newline and surrounding blanks are ignored.
 - The input WAV must be 48 kHz; stereo files are downmixed to mono. Anything else is rejected with a message naming the problem.
-- The output WAV is written even when the session ends badly (ejected, rejected, timed out), so a test run always leaves evidence.
+- The output WAV is written on the four session endings as well as a clean one: ejected, rejected, timed out, and session full. A socket or file error, or an `--input` file that fails validation, exits without writing it.
 - Chat lines, roster changes, metronome changes, and ejection reasons print one per line; latency samples are not printed.
 - The session's recorder prints as `record: idle`, `record: recording (mix and stems)`, or `record: failed: <reason>` on every transition, so a rig can assert that a take ran. See [Recording a session](../guides/recording.md).
 - A version mismatch fails at the handshake with both versions named, never with silence.

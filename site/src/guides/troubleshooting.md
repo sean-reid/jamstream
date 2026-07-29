@@ -16,7 +16,7 @@ The total is built from pieces, and you control several:
 Things to check, in order of payoff:
 
 1. **Bluetooth.** Bluetooth headphones or earbuds add more delay than JamStream's entire network path. Use wired headphones, always. This is the most common cause of "it feels wrong" with a good-looking number.
-2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. Hover the latency number in the status bar for the `buffer` readout, which shows depth in frames; each frame is 2.5 ms. If it sits high or climbs, plug in ethernet.
+2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. Hover the latency number in the status bar for the `buffer` readout, which reads "buffer 3/4 frames": the depth it is holding against the depth it is aiming for, in 2.5 ms frames. If it sits high or climbs, plug in ethernet.
 3. **Buffer size.** On the Audio tab of Settings, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that plays clean. Crackles mean one step up.
 4. **Region.** If the session's round trip (`rtt`, on the latency number's hover) is high for you specifically, the server is far from you. The host can pick a fairer region next time; see [Hosting a session](hosting.md#the-region-table).
 5. **Loss.** The `loss` percentage, on the same hover, should sit near 0.0%. Sustained loss above 1% points at the local network: congested wifi, a saturated uplink, a bad cable.
@@ -26,7 +26,7 @@ Things to check, in order of payoff:
 Input and output devices are picked on the Audio tab of Settings, under Devices: a Capture picker, a Playback picker, and an input level meter that should move when you play. If the meter is still, the wrong capture device is selected or the operating system has not granted microphone access to the app. The lists come from the platform's audio backend (CoreAudio on macOS, WASAPI on Windows, PipeWire or ALSA on Linux), with the system default listed first, and a change mid-session reopens the stream on the new device without leaving the session.
 
 - "no devices found" in a picker means the platform reported nothing for that direction; check that the interface is connected and visible to other apps.
-- Sample rate is fixed at 48 kHz. Most interfaces are fine with this; set your interface to 48 kHz in its control panel if it is pinned elsewhere.
+- Sample rate is fixed at 48 kHz and nothing resamples, so a device that will not open at 48 kHz is refused rather than run at the wrong rate. The message names the device's rate and what to do about it, and the remedy depends on the platform: on macOS, look for a 48 kHz entry under Audio MIDI Setup, Format, and use another device if there is none; on Windows, set the device to 48 kHz in Sound, the device's Properties, Advanced, Default Format; on Linux under PipeWire, the graph rate is not the problem because PipeWire converts rates, so that device has no 48 kHz mode and another one is the answer; on bare ALSA, nothing converts at all, so start PipeWire or use a device with a 48 kHz mode.
 - On macOS, grant microphone permission when prompted; without it, capture is silence.
 
 ## Firewall and NAT
