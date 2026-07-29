@@ -1644,10 +1644,12 @@ fn stream_keys_never_appear_in_anything_the_server_relays() {
     let mut h = Harness::new(10, 20);
     let inv_host = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
-    let inv_snoop = h.mint(7, Role::Listener);
+    let inv_snoop_m = h.mint(2, Role::Musician);
+    let inv_snoop_l = h.mint(7, Role::Listener);
     h.add_client(&inv_host, Some(440.0));
     h.add_client(&inv_b, Some(0.0));
-    h.add_sniffer(&inv_snoop, addr_of(60));
+    h.add_sniffer(&inv_snoop_m, addr_of(59));
+    h.add_sniffer(&inv_snoop_l, addr_of(60));
     h.run_ms(1_000);
 
     h.clients[0]
@@ -1656,37 +1658,66 @@ fn stream_keys_never_appear_in_anything_the_server_relays() {
         .unwrap();
     h.clients[0].core.stream_ctl(StreamOp::Start).unwrap();
     h.run_ms(500);
-    // The op reached the driver, so the key really was in flight.
+    // The driver got the key itself, not just an add of some sort. Everything
+    // below is a search for a string, so a build where the key never reached
+    // the server would pass all of it while the feature was broken.
+    let to_driver: Vec<&StreamOp> = h
+        .server_events
+        .iter()
+        .filter_map(|e| match e {
+            ServerEvent::StreamCtl(op) => Some(op),
+            _ => None,
+        })
+        .collect();
     assert!(
-        h.server_events
+        to_driver
             .iter()
-            .any(|e| matches!(e, ServerEvent::StreamCtl(StreamOp::AddDestination { .. }))),
-        "the host's add never arrived"
+            .any(|op| **op == add_dest(1, StreamPlatform::Twitch, KEY)),
+        "the driver never got the host's key: {to_driver:?}"
     );
 
     // The pipeline reports status, which is the only stream traffic that fans
     // out. Include the destination in a failed state, since the reason string
     // is the one status field that carries free text.
+    const REASON: &str = "pusher exited: connection refused";
     let now = h.now_ms();
     h.server.set_stream_status(
         now,
         vec![status(
             1,
             DestinationState::Failed {
-                reason: "pusher exited: connection refused".to_owned(),
+                reason: REASON.to_owned(),
             },
         )],
     );
     h.run_ms(1_000);
 
-    let needle = KEY.as_bytes();
-    let contains = |bytes: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    let finder = |needle: &'static str| {
+        move |bytes: &[u8]| {
+            let needle = needle.as_bytes();
+            bytes.windows(needle.len()).any(|w| w == needle)
+        }
+    };
+    let has_key = finder(KEY);
+    let has_reason = finder(REASON);
 
-    // Every plaintext byte the server sealed to a member.
-    let snoop = h.sniffer(MemberId(7));
-    assert!(!snoop.seen.is_empty(), "the sniffer received nothing");
-    for plain in &snoop.seen {
-        assert!(!contains(plain), "key found in a relayed datagram");
+    // Every plaintext byte the server sealed to a member, on both sides of
+    // the roster: a listener and a musician, because the fanout is per role
+    // and a key leaked only to the band is still a key leaked.
+    for id in [MemberId(2), MemberId(7)] {
+        let snoop = h.sniffer(id);
+        assert!(!snoop.seen.is_empty(), "sniffer {id:?} received nothing");
+        // The bytes being searched are the bytes that carry the destination.
+        // Without this the loop below is a search through whatever happened to
+        // arrive, and it would stay green if the status stopped fanning out.
+        assert!(
+            snoop.seen.iter().any(|p| has_reason(p)),
+            "sniffer {id:?} never saw the stream status, so it never saw the \
+             message a key could ride in"
+        );
+        for plain in &snoop.seen {
+            assert!(!has_key(plain), "key found in a datagram relayed to {id:?}");
+        }
     }
     // And every message the honest clients decoded, serialized back to bytes.
     for i in 0..h.clients.len() {
@@ -1695,17 +1726,11 @@ fn stream_keys_never_appear_in_anything_the_server_relays() {
                 destinations: status,
             })
             .unwrap();
-            assert!(
-                !contains(&bytes),
-                "key found in a status sent to client {i}"
-            );
+            assert!(!has_key(&bytes), "key found in a status sent to client {i}");
         }
         let debug = format!("{:?}", h.clients[i].events);
         assert!(!debug.contains(KEY), "key found in client {i} events");
     }
-    // The server's own copy of the status is key-free too.
-    let bytes = postcard::to_allocvec(h.server.stream_status()).unwrap();
-    assert!(!contains(&bytes));
 }
 
 #[test]
@@ -1752,9 +1777,11 @@ fn broadcast_tap_exposes_post_limiter_audio_and_card_state() {
     assert_eq!(tick.members.len(), 2, "listeners are not carded");
     assert!(tick.roster_epoch > epoch);
 
-    // Turning the tap off clears the meters.
+    // Turning the tap off clears the meters. The card count comes first: on
+    // an empty list the peak check below is true of nothing.
     h.server.set_broadcast_tap(false);
     let tick = h.server.broadcast_tick();
+    assert_eq!(tick.members.len(), 2);
     assert!(tick.members.iter().all(|m| m.level_peak == 0.0));
 }
 
@@ -1800,10 +1827,13 @@ fn the_stem_tap_carries_decoded_members_and_their_broadcast_faders() {
     assert!(rms(tone.pcm) > 0.1, "pre-mix pcm was attenuated");
 
     // A member who leaves stops appearing; the tap never yields stale audio.
+    // The set, not an absence: a tap that yielded nothing at all would satisfy
+    // "member 0 is not in it" while having stopped working.
     h.clients[host].core.leave("done").unwrap();
     h.clients[host].tone_hz = None;
     h.run_ms(250);
-    assert!(h.server.stems().all(|s| s.id != MemberId(0)));
+    let left: Vec<MemberId> = h.server.stems().map(|s| s.id).collect();
+    assert_eq!(left, vec![MemberId(1)]);
 }
 
 #[test]
@@ -1914,7 +1944,8 @@ fn revoke_ejects_and_blocks_rejoin() {
     );
     assert_eq!(h.server.musicians_connected(), 2);
     let roster = h.last_roster(0).expect("roster after revoke");
-    assert!(roster.iter().all(|m| m.id != MemberId(1)));
+    let ids: Vec<MemberId> = roster.iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![MemberId(0), MemberId(2)]);
 
     // The same token cannot come back: refusal is silent.
     let now = h.now_ms();
@@ -3192,8 +3223,25 @@ fn chat_delivers_within_four_steps_while_a_max_avatar_streams() {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
+    /// The packet type is drawn from the seven that exist rather than from
+    /// all 256, because a uniform first byte misses the parser 97% of the
+    /// time and the property then only exercises the tag check.
     #[test]
-    fn cores_survive_arbitrary_datagrams(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+    fn cores_survive_arbitrary_datagrams(
+        tag in prop::sample::select(vec![
+            wire::TYPE_HANDSHAKE_INIT,
+            wire::TYPE_HANDSHAKE_RESP,
+            wire::TYPE_TRANSPORT,
+            wire::TYPE_VERSION_REJECT,
+            wire::TYPE_CAPACITY_REJECT,
+            wire::TYPE_COOKIE_CHALLENGE,
+            wire::TYPE_COOKIED_INIT,
+            0u8,
+            255u8,
+        ]),
+        body in proptest::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let data: Vec<u8> = std::iter::once(tag).chain(body).collect();
         let issuer = Issuer::generate();
         let kp = generate_keypair();
         let sid = SessionId::generate();
@@ -3214,9 +3262,21 @@ proptest! {
             },
         );
         let (mut client, _init) = ClientCore::connect(&invite, 0).unwrap();
-        server.handle_datagram(0, 0, addr_of(2), &data);
+        let replies = server.handle_datagram(0, 0, addr_of(2), &data);
         client.handle_datagram(0, &data);
-        server.tick(1);
+        // Surviving is the floor, not the property. Nothing unauthenticated is
+        // answered at all, which is what keeps the port off the reflection
+        // lists: the version reject derives its key from the Noise message
+        // before it will speak, and the cookie gate stays shut until the
+        // server is under handshake load.
+        prop_assert!(
+            replies.is_empty(),
+            "the server answered {} bytes it could not authenticate",
+            data.len()
+        );
+        prop_assert_eq!(server.musicians_connected(), 0);
+        prop_assert!(server.tick(1).is_empty());
+        prop_assert_eq!(client.state(), &ClientState::Connecting);
         client.poll(1);
     }
 }

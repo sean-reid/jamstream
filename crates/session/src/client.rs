@@ -1644,10 +1644,17 @@ mod tests {
         assert_eq!(core.poll(5_500).len(), 1);
     }
 
+    /// Both ends of the deadline. The one-millisecond-early poll has to leave
+    /// the client connecting: asserting only that it produced at most one
+    /// datagram was satisfied by producing none, which is what a client that
+    /// had already given up does, so the whole ten seconds could shrink to
+    /// half a second with this green.
     #[test]
     fn connecting_times_out_after_ten_seconds() {
         let (mut core, _) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
         assert!(core.poll(9_999).len() <= 1);
+        assert_eq!(*core.state(), ClientState::Connecting);
+        assert!(!core.events().contains(&ClientEvent::TimedOut));
         core.poll(10_000);
         assert_eq!(*core.state(), ClientState::TimedOut);
         assert!(core.events().contains(&ClientEvent::TimedOut));

@@ -116,25 +116,59 @@ proptest! {
     /// stays inside the window `ack_bits` can advertise.
     #[test]
     fn control_reassembly_stays_inside_the_window(
-        seqs in prop::collection::vec(0u64..100, 1..500),
+        seqs in prop::collection::vec(0u64..SEQ_COUNT, 1..500),
     ) {
-        let mut sender = ControlLink::new();
+        let dgrams = one_datagram_per_seq();
         let mut link = ControlLink::new();
-        // One legal datagram per sequence number, built by a real sender so
-        // only the ordering is adversarial. 100 of them is three times the
-        // window and inside the link's queue cap.
-        for n in 0..100u64 {
-            sender.send(ControlMsg::Chat { from: MemberId(1), text: format!("m{n}") }).unwrap();
-        }
-        let dgrams = sender.poll(0);
         for &seq in &seqs {
-            let Some(dgram) = dgrams.get(seq as usize) else { continue };
-            let _ = link.receive(dgram);
+            let _ = link.receive(&dgrams[seq as usize]);
+            // The tight bound, not RECV_WINDOW itself: the frame at
+            // `recv_next` drains on arrival, so the slots that can hold a
+            // frame are the 31 above it, which is exactly what `ack_bits`
+            // advertises.
             prop_assert!(
-                link.buffered() <= RECV_WINDOW as usize,
-                "buffered {} frames",
+                link.buffered() < RECV_WINDOW as usize,
+                "buffered {} frames after seq {seq}",
                 link.buffered()
             );
         }
     }
+}
+
+/// Three windows' worth, so most draws are frames the receiver must refuse.
+const SEQ_COUNT: u64 = 100;
+
+/// One legal datagram per sequence number in `0..SEQ_COUNT`, built by a real
+/// sender so that only the ordering is adversarial.
+///
+/// Draining the sender takes a peer that acks, because `poll` holds anything
+/// at or past the peer's window: one call returns RECV_WINDOW datagrams and
+/// no more. Collecting only those left 68 of every 100 draws with no datagram
+/// to present, and the 32 that were left are all inside the window from
+/// `recv_next` 0, so the bound above held for every input the property could
+/// generate whether or not the code enforced it.
+fn one_datagram_per_seq() -> Vec<Vec<u8>> {
+    let mut sender = ControlLink::new();
+    let mut acker = ControlLink::new();
+    for n in 0..SEQ_COUNT {
+        sender
+            .send(ControlMsg::Chat {
+                from: MemberId(1),
+                text: format!("m{n}"),
+            })
+            .expect("inside the queue cap");
+    }
+    let mut out = Vec::with_capacity(SEQ_COUNT as usize);
+    while (out.len() as u64) < SEQ_COUNT {
+        let batch = sender.poll(0);
+        assert!(!batch.is_empty(), "sender stalled at {} frames", out.len());
+        for dgram in batch {
+            acker.receive(&dgram).expect("a real sender's own datagram");
+            out.push(dgram);
+        }
+        for ack in acker.poll(0) {
+            sender.receive(&ack).expect("a real receiver's own ack");
+        }
+    }
+    out
 }
