@@ -109,12 +109,21 @@ fn latency_dsl() {
 }
 
 // hostile-wifi: 20 ms RTT, 7.5 ms jitter with 20 ms reorder spikes, 2% loss.
-// Silence gate 120 ms: the jitter buffer clamp is 24 frames (60 ms) and Opus
-// PLC keeps concealment audible for several frames, so any silent gap beyond
-// two full buffer refills means recovery is broken, not that the network was
-// bad. Sine peak per 2.5 ms tick is ~0.35 (0.5 amp, center pan 0.707);
-// threshold 0.02 is well below concealment output and well above numeric
-// noise.
+//
+// Silence gate 120 ms: the jitter buffer clamp is 24 frames (60 ms), so a
+// silent gap beyond two full buffer refills means the buffer is resetting in
+// a loop. It says nothing about redundancy, because Opus PLC conceals a
+// missing frame with sound and satisfies this on its own; it is here for the
+// collapse, not for the recovery. Sine peak per 2.5 ms tick is ~0.35 (0.5
+// amp, center pan 0.707); threshold 0.02 is well below concealment output and
+// well above numeric noise.
+//
+// Redundancy is gated separately and per member, on the share of gaps the
+// piggybacked copies close. Measured over 30 s: about 430 gaps per member, of
+// which 390 to 394 are recovered, so 90% to 93%. The floor is 75%: turning
+// redundancy off takes it to 0, and any real degradation lands well below 75
+// while a run of bad luck cannot. Per member and not summed, because summed,
+// one healthy member covers for two broken ones.
 #[test]
 fn loss_resilience_hostile_wifi() {
     let mut s = ScenarioBuilder::new(0xB1)
@@ -147,16 +156,26 @@ fn loss_resilience_hostile_wifi() {
 
     // 2% loss sits above the 1% redundancy-on threshold, so uplink frames
     // lost on the wire must be recovered from piggybacked copies.
-    let recovered: u64 = s
-        .server_member_stats()
-        .iter()
-        .map(|m| m.jitter.recovered)
-        .sum();
-    assert!(
-        recovered > 0,
-        "no frames recovered via app-layer redundancy under 2% loss; stats: {:?}",
-        s.server_member_stats()
-    );
+    let stats = s.server_member_stats();
+    assert_eq!(stats.len(), 3, "expected three members: {stats:?}");
+    for m in &stats {
+        let gaps = m.jitter.lost + m.jitter.recovered;
+        // The profile has to have hurt, or the share below means nothing.
+        assert!(
+            gaps >= 150,
+            "member {:?} saw only {gaps} gaps in 30 s of 2% loss, so the profile \
+             is no longer testing redundancy: {m:?}",
+            m.id
+        );
+        let share = 100.0 * m.jitter.recovered as f64 / gaps as f64;
+        assert!(
+            share >= 75.0,
+            "member {:?} recovered {:.1}% of {gaps} gaps from piggybacked copies \
+             (floor 75%, measured 90 to 93): {m:?}",
+            m.id,
+            share
+        );
+    }
 
     assert!(
         !s.server_events().iter().any(|e| matches!(
@@ -941,13 +960,20 @@ fn capacity_latency_ms(profile_name: &str, seed: u64) -> f32 {
     median(latencies)
 }
 
-// Same three profiles and the same gates as the two-musician runs above, on
-// a full room. The medians come out bit-identical to those runs (9.67 /
-// 19.31 / 64.75 ms), which is the point: latency is set by the tick schedule
-// and the wire, not by how many people are in the session, so any movement
-// here is a finding rather than noise.
+// Same three profiles and the same product gates as the two-musician runs
+// above, on a full room, plus the one those gates cannot be. Latency is set
+// by the tick schedule and the wire, not by how many people are in the
+// session, so the capacity median and the two-musician median are the same
+// number: 9.67 / 19.31 / 64.75 ms, and the same on either seed. The product
+// gates sit 5 to 20 ms above that, which is room enough for the whole
+// regression this test exists to catch, so the gate is the difference between
+// the two rooms rather than the band.
 #[test]
 fn latency_at_capacity() {
+    // A tenth of a tick. The two rooms come out bit-identical today and the
+    // slack is for a sample or two of platform difference in the impulse
+    // detector, not for a cost that arrives with the tenth musician.
+    const ROOM_SIZE_MS: f32 = 0.25;
     // Profile, seed, physical floor (2 x one-way), gate. Derivations sit with
     // the two-musician gates above.
     for (profile, seed, floor, gate) in [
@@ -956,9 +982,10 @@ fn latency_at_capacity() {
         ("dsl-cross-country", 0xA6, 45.0, 65.0),
     ] {
         let m = capacity_latency_ms(profile, seed);
+        let two = median_latency_ms(profile, seed);
         println!(
             "{profile} at capacity ({MAX_MUSICIANS} musicians, {MAX_LISTENERS} listeners) \
-             median mouth-to-ear: {m:.2} ms"
+             median mouth-to-ear: {m:.2} ms, against {two:.2} ms with two musicians"
         );
         assert!(
             m >= floor,
@@ -968,6 +995,12 @@ fn latency_at_capacity() {
         assert!(
             m <= gate,
             "{profile} at capacity: median mouth-to-ear {m:.2} ms exceeds the {gate:.0} ms gate"
+        );
+        assert!(
+            (m - two).abs() <= ROOM_SIZE_MS,
+            "{profile}: median {m:.2} ms at capacity against {two:.2} ms with two \
+             musicians. Room size is not supposed to be in this number, so this is \
+             per-member cost on the latency path"
         );
     }
 }
