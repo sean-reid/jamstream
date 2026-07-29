@@ -10,7 +10,7 @@ mod common;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use common::{fixture, wav_tail_rms};
+use common::{fixture, wav_audio_ms_from};
 use jamstream_cli::cli::JoinArgs;
 use jamstream_cli::{CliError, join};
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
@@ -19,10 +19,32 @@ use jamstream_protocol::transport::generate_keypair;
 use jamstream_server::config::Config;
 use jamstream_server::runtime::{Options, Server};
 
-/// Whole-session length for every member that is not ejected.
+/// Whole-session length for every member that is not ejected. Not scaled with
+/// the machine: the host plays a 5 s sine, and past that its capture is
+/// zero-padded, so a longer session would feed musician 1 silence and break
+/// the very thing the tail assertion checks. What scales is the tolerance for
+/// a stall inside the session, not the session.
 const SESSION_SECS: u64 = 4;
+/// The host plays a second longer than the musicians, and exactly as long as
+/// its 5 s sine fixture. Each client runs its duration from its own join, so
+/// without this the host can win the join race and leave while musician 1 is
+/// still recording, which puts real silence at the end of musician 1's file
+/// on a machine where the joins spread out.
+const HOST_SESSION_SECS: u64 = 5;
 /// The host fires the revoke this long after joining.
 const REVOKE_AFTER_SECS: u64 = 1;
+/// Where musician 1's recording is certainly past the revoke: the revoke fires
+/// at REVOKE_AFTER_SECS and its round trip is milliseconds, so half a second
+/// of slack is generous.
+const POST_REVOKE_FROM_SECS: f64 = 1.5;
+/// Granularity of the audio measurement. 50 ms is many periods of the host's
+/// 440 Hz tone, so a block's RMS is a stable reading of whether audio arrived.
+const AUDIO_BLOCK_MS: f64 = 50.0;
+/// How much of the post-revoke stretch has to carry the host's tone. There are
+/// 2.5 s of it in a clean run and all 2.5 s are audio; the floor is 1 s, which
+/// leaves room for a stall or for the host's session ending up to 1.5 s before
+/// musician 1's, and is unreachable for a session that stopped playing.
+const POST_REVOKE_AUDIO_FLOOR_MS: f64 = 1_000.0;
 
 fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -111,6 +133,7 @@ async fn host_revokes_musician_two_and_musician_one_plays_on() {
     std::fs::write(&revoke_file, format!("{}\n", m2_invite.encode())).unwrap();
     host_args.revoke_invite_file = Some(revoke_file.clone());
     host_args.revoke_after_secs = Some(REVOKE_AFTER_SECS);
+    host_args.duration_secs = HOST_SESSION_SECS;
     let m1_args = join_args(&m1_invite, fixture("silence-48k.wav"), out_one.clone());
     let m2_args = join_args(&m2_invite, fixture("sine-880-48k.wav"), out_two.clone());
 
@@ -157,14 +180,24 @@ async fn host_revokes_musician_two_and_musician_one_plays_on() {
         "musician 1 never saw the roster shrink after the revoke: {text_one}"
     );
 
-    // Musician 1's audio continues after the revoke: the ejection lands at
-    // ~1 s of a 4 s session, so the final 1.5 s is entirely post-revoke and
-    // must still carry the host's sine.
-    let tail = wav_tail_rms(&out_one, 1.5);
+    // Musician 1's audio continues after the revoke: the ejection lands about
+    // REVOKE_AFTER_SECS into the session, so everything measured below is
+    // post-revoke and has to still carry the host's sine.
+    //
+    // A total, not the mean of the final 1.5 s. Nothing in this test scales
+    // with the machine, and the three clients each run their own duration from
+    // their own join, so load moves where the audio sits inside musician 1's
+    // recording: if the host wins the join race by enough, it leaves before
+    // musician 1 does and the end of musician 1's file is legitimately silent.
+    // A mean pinned to that end reads the whole story as no audio, which is
+    // how this fired on PR #266, a change touching only crates/client. The
+    // total is what the story claims, and it is zero if the session stopped,
+    // so the bar for what counts as audio stays at 0.01.
+    let played = wav_audio_ms_from(&out_one, POST_REVOKE_FROM_SECS, AUDIO_BLOCK_MS, 0.01);
     assert!(
-        tail > 0.01,
-        "musician 1's post-revoke audio is near-silence (rms {tail}); \
-         the session did not play on"
+        played >= POST_REVOKE_AUDIO_FLOOR_MS,
+        "musician 1 received {played:.0} ms of audio after the revoke, under the \
+         {POST_REVOKE_AUDIO_FLOOR_MS:.0} ms floor; the session did not play on"
     );
 
     // The revoked invite cannot rejoin: the server refuses the handshake
