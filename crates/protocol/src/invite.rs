@@ -165,9 +165,9 @@ pub fn verify_token(
     // by `verify` below, exactly as before.
     issuer_pk
         .verify(&msg, &Signature::from_bytes(signature))
-        .map_err(|_| Error::Token("bad signature"))?;
+        .map_err(|_| Error::Token("has a bad signature"))?;
     if now_unix >= token.expires_unix {
-        return Err(Error::Token("expired"));
+        return Err(Error::Token("has expired"));
     }
     Ok(())
 }
@@ -195,11 +195,11 @@ impl Invite {
         let blob = raw.strip_prefix(URL_PREFIX).unwrap_or(raw);
         let bytes = data_encoding::BASE64URL_NOPAD
             .decode(blob.as_bytes())
-            .map_err(|_| Error::Invite("not valid encoding"))?;
+            .map_err(|_| Error::Invite("has invalid encoding"))?;
         let invite: Invite =
-            postcard::from_bytes(&bytes).map_err(|_| Error::Invite("truncated or corrupt"))?;
+            postcard::from_bytes(&bytes).map_err(|_| Error::Invite("is truncated or corrupt"))?;
         if invite.addresses.is_empty() {
-            return Err(Error::Invite("no server address"));
+            return Err(Error::Invite("has no server address"));
         }
         Ok(invite)
     }
