@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use data_encoding::{BASE64, HEXLOWER};
 use egui::{RichText, Ui, vec2};
 use jamstream_cloud::{
-    BootConfig, CostPreview, InstanceClass, LaunchSpec, PinnedServerArtifacts, Price, ProbeMatrix,
-    Provider, ProviderKind, Region, RegionId, RetentionEnforcement, SelfDestruct, ServerArch, rank,
-    session_tag,
+    BootConfig, CostPreview, HANDSHAKE_CAP, IP_POLL_PERIOD, IP_WAIT_CAP, InstanceClass, LaunchSpec,
+    PinnedServerArtifacts, Price, ProbeMatrix, Provider, ProviderKind, Region, RegionId,
+    RetentionEnforcement, SelfDestruct, ServerArch, rank, session_tag,
 };
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::SessionId;
@@ -44,9 +44,6 @@ use crate::widgets::{PICK_INDENT, pick_row, row_cell};
 /// the per-session firewall opens: the two have to be the same value or the
 /// machine comes up behind a firewall for a port nothing is listening on.
 const SESSION_PORT: u16 = jamstream_cloud::DEFAULT_SESSION_PORT;
-const IP_WAIT_CAP: Duration = Duration::from_secs(180);
-const IP_POLL_PERIOD: Duration = Duration::from_secs(2);
-const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
 
 /// The local provider consumes the flat config, which carries no artifact
 /// fields; these placeholders fill the BootConfig struct for it. Cloud
