@@ -640,8 +640,9 @@ impl JamApp {
             SettingsTab::Audio => {
                 let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
                 let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
+                let refusal = snap.as_ref().and_then(|s| s.device_error.as_deref());
                 self.devices
-                    .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e);
+                    .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, refusal);
                 None
             }
             SettingsTab::Broadcast => {

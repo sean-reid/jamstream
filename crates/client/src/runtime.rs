@@ -301,6 +301,11 @@ pub struct Snapshot {
     pub session_short: String,
     pub server_addr: String,
     pub is_host: bool,
+    /// Why this computer has no audio stream, in the device's own words, for
+    /// as long as it has none. A device swapped mid-song and refused leaves
+    /// the session up and the musician silent, so the reason belongs on
+    /// screen rather than only in the log (#263).
+    pub device_error: Option<String>,
 }
 
 /// One snapshot pull per frame, commands fire and forget. Implementations

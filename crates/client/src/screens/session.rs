@@ -347,6 +347,21 @@ impl SessionScreen {
             ConnState::Joined | ConnState::Idle => {}
         }
 
+        // A device that will not run is a genuine problem: the session is up,
+        // the strips are drawn, and this musician is silent in both directions.
+        // It used to be a log line and one chat line that said what the app did
+        // about it but not why, so a swap mid-song was silence with nothing on
+        // screen (#263). Above the strips, in the danger step that reads on the
+        // panel, never the accent, which means live.
+        if let Some(reason) = &snap.device_error {
+            theme::reason(ui, format!("no audio device is running: {reason}"));
+            ui.label(theme::muted(
+                ui,
+                "Nobody can hear you until one opens. The Audio tab in Settings picks another \
+                 device.",
+            ));
+        }
+
         let musicians: Vec<MemberView> = snap
             .members
             .iter()

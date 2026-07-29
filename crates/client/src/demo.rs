@@ -119,6 +119,10 @@ struct DemoState {
     audition: bool,
     destinations: Vec<Destination>,
     record: RecordView,
+    /// Why this computer has no audio stream, when it has none. The real
+    /// runtime fills this from the device that refused; a fixture pins it so
+    /// the sentence a silent musician reads can be looked at.
+    device_error: Option<String>,
 }
 
 pub struct DemoRuntime {
@@ -272,6 +276,7 @@ impl DemoRuntime {
                 audition: false,
                 destinations: Vec::new(),
                 record: RecordView::default(),
+                device_error: None,
             }),
             is_host,
             frozen,
@@ -313,6 +318,13 @@ impl DemoRuntime {
         if away {
             s.away.push(member);
         }
+    }
+
+    /// Pins the reason this computer has no audio stream, the way the real
+    /// runtime publishes the one the device gave it.
+    pub fn set_device_error(&self, reason: Option<&str>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.device_error = reason.map(str::to_owned);
     }
 
     /// Pins the recorder's reported state, the way [`Self::set_destinations`]
@@ -450,6 +462,7 @@ impl Runtime for DemoRuntime {
             session_short: "a3f29c41".to_owned(),
             server_addr: "203.0.113.10:43210".to_owned(),
             is_host: self.is_host,
+            device_error: s.device_error.clone(),
         }
     }
 

@@ -116,6 +116,10 @@ impl DevicesScreen {
     /// musician reaches for mid session, by ear and by meter, while the
     /// device pickers are set once. Whatever is last is what a short window
     /// puts behind a scroll, so the order is the priority.
+    /// `refusal` is why there is no audio stream right now, when there is
+    /// none: the pickers are what a musician came here to change, so the
+    /// reason belongs beside them rather than only over the mixer they cannot
+    /// see with this drawer open (#263).
     pub fn audio_ui(
         &mut self,
         ui: &mut Ui,
@@ -123,12 +127,13 @@ impl DevicesScreen {
         catalog: &DeviceCatalog,
         levels: &LevelsView,
         mouth_to_ear_ms: Option<f32>,
+        refusal: Option<&str>,
     ) {
         self.buffer_ui(ui, block, mouth_to_ear_ms);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
         ui.add_space(theme::SPACE_MD);
-        self.devices_ui(ui, block, catalog);
+        self.devices_ui(ui, block, catalog, refusal);
     }
 
     fn buffer_ui(&mut self, ui: &mut Ui, block: Block, mouth_to_ear_ms: Option<f32>) {
@@ -165,7 +170,13 @@ impl DevicesScreen {
         });
     }
 
-    fn devices_ui(&mut self, ui: &mut Ui, block: Block, catalog: &DeviceCatalog) {
+    fn devices_ui(
+        &mut self,
+        ui: &mut Ui,
+        block: Block,
+        catalog: &DeviceCatalog,
+        refusal: Option<&str>,
+    ) {
         block.show(ui, |ui| {
             ui.label(theme::title(ui, "Devices"));
             // The pickers take the width that is left rather than a fixed
@@ -198,6 +209,12 @@ impl DevicesScreen {
                     );
                     ui.end_row();
                 });
+            // The pick that will not open, in the device's own words, under
+            // the picker that made it.
+            if let Some(reason) = refusal {
+                ui.add_space(theme::SPACE_XS);
+                theme::reason(ui, format!("no audio device is running: {reason}"));
+            }
         });
     }
 }

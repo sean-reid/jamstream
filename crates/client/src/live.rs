@@ -152,6 +152,11 @@ struct SharedState {
     server_addr: String,
     /// Stream reopen attempts after device loss; surfaced in logs.
     reopen_attempts: u64,
+    /// Why the audio stream will not open, verbatim, while it will not. Set
+    /// on every failed open and cleared by the one that succeeds, so the UI
+    /// reads it the way it reads the connection state rather than being told
+    /// once in a chat line it may already have scrolled past.
+    device_error: Option<String>,
 }
 
 impl SharedState {
@@ -184,6 +189,7 @@ impl SharedState {
             session_short,
             server_addr: server_addr.to_string(),
             reopen_attempts: 0,
+            device_error: None,
         }
     }
 
@@ -521,6 +527,7 @@ impl LiveRuntime {
             session_short: s.session_short.clone(),
             server_addr: s.server_addr.clone(),
             is_host,
+            device_error: s.device_error.clone(),
         }
     }
 
@@ -940,11 +947,18 @@ impl Worker {
                 self.engine = Some(engine);
                 self.carry_pos = 0;
                 self.carry_len = 0;
-                self.shared.lock().expect("live state").reopen_attempts = self.reopen_attempts;
+                let mut shared = self.shared.lock().expect("live state");
+                shared.reopen_attempts = self.reopen_attempts;
+                shared.device_error = None;
                 true
             }
             Err(err) => {
                 tracing::warn!(%err, "audio stream open failed");
+                // The reason the device gave, kept for the UI. A refused
+                // device is the one failure a musician can act on from inside
+                // the session, and the log is the one place they will not be
+                // looking at mid-song.
+                self.shared.lock().expect("live state").device_error = Some(err.to_string());
                 false
             }
         }
