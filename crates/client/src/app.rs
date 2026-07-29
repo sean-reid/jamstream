@@ -10,7 +10,7 @@ use crate::avatar;
 use crate::creds::{self, CredStore, EnvReader, KeyringStore};
 use crate::demo::DemoRuntime;
 use crate::exec::{Executor, Job};
-use crate::live::{AudioSettings, CostedRuntime, LiveRuntime};
+use crate::live::{AudioSettings, CostedRuntime, LiveError, LiveRuntime};
 use crate::picker::{Pick, Picked};
 use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
@@ -27,10 +27,36 @@ use crate::widgets::{AVATAR_D_STRIP, avatar_disc, sweep_avatar_textures};
 /// drawer is this wide and no wider whatever the window does.
 const DRAWER_W: f32 = 340.0;
 
+/// How the app turns an invite into a live session.
+///
+/// A parameter rather than a call to [`LiveRuntime::join`], because that opens
+/// the platform's sound card and there is nothing to unplug in a test. Both
+/// ways into a session, the wizard's auto-join and the home screen's Join, go
+/// through this one, so a test can drive either of them over the offline WAV
+/// backend and get the app's real wiring: the [`CostedRuntime`] wrapper, the
+/// invite book's token map, the panels the host screen hangs off.
+///
+/// It is what closes #218. `enter_hosted_session` had no test caller at all and
+/// `wizard_local.rs` re-implemented its body by hand, so the app could have
+/// stopped wrapping in `CostedRuntime`, losing the cost meter and leaving the
+/// mixer's Revoke pointing at nothing, with the suite green.
+pub type Joiner = Arc<
+    dyn Fn(&jamstream_protocol::invite::Invite, AudioSettings) -> Result<LiveRuntime, LiveError>
+        + Send
+        + Sync,
+>;
+
+/// The production joiner: the real sound card, through the platform backend.
+pub fn system_joiner() -> Joiner {
+    Arc::new(|invite, settings| LiveRuntime::join(invite, settings, jamstream_audio_io::backend()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where the window is. There is no Devices screen: audio settings live in
+/// the drawer's Audio tab, which is reachable from everywhere, and the
+/// full-screen route was set from nowhere but a snapshot fixture (#191).
 pub enum Screen {
     Home,
-    Devices,
     HostWizard,
     Session,
 }
@@ -39,7 +65,6 @@ impl Screen {
     fn title(self) -> &'static str {
         match self {
             Screen::Home => "home",
-            Screen::Devices => "devices",
             Screen::HostWizard => "host a session",
             Screen::Session => "session",
         }
@@ -91,6 +116,8 @@ pub struct JamApp {
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
+    /// How a join is performed; see [`Joiner`].
+    pub join: Joiner,
     creds: Arc<dyn CredStore>,
     env: EnvReader,
     exec: Arc<Executor>,
@@ -148,6 +175,7 @@ impl JamApp {
             own_avatar_bytes: None,
             applied_audio,
             ending: None,
+            join: system_joiner(),
             creds,
             env,
             exec,
@@ -246,7 +274,7 @@ impl JamApp {
             return;
         };
         let settings = self.audio_settings();
-        match LiveRuntime::join(&invite, settings, jamstream_audio_io::backend()) {
+        match (self.join)(&invite, settings) {
             Ok(rt) => {
                 let rt = Arc::new(rt);
                 self.live = Some(Arc::clone(&rt));
@@ -283,7 +311,13 @@ impl JamApp {
 
     /// Host chose "end session for everyone": leave the session, then
     /// destroy the instance and mark the state file ended on the executor.
-    fn end_session(&mut self) {
+    ///
+    /// Public for the same reason as [`JamApp::enter_hosted_session`]: it takes
+    /// the invite book out of the screen, resolves the provider from the state
+    /// file's own provider name, and drops the runtime, and a test that
+    /// reimplemented that would agree with itself about all three.
+    /// [`JamApp::poll_ending`] is how a caller waits for the teardown.
+    pub fn end_session(&mut self) {
         if let Some(rt) = self.runtime.as_deref() {
             rt.send(Command::Leave);
         }
@@ -302,18 +336,31 @@ impl JamApp {
         self.screen = Screen::Home;
     }
 
+    /// The teardown's result, once it has one, and `None` while it is still
+    /// running or was never started. Called once per frame by
+    /// [`JamApp::ending_progress`]; also how a test waits for an end to finish.
+    pub fn poll_ending(&mut self) -> Option<Result<(), String>> {
+        let result = self.ending.as_mut()?.poll()?;
+        self.ending = None;
+        self.recent = RecentSession::load();
+        Some(result)
+    }
+
+    /// True while the teardown is in flight.
+    pub fn ending(&self) -> bool {
+        self.ending.is_some()
+    }
+
     /// Progress sheet for the teardown; a failure lands on the home screen
     /// with the provider's error.
     fn ending_progress(&mut self, ctx: &Context) {
-        let Some(job) = &mut self.ending else {
-            return;
-        };
-        if let Some(result) = job.poll() {
-            self.ending = None;
+        if let Some(result) = self.poll_ending() {
             if let Err(err) = result {
                 self.home.error = Some(format!("ending the session failed: {err}"));
             }
-            self.recent = RecentSession::load();
+            return;
+        }
+        if !self.ending() {
             return;
         }
         egui::Window::new("Ending session")
@@ -383,11 +430,7 @@ impl JamApp {
                     match action {
                         HomeAction::Join(invite) => {
                             let settings = self.audio_settings();
-                            match LiveRuntime::join(
-                                &invite,
-                                settings,
-                                jamstream_audio_io::backend(),
-                            ) {
+                            match (self.join)(&invite, settings) {
                                 Ok(rt) => {
                                     let rt = Arc::new(rt);
                                     self.live = Some(Arc::clone(&rt));
@@ -409,12 +452,6 @@ impl JamApp {
                         }
                     }
                 }
-            }
-            Screen::Devices => {
-                let snap = self.runtime.as_deref().map(|rt| rt.snapshot());
-                let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
-                let m2e = snap.and_then(|s| s.stats.mouth_to_ear_ms);
-                self.devices.ui(ui, &self.catalog, &levels, m2e);
             }
             Screen::HostWizard => {
                 // What this computer can record to, handed over as plain data
@@ -789,7 +826,7 @@ impl eframe::App for JamApp {
             || self.avatar_dialog.is_some()
             || self.recording.busy()
             || match self.screen {
-                Screen::Session | Screen::Devices => true,
+                Screen::Session => true,
                 Screen::HostWizard => self.wizard.busy() || self.settings_open,
                 _ => self.settings_open,
             };

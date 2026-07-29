@@ -675,6 +675,68 @@ fn the_host_pressing_record_lands_a_take_and_lights_the_lamp() {
     let _ = std::fs::remove_dir_all(&takes);
 }
 
+/// A device unplugged mid-session: the stream is closed, the room is told, and
+/// the runtime reopens on the system default without losing the session.
+///
+/// This is the test the offline backend existed for and could not run.
+/// `Driver::errored` answered a flat `false` for the offline arm, so
+/// `WavStream::errored` was never read and `Worker::check_stream`'s device-gone
+/// branch was dead code under test: the only backend a test can drive could not
+/// report a lost device, and the only one that could needs a hand on a cable.
+/// Both halves of the fix are in the same change, which is the point:
+/// `with_device_loss_after` on the backend, and reading it here.
+#[test]
+fn a_device_lost_mid_session_is_announced_and_reopened() {
+    let server = TestServer::start();
+    let sine = sine_fixture("device-loss", 440.0);
+    // Two hundred frames is half a second of pumping at 2.5 ms, so the loss
+    // lands well after the join and well inside the test's own patience.
+    let backend = WavBackend::new(Some(sine.clone()), None).with_device_loss_after(200);
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+
+    // The notice goes to everyone on this client's own chat, which is where the
+    // app puts a device problem: nothing else on screen would say why the
+    // meters went quiet.
+    let snap = wait_for(&rt, "the device notice", Duration::from_secs(10), |s| {
+        s.chat
+            .iter()
+            .any(|l| l.text.contains("audio device disconnected"))
+    });
+    let notice = snap
+        .chat
+        .iter()
+        .find(|l| l.text.contains("audio device disconnected"))
+        .expect("the predicate above matched");
+    assert!(
+        notice.text.contains("system default"),
+        "the notice must say what it did about it: {:?}",
+        notice.text
+    );
+
+    // And it comes back. The reopen runs on a 500 ms cadence and the WAV
+    // backend's fresh stream has not been pumped past its loss threshold, so
+    // the second open succeeds and the session was never dropped.
+    let snap = wait_for(&rt, "the reopen", Duration::from_secs(10), |s| {
+        s.chat
+            .iter()
+            .any(|l| l.text.contains("audio device reopened"))
+    });
+    assert_eq!(
+        snap.stats.state,
+        ConnState::Joined,
+        "losing a device must not drop the session"
+    );
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(rt);
+    let _ = std::fs::remove_file(&sine);
+}
+
 /// The other half of the same contract: a session nobody armed to record
 /// must say so in the lamp rather than swallow the press. That is what a
 /// host who launched from the app sees today, because the app's own launch
