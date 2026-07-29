@@ -116,6 +116,10 @@ struct DemoState {
     /// demo produces one, so the strip's disconnected note and its presence
     /// dot had no fixture at all.
     away: Vec<u16>,
+    /// Members the roster reports as quiet: connected, seat held, nothing
+    /// heard from them for `MEMBER_QUIET_AFTER_MS`. A real session passes
+    /// through this window in seconds, so only a fixture can hold it still.
+    quiet: Vec<u16>,
     left: bool,
     audition: bool,
     destinations: Vec<Destination>,
@@ -273,6 +277,7 @@ impl DemoRuntime {
                 },
                 revoked: Vec::new(),
                 away: Vec::new(),
+                quiet: Vec::new(),
                 left: false,
                 audition: false,
                 destinations: Vec::new(),
@@ -323,6 +328,20 @@ impl DemoRuntime {
         s.away.retain(|id| *id != member);
         if away {
             s.away.push(member);
+        }
+    }
+
+    /// Marks one member quiet, the way the server's roster does two seconds
+    /// after it last heard from them.
+    ///
+    /// Away wins in the snapshot rather than here, because that is where the
+    /// server's own rule lives: it clears the flag when it drops a member, so a
+    /// fixture that set both would be showing a roster the wire cannot carry.
+    pub fn set_quiet(&self, member: u16, quiet: bool) {
+        let mut s = self.state.lock().expect("demo state");
+        s.quiet.retain(|id| *id != member);
+        if quiet {
+            s.quiet.push(member);
         }
     }
 
@@ -416,6 +435,10 @@ impl Runtime for DemoRuntime {
                 name: m.name.to_owned(),
                 role: m.role,
                 connected: !s.away.contains(&m.id),
+                // Never both: the server clears quiet when it gives up on a
+                // member, so a snapshot claiming gone and quiet at once would
+                // be a fixture inventing a roster.
+                quiet: !s.away.contains(&m.id) && s.quiet.contains(&m.id),
                 is_you: m.id == 0,
                 fader: m.fader,
                 token: self.is_host.then_some(TokenId([m.id as u8; 16])),

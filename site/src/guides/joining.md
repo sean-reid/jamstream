@@ -24,7 +24,7 @@ Once connected you are in the session screen:
 
 What you are looking at:
 
-- One mixer strip per musician: an avatar disc, a status dot, name, fader, pan, dB readout, and a Mute button. This is your personal monitor mix; moving Ana's fader changes what you hear, not what anyone else hears.
+- One mixer strip per musician: an avatar disc, a presence dot, name, fader, pan, dB readout, and a Mute button. This is your personal monitor mix; moving Ana's fader changes what you hear, not what anyone else hears.
 - The avatar disc shows a member's picture if they set one, and their initials on a color hashed from their name if they have not. The same disc and the same color appear on the card the broadcast renders, so a member looks the same in the app and on a stream.
 - Your own strip is dimmed with a "you" tag. Self monitoring is local, on your interface, not through the server, so your own channel has no fader in the mix.
 - The host additionally sees a Revoke button on every other strip. Revoking ejects that member and kills their invite, with a confirmation step.
@@ -32,7 +32,7 @@ What you are looking at:
 - The status bar, in the same place every session: mouth to ear latency in milliseconds and your meters on the left, ON AIR and REC in the middle, and the session id and Leave on the right. Hover the latency number for `rtt`, `buffer`, and `loss`, which [Troubleshooting](troubleshooting.md#latency-feels-high) turns into actions. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
 - The **ON AIR** lamp, in the middle of the bar: absent until the host starts a broadcast, amber while one is running, and its hover says how many platforms are receiving it. Only the host can start or stop one, but everyone sees the lamp, because everyone is in it. See [Streaming to Twitch and YouTube](streaming.md).
 
-A member who stops responding grays out after 10 seconds; when they reconnect with their invite, they come back in the same seat.
+A member who stops responding shows it in two stages. The dot beside their name turns amber after 2 seconds, which is 800 missed frames and far past anything a working client does. After 10 the server gives up on them: the strip grays out and reads disconnected. The dot stays nearly silent while somebody is playing, so the one to notice mid song is the one that changed. Their seat is held either way, and reconnecting with the same invite puts them back in it.
 
 At ten musicians the strips extend past the window and scroll horizontally:
 

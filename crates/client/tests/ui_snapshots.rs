@@ -517,6 +517,50 @@ fn session_long_names() {
     snapshot(&mut harness, "session_long_names");
 }
 
+/// The three presences a roster can report, side by side: Ana has gone quiet,
+/// Ben is gone, everyone else is playing. Both of the states that are not the
+/// resting one had no baseline at all before, and the middle one had no pixels
+/// to draw (#285).
+fn presence_app(theme: Theme) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_quiet(1, true);
+    rt.set_away(2, true);
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_presence() {
+    // What this is for: one amber dot in a row of resting ones, and one strip
+    // greyed out beside it, at a glance and without hovering anything.
+    let mut harness = app_harness(presence_app(Theme::Dark), WIDE);
+    snapshot(&mut harness, "session_presence");
+}
+
+#[test]
+fn session_presence_light() {
+    // The light palette steps the resting dot the other way, so the amber has
+    // a different neighbour to stand out against.
+    let mut harness = app_harness(presence_app(Theme::Light), WIDE);
+    snapshot(&mut harness, "session_presence_light");
+}
+
+#[test]
+fn session_presence_narrow() {
+    // The smallest window the app opens: the strips keep their width, so the
+    // dot keeps its place beside the name rather than being the thing that
+    // gets squeezed.
+    let mut harness = app_harness(presence_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "session_presence_narrow");
+}
+
+#[test]
+fn session_presence_light_narrow() {
+    // The corner where the amber has the least to work with: the light panel
+    // and the smallest window at once.
+    let mut harness = app_harness(presence_app(Theme::Light), NARROW);
+    snapshot(&mut harness, "session_presence_light_narrow");
+}
+
 /// A session whose audio device stopped and will not reopen: the reason the
 /// device gave, over strips that are all still there. The reason is the one
 /// the offline backend really produces when it is handed a rate it does not
