@@ -121,6 +121,7 @@ The keys live in your system keychain from then on. You are ready to host; conti
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
+        "s3:GetObject",
         "s3:DeleteObject",
         "s3:AbortMultipartUpload"
       ],
@@ -134,6 +135,17 @@ The keys live in your system keychain from then on. You are ready to host; conti
         "s3:PutLifecycleConfiguration"
       ],
       "Resource": "arn:aws:s3:::YOUR-BUCKET"
+    },
+    {
+      "Sid": "JamstreamFindTakes",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::YOUR-BUCKET",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "jamstream/recordings/*"
+        }
+      }
     }
   ]
 }
@@ -141,7 +153,11 @@ The keys live in your system keychain from then on. You are ready to host; conti
 
 3. Give that user its own access key, exactly as in step 3.
 
-The key can write under one prefix of one bucket and read and set that bucket's expiry rules, and nothing else: it cannot read a take back, list the bucket, or touch EC2. `DeleteObject` is on the prefix because arming a session writes one small probe object there and removes it, which is how a bucket that refuses the key fails while you are configuring rather than mid-song. The two lifecycle actions are bucket-wide, which is the other reason recordings want a bucket of their own. Both are needed: setting a rule replaces the bucket's whole list, so the rules already there are read and written back with the new one. Grant only the `Put` half and arming a session says retention could not be applied, and nothing will delete the takes for you.
+The key can read, write and delete under one prefix of one bucket, list what is there, and read and set that bucket's expiry rules. It cannot see anything outside `jamstream/recordings/`, and it cannot touch EC2.
+
+Why each one is there. `PutObject` uploads the take. `GetObject` is how the app and `jamstream recordings` download it again, which is the whole point of a bucket you own. `ListBucket` is how either of them finds a take in the first place, and its condition on the prefix is what keeps the rest of the bucket invisible. `DeleteObject` is because arming a session writes one small probe object and removes it, which is how a bucket that refuses the key fails while you are configuring rather than mid-song. The two lifecycle actions are bucket-wide, which is the other reason recordings want a bucket of their own, and both are needed because setting a rule replaces the bucket's whole list, so the rules already there are read and written back with the new one. Grant only the `Put` half and arming a session says retention could not be applied, and nothing will delete the takes for you.
+
+One thing to know rather than worry about. This same key is written into each session machine so it can upload, so anything that key can do, a compromised session machine could do to that prefix. It could already delete your takes before it could read them, which is the worse of the two, so `GetObject` widens that less than it looks. If you would rather the machine could only write, make a second key with `PutObject` and `AbortMultipartUpload` alone for recording and keep this one for the app; nothing in JamStream requires them to be the same key. The two lifecycle actions are bucket-wide, which is the other reason recordings want a bucket of their own. Both are needed: setting a rule replaces the bucket's whole list, so the rules already there are read and written back with the new one. Grant only the `Put` half and arming a session says retention could not be applied, and nothing will delete the takes for you.
 
 Paste both values into **Settings**, then **Recording**, in the app, and click Check. The app keeps this key in a keychain slot of its own, so the two AWS keys never stand in for each other.
 
