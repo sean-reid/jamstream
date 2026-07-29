@@ -419,7 +419,7 @@ impl HostWizard {
         let Some(row) = self.providers.get_mut(idx) else {
             return;
         };
-        if row.name != "local" {
+        if row.name != ProviderKind::Local.as_str() {
             row.status = if creds::build_provider(&row.name, self.creds.as_ref(), &self.env).is_ok()
             {
                 ProviderStatus::Ready
@@ -432,8 +432,11 @@ impl HostWizard {
     /// A provider built from the setup pane's unsaved fields, for the
     /// credential check.
     pub fn provider_from_setup(&self) -> Result<Box<dyn Provider>, String> {
-        match self.selected_provider_name() {
-            Some("digitalocean") => {
+        let Some(kind) = self.selected_provider_kind() else {
+            return Err("pick a provider first".to_owned());
+        };
+        match kind {
+            ProviderKind::DigitalOcean => {
                 let token = self.setup.do_token.trim();
                 if token.is_empty() {
                     return Err("paste the token first".to_owned());
@@ -444,7 +447,7 @@ impl HostWizard {
                     ),
                 ))
             }
-            Some("aws") => {
+            ProviderKind::Aws => {
                 let id = self.setup.aws_access_key_id.trim();
                 let secret = self.setup.aws_secret_access_key.trim();
                 if id.is_empty() || secret.is_empty() {
@@ -455,14 +458,14 @@ impl HostWizard {
                     secret.to_owned(),
                 )))
             }
-            Some("gcp") => {
+            ProviderKind::Gcp => {
                 let json = self.setup.gcp_json.trim();
                 if json.is_empty() {
                     return Err("paste the service account JSON first".to_owned());
                 }
                 creds::gcp_from_json(json, &self.env)
             }
-            other => Err(format!("no setup pane for {other:?}")),
+            ProviderKind::Local => Err("this computer needs no credentials".to_owned()),
         }
     }
 
@@ -491,17 +494,20 @@ impl HostWizard {
         if result.is_ok()
             && let Some(idx) = self.selected_provider
         {
-            let saves: &[((&str, &str), &str)] = match self.selected_provider_name() {
-                Some("digitalocean") => &[(creds::DO_TOKEN, &self.setup.do_token)],
-                Some("aws") => &[
+            let saves: &[((&str, &str), &str)] = match self.selected_provider_kind() {
+                Some(ProviderKind::DigitalOcean) => &[(creds::DO_TOKEN, &self.setup.do_token)],
+                Some(ProviderKind::Aws) => &[
                     (creds::AWS_ACCESS_KEY_ID, &self.setup.aws_access_key_id),
                     (
                         creds::AWS_SECRET_ACCESS_KEY,
                         &self.setup.aws_secret_access_key,
                     ),
                 ],
-                Some("gcp") => &[(creds::GCP_SERVICE_ACCOUNT_JSON, &self.setup.gcp_json)],
-                _ => &[],
+                Some(ProviderKind::Gcp) => {
+                    &[(creds::GCP_SERVICE_ACCOUNT_JSON, &self.setup.gcp_json)]
+                }
+                // Local holds nothing, and nothing selected saves nothing.
+                Some(ProviderKind::Local) | None => &[],
             };
             let mut save_err = None;
             for ((provider, field), value) in saves {
@@ -757,7 +763,7 @@ impl HostWizard {
     /// A cloud provider is built with the session port, which is the one port
     /// it opens in the firewall it creates for the session.
     fn launch_provider(&self, name: &str) -> Result<Box<dyn Provider>, String> {
-        if name == "local" && self.recording.is_on() {
+        if name == ProviderKind::Local.as_str() && self.recording.is_on() {
             return jamstream_cli::providers::resolve_local_recording(self.recording.stems())
                 .map_err(|e| e.to_string());
         }
@@ -1531,7 +1537,7 @@ impl HostWizard {
     /// the docs site's provider pages; the check runs a real API call and
     /// only a passing check writes the keychain.
     fn setup_ui(&mut self, ui: &mut Ui) {
-        let Some(name) = self.selected_provider_name().map(str::to_owned) else {
+        let Some(kind) = self.selected_provider_kind() else {
             return;
         };
         // Indented under the provider row it belongs to, not framed: a panel
@@ -1539,8 +1545,8 @@ impl HostWizard {
         // states that rule for the same job and follows it (#192).
         ui.indent("provider-setup", |ui| {
             ui.set_width(ui.available_width());
-            match name.as_str() {
-                "digitalocean" => {
+            match kind {
+                ProviderKind::DigitalOcean => {
                     ui.label(theme::title(ui, "Connect DigitalOcean"));
                     ui.add_space(theme::SPACE_XS);
                     guidance(
@@ -1560,7 +1566,7 @@ impl HostWizard {
                     ui.add_space(theme::SPACE_SM);
                     secret_field(ui, "API token", &mut self.setup.do_token);
                 }
-                "aws" => {
+                ProviderKind::Aws => {
                     ui.label(theme::title(ui, "Connect AWS"));
                     ui.add_space(theme::SPACE_XS);
                     guidance(
@@ -1585,7 +1591,7 @@ impl HostWizard {
                         &mut self.setup.aws_secret_access_key,
                     );
                 }
-                "gcp" => {
+                ProviderKind::Gcp => {
                     ui.label(theme::title(ui, "Connect Google Cloud"));
                     ui.add_space(theme::SPACE_XS);
                     guidance(
@@ -1637,7 +1643,10 @@ impl HostWizard {
                     );
                     character_count(ui, &self.setup.gcp_json);
                 }
-                _ => {}
+                // Local runs on this computer and holds no credential, so its
+                // row never reaches setup needed and this pane never opens
+                // for it.
+                ProviderKind::Local => {}
             }
             ui.add_space(theme::SPACE_SM);
             ui.horizontal(|ui| {
@@ -2603,6 +2612,32 @@ mod tests {
         assert!(!w.begin_check());
         assert!(matches!(w.check_result, Some(Err(_))));
         assert!(!w.busy());
+    }
+
+    /// The setup pane is picked by [`ProviderKind`], so every cloud reaches its
+    /// own fields and asks for them in its own words. Local is the one provider
+    /// with nothing to set up and says so rather than borrowing a cloud's pane.
+    #[test]
+    fn each_provider_reaches_its_own_setup_pane() {
+        let mut w = wizard();
+        let mut refusals: Vec<String> = Vec::new();
+        for (index, kind) in ProviderKind::ALL.into_iter().enumerate() {
+            assert!(w.select_provider(index), "row {index} must be selectable");
+            let err = w
+                .provider_from_setup()
+                .err()
+                .unwrap_or_else(|| panic!("{kind} built a provider from empty fields"));
+            if kind == ProviderKind::Local {
+                assert!(err.contains("no credentials"), "{kind} said {err:?}");
+            } else {
+                assert!(
+                    !refusals.contains(&err),
+                    "{kind} shares a pane with another provider: {err:?}"
+                );
+                refusals.push(err);
+            }
+        }
+        assert_eq!(refusals.len(), ProviderKind::ALL.len() - 1);
     }
 
     /// A cloud bucket this computer has a key for, as the app hands one over.
