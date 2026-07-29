@@ -11,6 +11,11 @@
 //! host plus `MAX_MUSICIANS - 1` guests.
 
 /// Musicians admitted at once, the host's own seat included.
+///
+/// The broadcast renderer draws one card per musician and caps its own count
+/// at the same number. Neither crate can see the other, so the test at the
+/// foot of this file is what holds them together: raise this alone and the
+/// last musicians admitted appear in the mix with no card on the stream.
 pub const MAX_MUSICIANS: usize = 10;
 
 /// Listeners admitted at once. Listeners receive the broadcast mix and send
@@ -139,7 +144,24 @@ impl TokenBucket {
 
 #[cfg(test)]
 mod tests {
-    use super::TokenBucket;
+    use super::{MAX_MUSICIANS, TokenBucket};
+
+    /// One card per musician, and the renderer silently draws none for a
+    /// musician past its own cap: `MAX_CARDS` and [`MAX_MUSICIANS`] are the
+    /// same fact spelled in two crates with no dependency path between them.
+    /// A dev-dependency and this test are the only thing that can catch the
+    /// drift, and what the drift looks like is a paying host's tenth guest
+    /// heard in the mix and missing from the stream.
+    #[test]
+    fn every_admitted_musician_gets_a_card_on_the_stream() {
+        assert_eq!(
+            jamstream_broadcast::MAX_CARDS,
+            MAX_MUSICIANS,
+            "the renderer cards {} musicians and the server admits {MAX_MUSICIANS}; \
+             raising one without the other loses a musician off the broadcast",
+            jamstream_broadcast::MAX_CARDS
+        );
+    }
 
     #[test]
     fn burst_then_refill_at_the_configured_rate() {
