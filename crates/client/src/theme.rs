@@ -461,10 +461,15 @@ pub fn mono_drag(ui: &mut Ui, drag: egui::DragValue<'_>) -> egui::Response {
     .inner
 }
 
-/// "$0.14" from microdollars, always two decimals, trimmed beyond that.
-/// Rounded to four decimals first so tickers never show raw microdollars.
+/// "$0.14" from microdollars: cents, and exactly two decimals.
+///
+/// Rounded to the cent before formatting, not to four decimals. The bar read
+/// `$0.0133 so far`, which is four significant digits of a fraction of a cent
+/// in the one readout a musician glances at mid-song (#189). A session's cost
+/// is worth watching at the cent; below that it is noise that moves.
 pub fn microusd(micro: u64) -> String {
-    jamstream_cloud::format_microusd((micro + 50) / 100 * 100)
+    const CENT: u64 = 10_000;
+    jamstream_cloud::format_microusd((micro + CENT / 2) / CENT * CENT)
 }
 
 /// WCAG relative luminance of an sRGB color.
@@ -499,9 +504,18 @@ const READABLE_STEPS: u8 = 32;
 /// which is a legible lamp and an illegible label. Words go through here;
 /// the lamp beside them keeps the palette value.
 pub fn readable(color: Color32, surface: Color32, p: &Palette) -> Color32 {
+    readable_on(color, &[surface], p)
+}
+
+/// [`readable`] against more than one surface at once, for a colour the same
+/// words get set in on several of them. Stepping twice would blend from an
+/// already blended colour and drift off the hue, so the loop tests every
+/// surface per step instead.
+fn readable_on(color: Color32, surfaces: &[Color32], p: &Palette) -> Color32 {
+    let clears = |c: Color32| surfaces.iter().all(|s| contrast_ratio(c, *s) >= AA_TEXT);
     let mut out = color;
     for step in 1..=READABLE_STEPS {
-        if contrast_ratio(out, surface) >= AA_TEXT {
+        if clears(out) {
             break;
         }
         out = blend(
@@ -511,6 +525,49 @@ pub fn readable(color: Color32, surface: Color32, p: &Palette) -> Color32 {
         );
     }
     out
+}
+
+/// The danger colour as *text*, for the verbatim failure reasons the app sets
+/// in it: a dropped stream's, a refused avatar's, a recorder's, a provider's.
+///
+/// Straight off the palette, `danger` measures 4.22:1 on surface1 in dark, and
+/// every one of those reasons was set in it. This is the step of it that reads
+/// on every surface one can land on, which is the same treatment a state word
+/// already gets.
+pub fn danger_ink(p: &Palette) -> Color32 {
+    readable_on(p.danger, &[p.well, p.surface0, p.surface1, p.surface2], p)
+}
+
+/// The fill and the label a destructive button carries: Leave, Revoke invite,
+/// End session for everyone.
+///
+/// White on the danger fill measured 4.00:1 in dark, so the ink is chosen the
+/// way [`selected_pair`] chooses one and the fill is stepped until the pair
+/// clears the AA text floor. The button is still unmistakably the one red in
+/// the palette; the step is a correction, not a repaint.
+pub fn danger_pair(p: &Palette) -> (Color32, Color32) {
+    let ink = if contrast_ratio(p.surface1, p.danger) >= contrast_ratio(Color32::WHITE, p.danger) {
+        p.surface1
+    } else {
+        Color32::WHITE
+    };
+    (readable(p.danger, ink, p), ink)
+}
+
+/// A destructive button: the one red in the palette, with a label that reads
+/// on it. Every Leave, Revoke, and End session in the app comes through here,
+/// so there is one place the pair is chosen.
+pub fn danger_button(p: &Palette, text: &str) -> egui::Button<'static> {
+    let (fill, ink) = danger_pair(p);
+    egui::Button::new(RichText::new(text.to_owned()).color(ink)).fill(fill)
+}
+
+/// Verbatim failure text: wrapped, full width, in the readable step of the
+/// danger colour. Summarising an error hides the part someone can act on, so
+/// every one of these is the reason its source gave.
+pub fn reason(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
+    let color = danger_ink(palette_of(ui));
+    ui.add(egui::Label::new(RichText::new(text.into()).color(color)).wrap())
 }
 
 /// The fill and the label a selected control carries: the accent, opaque,
@@ -636,6 +693,81 @@ mod tests {
                 contrast_ratio(fill, p.accent) < 2.0,
                 "{name} selected fill is no longer the accent"
             );
+        }
+    }
+
+    /// The colour every verbatim failure reason in the app is set in, on every
+    /// surface one lands on. `danger` itself measured 4.22:1 on surface1 in
+    /// dark, and the test above could not see it because it only ever asked
+    /// about the two text steps (#192).
+    #[test]
+    fn a_failure_reason_reads_on_every_surface_it_can_land_on() {
+        for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            let ink = danger_ink(p);
+            for (sname, surface) in [
+                ("well", p.well),
+                ("surface0", p.surface0),
+                ("surface1", p.surface1),
+                ("surface2", p.surface2),
+            ] {
+                let ratio = contrast_ratio(ink, surface);
+                assert!(
+                    ratio >= AA_TEXT,
+                    "{name} a failure reason on {sname} is {ratio:.2}, below AA {AA_TEXT}"
+                );
+            }
+            assert!(
+                contrast_ratio(ink, p.danger) < 2.0,
+                "{name} failure reasons are no longer the danger colour"
+            );
+        }
+    }
+
+    /// Leave, Revoke invite, and End session for everyone. White on the danger
+    /// fill measured 4.00:1 in dark, on the three buttons in the product that
+    /// take something away from other people.
+    #[test]
+    fn a_destructive_button_reads_in_both_palettes() {
+        for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            let (fill, ink) = danger_pair(p);
+            let label = contrast_ratio(ink, fill);
+            assert!(
+                label >= AA_TEXT,
+                "{name} destructive label is {label:.2}, below AA {AA_TEXT}"
+            );
+            for (sname, surface) in [
+                ("surface0", p.surface0),
+                ("surface1", p.surface1),
+                ("surface2", p.surface2),
+            ] {
+                let ratio = contrast_ratio(fill, surface);
+                assert!(
+                    ratio >= AA_STATE,
+                    "{name} destructive fill on {sname} is {ratio:.2}, below {AA_STATE}"
+                );
+            }
+            // Still the one red, not a fourth colour that would pass and say
+            // nothing.
+            assert!(
+                contrast_ratio(fill, p.danger) < 2.0,
+                "{name} destructive fill is no longer the danger colour"
+            );
+        }
+    }
+
+    /// The cost ticker's own doc says two decimals. It rendered `$0.0133`.
+    #[test]
+    fn the_cost_readout_is_cents_and_two_decimals() {
+        assert_eq!(microusd(0), "$0.00");
+        assert_eq!(microusd(13_300), "$0.01");
+        assert_eq!(microusd(4_999), "$0.00");
+        assert_eq!(microusd(5_000), "$0.01");
+        assert_eq!(microusd(140_000), "$0.14");
+        assert_eq!(microusd(1_234_567), "$1.23");
+        for micro in [0u64, 1, 999, 13_300, 26_790, 1_234_567, 9_999_999] {
+            let text = microusd(micro);
+            let decimals = text.split_once('.').expect("a decimal point").1.len();
+            assert_eq!(decimals, 2, "{micro} rendered as {text}");
         }
     }
 

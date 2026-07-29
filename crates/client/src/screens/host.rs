@@ -125,8 +125,6 @@ pub struct SetupFields {
     pub aws_secret_access_key: String,
     pub gcp_json: String,
     pub gcp_path: String,
-    /// Text fields render masked; this is the explicit reveal.
-    pub reveal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1536,7 +1534,10 @@ impl HostWizard {
         let Some(name) = self.selected_provider_name().map(str::to_owned) else {
             return;
         };
-        theme::panel(ui).show(ui, |ui| {
+        // Indented under the provider row it belongs to, not framed: a panel
+        // inside the step card is a card in a card, and the destinations sheet
+        // states that rule for the same job and follows it (#192).
+        ui.indent("provider-setup", |ui| {
             ui.set_width(ui.available_width());
             match name.as_str() {
                 "digitalocean" => {
@@ -1557,8 +1558,7 @@ impl HostWizard {
                         ));
                     }
                     ui.add_space(theme::SPACE_SM);
-                    let reveal = self.setup.reveal;
-                    secret_field(ui, "API token", &mut self.setup.do_token, reveal);
+                    secret_field(ui, "API token", &mut self.setup.do_token);
                 }
                 "aws" => {
                     ui.label(theme::title(ui, "Connect AWS"));
@@ -1578,18 +1578,11 @@ impl HostWizard {
                         ));
                     }
                     ui.add_space(theme::SPACE_SM);
-                    let reveal = self.setup.reveal;
-                    secret_field(
-                        ui,
-                        "Access key id",
-                        &mut self.setup.aws_access_key_id,
-                        reveal,
-                    );
+                    secret_field(ui, "Access key id", &mut self.setup.aws_access_key_id);
                     secret_field(
                         ui,
                         "Secret access key",
                         &mut self.setup.aws_secret_access_key,
-                        reveal,
                     );
                 }
                 "gcp" => {
@@ -1635,14 +1628,14 @@ impl HostWizard {
                         }
                     });
                     ui.label(theme::muted(ui, "service account JSON"));
-                    let mask = !self.setup.reveal;
                     ui.add(
                         egui::TextEdit::multiline(&mut self.setup.gcp_json)
                             .desired_width(f32::INFINITY)
                             .desired_rows(4)
-                            .password(mask)
+                            .password(true)
                             .hint_text("paste the downloaded key file's contents"),
                     );
+                    character_count(ui, &self.setup.gcp_json);
                 }
                 _ => {}
             }
@@ -1655,12 +1648,6 @@ impl HostWizard {
                 {
                     self.begin_check();
                 }
-                if ui
-                    .button(if self.setup.reveal { "Hide" } else { "Show" })
-                    .clicked()
-                {
-                    self.setup.reveal = !self.setup.reveal;
-                }
                 if checking {
                     ui.add(egui::Spinner::new().color(theme::palette_of(ui).text_muted));
                     ui.label(theme::muted(ui, "asking the provider"));
@@ -1672,8 +1659,7 @@ impl HostWizard {
                     ui.label(RichText::new("Works. Saved to your keychain.").color(p.meter_green));
                 }
                 Some(Err(err)) => {
-                    let p = theme::palette_of(ui);
-                    ui.label(RichText::new(err.clone()).color(p.danger));
+                    theme::reason(ui, err.clone());
                 }
                 None => {}
             }
@@ -1692,8 +1678,7 @@ impl HostWizard {
             return;
         }
         if let Some(err) = self.regions_error.clone() {
-            let p = theme::palette_of(ui);
-            ui.label(RichText::new(err).color(p.danger));
+            theme::reason(ui, err);
             return;
         }
         // The solver sorts by coverage, then worst round trip bucketed to
@@ -1702,10 +1687,15 @@ impl HostWizard {
         if self.nothing_measured() {
             // Zeros here would be a lie the table tells confidently; say
             // instead that the measurement is missing and what is left.
+            //
+            // Amber, not danger: nothing failed and nothing was lost, the table
+            // is still complete, and a region is still pickable on price. The
+            // session-full message on the mixer argues the same case and picks
+            // the same colour (#192).
             let p = theme::palette_of(ui);
             ui.label(
                 RichText::new("No region answered a probe, so none of them are timed.")
-                    .color(p.danger),
+                    .color(theme::readable(p.meter_amber, p.surface1, p)),
             );
             ui.label(theme::muted(
                 ui,
@@ -2033,8 +2023,7 @@ impl HostWizard {
 
     fn launching_ui(&mut self, ui: &mut Ui) {
         if let Some(err) = self.launch_error.clone() {
-            let p = theme::palette_of(ui);
-            ui.label(RichText::new(err).color(p.danger));
+            theme::reason(ui, err);
             if !self.is_local() {
                 ui.add_space(theme::SPACE_XS);
                 ui.label(theme::muted(
@@ -2107,18 +2096,31 @@ fn guidance(ui: &mut Ui, lines: &[&str]) {
     }
 }
 
-/// One labeled secret input; masked unless revealed, never logged.
-fn secret_field(ui: &mut Ui, label: &str, value: &mut String, reveal: bool) {
+/// One labeled secret input: masked, with no reveal, and a character count
+/// under it. See [`crate::creds`] for why there is no reveal anywhere.
+fn secret_field(ui: &mut Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
         row_cell(ui, 130.0, |ui| {
             ui.label(theme::muted(ui, label));
         });
-        ui.add(
-            egui::TextEdit::singleline(value)
-                .desired_width(300.0)
-                .password(!reveal),
-        );
+        ui.vertical(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(value)
+                    .desired_width(300.0)
+                    .password(true),
+            );
+            character_count(ui, value);
+        });
     });
+}
+
+/// What stands in for reading a masked field back: a masked field cannot be
+/// proofread, and a count catches the paste that took half a token.
+fn character_count(ui: &mut Ui, value: &str) {
+    ui.label(theme::mono_muted(
+        ui,
+        format!("{} characters", value.trim().chars().count()),
+    ));
 }
 
 #[cfg(test)]

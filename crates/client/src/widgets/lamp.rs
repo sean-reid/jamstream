@@ -73,6 +73,20 @@ pub fn state_lamp_width(ui: &mut Ui, label: &str) -> f32 {
     STATE_LABEL_X + text_w
 }
 
+/// A cluster lamp's shape, which is the cue that does not depend on telling two
+/// warm colours apart.
+///
+/// The accent and `meter_amber` are 1.25:1 against each other in dark and
+/// 1.20:1 in light, and ON AIR and UPLOADING could both be lit at once, so the
+/// colour was carrying no information and the words were doing all the work
+/// (#182). A state that is going out of the room is filled; one that is
+/// finishing or is only about what you hear is a ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LampShape {
+    Filled,
+    Ring,
+}
+
 /// One lit state in the status bar's centre cluster: a bigger lamp and its
 /// label, both in `color`. Only ever drawn for a state that is actually on,
 /// so there is no unlit form and an idle bar shows no cluster at all.
@@ -80,23 +94,32 @@ pub fn state_lamp_width(ui: &mut Ui, label: &str) -> f32 {
 /// The circle carries the palette colour and the label carries the step of it
 /// that reads as text on the bar: ON AIR set in the light accent measured
 /// 3.77:1 against the bar and looked switched off.
-pub fn state_lamp(ui: &mut Ui, label: &str, color: Color32) -> Response {
+pub fn state_lamp(ui: &mut Ui, label: &str, color: Color32, shape: LampShape) -> Response {
     let font = state_font(ui);
     let width = state_lamp_width(ui, label);
     let (rect, response) = ui.allocate_exact_size(vec2(width, STATE_LAMP_SIZE), Sense::hover());
     // The lamp is painted, so its state reaches a screen reader only if it is
-    // said out loud here. These are the two that have to.
+    // said out loud here. These are the states that have to.
     response.widget_info(|| WidgetInfo::labeled(egui::WidgetType::Label, true, label));
     if !ui.is_rect_visible(rect) {
         return response;
     }
     let p = theme::palette_of(ui);
-    ui.painter().circle(
-        egui::pos2(rect.left() + STATE_LAMP_R + 1.0, rect.center().y),
-        STATE_LAMP_R,
-        color,
-        Stroke::new(1.0, theme::blend(color, p.text_primary, 0.45)),
-    );
+    let center = egui::pos2(rect.left() + STATE_LAMP_R + 1.0, rect.center().y);
+    match shape {
+        LampShape::Filled => ui.painter().circle(
+            center,
+            STATE_LAMP_R,
+            color,
+            Stroke::new(1.0, theme::blend(color, p.text_primary, 0.45)),
+        ),
+        // Drawn at the same diameter so the labels stay on one baseline; a
+        // 1.5 px ring is the heaviest hairline that still reads as hollow.
+        LampShape::Ring => {
+            ui.painter()
+                .circle_stroke(center, STATE_LAMP_R - 0.75, Stroke::new(1.5, color))
+        }
+    };
     ui.painter().text(
         egui::pos2(rect.left() + STATE_LABEL_X, rect.center().y),
         egui::Align2::LEFT_CENTER,

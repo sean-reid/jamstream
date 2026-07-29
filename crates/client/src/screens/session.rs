@@ -8,8 +8,14 @@
 //! The centre is the point of it: ON AIR and REC are the two states in the
 //! product with consequences outside the room, and they used to sit at
 //! opposite ends of the bar with the session id and the cost ticker between
-//! them. They are one cluster now, in the middle, in their own colours, and
-//! the cluster takes no space at all while both are off.
+//! them. They are one cluster now, in the middle, in their own lamps, and the
+//! cluster takes no space at all while all of them are off.
+//!
+//! AUDITION is in there too, because "your monitor is not your monitor" is a
+//! state with consequences and it had been a 4 px dot with two lowercase words
+//! parked in the health zone (#188). Every lamp in the cluster carries a shape
+//! as well as a colour, so the two that can be lit at once are told apart
+//! without having to tell two warm oranges apart (#182).
 //!
 //! What the link is doing beyond the headline number, rtt and buffer depth
 //! and loss, is on that number's hover. It is diagnostic: worth reading when
@@ -17,8 +23,8 @@
 //! a musician looks mid-song.
 
 use egui::{
-    Align, Align2, Button, CornerRadius, FontFamily, FontId, Layout, RichText, ScrollArea, Sense,
-    Stroke, TextEdit, Ui, UiBuilder, vec2,
+    Align, Align2, Button, FontFamily, FontId, Layout, RichText, ScrollArea, Sense, Stroke,
+    TextEdit, Ui, UiBuilder, vec2,
 };
 
 use crate::runtime::{
@@ -29,7 +35,7 @@ use crate::screens::invites::{InvitesEvent, InvitesPanel};
 use crate::screens::record::{record_sheet, record_state_lamp};
 use crate::theme;
 use crate::widgets::{
-    AVATAR_D_STRIP, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, pan_slider,
+    AVATAR_D_STRIP, LampShape, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, pan_slider,
     presence_dot, state_lamp, state_lamp_width, status_dot,
 };
 
@@ -58,7 +64,6 @@ const STRIP_GAP: f32 = 8.0;
 const ROW_H: f32 = 22.0;
 const DB_H: f32 = 16.0;
 const PAN_H: f32 = 14.0;
-const METER_SLOT_H: f32 = 12.0;
 const NAME_ROW_H: f32 = 18.0;
 /// The "disconnected" note; only a disconnected member's strip carries it.
 const NOTE_ROW_H: f32 = 18.0;
@@ -90,6 +95,10 @@ const STRIP_ROW_GAP: f32 = theme::SPACE_SM;
 // full name one hover away, the same treatment as a strip's name.
 const CHAT_TIME_W: f32 = 38.0;
 const CHAT_NAME_W: f32 = 64.0;
+
+/// The metronome panel's width: its widest label, "beats per bar", plus the
+/// drag value beside it and the panel's own margins.
+const METRONOME_W: f32 = 290.0;
 
 pub enum SessionEvent {
     /// The user confirmed leaving; the app should drop the runtime.
@@ -320,16 +329,10 @@ impl SessionScreen {
                 ));
             }
             ConnState::Ejected(reason) => {
-                let p = theme::palette_of(ui);
-                ui.label(
-                    RichText::new(format!("removed from the session: {reason}")).color(p.danger),
-                );
+                theme::reason(ui, format!("removed from the session: {reason}"));
             }
             ConnState::TimedOut => {
-                let p = theme::palette_of(ui);
-                ui.label(
-                    RichText::new("connection lost: no packets for 10 seconds").color(p.danger),
-                );
+                theme::reason(ui, "connection lost: no packets for 10 seconds");
             }
             // Not danger: nothing is wrong and nothing was lost. The seat
             // this invite names is occupied, the client is still trying, and
@@ -508,7 +511,6 @@ impl SessionScreen {
         // in every strip; the fader takes the exact remainder.
         let row = button_row_h(ui);
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-            meter_slot(ui);
             if snap.is_host {
                 if member.is_you {
                     // Reserves the revoke row so slots align across strips.
@@ -593,11 +595,14 @@ impl SessionScreen {
         ));
     }
 
-    fn metronome_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, row_w: f32) {
+    fn metronome_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, _row_w: f32) {
         theme::panel(ui).show(ui, |ui| {
-            // Margins and stroke add 22; the panel's outer edge lines up
-            // with the strip row above it.
-            ui.set_width((row_w - 22.0).max(240.0));
+            // As wide as its own content, not as wide as however many
+            // musicians are in the band. It used to track the strip row, which
+            // put "tempo 112" and three other short rows in the corner of a
+            // 1500 px box at ten musicians, with its right edge running under
+            // the settings drawer (#186).
+            ui.set_width(METRONOME_W.min(ui.available_width()));
             ui.label(theme::title(ui, "Metronome"));
             ui.add_space(theme::SPACE_XS);
             let m = snap.metronome;
@@ -621,7 +626,11 @@ impl SessionScreen {
                                 .changed();
                         ui.end_row();
                         ui.label(theme::muted(ui, "click"));
-                        changed |= ui.checkbox(&mut enabled, "enabled").changed();
+                        // The same word a musician reads for the same fact. A
+                        // host's row said "enabled" and a musician's said "on"
+                        // (#192).
+                        let word = if enabled { "on" } else { "off" };
+                        changed |= ui.checkbox(&mut enabled, word).changed();
                         ui.end_row();
                     });
                 if changed {
@@ -690,8 +699,8 @@ impl SessionScreen {
     /// bar, and health and controls get the halves on either side of it. Two
     /// rules keep each zone inside its own half: health drops its meters below
     /// [`BAR_METERS_W`], and the bar stacks into two rows when either zone
-    /// needs more than a half. For a host that lands at about 850 px with the
-    /// cluster empty, 910 with one lamp lit and 960 with both, measured by
+    /// needs more than a half. For a host that lands at about 820 px with the
+    /// cluster empty, 880 with one lamp lit and 930 with both, measured by
     /// `the_one_row_threshold_is_where_the_zones_stop_fitting`; a musician's
     /// narrower controls keep one row down past the 800 px minimum window.
     fn status_bar(&mut self, ui: &mut Ui, snap: &Snapshot) {
@@ -756,17 +765,23 @@ impl SessionScreen {
     /// session for you, the other is pressed between songs.
     fn status_controls(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let p = theme::palette_of(ui);
-        if ui
-            .add(Button::new(RichText::new("Leave").color(egui::Color32::WHITE)).fill(p.danger))
-            .clicked()
-        {
+        if ui.add(theme::danger_button(p, "Leave")).clicked() {
             self.confirm_leave = true;
         }
         bar_divider(ui);
+        // Accent means the live state, so it follows the take and not the
+        // sheet. Lit while the sheet was open, this button claimed a take
+        // existed when none did, in the same colour as the ON AIR lamp (#181).
+        // The sheet being on screen is what says the sheet is open.
+        let capturing = matches!(snap.record.state, crate::runtime::RecordState::Recording);
         if snap.is_host
             && ui
-                .add(theme::selectable(p, "Record", self.record_open))
-                .on_hover_text("start or end a take")
+                .add(theme::selectable(p, "Record", capturing))
+                .on_hover_text(if capturing {
+                    "a take is running; open the sheet to end it"
+                } else {
+                    "start or end a take"
+                })
                 .clicked()
         {
             self.record_open = !self.record_open;
@@ -816,15 +831,7 @@ impl SessionScreen {
                             self.confirm_leave = false;
                         }
                         let p = theme::palette_of(ui);
-                        if ui
-                            .add(
-                                Button::new(
-                                    RichText::new("Leave session").color(egui::Color32::WHITE),
-                                )
-                                .fill(p.danger),
-                            )
-                            .clicked()
-                        {
+                        if ui.add(theme::danger_button(p, "Leave session")).clicked() {
                             rt.send(Command::Leave);
                             self.confirm_leave = false;
                             *event = Some(SessionEvent::Left);
@@ -847,15 +854,7 @@ impl SessionScreen {
                             self.confirm_revoke = None;
                         }
                         let p = theme::palette_of(ui);
-                        if ui
-                            .add(
-                                Button::new(
-                                    RichText::new("Revoke invite").color(egui::Color32::WHITE),
-                                )
-                                .fill(p.danger),
-                            )
-                            .clicked()
-                        {
+                        if ui.add(theme::danger_button(p, "Revoke invite")).clicked() {
                             // Token comes from the current snapshot; host only.
                             let token = rt
                                 .snapshot()
@@ -1002,11 +1001,6 @@ fn status_readouts(ui: &mut Ui, snap: &Snapshot) {
         s.loss_pct,
     );
     latency_readout(ui, snap);
-    // The audition reminder lives beside the headline readout so the host can
-    // never forget what they are hearing.
-    if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
-        audition_indicator(ui);
-    }
     // The compact meters are the first thing to go when the bar gets tight.
     // What is left here is the room the zone was given, so this is the real
     // question: do the meters fit in it, or not.
@@ -1074,12 +1068,13 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
     ));
 }
 
-/// The centre cluster: the two states with consequences outside this room,
-/// side by side in the middle of the bar. Nothing is drawn while both are
-/// off, so an idle session has a calm bar and a live one cannot be misread.
+/// The centre cluster: every state that changes what leaves this room or what
+/// you are hearing, side by side in the middle of the bar. Nothing is drawn
+/// while all of them are off, so an idle session has a calm bar and a live one
+/// cannot be misread.
 fn state_cluster(ui: &mut Ui, snap: &Snapshot) {
-    for entry in cluster_entries(ui, snap) {
-        state_lamp(ui, entry.label, entry.color).on_hover_text(entry.hover);
+    for entry in cluster_entries(theme::palette_of(ui), snap) {
+        state_lamp(ui, entry.label, entry.color, entry.shape).on_hover_text(entry.hover);
     }
 }
 
@@ -1087,7 +1082,7 @@ fn state_cluster(ui: &mut Ui, snap: &Snapshot) {
 /// the bar is laid out, because the cluster's width decides how much room the
 /// zones on either side of it get.
 fn state_cluster_width(ui: &mut Ui, snap: &Snapshot) -> f32 {
-    let entries = cluster_entries(ui, snap);
+    let entries = cluster_entries(theme::palette_of(ui), snap);
     if entries.is_empty() {
         return 0.0;
     }
@@ -1104,37 +1099,58 @@ fn state_cluster_width(ui: &mut Ui, snap: &Snapshot) -> f32 {
 struct ClusterEntry {
     label: &'static str,
     color: egui::Color32,
+    shape: LampShape,
     hover: String,
 }
 
-/// The cluster's contents, in a fixed order so a lamp never moves as the
-/// other one comes and goes: broadcast, then take, then the failure count
-/// that says a destination stopped.
-fn cluster_entries(ui: &Ui, snap: &Snapshot) -> Vec<ClusterEntry> {
-    let p = theme::palette_of(ui);
+/// The cluster's contents, in a fixed order so a lamp never moves as another
+/// comes and goes: broadcast, then the take, then what the host is monitoring,
+/// then the failure count that says a destination stopped.
+///
+/// Takes the palette rather than a Ui so the rules the cluster is built on can
+/// be asserted without rendering; see
+/// `no_two_lamps_that_light_together_look_alike`.
+fn cluster_entries(p: &theme::Palette, snap: &Snapshot) -> Vec<ClusterEntry> {
     let mut entries = Vec::new();
     let live = snap.stream.live_count();
     if live > 0 {
         entries.push(ClusterEntry {
             label: "ON AIR",
             color: p.accent,
+            shape: LampShape::Filled,
             hover: match live {
                 1 => "this session is being broadcast to 1 destination".to_owned(),
                 n => format!("this session is being broadcast to {n} destinations"),
             },
         });
     }
-    if let Some((label, color, hover)) = record_state_lamp(&snap.record.state, p) {
+    if let Some((label, color, shape, hover)) = record_state_lamp(&snap.record.state, p) {
         entries.push(ClusterEntry {
             label,
             color,
+            shape,
             hover,
+        });
+    }
+    // Audition used to be a 4 px accent dot and two lowercase muted words
+    // wedged into the health zone, which is the zone reserved for link
+    // quality: a third visual language for the one state of the three that is
+    // about what the host hears (#188). It is a lamp like the others now, in
+    // the cluster with them, and it is a ring in no colour at all, because
+    // nothing is wrong and nothing extra is leaving the room.
+    if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
+        entries.push(ClusterEntry {
+            label: "AUDITION",
+            color: p.text_primary,
+            shape: LampShape::Ring,
+            hover: "your monitor is the stream mix, your own voice included".to_owned(),
         });
     }
     if snap.stream.failed_count() > 0 {
         entries.push(ClusterEntry {
             label: "STREAM FAILED",
             color: p.danger,
+            shape: LampShape::Filled,
             hover: "a destination stopped; the reason is in Settings, under Broadcast".to_owned(),
         });
     }
@@ -1188,26 +1204,6 @@ fn mono_text_width(ui: &mut Ui, text: &str) -> f32 {
     text_width(ui, text, FontId::new(12.5, FontFamily::Monospace))
 }
 
-/// The persistent audition reminder: a lit lamp and its sentence, beside
-/// the mouth-to-ear readout for as long as audition is on.
-fn audition_indicator(ui: &mut Ui) {
-    let p = theme::palette_of(ui);
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 5.0;
-        let (rect, _) = ui.allocate_exact_size(vec2(9.0, 16.0), Sense::hover());
-        if ui.is_rect_visible(rect) {
-            ui.painter().circle(
-                egui::pos2(rect.left() + 4.0, rect.center().y),
-                4.0,
-                p.accent,
-                Stroke::new(1.0, theme::blend(p.accent, p.text_primary, 0.45)),
-            );
-        }
-        ui.label(theme::muted(ui, "hearing stream mix"))
-            .on_hover_text("audition is on: your monitor carries what listeners hear");
-    });
-}
-
 /// What a strip's button rows actually draw at. egui floors a button at its
 /// text height plus the style's vertical padding whatever size it is added
 /// at, so the console asks rather than assumes: it reserved a flat 22, both
@@ -1234,8 +1230,8 @@ fn button_row_h(ui: &Ui) -> f32 {
 /// was fixed it took the shortfall out of its own travel instead.
 fn strip_h_for(ui: &Ui, gap: f32, member: &MemberView, is_host: bool) -> f32 {
     let row = button_row_h(ui);
-    let mut rows = AVATAR_D_STRIP + NAME_ROW_H + MIN_FADER_H + DB_H + PAN_H + row + METER_SLOT_H;
-    let mut count = 7.0;
+    let mut rows = AVATAR_D_STRIP + NAME_ROW_H + MIN_FADER_H + DB_H + PAN_H + row;
+    let mut count = 6.0;
     if !member.connected {
         rows += NOTE_ROW_H;
         count += 1.0;
@@ -1307,29 +1303,120 @@ fn mute_button(ui: &mut Ui, muted: &mut bool, size: egui::Vec2, hover: [&str; 2]
     }
 }
 
-/// Reserved slot for the per-member meter; protocol support arrives with
-/// the Stats follow-up. Outlined so it reads reserved, not broken.
-fn meter_slot(ui: &mut Ui) {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(STRIP_INNER_W, METER_SLOT_H), Sense::hover());
-    if ui.is_rect_visible(rect) {
-        use egui::emath::GuiRounding;
-        let rect = rect.round_to_pixels(ui.pixels_per_point());
-        let p = theme::palette_of(ui);
-        ui.painter().rect(
-            rect,
-            CornerRadius::same(2),
-            p.surface0,
-            Stroke::new(1.0, p.border),
-            egui::StrokeKind::Inside,
-        );
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "meter",
-            egui::FontId::new(9.0, egui::FontFamily::Proportional),
-            p.text_muted,
-        );
+// No per-member meter slot. Every strip used to end in an outlined box with
+// the word "meter" in it and the explanation only on hover, so a four to ten
+// piece console showed that many empty gauges, which reads as a readout that
+// is broken rather than one that does not exist yet (#185). It was also in the
+// published screenshots. The strips get the room back until the Stats control
+// message carries per-member levels; at that point the slot comes back with
+// something in it.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::demo::{DemoRuntime, FROZEN_FRAME};
+    use crate::runtime::{DestinationState, RecordState, StreamPlatform};
+    use crate::theme::{DARK, LIGHT};
+
+    /// Every combination of cluster states a session can be in at once.
+    fn every_cluster() -> Vec<(String, Snapshot)> {
+        let mut out = Vec::new();
+        for record in [
+            None,
+            Some(RecordState::Recording),
+            Some(RecordState::Uploading),
+            Some(RecordState::Failed {
+                reason: "multipart upload aborted".to_owned(),
+            }),
+        ] {
+            for stream in [
+                &[][..],
+                &[(StreamPlatform::Twitch, DestinationState::Live)][..],
+                &[
+                    (StreamPlatform::Twitch, DestinationState::Live),
+                    (
+                        StreamPlatform::YouTube,
+                        DestinationState::Failed {
+                            reason: "rtmp connection refused".to_owned(),
+                        },
+                    ),
+                ][..],
+            ] {
+                for audition in [false, true] {
+                    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+                    rt.set_destinations(stream);
+                    if let Some(state) = record.clone() {
+                        rt.set_record(state, false);
+                    }
+                    if audition {
+                        rt.send(Command::SetBroadcastAudition(true));
+                    }
+                    let take = record.as_ref().map_or("idle", |_| "a take");
+                    let label = format!(
+                        "record {take}, {} destinations, audition {audition}",
+                        stream.len()
+                    );
+                    out.push((label, rt.snapshot()));
+                }
+            }
+        }
+        out
     }
-    response.on_hover_text("per-member meters arrive with a protocol update");
+
+    /// Two lamps lit at once may never be the same lamp.
+    ///
+    /// ON AIR and UPLOADING were both a filled circle in a warm orange 1.25:1
+    /// apart, and they can be lit together, so the colour carried nothing and
+    /// the words did all of the work (#182). Shape is the cue that survives
+    /// two hues nobody can separate at 5 px.
+    #[test]
+    fn no_two_lamps_that_light_together_look_alike() {
+        for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            for (what, snap) in every_cluster() {
+                let entries = cluster_entries(p, &snap);
+                for (i, a) in entries.iter().enumerate() {
+                    for b in &entries[i + 1..] {
+                        assert!(
+                            a.shape != b.shape || a.color != b.color,
+                            "{name}, {what}: {} and {} are the same lamp",
+                            a.label,
+                            b.label
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pair the audit actually found, named on its own so a future edit
+    /// that gives them the same shape again fails on the reason rather than on
+    /// a generic pairing rule.
+    #[test]
+    fn on_air_and_uploading_differ_in_shape() {
+        let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+        rt.set_destinations(&[(StreamPlatform::Twitch, DestinationState::Live)]);
+        rt.set_record(RecordState::Uploading, false);
+        let snap = rt.snapshot();
+        for p in [&DARK, &LIGHT] {
+            let entries = cluster_entries(p, &snap);
+            let labels: Vec<&str> = entries.iter().map(|e| e.label).collect();
+            assert_eq!(labels, vec!["ON AIR", "UPLOADING"]);
+            assert_eq!(entries[0].shape, LampShape::Filled);
+            assert_eq!(entries[1].shape, LampShape::Ring);
+        }
+    }
+
+    /// Audition is a lamp in the cluster, not a dot in the health zone.
+    #[test]
+    fn audition_is_a_lamp_in_the_cluster() {
+        let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+        rt.send(Command::SetBroadcastAudition(true));
+        let snap = rt.snapshot();
+        let entries = cluster_entries(&DARK, &snap);
+        let labels: Vec<&str> = entries.iter().map(|e| e.label).collect();
+        assert_eq!(labels, vec!["AUDITION"]);
+        // Never the accent: the accent is what says this room is on air, and
+        // audition changes only what the host hears.
+        assert_ne!(entries[0].color, DARK.accent);
+    }
 }

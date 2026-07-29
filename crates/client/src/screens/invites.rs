@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use data_encoding::HEXLOWER;
-use egui::{Align2, Button, RichText, Ui, vec2};
+use egui::{Align2, Button, Ui, vec2};
 
 /// The seat label's cell, so a status word lands in the same place on every
 /// row whatever the label says.
@@ -450,10 +450,7 @@ impl InvitesPanel {
         ui.separator();
         let p = theme::palette_of(ui);
         if ui
-            .add(
-                Button::new(RichText::new("End session for everyone").color(egui::Color32::WHITE))
-                    .fill(p.danger),
-            )
+            .add(theme::danger_button(p, "End session for everyone"))
             .clicked()
         {
             self.confirm_end = true;
@@ -575,9 +572,8 @@ impl InvitesPanel {
                 self.error = self.mint(self.mint_role).err();
             }
         });
-        if let Some(err) = &self.error {
-            let p = theme::palette_of(ui);
-            ui.label(RichText::new(err.clone()).color(p.danger));
+        if let Some(err) = self.error.clone() {
+            theme::reason(ui, err);
         }
     }
 
@@ -597,15 +593,7 @@ impl InvitesPanel {
                             self.confirm_revoke = None;
                         }
                         let p = theme::palette_of(ui);
-                        if ui
-                            .add(
-                                Button::new(
-                                    RichText::new("Revoke invite").color(egui::Color32::WHITE),
-                                )
-                                .fill(p.danger),
-                            )
-                            .clicked()
-                        {
+                        if ui.add(theme::danger_button(p, "Revoke invite")).clicked() {
                             rt.send(Command::Revoke(token));
                             // The name the roster has for them right now:
                             // the eject takes them off it a moment later,
@@ -642,15 +630,7 @@ impl InvitesPanel {
                             self.confirm_end = false;
                         }
                         let p = theme::palette_of(ui);
-                        if ui
-                            .add(
-                                Button::new(
-                                    RichText::new("End session").color(egui::Color32::WHITE),
-                                )
-                                .fill(p.danger),
-                            )
-                            .clicked()
-                        {
+                        if ui.add(theme::danger_button(p, "End session")).clicked() {
                             self.confirm_end = false;
                             *event = Some(InvitesEvent::EndSession);
                         }

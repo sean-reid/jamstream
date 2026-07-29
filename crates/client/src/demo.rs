@@ -282,6 +282,16 @@ impl DemoRuntime {
     /// snapshot hold a state a real pipeline passes through in seconds; no
     /// key is involved, which is the point.
     pub fn set_destinations(&self, entries: &[(StreamPlatform, DestinationState)]) {
+        // One encode feeds every destination, so the dropped counter is one
+        // counter and the pipeline reports the same value on every row
+        // (jamstream_stream::pipeline, `status`). This used to hand Twitch 0 and
+        // YouTube 41, which is a state the product cannot reach and which the
+        // docs site was publishing (#264). Nonzero whenever anything has gone
+        // wrong at all, so the readout is still exercised.
+        let anything_wrong = entries
+            .iter()
+            .any(|(_, state)| matches!(state, DestinationState::Failed { .. }));
+        let repeats = if anything_wrong { 41 } else { 0 };
         let mut s = self.state.lock().expect("demo state");
         s.destinations = entries
             .iter()
@@ -290,12 +300,7 @@ impl DemoRuntime {
                 id: DestinationId(i as u16),
                 platform: *platform,
                 state: state.clone(),
-                // A dropped frame is the one number that has to be visibly
-                // nonzero somewhere, so the failed destination carries some.
-                dropped_frames: match state {
-                    DestinationState::Failed { .. } => 41,
-                    _ => 0,
-                },
+                dropped_frames: repeats,
             })
             .collect();
     }

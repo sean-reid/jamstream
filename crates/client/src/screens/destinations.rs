@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use egui::{Align, Button, Layout, RichText, TextEdit, Ui};
+use egui::{Button, RichText, TextEdit, Ui};
 use jamstream_stream::PlatformCatalog;
 use zeroize::Zeroize;
 
@@ -24,14 +24,13 @@ use crate::theme;
 use crate::widgets::{lamp, row_cell};
 
 /// Column widths. Every row is laid out on these, so nothing moves as a
-/// stream comes up. The bitrate is not one of them: one encode feeds every
-/// destination, so it is a line under the rows instead of the same number
-/// twice.
+/// stream comes up. Neither the bitrate nor the dropped count is one of them:
+/// one encode feeds every destination, so both are lines under the rows
+/// instead of the same number once per row.
 const NAME_W: f32 = 132.0;
 const STATE_W: f32 = 80.0;
-const DROP_W: f32 = 100.0;
 
-/// Any dropped frame is worth noticing; 30 is a second of video gone at the
+/// Any dropped frame is worth noticing; 30 is a second of video at the
 /// pipeline's 30 fps, which earns the meter's red.
 const DROPPED_AMBER: u64 = 1;
 const DROPPED_RED: u64 = 30;
@@ -336,10 +335,10 @@ impl DestinationsPanel {
         }
         ui.add_space(theme::SPACE_SM);
         ui.label(theme::muted(ui, self.encode.clone()).small());
-        if let Some(err) = &self.error {
-            let p = theme::palette_of(ui);
+        dropped_frames(ui, snap);
+        if let Some(err) = self.error.clone() {
             ui.add_space(theme::SPACE_XS);
-            ui.add(egui::Label::new(RichText::new(err.clone()).color(p.danger)).wrap());
+            theme::reason(ui, err);
         }
         ui.add_space(theme::SPACE_MD);
         ui.separator();
@@ -371,11 +370,6 @@ impl DestinationsPanel {
                 DestinationState::Failed { .. } => ("failed", p.danger),
             },
         };
-        // The count only exists once the server reports the destination.
-        let dropped = match &state {
-            RowState::Reported(view) => Some(view.dropped_frames),
-            _ => None,
-        };
         let reason = match &state {
             RowState::Reported(DestinationView {
                 state: DestinationState::Failed { reason },
@@ -405,67 +399,55 @@ impl DestinationsPanel {
                 ui.label(RichText::new(word).color(theme::readable(color, p.surface1, p)));
             });
         });
+        // The second line: this row's actions, left to right in reading order
+        // under the platform they belong to.
+        //
+        // They used to sit in a right_to_left layout, which reversed them on
+        // screen so a row read "Forget key" before "Use saved key", destructive
+        // first, while the invites panel two tabs away built the same pair in a
+        // normal layout and read the other way round (#183). It also left an
+        // unconfigured platform with a lone "Add key" pinned to the drawer's
+        // right edge, 36 px below its own name with a blank line between them
+        // (#192). One layout, one reading order, under the name.
         ui.horizontal(|ui| {
-            row_cell(ui, DROP_W, |ui| {
-                if let Some(n) = dropped {
-                    // The meter's own color language: dropped frames are the
-                    // health reading, so they run muted, amber, red.
-                    let color = if n >= DROPPED_RED {
-                        p.meter_red
-                    } else if n >= DROPPED_AMBER {
-                        p.meter_amber
-                    } else {
-                        p.text_muted
-                    };
-                    ui.label(
-                        RichText::new(format!("{n} dropped"))
-                            .monospace()
-                            .color(color),
-                    )
-                    .on_hover_text("video frames the broadcast had to skip");
+            match configured_id {
+                Some(id) => {
+                    if ui
+                        .button("Remove")
+                        .on_hover_text(if live {
+                            "stops this destination; every other one keeps streaming"
+                        } else {
+                            "drops this destination before it goes live"
+                        })
+                        .clicked()
+                    {
+                        action = Some(RowAction::Remove(id));
+                    }
                 }
-            });
-            ui.with_layout(
-                Layout::right_to_left(Align::Center),
-                |ui| match configured_id {
-                    Some(id) => {
+                None => {
+                    if self.rows[index].saved {
+                        if ui.button("Use saved key").clicked() {
+                            action = Some(RowAction::UseSaved);
+                        }
                         if ui
-                            .button("Remove")
-                            .on_hover_text(if live {
-                                "stops this destination; every other one keeps streaming"
-                            } else {
-                                "drops this destination before it goes live"
-                            })
+                            .button("Forget key")
+                            .on_hover_text("deletes it from this computer's keychain")
                             .clicked()
                         {
-                            action = Some(RowAction::Remove(id));
+                            action = Some(RowAction::Forget);
                         }
+                    // Deliberately not a selected button: the open pane
+                    // below is the state, and the accent belongs to air.
+                    } else if ui.button("Add key").clicked() {
+                        action = Some(RowAction::ToggleEntry);
                     }
-                    None => {
-                        if self.rows[index].saved {
-                            if ui.button("Use saved key").clicked() {
-                                action = Some(RowAction::UseSaved);
-                            }
-                            if ui
-                                .button("Forget key")
-                                .on_hover_text("deletes it from this computer's keychain")
-                                .clicked()
-                            {
-                                action = Some(RowAction::Forget);
-                            }
-                        // Deliberately not a selected button: the open pane
-                        // below is the state, and the accent belongs to air.
-                        } else if ui.button("Add key").clicked() {
-                            action = Some(RowAction::ToggleEntry);
-                        }
-                    }
-                },
-            );
+                }
+            }
         });
         if let Some(reason) = reason {
             // The reason the pipeline gave, verbatim and full width. It never
             // contains a key; the server strips that by construction.
-            ui.add(egui::Label::new(RichText::new(reason).color(p.danger)).wrap());
+            theme::reason(ui, reason);
         }
         if self.rows[index].entering {
             self.entry_ui(ui, index, rt);
@@ -592,7 +574,7 @@ impl DestinationsPanel {
                 ui.label(
                     RichText::new(format!("{failed} failed"))
                         .monospace()
-                        .color(p.danger),
+                        .color(theme::danger_ink(p)),
                 );
             }
         });
@@ -600,6 +582,56 @@ impl DestinationsPanel {
             ui.add(egui::Label::new(theme::muted(ui, note).small()).wrap());
         }
     }
+}
+
+/// The dropped count, once, under the rows.
+///
+/// It is one counter for the whole encode, so a per-row copy of it was a shared
+/// number rendered as though it belonged to one destination, which invites
+/// exactly the wrong fix: removing a destination does nothing about it (#264).
+/// The bitrate is a line under the rows for the same reason, and this is the
+/// same shape of fact.
+///
+/// What it counts is frames the machine could not keep up with, and the
+/// tooltip said "frames the broadcast had to skip", which is not what usually
+/// happens: the frame count is what holds video in step with the audio, so a
+/// frame there was no time to draw goes out again as the last picture. It is
+/// not never, either. Since #271 the video queue has a cap, and a frame the
+/// encoder cannot take is left out rather than repeated, which does leave the
+/// stream a picture short. The counter conflates the two (#278 tracks
+/// splitting it), so the line says the part a host can act on and claims
+/// neither.
+fn dropped_frames(ui: &mut Ui, snap: &Snapshot) {
+    // Every destination reports the same figure; taking the largest is how this
+    // stays right if one row's status is a frame behind another's.
+    let Some(n) = snap
+        .stream
+        .destinations
+        .iter()
+        .map(|d| d.dropped_frames)
+        .max()
+    else {
+        return;
+    };
+    let p = theme::palette_of(ui);
+    // The meter's own colour language: this is a health reading, so it runs
+    // muted, amber, red.
+    let color = if n >= DROPPED_RED {
+        p.meter_red
+    } else if n >= DROPPED_AMBER {
+        p.meter_amber
+    } else {
+        p.text_muted
+    };
+    ui.label(
+        RichText::new(format!("{n} dropped"))
+            .monospace()
+            .color(theme::readable(color, p.surface1, p)),
+    )
+    .on_hover_text(
+        "frames the session machine could not keep up with, mostly sent again as the last \
+         picture and sometimes left out; one count for the one encode every destination shares",
+    );
 }
 
 enum RowAction {
