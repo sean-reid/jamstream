@@ -66,7 +66,6 @@ The [quickstart](../quickstart.md#from-the-terminal) shows a full run end to end
 
 ## Notes
 
-- `--musicians` counts the host. A session of N musician seats is you plus N-1 guests, and N is also what the server admits: it refuses an eleventh musician, so there is never an invite in hand that cannot get in. The desktop app's host wizard offers the same range with the same meaning, and its "musicians, including you" dial defaults to the same 4.
 - If JamStream-tagged machines already exist on the provider, they are listed with a warning before anything launches; run [`jamstream sweep`](sweep.md) if they are strays.
 - `--record` arms recording, it does not start it: the host presses Record in the session, and each Record to Stop is one take. Finished takes are FLAC files named by date and time in the printed folder (`record_dir` in the `--json` output), and they stay there after `jamstream end`. See [Recording a session](../guides/recording.md).
 - `--json` prints the session id, address, invites, cost estimate, recording folder, and state file path as one object, for scripts.

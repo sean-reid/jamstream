@@ -71,7 +71,7 @@ $ export JAMSTREAM_RECORDING_ACCESS_KEY_ID=...
 $ export JAMSTREAM_RECORDING_SECRET_ACCESS_KEY=...
 ```
 
-Variables of its own because launching a recorded session writes this key into the machine's user data. On AWS the obvious names, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, are the pair that launches instances, so they are deliberately not read here: a key that could start machines does not belong on one. Scope this key to writing the recordings prefix of one bucket; the last section of your [provider's page](../guides/providers.md) creates it.
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are deliberately not read here, because they are the pair that launches instances and this key is written into a machine's user data. Scope this key to writing the recordings prefix of one bucket; the last section of your [provider's page](../guides/providers.md) creates it.
 
 `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY` on DigitalOcean, and `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY` on GCP, are read as well: neither pair is a launch credential on its provider.
 
@@ -80,6 +80,6 @@ The app keeps the same key in your system keychain instead, in a slot of its own
 ## Notes
 
 - Takes outlive the session. A session ended weeks ago still lists, until the bucket's retention rule deletes the objects.
-- Every take is streamed to disk, never held in memory, and what lands is checked against the size the bucket listed. A file that arrives short is deleted rather than left looking like a recording.
+- What lands is checked against the size the bucket listed, and a file that arrives short is deleted rather than left looking like a recording.
 - A take already in the output directory at the right size is skipped and costs no egress. One at a different size stops the download instead of being overwritten.
 - If a bucket cannot be reached, that session's line says why and the other sessions still list, but the command exits nonzero.

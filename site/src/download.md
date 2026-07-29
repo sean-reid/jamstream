@@ -3,37 +3,19 @@
 
 Most people want the desktop app: pick your platform below, download it, open it, and you can host and join sessions with nothing else installed, because every app build bundles its own `jamstreamd` session server. The `jamstream` CLI, for terminals and automation, installs in one line at the [bottom of this page](#install-the-cli-in-one-line).
 
-Every link on this page points at the latest release by a stable name, so a new release updates them all in place. All artifacts are listed on the [releases page](https://github.com/sean-reid/jamstream/releases/latest), and each release includes a [SHA256SUMS](https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS) file for verifying downloads. Building from source also works on every platform: clone [the repository](https://github.com/sean-reid/jamstream) and run `cargo install --path crates/cli`.
+Every link on this page points at the latest release by a stable name, so a new release updates them all in place. All artifacts are listed on the [releases page](https://github.com/sean-reid/jamstream/releases/latest). Building from source also works on every platform: clone [the repository](https://github.com/sean-reid/jamstream) and run `cargo install --path crates/cli`.
 
 ## macOS
 
 - Desktop app: [jamstream-app-macos.dmg](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-macos.dmg)
 - CLI, one universal binary for Apple silicon and Intel: [jamstream-cli-macos-universal.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-macos-universal.tar.gz)
 
-Verify a download against the release checksums:
-
-```console
-$ curl -fsSLO https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS
-$ shasum -a 256 --check --ignore-missing SHA256SUMS
-jamstream-app-macos.dmg: OK
-```
-
 ## Windows
 
 - Desktop app: [jamstream-app-windows-x86_64.zip](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-windows-x86_64.zip)
 - CLI: [jamstream-cli-windows-x86_64.zip](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-windows-x86_64.zip)
 
-The Windows binaries are plain zips and are not code signed. SmartScreen will show "Windows protected your PC" the first time you run them: click More info, then Run anyway. The warning is expected and the checksum below is the way to confirm you have the real file. A [winget package](#package-managers), which verifies downloads by hash, is prepared but not yet submitted.
-
-Verify a download in PowerShell:
-
-```console
-> irm https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS -OutFile SHA256SUMS
-> (Get-FileHash jamstream-cli-windows-x86_64.zip).Hash
-> Select-String jamstream-cli-windows-x86_64.zip SHA256SUMS
-```
-
-The two hashes must match; `Get-FileHash` prints uppercase and `SHA256SUMS` is lowercase, which does not matter.
+The Windows binaries are plain zips and are not code signed. SmartScreen will show "Windows protected your PC" the first time you run them: click More info, then Run anyway. The warning is expected, and [verifying the download](#verifying-a-download) is the way to confirm you have the real file.
 
 ## Linux
 
@@ -44,9 +26,11 @@ The two hashes must match; `Get-FileHash` prints uppercase and `SHA256SUMS` is l
 - Session server, static musl build (aarch64), tarred: [jamstreamd-linux-aarch64-musl.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-aarch64-musl.tar.gz)
 - Session server, the same build as a bare binary: [jamstreamd-linux-aarch64-musl](https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-aarch64-musl)
 
-The bare server binaries are the exact artifacts a release's clients tell cloud session machines to download and verify at boot, one per machine architecture (AWS launches arm64 instances, GCP and DigitalOcean x86_64); the URLs and sha256s are pinned into that release's app and CLI at build time, so you never handle them yourself. The tarballs package the same binaries for humans and the install script (the script's `--with-server` flag installs the one matching your machine), which is only needed for [hosting on your own computer](guides/local.md) with the CLI alone; the desktop app tarball already bundles `jamstreamd`. No arm64 Linux app or CLI builds are published yet; build from source on that platform.
+The session server downloads are only for [hosting on your own computer](guides/local.md) with the CLI alone; the desktop app bundles its own. No arm64 Linux app or CLI builds are published yet; build from source on that platform.
 
-Verify a download against the release checksums:
+## Verifying a download
+
+Every release ships a `SHA256SUMS` file covering every artifact:
 
 ```console
 $ curl -fsSLO https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS
@@ -54,9 +38,9 @@ $ sha256sum --check --ignore-missing SHA256SUMS
 jamstream-cli-linux-x86_64.tar.gz: OK
 ```
 
-## Package managers
+On macOS that command is `shasum -a 256`. In PowerShell, compare `(Get-FileHash <file>).Hash` against that file's line in `SHA256SUMS`; `Get-FileHash` prints uppercase and the file is lowercase, which does not matter.
 
-Homebrew is live; winget and the AUR are not yet (the winget package has not been submitted and the AUR packages have not been published), so those two commands do not work today. Every manifest is generated from each release's own checksums either way.
+## Package managers
 
 Homebrew:
 
@@ -67,24 +51,7 @@ $ brew install sean-reid/jamstream/jamstream-cli
 
 The first line installs the desktop app, the second the CLI with shell completions set up for you. The [tap](https://github.com/sean-reid/homebrew-jamstream) is updated by the release pipeline, so `brew upgrade` tracks releases on its own. The formula also works with brew on Linux x86_64, from the same tarball this page links.
 
-winget, once the package is accepted into the community repository:
-
-```console
-> winget install SeanReid.JamStream
-```
-
-That installs the desktop app and puts `jamstream-app` and `jamstreamd` on your PATH. winget checks the download against the hash in its manifest, which is the verification the unsigned zip otherwise leaves to you.
-
-Arch Linux, once the packages are published, with `paru` or `yay`:
-
-```console
-$ paru -S jamstream-bin
-$ paru -S jamstream-cli-bin
-```
-
-Again the first is the desktop app and the second the CLI. The app package installs `jamstream-app`, `jamstreamd`, the icon, and the desktop entry; the CLI package installs `jamstream` alone.
-
-The manifests for all three live in [packaging/](https://github.com/sean-reid/jamstream/tree/main/packaging), and every release after v0.1.1-beta attaches them as a `jamstream-packaging.tar.gz` asset with that release's checksums filled in, so you can read exactly what each channel would install.
+winget and the AUR are coming; neither is published yet.
 
 ## Install the CLI in one line
 

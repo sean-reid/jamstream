@@ -1,6 +1,6 @@
 # Hosting a session
 
-Hosting means launching one small server, minting the invites, and ending the session when you are done. In the app, **Host a session** on the home screen walks four steps: where the server runs, which region, a cost preview, and the launch itself. The wizard stores your provider credentials in the system keychain, joins you automatically once the server answers, and opens Settings on the Invites tab. The CLI does the same three jobs from the terminal, and both record the session in the same place, so a session hosted in the app shows up in `jamstream status` and can be ended from either side.
+Hosting means launching one small server, minting the invites, and ending the session when you are done. In the app, **Host a session** on the home screen walks four steps: where the server runs, which region, a cost preview, and the launch itself.
 
 Hosting does not have to involve a cloud at all: picking **local** in the wizard's first step runs the server on your own computer, costs nothing, and is the right choice when everyone is on the same network. This page covers the cloud path; [Playing on the same network](local.md) covers local mode.
 
@@ -32,7 +32,7 @@ Step 3 shows the expected hours, the seat counts, and the resulting estimate, al
 
 - **hours** shapes the estimate only; the real bill is metered. Play longer and you pay for the time played.
 - **musicians** is the number of playing seats, counting you: 4 means your own seat plus three invites to hand out. The cap is 10, which is also what the server admits. **listeners** are people who only hear the mix.
-- **stream destinations** is how many platforms you expect to broadcast to, and it is the number here that moves the estimate most: about 1.2 GB per hour each, against about 0.54 GB per hour for four musicians playing. It configures nothing; platforms are set up in the session itself, in [Streaming to Twitch and YouTube](streaming.md).
+- **stream destinations** is how many platforms you expect to broadcast to, and it is the number here that moves the estimate most. It configures nothing; platforms are set up in the session itself, in [Streaming to Twitch and YouTube](streaming.md).
 - **Recording** is off, the mix, or the mix and stems, and it is the one choice here that is fixed for the session: a session launched with it off cannot record later. A cloud take needs a bucket, which is set up once in Settings, and [Recording a session](recording.md) walks it.
 
 [Understanding cost](cost.md) explains every line of the estimate. Clicking **Launch** boots the machine, waits for its address, proves the server answers a real encrypted handshake, and joins you.
@@ -48,7 +48,7 @@ One invite per seat is minted up front, on your machine, and the wizard opens Se
 - **Revoke** ejects that member and kills their invite, with a confirmation step. The host also sees a Revoke button on each mixer strip.
 - **Mint invite** adds a musician or listener seat mid-session, up to 10 musicians (you included) and 20 listeners. Unused invites cost nothing.
 
-See [Joining a session](joining.md) for how invites behave on the other end. The CLI mints its seats with `--musicians` (default 4, counting you) and `--listeners` (default 0) and cannot add seats to a running session; the app's panel can, even for sessions the CLI hosted.
+See [Joining a session](joining.md) for how invites behave on the other end. The CLI mints its seats at launch and cannot add more to a running session; the app's panel can, even for sessions the CLI hosted.
 
 ## The safety knobs
 
@@ -61,7 +61,7 @@ Both are yours to set. The wizard has an **idle exit** and a **hard cap** field 
 
 ## While it runs
 
-The host's status bar shows cost so far and elapsed time at its right-hand end, beside **Record** and **Leave**; nothing accrues silently. The **Broadcast** tab of Settings holds both halves of streaming: **Stream mix** sets what the platforms and the listeners hear, and **Destinations** puts the session on air to Twitch and YouTube Live. **Record** is the one action in the bar itself, and [Recording a session](recording.md) covers takes. Devices and buffer size can change mid-session from Settings in the top bar, and the change applies immediately; [Joining a session](joining.md#the-session-screen) walks the whole screen. `jamstream status` lists the same sessions from the terminal, with elapsed time, cost accrued so far, and a projection.
+The **Broadcast** tab of Settings holds both halves of streaming: **Stream mix** sets what the platforms and the listeners hear, and **Destinations** puts the session on air to Twitch and YouTube Live. **Record** is the one action in the bar itself, and [Recording a session](recording.md) covers takes. Devices and buffer size can change mid-session from Settings in the top bar, and the change applies immediately; [Joining a session](joining.md#the-session-screen) walks the whole screen. `jamstream status` lists the same sessions from the terminal, with elapsed time, cost accrued so far, and a projection.
 
 If tagged machines already exist in your account when you host again, the CLI warns at host time, so a stray session does not hide behind a new one.
 
