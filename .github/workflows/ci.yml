@@ -214,6 +214,17 @@ jobs:
         run: cargo nextest run --locked --workspace --exclude jamstream-harness --exclude jamstream-client
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
+      # nextest does not run doctests, and nothing else did either, so a doctest
+      # would have compiled on the author's machine and never once in CI (#295).
+      # It costs a doc-mode build to find zero of them today, because every
+      # fenced block in the workspace is `text` or `console`, and the point is
+      # the next one somebody writes: a doctest looks like documentation, so it
+      # is exactly the kind of test added without wondering whether CI runs it.
+      # Linux only. Doctests here exercise no platform-specific path, so running
+      # them three times would buy nothing.
+      - if: runner.os == 'Linux'
+        name: Run doctests, which nextest does not
+        run: cargo test --locked --workspace --doc
       # `cargo xtask fixtures` was invoked by nothing, and its WAV generator is
       # duplicated verbatim into crates/cli/tests/common/mod.rs with "keep them
       # in sync" written in a doc comment and enforced nowhere. The nextest run
