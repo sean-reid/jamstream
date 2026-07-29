@@ -290,7 +290,7 @@ impl ServerCandidates {
     pub fn new(invite: &Invite) -> Result<Self, SessionError> {
         if invite.addresses.is_empty() {
             return Err(SessionError::Protocol(jamstream_protocol::Error::Invite(
-                "no server address",
+                "has no server address",
             )));
         }
         Ok(ServerCandidates {

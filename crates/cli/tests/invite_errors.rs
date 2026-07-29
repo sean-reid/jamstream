@@ -38,7 +38,7 @@ async fn garbage_invite_yields_the_specific_decode_error() {
         matches!(&err, CliError::Protocol(_)),
         "expected a protocol error, got {err:?}"
     );
-    assert_eq!(err.to_string(), "invite is not valid: not valid encoding");
+    assert_eq!(err.to_string(), "invite has invalid encoding");
 
     // Valid encoding, corrupt payload: the other decode failure is named
     // differently so the user knows the paste was cut short.
@@ -46,7 +46,7 @@ async fn garbage_invite_yields_the_specific_decode_error() {
     let err = join::run(&args_with_invite(&truncated), &mut out)
         .await
         .expect_err("a truncated blob must not join");
-    assert_eq!(err.to_string(), "invite is not valid: truncated or corrupt");
+    assert_eq!(err.to_string(), "invite is truncated or corrupt");
 }
 
 /// The whole point of the file and pipe forms is that the credential never
@@ -86,7 +86,7 @@ fn built_binary_reads_the_invite_from_a_pipe_and_from_a_file() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error: invite is not valid: not valid encoding"),
+        stderr.contains("error: invite has invalid encoding"),
         "the piped invite must reach the decode: {stderr}"
     );
     // Nothing warned: no credential passed through argv.
@@ -112,8 +112,7 @@ fn built_binary_reads_the_invite_from_a_pipe_and_from_a_file() {
         .expect("spawn the jamstream binary");
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("error: invite is not valid: not valid encoding"),
+        String::from_utf8_lossy(&output.stderr).contains("error: invite has invalid encoding"),
         "the file invite must reach the decode"
     );
     std::fs::remove_file(&path).unwrap();
@@ -142,7 +141,7 @@ fn built_binary_prints_the_decode_error_and_exits_nonzero() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error: invite is not valid: not valid encoding"),
+        stderr.contains("error: invite has invalid encoding"),
         "stderr must carry the specific decode error, was: {stderr}"
     );
 }
