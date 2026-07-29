@@ -169,6 +169,17 @@ egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 [profile.test]
 opt-level = 1
 
+# panic = "abort" is not available here, and it looks like the cheapest 600 KB
+# in jamstreamd. Measuring #224 put .eh_frame, .eh_frame_hdr and
+# .gcc_except_table at 613,804 bytes of the 7.5 MB musl artifact, 9.4 percent of
+# the growth since v0.1.5, and unwinding is what all of that pays for. But
+# jamstream-server's runtime wraps every inbound datagram in
+# `std::panic::catch_unwind`, so one peer's malformed packet cannot end the
+# session for everyone, and abort makes catch_unwind stop catching. The test
+# that notices, `guard_turns_an_unwind_into_a_value_the_loop_can_handle`, aborts
+# the test process rather than failing, which is loud only to someone running
+# it. Whole-binary opt-level = "z" is out for a different reason: the 2.5 ms mix
+# tick and the recorder's FLAC encoding have perf budgets in record.rs.
 [profile.release]
 lto = "thin"
 codegen-units = 1
