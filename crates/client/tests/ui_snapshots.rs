@@ -19,6 +19,7 @@ use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow, Reg
 use jamstream_client::screens::invites::InvitesPanel;
 use jamstream_client::screens::recording::RecordingChoice;
 use jamstream_client::screens::session::SettingsTab;
+use jamstream_client::screens::takes::Half;
 use jamstream_client::theme::{self, Theme};
 use jamstream_cloud::{Price, ProbeMatrix, ProviderKind, Region, RegionId, rank};
 
@@ -394,6 +395,24 @@ fn takes_app(theme: Theme) -> JamApp {
 fn takes() {
     let mut harness = app_harness(takes_app(Theme::Dark), WIDE);
     snapshot_for_docs(&mut harness, "takes");
+}
+
+#[test]
+fn takes_downloading() {
+    // The state a musician spends the longest in: a take is gigabytes, so the
+    // wait is the part that would otherwise be a surprise. 1.4 GB of the 4.4 GB
+    // of stems is on disk, and the other buttons are out while it runs, because
+    // one download at a time is what the screen allows.
+    let mut app = takes_app(Theme::Dark);
+    app.takes.park_download(
+        "a3f29c41deadbeef",
+        "jamstream-2026-07-28-1845",
+        Half::Stems,
+        4_400_000_000,
+        1_400_000_000,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot_for_docs(&mut harness, "takes_downloading");
 }
 
 #[test]

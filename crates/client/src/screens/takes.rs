@@ -55,6 +55,11 @@ const PROGRESS_STEP_BYTES: u64 = 4 * 1_000_000;
 /// button, which is wider than Home's column of prose.
 const COLUMN_W: f32 = 760.0;
 
+/// The download track: as wide as the buttons it stands in for, and a hairline
+/// tall, because it is a readout rather than a control.
+const TRACK_W: f32 = 180.0;
+const TRACK_H: f32 = 6.0;
+
 /// Under this many days left, the countdown is set in the danger ink: a take is
 /// deleted permanently when the rule fires, and a weekend is enough to miss it.
 const EXPIRY_SOON_DAYS: i64 = 3;
@@ -826,6 +831,40 @@ impl TakesScreen {
         true
     }
 
+    /// Parks a download partway through, with `done` of `total` bytes on disk.
+    ///
+    /// The app reaches this state only by pressing a Download button, and a
+    /// real one is at a different point in the transfer every run. So this is
+    /// how a fixture holds the state a musician spends the longest looking at:
+    /// the same fields the running download writes, and a job that never
+    /// answers, so the bar stays where it was put.
+    #[doc(hidden)]
+    pub fn park_download(
+        &mut self,
+        session_id: &str,
+        base: &str,
+        half: Half,
+        total: u64,
+        done: u64,
+    ) {
+        let Some(row) = self.rows.iter().find(|r| r.session_id == session_id) else {
+            return;
+        };
+        let meter = Arc::new(Meter::default());
+        meter.done.store(done, Ordering::Relaxed);
+        *meter.name.lock().expect("download name") = format!("{base}-mix.flac");
+        self.landed = None;
+        self.fetching = Some(Fetching {
+            session_id: session_id.to_owned(),
+            base: base.to_owned(),
+            half,
+            total,
+            dir: row.dir.clone(),
+            meter,
+            job: self.exec.run(std::future::pending()),
+        });
+    }
+
     /// Shows one file in the platform's file manager, keeping the path on
     /// screen when there is no window to open it in.
     pub fn reveal(&mut self, path: &Path) {
@@ -1070,6 +1109,22 @@ fn session_card(
     action
 }
 
+/// How far a download has got: an engraved track with the accent filling it,
+/// drawn rather than assembled out of default widget chrome, like every other
+/// moving thing in the app.
+fn track(ui: &mut Ui, done: u64, total: u64) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(TRACK_W, TRACK_H), egui::Sense::hover());
+    let p = theme::palette_of(ui);
+    let radius = egui::CornerRadius::same(2);
+    ui.painter().rect_filled(rect, radius, p.well);
+    let fraction = (done as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+    if fraction > 0.0 {
+        let mut filled = rect;
+        filled.set_width(rect.width() * fraction);
+        ui.painter().rect_filled(filled, radius, p.accent);
+    }
+}
+
 /// One line: what this half of the take is, how big, where it is, and the one
 /// thing to do about it.
 fn part_row(
@@ -1094,16 +1149,20 @@ fn part_row(
         ui.label(theme::mono_muted(ui, recordings::human_size(part.bytes())));
         if let Some(fetching) = running {
             let done = fetching.meter.done.load(Ordering::Relaxed);
-            let fraction = if fetching.total == 0 {
-                0.0
-            } else {
-                (done as f32 / fetching.total as f32).clamp(0.0, 1.0)
-            };
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_width(140.0)
-                    .text(theme::mono_muted(ui, recordings::human_size(done))),
-            );
+            // In the button's place, so the row does not move when the download
+            // starts: what was the one thing to press is now the one thing to
+            // watch.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                track(ui, done, fetching.total);
+                ui.label(theme::mono_muted(
+                    ui,
+                    format!(
+                        "{} of {}",
+                        recordings::human_size(done),
+                        recordings::human_size(fetching.total)
+                    ),
+                ));
+            });
             return;
         }
         if part.writing() {
