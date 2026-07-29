@@ -30,12 +30,14 @@ Both forms read the bucket details [`jamstream host`](host.md) saved beside each
 ```console
 $ jamstream recordings
 SESSION    TAKE                                           SIZE  MODIFIED
-3f2a9c01   mix.flac                                    1.38 GB  2026-07-28 19:30
-3f2a9c01   stems/bass.flac                            691.2 MB  2026-07-28 19:30
-3f2a9c01   stems/drums.flac                           691.2 MB  2026-07-28 19:31
+3f2a9c01   jamstream-2026-07-28-1930-mix.flac          1.38 GB  2026-07-28 19:30
+3f2a9c01   jamstream-2026-07-28-1930-Ana.flac         691.2 MB  2026-07-28 19:30
+3f2a9c01   jamstream-2026-07-28-1930-Bo.flac          691.2 MB  2026-07-28 19:31
 
 Fetch a session's takes with: jamstream recordings get <session>
 ```
+
+A take is named for the minute it started, in UTC: `jamstream-YYYY-MM-DD-HHMM-mix.flac` for the mix, and one `jamstream-YYYY-MM-DD-HHMM-<name>.flac` per musician when the session recorded stems. They all sit side by side under the session's own prefix; there is no stems folder.
 
 A session that recorded nothing says so on its own line rather than showing an empty table.
 
@@ -51,9 +53,9 @@ Egress is billed on the download, not on the recording.
 Your plan includes 100 GB/month of free download, so this is an upper bound.
 Billed to your own cloud account at list prices; JamStream never sees it.
 Download these takes? [y/N] y
-  mix.flac                                 100%
-  stems/bass.flac                          100%
-  stems/drums.flac                         100%
+  jamstream-2026-07-28-1930-mix.flac       100%
+  jamstream-2026-07-28-1930-Ana.flac       100%
+  jamstream-2026-07-28-1930-Bo.flac        100%
 3 takes in /Users/you/takes, 2.76 GB.
 Egress for this download: $0.248832.
 ```
@@ -69,7 +71,7 @@ $ export JAMSTREAM_RECORDING_ACCESS_KEY_ID=...
 $ export JAMSTREAM_RECORDING_SECRET_ACCESS_KEY=...
 ```
 
-Variables of its own because launching a recorded session writes this key into the machine's user data. On AWS the obvious names, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, are the pair that launches instances, so they are deliberately not read here: a key that could start machines does not belong on one. Scope this key to writing the recordings prefix of one bucket; the last section of your [provider's page](../guides/providers.md) creates it.
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are deliberately not read here, because they are the pair that launches instances and this key is written into a machine's user data. Scope this key to writing the recordings prefix of one bucket; the last section of your [provider's page](../guides/providers.md) creates it.
 
 `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY` on DigitalOcean, and `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY` on GCP, are read as well: neither pair is a launch credential on its provider.
 
@@ -78,6 +80,6 @@ The app keeps the same key in your system keychain instead, in a slot of its own
 ## Notes
 
 - Takes outlive the session. A session ended weeks ago still lists, until the bucket's retention rule deletes the objects.
-- Every take is streamed to disk, never held in memory, and what lands is checked against the size the bucket listed. A file that arrives short is deleted rather than left looking like a recording.
+- What lands is checked against the size the bucket listed, and a file that arrives short is deleted rather than left looking like a recording.
 - A take already in the output directory at the right size is skipped and costs no egress. One at a different size stops the download instead of being overwritten.
 - If a bucket cannot be reached, that session's line says why and the other sessions still list, but the command exits nonzero.

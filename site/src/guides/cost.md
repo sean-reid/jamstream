@@ -19,7 +19,7 @@ Total (estimate)                                  $0.08037
 Line by line:
 
 - **VM** is the machine's hourly price times your expected length, set on the preview step (`--hours` in the CLI). The price is fetched live from the provider where possible (DigitalOcean's sizes API) and from a bundled snapshot of public pricing otherwise, so the preview tracks reality and the numbers in this documentation are the approximations.
-- **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Each musician's personal mix streams down at about 300 kbit/s, each listener at about 150 kbit/s, and each broadcast destination at 2628 kbit/s. Four musicians for three hours is about 1.6 GB; add a Twitch or YouTube destination and it is about 5.2 GB.
+- **Egress estimate** is predicted outbound traffic times the provider's per-GB rate. Four musicians for three hours is about 1.6 GB; add a Twitch or YouTube destination and it is about 5.2 GB.
 - **Included egress credit** appears when the provider bundles free transfer that covers some or all of the estimate. DigitalOcean droplets include thousands of GB; AWS accounts include 100 GB per month; GCP includes close to nothing.
 
 The expected length only shapes the estimate. The real bill is metered: elapsed time times the hourly rate, plus measured traffic. Play four hours after previewing three and you pay for four.
@@ -42,9 +42,9 @@ The wizard shows both lines before you launch, and they move when you switch bet
 
 ## The guardrails
 
-Ephemeral cloud machines have one classic failure: you forget one and it bills for a month. JamStream treats that as a design problem:
+Three, all on by default:
 
-- **The self-destruct timers.** Every server shuts itself down after `--idle-min` minutes with no musicians (default 10) and destroys itself at the `--max-hours` hard cap (default 12) no matter what. The cap is enforced on the machine itself, not by your laptop, so it works even if your laptop is in a lake.
+- **The self-destruct timers.** Every server shuts itself down after `--idle-min` minutes with no musicians (default 10) and destroys itself at the `--max-hours` hard cap (default 12) no matter what. The cap is enforced on the machine itself, not by your laptop.
 
   GCP is the exception, and it costs money if you walk away. There the idle window stops the server but cannot delete the machine, so an abandoned session keeps billing until the hard cap: roughly $0.39 on an e2-medium if everyone leaves at twenty minutes and nobody comes back. End the session when you are done, or run `jamstream sweep` afterwards, and you pay for the time you played. Shortening `--max-hours` bounds it too.
 - **The cost ticker.** While a session runs, cost so far and elapsed time sit at the right-hand end of the app's status bar, beside **Record** and **Leave**, and `jamstream status` prints accrued and projected cost per session. You always know the meter's reading; nothing accrues silently.
@@ -61,4 +61,4 @@ SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED 
 b7e5c9b6   local/local          ended     2 h 13 min        $0.00              - -
 ```
 
-Accrued is hourly rate times elapsed time; it stops when the session ends. TAKES is the bucket the session recorded to, if it recorded to one; a take on your own disk shows a dash and lives in the folder [Recording a session](recording.md#on-this-computer) names. The state files behind this table live on your machine, one JSON file per session, under your platform's data directory in `jamstream/sessions/`.
+Accrued is hourly rate times elapsed time; it stops when the session ends. TAKES is the bucket the session recorded to, if it recorded to one; a take on your own disk shows a dash and lives in the folder [Recording a session](recording.md#on-this-computer) names.

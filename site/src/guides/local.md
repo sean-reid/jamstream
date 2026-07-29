@@ -24,16 +24,6 @@ If a laptop dies mid-session or a state file is lost, `jamstream sweep` finds lo
 
 `jamstream host --provider local` (local is the default provider, so the flag is optional) runs the same flow: it prints one invite per seat after the handshake check and takes `--musicians`, `--listeners`, `--idle-min`, and `--port`; the wizard offers the same seats and windows, and picks the port itself. See the [host reference](../cli/host.md). The app picks a free UDP port for each local session; the CLI defaults to 43210.
 
-Unlike the app, the CLI does not bundle the server, so local mode needs a `jamstreamd` binary already on your machine; nothing is downloaded, and the `--artifact-url` and `--artifact-sha256` flags play no part. The binary is found in this order:
+Unlike the app, the CLI does not bundle the server, so local mode needs a `jamstreamd` binary already on your machine; nothing is downloaded. It is taken from `JAMSTREAMD_PATH`, then from beside the running executable, then from your PATH, and `host` fails before starting anything with an error naming every place it looked; on Linux x86_64 the [install script's](../download.md) `--with-server` flag puts one in the second of those places.
 
-1. The `JAMSTREAMD_PATH` environment variable, if set, is used as the path.
-2. A `jamstreamd` sitting next to the running executable itself: next to the `jamstream` CLI, or inside the desktop app beside the app binary (on macOS that is `JamStream.app/Contents/MacOS/jamstreamd`).
-3. `jamstreamd` on your PATH.
-
-Every desktop app artifact bundles `jamstreamd` in that app-adjacent spot, which is why the app needs nothing else on every platform. For the CLI alone: on Linux x86_64, the [install script's](../download.md) `--with-server` flag puts `jamstreamd` next to the `jamstream` CLI, satisfying the second step; building from source with `cargo install --path crates/server` satisfies the last one. If none resolves, `host` fails before starting anything, with an error naming every place it looked.
-
-## What lands on disk
-
-Under your platform's data directory in `jamstream/`: a `local.json` registry of running server processes, and `jamstream/sessions/`, holding one directory per session with the server's config and its log (`server.log`, the first place to look if a local server exits at startup) alongside the session state files that `status` and `end` read.
-
-A session launched with `--record` writes its takes to `jamstream/recordings/` instead, outside the per-session directory that ending a session deletes. See [Recording a session](recording.md).
+If a local server exits at startup, the first place to look is its `server.log`, in the session's own directory under your platform's data directory in `jamstream/sessions/`.
