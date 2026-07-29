@@ -220,12 +220,21 @@ impl JamApp {
         }
     }
 
-    /// The wizard finished a real launch: auto-join with the host invite
-    /// (member 0, never rendered anywhere), wrap the runtime so snapshots
-    /// carry the cost meter and the invite book's token ids, and land on
-    /// the session screen with the invites panel already open so the next
-    /// act is sharing the links.
-    fn enter_hosted_session(&mut self, outcome: LaunchOutcome) {
+    /// The wizard finished a real launch: record what the bucket agreed to,
+    /// auto-join with the host invite (member 0, never rendered anywhere),
+    /// wrap the runtime so snapshots carry the cost meter and the invite
+    /// book's token ids, and land on the session screen with the invites
+    /// panel already open so the next act is sharing the links.
+    ///
+    /// Public so a test can drive the real thing. Every early return in here
+    /// is a state a host can end up in, and a test that reimplemented the
+    /// body would agree with itself about all of them.
+    pub fn enter_hosted_session(&mut self, outcome: LaunchOutcome) {
+        // First, and outside the join: what the bucket agreed to is true
+        // whether or not this host gets into the session they just paid for,
+        // and a retention choice nothing is enforcing has to survive every
+        // early return below it.
+        self.recording.applied = outcome.retention.clone();
         let invite = outcome
             .state
             .invites
@@ -419,6 +428,11 @@ impl JamApp {
                 }
             }
             Screen::Session => {
+                // Handed over as plain data every frame, the way the wizard is
+                // handed the recording setup: the Recording tab owns the
+                // launch's retention answer and the record sheet shows it, so
+                // the screen keeps no second copy that could go stale.
+                self.session.retention_note = self.recording.retention_note();
                 if let Some(rt) = self.runtime.as_deref() {
                     // One snapshot pull per frame; screens never call back in.
                     let snap = rt.snapshot();

@@ -18,7 +18,8 @@ use data_encoding::{BASE64, HEXLOWER};
 use egui::{RichText, Ui, vec2};
 use jamstream_cloud::{
     BootConfig, CostPreview, InstanceClass, LaunchSpec, PinnedServerArtifacts, Price, ProbeMatrix,
-    Provider, ProviderKind, Region, RegionId, SelfDestruct, ServerArch, rank, session_tag,
+    Provider, ProviderKind, Region, RegionId, RetentionEnforcement, SelfDestruct, ServerArch, rank,
+    session_tag,
 };
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::SessionId;
@@ -179,6 +180,16 @@ pub enum LaunchPhase {
 pub struct LaunchOutcome {
     pub state: jamstream_cli::state::SessionState,
     pub state_path: PathBuf,
+    /// What the retention call actually did, for a session armed to record to
+    /// a bucket, and `None` for one that records nowhere or to local disk.
+    ///
+    /// Carried rather than logged because the answer can be "nothing is
+    /// enforcing your choice": a key that can write a lifecycle rule but not
+    /// read one back comes out of here as
+    /// [`RetentionEnforcement::Manual`](jamstream_cloud::RetentionEnforcement),
+    /// and the host has to be told before they record something they think
+    /// will be deleted for them.
+    pub retention: Option<RetentionEnforcement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1044,13 +1055,21 @@ async fn launch_session(
     };
     // Proved before the machine exists, through the same call `jamstream host
     // --bucket` makes: the key writes and deletes a probe object under this
-    // session's prefix, and the retention rule is in place before the first
-    // byte is uploaded.
-    if let Some(storage) = &params.recording {
-        jamstream_cli::host::verify_bucket(storage, &session_hex)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    // session's prefix, and the retention rule is applied to it.
+    //
+    // Applied, not necessarily enforced. The call answers with what the bucket
+    // actually agreed to, and a key that cannot read a lifecycle rule back
+    // leaves the choice unenforced with a note saying so. That answer rides out
+    // in the outcome; dropping it is what made an unenforced choice invisible
+    // until the bill arrived (#257).
+    let retention = match &params.recording {
+        Some(storage) => Some(
+            jamstream_cli::host::verify_bucket(storage, &session_hex)
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
     let user_data = if is_local {
         boot.render_flat_config()
     } else {
@@ -1115,7 +1134,11 @@ async fn launch_session(
         )
         .map_err(|e| e.to_string())?;
     }
-    Ok(LaunchOutcome { state, state_path })
+    Ok(LaunchOutcome {
+        state,
+        state_path,
+        retention,
+    })
 }
 
 /// Per-provider self-destruct, as the CLI arms it. DigitalOcean is the one
