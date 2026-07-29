@@ -695,9 +695,8 @@ impl JamApp {
                 }
             });
         });
-        if let Some(err) = &self.avatar_error {
-            let p = theme::palette_of(ui);
-            ui.label(egui::RichText::new(err.clone()).color(p.danger));
+        if let Some(err) = self.avatar_error.clone() {
+            theme::reason(ui, err);
         }
         if handle.is_some() {
             ui.label(theme::muted(

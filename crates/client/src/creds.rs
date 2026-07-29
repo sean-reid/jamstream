@@ -2,8 +2,26 @@
 //! keychain (service "jamstream", account "<provider>.<field>"); the same
 //! environment variables the CLI reads remain a silent fallback so a
 //! terminal-configured machine works in the app with no extra setup.
-//! Values are never logged and never rendered unmasked without an explicit
-//! reveal.
+//!
+//! # No field in this product reveals a secret
+//!
+//! Every credential input is masked with no way to unmask it, and a character
+//! count under the field stands in for reading it back. This is the one place
+//! that rule is written down; the three panes that take a credential point
+//! here.
+//!
+//! The reason is the screen a host is on. Hosting means being one keystroke
+//! from a broadcast, and a key on a shared screen is worse than a typo: a
+//! stream key lets a stranger broadcast as you, a cloud API token lets them
+//! launch machines on your card, and a storage key lets them read every take
+//! you have ever made. None of those is undone by rotating a password. A typo
+//! is undone by pasting again, and the character count catches the paste that
+//! took half a token, which is the failure a reveal was there for.
+//!
+//! The destinations sheet argued this for stream keys and held the line while
+//! the host wizard's API token field kept a Show button and the Recording
+//! tab's key pair kept another, so two surfaces disagreed about whether the
+//! same class of secret was safe to put on a screen (#184). It is not.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

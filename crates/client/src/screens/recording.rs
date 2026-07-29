@@ -147,9 +147,6 @@ pub struct RecordingPanel {
     pub region: String,
     key_id: String,
     secret: String,
-    /// The fields render masked; this is the explicit reveal, as the provider
-    /// setup panes have.
-    pub reveal: bool,
     pub retention: Retention,
     /// What the last launch's retention call actually did, and the one copy
     /// of that answer in the app. `None` until a session is launched with a
@@ -228,7 +225,6 @@ impl RecordingPanel {
             region: String::new(),
             key_id: String::new(),
             secret: String::new(),
-            reveal: false,
             retention: prefs.retention(),
             applied: None,
             check_result: None,
@@ -503,9 +499,8 @@ impl RecordingPanel {
         ui.add_space(theme::SPACE_LG);
         self.retention_rows(ui);
         if let Some(err) = self.error.clone() {
-            let p = theme::palette_of(ui);
             ui.add_space(theme::SPACE_SM);
-            ui.add(egui::Label::new(RichText::new(err).color(p.danger)).wrap());
+            theme::reason(ui, err);
         }
         ui.add_space(theme::SPACE_MD);
         note(
@@ -569,9 +564,9 @@ impl RecordingPanel {
         );
     }
 
-    /// The key pair, masked with a reveal, exactly as the provider setup panes
-    /// hold a token. The second credential this product asks for, and the only
-    /// one that rides on the machine.
+    /// The key pair, masked with no reveal, exactly as the provider setup panes
+    /// and the stream key field hold theirs. The second credential this product
+    /// asks for, and the only one that rides on the machine.
     fn key_fields(&mut self, ui: &mut Ui) {
         ui.label(theme::muted(ui, "storage key"));
         if self.key_saved() {
@@ -580,23 +575,24 @@ impl RecordingPanel {
                 "A key for this provider is on this computer. Paste a new pair to replace it.",
             );
         }
-        let mask = !self.reveal;
         let id_label = ui.label(theme::muted(ui, "access key id")).id;
         ui.add(
             TextEdit::singleline(&mut self.key_id)
                 .desired_width(FIELD_W)
-                .password(mask)
+                .password(true)
                 .hint_text("paste the key id"),
         )
         .labelled_by(id_label);
+        count(ui, &self.key_id);
         let secret_label = ui.label(theme::muted(ui, "secret access key")).id;
         ui.add(
             TextEdit::singleline(&mut self.secret)
                 .desired_width(FIELD_W)
-                .password(mask)
+                .password(true)
                 .hint_text("paste the secret"),
         )
         .labelled_by(secret_label);
+        count(ui, &self.secret);
         note(
             ui,
             "Never the key that launches machines: this one is written to the session \
@@ -608,15 +604,11 @@ impl RecordingPanel {
     fn actions(&mut self, ui: &mut Ui) {
         let checking = self.busy();
         let mut check = false;
-        let mut reveal = false;
         let mut forget = false;
         ui.horizontal(|ui| {
             check = ui
                 .add_enabled(!checking, egui::Button::new("Check"))
                 .on_hover_text("writes one small object to the bucket and deletes it")
-                .clicked();
-            reveal = ui
-                .button(if self.reveal { "Hide" } else { "Show" })
                 .clicked();
             if self.key_saved() {
                 forget = ui
@@ -643,16 +635,12 @@ impl RecordingPanel {
                 );
             }
             Some(Err(err)) => {
-                let p = theme::palette_of(ui);
-                ui.add(egui::Label::new(RichText::new(err.clone()).color(p.danger)).wrap());
+                theme::reason(ui, err.clone());
             }
             None => {}
         }
         if check {
             self.begin_check();
-        }
-        if reveal {
-            self.reveal = !self.reveal;
         }
         if forget {
             self.forget();
@@ -709,6 +697,15 @@ impl RecordingPanel {
 /// or more, and a sentence about a credential is not something to elide.
 fn note(ui: &mut Ui, text: impl Into<String>) {
     ui.add(egui::Label::new(theme::muted(ui, text).small()).wrap());
+}
+
+/// A masked field cannot be proofread, so the count stands in for reading it
+/// back, exactly as it does on the stream key field.
+fn count(ui: &mut Ui, value: &str) {
+    ui.label(theme::mono_muted(
+        ui,
+        format!("{} characters", value.trim().chars().count()),
+    ));
 }
 
 fn hex(bytes: &[u8]) -> String {

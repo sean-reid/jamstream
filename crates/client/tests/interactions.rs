@@ -159,9 +159,9 @@ fn the_bars_three_zones_never_touch_at_any_size() {
 #[test]
 fn the_one_row_threshold_is_where_the_zones_stop_fitting() {
     for (lamps, expected) in [
-        (Lamps::None, 850_i32),
-        (Lamps::OnAir, 910),
-        (Lamps::Both, 960),
+        (Lamps::None, 820_i32),
+        (Lamps::OnAir, 880),
+        (Lamps::Both, 930),
     ] {
         let mut stacked_at: Option<i32> = None;
         // Walk down in 10 px steps and find the first width that stacks.
@@ -1092,8 +1092,8 @@ fn audition_round_trip_and_closing_the_drawer_leaves_it_on() {
     harness.run_steps(2);
     assert_eq!(audition_commands(&rt), vec![true]);
     assert!(
-        harness.query_by_label("hearing stream mix").is_some(),
-        "the status bar must show the audition reminder"
+        harness.query_by_label("AUDITION").is_some(),
+        "the bar's centre cluster must show the audition lamp"
     );
 
     // Escape closes the drawer; audition is a mix state, not navigation, so
@@ -1109,8 +1109,8 @@ fn audition_round_trip_and_closing_the_drawer_leaves_it_on() {
             .audition
     );
     assert!(
-        harness.query_by_label("hearing stream mix").is_some(),
-        "closing the drawer must not hide the audition reminder"
+        harness.query_by_label("AUDITION").is_some(),
+        "closing the drawer must not take the audition lamp with it"
     );
 
     // Reopen and switch it off. The drawer remembers the tab it was on, so
@@ -1122,7 +1122,7 @@ fn audition_round_trip_and_closing_the_drawer_leaves_it_on() {
     harness.get_by_label("audition stream mix").click();
     harness.run_steps(2);
     assert_eq!(audition_commands(&rt), vec![true, false]);
-    assert!(harness.query_by_label("hearing stream mix").is_none());
+    assert!(harness.query_by_label("AUDITION").is_none());
 }
 
 #[test]
@@ -1130,7 +1130,7 @@ fn non_hosts_see_no_stream_mix() {
     let (rt, mut harness) = session_harness(false);
     harness.run_steps(2);
     assert!(harness.query_by_label("Ana stream gain").is_none());
-    assert!(harness.query_by_label("hearing stream mix").is_none());
+    assert!(harness.query_by_label("AUDITION").is_none());
     assert!(rt.snapshot().broadcast.is_none());
 }
 
@@ -1436,6 +1436,74 @@ fn a_failed_destination_says_why_where_the_host_will_see_it() {
     harness.run_steps(2);
     assert!(harness.query_by_label("STREAM FAILED").is_some());
     assert!(harness.query_by_label("ON AIR").is_some());
+}
+
+/// A row's two actions read safe first, destructive second, and both sit under
+/// the platform they belong to.
+///
+/// The pair used to be built inside a right_to_left layout, so it reached the
+/// screen as "Forget key" then "Use saved key": destructive first, and the
+/// opposite reading order from the same pair in the invites panel two tabs away
+/// (#183). An unconfigured platform's lone "Add key" was pinned to the drawer's
+/// right edge, a blank line below its own name (#192). Both are questions about
+/// where a rect lands, so both are asserted on rects.
+#[test]
+fn a_destination_rows_actions_read_safe_first_and_sit_under_its_name() {
+    use jamstream_client::creds::CredStore as _;
+    use jamstream_client::runtime::StreamPlatform;
+    let store = Arc::new(MemStore::default());
+    let field = jamstream_client::creds::stream_key_field(StreamPlatform::Twitch);
+    store.set(field.0, field.1, FAKE_KEY).expect("save a key");
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    let rt_ui = rt.clone();
+    let mut app = jamstream_client::app::JamApp::in_memory();
+    app.recent = Vec::new();
+    app.session.destinations = Some(DestinationsPanel::new(store));
+    app.session.invites = Some(empty_invites());
+    app.runtime = Some(Box::new(rt_ui));
+    app.screen = jamstream_client::app::Screen::Session;
+    app.settings_open = true;
+    app.settings_tab = SettingsTab::Broadcast;
+    let size = vec2(1280.0, 800.0);
+    let mut harness = Harness::builder()
+        .with_size(size)
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(2);
+    scroll_drawer(&mut harness, size);
+    harness.run_steps(2);
+
+    let use_saved = harness.get_by_label("Use saved key").rect();
+    let forget = harness.get_by_label("Forget key").rect();
+    assert!(
+        use_saved.left() < forget.left(),
+        "Forget key reads first: Use saved key at {:?}, Forget key at {:?}",
+        use_saved,
+        forget
+    );
+
+    // The unconfigured platform's action is under its own name, not pinned to
+    // the far edge of the drawer.
+    let add_key = harness.get_by_label("Add key").rect();
+    let youtube = harness.get_by_label_contains("YouTube Live").rect();
+    assert!(
+        add_key.left() < youtube.left() + 40.0,
+        "Add key at {:?} is not under YouTube Live at {:?}",
+        add_key,
+        youtube
+    );
+    assert!(
+        add_key.top() - youtube.bottom() < 24.0,
+        "Add key at {:?} is a blank line below YouTube Live at {:?}",
+        add_key,
+        youtube
+    );
 }
 
 #[test]

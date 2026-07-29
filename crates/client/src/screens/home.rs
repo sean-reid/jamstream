@@ -1,7 +1,7 @@
 //! Landing screen: paste an invite, host a session, and the recent
 //! sessions recorded by the CLI and the host wizard.
 
-use egui::{Key, RichText, TextEdit, Ui};
+use egui::{Key, TextEdit, Ui};
 use jamstream_protocol::invite::Invite;
 
 use crate::theme;
@@ -81,9 +81,8 @@ impl HomeScreen {
                         }
                     }
                 });
-                if let Some(err) = &self.error {
-                    let p = theme::palette_of(ui);
-                    ui.label(RichText::new(err.clone()).color(p.danger));
+                if let Some(err) = self.error.clone() {
+                    theme::reason(ui, err);
                 }
             });
             ui.add_space(theme::SPACE_MD);
@@ -111,11 +110,21 @@ impl HomeScreen {
                         "No sessions yet; host one or paste an invite above.",
                     ));
                 } else {
+                    // A record of what happened, not a list of things to press.
+                    // These rows had no rejoin, no end, and no click, and they
+                    // read as a list you could act on because each one carried
+                    // three type treatments in one line: a mono id, the
+                    // provider and region proportional and muted, then the
+                    // status back in mono (#187). The id is the one thing here
+                    // that is a number, so it keeps the monospace; everything
+                    // else is a sentence about a session that is over.
                     for row in recent {
                         ui.horizontal(|ui| {
-                            ui.label(theme::mono(ui, row.short_id.clone()));
-                            ui.label(theme::muted(ui, format!("{} {}", row.provider, row.region)));
-                            ui.label(theme::mono_muted(ui, row.status.clone()));
+                            ui.label(theme::mono_muted(ui, row.short_id.clone()));
+                            ui.label(theme::muted(
+                                ui,
+                                format!("{} {}, {}", row.provider, row.region, row.status),
+                            ));
                         });
                     }
                 }

@@ -13,30 +13,40 @@ use egui::{Align, Align2, Button, Color32, Layout, RichText, Sense, Stroke, Ui, 
 use crate::runtime::{Command, RecordState, Runtime, Snapshot};
 use crate::screens::recording::RetentionNote;
 use crate::theme;
+use crate::widgets::LampShape;
 
-/// The lamp's fill, in the meter's color language: red while a take is
-/// captured, which is the color musicians expect on a record lamp; amber
-/// while the upload drains, in progress rather than wrong; the danger
-/// color when the recorder failed. Idle paints the dark raised lamp.
-fn lamp_fill(state: &RecordState, p: &theme::Palette) -> Option<Color32> {
+/// The lamp's fill and shape.
+///
+/// The recorder keeps one colour through the whole take, `meter_red`, which is
+/// what musicians expect on a record lamp. Capturing is filled; the upload
+/// draining is the same red hollowed out, because it is the same take
+/// finishing. It used to be `meter_amber`, which is 1.25:1 against the accent
+/// the ON AIR lamp beside it carries, so two states with very different
+/// consequences were told apart by their words alone (#182).
+///
+/// A failed recorder takes the danger colour and a ring, because nothing is
+/// being captured. It cannot be a filled danger disc: STREAM FAILED already is
+/// one, they can be lit at the same time, and two different failures that look
+/// identical is the same defect one layer over.
+fn lamp_look(state: &RecordState, p: &theme::Palette) -> Option<(Color32, LampShape)> {
     match state {
         RecordState::Idle => None,
-        RecordState::Recording => Some(p.meter_red),
-        RecordState::Uploading => Some(p.meter_amber),
-        RecordState::Failed { .. } => Some(p.danger),
+        RecordState::Recording => Some((p.meter_red, LampShape::Filled)),
+        RecordState::Uploading => Some((p.meter_red, LampShape::Ring)),
+        RecordState::Failed { .. } => Some((p.danger, LampShape::Ring)),
     }
 }
 
-/// What the centre cluster shows for the recorder: the word, its colour, and
-/// the sentence on hover. None while idle, which is what keeps an idle bar
-/// free of a cluster.
+/// What the centre cluster shows for the recorder: the word, its lamp, and the
+/// sentence on hover. None while idle, which is what keeps an idle bar free of
+/// a cluster.
 pub fn record_state_lamp(
     state: &RecordState,
     p: &theme::Palette,
-) -> Option<(&'static str, Color32, String)> {
-    let color = lamp_fill(state, p)?;
+) -> Option<(&'static str, Color32, LampShape, String)> {
+    let (color, shape) = lamp_look(state, p)?;
     let (label, hover) = match state {
-        // Never reached: lamp_fill answers None for idle.
+        // Never reached: lamp_look answers None for idle.
         RecordState::Idle => return None,
         RecordState::Recording => ("REC", "this session is being recorded".to_owned()),
         RecordState::Uploading => (
@@ -45,20 +55,24 @@ pub fn record_state_lamp(
         ),
         RecordState::Failed { reason } => ("REC FAILED", reason.clone()),
     };
-    Some((label, color, hover))
+    Some((label, color, shape, hover))
 }
 
-/// One record lamp at `center`, the on-air lamp's construction in the
-/// state's own color, so the two read as siblings in the bar.
-fn paint_lamp(ui: &Ui, center: egui::Pos2, fill: Option<Color32>) {
+/// One record lamp at `center`, the cluster lamp's construction at the inline
+/// size, so the sheet and the bar say the same thing the same way.
+fn paint_lamp(ui: &Ui, center: egui::Pos2, look: Option<(Color32, LampShape)>) {
     let p = theme::palette_of(ui);
-    match fill {
-        Some(color) => ui.painter().circle(
+    match look {
+        Some((color, LampShape::Filled)) => ui.painter().circle(
             center,
             4.0,
             color,
             Stroke::new(1.0, theme::blend(color, p.text_primary, 0.45)),
         ),
+        Some((color, LampShape::Ring)) => {
+            ui.painter()
+                .circle_stroke(center, 3.25, Stroke::new(1.5, color))
+        }
         None => ui
             .painter()
             .circle(center, 4.0, p.surface2, Stroke::new(1.0, p.border)),
@@ -143,15 +157,18 @@ fn state_row(ui: &mut Ui, snap: &Snapshot) {
             paint_lamp(
                 ui,
                 egui::pos2(rect.left() + 5.0, rect.center().y),
-                lamp_fill(state, p),
+                lamp_look(state, p),
             );
         }
-        let (word, color) = match state {
-            RecordState::Idle => ("idle", p.text_muted),
-            RecordState::Recording => ("recording", p.meter_red),
-            RecordState::Uploading => ("uploading", p.meter_amber),
-            RecordState::Failed { .. } => ("failed", p.danger),
+        // The word takes the lamp's own colour, so the sheet and the bar cannot
+        // disagree about what state the recorder is in.
+        let word = match state {
+            RecordState::Idle => "idle",
+            RecordState::Recording => "recording",
+            RecordState::Uploading => "uploading",
+            RecordState::Failed { .. } => "failed",
         };
+        let color = lamp_look(state, p).map_or(p.text_muted, |(color, _)| color);
         // The lamp beside it keeps the palette colour, which is data; the word
         // is text and takes the step of that colour that reads on the sheet.
         ui.label(RichText::new(word).color(theme::readable(color, p.surface1, p)));
@@ -164,7 +181,7 @@ fn state_row(ui: &mut Ui, snap: &Snapshot) {
     if let RecordState::Failed { reason } = state {
         // The reason the recorder gave, verbatim, the treatment a dropped
         // stream gets on the destinations sheet.
-        ui.add(egui::Label::new(RichText::new(reason.clone()).color(p.danger)).wrap());
+        theme::reason(ui, reason.clone());
     }
 }
 
