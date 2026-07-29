@@ -23,6 +23,10 @@ fuzzing = []
 [dev-dependencies]
 # A version reject can only be drawn by a readable init this build refuses.
 jamstream-protocol = { workspace = true, features = ["testing"] }
+# Tests only: the broadcast renderer cards musicians, so its card cap and this
+# crate's musician cap are one fact with no dependency path between them. See
+# the test beside MAX_MUSICIANS in src/limits.rs (#232).
+jamstream-broadcast.workspace = true
 proptest.workspace = true
 # Loopback tests scan the bytes the server actually seals.
 postcard.workspace = true

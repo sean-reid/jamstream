@@ -165,6 +165,27 @@ mod tests {
         );
     }
 
+    /// The catalog is what ffmpeg is invoked with; `jamstream_cloud::cost` is
+    /// what the host is quoted and billed for. Two numbers for one bitrate,
+    /// and the cost crate cannot read this file, so drift means we bill for a
+    /// bitrate we do not send: quote 2.6 Mbps of egress, push 6, and the first
+    /// the host hears of it is the provider's invoice. This crate is the one
+    /// that sees both (#232).
+    #[test]
+    fn the_billed_bitrate_is_the_bitrate_we_actually_send() {
+        let cat = PlatformCatalog::bundled();
+        assert_eq!(
+            u64::from(cat.video().kbps),
+            jamstream_cloud::cost::STREAM_DEST_VIDEO_KBPS,
+            "the cost preview bills a video bitrate the encoder does not send"
+        );
+        assert_eq!(
+            u64::from(cat.audio().kbps),
+            jamstream_cloud::cost::STREAM_DEST_AUDIO_KBPS,
+            "the cost preview bills an audio bitrate the encoder does not send"
+        );
+    }
+
     #[test]
     fn ingest_url_substitutes_the_key_and_nothing_else() {
         let cat = PlatformCatalog::bundled();
