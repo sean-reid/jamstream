@@ -170,6 +170,31 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: cargo-nextest
+      # nextest rather than `cargo test`, for the isolation in
+      # .config/nextest.toml. Three tests in this workspace read a wall clock,
+      # and this job ran them under libtest's default parallelism among a
+      # thousand cpu-bound simulations, which is the arrangement that made
+      # windows-latest report a tick p99 19 times its median on the ci path
+      # (#276). It had not bitten here yet, and it reproduces on demand: run
+      # this same workspace on a 14-core laptop and `tick_budget_at_capacity`
+      # measures p99 3399 us against a 435 us median and a 60779 us max, 136%
+      # of budget, and fails. Alone on the same laptop it measures p99 435 us
+      # against a 387 us median. The scheduler is what moved, so the fix is
+      # isolation and not a wider budget.
+      #
+      # `cargo test` cannot express that, and a second copy of the workflow
+      # trick from #282 would have left a laptop run still lying. The config
+      # covers all three paths, so there is one place that says which tests
+      # get the machine to themselves.
+      #
+      # Nothing is lost by leaving libtest: nextest does not run doctests, and
+      # this workspace has none. Every fenced block in it is `text` or
+      # `console` (ascii diagrams and copy-pasteable commands), so
+      # `cargo test --doc` compiles nothing here today.
+      #
       # The harness has two wall-clock gates, and their budgets are
       # calibrated on a developer laptop. ci.yml scales them for shared
       # runners; this job runs the same tests and did not, so both were
@@ -178,11 +203,11 @@ jobs:
       - if: runner.os == 'macOS'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
-        run: cargo test --locked --workspace
+        run: cargo nextest run --locked --workspace
       - if: runner.os != 'macOS'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
-        run: cargo test --locked --workspace --exclude jamstream-client
+        run: cargo nextest run --locked --workspace --exclude jamstream-client
       - if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@v7
         with:
