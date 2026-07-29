@@ -7,9 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use data_encoding::{BASE64, HEXLOWER};
 use jamstream_cloud::{
-    BootConfig, CostPreview, InstanceClass, LaunchSpec, Price, ProbeMatrix, ProbeTarget, Provider,
-    ProviderKind, RecordingStorage, Region, RegionId, RegionScore, RetentionEnforcement,
-    SelfDestruct, rank, session_tag,
+    BootConfig, CostPreview, HANDSHAKE_CAP, IP_POLL_PERIOD, IP_WAIT_CAP, InstanceClass, LaunchSpec,
+    Price, ProbeMatrix, ProbeTarget, Provider, ProviderKind, RecordingStorage, Region, RegionId,
+    RegionScore, RetentionEnforcement, SelfDestruct, rank, session_tag,
 };
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
@@ -20,10 +20,6 @@ use jamstream_session::client::{ClientCore, ClientState, ServerCandidates};
 use crate::CliError;
 use crate::cli::HostArgs;
 use crate::state::{self, InviteRecord, SessionState, SessionStatus};
-
-const IP_WAIT_CAP: Duration = Duration::from_secs(180);
-const IP_POLL_PERIOD: Duration = Duration::from_secs(2);
-const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
 
 /// Placeholders the mock and local providers accept: the mock launches
 /// nothing, and the flat config the local provider consumes carries no

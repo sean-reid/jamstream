@@ -1,6 +1,7 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,20 @@ pub const SESSION_TAG_KEY: &str = "jamstream-session";
 /// per-session firewall opens exactly this port, so the two have to agree:
 /// see `Provider::session_port`.
 pub const DEFAULT_SESSION_PORT: u16 = 43210;
+
+/// How long a launch waits for the provider to report the instance's public
+/// address, and how often it asks again. This is a fact about the providers,
+/// not about whichever front end is driving them, so both the CLI and the app
+/// wait the same amount before telling a host the machine never came up. The
+/// cap matches [`crate::WaitOpts`]'s total timeout, which bounds the other
+/// half of the same launch.
+pub const IP_WAIT_CAP: Duration = Duration::from_secs(180);
+pub const IP_POLL_PERIOD: Duration = Duration::from_secs(2);
+
+/// How long a launch drives a real handshake against the server it just
+/// started before reporting the session unreachable. Long enough for a VM to
+/// finish booting and downloading `jamstreamd` after it has an address.
+pub const HANDSHAKE_CAP: Duration = Duration::from_secs(60);
 
 /// Everywhere, in the two address families. A musician dials in from an
 /// address nobody knows in advance, so the session port cannot be narrowed
