@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.1.6](https://github.com/sean-reid/jamstream/compare/v0.1.5...v0.1.6) (2026-07-29)
+
+
+### Features
+
+* **broadcast:** drop --session-name and the caption it drew ([#281](https://github.com/sean-reid/jamstream/issues/281)) ([c8dea2e](https://github.com/sean-reid/jamstream/commit/c8dea2e2d9dada7d41ec0396d7b14dad1bf24b01))
+* **client:** a record sheet and a lamp everyone can see ([#162](https://github.com/sean-reid/jamstream/issues/162)) ([d5af695](https://github.com/sean-reid/jamstream/commit/d5af695b512408efaba4c0d690749cdf6d00fe0c))
+* **client:** a Takes screen that can fetch a take ([#303](https://github.com/sean-reid/jamstream/issues/303)) ([e2054e6](https://github.com/sean-reid/jamstream/commit/e2054e60dd40d0eb3b5d703f09e10e32bc9f0606))
+* **client:** arm recording from the app, with the key in the keychain ([#220](https://github.com/sean-reid/jamstream/issues/220)) ([4340136](https://github.com/sean-reid/jamstream/commit/4340136c775ba8e96c9c988eb1839278a8dcf0c0))
+* **client:** paint the window where a member has gone quiet ([#309](https://github.com/sean-reid/jamstream/issues/309)) ([3298a1e](https://github.com/sean-reid/jamstream/commit/3298a1ec68fc76b1b4582802efefd567135c8eca)), closes [#285](https://github.com/sean-reid/jamstream/issues/285)
+* **client:** say the session is full instead of pretending to connect ([#170](https://github.com/sean-reid/jamstream/issues/170)) ([36487de](https://github.com/sean-reid/jamstream/commit/36487de91296dbdc22059856977202b5ac6afa89))
+* **client:** show repeats and losses as two frame counts ([#305](https://github.com/sean-reid/jamstream/issues/305)) ([6c02f1a](https://github.com/sean-reid/jamstream/commit/6c02f1aa896a2c467fd99cf70e56cb4c6ab53cf2))
+* **cli:** list and fetch the takes a session recorded ([#165](https://github.com/sean-reid/jamstream/issues/165)) ([40a5e85](https://github.com/sean-reid/jamstream/commit/40a5e852c8abea413d54c0893798e7371f4aa84b))
+* **cli:** record a local session to disk with --record ([#161](https://github.com/sean-reid/jamstream/issues/161)) ([b615019](https://github.com/sean-reid/jamstream/commit/b6150192ca58632b2754bdaf22cb09b9d3656cba))
+* **protocol:** count a repeated frame apart from a lost one ([#296](https://github.com/sean-reid/jamstream/issues/296)) ([61a4dd5](https://github.com/sean-reid/jamstream/commit/61a4dd5ffa4c1b7e38df8c430ac74389330ca8b3))
+* **protocol:** let the roster say a member has gone quiet ([#292](https://github.com/sean-reid/jamstream/issues/292)) ([d2329a0](https://github.com/sean-reid/jamstream/commit/d2329a0ba7b8ccaebcb7794b8dc55af4bc1ad0d3))
+* **server:** cloud sessions stream takes to the bucket ([#158](https://github.com/sean-reid/jamstream/issues/158)) ([fa6f2b2](https://github.com/sean-reid/jamstream/commit/fa6f2b296fc6285fc6eda6edbd28743071c0dba5))
+* **server:** the wire message drives the recorder ([#154](https://github.com/sean-reid/jamstream/issues/154)) ([b2844fe](https://github.com/sean-reid/jamstream/commit/b2844fefdce4ff6f34b3ecff7652e9835ff90f74))
+
+
+### Bug Fixes
+
+* a musician joining a long take no longer punches a hole in the mix ([#241](https://github.com/sean-reid/jamstream/issues/241)) ([12657bc](https://github.com/sean-reid/jamstream/commit/12657bce5bc15d92113f3f18d42cb3e3c4ad5eb0))
+* an avatar cannot panic the renderer, a 44.1 kHz device cannot play sharp ([#238](https://github.com/sean-reid/jamstream/issues/238)) ([a7e754b](https://github.com/sean-reid/jamstream/commit/a7e754b1658a1db73dcc104954b15c30e4cfc73d))
+* **audio-io:** attempt the open at 48 kHz where the host reports the rate ([#256](https://github.com/sean-reid/jamstream/issues/256)) ([02cb80c](https://github.com/sean-reid/jamstream/commit/02cb80c40caa8a51947ecbd19fe72a0ffd0932b4)), closes [#242](https://github.com/sean-reid/jamstream/issues/242)
+* **audio-io:** say where to set the rate when a device is refused ([#246](https://github.com/sean-reid/jamstream/issues/246)) ([b7a6761](https://github.com/sean-reid/jamstream/commit/b7a67612a42878432bfb8c3072375882a8740b9b))
+* **broadcast:** hold a meter peak for a time, not a frame count ([#301](https://github.com/sean-reid/jamstream/issues/301)) ([28b8147](https://github.com/sean-reid/jamstream/commit/28b814735e270e3f31dd47cefc3b54a32551499d))
+* **client:** make the app's own screens usable and honest ([#247](https://github.com/sean-reid/jamstream/issues/247)) ([4123b5f](https://github.com/sean-reid/jamstream/commit/4123b5ffb85a02eb3fdca28b57ea1ea4485af9a2))
+* **client:** make the interface say what is actually true ([#273](https://github.com/sean-reid/jamstream/issues/273)) ([9796cb7](https://github.com/sean-reid/jamstream/commit/9796cb7b20c36462638a61bc252095081ac0cca3))
+* **client:** say so when a retention choice is not being enforced ([#266](https://github.com/sean-reid/jamstream/issues/266)) ([ad27f04](https://github.com/sean-reid/jamstream/commit/ad27f0465f9858b196c4febb08711eb36b5616e1)), closes [#257](https://github.com/sean-reid/jamstream/issues/257)
+* **client:** say why the audio device stopped, and stop slicing panels at their edges ([#294](https://github.com/sean-reid/jamstream/issues/294)) ([526c9cc](https://github.com/sean-reid/jamstream/commit/526c9cc373d2b45dd43963f743097cfcbe787c53))
+* **cli:** price the recording a launch is arming ([#304](https://github.com/sean-reid/jamstream/issues/304)) ([3702cb5](https://github.com/sean-reid/jamstream/commit/3702cb53a1b6bc82e54f12140de3658e5c782173))
+* **cli:** reject a WAV header with an unusable bit depth ([#255](https://github.com/sean-reid/jamstream/issues/255)) ([4b07371](https://github.com/sean-reid/jamstream/commit/4b073715bd4090e20756457e56c41b3934250b32))
+* **cli:** stop the revocation story failing on a healthy session ([#274](https://github.com/sean-reid/jamstream/issues/274)) ([c751247](https://github.com/sean-reid/jamstream/commit/c751247e29a36565bc4988d6916ff3b4e2491d8a))
+* **cloud:** ask AWS for unlimited CPU credits on burstable launches ([#270](https://github.com/sean-reid/jamstream/issues/270)) ([00ac631](https://github.com/sean-reid/jamstream/commit/00ac631f2d1b4cf4d8937a82a63fc7ab4394e775))
+* **cloud:** corroborate a pid before trusting it, and check who owns the state dir ([#160](https://github.com/sean-reid/jamstream/issues/160)) ([16763aa](https://github.com/sean-reid/jamstream/commit/16763aa7638584c348b327b8c86b64f1bed56927)), closes [#92](https://github.com/sean-reid/jamstream/issues/92)
+* **cloud:** keep every session's retention rule, not just the last one ([#250](https://github.com/sean-reid/jamstream/issues/250)) ([ff15f47](https://github.com/sean-reid/jamstream/commit/ff15f47a82dc81cc07835a8fe6b1afc19acb76af))
+* **cloud:** make a dropped decision a compile error ([#290](https://github.com/sean-reid/jamstream/issues/290)) ([63a7e39](https://github.com/sean-reid/jamstream/commit/63a7e39cf32a598b137af2117b003df7afa742c1))
+* **cloud:** the cost preview was quoting WAV mono for a stereo flac take ([#166](https://github.com/sean-reid/jamstream/issues/166)) ([0c57c52](https://github.com/sean-reid/jamstream/commit/0c57c5250b1e733cfae59f3e61009a4b3b1a2f82))
+* **docs:** make the docs freshness gates able to fail ([#244](https://github.com/sean-reid/jamstream/issues/244)) ([e74ef46](https://github.com/sean-reid/jamstream/commit/e74ef4651eebe68562d32f998b0fe56e5fb06ddf))
+* **protocol:** harden the handshake against an on-path attacker ([#168](https://github.com/sean-reid/jamstream/issues/168)) ([49e5186](https://github.com/sean-reid/jamstream/commit/49e5186b28d0009a98ad7f101905eda9279afca0)), closes [#50](https://github.com/sean-reid/jamstream/issues/50)
+* **protocol:** make the error messages fragments that compose ([#288](https://github.com/sean-reid/jamstream/issues/288)) ([b1a2962](https://github.com/sean-reid/jamstream/commit/b1a2962dd18e0631f20df83e14c8ddd2f4ddfeeb))
+* **security:** an untargetable limiter, and secrets out of Debug and URLs ([#194](https://github.com/sean-reid/jamstream/issues/194)) ([f9eb8be](https://github.com/sean-reid/jamstream/commit/f9eb8be4d5f6ffaa32bb80909956bfac7e092437))
+* **session:** do not adopt a cookie we cannot answer with ([a6c68ff](https://github.com/sean-reid/jamstream/commit/a6c68ff4622f2268d5de06ceffbd99975352c5ec)), closes [#203](https://github.com/sean-reid/jamstream/issues/203)
+* **session:** do not adopt a handshake cookie we cannot answer with ([#240](https://github.com/sean-reid/jamstream/issues/240)) ([a6c68ff](https://github.com/sean-reid/jamstream/commit/a6c68ff4622f2268d5de06ceffbd99975352c5ec))
+* **stream:** give each encoder pipe its own writer ([#271](https://github.com/sean-reid/jamstream/issues/271)) ([7597fd9](https://github.com/sean-reid/jamstream/commit/7597fd9b0ae0a905426563862fda26e69873bd88))
+* **stream:** keep a stream key out of a child's stderr ([#280](https://github.com/sean-reid/jamstream/issues/280)) ([affb7a4](https://github.com/sean-reid/jamstream/commit/affb7a4cd197301ea78f733811e71ba4a12808ec)), closes [#204](https://github.com/sean-reid/jamstream/issues/204)
+
+
+### Performance Improvements
+
+* **engine:** bench the tick the server actually runs ([#259](https://github.com/sean-reid/jamstream/issues/259)) ([4b6ef78](https://github.com/sean-reid/jamstream/commit/4b6ef78db745f54e801b4c17b704634dff0acbd7))
+* the recorder taps broadcast audio, not the whole tick ([#221](https://github.com/sean-reid/jamstream/issues/221)) ([043a234](https://github.com/sean-reid/jamstream/commit/043a23411702b46a8cbdc29e98c541d1a9938fa8))
+
 ## [0.1.5](https://github.com/sean-reid/jamstream/compare/v0.1.4...v0.1.5) (2026-07-28)
 
 
