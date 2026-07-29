@@ -644,9 +644,10 @@ async fn ssm_ami_resolution_is_cached_per_region() {
 }
 
 /// #223: the default class is t4g.medium, a burstable instance whose credits
-/// a long jam exhausts. Left on the API default credit mode, the box is
-/// clamped to a 20 percent baseline part way through the session, the mix
-/// tick overruns and every client sees latency that only grows.
+/// a long jam exhausts. Under a host account whose default for the family is
+/// standard, and without this parameter, the box is clamped to a 20 percent
+/// baseline part way through the session, the mix tick overruns and every
+/// client sees latency that only grows.
 ///
 /// Asserted on the parsed form rather than a body substring, so the value has
 /// to sit under that exact parameter name.

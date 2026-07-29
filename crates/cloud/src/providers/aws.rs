@@ -112,8 +112,8 @@ fn instance_type(class: InstanceClass) -> &'static str {
     }
 }
 
-/// True for the burstable EC2 families, which are T2 and later; T1 bursts
-/// too but has no unlimited mode.
+/// True for the burstable EC2 families, T2 through T4g, the only ones AWS
+/// accepts a credit specification for; T1 bursts without an unlimited mode.
 fn is_burstable(instance_type: &str) -> bool {
     let family = instance_type.split('.').next().unwrap_or_default();
     let mut chars = family.chars();
@@ -662,11 +662,12 @@ impl Provider for AwsProvider {
                 "instance".to_owned(),
             ),
         ];
-        // A burstable instance defaults to standard credit mode, where a long
-        // session drains its credits and gets clamped to a 20 percent
-        // baseline: the mix tick then overruns and clients absorb the catch-up
-        // as latency that grows all session. Surplus credits cost cents an
-        // hour, and the clamp shows up nowhere in the console.
+        // Left out, the credit mode is whatever the account defaults to for
+        // this family, and a host whose default is standard gets clamped to a
+        // 20 percent baseline when a long session drains its credits: the mix
+        // tick overruns and clients absorb the catch-up as latency that grows
+        // all session. Surplus credits cost cents an hour, and the clamp shows
+        // up nowhere in the console.
         params.extend(credit_specification(ec2_type));
         for (i, (key, value)) in spec.tags.iter().enumerate() {
             params.push((format!("TagSpecification.1.Tag.{}.Key", i + 1), key.clone()));
