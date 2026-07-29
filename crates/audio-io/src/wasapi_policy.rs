@@ -1,12 +1,16 @@
 //! Exclusive-mode failure classification, the shared-mode fallback decision
-//! table, and device period arithmetic.
+//! table, device period arithmetic, and the device thread's liveness rule.
 //!
 //! None of this touches a Windows API, so all of it is unit-testable on any
-//! host. The HRESULT values are duplicated here as plain `i32`s for exactly
-//! that reason; a `cfg(windows)` test asserts they still equal the constants
-//! in the `windows` crate, so the duplication cannot drift silently.
+//! host, which is the point: `wasapi_backend` itself only compiles on Windows
+//! and only runs against a real endpoint. The HRESULT values are duplicated
+//! here as plain `i32`s for the same reason; a `cfg(windows)` test asserts they
+//! still equal the constants in the `windows` crate, so the duplication cannot
+//! drift silently.
 
 use std::time::{Duration, Instant};
+
+use crate::types::AudioError;
 
 /// `AUDCLNT_E_*` and `E_*` values we key decisions on.
 ///
@@ -162,6 +166,44 @@ pub(crate) const fn classify_hresult(code: i32) -> ExclusiveFailure {
     }
 }
 
+/// The error a caller sees when exclusive mode failed and the shared-mode
+/// fallback could not stand in for it.
+///
+/// The three variants are three different jobs for the caller: `DeviceGone`
+/// means reopen on whatever device is there now, `Unsupported` means the
+/// request or the endpoint will never work and a human has to change
+/// something, and `Backend` means something went wrong that a retry might get
+/// past.
+pub(crate) fn open_error(failure: ExclusiveFailure, detail: &str) -> AudioError {
+    let reason = failure.as_str();
+    match failure {
+        ExclusiveFailure::DeviceNotFound | ExclusiveFailure::DeviceInvalidated => {
+            AudioError::DeviceGone
+        }
+        ExclusiveFailure::InvalidConfig | ExclusiveFailure::UnsupportedFormat => {
+            AudioError::Unsupported(format!("{reason}: {detail}"))
+        }
+        _ => AudioError::Backend(format!("{reason}: {detail}")),
+    }
+}
+
+/// How long a device thread blocks on its buffer event before looking at the
+/// stop flag again. Also the granularity of stream teardown: both threads are
+/// signalled together, so a close costs about this much in the worst case.
+pub(crate) const EVENT_WAIT_MS: u32 = 50;
+
+/// Consecutive event waits that may expire before the stream is declared dead.
+/// At [`EVENT_WAIT_MS`] this is half a second of silence from a device that
+/// should be signalling every few milliseconds, which lines up with the
+/// client's own 500 ms reopen cadence.
+pub(crate) const MAX_CONSECUTIVE_TIMEOUTS: u32 = 10;
+
+/// True once the device has missed enough consecutive buffer events to be dead
+/// rather than late.
+pub(crate) const fn stream_is_dead(consecutive_timeouts: u32) -> bool {
+    consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS
+}
+
 /// True when this HRESULT means the endpoint itself is gone, as opposed to a
 /// driver or plumbing fault on a device that is still there.
 ///
@@ -222,6 +264,23 @@ pub(crate) fn period_frames(period_hns: i64, sample_rate: u32) -> u32 {
     }
     let frames = (period_hns as f64 * f64::from(sample_rate) / 10_000_000.0).ceil();
     frames.max(0.0).min(f64::from(u32::MAX)) as u32
+}
+
+/// The buffer range to advertise for an endpoint whose driver reports
+/// `min_period_hns` as its minimum exclusive-mode period, or None when this
+/// backend would never open it.
+///
+/// The floor is ours as well as the driver's: below [`MIN_PERIOD_FRAMES`] the
+/// callback rate stops being serviceable whatever the driver claims, and the
+/// ceiling is simply the largest period this backend will ever ask for, so
+/// promising more would be promising something it will not do. A driver whose
+/// own minimum is above that ceiling gets None rather than an inverted range,
+/// because "no exclusive bounds" is what the enumeration already means by an
+/// endpoint exclusive mode is not available on.
+pub(crate) fn exclusive_period_bounds(min_period_hns: i64, sample_rate: u32) -> Option<(u32, u32)> {
+    let device_min = period_frames(min_period_hns, sample_rate);
+    (device_min <= MAX_PERIOD_FRAMES)
+        .then_some((device_min.max(MIN_PERIOD_FRAMES), MAX_PERIOD_FRAMES))
 }
 
 /// Holds off exclusive-mode probes for a request that just failed.
@@ -389,6 +448,107 @@ mod tests {
         ] {
             assert!(!failure.as_str().is_empty());
         }
+    }
+
+    /// The caller acts on the variant, not the text, so each failure has to
+    /// land on the variant whose recovery is the right one.
+    #[test]
+    fn open_errors_carry_the_recovery_the_caller_should_attempt() {
+        for failure in [
+            ExclusiveFailure::DeviceNotFound,
+            ExclusiveFailure::DeviceInvalidated,
+        ] {
+            assert!(
+                matches!(open_error(failure, "detail"), AudioError::DeviceGone),
+                "{failure:?} means reopen on whatever is there now"
+            );
+        }
+        for failure in [
+            ExclusiveFailure::InvalidConfig,
+            ExclusiveFailure::UnsupportedFormat,
+        ] {
+            assert!(
+                matches!(open_error(failure, "detail"), AudioError::Unsupported(_)),
+                "{failure:?} needs a human to change something"
+            );
+        }
+        for failure in [
+            ExclusiveFailure::DeviceInUse,
+            ExclusiveFailure::ExclusiveNotAllowed,
+            ExclusiveFailure::BufferSizeNotAligned,
+            ExclusiveFailure::InvalidDevicePeriod,
+            ExclusiveFailure::EndpointCreateFailed,
+            ExclusiveFailure::ServiceNotRunning,
+            ExclusiveFailure::Other,
+        ] {
+            assert!(
+                matches!(open_error(failure, "detail"), AudioError::Backend(_)),
+                "{failure:?}"
+            );
+        }
+    }
+
+    /// Whatever the variant, the driver's own words have to survive into the
+    /// message: they are the only thing that says which device and which call.
+    #[test]
+    fn an_open_error_keeps_the_detail_it_was_given() {
+        for failure in [
+            ExclusiveFailure::InvalidConfig,
+            ExclusiveFailure::UnsupportedFormat,
+            ExclusiveFailure::DeviceInUse,
+            ExclusiveFailure::ExclusiveNotAllowed,
+            ExclusiveFailure::BufferSizeNotAligned,
+            ExclusiveFailure::InvalidDevicePeriod,
+            ExclusiveFailure::EndpointCreateFailed,
+            ExclusiveFailure::ServiceNotRunning,
+            ExclusiveFailure::Other,
+        ] {
+            let message = open_error(failure, "IAudioClient::Initialize: 0x88890008").to_string();
+            assert!(message.contains("0x88890008"), "{failure:?}: {message}");
+            assert!(message.contains(failure.as_str()), "{failure:?}: {message}");
+        }
+    }
+
+    /// A late device gets waited for; a silent one gets declared dead. The
+    /// budget is what makes those different, and it has to stay inside the
+    /// client's own 500 ms reopen cadence or a dead stream is reported after
+    /// the client has already given up on it.
+    #[test]
+    fn a_stream_is_dead_only_after_the_whole_timeout_budget() {
+        assert!(!stream_is_dead(0));
+        assert!(!stream_is_dead(MAX_CONSECUTIVE_TIMEOUTS - 1));
+        assert!(stream_is_dead(MAX_CONSECUTIVE_TIMEOUTS));
+        assert!(stream_is_dead(u32::MAX));
+        assert_eq!(EVENT_WAIT_MS * MAX_CONSECUTIVE_TIMEOUTS, 500);
+    }
+
+    /// The advertised range is a promise about what the backend will open, so
+    /// its floor is ours where the driver would go lower, and its ceiling is
+    /// ours regardless.
+    #[test]
+    fn advertised_period_bounds_never_promise_what_we_will_not_ask_for() {
+        // 3 ms, the usual Windows minimum: well above our floor, so it stands.
+        assert_eq!(
+            exclusive_period_bounds(30_000, 48_000),
+            Some((144, MAX_PERIOD_FRAMES))
+        );
+        // A driver claiming 0.1 ms is raised to our floor rather than promised.
+        assert_eq!(
+            exclusive_period_bounds(1_000, 48_000),
+            Some((MIN_PERIOD_FRAMES, MAX_PERIOD_FRAMES))
+        );
+        // A driver whose own minimum is 200 ms is past the ceiling, so there is
+        // no range to advertise rather than an inverted one.
+        assert_eq!(exclusive_period_bounds(2_000_000, 48_000), None);
+        // The boundary itself is usable, and one frame past it is not.
+        assert_eq!(
+            exclusive_period_bounds(period_100ns(MAX_PERIOD_FRAMES, 48_000), 48_000),
+            Some((MAX_PERIOD_FRAMES, MAX_PERIOD_FRAMES))
+        );
+        assert_eq!(
+            exclusive_period_bounds(period_100ns(MAX_PERIOD_FRAMES + 3, 48_000), 48_000),
+            None
+        );
     }
 
     #[test]

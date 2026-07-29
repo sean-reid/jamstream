@@ -70,6 +70,75 @@ impl FormatSpec {
     pub(crate) const fn block_align(&self) -> usize {
         self.format.bytes() * self.channels as usize
     }
+
+    /// True when a format the driver accepted frames audio exactly as this
+    /// spec does.
+    ///
+    /// `is_supported_exclusive_with_quirks` may hand back a plain
+    /// `WAVEFORMATEX` copy whose `SubFormat` GUID is zeroed, so these three
+    /// framing fields are the only ones worth comparing, and a candidate whose
+    /// framing disagrees with ours is skipped rather than trusted.
+    pub(crate) const fn frames_like(
+        &self,
+        channels: u16,
+        sample_rate: u32,
+        block_align: u32,
+    ) -> bool {
+        self.channels == channels
+            && self.sample_rate == sample_rate
+            && self.block_align() == block_align as usize
+    }
+}
+
+/// Scratch sizes for one direction's conversion stage, worked out once during
+/// the open so a device thread only ever takes subslices.
+///
+/// The byte buffer and the device float buffer always describe the same
+/// samples, which is what lets [`decode_to_f32`] and [`encode_from_f32`] be
+/// handed a pair of subslices and trusted to agree on how many there are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StageLayout {
+    pub(crate) format: SampleFormat,
+    pub(crate) device_channels: usize,
+    pub(crate) handler_channels: usize,
+    /// Bytes per frame on the device side. Derived from `device_channels`
+    /// rather than the spec's own count, so it cannot disagree with the float
+    /// buffer about how many samples a frame holds.
+    pub(crate) block_align: usize,
+    frames: usize,
+}
+
+impl StageLayout {
+    /// `periods` is how many device periods the scratch must hold: one for
+    /// render, which writes at most a period per event, and more for capture,
+    /// where a late wake-up can find several waiting.
+    pub(crate) fn new(
+        spec: FormatSpec,
+        handler_channels: u16,
+        buffer_frames: u32,
+        periods: usize,
+    ) -> Self {
+        let device_channels = usize::from(spec.channels.max(1));
+        Self {
+            format: spec.format,
+            device_channels,
+            handler_channels: usize::from(handler_channels.max(1)),
+            block_align: spec.format.bytes() * device_channels,
+            frames: periods * buffer_frames as usize,
+        }
+    }
+
+    pub(crate) const fn byte_len(self) -> usize {
+        self.frames * self.block_align
+    }
+
+    pub(crate) const fn device_float_len(self) -> usize {
+        self.frames * self.device_channels
+    }
+
+    pub(crate) const fn handler_float_len(self) -> usize {
+        self.frames * self.handler_channels
+    }
 }
 
 /// Sample layouts in the order we offer them, best first.
@@ -230,6 +299,88 @@ fn clamp_unit(s: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec(format: SampleFormat, channels: u16) -> FormatSpec {
+        FormatSpec {
+            format,
+            sample_rate: 48_000,
+            channels,
+        }
+    }
+
+    /// The negotiation loop keys on these three fields and nothing else,
+    /// because the driver may return a WAVEFORMATEX copy whose SubFormat GUID
+    /// is zeroed. Each one has to be able to reject on its own.
+    #[test]
+    fn accepted_framing_is_compared_field_by_field() {
+        let want = spec(SampleFormat::F32, 2);
+        assert!(want.frames_like(2, 48_000, 8));
+        assert!(!want.frames_like(1, 48_000, 8), "channel count ignored");
+        assert!(!want.frames_like(2, 44_100, 8), "sample rate ignored");
+        assert!(!want.frames_like(2, 48_000, 4), "block align ignored");
+    }
+
+    /// A driver that accepts I24In32 while framing it as packed I24 reports the
+    /// channel count and rate we asked for and a block align that is 3 bytes a
+    /// channel rather than 4. Trusting it would misread every frame, so the
+    /// candidate has to be skipped.
+    #[test]
+    fn a_same_width_format_with_a_different_container_is_rejected() {
+        let want = spec(SampleFormat::I24In32, 2);
+        assert_eq!(want.block_align(), 8);
+        assert!(!want.frames_like(2, 48_000, 6));
+        assert!(spec(SampleFormat::I24, 2).frames_like(2, 48_000, 6));
+    }
+
+    /// The invariant the real-time path depends on: the byte scratch and the
+    /// device float scratch always describe the same samples, so a decode or
+    /// encode handed a subslice of each cannot disagree about how many there
+    /// are.
+    #[test]
+    fn the_byte_and_float_scratch_always_hold_the_same_samples() {
+        for format in FORMAT_PREFERENCE {
+            for channels in [1u16, 2, 4, 8] {
+                for frames in [1u32, 32, 240, 4_800] {
+                    for periods in [1usize, 2] {
+                        let layout = StageLayout::new(spec(format, channels), 2, frames, periods);
+                        assert_eq!(
+                            layout.byte_len(),
+                            layout.device_float_len() * format.bytes(),
+                            "{format:?} {channels} ch {frames} frames x{periods}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_covers_every_period_it_promised_to_hold() {
+        let layout = StageLayout::new(spec(SampleFormat::I16, 4), 2, 240, 2);
+        assert_eq!(layout.device_channels, 4);
+        assert_eq!(layout.handler_channels, 2);
+        assert_eq!(layout.block_align, 8);
+        // Two periods of 240 frames, 4 channels of 2 bytes.
+        assert_eq!(layout.byte_len(), 2 * 240 * 8);
+        assert_eq!(layout.device_float_len(), 2 * 240 * 4);
+        assert_eq!(layout.handler_float_len(), 2 * 240 * 2);
+        // Render sizes for one period, and gets exactly half of each.
+        let one = StageLayout::new(spec(SampleFormat::I16, 4), 2, 240, 1);
+        assert_eq!(one.byte_len() * 2, layout.byte_len());
+        assert_eq!(one.handler_float_len() * 2, layout.handler_float_len());
+    }
+
+    /// A zero channel count is refused during the open, so this is only about
+    /// the arithmetic staying self-consistent if one ever arrived: a stage that
+    /// sized its bytes from 0 channels and its floats from 1 would slice past
+    /// the end of the byte buffer.
+    #[test]
+    fn zero_channels_cannot_desynchronise_the_two_buffers() {
+        let layout = StageLayout::new(spec(SampleFormat::F32, 0), 0, 240, 1);
+        assert_eq!(layout.device_channels, 1);
+        assert_eq!(layout.handler_channels, 1);
+        assert_eq!(layout.byte_len(), layout.device_float_len() * 4);
+    }
 
     #[test]
     fn format_metrics_match_wave_format_fields() {

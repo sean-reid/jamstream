@@ -3,9 +3,10 @@
 //! producing silence; only a frequency check catches a conversion that mangles
 //! amplitude or sign, a channel swap, or a NaN reaching the device.
 //!
-//! Needs a device whose output feeds its own input, so it is ignored by default
-//! and skips when none is present: BlackHole on macOS, VB-CABLE on Windows, a
-//! null sink on Linux.
+//! Needs a device whose output feeds its own input, so it is ignored by
+//! default: BlackHole on macOS, VB-CABLE on Windows, a null sink on Linux.
+//! Asking for it is asserting you have one, so a machine without fails here
+//! rather than printing a note and passing.
 //!
 //! ```text
 //! cargo test -p jamstream-audio-io --test hardware_loopback -- --ignored --nocapture
@@ -65,12 +66,17 @@ fn a_tone_survives_the_round_trip_through_real_hardware() {
                 .any(|p| p.direction == Direction::Playback && p.id == c.id)
         });
     let Some(loopback) = loopback else {
-        println!(
-            "no loopback device among {} endpoints, skipping. Install BlackHole (macOS), \
-             VB-CABLE (Windows), or create a null sink (Linux) to run this test.",
-            devices.len()
+        panic!(
+            "no loopback device among {} endpoints, so nothing was tested. Install \
+             BlackHole (macOS), VB-CABLE (Windows), or create a null sink (Linux). \
+             A loopback reports the same id in both directions; these do not: {}",
+            devices.len(),
+            devices
+                .iter()
+                .map(|d| format!("{:?} {}", d.direction, d.name))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        return;
     };
     println!("loopback device: {:?} id={}", loopback.name, loopback.id);
 

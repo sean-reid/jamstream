@@ -5,6 +5,11 @@
 //! on a machine producing pure silence. That is deliberate, because it has to
 //! work on any pair of default devices. `hardware_loopback.rs` checks the
 //! audio content and needs a loopback device to do it.
+//!
+//! Asking for it is asserting you have devices, so a machine with none fails
+//! here rather than printing a note and passing. It used to do the latter,
+//! which meant the only way to run it reported success whether or not it had
+//! tested anything.
 
 #![cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 
@@ -26,12 +31,18 @@ fn enumerate_and_open_default_duplex() {
         );
     }
 
-    let has_capture = devices.iter().any(|d| d.direction == Direction::Capture);
-    let has_playback = devices.iter().any(|d| d.direction == Direction::Playback);
-    if !has_capture || !has_playback {
-        println!("no default duplex pair, skipping stream open");
-        return;
-    }
+    assert!(
+        devices.iter().any(|d| d.direction == Direction::Capture),
+        "no capture endpoint among {} devices, so there is nothing to open. \
+         This test only runs when it is asked for, and asking for it is saying \
+         the machine has audio devices.",
+        devices.len()
+    );
+    assert!(
+        devices.iter().any(|d| d.direction == Direction::Playback),
+        "no playback endpoint among {} devices, so there is nothing to open.",
+        devices.len()
+    );
 
     let captured = Arc::new(AtomicUsize::new(0));
     let played = Arc::new(AtomicUsize::new(0));
