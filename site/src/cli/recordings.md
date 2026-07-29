@@ -75,7 +75,7 @@ $ export JAMSTREAM_RECORDING_SECRET_ACCESS_KEY=...
 
 `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY` on DigitalOcean, and `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY` on GCP, are read as well: neither pair is a launch credential on its provider.
 
-The app keeps the same key in your system keychain instead, in a slot of its own; see [Recording a session](../guides/recording.md). The key is never written to disk here: only the bucket, region, and retention are kept beside the session record.
+The app keeps the same key in your system keychain instead, and its [Takes screen](../guides/recording.md#getting-your-takes) fetches from there. This command does not read that keychain, so export the pair here even when the app already has the key. The key is never written to disk: only the bucket, region, and retention are kept beside the session record.
 
 ## Notes
 
