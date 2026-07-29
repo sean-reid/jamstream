@@ -1,18 +1,23 @@
 //! Level meter with real ballistics: instant attack, timed release, and a
-//! 1.5 s peak-hold tick. Green to -12 dBFS, amber to -3, red above. Drawn
-//! entirely with the painter; ballistic state lives in egui memory keyed by
-//! id, advanced with `stable_dt`.
+//! peak-hold tick. Drawn entirely with the painter; ballistic state lives in
+//! egui memory keyed by id, advanced with `stable_dt`.
+//!
+//! Where green ends, where amber ends, and how long a peak holds are
+//! [`jamstream_broadcast::meter`]'s, not this file's. A viewer watching the
+//! stream beside a musician looking at the app is reading one level, and this
+//! used to hold a second copy of all four numbers: the app held the peak for
+//! 1.5 s and the renderer for 45 frames, which is the same thing only at 30
+//! fps, and frame rate is data in the platform catalog (#232). The release
+//! rates below stay here, because a repainting widget and a fixed-rate encode
+//! measure decay differently.
 
 use egui::{Color32, CornerRadius, Rect, Sense, Ui, Vec2, pos2};
+use jamstream_broadcast::meter::{AMBER_FROM_DB, FLOOR_DB, HOLD_SECS, RED_FROM_DB};
 
 use crate::theme;
 
-const FLOOR_DB: f32 = -60.0;
-const AMBER_FROM_DB: f32 = -12.0;
-const RED_FROM_DB: f32 = -3.0;
 const PEAK_RELEASE_DB_PER_S: f32 = 26.0;
 const RMS_RELEASE_DB_PER_S: f32 = 20.0;
-const HOLD_SECS: f32 = 1.5;
 const HOLD_RELEASE_DB_PER_S: f32 = 40.0;
 
 #[derive(Clone, Copy)]

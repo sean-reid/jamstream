@@ -771,6 +771,52 @@ mod tests {
         }
     }
 
+    /// `crates/broadcast/src/palette.rs` spells the dark palette a second
+    /// time, in a crate with no dependency path back to this one, and the app
+    /// is the only crate that sees both. A member is supposed to look the same
+    /// on their strip and on their stream card, and the docs say so, so the
+    /// hexes are held together here the way `avatar::disc_color` is.
+    ///
+    /// The pairs are listed by hand because consts cannot be enumerated. What
+    /// keeps the list complete is the count: it is read out of the broadcast
+    /// source itself, so an entry added there and not paired here fails rather
+    /// than going unchecked.
+    #[test]
+    fn the_stage_palette_is_this_palette() {
+        use jamstream_broadcast::palette as stage;
+
+        let pairs: [(&str, Color32, stage::Rgb); 10] = [
+            ("well", DARK.well, stage::WELL),
+            ("surface0", DARK.surface0, stage::SURFACE0),
+            ("surface1", DARK.surface1, stage::SURFACE1),
+            ("text_primary", DARK.text_primary, stage::TEXT_PRIMARY),
+            ("text_muted", DARK.text_muted, stage::TEXT_MUTED),
+            ("accent", DARK.accent, stage::ACCENT),
+            ("meter_green", DARK.meter_green, stage::METER_GREEN),
+            ("meter_amber", DARK.meter_amber, stage::METER_AMBER),
+            ("meter_red", DARK.meter_red, stage::METER_RED),
+            ("border", DARK.border, stage::BORDER),
+        ];
+        for (name, ours, theirs) in pairs {
+            assert_eq!(
+                [ours.r(), ours.g(), ours.b()],
+                theirs,
+                "{name} is a different colour on the stream card than in the app"
+            );
+        }
+
+        let declared = include_str!("../../broadcast/src/palette.rs")
+            .lines()
+            .filter(|line| line.starts_with("pub const ") && line.contains(": Rgb = ["))
+            .count();
+        assert_eq!(
+            declared,
+            pairs.len(),
+            "the stage palette declares {declared} colours and this test pairs {}",
+            pairs.len()
+        );
+    }
+
     #[test]
     fn contrast_ratio_sanity() {
         let black = Color32::from_rgb(0, 0, 0);
