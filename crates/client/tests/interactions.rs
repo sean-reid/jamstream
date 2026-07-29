@@ -396,6 +396,12 @@ fn a_fader_gets_its_floor_and_stays_in_the_window() {
 /// above. `in_memory` for the same reason every fixture uses it: the real
 /// keychain would put a system dialog in front of the test run.
 fn settings_harness_sized(size: egui::Vec2) -> Harness<'static> {
+    session_shell_sized(size, true)
+}
+
+/// The same shell with the drawer closed, for the pair of assertions that need
+/// to see what the drawer is over.
+fn session_shell_sized(size: egui::Vec2, settings_open: bool) -> Harness<'static> {
     use jamstream_client::app::{JamApp, Screen};
 
     let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
@@ -408,7 +414,7 @@ fn settings_harness_sized(size: egui::Vec2) -> Harness<'static> {
     app.screen = Screen::Session;
     app.session.invites = Some(empty_invites());
     app.session.destinations = Some(DestinationsPanel::new(Arc::new(MemStore::default())));
-    app.settings_open = true;
+    app.settings_open = settings_open;
     Harness::builder()
         .with_size(size)
         .with_step_dt(0.05)
@@ -416,6 +422,44 @@ fn settings_harness_sized(size: egui::Vec2) -> Harness<'static> {
             theme::apply(ui.ctx(), Theme::Dark);
             app.root_ui(ui);
         })
+}
+
+/// The drawer is the full height of the window between the two bars and wider
+/// than the chat panel, so the panel's message field showed under its bottom
+/// edge: a lone text input with a message placeholder and no conversation above
+/// it, two surfaces overlapping at the bottom edge the way the two sheets did in
+/// #175 (#286). The panel holds its width and draws nothing while it is covered.
+///
+/// The wide layout only: below 900 px the chat is behind its own toggle and the
+/// drawer takes less than half the window, so there is nothing to cover.
+#[test]
+fn the_drawer_leaves_no_chat_field_poking_out_below_it() {
+    let size = vec2(1280.0, 800.0);
+    let mut open = session_shell_sized(size, true);
+    open.run_steps(4);
+    let poking: Vec<egui::Rect> = open
+        .query_all_by_role(AkRole::TextInput)
+        .map(|n| n.rect())
+        .collect();
+    assert!(
+        poking.is_empty(),
+        "the drawer is over the chat panel and these fields are still drawn: {poking:?}"
+    );
+
+    // And the field is really there to be covered: the same shell with the
+    // drawer closed draws it, so the assertion above is about the drawer and
+    // not about a field that never existed.
+    let mut closed = session_shell_sized(size, false);
+    closed.run_steps(4);
+    let field = closed
+        .query_all_by_role(AkRole::TextInput)
+        .map(|n| n.rect())
+        .next()
+        .expect("the chat panel's message field");
+    assert!(
+        field.right() > size.x - 300.0,
+        "the field at {field:?} is not the chat panel's"
+    );
 }
 
 /// The invariant behind #122. Buffer size and input level are adjusted while
@@ -1843,6 +1887,46 @@ fn a_strip_lays_out_identically_with_and_without_an_avatar() {
             "{probe} moved when the avatar went away"
         );
     }
+}
+
+/// A device that will not run has to be readable from inside the session: the
+/// reason the device gave, and one line saying what it costs and where to fix
+/// it, over strips that are all still there. Told, not stopped (#263).
+///
+/// The mixer used to draw nothing at all for this, so the whole of what a
+/// silent musician had was a chat line about the fallback and a log they were
+/// not reading mid-song.
+#[test]
+fn a_refused_device_puts_the_reason_over_the_strips() {
+    let reason = "unsupported audio configuration: \
+                  wav device runs at 44100 Hz and will not open at 48000 Hz";
+    let quiet = DemoRuntime::frozen(FROZEN_FRAME, true).snapshot();
+    let mut refused = quiet.clone();
+    refused.device_error = Some(reason.to_owned());
+
+    let mut harness = static_harness(refused);
+    harness.run_steps(3);
+    assert!(
+        harness.query_by_label(reason).is_some(),
+        "the device's own reason must be on the mixer, verbatim and unprefixed"
+    );
+    assert!(
+        harness
+            .query_all_by_label_contains("The Audio tab in Settings")
+            .next()
+            .is_some(),
+        "and what it costs and where to fix it"
+    );
+    // The session carries on around it: nothing here blocks the mixer.
+    assert!(harness.query_by_label("Ana fader").is_some());
+
+    // And it is the state that draws it, not the screen always drawing it.
+    let mut harness = static_harness(quiet);
+    harness.run_steps(3);
+    assert!(
+        harness.query_by_label(reason).is_none(),
+        "a working device must say nothing"
+    );
 }
 
 /// The chat alignment invariant: message text starts at one x for every

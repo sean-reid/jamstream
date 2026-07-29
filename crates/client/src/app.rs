@@ -470,6 +470,11 @@ impl JamApp {
                 // launch's retention answer and the record sheet shows it, so
                 // the screen keeps no second copy that could go stale.
                 self.session.retention_note = self.recording.retention_note();
+                // The drawer is drawn after the screen and covers the chat
+                // panel, so the panel is told before it draws rather than
+                // leaving its message field showing under the drawer's bottom
+                // edge (#286).
+                self.session.chat_covered = self.settings_open;
                 if let Some(rt) = self.runtime.as_deref() {
                     // One snapshot pull per frame; screens never call back in.
                     let snap = rt.snapshot();
@@ -640,8 +645,9 @@ impl JamApp {
             SettingsTab::Audio => {
                 let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
                 let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
+                let refusal = snap.as_ref().and_then(|s| s.device_error.as_deref());
                 self.devices
-                    .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e);
+                    .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, refusal);
                 None
             }
             SettingsTab::Broadcast => {

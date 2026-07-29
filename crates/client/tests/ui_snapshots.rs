@@ -344,6 +344,39 @@ fn session_long_names() {
     snapshot(&mut harness, "session_long_names");
 }
 
+/// A session whose audio device stopped and will not reopen: the reason the
+/// device gave, over strips that are all still there. The reason is the one
+/// the offline backend really produces when it is handed a rate it does not
+/// run at, which is the refusal a musician swapping interfaces mid-song gets.
+fn device_refused_app(theme: Theme) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_device_error(Some(
+        "unsupported audio configuration: \
+         wav device runs at 44100 Hz and will not open at 48000 Hz",
+    ));
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_device_refused() {
+    let mut harness = app_harness(device_refused_app(Theme::Dark), WIDE);
+    snapshot(&mut harness, "session_device_refused");
+}
+
+#[test]
+fn session_device_refused_light() {
+    let mut harness = app_harness(device_refused_app(Theme::Light), WIDE);
+    snapshot(&mut harness, "session_device_refused_light");
+}
+
+#[test]
+fn session_device_refused_narrow() {
+    // The smallest window the app opens: the sentence wraps above the strips
+    // and the faders keep their floor under it.
+    let mut harness = app_harness(device_refused_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "session_device_refused_narrow");
+}
+
 /// The drawer open on one tab. Every settings fixture goes through here, so
 /// the tab row in each of them is the one the app really builds for that
 /// role and screen.
@@ -389,6 +422,16 @@ fn session_settings() {
     );
     let mut harness = app_harness(app, WIDE);
     snapshot_for_docs(&mut harness, "session_settings");
+}
+
+#[test]
+fn session_settings_device_refused() {
+    // The other place the refusal has to be: with the drawer open it is over
+    // the mixer's copy of it, and this tab is where the pick that failed gets
+    // changed, so the reason sits under the pickers.
+    let app = drawer_app(device_refused_app(Theme::Dark), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_device_refused");
 }
 
 #[test]

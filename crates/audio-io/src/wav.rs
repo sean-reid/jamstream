@@ -10,6 +10,8 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, Result, StreamConfig,
@@ -26,6 +28,10 @@ pub struct WavBackend {
     capture_output: Option<PathBuf>,
     device_rate: u32,
     lose_device_after: Option<u64>,
+    /// The rate every open after the first one runs at, when it differs.
+    /// Shared, so the count survives the clone a caller keeps.
+    reopen_rate: Option<u32>,
+    opened: Arc<AtomicBool>,
 }
 
 impl WavBackend {
@@ -38,6 +44,8 @@ impl WavBackend {
             capture_output,
             device_rate: 48_000,
             lose_device_after: None,
+            reopen_rate: None,
+            opened: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -58,13 +66,28 @@ impl WavBackend {
         self
     }
 
+    /// Models the interface a musician swaps to mid-song: the first open is the
+    /// device they started on, and every one after it runs at `rate`, so a
+    /// reopen is refused the way [`Self::with_device_rate`] refuses a join.
+    /// Pair it with [`Self::with_device_loss_after`] for the whole sequence a
+    /// swapped cable puts a running session through.
+    #[must_use]
+    pub fn refusing_reopen_at(mut self, rate: u32) -> Self {
+        self.reopen_rate = Some(rate);
+        self
+    }
+
     /// Concrete-typed variant of [`AudioBackend::open_duplex`] so callers can
     /// reach [`WavStream::pump`] without downcasting.
     pub fn open_offline(&self, config: StreamConfig, handler: DuplexHandler) -> Result<WavStream> {
-        if config.sample_rate != self.device_rate {
+        let rate = match self.reopen_rate {
+            Some(rate) if self.opened.swap(true, Ordering::Relaxed) => rate,
+            _ => self.device_rate,
+        };
+        if config.sample_rate != rate {
             return Err(AudioError::Unsupported(format!(
-                "wav device runs at {} Hz and will not open at {} Hz",
-                self.device_rate, config.sample_rate
+                "wav device runs at {rate} Hz and will not open at {} Hz",
+                config.sample_rate
             )));
         }
         if config.channels == 0 {
