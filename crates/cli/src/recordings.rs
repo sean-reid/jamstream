@@ -610,11 +610,10 @@ impl<W: Write + Send> TakeProgress for Percentages<'_, W> {
     }
 
     fn advanced(&mut self, take: &str, written: u64, expected: u64) -> Result<(), CliError> {
-        let pct = if expected == 0 {
-            100
-        } else {
-            (written.saturating_mul(100) / expected).min(100)
-        };
+        let pct = written
+            .saturating_mul(100)
+            .checked_div(expected)
+            .map_or(100, |pct| pct.min(100));
         if pct < self.next_pct {
             return Ok(());
         }

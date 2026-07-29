@@ -239,11 +239,13 @@ pub async fn run<W: Write>(
     // because the bucket was wrong, and the retention rule has to be in place
     // before the first byte is uploaded. The lifecycle call is the host's to
     // make, not the VM's, whose key is scoped to writing one prefix.
+    let mut retention_applied = None;
     if let Some(storage) = &recording {
         let applied = verify_bucket(storage, &session_hex).await?;
         if !args.json {
             writeln!(out, "{}", applied.describe())?;
         }
+        retention_applied = Some(applied);
     }
 
     // The local provider consumes the flat key=value server config
@@ -319,7 +321,10 @@ pub async fn run<W: Write>(
     let state_path = state::save(&session_state)?;
     // Written beside the session record, because `jamstream recordings` has
     // no other way to find the bucket once the VM that wrote to it is gone.
-    let recording_record = recording.as_ref().map(recording_record);
+    let recording_record = recording
+        .as_ref()
+        .zip(retention_applied.as_ref())
+        .map(|(storage, applied)| recording_record(storage, applied));
     if let Some(record) = &recording_record {
         state::save_recording(&session_hex, record)?;
     }
@@ -409,13 +414,22 @@ fn recording_storage(
 }
 
 /// What the session record keeps about the bucket: everything but the key.
-pub fn recording_record(storage: &RecordingStorage) -> state::RecordingRecord {
+///
+/// `applied` is what the launch's retention call answered, kept because it is
+/// asked once and read for as long as the takes exist: a surface listing them
+/// weeks later cannot otherwise tell a countdown that is real from one nothing
+/// will perform.
+pub fn recording_record(
+    storage: &RecordingStorage,
+    applied: &RetentionEnforcement,
+) -> state::RecordingRecord {
     state::RecordingRecord {
         provider: storage.provider.as_str().to_owned(),
         bucket: storage.bucket.clone(),
         region: storage.region.clone(),
         retention: storage.retention.to_string(),
         stems: storage.stems,
+        applied: Some(state::RetentionApplied::from_enforcement(applied)),
     }
 }
 
@@ -924,7 +938,19 @@ mod tests {
             },
             stems: args.record_stems,
         };
-        let record = recording_record(&storage);
+        let applied = RetentionEnforcement::Manual {
+            retention: args.retention,
+            note: "this target has no lifecycle API".to_owned(),
+        };
+        let record = recording_record(&storage, &applied);
+        // What the bucket did with the rule is on the record, because a
+        // surface listing these takes later cannot ask the bucket again.
+        assert_eq!(
+            record.applied,
+            Some(state::RetentionApplied::Unenforced {
+                note: applied.describe()
+            })
+        );
         assert_eq!(record.provider, "aws");
         assert_eq!(record.bucket, "my-jams");
         assert_eq!(record.region, "eu-west-1");

@@ -1126,12 +1126,15 @@ async fn launch_session(
         ended_unix: None,
     };
     let state_path = jamstream_cli::state::save(&state).map_err(|e| e.to_string())?;
-    // Written beside the session record, because `jamstream recordings` has no
-    // other way to find the bucket once the VM that wrote to it is gone.
-    if let Some(storage) = &params.recording {
+    // Written beside the session record, because `jamstream recordings` and the
+    // Takes screen have no other way to find the bucket once the VM that wrote
+    // to it is gone. What the bucket did with the retention rule goes with it,
+    // for the same reason: it is answered once, here, and read for as long as
+    // the takes exist.
+    if let Some((storage, applied)) = params.recording.as_ref().zip(retention.as_ref()) {
         jamstream_cli::state::save_recording(
             &state.session_id_hex,
-            &jamstream_cli::host::recording_record(storage),
+            &jamstream_cli::host::recording_record(storage, applied),
         )
         .map_err(|e| e.to_string())?;
     }

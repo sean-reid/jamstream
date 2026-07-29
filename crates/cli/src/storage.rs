@@ -200,7 +200,11 @@ pub fn storage_for_launch(
 /// A seam, not a layer: the integration tests hand `recordings` a factory
 /// pointing at a wiremock server, so the listing and download run through the
 /// real S3 client rather than a stand-in for it.
-pub trait Stores {
+///
+/// `Send + Sync` because the desktop app's Takes screen holds one and lists a
+/// bucket on its executor thread, so the factory crosses a thread boundary
+/// while the frame loop keeps drawing.
+pub trait Stores: Send + Sync {
     fn open(&self, record: &RecordingRecord) -> Result<Arc<dyn ObjectStore>, CliError>;
 }
 
@@ -327,6 +331,7 @@ mod tests {
             region: "eu-west-1".to_owned(),
             retention: Retention::Days90.to_string(),
             stems: false,
+            applied: None,
         };
         assert_eq!(retention_label(&record), "Delete after 90 days");
         // Anything unparseable is shown verbatim rather than guessed at.

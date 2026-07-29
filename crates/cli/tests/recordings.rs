@@ -88,6 +88,7 @@ impl Machine {
                 region: "eu-west-1".to_owned(),
                 retention: "30d".to_owned(),
                 stems: true,
+                applied: Some(state::RetentionApplied::ServerSide),
             },
         )
         .unwrap();
