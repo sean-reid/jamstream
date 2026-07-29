@@ -439,23 +439,12 @@ fn paint_stage(px: &mut Pixmap) {
     }
 }
 
-/// Session name lower left, wordmark lockup lower right.
+/// Wordmark lockup lower right. The lower left is deliberately bare: the
+/// listener line sits centered on the frame, and both are anchored to their
+/// own edge, so nothing moves in to fill it.
 fn paint_footer(px: &mut Pixmap, cfg: &SceneConfig, fonts: &Fonts, s: f32) {
     let (w, h) = (cfg.width, cfg.height);
     let baseline = h as f32 - 17.0 * s;
-    text::draw(
-        px.data_mut(),
-        w,
-        h,
-        &fonts.semibold,
-        15.0 * s,
-        0.0,
-        24.0 * s,
-        baseline,
-        pal::TEXT_PRIMARY,
-        1.0,
-        &cfg.session_name,
-    );
     if cfg.wordmark {
         let size = 14.0 * s;
         let spacing = -size * 0.015;

@@ -59,7 +59,6 @@ pub enum StreamError {
 /// from the platform catalog, so the encode ladder has one source of truth.
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
-    pub session_name: String,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -81,15 +80,14 @@ pub struct StreamConfig {
     pub key_dir: PathBuf,
 }
 
-impl StreamConfig {
+impl Default for StreamConfig {
     /// Encode settings from the bundled catalog, paths from the layout
     /// cloud-init creates.
-    pub fn new(session_name: impl Into<String>) -> Self {
+    fn default() -> Self {
         let catalog = PlatformCatalog::bundled();
         let v = catalog.video();
         let a = catalog.audio();
         StreamConfig {
-            session_name: session_name.into(),
             width: v.width,
             height: v.height,
             fps: v.fps,
@@ -104,7 +102,9 @@ impl StreamConfig {
             key_dir: PathBuf::from("/run/jamstream/keys"),
         }
     }
+}
 
+impl StreamConfig {
     /// Video plus audio, the number every destination reports.
     pub fn total_kbps(&self) -> u32 {
         self.video_kbps + self.audio_kbps
@@ -273,7 +273,6 @@ impl<H: ProcessHost> Pipeline<H> {
         let scene = SceneConfig {
             width: cfg.width,
             height: cfg.height,
-            session_name: cfg.session_name.clone(),
             wordmark: true,
         };
         let rgba = vec![0u8; (cfg.width * cfg.height * 4) as usize];
@@ -944,13 +943,14 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("jamstream-pipeline-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let mut cfg = StreamConfig::new("Test Session");
-        // Small frames keep the render cost off the unit tests.
-        cfg.width = 320;
-        cfg.height = 180;
-        cfg.work_dir = root.clone();
-        cfg.key_dir = root.join("keys");
-        cfg
+        StreamConfig {
+            // Small frames keep the render cost off the unit tests.
+            width: 320,
+            height: 180,
+            work_dir: root.clone(),
+            key_dir: root.join("keys"),
+            ..StreamConfig::default()
+        }
     }
 
     fn pipeline(name: &str) -> Pipeline<FakeProcessHost> {

@@ -113,15 +113,17 @@ async fn a_hosts_stream_request_reaches_the_pipeline_and_status_reaches_everyone
 
     let session = Session::new();
 
-    let mut stream_cfg = StreamConfig::new("Integration Jam");
-    stream_cfg.ffmpeg = fake_ffmpeg(&root);
-    stream_cfg.work_dir = root.clone();
-    stream_cfg.key_dir = root.join("keys");
-    // No relay in this test: the stand-in ignores its output argument.
-    stream_cfg.encoder_output = root.join("out.flv").to_string_lossy().into_owned();
-    // Small frames: this test is about wiring, not pixels.
-    stream_cfg.width = 320;
-    stream_cfg.height = 180;
+    let stream_cfg = StreamConfig {
+        ffmpeg: fake_ffmpeg(&root),
+        work_dir: root.clone(),
+        key_dir: root.join("keys"),
+        // No relay in this test: the stand-in ignores its output argument.
+        encoder_output: root.join("out.flv").to_string_lossy().into_owned(),
+        // Small frames: this test is about wiring, not pixels.
+        width: 320,
+        height: 180,
+        ..StreamConfig::default()
+    };
 
     let server = Server::bind(
         &session.cfg,

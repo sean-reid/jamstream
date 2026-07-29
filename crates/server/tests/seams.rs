@@ -99,7 +99,7 @@ fn the_boot_script_creates_the_paths_the_processes_use() {
     // Stream keys. StreamConfig names this directory from a crate that cannot
     // import the constant, so a pusher whose key file is unreadable fails
     // every destination.
-    let cfg = jamstream_stream::pipeline::StreamConfig::new("session");
+    let cfg = jamstream_stream::pipeline::StreamConfig::default();
     assert_eq!(
         cfg.key_dir,
         std::path::Path::new(STREAM_KEY_DIR),

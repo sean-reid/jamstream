@@ -123,7 +123,7 @@ mod tests {
             height: 512,
             data: vec![200u8; 8 * 8 * 4],
         };
-        let cfg = SceneConfig::new("mismatched avatar");
+        let cfg = SceneConfig::default();
         let (w, h) = (cfg.width, cfg.height);
         let mut renderer = Renderer::new(cfg);
         let members = vec![MemberVisual {
@@ -139,7 +139,7 @@ mod tests {
         // The card fell back to the initials disc, so the frame is still a
         // frame: opaque everywhere, and not the empty stage.
         assert!(frame.chunks_exact(4).all(|px| px[3] == 255));
-        let mut empty = Renderer::new(SceneConfig::new("mismatched avatar"));
+        let mut empty = Renderer::new(SceneConfig::default());
         let mut bare = vec![0u8; (w * h * 4) as usize];
         empty.render(0, &[], 0, &mut bare);
         assert_ne!(frame, bare, "the member card was never drawn");
