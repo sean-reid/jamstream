@@ -176,6 +176,25 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      # ffmpeg is what makes crates/stream's real_ffmpeg test a test. Without it
+      # that test returned early and printed PASS, so nothing in CI ever checked
+      # H.264/yuv420p, AAC-LC, nal-hrd=cbr, the 2 s keyframe cadence or A/V
+      # drift: the fake-host unit tests only assert argv substrings, which
+      # cannot tell a flag ffmpeg honoured from one it ignored.
+      #
+      # It is the PINNED build, not the distro's. A session VM downloads the
+      # binary named in crates/cloud/data/media_artifacts.json at boot, so that
+      # is the only ffmpeg whose behaviour is a fact about the product, and the
+      # difference decided the answer to #248: apt's 6.1.1 and the pinned 7.1.5
+      # both deadlocked where 8.1.2 usually did not. A gate on apt's build, or
+      # on 8.x, would each have reported something untrue of what ships. The
+      # installer verifies the same sha256 the VM does, so a bad pin fails here
+      # rather than at somebody's session boot.
+      - if: runner.os == 'Linux'
+        name: Install the ffmpeg a session VM runs
+        run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
+      - if: runner.os == 'Linux'
+        run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-nextest
@@ -307,6 +326,14 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      # The pinned ffmpeg for the same reason as the test job: this runs
+      # crates/stream's tests too, and real_ffmpeg fails on Linux when the
+      # encoder is absent rather than reporting a pass. Instrumentation makes
+      # this the job most likely to catch a feed that only just keeps up, which
+      # is where the ffmpeg 8 wedge showed itself.
+      - name: Install the ffmpeg a session VM runs
+        run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
+      - run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
       # jamstream-harness is also excluded: its gates assert wall-clock
       # budgets, which instrumentation invalidates by design, and its
       # coverage contribution is redundant with the direct suites the

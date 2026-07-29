@@ -3,13 +3,19 @@
 //! The supervisor's interesting behaviour (backoff, isolation between
 //! destinations, key handling, status derivation) is all about *when* it
 //! spawns and kills things, not about `std::process`. So every process
-//! interaction goes through [`ProcessHost`]: [`StdProcessHost`] is the thin
-//! real adapter, [`fake::FakeProcessHost`] is a scriptable double with a call
-//! log that tests assert against.
+//! interaction goes through [`ProcessHost`]: [`StdProcessHost`] is the real
+//! adapter, [`fake::FakeProcessHost`] is a scriptable double with a call log
+//! that tests assert against.
+//!
+//! The real adapter is not thin, and the reason is the one thing in this
+//! crate that cannot be faked: feeding two pipes to one process without
+//! deadlocking. See [`StdProcessHost`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Handle for one spawned process, unique per host instance.
 pub type ProcId = u64;
@@ -63,13 +69,29 @@ pub enum Exit {
     },
 }
 
-/// Spawn, feed, observe, kill. Blocking writes on purpose: a partial
-/// rawvideo frame would corrupt the encode, so the pipeline would rather
-/// wait, which is why it runs on its own thread and never on the mix tick.
+/// What became of one video frame handed to a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feed {
+    /// Accepted, and it will reach the child whole and in order.
+    Queued,
+    /// The child is behind and the backlog is at its cap, so the frame was
+    /// discarded. The caller counts it; the alternative is a queue that grows
+    /// until the VM runs out of memory.
+    Dropped,
+}
+
+/// Spawn, feed, observe, kill.
+///
+/// Submissions never block on the child: each pipe has its own writer, and a
+/// backlog past its cap is a dropped frame or a broken feed, not a wait. See
+/// [`StdProcessHost`] for why that is the only shape that works.
 pub trait ProcessHost {
     fn spawn(&mut self, spec: &ProcSpec) -> io::Result<ProcId>;
+    /// Audio is the master clock, so it is never dropped: a child that has
+    /// stopped reading it is a broken feed and an error here.
     fn write_stdin(&mut self, id: ProcId, buf: &[u8]) -> io::Result<()>;
-    fn write_fifo(&mut self, id: ProcId, index: usize, buf: &[u8]) -> io::Result<()>;
+    /// One whole frame. Written all or not at all, never torn.
+    fn write_fifo(&mut self, id: ProcId, index: usize, buf: &[u8]) -> io::Result<Feed>;
     /// Non-blocking liveness check. An unknown id reads as exited.
     fn poll(&mut self, id: ProcId) -> Exit;
     /// Kills and reaps. Idempotent; the id is invalid afterwards.
@@ -98,6 +120,48 @@ pub trait ProcessHost {
 /// `O_NONBLOCK` and retry so a child that dies at startup surfaces as a spawn
 /// error instead of a hang, then clear `O_NONBLOCK` so frame writes are
 /// all-or-nothing.
+///
+/// ## One writer thread per pipe, and why there is no other option
+///
+/// ffmpeg up to and including 7.x demuxes every input on one thread and
+/// interleaves them by timestamp, so it reads whichever input is behind and
+/// will not touch the other until that read returns. A 720p yuv420p frame is
+/// 1382400 bytes and no pipe holds anything like that, so a frame is many pipe
+/// fulls and a writer is parked inside one almost all the time.
+///
+/// How many is deliberately not a number anything here relies on. Linux gives
+/// a pipe 65536 bytes; Darwin sizes them dynamically and falls back to 16384
+/// when it cannot get the large buffer, so the same frame is 21 pipe fulls on
+/// one machine and 84 on the next. A design that survives one figure and not
+/// the other has the bug at a different threshold, which is exactly how this
+/// one lasted as long as it did.
+///
+/// Feeding both pipes from one thread therefore deadlocks, and did: the
+/// writer sat in the video FIFO waiting for a reader, ffmpeg sat in stdin
+/// waiting for audio the same thread would have sent next, and neither moved
+/// again (issue #248). It is structural. No pipe size, no write ordering and
+/// no ffmpeg version fixes it: 8.x only hides it by demuxing each input on
+/// its own thread.
+///
+/// So each pipe gets a thread and a bounded queue:
+///
+/// - a writer blocks in `write` on its own pipe and nothing else, holding no
+///   lock and owning nothing another thread needs,
+/// - the pipeline thread only ever appends to a queue under a mutex held for
+///   a pointer swap, so it never waits on a child,
+/// - ffmpeg waits for at most one pipe at a time, and that pipe's writer is
+///   waiting for exactly that read.
+///
+/// No thread waits on two things, so the wait-for graph has no cycle and
+/// cannot deadlock, whatever order ffmpeg chooses to read its inputs in.
+///
+/// Falling behind is bounded rather than buffered. Video past
+/// [`VIDEO_QUEUE_BYTES`] is dropped and reported as [`Feed::Dropped`] for the
+/// status to count. Audio is never dropped, because a hole in the master
+/// clock is worse than a restart, so its queue is allowed past
+/// [`AUDIO_QUEUE_BYTES`] and is bounded instead by [`STALL`]: either queue
+/// over its cap for that long is a child that has stopped consuming, and a
+/// broken feed the supervisor restarts.
 #[derive(Debug, Default)]
 pub struct StdProcessHost {
     next_id: ProcId,
@@ -107,8 +171,8 @@ pub struct StdProcessHost {
 #[derive(Debug)]
 struct Live {
     child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    fifos: Vec<std::fs::File>,
+    stdin: Option<Feeder>,
+    fifos: Vec<Feeder>,
     fifo_paths: Vec<PathBuf>,
     /// We feed this process, so closing our write ends is an end-of-stream it
     /// can act on: give it a moment to flush before the signal. A pusher has
@@ -116,13 +180,216 @@ struct Live {
     drains_on_eof: bool,
 }
 
-/// How long a fed process gets to notice EOF and exit cleanly.
-const DRAIN_MS: u64 = 1_500;
+/// How long a fed process gets to drain its backlog, notice EOF, and exit.
+const DRAIN_MS: u64 = 3_000;
+
+/// Audio the writer holds before it counts as behind: two seconds at 48 kHz
+/// stereo s16le.
+pub const AUDIO_QUEUE_BYTES: usize = 2 * crate::SAMPLE_RATE as usize * 2 * 2;
+
+/// Video the writer may hold: 12 MiB, about eight 720p frames or a quarter
+/// second. Deep enough to ride out a scheduler hiccup, shallow enough that a
+/// real stall shows up as dropped frames in the status instead of as memory.
+pub const VIDEO_QUEUE_BYTES: usize = 12 << 20;
+
+/// A queue over its cap this long means the child has stopped reading, not
+/// that it is briefly behind. Reported as a broken feed, so the supervisor
+/// restarts the encode instead of dropping frames into a void forever.
+///
+/// It is also what bounds an [`Overflow::Keep`] queue: the producer is a
+/// real-time audio clock, so the most it can pile up before this fires is
+/// five seconds of audio, about a megabyte.
+const STALL: Duration = Duration::from_secs(5);
 
 impl StdProcessHost {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// What a queue does with a submission that puts it over its cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overflow {
+    /// Discard it and say so. Frames only: the count is in the status, and a
+    /// broadcast one frame short beats a VM out of memory.
+    Discard,
+    /// Take it anyway. Audio, which is the master clock and cannot have holes
+    /// punched in it; [`STALL`] is what stops the queue growing for ever.
+    Keep,
+}
+
+/// One child pipe, its backlog, and the thread that drains the backlog into
+/// it. Dropping it does nothing; [`Feeder::close`] then [`Feeder::finish`] is
+/// the shutdown, in that order.
+#[derive(Debug)]
+struct Feeder {
+    queue: Arc<Queue>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct Queue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+    budget: usize,
+    overflow: Overflow,
+    label: String,
+}
+
+#[derive(Debug, Default)]
+struct QueueState {
+    items: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// Nothing more will be submitted; the writer flushes and closes its end.
+    closed: bool,
+    /// The write that failed, reported to the producer on its next call.
+    error: Option<String>,
+    /// Since when submissions have been refused, cleared by any acceptance.
+    over_since: Option<Instant>,
+    /// Buffers the writer has finished with, so a 1.4 MB frame is a memcpy
+    /// into a recycled allocation rather than a fresh one thirty times a
+    /// second.
+    spare: Vec<Vec<u8>>,
+}
+
+impl Feeder {
+    /// Starts a writer thread owning `sink`. The thread closes `sink`, and so
+    /// signals end of stream, exactly when it returns.
+    fn start(
+        sink: Box<dyn io::Write + Send>,
+        budget: usize,
+        overflow: Overflow,
+        label: String,
+    ) -> io::Result<Feeder> {
+        let queue = Arc::new(Queue {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+            budget,
+            overflow,
+            label: label.clone(),
+        });
+        let mine = Arc::clone(&queue);
+        let join = std::thread::Builder::new()
+            .name(format!("jamstream-feed-{label}"))
+            .spawn(move || drain(&mine, sink))?;
+        Ok(Feeder {
+            queue,
+            join: Some(join),
+        })
+    }
+
+    /// Hands over one submission. Never blocks on the child.
+    fn submit(&self, buf: &[u8]) -> io::Result<Feed> {
+        self.queue.submit(buf)
+    }
+
+    /// No more submissions. The writer flushes what is queued, closes its end
+    /// of the pipe, and exits.
+    fn close(&self) {
+        let mut state = self.queue.lock();
+        state.closed = true;
+        drop(state);
+        self.queue.ready.notify_all();
+    }
+
+    /// True once the writer has emptied its queue and closed its end of the
+    /// pipe, which is the only moment at which the child has really seen end
+    /// of stream.
+    fn finished(&self) -> bool {
+        self.join.as_ref().is_none_or(|j| j.is_finished())
+    }
+
+    /// Joins the writer. Only call once the child is gone: a writer parked in
+    /// `write` returns when the read end closes and not before.
+    fn finish(mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Queue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        // A writer thread that panicked mid-frame has already recorded what
+        // matters; a poisoned queue is no reason to take the session down.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn submit(&self, buf: &[u8]) -> io::Result<Feed> {
+        let mut item = {
+            let mut state = self.lock();
+            if let Some(err) = &state.error {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, err.clone()));
+            }
+            // An empty queue always accepts, whatever the size: the cap bounds
+            // the backlog, not one frame.
+            if state.items.is_empty() || state.bytes + buf.len() <= self.budget {
+                state.over_since = None;
+            } else {
+                let since = *state.over_since.get_or_insert_with(Instant::now);
+                let waited = since.elapsed();
+                if waited >= STALL {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "{}: {} bytes queued and unread for {:.1}s",
+                            self.label,
+                            state.bytes,
+                            waited.as_secs_f32()
+                        ),
+                    ));
+                }
+                if self.overflow == Overflow::Discard {
+                    return Ok(Feed::Dropped);
+                }
+            }
+            state.spare.pop().unwrap_or_default()
+        };
+        // The copy happens outside the lock: a frame is 1.4 MB and the writer
+        // wants the lock back between frames.
+        item.clear();
+        item.extend_from_slice(buf);
+        let mut state = self.lock();
+        state.bytes += item.len();
+        state.items.push_back(item);
+        drop(state);
+        self.ready.notify_one();
+        Ok(Feed::Queued)
+    }
+}
+
+/// The writer thread: one submission at a time, whole, until the queue is
+/// closed and empty or a write fails.
+fn drain(queue: &Queue, mut sink: Box<dyn io::Write + Send>) {
+    loop {
+        let item = {
+            let mut state = queue.lock();
+            loop {
+                if let Some(item) = state.items.pop_front() {
+                    // Accounted as consumed here rather than after the write,
+                    // so the producer can refill while this frame is in
+                    // flight. That is the whole point of the thread.
+                    state.bytes -= item.len();
+                    break Some(item);
+                }
+                if state.closed {
+                    break None;
+                }
+                state = queue.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let Some(item) = item else { break };
+        let wrote = sink.write_all(&item);
+        let mut state = queue.lock();
+        state.spare.push(item);
+        if let Err(err) = wrote {
+            state.error = Some(format!("{}: {err}", queue.label));
+            break;
+        }
+    }
+    let _ = sink.flush();
+    // Dropping the sink closes this end of the pipe, which is the end of
+    // stream the child needs to finish its file.
 }
 
 impl Drop for StdProcessHost {
@@ -173,18 +440,53 @@ impl ProcessHost for StdProcessHost {
                 let _ = std::fs::remove_file(path);
             }
         })?;
-        let stdin = child.stdin.take();
 
-        let mut fifos = Vec::with_capacity(spec.fifos.len());
-        for path in &spec.fifos {
-            match open_fifo_write(path) {
-                Ok(file) => fifos.push(file),
+        // Every pipe gets its own writer from here on. Anything that fails
+        // while wiring them up takes the child and the FIFOs with it, so a
+        // half-connected encoder is never handed back as running.
+        let abandon = |child: &mut std::process::Child, feeders: Vec<Feeder>| {
+            let _ = child.kill();
+            let _ = child.wait();
+            for feeder in feeders {
+                feeder.close();
+                feeder.finish();
+            }
+            for path in &spec.fifos {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+
+        let stdin = match child.stdin.take() {
+            Some(pipe) => match Feeder::start(
+                Box::new(pipe),
+                AUDIO_QUEUE_BYTES,
+                Overflow::Keep,
+                format!("{}:audio", spec.label),
+            ) {
+                Ok(feeder) => Some(feeder),
                 Err(err) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    for p in &spec.fifos {
-                        let _ = std::fs::remove_file(p);
-                    }
+                    abandon(&mut child, Vec::new());
+                    return Err(err);
+                }
+            },
+            None => None,
+        };
+
+        let mut fifos: Vec<Feeder> = Vec::with_capacity(spec.fifos.len());
+        for (index, path) in spec.fifos.iter().enumerate() {
+            let started = open_fifo_write(path).and_then(|file| {
+                Feeder::start(
+                    Box::new(file),
+                    VIDEO_QUEUE_BYTES,
+                    Overflow::Discard,
+                    format!("{}:fifo{index}", spec.label),
+                )
+            });
+            match started {
+                Ok(feeder) => fifos.push(feeder),
+                Err(err) => {
+                    fifos.extend(stdin);
+                    abandon(&mut child, fifos);
                     return Err(err);
                 }
             }
@@ -207,7 +509,6 @@ impl ProcessHost for StdProcessHost {
     }
 
     fn write_stdin(&mut self, id: ProcId, buf: &[u8]) -> io::Result<()> {
-        use std::io::Write;
         let live = self
             .procs
             .get_mut(&id)
@@ -216,11 +517,11 @@ impl ProcessHost for StdProcessHost {
             .stdin
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "stdin is not a pipe"))?;
-        stdin.write_all(buf)
+        // Audio queues with Overflow::Keep, so this is Queued or an error.
+        stdin.submit(buf).map(|_| ())
     }
 
-    fn write_fifo(&mut self, id: ProcId, index: usize, buf: &[u8]) -> io::Result<()> {
-        use std::io::Write;
+    fn write_fifo(&mut self, id: ProcId, index: usize, buf: &[u8]) -> io::Result<Feed> {
         let live = self
             .procs
             .get_mut(&id)
@@ -229,7 +530,7 @@ impl ProcessHost for StdProcessHost {
             .fifos
             .get_mut(index)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such fifo"))?;
-        fifo.write_all(buf)
+        fifo.submit(buf)
     }
 
     fn poll(&mut self, id: ProcId) -> Exit {
@@ -253,22 +554,41 @@ impl ProcessHost for StdProcessHost {
         let Some(mut live) = self.procs.remove(&id) else {
             return;
         };
-        // Dropping our write ends first lets a fed child see end of stream,
-        // flush its muxer, and exit; the kill covers everything else.
-        live.stdin.take();
-        live.fifos.clear();
+        // Closing the queues lets each writer finish its backlog and then drop
+        // its end of the pipe, which is the end of stream a fed child needs to
+        // flush its muxer and exit cleanly.
+        let mut feeders: Vec<Feeder> = live.fifos.drain(..).collect();
+        feeders.extend(live.stdin.take());
+        for feeder in &feeders {
+            feeder.close();
+        }
         if live.drains_on_eof {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(DRAIN_MS);
-            while std::time::Instant::now() < deadline {
+            let deadline = Instant::now() + Duration::from_millis(DRAIN_MS);
+            // Our own backlog first. Closing a queue is not an end of stream
+            // until the writer has sent what we already accepted, so waiting
+            // on the child before that waits for the wrong thing and can cut a
+            // frame we had promised to deliver in half.
+            while Instant::now() < deadline && !feeders.iter().all(Feeder::finished) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Then the child's own flush, on what is left of the same budget,
+            // so a wedged encoder costs one DRAIN_MS and not two.
+            while Instant::now() < deadline {
                 match live.child.try_wait() {
                     Ok(Some(_)) => break,
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                     Err(_) => break,
                 }
             }
         }
         let _ = live.child.kill();
         let _ = live.child.wait();
+        // The read ends are gone with the child, so a writer still parked in
+        // `write` gets EPIPE now and returns. Joining is bounded from here,
+        // and it is what guarantees no thread outlives the process it feeds.
+        for feeder in feeders {
+            feeder.finish();
+        }
         for path in &live.fifo_paths {
             let _ = std::fs::remove_file(path);
         }
@@ -361,7 +681,7 @@ fn open_fifo_write(_path: &std::path::Path) -> io::Result<std::fs::File> {
 /// A scriptable [`ProcessHost`] with a call log. Compiled unconditionally so
 /// integration tests in `tests/` can use it; it spawns nothing.
 pub mod fake {
-    use super::{Exit, ProcId, ProcSpec, ProcessHost, Stdin};
+    use super::{Exit, Feed, ProcId, ProcSpec, ProcessHost, Stdin};
     use std::collections::BTreeMap;
     use std::io;
 
@@ -399,8 +719,10 @@ pub mod fake {
         /// The secret read out of the staged stdin file at spawn, if any.
         secret: Option<String>,
         writes_fail: bool,
+        fifo_full: bool,
         stdin_bytes: u64,
         fifo_bytes: u64,
+        fifo_dropped: u64,
     }
 
     #[derive(Debug, Default)]
@@ -436,6 +758,15 @@ pub mod fake {
         pub fn fail_writes(&mut self, id: ProcId) {
             if let Some(p) = self.procs.get_mut(&id) {
                 p.writes_fail = true;
+            }
+        }
+
+        /// `id`'s video queue is at its cap, so every frame from now on comes
+        /// back [`Feed::Dropped`]. Audio keeps flowing, which is the whole
+        /// point: the two pipes are independent.
+        pub fn fill_fifo(&mut self, id: ProcId, full: bool) {
+            if let Some(p) = self.procs.get_mut(&id) {
+                p.fifo_full = full;
             }
         }
 
@@ -475,6 +806,11 @@ pub mod fake {
 
         pub fn fifo_bytes(&self, id: ProcId) -> u64 {
             self.procs.get(&id).map_or(0, |p| p.fifo_bytes)
+        }
+
+        /// Frames refused because the video queue was at its cap.
+        pub fn fifo_dropped(&self, id: ProcId) -> u64 {
+            self.procs.get(&id).map_or(0, |p| p.fifo_dropped)
         }
 
         /// The most recent live process whose label contains `needle`.
@@ -521,8 +857,10 @@ pub mod fake {
                     exit_reason: None,
                     secret,
                     writes_fail: false,
+                    fifo_full: false,
                     stdin_bytes: 0,
                     fifo_bytes: 0,
+                    fifo_dropped: 0,
                 },
             );
             self.calls.push(Call::Spawn {
@@ -545,7 +883,7 @@ pub mod fake {
             Ok(())
         }
 
-        fn write_fifo(&mut self, id: ProcId, index: usize, buf: &[u8]) -> io::Result<()> {
+        fn write_fifo(&mut self, id: ProcId, index: usize, buf: &[u8]) -> io::Result<Feed> {
             let p = self
                 .procs
                 .get_mut(&id)
@@ -553,13 +891,17 @@ pub mod fake {
             if !p.alive || p.writes_fail {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"));
             }
+            if p.fifo_full {
+                p.fifo_dropped += 1;
+                return Ok(Feed::Dropped);
+            }
             p.fifo_bytes += buf.len() as u64;
             self.calls.push(Call::WriteFifo {
                 id,
                 index,
                 len: buf.len(),
             });
-            Ok(())
+            Ok(Feed::Queued)
         }
 
         fn poll(&mut self, id: ProcId) -> Exit {
