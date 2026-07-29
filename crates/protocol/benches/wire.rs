@@ -165,6 +165,7 @@ fn roster(n: u16) -> Vec<MemberInfo> {
             role: Role::Musician,
             connected: true,
             avatar_hash: Some([i as u8; 32]),
+            quiet: false,
         })
         .collect()
 }

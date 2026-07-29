@@ -210,6 +210,23 @@ pub struct MemberInfo {
     /// change to the roster encoding, accepted deliberately while protocol
     /// version 1 is unreleased; no compat fixtures reference roster bytes.
     pub avatar_hash: Option<[u8; 32]>,
+    /// The server has not heard from this member lately, but has not given up
+    /// on them either. `connected` is still true; that is the point.
+    ///
+    /// With `connected` this is a three-state presence, which is what a
+    /// musician mid-song needs: here, gone quiet, gone. Before it existed a
+    /// client saw the roster before a member vanished and the roster after,
+    /// with nothing in between, so a stall and a healthy player looked the
+    /// same until the server gave up ten seconds later (#285). The server is
+    /// the only party that can know: it is the only one that receives every
+    /// member's packets.
+    ///
+    /// `jamstream_session::MEMBER_QUIET_AFTER_MS` is the threshold and
+    /// `DEFAULT_MEMBER_TIMEOUT_MS` is when `connected` goes false, so the
+    /// quiet window is the gap between them. Trailing field, so the same
+    /// encoding note as `avatar_hash` applies: one byte, appended, and bytes
+    /// written before it fail to decode rather than misreading.
+    pub quiet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1024,11 +1041,12 @@ mod tests {
         assert!(a.send(big).is_err());
     }
 
-    /// Pins what postcard actually does with the trailing Option added to
-    /// MemberInfo: old bytes are one byte short of the Option tag and fail
-    /// to decode instead of misreading. Breaking pre-release, by decision.
+    /// Pins what postcard actually does with the trailing fields added to
+    /// MemberInfo: old bytes are short of the new ones and fail to decode
+    /// instead of misreading. Breaking pre-release, by decision, twice now:
+    /// the `avatar_hash` Option and then the `quiet` flag (#285).
     #[test]
-    fn member_info_trailing_option_changed_the_roster_encoding() {
+    fn member_info_trailing_fields_changed_the_roster_encoding() {
         #[derive(Serialize)]
         struct OldMemberInfo {
             id: MemberId,
@@ -1051,18 +1069,91 @@ mod tests {
             name: "ana".into(),
             connected: true,
             avatar_hash: None,
+            quiet: false,
         };
         let bytes = postcard::to_allocvec(&unset).unwrap();
-        // None costs exactly the one tag byte the old encoding lacked.
-        assert_eq!(bytes.len(), old.len() + 1);
+        // The Option tag and the quiet byte are exactly the two the oldest
+        // encoding lacked.
+        assert_eq!(bytes.len(), old.len() + 2);
         assert_eq!(postcard::from_bytes::<MemberInfo>(&bytes).unwrap(), unset);
+
+        // And the encoding from between the two changes, which had the Option
+        // and not the flag, is also refused rather than read as quiet: false.
+        assert!(postcard::from_bytes::<MemberInfo>(&bytes[..bytes.len() - 1]).is_err());
 
         let set = MemberInfo {
             avatar_hash: Some([9u8; 32]),
+            quiet: true,
             ..unset
         };
         let bytes = postcard::to_allocvec(&set).unwrap();
         assert_eq!(postcard::from_bytes::<MemberInfo>(&bytes).unwrap(), set);
+    }
+
+    /// Exact roster bytes, worked out from the encoding rules rather than
+    /// captured from the encoder above, so the two have to agree for this to
+    /// pass. A field reordered, a discriminant shifted, or `quiet` silently
+    /// dropped cannot survive it, which is what a round trip through the same
+    /// wrong code would let through.
+    ///
+    /// Derivation, postcard: a newtype struct is its inner value, `u16` is a
+    /// LEB128 varint, an enum is its variant index as a varint, a `String` and
+    /// a `Vec` are a varint length then their contents, a fixed-size array has
+    /// no length prefix at all, `bool` is one byte, and `Option` is a 0x00 tag
+    /// or 0x01 followed by the value. Struct fields go in declaration order
+    /// with no framing between them.
+    ///
+    ///   00              ControlMsg::Roster, variant 0
+    ///   02              two members
+    ///     03            MemberId(3)
+    ///     00            Role::Musician
+    ///     03 61 6e 61   "ana"
+    ///     01            connected
+    ///     00            avatar_hash: None
+    ///     00            quiet: false
+    ///     ac 02         MemberId(300), varint: 300 = 0x2c | 0x80, 0x02
+    ///     01            Role::Listener
+    ///     02 62 6f      "bo"
+    ///     01            connected
+    ///     01 09 x32     avatar_hash: Some([9; 32])
+    ///     01            quiet: true
+    #[test]
+    fn roster_encoding_is_pinned() {
+        const GOLDEN: &str = concat!(
+            "0002",
+            "030003616e610100",
+            "00",
+            "ac0201",
+            "02626f",
+            "0101",
+            "0909090909090909090909090909090909090909090909090909090909090909",
+            "01",
+        );
+        let roster = ControlMsg::Roster(vec![
+            MemberInfo {
+                id: MemberId(3),
+                role: Role::Musician,
+                name: "ana".into(),
+                connected: true,
+                avatar_hash: None,
+                quiet: false,
+            },
+            MemberInfo {
+                id: MemberId(300),
+                role: Role::Listener,
+                name: "bo".into(),
+                connected: true,
+                avatar_hash: Some([9u8; 32]),
+                quiet: true,
+            },
+        ]);
+        let bytes = postcard::to_allocvec(&roster).unwrap();
+        assert_eq!(data_encoding::HEXLOWER.encode(&bytes), GOLDEN);
+        let golden = data_encoding::HEXLOWER.decode(GOLDEN.as_bytes()).unwrap();
+        assert_eq!(postcard::from_bytes::<ControlMsg>(&golden).unwrap(), roster);
+        // One byte short is the second member with no quiet flag: refused,
+        // not read as present-and-talking.
+        assert!(postcard::from_bytes::<ControlMsg>(&golden[..golden.len() - 1]).is_err());
     }
 
     /// The reassembly buffer used to grow without limit for any peer that
@@ -1251,6 +1342,7 @@ mod tests {
                 name: "n".repeat(MAX_NAME_LEN + 1),
                 connected: true,
                 avatar_hash: None,
+                quiet: false,
             }]),
         ];
         for msg in oversized {

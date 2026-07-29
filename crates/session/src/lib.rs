@@ -20,7 +20,8 @@ pub use client::{ClientCore, ClientEvent, ClientState, ClientStats, ServerCandid
 /// needs them: `jamstream_session::MAX_MUSICIANS` is the number.
 pub use limits::{
     DEFAULT_HOURS, DEFAULT_IDLE_MIN, DEFAULT_LISTENERS, DEFAULT_MAX_HOURS,
-    DEFAULT_MEMBER_TIMEOUT_MS, DEFAULT_MUSICIANS, MAX_LISTENERS, MAX_MUSICIANS, VIOLATION_BURST,
+    DEFAULT_MEMBER_TIMEOUT_MS, DEFAULT_MUSICIANS, MAX_LISTENERS, MAX_MUSICIANS,
+    MEMBER_QUIET_AFTER_MS, VIOLATION_BURST,
 };
 pub use server::{
     BroadcastMember, BroadcastTick, MemberStats, ServerConfig, ServerCore, ServerEvent, Stem,

@@ -40,6 +40,21 @@ pub const DEFAULT_MAX_HOURS: u32 = 12;
 /// A member silent this long is dropped from the roster.
 pub const DEFAULT_MEMBER_TIMEOUT_MS: u64 = 10_000;
 
+/// A member silent this long is marked quiet on the roster, still connected.
+///
+/// Two seconds, because that is far past anything a working client does and
+/// far short of giving up. A musician sends a 2.5 ms frame 400 times a second
+/// with DTX off, so two seconds of silence is 800 frames missing; a listener
+/// keepalives once a second, so it is two missed keepalives. Meanwhile
+/// [`DEFAULT_MEMBER_TIMEOUT_MS`] is 10 s, which leaves an eight second window
+/// in which a client can say "gone quiet" instead of showing a healthy dot
+/// over a member who stopped playing eight seconds ago (#285).
+///
+/// It also bounds how often the flag can move. Going quiet costs the member
+/// two seconds of silence, so no member can flip more than once a second, and
+/// a roster fanout is the widest message the server sends.
+pub const MEMBER_QUIET_AFTER_MS: u64 = 2_000;
+
 /// Messages one member may send that the server relays to every other member,
 /// which is a chat line or a change of avatar. One of these costs roughly
 /// [`MAX_MUSICIANS`] + [`MAX_LISTENERS`] times its own size in egress, so the
