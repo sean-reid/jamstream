@@ -16,7 +16,10 @@ pub enum FrameDuration {
 }
 
 impl FrameDuration {
-    pub fn samples(self) -> u32 {
+    /// `const` so a caller can size a buffer or a tick from the wire's own
+    /// answer instead of spelling the number again. Both of the numbers below
+    /// were hand copied in jamstream-client for exactly that reason (#231).
+    pub const fn samples(self) -> u32 {
         match self {
             FrameDuration::Ms2_5 => 120,
             FrameDuration::Ms5 => 240,
@@ -25,7 +28,10 @@ impl FrameDuration {
         }
     }
 
-    pub fn micros(self) -> u32 {
+    /// `const` for the same reason as [`Self::samples`];
+    /// `Duration::from_micros` is itself a const fn, so a tick interval can be
+    /// derived from this.
+    pub const fn micros(self) -> u32 {
         match self {
             FrameDuration::Ms2_5 => 2_500,
             FrameDuration::Ms5 => 5_000,
@@ -52,6 +58,14 @@ impl FrameDuration {
         }
     }
 }
+
+/// Both accessors have to stay const-callable, because another crate's buffer
+/// sizes and tick interval are derived from them. Taking `const` off either one
+/// fails to compile here rather than somewhere downstream.
+const _: () = {
+    assert!(FrameDuration::Ms2_5.samples() == 120);
+    assert!(FrameDuration::Ms2_5.micros() == 2_500);
+};
 
 const FLAG_STEREO: u8 = 1 << 2;
 const FLAG_REDUNDANT: u8 = 1 << 3;
