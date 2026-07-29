@@ -170,7 +170,9 @@ pub struct SessionTakes {
     pub running: bool,
     pub provider: String,
     pub region: String,
-    /// What the machine cost, which is what the session spent.
+    /// What the machine cost, which is what the session itself spent. Not
+    /// egress: the prices on the buttons below are a separate charge, and this
+    /// figure has to be labelled so the two are not read as one family.
     pub spent_microusd: u64,
     pub place: Place,
     pub takes: Vec<TakeRow>,
@@ -1047,7 +1049,11 @@ fn session_card(
             if row.spent_microusd > 0 {
                 ui.label(theme::mono_muted(
                     ui,
-                    format!("{} spent", theme::microusd(row.spent_microusd)),
+                    // Named, because it is the only past figure on a screen
+                    // whose other prices are all prospective, and an unlabelled
+                    // one a few pixels above an egress price reads as part of
+                    // it.
+                    format!("machine {}", theme::microusd(row.spent_microusd)),
                 ));
             }
         });
