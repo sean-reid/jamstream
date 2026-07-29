@@ -103,6 +103,7 @@ struct Destination {
     platform: StreamPlatform,
     state: DestinationState,
     dropped_frames: u64,
+    repeated_frames: u64,
 }
 
 struct DemoState {
@@ -287,16 +288,20 @@ impl DemoRuntime {
     /// snapshot hold a state a real pipeline passes through in seconds; no
     /// key is involved, which is the point.
     pub fn set_destinations(&self, entries: &[(StreamPlatform, DestinationState)]) {
-        // One encode feeds every destination, so the dropped counter is one
-        // counter and the pipeline reports the same value on every row
+        // One encode feeds every destination, so both frame counters are one
+        // counter each and the pipeline reports the same pair on every row
         // (jamstream_stream::pipeline, `status`). This used to hand Twitch 0 and
         // YouTube 41, which is a state the product cannot reach and which the
         // docs site was publishing (#264). Nonzero whenever anything has gone
-        // wrong at all, so the readout is still exercised.
+        // wrong at all, so both readouts are still exercised.
+        //
+        // Repeats far outnumber losses, which is the shape a struggling machine
+        // really has: it runs out of time to draw long before the encoder's
+        // queue starts refusing frames.
         let anything_wrong = entries
             .iter()
             .any(|(_, state)| matches!(state, DestinationState::Failed { .. }));
-        let repeats = if anything_wrong { 41 } else { 0 };
+        let (repeats, losses) = if anything_wrong { (41, 3) } else { (0, 0) };
         let mut s = self.state.lock().expect("demo state");
         s.destinations = entries
             .iter()
@@ -305,7 +310,8 @@ impl DemoRuntime {
                 id: DestinationId(i as u16),
                 platform: *platform,
                 state: state.clone(),
-                dropped_frames: repeats,
+                dropped_frames: losses,
+                repeated_frames: repeats,
             })
             .collect();
     }
@@ -441,6 +447,7 @@ impl Runtime for DemoRuntime {
                     state: d.state.clone(),
                     bitrate_kbps,
                     dropped_frames: d.dropped_frames,
+                    repeated_frames: d.repeated_frames,
                 })
                 .collect(),
         };
@@ -546,6 +553,7 @@ impl Runtime for DemoRuntime {
                         DestinationState::Idle
                     },
                     dropped_frames: 0,
+                    repeated_frames: 0,
                 });
             }
             Command::RemoveDestination(id) => s.destinations.retain(|d| d.id != id),
@@ -558,6 +566,7 @@ impl Runtime for DemoRuntime {
                 for d in &mut s.destinations {
                     d.state = DestinationState::Idle;
                     d.dropped_frames = 0;
+                    d.repeated_frames = 0;
                 }
             }
             // The demo recorder transitions instantly; the state a fixture

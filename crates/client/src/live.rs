@@ -1109,6 +1109,7 @@ impl Worker {
                             state: d.state,
                             bitrate_kbps: d.bitrate_kbps,
                             dropped_frames: d.dropped_frames,
+                            repeated_frames: d.repeated_frames,
                         })
                         .collect();
                 }

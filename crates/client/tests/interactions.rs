@@ -2392,3 +2392,50 @@ fn takes_is_reached_from_the_recent_sessions_card_and_only_when_there_are_any() 
         );
     }
 }
+
+/// #278: one frame counter could not say which of two opposite things a host
+/// was looking at. A repeat is a stutter with nothing missing; a loss is video
+/// the broadcast will never have. Both are on screen, both are named, and each
+/// says what it means on hover.
+///
+/// Over a pipeline that has both, which is the shape a struggling machine
+/// really has: it runs out of time to draw long before the encoder's queue
+/// starts refusing frames.
+#[test]
+fn the_two_frame_counts_are_named_apart() {
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, true);
+    demo.set_destinations(&[
+        (
+            jamstream_client::runtime::StreamPlatform::Twitch,
+            DestinationState::Live,
+        ),
+        (
+            jamstream_client::runtime::StreamPlatform::YouTube,
+            DestinationState::Failed {
+                reason: "pusher exited: rtmp connection refused".to_owned(),
+            },
+        ),
+    ]);
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let mut harness = drawer_harness(rt, SettingsTab::Broadcast, vec2(1280.0, 800.0));
+    harness.run_steps(3);
+
+    // Two readouts, each with its own count: 41 draws missed, 3 frames the
+    // encoder would not take.
+    assert!(
+        harness.query_by_label("41 repeated").is_some(),
+        "the repeats have to be on screen under the encode line"
+    );
+    assert!(
+        harness.query_by_label("3 dropped").is_some(),
+        "and the losses have to be a separate figure"
+    );
+    // Neither may still be the merged number: 44 would be the old single
+    // count, and either word carrying the other total is the defect.
+    for wrong in ["44 repeated", "44 dropped", "3 repeated", "41 dropped"] {
+        assert!(
+            harness.query_by_label(wrong).is_none(),
+            "{wrong} is on screen, so the two counts are crossed"
+        );
+    }
+}

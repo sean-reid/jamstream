@@ -208,8 +208,14 @@ pub struct DestinationView {
     /// Video plus audio bitrate the encoder is configured for. One encode
     /// feeds every destination, so it is the same number on each.
     pub bitrate_kbps: u32,
-    /// Frames the pipeline could not hand the encoder in time, cumulative.
+    /// Frames the encoder's queue refused, cumulative and pipeline-wide.
+    /// Genuine loss: the video timeline is this many pictures short of its
+    /// audio.
     pub dropped_frames: u64,
+    /// Catch-up frames the renderer had no time to draw, cumulative and
+    /// pipeline-wide. Delivered again as the last picture, so nothing is
+    /// missing and the audio stays in step; the cost is a stutter.
+    pub repeated_frames: u64,
 }
 
 /// The recorder as the server last reported it, for the record lamp and
