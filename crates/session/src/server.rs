@@ -25,7 +25,7 @@ use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, COOKIE_BYTE
 use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
 use crate::limits::{
     DEFAULT_MEMBER_TIMEOUT_MS, FANOUT_BURST, FANOUT_REFILL_PER_SEC, MAX_LISTENERS, MAX_MUSICIANS,
-    TokenBucket, VIOLATION_BURST, VIOLATION_REFILL_PER_SEC,
+    MEMBER_QUIET_AFTER_MS, TokenBucket, VIOLATION_BURST, VIOLATION_REFILL_PER_SEC,
 };
 
 /// Samples per mix tick: 2.5 ms at 48 kHz.
@@ -304,6 +304,11 @@ struct Member {
     click_enabled: bool,
     connected: bool,
     last_heard_ms: u64,
+    /// Published on the roster: silent for longer than
+    /// [`MEMBER_QUIET_AFTER_MS`] but not yet timed out. Stored rather than
+    /// recomputed per read because it is the transition that has to send a
+    /// roster, and the roster is edge-triggered.
+    quiet: bool,
     rtt_ms_last: Option<f32>,
     send_seq: u32,
     /// Lifetime count, for the stats surface.
@@ -793,6 +798,29 @@ impl ServerCore {
             }
             self.queue_roster();
             self.note_musician_count();
+        }
+
+        // Quiet scan, over whoever survived the reap. Same input as the scan
+        // above, a different threshold, and it publishes rather than reaps: a
+        // member unheard from for MEMBER_QUIET_AFTER_MS is still connected and
+        // still holding their seat, but the roster now says nobody has heard
+        // from them, which is the state a client had no way to show (#285).
+        //
+        // Only a change queues a roster, so a session where everyone is
+        // talking sends nothing extra ever. It runs after the reap so a
+        // member being dropped this same tick is reported gone rather than
+        // gone and quiet.
+        let mut moved = false;
+        for m in self.members.values_mut() {
+            let quiet =
+                m.connected && now_ms.saturating_sub(m.last_heard_ms) >= MEMBER_QUIET_AFTER_MS;
+            if quiet != m.quiet {
+                m.quiet = quiet;
+                moved = true;
+            }
+        }
+        if moved {
+            self.queue_roster();
         }
 
         out
@@ -1398,6 +1426,7 @@ impl ServerCore {
                 click_enabled,
                 connected: true,
                 last_heard_ms: now_ms,
+                quiet: false,
                 rtt_ms_last: None,
                 send_seq: 0,
                 violations,
@@ -1855,6 +1884,7 @@ impl ServerCore {
                 name: m.name.clone(),
                 connected: m.connected,
                 avatar_hash: m.avatar.map(|(h, _)| h),
+                quiet: m.quiet,
             })
             .collect();
         for m in self.members.values_mut().filter(|m| m.connected) {
@@ -1977,6 +2007,10 @@ impl ServerCore {
             return;
         }
         m.connected = false;
+        // Gone, not quiet. A member who came back would otherwise be listed
+        // as both, and the roster would say "here but silent" about somebody
+        // who had just finished a fresh handshake.
+        m.quiet = false;
         m.addr = None;
         m.session = None;
         m.resp_cache = None;

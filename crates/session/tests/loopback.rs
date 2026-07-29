@@ -2108,6 +2108,146 @@ fn timeout_then_rejoin_with_same_token() {
     let roster = h.last_roster(c).expect("roster after rejoin");
     assert_eq!(roster.len(), 3);
     assert!(roster.iter().all(|m| m.connected));
+    assert!(
+        roster.iter().all(|m| !m.quiet),
+        "a member who just handshook is not quiet: {roster:?}"
+    );
+}
+
+/// The middle state, end to end: a member the server has stopped hearing from
+/// but has not given up on.
+///
+/// Before this the roster had two states and the gap between them was ten
+/// seconds long (#285). A client saw everyone present, then saw one of them
+/// gone, and had nothing to show in between, which is exactly the stretch
+/// where a musician wants to know that the bass has stalled rather than
+/// stopped playing. The server is the only party that can tell: it is the only
+/// one that receives every member's packets.
+///
+/// Times are counted from B's last packet. MEMBER_QUIET_AFTER_MS is 2 s and
+/// the timeout is 10 s, so 1.8 s is inside the healthy window, 2.4 s is quiet,
+/// and 8 s later is still quiet and still connected.
+#[test]
+fn a_silent_member_reads_quiet_before_it_reads_gone() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    h.add_client(&inv_a, Some(220.0));
+    let b = h.add_client(&inv_b, Some(330.0));
+    h.run_ms(500);
+    assert_eq!(h.server.musicians_connected(), 2);
+    let roster = h.last_roster(0).expect("roster once joined");
+    assert!(
+        roster.iter().all(|m| m.connected && !m.quiet),
+        "two musicians mid-song are neither quiet nor gone: {roster:?}"
+    );
+
+    // B falls off the network. Just short of the threshold, nothing has
+    // changed: a client that painted amber here would flicker on every hiccup.
+    h.clients[b].blocked = true;
+    let quiet_epoch = h.server.broadcast_tick().roster_epoch;
+    h.advance_quiet(1_800);
+    let roster = h.last_roster(0).expect("roster");
+    assert!(
+        roster.iter().all(|m| !m.quiet),
+        "1.8 s of silence is inside the healthy window: {roster:?}"
+    );
+    assert_eq!(
+        h.server.broadcast_tick().roster_epoch,
+        quiet_epoch,
+        "nothing changed, so no roster went out"
+    );
+
+    // Past it, and A hears about it. One roster, not one per tick.
+    h.advance_quiet(600);
+    let roster = h.last_roster(0).expect("roster while B is quiet");
+    let bee = roster
+        .iter()
+        .find(|m| m.id == MemberId(1))
+        .expect("B is still on the roster");
+    assert!(bee.quiet, "B has been silent for 2.4 s: {bee:?}");
+    assert!(bee.connected, "quiet is not gone: {bee:?}");
+    assert_eq!(
+        h.server.broadcast_tick().roster_epoch,
+        quiet_epoch + 1,
+        "going quiet costs exactly one roster"
+    );
+
+    // And it stays that way for the rest of the window rather than flapping.
+    h.advance_quiet(6_000);
+    assert_eq!(
+        h.server.broadcast_tick().roster_epoch,
+        quiet_epoch + 1,
+        "six more seconds of the same silence sent another roster"
+    );
+    let bee = h
+        .last_roster(0)
+        .and_then(|r| r.iter().find(|m| m.id == MemberId(1)).cloned())
+        .expect("B on the roster");
+    assert!(
+        bee.quiet && bee.connected,
+        "still quiet, still here: {bee:?}"
+    );
+    assert_eq!(h.server.musicians_connected(), 2);
+
+    // B comes back before the server gives up: the flag clears, once.
+    h.clients[b].blocked = false;
+    h.run_ms(200);
+    let bee = h
+        .last_roster(0)
+        .and_then(|r| r.iter().find(|m| m.id == MemberId(1)).cloned())
+        .expect("B on the roster");
+    assert!(!bee.quiet, "B is audible again: {bee:?}");
+    assert!(bee.connected);
+    assert_eq!(
+        h.server.broadcast_tick().roster_epoch,
+        quiet_epoch + 2,
+        "coming back costs exactly one more roster"
+    );
+
+    // And the far end of the window is unchanged: silence past the timeout is
+    // gone, not quiet, so a client never has to decide which of the two it is.
+    h.clients[b].blocked = true;
+    h.advance_quiet(11_000);
+    let bee = h
+        .last_roster(0)
+        .and_then(|r| r.iter().find(|m| m.id == MemberId(1)).cloned())
+        .expect("B on the roster");
+    assert!(!bee.connected, "11 s of silence is gone: {bee:?}");
+    assert!(
+        !bee.quiet,
+        "gone members are not also quiet, or a dot has to break the tie: {bee:?}"
+    );
+}
+
+/// The flag costs nothing while everybody is playing.
+///
+/// The roster is the widest message the server sends, about 640 bytes to every
+/// member, and the quiet scan runs on every one of the 400 ticks a second. If
+/// it queued a roster for a state that had not changed it would be an egress
+/// amplifier of exactly the shape #937 metered avatars for, so this prices the
+/// normal case at zero.
+#[test]
+fn the_quiet_scan_sends_nothing_while_a_session_is_healthy() {
+    let (mut h, _spare) = full_session();
+    h.run_ms(500);
+    let epoch = h.server.broadcast_tick().roster_epoch;
+    h.server_out_bytes = 0;
+    let before = h.server_out_bytes;
+    h.run_ms(5_000);
+    assert_eq!(
+        h.server.broadcast_tick().roster_epoch,
+        epoch,
+        "five seconds of a full session with nobody silent moved the roster"
+    );
+    // Egress over those five seconds is media and nothing else. A roster to 30
+    // members is about 19 KB, so one stray fanout per tick would be visible
+    // here as megabytes; the assertion is on the roster count above, and this
+    // is the sanity check that the traffic is the mix.
+    assert!(
+        h.server_out_bytes > before,
+        "the session sent no audio at all, so the test is not measuring anything"
+    );
 }
 
 /// An attacker on the same wifi sees the init leave and answers it with
