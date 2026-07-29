@@ -49,7 +49,7 @@ Each row says what that platform is actually doing:
 | `live` | the platform is receiving the broadcast |
 | `failed` | it stopped, with the reason on the next line |
 
-**dropped** counts repeated pictures, not missing ones. The video runs at 30 frames a second and the frame count is what holds it in step with the audio, so a frame the machine could not draw in time is sent again as the last picture rather than skipped, and this is how many of those went out. It is one count for the whole broadcast, so both rows show the same number, and it changes color as it rises. A number that rises means the session machine cannot draw and encode 30 frames a second; removing a destination does not bring it down, because one encode feeds every platform.
+**dropped** counts frames the machine could not keep up with. Most of them are repeats: the video runs at 30 frames a second and the frame count is what holds it in step with the audio, so a frame there was no time to draw goes out again as the last picture rather than being skipped. If the encoder falls far enough behind, a frame is left out instead, and the stream is short that picture. It is one count for the whole broadcast, so both rows show the same number, and it changes color as it rises. A number that rises means the session machine cannot draw and encode 30 frames a second; removing a destination does not bring it down, because one encode feeds every platform.
 
 ## When a platform fails
 
