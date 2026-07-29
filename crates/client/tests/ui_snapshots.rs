@@ -552,6 +552,41 @@ fn session_settings_recording_empty() {
     snapshot(&mut harness, "session_settings_recording_empty");
 }
 
+/// A launch whose bucket would not take the retention rule.
+///
+/// Constructed rather than driven, because a snapshot fixture is synchronous
+/// and the store's answer is not; `tests/retention.rs` is where the value comes
+/// out of the store itself. The note is the store's own text either way.
+fn unenforced_retention() -> jamstream_cloud::RetentionEnforcement {
+    let retention = jamstream_cloud::Retention::Days30;
+    jamstream_cloud::RetentionEnforcement::Manual {
+        retention,
+        note: jamstream_cloud::retention::manual_note(retention),
+    }
+}
+
+#[test]
+fn session_settings_recording_unenforced() {
+    // The bucket took the takes and refused the rule, so nothing is going to
+    // delete them. Scrolled to the retention rows, because the note sits under
+    // the choice it contradicts and that is the whole point of it.
+    let mut app = recording_app(Theme::Dark, true);
+    app.recording.applied = Some(unenforced_retention());
+    let mut harness = app_harness(app, WIDE);
+    scroll_drawer(&mut harness, WIDE);
+    snapshot(&mut harness, "session_settings_recording_unenforced");
+}
+
+#[test]
+fn session_record_unenforced_retention() {
+    // The same fact on the sheet a host reads before pressing Record, which is
+    // the last moment it is any use to them.
+    let mut app = record_app(Theme::Dark, RecordState::Idle, false);
+    app.recording.applied = Some(unenforced_retention());
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_record_unenforced_retention");
+}
+
 #[test]
 fn session_settings_recording_typed() {
     // The one surface where a storage key exists at all: a pair pasted into the

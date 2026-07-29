@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use egui::{RichText, TextEdit, Ui};
 use jamstream_cloud::cloudinit::{RecordingStorage, StorageCredential};
-use jamstream_cloud::{ProviderKind, RegionId, Retention};
+use jamstream_cloud::{ProviderKind, RegionId, Retention, RetentionEnforcement};
 use jamstream_protocol::ids::SessionId;
 use zeroize::Zeroize;
 
@@ -109,6 +109,34 @@ impl RecordingSetup {
     }
 }
 
+/// What a launch's retention call left the host with, reduced to what a
+/// surface has to draw. Built only when nothing is enforcing the choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionNote {
+    /// The store's own sentence, verbatim.
+    pub text: String,
+    /// A day count was asked for and nothing will act on it, so this is a
+    /// promise the product is not keeping. False for "keep forever", which
+    /// asked for nothing and is therefore not a problem, only a fact.
+    pub broken_promise: bool,
+}
+
+impl RetentionNote {
+    /// The colour this line is set in: the restrained red for a promise that
+    /// is not being kept, the muted step for a fact worth knowing.
+    ///
+    /// Both surfaces this lands on are a sheet's, and this is a paragraph
+    /// rather than a lamp, so the red goes through [`theme::readable`] the way
+    /// every other state word in the app does.
+    pub fn color(&self, p: &theme::Palette) -> egui::Color32 {
+        if self.broken_promise {
+            theme::readable(p.danger, p.surface1, p)
+        } else {
+            p.text_muted
+        }
+    }
+}
+
 /// The Recording tab's state. Typed key values live here until a check passes;
 /// after that they live in the keychain and nowhere else.
 pub struct RecordingPanel {
@@ -122,6 +150,11 @@ pub struct RecordingPanel {
     /// setup panes have.
     pub reveal: bool,
     pub retention: Retention,
+    /// What the last launch's retention call actually did, and the one copy
+    /// of that answer in the app. `None` until a session is launched with a
+    /// bucket; the record sheet reads its note through
+    /// [`RecordingPanel::unenforced_note`] rather than keeping a second one.
+    pub applied: Option<RetentionEnforcement>,
     /// What the last check said, verbatim on failure.
     pub check_result: Option<Result<(), String>>,
     /// Why the preferences file could not be read or written, if it could not.
@@ -196,6 +229,7 @@ impl RecordingPanel {
             secret: String::new(),
             reveal: false,
             retention: prefs.retention(),
+            applied: None,
             check_result: None,
             error,
             check_job: None,
@@ -260,6 +294,21 @@ impl RecordingPanel {
 
     pub fn retention(&self) -> Retention {
         self.retention
+    }
+
+    /// What the last launch's retention call has to say, and nothing when the
+    /// provider took the rule and is keeping the promise itself.
+    pub fn retention_note(&self) -> Option<RetentionNote> {
+        let applied = self.applied.as_ref()?;
+        if applied.is_server_side() {
+            return None;
+        }
+        Some(RetentionNote {
+            // The store's own words: they name the missing permission or the
+            // missing API, which is the part a host can act on.
+            text: applied.describe(),
+            broken_promise: applied.retention().days().is_some(),
+        })
     }
 
     /// What this computer can record a session on `provider` to. `None` for a
@@ -643,6 +692,14 @@ impl RecordingPanel {
             "A rule on the bucket itself, so it keeps being enforced after the machine is \
              gone.",
         );
+        // Unless the bucket would not take one. Directly under the choice it
+        // contradicts, because the rows above otherwise read as settled.
+        if let Some(note) = self.retention_note() {
+            let p = theme::palette_of(ui);
+            ui.add_space(theme::SPACE_SM);
+            let color = note.color(p);
+            ui.add(egui::Label::new(RichText::new(note.text).color(color)).wrap());
+        }
     }
 }
 

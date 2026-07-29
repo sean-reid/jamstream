@@ -11,6 +11,7 @@
 use egui::{Align, Align2, Button, Color32, Layout, RichText, Sense, Stroke, Ui, vec2};
 
 use crate::runtime::{Command, RecordState, Runtime, Snapshot};
+use crate::screens::recording::RetentionNote;
 use crate::theme;
 
 /// The lamp's fill, in the meter's color language: red while a take is
@@ -67,7 +68,13 @@ fn paint_lamp(ui: &Ui, center: egui::Pos2, fill: Option<Color32>) {
 /// The host's record sheet: the take's state, whether stems are being
 /// captured, and the one control that starts or ends a take. Everyone else
 /// gets the lamp; only this sheet gets the button.
-pub fn record_sheet(ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, open: &mut bool) {
+pub fn record_sheet(
+    ui: &mut Ui,
+    snap: &Snapshot,
+    rt: &dyn Runtime,
+    retention: Option<&RetentionNote>,
+    open: &mut bool,
+) {
     egui::Window::new("Record")
         .title_bar(false)
         .frame(theme::sheet_frame(theme::palette_of(ui)))
@@ -101,6 +108,23 @@ pub fn record_sheet(ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, open: &mut b
                 )
                 .small(),
             );
+            // What happens to the take after it lands, when that is not what
+            // the host asked for. Beside the line saying what is captured,
+            // because both are facts about this take set at launch, and here
+            // rather than only in Settings because this is the sheet a host
+            // reads before pressing Record.
+            if let Some(note) = retention {
+                let p = theme::palette_of(ui);
+                ui.add_space(theme::SPACE_SM);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(note.text.clone())
+                            .color(note.color(p))
+                            .small(),
+                    )
+                    .wrap(),
+                );
+            }
             ui.add_space(theme::SPACE_MD);
             ui.separator();
             control_row(ui, snap, rt);

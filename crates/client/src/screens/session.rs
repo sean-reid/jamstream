@@ -146,6 +146,11 @@ pub struct SessionScreen {
     /// hangs off the snapshot's `is_host` rather than a panel of its own;
     /// everyone else gets the lamp in the bar.
     pub record_open: bool,
+    /// What the launch's retention call left this session with, when it left
+    /// it with anything worth saying. Refreshed from the Recording tab every
+    /// frame the session is on screen, so this screen holds no second answer;
+    /// the record sheet shows it beside what the take is capturing.
+    pub retention_note: Option<crate::screens::recording::RetentionNote>,
     /// Set for the frame the record sheet opens. It shares [`theme::SHEET_OFFSET`]
     /// with the settings drawer, so the app closes the drawer instead of
     /// letting the wider sheet stick out to the left of it (#175).
@@ -224,7 +229,13 @@ impl SessionScreen {
         }
 
         if self.record_open && snap.is_host {
-            record_sheet(ui, snap, rt, &mut self.record_open);
+            record_sheet(
+                ui,
+                snap,
+                rt,
+                self.retention_note.as_ref(),
+                &mut self.record_open,
+            );
         }
 
         self.confirm_windows(ui, rt, &mut event);
