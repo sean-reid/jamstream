@@ -19,6 +19,12 @@ pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_STREAM_KEY_LEN: usize = 256;
 /// Longest accepted failure reason in a [`DestinationStatus`].
 pub const MAX_STREAM_REASON_LEN: usize = 200;
+/// Destinations one session may point at, and so the longest `StreamStatus`
+/// that decodes. The pipeline in jamstream-stream refuses to add a ninth and
+/// re-exports this rather than keeping its own number, so the cap a host hits
+/// and the cap the wire enforces cannot drift apart. Each destination is a
+/// process on the session VM and another copy of the egress bill.
+pub const MAX_DESTINATIONS: usize = 8;
 /// Longest accepted failure reason in a [`RecordingState::Failed`].
 pub const MAX_RECORD_REASON_LEN: usize = 200;
 /// Avatars are capped at 256 KB and identified by the Blake2s-256 of their
@@ -170,8 +176,27 @@ pub struct DestinationStatus {
     /// Configured video plus audio bitrate for this destination; the copy
     /// pushers all carry the one encode, so it is the same for each.
     pub bitrate_kbps: u32,
-    /// Frames the pipeline could not hand the encoder in time, cumulative.
+    /// Frames the encoder's queue refused, cumulative and pipeline-wide.
+    /// Genuine loss: the frame was never delivered, so the broadcast's video
+    /// timeline is this many pictures short of its audio.
+    ///
+    /// This used to count repeats as well, which is what
+    /// [`Self::repeated_frames`] is for now (#278). One number could not say
+    /// which of the two a host was looking at, and they mean opposite things:
+    /// a repeat says the machine is struggling, a drop says it has already
+    /// failed to deliver.
     pub dropped_frames: u64,
+    /// Catch-up frames the renderer had no time to draw, cumulative and
+    /// pipeline-wide. Delivered, as a repeat of the previous picture: the
+    /// frame count is what holds video in step with audio, so a frame with no
+    /// time to draw goes out again rather than being skipped. Nothing is
+    /// missing and A/V sync stays exact; the cost is a stutter.
+    ///
+    /// Trailing field, appended while protocol version 1 is unreleased.
+    /// Postcard writes struct fields in order with no framing, so bytes
+    /// written before it are short of the new encoding and fail to decode
+    /// rather than misreading, the same note as `MemberInfo::avatar_hash`.
+    pub repeated_frames: u64,
 }
 
 /// What the host asks the recorder to do. Whether stems are captured is set
@@ -552,6 +577,9 @@ fn check_lengths(msg: &ControlMsg) -> Result<(), Error> {
             op: StreamOp::AddDestination { key, .. },
         } if key.is_empty() || key.len() > MAX_STREAM_KEY_LEN => Err(Error::Malformed),
         ControlMsg::StreamStatus { destinations } => {
+            if destinations.len() > MAX_DESTINATIONS {
+                return Err(Error::Malformed);
+            }
             let bad_reason = destinations.iter().any(|d| match &d.state {
                 DestinationState::Failed { reason } => reason.len() > MAX_STREAM_REASON_LEN,
                 _ => false,
@@ -797,6 +825,7 @@ mod tests {
                         state: DestinationState::Live,
                         bitrate_kbps: 2_628,
                         dropped_frames: 0,
+                        repeated_frames: 0,
                     },
                     DestinationStatus {
                         id: DestinationId(2),
@@ -806,6 +835,7 @@ mod tests {
                         },
                         bitrate_kbps: 2_628,
                         dropped_frames: 3,
+                        repeated_frames: 41,
                     },
                 ],
             },
@@ -981,9 +1011,152 @@ mod tests {
                     },
                     bitrate_kbps: 0,
                     dropped_frames: 0,
+                    repeated_frames: 0,
                 }],
             })
             .is_err()
+        );
+    }
+
+    /// Exact `StreamStatus` bytes, worked out from the encoding rules rather
+    /// than captured from the encoder, so the two have to agree for this to
+    /// pass. A field reordered, a state discriminant shifted, or
+    /// `repeated_frames` silently dropped cannot survive it, which is what a
+    /// round trip through the same wrong code lets through.
+    ///
+    /// Derivation, postcard: an enum is its variant index as a varint, a
+    /// newtype struct is its inner value, `u16`/`u32`/`u64` are LEB128
+    /// varints, a `String` and a `Vec` are a varint length then their
+    /// contents, and struct fields go in declaration order with no framing.
+    /// `ControlMsg::StreamStatus` is variant 16 and `DestinationState` runs
+    /// Idle, Connecting, Live, Failed.
+    ///
+    ///   10              ControlMsg::StreamStatus, variant 16
+    ///   02              two destinations
+    ///     01            DestinationId(1)
+    ///     00            StreamPlatform::Twitch
+    ///     02            DestinationState::Live
+    ///     c4 14         bitrate 2628: 20 * 128 + 68
+    ///     00            dropped_frames: 0
+    ///     05            repeated_frames: 5
+    ///     ac 02         DestinationId(300): 2 * 128 + 44
+    ///     01            StreamPlatform::YouTube
+    ///     03            DestinationState::Failed
+    ///     04 67 6f 6e 65  reason "gone"
+    ///     c4 14         bitrate 2628
+    ///     07            dropped_frames: 7
+    ///     ac 02         repeated_frames: 300
+    #[test]
+    fn stream_status_encoding_is_pinned() {
+        const GOLDEN: &str = concat!(
+            "1002",
+            "010002",
+            "c414",
+            "00",
+            "05",
+            "ac02",
+            "01",
+            "0304676f6e65",
+            "c414",
+            "07",
+            "ac02",
+        );
+        let status = ControlMsg::StreamStatus {
+            destinations: vec![
+                DestinationStatus {
+                    id: DestinationId(1),
+                    platform: StreamPlatform::Twitch,
+                    state: DestinationState::Live,
+                    bitrate_kbps: 2_628,
+                    dropped_frames: 0,
+                    repeated_frames: 5,
+                },
+                DestinationStatus {
+                    id: DestinationId(300),
+                    platform: StreamPlatform::YouTube,
+                    state: DestinationState::Failed {
+                        reason: "gone".into(),
+                    },
+                    bitrate_kbps: 2_628,
+                    dropped_frames: 7,
+                    repeated_frames: 300,
+                },
+            ],
+        };
+        let bytes = postcard::to_allocvec(&status).unwrap();
+        assert_eq!(data_encoding::HEXLOWER.encode(&bytes), GOLDEN);
+        let golden = data_encoding::HEXLOWER.decode(GOLDEN.as_bytes()).unwrap();
+        assert_eq!(postcard::from_bytes::<ControlMsg>(&golden).unwrap(), status);
+        // One byte short is the second destination's repeat count cut in half:
+        // refused, not read as a smaller number.
+        assert!(postcard::from_bytes::<ControlMsg>(&golden[..golden.len() - 1]).is_err());
+        // An unknown state discriminant is refused rather than misread.
+        assert!(postcard::from_bytes::<ControlMsg>(&[0x10, 0x01, 0x01, 0x00, 0x04]).is_err());
+    }
+
+    /// The same note as `MemberInfo`, for the field #278 appended: bytes from
+    /// before it are short of the new encoding and fail to decode instead of
+    /// reading as "no repeats". Breaking pre-release, by decision.
+    #[test]
+    fn destination_status_trailing_field_changed_the_status_encoding() {
+        #[derive(Serialize)]
+        struct OldDestinationStatus {
+            id: DestinationId,
+            platform: StreamPlatform,
+            state: DestinationState,
+            bitrate_kbps: u32,
+            dropped_frames: u64,
+        }
+        let old = postcard::to_allocvec(&OldDestinationStatus {
+            id: DestinationId(1),
+            platform: StreamPlatform::Twitch,
+            state: DestinationState::Live,
+            bitrate_kbps: 2_628,
+            dropped_frames: 9,
+        })
+        .unwrap();
+        assert!(postcard::from_bytes::<DestinationStatus>(&old).is_err());
+
+        let now = DestinationStatus {
+            id: DestinationId(1),
+            platform: StreamPlatform::Twitch,
+            state: DestinationState::Live,
+            bitrate_kbps: 2_628,
+            dropped_frames: 9,
+            repeated_frames: 0,
+        };
+        let bytes = postcard::to_allocvec(&now).unwrap();
+        // The repeat count is exactly the byte the old encoding lacked.
+        assert_eq!(bytes.len(), old.len() + 1);
+        assert_eq!(
+            postcard::from_bytes::<DestinationStatus>(&bytes).unwrap(),
+            now
+        );
+    }
+
+    /// A status longer than a session can legally have is refused at decode,
+    /// not just at send. `MAX_DATAGRAM_BYTES` left room for about 200 entries,
+    /// so the only bound was the datagram's.
+    #[test]
+    fn rejects_oversized_destination_list() {
+        let destinations: Vec<_> = (0..=MAX_DESTINATIONS as u16)
+            .map(|i| DestinationStatus {
+                id: DestinationId(i),
+                platform: StreamPlatform::Twitch,
+                state: DestinationState::Live,
+                bitrate_kbps: 2_628,
+                dropped_frames: 0,
+                repeated_frames: 0,
+            })
+            .collect();
+        let mut link = ControlLink::new();
+        let legal = ControlMsg::StreamStatus {
+            destinations: destinations[..MAX_DESTINATIONS].to_vec(),
+        };
+        assert!(link.send(legal).is_ok());
+        assert!(
+            link.send(ControlMsg::StreamStatus { destinations })
+                .is_err()
         );
     }
 
@@ -1328,7 +1501,20 @@ mod tests {
                     },
                     bitrate_kbps: 0,
                     dropped_frames: 0,
+                    repeated_frames: 0,
                 }],
+            },
+            ControlMsg::StreamStatus {
+                destinations: (0..=MAX_DESTINATIONS as u16)
+                    .map(|i| DestinationStatus {
+                        id: DestinationId(i),
+                        platform: StreamPlatform::Twitch,
+                        state: DestinationState::Live,
+                        bitrate_kbps: 2_628,
+                        dropped_frames: 0,
+                        repeated_frames: 0,
+                    })
+                    .collect(),
             },
             ControlMsg::RecordStatus {
                 state: RecordingState::Failed {

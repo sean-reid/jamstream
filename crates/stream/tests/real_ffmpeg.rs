@@ -258,13 +258,19 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
         pipeline.poll(now_ms);
     }
     println!("fed {SECONDS}s of programme in {:?}", started.elapsed());
-    // Nothing may be dropped at real time on any machine that can encode at
-    // all: a drop here is either the renderer or the encoder failing to keep
-    // up with 30 fps of 720p, which is the thing a session VM is sized for.
+    // Nothing may be dropped or repeated at real time on any machine that can
+    // encode at all: either count here is the renderer or the encoder failing
+    // to keep up with 30 fps of 720p, which is the thing a session VM is sized
+    // for.
     assert_eq!(
         pipeline.dropped_frames(),
         0,
-        "the encoder could not keep up with real time"
+        "the encoder refused frames at real time"
+    );
+    assert_eq!(
+        pipeline.repeated_frames(),
+        0,
+        "the renderer could not keep up with real time"
     );
     // Stop closes our write ends, so ffmpeg drains and finishes the file.
     pipeline
