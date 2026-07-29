@@ -224,18 +224,27 @@ pub fn build_provider_for_port(
     creds: &dyn CredStore,
     env: &EnvReader,
 ) -> Result<Box<dyn Provider>, String> {
-    match name {
+    // The cloud crate's own parser, not a fifth table of the same four
+    // spellings: `ProviderKind::as_str` is authoritative and the hand-written
+    // matches kept drifting from it, so a fifth provider is a compile error in
+    // the arms below rather than a wrong error message here (#233).
+    let kind: ProviderKind = name
+        .parse()
+        .map_err(|e: jamstream_cloud::ProviderError| e.to_string())?;
+    match kind {
         // Local spawns a process rather than opening a firewall, and takes its
         // port from the flat config the launch writes.
-        "local" => jamstream_cli::providers::resolve("local").map_err(|e| e.to_string()),
-        "digitalocean" => {
+        ProviderKind::Local => {
+            jamstream_cli::providers::resolve(kind.as_str()).map_err(|e| e.to_string())
+        }
+        ProviderKind::DigitalOcean => {
             let token = lookup(creds, env, DO_TOKEN, "DIGITALOCEAN_TOKEN")
                 .ok_or("no DigitalOcean token saved and DIGITALOCEAN_TOKEN is not set")?;
             Ok(Box::new(
                 DigitalOceanProvider::new(token).with_session_port(session_port),
             ))
         }
-        "aws" => {
+        ProviderKind::Aws => {
             let id = lookup(creds, env, AWS_ACCESS_KEY_ID, "AWS_ACCESS_KEY_ID")
                 .ok_or("no AWS access key saved and AWS_ACCESS_KEY_ID is not set")?;
             let secret = lookup(creds, env, AWS_SECRET_ACCESS_KEY, "AWS_SECRET_ACCESS_KEY")
@@ -244,8 +253,7 @@ pub fn build_provider_for_port(
                 AwsProvider::new(id, secret).with_session_port(session_port),
             ))
         }
-        "gcp" => build_gcp(session_port, creds, env),
-        other => Err(format!("unknown provider {other:?}")),
+        ProviderKind::Gcp => build_gcp(session_port, creds, env),
     }
 }
 
@@ -362,6 +370,39 @@ mod tests {
                 .expect("must not build");
             assert!(err.contains(hint), "error for {name} was {err:?}");
         }
+    }
+
+    /// Every name the app builds a provider from is a `ProviderKind` name, and
+    /// a name that is not one is refused by the cloud crate's own parser, whose
+    /// message lists what it would have taken. The hand-written match this
+    /// replaced answered `unknown provider "azure"` and named nothing.
+    #[test]
+    fn the_names_are_the_provider_kinds_and_nothing_else_parses() {
+        let (store, env) = (MemStore::default(), env_of(&[]));
+        for kind in ProviderKind::ALL {
+            // Every one of them gets past the parse: local builds, the clouds
+            // reach their own credential complaint rather than a name error.
+            let result = build_provider(kind.as_str(), &store, &env);
+            if let Err(err) = &result {
+                assert!(
+                    !err.contains("unknown provider"),
+                    "{kind} did not parse: {err}"
+                );
+            }
+        }
+        let err = build_provider("azure", &store, &env)
+            .err()
+            .expect("azure is not a provider");
+        assert!(err.contains("azure"), "error was {err:?}");
+        for kind in ProviderKind::ALL {
+            assert!(
+                err.contains(kind.as_str()),
+                "the refusal does not name {kind}: {err:?}"
+            );
+        }
+        // The test-only mock is resolvable in the CLI and is deliberately not
+        // one of these, so the app cannot launch a session onto nothing.
+        assert!(build_provider("mock", &store, &env).is_err());
     }
 
     #[test]
