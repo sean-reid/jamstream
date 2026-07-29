@@ -111,8 +111,12 @@ const CATALOG: &[(&str, &str, &str)] = &[
 ];
 
 const DEFAULT_BASE_URL: &str = "https://compute.googleapis.com";
-/// Provider-enforced hard cap default: 12 hours.
-const DEFAULT_MAX_RUN_SECONDS: u64 = 12 * 60 * 60;
+/// Provider-enforced hard cap default, in the units GCP's `maxRunDuration`
+/// wants. Derived rather than spelled, because it was a third copy of the
+/// twelve hours: the pin between the session limit and the local provider did
+/// not reach here, so this could have drifted from both and only GCP hosts
+/// would have noticed.
+const DEFAULT_MAX_RUN_SECONDS: u64 = super::local::DEFAULT_MAX_DURATION_MIN as u64 * 60;
 /// Debian 12 has cloud-init and reads the `user-data` metadata key.
 const SOURCE_IMAGE: &str = "projects/debian-cloud/global/images/family/debian-12";
 /// Marker label added to every launch so `list_tagged(None)` can filter
