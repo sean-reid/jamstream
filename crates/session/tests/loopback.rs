@@ -1153,6 +1153,7 @@ fn status(id: u16, state: DestinationState) -> DestinationStatus {
         state,
         bitrate_kbps: 2_628,
         dropped_frames: 0,
+        repeated_frames: 0,
     }
 }
 

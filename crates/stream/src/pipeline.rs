@@ -26,9 +26,10 @@ use crate::yuv;
 /// bounds the roster and the level array handed to it, so a second number
 /// here would silently truncate or overrun.
 pub use jamstream_broadcast::MAX_CARDS;
-/// A session may not point at more destinations than this. Each one is a
-/// process and a copy of the egress bill.
-pub const MAX_DESTINATIONS: usize = 8;
+/// Destinations a session may point at. The wire type's own cap, not a copy of
+/// it: `StreamStatus` refuses a longer list at decode, so a second number here
+/// would let the pipeline build a status no peer would accept.
+pub use jamstream_protocol::control::MAX_DESTINATIONS;
 
 /// A process alive this long has proven itself: state goes Live and the
 /// backoff resets, so a stream that fails after two hours restarts promptly
@@ -252,19 +253,21 @@ pub struct Pipeline<H: ProcessHost> {
     /// The host asked for Start and has not asked for Stop.
     started: bool,
     dests: Vec<Destination>,
-    /// Frames the broadcast did not draw, cumulative for the session and
-    /// reported on every destination. Two different things land here:
-    ///
-    /// - a catch-up frame the renderer had no time to draw, which is still
-    ///   *delivered*, as a repeat of the last picture, so the frame count and
-    ///   with it A/V sync stay exact and the cost is a stutter;
-    /// - a frame the encoder's queue refused, which is not delivered at all,
-    ///   so the video timeline comes up one frame short where it happened.
-    ///
-    /// The second is the bounded alternative to a queue that grows until the
-    /// VM is out of memory. Telling them apart in the status would mean a
-    /// second field on the wire type in `jamstream-protocol`.
+    /// Frames the encoder's queue refused, cumulative for the session and
+    /// reported on every destination. Not delivered at all, so the video
+    /// timeline comes up one frame short of the audio where it happened. It is
+    /// the bounded alternative to a queue that grows until the VM is out of
+    /// memory.
     dropped_frames: u64,
+    /// Catch-up frames the renderer had no time to draw, cumulative and
+    /// reported the same way. Still *delivered*, as a repeat of the last
+    /// picture, so the frame count and with it A/V sync stay exact and the
+    /// cost is a stutter.
+    ///
+    /// Counted apart from `dropped_frames` because the two say different
+    /// things to a host: a repeat says the machine is struggling, a drop says
+    /// it has already failed to deliver (#278).
+    repeated_frames: u64,
     events: Vec<PipelineEvent>,
 }
 
@@ -297,6 +300,7 @@ impl<H: ProcessHost> Pipeline<H> {
             started: false,
             dests: Vec::new(),
             dropped_frames: 0,
+            repeated_frames: 0,
             events: Vec::new(),
         }
     }
@@ -661,8 +665,9 @@ impl<H: ProcessHost> Pipeline<H> {
             if rendered {
                 // Catch-up frames repeat the last picture instead of skipping:
                 // the frame *count* is what keeps video aligned with audio, so
-                // dropping one would shift the video clock permanently.
-                self.dropped_frames += 1;
+                // dropping one would shift the video clock permanently. The
+                // frame still goes out, which is why this is not a drop.
+                self.repeated_frames += 1;
             } else {
                 for (v, i) in self.visuals.iter_mut().zip(0..levels.len) {
                     v.level_peak = levels.peak[i];
@@ -714,6 +719,7 @@ impl<H: ProcessHost> Pipeline<H> {
                 state: d.state.clone(),
                 bitrate_kbps,
                 dropped_frames: self.dropped_frames,
+                repeated_frames: self.repeated_frames,
             })
             .collect()
     }
@@ -733,8 +739,16 @@ impl<H: ProcessHost> Pipeline<H> {
         self.dests.iter().any(|d| d.state == DestinationState::Live)
     }
 
+    /// Frames the encoder's queue refused, so the broadcast is that many
+    /// pictures short. Genuine loss.
     pub fn dropped_frames(&self) -> u64 {
         self.dropped_frames
+    }
+
+    /// Frames delivered as a repeat of the last picture because there was no
+    /// time to draw them. Nothing missing, sync exact, visibly stuttery.
+    pub fn repeated_frames(&self) -> u64 {
+        self.repeated_frames
     }
 
     pub fn cadence(&self) -> &VideoCadence {
@@ -1274,6 +1288,7 @@ mod tests {
         assert_eq!(p.host().fifo_bytes(encoder), 4 * frame_bytes);
         assert_eq!(p.cadence().frames_emitted(), 4);
         assert_eq!(p.dropped_frames(), 0);
+        assert_eq!(p.repeated_frames(), 0);
     }
 
     #[test]
@@ -1288,7 +1303,10 @@ mod tests {
         let frame_bytes = yuv::i420_len(p.cfg.width, p.cfg.height) as u64;
         assert_eq!(p.host().fifo_bytes(encoder), 16 * frame_bytes);
         assert_eq!(p.cadence().frames_emitted(), 16);
-        assert_eq!(p.dropped_frames(), 15);
+        // Repeats, every one of them delivered. Nothing was lost, so the drop
+        // count stays at zero: that is the whole point of splitting them.
+        assert_eq!(p.repeated_frames(), 15);
+        assert_eq!(p.dropped_frames(), 0);
     }
 
     #[test]
@@ -1321,6 +1339,10 @@ mod tests {
         assert_eq!(p.host().stdin_bytes(encoder), 80 * 480);
         assert!(p.host().live().contains(&encoder));
         assert_eq!(p.status()[0].dropped_frames, 3);
+        // Refused, never repeated: one submission per tick means no frame here
+        // was a catch-up, so the two counts do not bleed into each other.
+        assert_eq!(p.repeated_frames(), 0);
+        assert_eq!(p.status()[0].repeated_frames, 0);
 
         // And it recovers on its own once the encoder catches up.
         p.host_mut().fill_fifo(encoder, false);
@@ -1410,13 +1432,36 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_the_shared_bitrate_and_the_drop_count() {
+    fn status_reports_the_shared_bitrate_and_both_frame_counts() {
         let mut p = pipeline("status");
         p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
         let s = &p.status()[0];
         assert_eq!(s.bitrate_kbps, 2_628);
         assert_eq!(s.dropped_frames, 0);
+        assert_eq!(s.repeated_frames, 0);
         assert_eq!(s.platform, StreamPlatform::Twitch);
+    }
+
+    /// Both outcomes in one run, which is the case a single number could not
+    /// describe: a catch-up submission while the encoder's queue is full
+    /// repeats the picture *and* has it refused, so the same frame lands in
+    /// both counts, and a host reading either alone is misled.
+    #[test]
+    fn a_repeat_the_encoder_also_refuses_lands_in_both_counts() {
+        let mut p = pipeline("bothcounts");
+        p.apply(0, StreamOp::Start).unwrap();
+        p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
+        let encoder = p.host().find_live("encoder").unwrap();
+        p.host_mut().fill_fifo(encoder, true);
+        // Half a second in one submission: 16 frames due, 15 of them repeats,
+        // and the queue takes none of them.
+        let audio = vec![0.0f32; 24_000 * 2];
+        p.push_tick(0, &audio, &Levels::default());
+        assert_eq!(p.repeated_frames(), 15, "fifteen were repeats of the first");
+        assert_eq!(p.dropped_frames(), 16, "and none of the sixteen went out");
+        let s = &p.status()[0];
+        assert_eq!(s.repeated_frames, 15);
+        assert_eq!(s.dropped_frames, 16);
     }
 
     #[test]
