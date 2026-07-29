@@ -337,27 +337,39 @@ jobs:
       # built every instrumented artifact; each one only re-runs that
       # crate's test binaries and re-merges its profraw. Measured warm on
       # an M-series laptop: broadcast 5 s, cloud 24 s, server 27 s, cli
-      # 31 s, so the four crates added here cost about 90 s of the job.
-      # Nowhere near the point where the shared build would have to be
-      # split out of the floor loop.
+      # 31 s, so those four cost about 90 s of the job, and stream is a
+      # fifth invocation of the same shape. Nowhere near the point where
+      # the shared build would have to be split out of the floor loop.
       #
       # Floors: 75 for the crates whose suites are mature (protocol,
       # engine, session, cloud at 93 percent measured, broadcast at 99),
       # and a measured floor a few points under current coverage for the
-      # two newer ones so the gate is real without being brittle:
+      # newer ones so the gate is real without being brittle:
       # server measures 89.5 (floor 85), cli measures 84.3-84.5 (floor 80;
-      # it moves by about 0.2 between runs).
+      # it moves by about 0.2 between runs), stream measures 85.96 from its
+      # unit tests (floor 80).
+      #
+      # jamstream-stream was missing from `all` as well as from the loop,
+      # which cost twice: it had no floor of its own, and because it never
+      # appeared in another crate's mask, the server links it and stream's
+      # uncovered lines counted against the server's 85.
+      #
+      # Its 85.96 is measured the way this job measures, which is without
+      # ffmpeg: the apt line above installs alsa, xkbcommon, wayland,
+      # pipewire and dbus and nothing else. The gap is almost all proc.rs
+      # at 44.55; everything else in the crate is 90 to 100.
       #
       # Still without a floor, deliberately: jamstream-client (kittest
       # snapshot baselines are macOS renders, see the test job),
       # jamstream-harness (its gates assert wall-clock budgets that
-      # instrumentation invalidates), and jamstream-audio-io (a thin cpal
-      # shim; a headless runner has no device to open). The first two are
+      # instrumentation invalidates), and jamstream-audio-io (a headless
+      # runner has no device to open, so the device paths cannot be
+      # measured here; its pure logic is unit-tested). The first two are
       # also excluded from the workspace lcov above.
       - name: Enforce per-crate line-coverage floors
         run: |
-          all='protocol engine session audio-io cloud server cli client harness broadcast'
-          for pair in protocol:75 engine:75 session:75 cloud:75 broadcast:75 server:85 cli:80; do
+          all='protocol engine session audio-io cloud server cli client harness broadcast stream'
+          for pair in protocol:75 engine:75 session:75 cloud:75 broadcast:75 server:85 cli:80 stream:80; do
             crate="${pair%:*}"
             floor="${pair#*:}"
             others=''
