@@ -95,6 +95,10 @@ const STRIP_ROW_GAP: f32 = theme::SPACE_SM;
 // full name one hover away, the same treatment as a strip's name.
 const CHAT_TIME_W: f32 = 38.0;
 const CHAT_NAME_W: f32 = 64.0;
+/// The chat panel's width in the wide layout. The console measures itself
+/// against what is left of the window, so this is one number both of them
+/// read.
+const CHAT_PANEL_W: f32 = 280.0;
 
 /// The metronome panel's width: its widest label, "beats per bar", plus the
 /// drag value beside it and the panel's own margins.
@@ -168,6 +172,14 @@ pub struct SessionScreen {
     /// drawn after the screen and stops here, so it never covers the
     /// mouth-to-ear readout or the meters a musician adjusts against.
     pub status_bar_top: Option<f32>,
+    /// The settings drawer is over the chat panel this frame. It is the full
+    /// height of the window between the bars and wider than the panel, so it
+    /// hides the conversation and leaves the message field showing under its
+    /// bottom edge: a lone text field with a message placeholder and no
+    /// messages, two surfaces overlapping the way the two sheets did in #175.
+    /// The panel keeps its place in the layout and draws nothing while it is
+    /// covered, so opening the drawer moves no strip (#286).
+    pub chat_covered: bool,
 }
 
 impl SessionScreen {
@@ -214,8 +226,19 @@ impl SessionScreen {
         if !narrow {
             egui::Panel::right(egui::Id::new("session-chat"))
                 .resizable(false)
-                .exact_size(280.0)
-                .show(ui, |ui| self.chat_ui(ui, snap, rt, true));
+                .exact_size(CHAT_PANEL_W)
+                .show(ui, |ui| {
+                    // The panel keeps its width whatever is over it, so
+                    // opening the drawer moves no strip; it draws nothing
+                    // while the drawer is over it, because the only part of
+                    // it that reached past the drawer's bottom edge was the
+                    // message field (#286). The narrow layout is not covered
+                    // this way: there the chat is the whole content and the
+                    // drawer takes less than half of it.
+                    if !self.chat_covered {
+                        self.chat_ui(ui, snap, rt, true);
+                    }
+                });
             self.mixer_ui(ui, snap, rt);
         } else {
             // The toggle is symmetric and stationary: same place, same
@@ -369,11 +392,23 @@ impl SessionScreen {
             .cloned()
             .collect();
         // Outer strip width includes the 1 px frame stroke on each side.
-        let n = musicians.len() as f32;
-        let row_w = n * (STRIP_W + 2.0) + (n - 1.0).max(0.0) * STRIP_GAP;
-        // The console extends sideways past the window; the lower panel
-        // stays within it.
-        let visible_w = ui.available_width();
+        let row_w = strips_w(musicians.len());
+        // The strips are as tall as the tallest of them needs to be, so a
+        // window too short for one scrolls down as well as sideways. Measured
+        // out here because the vertical bar takes its width from the console,
+        // and the console shows whole strips only.
+        let needed = musicians
+            .iter()
+            .map(|m| strip_h_for(ui, STRIP_ROW_GAP, m, snap.is_host))
+            .fold(0.0_f32, f32::max);
+        let bar = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
+        let scroll_h = ui.available_height();
+        // The console extends sideways past the window; the lower panel stays
+        // within it. Never part of a strip: a musician at the right-hand end of
+        // a ten-piece console had a name cut mid-word and a Mute they could not
+        // press, with a horizontal scrollbar as the only cue (#286).
+        let room = ui.available_width() - if needed > scroll_h - bar { bar } else { 0.0 };
+        let visible_w = whole_strips_w(room, musicians.len());
         let lower_w = row_w.min(visible_w);
         let overflow = row_w > visible_w;
 
@@ -410,24 +445,26 @@ impl SessionScreen {
             });
 
         // The console scrolls in both directions: sideways past the last
-        // strip, and down when the window is too short for a whole strip.
-        ScrollArea::both().id_salt("mixer-scroll").show(ui, |ui| {
-            // Leave room for the scrollbar when the row overflows.
-            let bar = if overflow { 10.0 } else { 2.0 };
-            // Every strip is as tall as the tallest one needs to be, so
-            // the rows line up across the console.
-            let needed = musicians
-                .iter()
-                .map(|m| strip_h_for(ui, STRIP_ROW_GAP, m, snap.is_host))
-                .fold(0.0_f32, f32::max);
-            let strip_h = (ui.available_height() - bar).max(needed);
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = STRIP_GAP;
-                for member in &musicians {
-                    self.strip_ui(ui, member, snap, rt, strip_h);
-                }
+        // strip, and down when the window is too short for a whole strip. Its
+        // viewport is a whole number of strips wide, so what scrolls into it
+        // is a whole strip and never the left half of one.
+        ScrollArea::both()
+            .id_salt("mixer-scroll")
+            .max_width(visible_w)
+            .show(ui, |ui| {
+                // Leave room for the horizontal scrollbar when the row
+                // overflows.
+                let hbar = if overflow { 10.0 } else { 2.0 };
+                // Every strip is as tall as the tallest one needs to be, so
+                // the rows line up across the console.
+                let strip_h = (ui.available_height() - hbar).max(needed);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = STRIP_GAP;
+                    for member in &musicians {
+                        self.strip_ui(ui, member, snap, rt, strip_h);
+                    }
+                });
             });
-        });
     }
 
     fn strip_ui(
@@ -1219,6 +1256,26 @@ fn mono_text_width(ui: &mut Ui, text: &str) -> f32 {
     text_width(ui, text, FontId::new(12.5, FontFamily::Monospace))
 }
 
+/// The outer width of one strip: the fixed box plus the panel's hairline on
+/// each side.
+const STRIP_OUTER_W: f32 = STRIP_W + 2.0;
+
+/// What `count` strips take side by side, gaps included.
+fn strips_w(count: usize) -> f32 {
+    count as f32 * STRIP_OUTER_W + (count.max(1) - 1) as f32 * STRIP_GAP
+}
+
+/// The width to hand the console: as many whole strips as `room` holds, and
+/// never part of one more. A strip cut down the middle is a name broken
+/// mid-word and a Mute that cannot be pressed, which is what the right-hand end
+/// of a ten-piece console showed at the chat panel's edge (#286). One strip
+/// always, so a window narrower than a single one clips rather than vanishes.
+fn whole_strips_w(room: f32, count: usize) -> f32 {
+    let per = STRIP_OUTER_W + STRIP_GAP;
+    let fits = ((room + STRIP_GAP) / per).floor().max(1.0) as usize;
+    strips_w(fits.min(count.max(1)))
+}
+
 /// What a strip's button rows actually draw at. egui floors a button at its
 /// text height plus the style's vertical padding whatever size it is added
 /// at, so the console asks rather than assumes: it reserved a flat 22, both
@@ -1332,6 +1389,39 @@ mod tests {
     use crate::demo::{DemoRuntime, FROZEN_FRAME};
     use crate::runtime::{DestinationState, RecordState, StreamPlatform};
     use crate::theme::{DARK, LIGHT};
+
+    /// The console's width rule, over every width a window can leave it: what
+    /// it takes is always a whole number of strips, never more room than there
+    /// is, and never one strip fewer than the room holds. The right-hand end of
+    /// a ten-piece console used to be sliced by the chat panel's edge, mid name
+    /// and mid button, with a horizontal scrollbar as the only cue (#286).
+    #[test]
+    fn the_console_takes_whole_strips_and_all_of_them_that_fit() {
+        let per = STRIP_OUTER_W + STRIP_GAP;
+        // Half-pixel steps from nothing to less than ten strips, so the answer
+        // is never capped by the roster.
+        for half_px in 0..2_000u32 {
+            let room = f32::from(half_px as u16) / 2.0;
+            let w = whole_strips_w(room, 10);
+            let strips = ((w + STRIP_GAP) / per).round();
+            assert!(
+                (strips * per - STRIP_GAP - w).abs() < 0.01,
+                "{room} px gave {w}, which is {strips} strips and a fraction"
+            );
+            assert!(strips >= 1.0, "{room} px gave no strip at all");
+            // Room for less than one strip clips one rather than drawing none.
+            assert!(
+                w <= room.max(STRIP_OUTER_W),
+                "{room} px gave {w}, wider than the room"
+            );
+            assert!(
+                w + per > room,
+                "{room} px gave {w}, leaving room for a strip it did not draw"
+            );
+        }
+        // And the roster is the other cap: four musicians are four strips.
+        assert_eq!(whole_strips_w(4_000.0, 4), strips_w(4));
+    }
 
     /// Every combination of cluster states a session can be in at once.
     fn every_cluster() -> Vec<(String, Snapshot)> {

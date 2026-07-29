@@ -470,6 +470,11 @@ impl JamApp {
                 // launch's retention answer and the record sheet shows it, so
                 // the screen keeps no second copy that could go stale.
                 self.session.retention_note = self.recording.retention_note();
+                // The drawer is drawn after the screen and covers the chat
+                // panel, so the panel is told before it draws rather than
+                // leaving its message field showing under the drawer's bottom
+                // edge (#286).
+                self.session.chat_covered = self.settings_open;
                 if let Some(rt) = self.runtime.as_deref() {
                     // One snapshot pull per frame; screens never call back in.
                     let snap = rt.snapshot();

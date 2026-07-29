@@ -396,6 +396,12 @@ fn a_fader_gets_its_floor_and_stays_in_the_window() {
 /// above. `in_memory` for the same reason every fixture uses it: the real
 /// keychain would put a system dialog in front of the test run.
 fn settings_harness_sized(size: egui::Vec2) -> Harness<'static> {
+    session_shell_sized(size, true)
+}
+
+/// The same shell with the drawer closed, for the pair of assertions that need
+/// to see what the drawer is over.
+fn session_shell_sized(size: egui::Vec2, settings_open: bool) -> Harness<'static> {
     use jamstream_client::app::{JamApp, Screen};
 
     let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
@@ -408,7 +414,7 @@ fn settings_harness_sized(size: egui::Vec2) -> Harness<'static> {
     app.screen = Screen::Session;
     app.session.invites = Some(empty_invites());
     app.session.destinations = Some(DestinationsPanel::new(Arc::new(MemStore::default())));
-    app.settings_open = true;
+    app.settings_open = settings_open;
     Harness::builder()
         .with_size(size)
         .with_step_dt(0.05)
@@ -416,6 +422,44 @@ fn settings_harness_sized(size: egui::Vec2) -> Harness<'static> {
             theme::apply(ui.ctx(), Theme::Dark);
             app.root_ui(ui);
         })
+}
+
+/// The drawer is the full height of the window between the two bars and wider
+/// than the chat panel, so the panel's message field showed under its bottom
+/// edge: a lone text input with a message placeholder and no conversation above
+/// it, two surfaces overlapping at the bottom edge the way the two sheets did in
+/// #175 (#286). The panel holds its width and draws nothing while it is covered.
+///
+/// The wide layout only: below 900 px the chat is behind its own toggle and the
+/// drawer takes less than half the window, so there is nothing to cover.
+#[test]
+fn the_drawer_leaves_no_chat_field_poking_out_below_it() {
+    let size = vec2(1280.0, 800.0);
+    let mut open = session_shell_sized(size, true);
+    open.run_steps(4);
+    let poking: Vec<egui::Rect> = open
+        .query_all_by_role(AkRole::TextInput)
+        .map(|n| n.rect())
+        .collect();
+    assert!(
+        poking.is_empty(),
+        "the drawer is over the chat panel and these fields are still drawn: {poking:?}"
+    );
+
+    // And the field is really there to be covered: the same shell with the
+    // drawer closed draws it, so the assertion above is about the drawer and
+    // not about a field that never existed.
+    let mut closed = session_shell_sized(size, false);
+    closed.run_steps(4);
+    let field = closed
+        .query_all_by_role(AkRole::TextInput)
+        .map(|n| n.rect())
+        .next()
+        .expect("the chat panel's message field");
+    assert!(
+        field.right() > size.x - 300.0,
+        "the field at {field:?} is not the chat panel's"
+    );
 }
 
 /// The invariant behind #122. Buffer size and input level are adjusted while
