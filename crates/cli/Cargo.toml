@@ -34,3 +34,7 @@ thiserror.workspace = true
 [dev-dependencies]
 jamstream-server.workspace = true
 wiremock.workspace = true
+# The audio fixture generator, so `cargo xtask fixtures` and these tests
+# cannot drift apart. A path dependency and not a workspace one: nothing
+# ships xtask, and it has no business in the workspace dependency table.
+xtask = { path = "../../xtask" }
