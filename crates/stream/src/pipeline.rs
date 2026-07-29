@@ -19,7 +19,7 @@ use jamstream_protocol::ids::{DestinationId, MemberId};
 use crate::cadence::VideoCadence;
 use crate::keys::KeyStore;
 use crate::platform::PlatformCatalog;
-use crate::proc::{Exit, ProcId, ProcSpec, ProcessHost, Stdin};
+use crate::proc::{Exit, Feed, ProcId, ProcSpec, ProcessHost, Stdin};
 use crate::yuv;
 
 /// Cards the renderer draws. The renderer's own cap, not a copy of it: this
@@ -36,6 +36,11 @@ pub const MAX_DESTINATIONS: usize = 8;
 const HEALTHY_MS: u64 = 3_000;
 const BACKOFF_BASE_MS: u64 = 500;
 const BACKOFF_MAX_MS: u64 = 16_000;
+
+/// ffmpeg's floor for `-probesize`, and all either raw input needs: both are
+/// fully described in argv, so there is nothing to detect. See
+/// [`Pipeline::encoder_spec`] for why the default is a live-stream bug.
+const PROBESIZE: &str = "32";
 
 /// Blake2s-256 of an avatar's bytes, as the roster carries it.
 pub type AvatarHash = [u8; 32];
@@ -247,8 +252,18 @@ pub struct Pipeline<H: ProcessHost> {
     /// The host asked for Start and has not asked for Stop.
     started: bool,
     dests: Vec<Destination>,
-    /// Frames the renderer could not produce in time, delivered as repeats so
-    /// the video clock stays exact. Cumulative for the session.
+    /// Frames the broadcast did not draw, cumulative for the session and
+    /// reported on every destination. Two different things land here:
+    ///
+    /// - a catch-up frame the renderer had no time to draw, which is still
+    ///   *delivered*, as a repeat of the last picture, so the frame count and
+    ///   with it A/V sync stay exact and the cost is a stutter;
+    /// - a frame the encoder's queue refused, which is not delivered at all,
+    ///   so the video timeline comes up one frame short where it happened.
+    ///
+    /// The second is the bounded alternative to a queue that grows until the
+    /// VM is out of memory. Telling them apart in the status would mean a
+    /// second field on the wire type in `jamstream-protocol`.
     dropped_frames: u64,
     events: Vec<PipelineEvent>,
 }
@@ -615,6 +630,12 @@ impl<H: ProcessHost> Pipeline<H> {
     /// [`VideoCadence`] turns the sample count into the frames now due. A
     /// caller that missed ticks submits silence for them, which keeps the two
     /// timelines locked rather than letting video slide.
+    ///
+    /// Neither submission blocks on the encoder. The host queues each pipe
+    /// separately ([`crate::proc::StdProcessHost`]); a video queue at its cap
+    /// gives the frame back as [`Feed::Dropped`] and an audio queue at its cap
+    /// is a broken feed, so a slow encoder costs frames rather than memory and
+    /// a stalled one is restarted rather than waited on.
     pub fn push_tick(&mut self, now_ms: u64, audio: &[f32], levels: &Levels) {
         if self.encoder.is_none() {
             return;
@@ -656,9 +677,18 @@ impl<H: ProcessHost> Pipeline<H> {
             let yuv = std::mem::take(&mut self.yuv);
             let write = self.host.write_fifo(proc, 0, &yuv);
             self.yuv = yuv;
-            if let Err(err) = write {
-                self.encoder_failed(now_ms, format!("video write failed: {err}"));
-                return;
+            match write {
+                Ok(Feed::Queued) => {}
+                // The encoder is behind by more than the queue holds. Shed the
+                // frame and count it: the broadcast comes up one frame short
+                // where it happened, which is a visible, bounded cost the host
+                // can see in the status, unlike a queue that grows until the
+                // VM is out of memory.
+                Ok(Feed::Dropped) => self.dropped_frames += 1,
+                Err(err) => {
+                    self.encoder_failed(now_ms, format!("video write failed: {err}"));
+                    return;
+                }
             }
         }
     }
@@ -731,7 +761,19 @@ impl<H: ProcessHost> Pipeline<H> {
     /// - `nal-hrd=cbr` with min=max=target is what Twitch means by CBR,
     /// - `keyint=min-keyint=fps*2` with `scenecut=0` pins keyframes to
     ///   exactly 2 s, which both platforms require,
-    /// - AAC-LC at 48 kHz because no platform accepts Opus.
+    /// - AAC-LC at 48 kHz because no platform accepts Opus,
+    /// - `-probesize`/`-analyzeduration` on both inputs, which is not a
+    ///   preference either.
+    ///
+    /// That last one is the difference between a stream and a stall. ffmpeg
+    /// analyses each input before it starts, and its default budget for a
+    /// stream with no duration is five seconds of *content*. Off a file that is
+    /// a few milliseconds of reading; off a live pipe it is five seconds of
+    /// waiting, during which ffmpeg reads one video frame and then nothing but
+    /// audio. That is the read pattern that used to deadlock us, and with the
+    /// deadlock fixed it still cost the first five seconds of every broadcast
+    /// as dropped frames. Both inputs are fully described right here in argv,
+    /// so there is nothing to analyse: the floor of 32 bytes and no duration.
     fn encoder_spec(&self) -> ProcSpec {
         let fifo = self.work_fifo();
         let gop = self.cfg.fps * self.cfg.keyframe_secs;
@@ -751,6 +793,10 @@ impl<H: ProcessHost> Pipeline<H> {
             format!("{}x{}", self.cfg.width, self.cfg.height),
             "-framerate".to_owned(),
             self.cfg.fps.to_string(),
+            "-probesize".to_owned(),
+            PROBESIZE.to_owned(),
+            "-analyzeduration".to_owned(),
+            "0".to_owned(),
             "-i".to_owned(),
             fifo.to_string_lossy().into_owned(),
             // Audio: s16le on stdin. Two raw inputs cannot share one stdin,
@@ -761,6 +807,10 @@ impl<H: ProcessHost> Pipeline<H> {
             crate::SAMPLE_RATE.to_string(),
             "-ac".to_owned(),
             "2".to_owned(),
+            "-probesize".to_owned(),
+            PROBESIZE.to_owned(),
+            "-analyzeduration".to_owned(),
+            "0".to_owned(),
             "-i".to_owned(),
             "pipe:0".to_owned(),
             "-map".to_owned(),
@@ -1242,6 +1292,46 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_the_encoder_cannot_take_is_dropped_and_counted_not_buffered() {
+        let mut p = pipeline("backpressure");
+        p.apply(0, StreamOp::Start).unwrap();
+        p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
+        let encoder = p.host().find_live("encoder").unwrap();
+        let audio = [0.0f32; 240];
+        for tick in 0..40 {
+            p.push_tick(tick, &audio, &Levels::default());
+        }
+        assert_eq!(p.dropped_frames(), 0);
+
+        // The encoder's video queue hits its cap. Frames come back refused.
+        p.host_mut().fill_fifo(encoder, true);
+        let before = p.host().fifo_bytes(encoder);
+        for tick in 40..80 {
+            p.push_tick(tick, &audio, &Levels::default());
+        }
+        assert_eq!(p.dropped_frames(), 3, "three frames were due and refused");
+        assert_eq!(p.host().fifo_dropped(encoder), 3);
+        assert_eq!(
+            p.host().fifo_bytes(encoder),
+            before,
+            "a refused frame must not reach the pipe"
+        );
+        // A refused frame is not a broken encoder: audio keeps flowing, the
+        // process lives, and the host is told through the status.
+        assert_eq!(p.host().stdin_bytes(encoder), 80 * 480);
+        assert!(p.host().live().contains(&encoder));
+        assert_eq!(p.status()[0].dropped_frames, 3);
+
+        // And it recovers on its own once the encoder catches up.
+        p.host_mut().fill_fifo(encoder, false);
+        for tick in 80..120 {
+            p.push_tick(tick, &audio, &Levels::default());
+        }
+        assert_eq!(p.dropped_frames(), 3, "no new drops once it keeps up");
+        assert!(p.host().fifo_bytes(encoder) > before);
+    }
+
+    #[test]
     fn a_broken_encoder_pipe_restarts_the_encode() {
         let mut p = pipeline("pipefail");
         p.apply(0, StreamOp::Start).unwrap();
@@ -1282,6 +1372,16 @@ mod tests {
         let ai = joined.find("s16le").unwrap();
         assert!(vi < ai, "video input must come first");
         assert!(joined.contains("pipe:0"));
+        // Both inputs opt out of stream analysis. Without this ffmpeg spends
+        // the first five seconds of every broadcast waiting to analyse a live
+        // pipe, reading one video frame and nothing else while it does.
+        assert_eq!(
+            joined
+                .matches("-probesize 32 -analyzeduration 0 -i")
+                .count(),
+            2,
+            "both inputs need the analysis opt-out: {joined}"
+        );
         assert_eq!(spec.stdin, Stdin::Pipe);
         assert_eq!(spec.fifos.len(), 1);
         assert!(joined.contains(&spec.fifos[0].to_string_lossy().into_owned()));
