@@ -16,6 +16,17 @@
 //! gigabytes. What lands is then checked against the size the bucket listed,
 //! and a file that came up short is deleted rather than left looking like a
 //! recording.
+//!
+//! # One downloader, two surfaces
+//!
+//! The desktop app's Takes screen fetches takes too, and a second
+//! implementation of this would be a second place to get the traversal guard,
+//! the size check, and the egress quote right. So the pieces are public:
+//! [`recorded_sessions`] and [`takes_for`] to list, [`plan_downloads`] to
+//! decide what is worth paying for, [`quote_for`] to price it, and
+//! [`fetch_takes`] to move the bytes. Progress is the only thing the two
+//! surfaces disagree about, and that is a [`TakeProgress`] the caller brings:
+//! percentages on a terminal here, a bar in the app.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -65,17 +76,32 @@ pub fn ask<W: Write>(out: &mut W) -> Result<bool, CliError> {
 }
 
 /// One object under a session's prefix.
-struct Take {
-    key: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Take {
+    pub key: String,
     /// The key with the session prefix removed: `mix.flac`,
     /// `stems/bass.flac`.
-    name: String,
-    size: u64,
-    last_modified: Option<String>,
+    pub name: String,
+    pub size: u64,
+    pub last_modified: Option<String>,
+}
+
+impl Take {
+    /// True for the broadcast mix, which every recorded take has exactly one
+    /// of. A stem is anything else, and the two are priced apart because
+    /// stems are about five times the bytes.
+    pub fn is_mix(&self) -> bool {
+        self.name.ends_with("-mix.flac")
+    }
+
+    /// The size in the units a bucket bills and reports.
+    pub fn size_display(&self) -> String {
+        human_size(self.size)
+    }
 }
 
 /// Every session this machine knows that recorded to a bucket, oldest first.
-fn recorded_sessions() -> Result<Vec<(SessionState, RecordingRecord)>, CliError> {
+pub fn recorded_sessions() -> Result<Vec<(SessionState, RecordingRecord)>, CliError> {
     let mut out = Vec::new();
     for (_, session) in state::list()? {
         if let Some(record) = state::load_recording(&session.session_id_hex)? {
@@ -87,7 +113,7 @@ fn recorded_sessions() -> Result<Vec<(SessionState, RecordingRecord)>, CliError>
 
 /// Takes under one session's prefix, smallest key first, with the prefix
 /// stripped for display.
-async fn takes_for(
+pub async fn takes_for(
     session: &SessionState,
     record: &RecordingRecord,
     stores: &dyn Stores,
@@ -267,11 +293,7 @@ pub async fn get<W: Write + Send>(
     }
 
     let bytes: u64 = wanted.iter().map(|take| take.size).sum();
-    let quote = EgressQuote::compute(
-        provider_kind(&record.provider)?,
-        &RegionId::new(record.region.clone()),
-        bytes,
-    )?;
+    let quote = quote_for(&record, bytes)?;
     writeln!(
         out,
         "Session {} recorded {} in {} ({}/{}), {}.",
@@ -297,17 +319,10 @@ pub async fn get<W: Write + Send>(
     }
 
     let store = stores.open(&record)?;
-    std::fs::create_dir_all(&dir)?;
-    let terminal = prompt.terminal;
-    let mut fetched = 0u64;
-    for take in &wanted {
-        let path = destination(&dir, take)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let written = fetch_one(store.as_ref(), &record.bucket, take, &path, terminal, out).await?;
-        fetched += written;
-    }
+    let fetched = {
+        let mut progress = Percentages::new(prompt.terminal, &mut *out);
+        fetch_takes(store.as_ref(), &record.bucket, &wanted, &dir, &mut progress).await?
+    };
     writeln!(
         out,
         "{} in {}, {}.",
@@ -323,25 +338,60 @@ pub async fn get<W: Write + Send>(
     Ok(())
 }
 
+/// What a download costs to pull out of one session's bucket.
+///
+/// The provider and region come from the session's own record, so the quote
+/// prices the bucket the takes are actually in.
+pub fn quote_for(record: &RecordingRecord, bytes: u64) -> Result<EgressQuote, CliError> {
+    Ok(EgressQuote::compute(
+        provider_kind(&record.provider)?,
+        &RegionId::new(record.region.clone()),
+        bytes,
+    )?)
+}
+
+/// Streams `takes` into `dir`, one at a time, and returns the bytes that
+/// landed.
+///
+/// The whole download path both surfaces share: the traversal guard on every
+/// name, the parent directories, the size check, and the removal of anything
+/// that came up short.
+pub async fn fetch_takes(
+    store: &dyn jamstream_cloud::ObjectStore,
+    bucket: &str,
+    takes: &[&Take],
+    dir: &Path,
+    progress: &mut dyn TakeProgress,
+) -> Result<u64, CliError> {
+    std::fs::create_dir_all(dir)?;
+    let mut fetched = 0u64;
+    for take in takes {
+        let path = destination(dir, take)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        fetched += fetch_one(store, bucket, take, &path, progress).await?;
+    }
+    Ok(fetched)
+}
+
 /// Streams one take to `path` and proves what landed is the whole object.
-async fn fetch_one<W: Write + Send>(
+pub async fn fetch_one(
     store: &dyn jamstream_cloud::ObjectStore,
     bucket: &str,
     take: &Take,
     path: &Path,
-    terminal: bool,
-    out: &mut W,
+    progress: &mut dyn TakeProgress,
 ) -> Result<u64, CliError> {
     let file = std::fs::File::create(path)?;
+    progress.started(&take.name, take.size)?;
     let mut sink = TakeSink {
         file: std::io::BufWriter::new(file),
         path: path.to_owned(),
         written: 0,
         expected: take.size,
         name: take.name.clone(),
-        next_pct: 0,
-        terminal,
-        out,
+        progress,
     };
     let outcome = store.get(bucket, &take.key, &mut sink).await;
     let written = sink.finish()?;
@@ -366,7 +416,7 @@ async fn fetch_one<W: Write + Send>(
 
 /// What to do about one take that may already be on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
+pub enum Action {
     Fetch,
     /// Already here at exactly the size the bucket lists.
     Have,
@@ -377,7 +427,7 @@ enum Action {
 /// The server writes takes under a sanitized prefix, but the bucket belongs to
 /// the host and an object store key is an arbitrary string: `..` in one is a
 /// valid key and would be a write into somebody's home directory.
-fn destination(dir: &Path, take: &Take) -> Result<PathBuf, CliError> {
+pub fn destination(dir: &Path, take: &Take) -> Result<PathBuf, CliError> {
     let relative = Path::new(&take.name);
     let contained = !take.name.is_empty()
         && relative
@@ -396,7 +446,7 @@ fn destination(dir: &Path, take: &Take) -> Result<PathBuf, CliError> {
 /// Decides each take's fate before any egress is spent. A local file of a
 /// different size is a conflict rather than something to overwrite, because
 /// it may be the only copy of an edit.
-fn plan_downloads(takes: &[Take], dir: &Path) -> Result<Vec<Action>, CliError> {
+pub fn plan_downloads(takes: &[Take], dir: &Path) -> Result<Vec<Action>, CliError> {
     let mut plan = Vec::with_capacity(takes.len());
     for take in takes {
         let path = destination(dir, take)?;
@@ -475,7 +525,7 @@ fn plural(n: usize, what: &str) -> String {
 }
 
 /// Decimal units, because that is how a bucket bills and reports.
-fn human_size(bytes: u64) -> String {
+pub fn human_size(bytes: u64) -> String {
     let round = |num: u64, den: u64| (num + den / 2) / den;
     if bytes >= 1_000_000_000 {
         let centi = round(bytes, 10_000_000);
@@ -508,65 +558,115 @@ fn short_time(raw: Option<&str>) -> String {
     raw.to_owned()
 }
 
-/// Writes one take to disk, reporting progress as it goes.
+/// Where a download says how far it has got.
 ///
-/// Progress is percentages on their own lines rather than a redrawn bar, so a
-/// log or a pipe reads the same as a terminal; a terminal gets the same
-/// percentages redrawn in place.
-struct TakeSink<'a, W: Write> {
+/// A take is hundreds of megabytes, so something has to move while it lands.
+/// What that something is differs by surface and nothing else does: this
+/// command prints percentages, the app moves a bar, so the download engine
+/// takes one of these rather than a writer.
+pub trait TakeProgress: Send {
+    /// A take is about to be written, of `expected` bytes. Called once, before
+    /// any of it lands.
+    fn started(&mut self, _take: &str, _expected: u64) -> Result<(), CliError> {
+        Ok(())
+    }
+
+    /// `written` bytes of `take` are on disk, of `expected`. Called per chunk,
+    /// so an implementation that draws has to rate limit itself.
+    fn advanced(&mut self, take: &str, written: u64, expected: u64) -> Result<(), CliError>;
+
+    /// The take is closed and flushed. Reached even when it came up short, so
+    /// this must not claim the take arrived.
+    fn finished(&mut self, _take: &str, _written: u64) -> Result<(), CliError> {
+        Ok(())
+    }
+}
+
+/// Progress as percentages, which is what a terminal and a log both read.
+///
+/// Percentages on their own lines rather than a redrawn bar, so a log or a
+/// pipe reads the same as a terminal; a terminal gets the same percentages
+/// redrawn in place.
+pub struct Percentages<'a, W: Write> {
+    terminal: bool,
+    next_pct: u64,
+    out: &'a mut W,
+}
+
+impl<'a, W: Write> Percentages<'a, W> {
+    pub fn new(terminal: bool, out: &'a mut W) -> Percentages<'a, W> {
+        Percentages {
+            terminal,
+            next_pct: 0,
+            out,
+        }
+    }
+}
+
+impl<W: Write + Send> TakeProgress for Percentages<'_, W> {
+    fn started(&mut self, _take: &str, _expected: u64) -> Result<(), CliError> {
+        self.next_pct = 0;
+        Ok(())
+    }
+
+    fn advanced(&mut self, take: &str, written: u64, expected: u64) -> Result<(), CliError> {
+        let pct = if expected == 0 {
+            100
+        } else {
+            (written.saturating_mul(100) / expected).min(100)
+        };
+        if pct < self.next_pct {
+            return Ok(());
+        }
+        self.next_pct = pct - pct % PROGRESS_STEP + PROGRESS_STEP;
+        let line = format!("  {take:<40} {pct:>3}%");
+        if self.terminal {
+            write!(self.out, "\r{line}")?;
+            self.out.flush()?;
+        } else {
+            writeln!(self.out, "{line}")?;
+        }
+        Ok(())
+    }
+
+    fn finished(&mut self, _take: &str, _written: u64) -> Result<(), CliError> {
+        if self.terminal {
+            writeln!(self.out)?;
+        }
+        Ok(())
+    }
+}
+
+/// Writes one take to disk, reporting progress as it goes.
+struct TakeSink<'a> {
     file: std::io::BufWriter<std::fs::File>,
     path: PathBuf,
     written: u64,
     expected: u64,
     name: String,
-    next_pct: u64,
-    terminal: bool,
-    out: &'a mut W,
+    progress: &'a mut dyn TakeProgress,
 }
 
 #[async_trait]
-impl<W: Write + Send> ChunkSink for TakeSink<'_, W> {
+impl ChunkSink for TakeSink<'_> {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
         self.file
             .write_all(chunk)
             .map_err(|e| ProviderError::Other(format!("writing {}: {e}", self.path.display())))?;
         self.written += chunk.len() as u64;
-        self.report()
+        self.progress
+            .advanced(&self.name, self.written, self.expected)
             .map_err(|e| ProviderError::Other(format!("reporting progress: {e}")))
     }
 }
 
-impl<W: Write> TakeSink<'_, W> {
-    fn percent(&self) -> u64 {
-        if self.expected == 0 {
-            return 100;
-        }
-        (self.written.saturating_mul(100) / self.expected).min(100)
-    }
-
-    fn report(&mut self) -> std::io::Result<()> {
-        let pct = self.percent();
-        if pct < self.next_pct {
-            return Ok(());
-        }
-        self.next_pct = pct - pct % PROGRESS_STEP + PROGRESS_STEP;
-        let line = format!("  {:<40} {:>3}%", self.name, pct);
-        if self.terminal {
-            write!(self.out, "\r{line}")?;
-            self.out.flush()
-        } else {
-            writeln!(self.out, "{line}")
-        }
-    }
-
+impl TakeSink<'_> {
     /// Flushes to disk and returns what was written. `sync_all` is the point:
-    /// the size check below has to see the bytes, not a buffer.
+    /// the size check above has to see the bytes, not a buffer.
     fn finish(mut self) -> Result<u64, CliError> {
-        if self.terminal {
-            writeln!(self.out)?;
-        }
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
+        self.progress.finished(&self.name, self.written)?;
         Ok(self.written)
     }
 }
@@ -700,15 +800,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mix.flac");
         let mut out: Vec<u8> = Vec::new();
+        let mut progress = Percentages::new(false, &mut out);
         let mut sink = TakeSink {
             file: std::io::BufWriter::new(std::fs::File::create(&path).unwrap()),
             path: path.clone(),
             written: 0,
             expected: 100,
             name: "mix.flac".to_owned(),
-            next_pct: 0,
-            terminal: false,
-            out: &mut out,
+            progress: &mut progress,
         };
         for _ in 0..10 {
             sink.write_chunk(&[7u8; 10]).await.unwrap();
@@ -726,5 +825,49 @@ mod tests {
             "one line per step, not one per chunk: {text}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The counter restarts per take, so the second take of a download reports
+    /// its own percentages rather than picking up where the first stopped.
+    #[tokio::test]
+    async fn each_take_reports_from_zero() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut progress = Percentages::new(false, &mut out);
+        for name in ["mix.flac", "stems/bass.flac"] {
+            progress.started(name, 100).unwrap();
+            for step in 1..=10u64 {
+                progress.advanced(name, step * 10, 100).unwrap();
+            }
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.matches("100%").count(),
+            2,
+            "both takes must reach 100 percent: {text}"
+        );
+        assert_eq!(text.lines().count(), 20, "{text}");
+    }
+
+    /// A mix is one object per take and the rest are stems, and the two are
+    /// priced apart, so the row has to be able to tell them apart by name.
+    #[test]
+    fn the_mix_is_named_apart_from_the_stems() {
+        let take = |name: &str| Take {
+            key: format!("jamstream/recordings/s1/{name}"),
+            name: name.to_owned(),
+            size: 4,
+            last_modified: None,
+        };
+        assert!(take("jamstream-2026-07-28-1930-mix.flac").is_mix());
+        assert!(!take("jamstream-2026-07-28-1930-Ana.flac").is_mix());
+        assert!(!take("stems/bass.flac").is_mix());
+        assert_eq!(
+            Take {
+                size: 1_382_400_044,
+                ..take("mix.flac")
+            }
+            .size_display(),
+            "1.38 GB"
+        );
     }
 }
