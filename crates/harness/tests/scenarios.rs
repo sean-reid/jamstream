@@ -1082,6 +1082,27 @@ fn latency_at_capacity() {
 // 339 us. With the pre-#78 per-listener broadcast encode restored: 4357 us and
 // 300 us, ratio 14.53. The ratio gate at 5 sits 2.5x above what the fanout
 // costs today and 2.9x below what one extra per-listener encode costs.
+//
+// And on the ci runners, which is where the budget is actually checked. These
+// are the first numbers this gate ever published: a passing test's output went
+// nowhere until #276, which is how #239 came to calibrate against an estimate.
+// Runner multiplier 4, so a 10000 us budget. Three runs per platform, so the
+// spread below is run-to-run variation on an idle runner and not a
+// distribution:
+//
+//   ubuntu-latest    median  675 to 825   p99  714 to  875    7 to  9% of budget
+//   macos-latest     median  681 to 744   p99  897 to 1663    9 to 17% of budget
+//   windows-latest   median  705 to 895   p99 1042 to 1092   10 to 11% of budget
+//
+// macos is the loose one, up to 2.4x its own median even with the runner to
+// itself, and windows is now the steadiest of the three. If this gate ever
+// needs a per-platform allowance it will be for macos, which is not where
+// anybody was looking.
+//
+// The same Windows runner, measured while the rest of the suite was running:
+// median 1213 us, p99 19251 us, max 33057 us, 193% of budget. The median
+// barely moved and the tail moved seventeen fold. That is why the two timed
+// gates get the runner to themselves and why the budget did not change.
 #[test]
 fn tick_budget_at_capacity() {
     // 20 ms broadcast frame accumulated over 2.5 ms master ticks.
