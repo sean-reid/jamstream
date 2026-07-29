@@ -11,6 +11,7 @@
 //! crate that cannot be faked: feeding two pipes to one process without
 //! deadlocking. See [`StdProcessHost`].
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -162,6 +163,18 @@ pub trait ProcessHost {
 /// [`AUDIO_QUEUE_BYTES`] and is bounded instead by [`STALL`]: either queue
 /// over its cap for that long is a child that has stopped consuming, and a
 /// broken feed the supervisor restarts.
+///
+/// ## Why a child's stderr is read rather than inherited
+///
+/// ffmpeg's one-line errors are the most useful thing in the log when a
+/// platform refuses a key, and they used to be inherited straight to ours for
+/// that reason. The trouble is what a refused connect prints: ffmpeg names its
+/// output URL, and for a pusher the stream key is in that URL. So the one
+/// message worth keeping was also the one message that put a key into journald
+/// on the session VM and into the local provider's per-session log (#204).
+///
+/// Each child's stderr is a pipe now, read by a thread that redacts every URL
+/// and logs what is left against the child's label. See [`redact`].
 #[derive(Debug, Default)]
 pub struct StdProcessHost {
     next_id: ProcId,
@@ -174,6 +187,10 @@ struct Live {
     stdin: Option<Feeder>,
     fifos: Vec<Feeder>,
     fifo_paths: Vec<PathBuf>,
+    /// The thread draining this child's stderr. It ends at end of stream,
+    /// which is when the child's write end closes, so it is joined after the
+    /// child is reaped and never before.
+    stderr: Option<std::thread::JoinHandle<()>>,
     /// We feed this process, so closing our write ends is an end-of-stream it
     /// can act on: give it a moment to flush before the signal. A pusher has
     /// nothing to flush and no reason to wait.
@@ -392,6 +409,100 @@ fn drain(queue: &Queue, mut sink: Box<dyn io::Write + Send>) {
     // stream the child needs to finish its file.
 }
 
+/// What replaces the tail of a URL in a child's stderr.
+const REDACTED: &str = "<redacted>";
+
+/// Longest stderr line kept, in bytes. ffmpeg at `-loglevel error` writes
+/// short lines; anything longer is a child misbehaving, and the tail of it is
+/// dropped rather than buffered without a bound.
+const STDERR_LINE_CAP: usize = 2_048;
+
+/// Strips everything after `scheme://` in one line of a child's stderr.
+///
+/// The line is worth keeping and the URL in it is not: `Failed to connect to
+/// rtmps://host/app/KEY: Connection refused` is the diagnosis, and `KEY` is a
+/// stream key. Redacting the URL keeps the diagnosis.
+///
+/// Nothing after `://` survives, not even the host. A host is not a secret,
+/// but `user:pass@host` and `?key=...` are, and a redactor that has to decide
+/// which part of an authority is safe is a redactor with a bug waiting in it.
+/// Nothing is lost either way: which destination this is comes from the label
+/// the line is logged against, not from the URL.
+fn redact(line: &str) -> Cow<'_, str> {
+    if !line.contains("://") {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("://") {
+        // Up to and including the separator, so the scheme stays readable.
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        out.push_str(REDACTED);
+        // The URL runs to the next whitespace. Punctuation ffmpeg puts after
+        // it goes too, since a port makes `:` no delimiter at all.
+        match tail.find(char::is_whitespace) {
+            Some(end) => rest = &tail[end..],
+            None => return Cow::Owned(out),
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// Reads one line of at most [`STDERR_LINE_CAP`] bytes into `line`, without
+/// the newline. `Ok(false)` is end of stream.
+///
+/// Bytes past the cap are discarded along with the rest of that line rather
+/// than emitted as a line of their own. A cut in the middle of a URL would
+/// otherwise hand the tail of it, key included, to [`redact`] with no scheme
+/// left in it to recognise.
+fn read_capped_line(reader: &mut impl io::BufRead, line: &mut Vec<u8>) -> io::Result<bool> {
+    line.clear();
+    let mut any = false;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(any);
+        }
+        any = true;
+        let (chunk, consumed, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(at) => (&buf[..at], at + 1, true),
+            None => (buf, buf.len(), false),
+        };
+        let room = STDERR_LINE_CAP.saturating_sub(line.len());
+        line.extend_from_slice(&chunk[..room.min(chunk.len())]);
+        reader.consume(consumed);
+        if done {
+            return Ok(true);
+        }
+    }
+}
+
+/// Drains a child's stderr, one redacted line at a time, until end of stream.
+///
+/// `emit` is where a line goes; the caller supplies it so a test can prove
+/// what does and does not arrive there.
+fn relay_stderr(mut reader: impl io::BufRead, mut emit: impl FnMut(&str)) {
+    let mut line = Vec::with_capacity(256);
+    loop {
+        match read_capped_line(&mut reader, &mut line) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            // A child whose stderr cannot be read is the supervisor's problem
+            // to notice through its exit, not this thread's to report.
+            Err(_) => return,
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.trim().is_empty() {
+            continue;
+        }
+        emit(redact(text).as_ref());
+    }
+}
+
 impl Drop for StdProcessHost {
     fn drop(&mut self) {
         let ids: Vec<ProcId> = self.procs.keys().copied().collect();
@@ -416,9 +527,9 @@ impl ProcessHost for StdProcessHost {
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args);
         cmd.stdout(Stdio::null());
-        // stderr is inherited: ffmpeg's one-line errors are the most useful
-        // thing in the journal when a platform refuses a key.
-        cmd.stderr(Stdio::inherit());
+        // Piped, not inherited: a refused connect names the output URL, and a
+        // pusher's URL holds its stream key. See the note on [`StdProcessHost`].
+        cmd.stderr(Stdio::piped());
         match &spec.stdin {
             Stdin::Pipe => {
                 cmd.stdin(Stdio::piped());
@@ -444,9 +555,16 @@ impl ProcessHost for StdProcessHost {
         // Every pipe gets its own writer from here on. Anything that fails
         // while wiring them up takes the child and the FIFOs with it, so a
         // half-connected encoder is never handed back as running.
-        let abandon = |child: &mut std::process::Child, feeders: Vec<Feeder>| {
+        let abandon = |child: &mut std::process::Child,
+                       feeders: Vec<Feeder>,
+                       stderr: Option<std::thread::JoinHandle<()>>| {
             let _ = child.kill();
             let _ = child.wait();
+            // The child held the only write end, so the reader is at end of
+            // stream by now and this join returns.
+            if let Some(join) = stderr {
+                let _ = join.join();
+            }
             for feeder in feeders {
                 feeder.close();
                 feeder.finish();
@@ -454,6 +572,29 @@ impl ProcessHost for StdProcessHost {
             for path in &spec.fifos {
                 let _ = std::fs::remove_file(path);
             }
+        };
+
+        // Before any feeder, because a child with nobody reading its stderr
+        // blocks in `write` once the pipe fills and stops encoding.
+        let stderr = match child.stderr.take() {
+            Some(pipe) => {
+                let label = spec.label.clone();
+                let started = std::thread::Builder::new()
+                    .name(format!("jamstream-stderr-{}", spec.label))
+                    .spawn(move || {
+                        relay_stderr(io::BufReader::new(pipe), |line| {
+                            tracing::warn!(child = %label, "{line}");
+                        });
+                    });
+                match started {
+                    Ok(join) => Some(join),
+                    Err(err) => {
+                        abandon(&mut child, Vec::new(), None);
+                        return Err(err);
+                    }
+                }
+            }
+            None => None,
         };
 
         let stdin = match child.stdin.take() {
@@ -465,7 +606,7 @@ impl ProcessHost for StdProcessHost {
             ) {
                 Ok(feeder) => Some(feeder),
                 Err(err) => {
-                    abandon(&mut child, Vec::new());
+                    abandon(&mut child, Vec::new(), stderr);
                     return Err(err);
                 }
             },
@@ -486,7 +627,7 @@ impl ProcessHost for StdProcessHost {
                 Ok(feeder) => fifos.push(feeder),
                 Err(err) => {
                     fifos.extend(stdin);
-                    abandon(&mut child, fifos);
+                    abandon(&mut child, fifos, stderr);
                     return Err(err);
                 }
             }
@@ -502,6 +643,7 @@ impl ProcessHost for StdProcessHost {
                 stdin,
                 fifos,
                 fifo_paths: spec.fifos.clone(),
+                stderr,
                 drains_on_eof,
             },
         );
@@ -588,6 +730,11 @@ impl ProcessHost for StdProcessHost {
         // and it is what guarantees no thread outlives the process it feeds.
         for feeder in feeders {
             feeder.finish();
+        }
+        // Same reasoning in the other direction: the child held the only write
+        // end of its stderr, so the reader is at end of stream and returns.
+        if let Some(join) = live.stderr.take() {
+            let _ = join.join();
         }
         for path in &live.fifo_paths {
             let _ = std::fs::remove_file(path);
@@ -944,5 +1091,94 @@ mod tests {
         assert!(spec.mentions("JS_INGEST"));
         // An empty needle never matches, so a keyless spec cannot false-positive.
         assert!(!spec.mentions(""));
+    }
+
+    /// Everything the relay is for: the line ffmpeg writes when a platform
+    /// refuses a key is the line that contains the key.
+    #[test]
+    fn a_key_in_a_refused_connect_does_not_reach_the_sink() {
+        const KEY: &str = "live_918273645_TZq0cVnB4kLsX";
+        let stderr = format!(
+            "[flv @ 0x55d1c0a2f480] Failed to connect to \
+             rtmps://ingest.twitch.tv/app/{KEY}: Connection refused\n\
+             [out#0/flv @ 0x55d1c0a31200] Could not write header: Broken pipe\n"
+        );
+
+        let mut got: Vec<String> = Vec::new();
+        relay_stderr(io::Cursor::new(stderr), |line| got.push(line.to_owned()));
+
+        let all = got.join("\n");
+        assert!(!all.contains(KEY), "the key reached the sink: {all}");
+        assert!(!all.contains("ingest.twitch.tv"), "{all}");
+        // And the diagnosis survived, which is the only reason to read stderr
+        // at all rather than send it to /dev/null.
+        assert_eq!(
+            got,
+            vec![
+                "[flv @ 0x55d1c0a2f480] Failed to connect to rtmps://<redacted> \
+                 Connection refused"
+                    .to_owned(),
+                "[out#0/flv @ 0x55d1c0a31200] Could not write header: Broken pipe".to_owned(),
+            ]
+        );
+    }
+
+    /// A line with no URL in it is passed through untouched, so redaction
+    /// costs nothing in the ordinary case.
+    #[test]
+    fn a_line_without_a_url_arrives_verbatim() {
+        let stderr = "[libx264 @ 0x1] VBV buffer size 0 too small, using 2500\n\
+                      Conversion failed!\n";
+        let mut got: Vec<String> = Vec::new();
+        relay_stderr(io::Cursor::new(stderr), |line| got.push(line.to_owned()));
+        assert_eq!(
+            got,
+            vec![
+                "[libx264 @ 0x1] VBV buffer size 0 too small, using 2500".to_owned(),
+                "Conversion failed!".to_owned(),
+            ]
+        );
+    }
+
+    /// Redaction runs to the end of the URL and no further, several times a
+    /// line if it has to, and a line that is only a URL still logs its scheme.
+    #[test]
+    fn redaction_stops_at_the_end_of_each_url() {
+        assert_eq!(
+            redact("rtmp://relay/in to rtmps://out/app/k failed"),
+            "rtmp://<redacted> to rtmps://<redacted> failed"
+        );
+        assert_eq!(redact("rtmps://host/app/secret"), "rtmps://<redacted>");
+        assert_eq!(redact("no url here"), "no url here");
+        assert_eq!(redact(""), "");
+    }
+
+    /// A line longer than the cap loses its tail rather than arriving as a
+    /// second line. Split in the middle of a URL, that second line would have
+    /// carried the key with no scheme left in it to redact.
+    #[test]
+    fn an_overlong_line_is_truncated_rather_than_split() {
+        const KEY: &str = "live_5551212_dontLogMe";
+        let padding = "x".repeat(STDERR_LINE_CAP);
+        let stderr = format!("{padding} rtmps://ingest.example/app/{KEY}\nshort line\n");
+
+        let mut got: Vec<String> = Vec::new();
+        relay_stderr(io::Cursor::new(stderr), |line| got.push(line.to_owned()));
+
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].len(), STDERR_LINE_CAP);
+        assert!(!got[0].contains(KEY));
+        // The next line is still read: the tail was discarded, not the stream.
+        assert_eq!(got[1], "short line");
+    }
+
+    /// Invalid UTF-8 and a missing final newline are both a child's business,
+    /// not a reason to lose the line or hang waiting for one.
+    #[test]
+    fn a_partial_line_of_invalid_utf8_still_arrives() {
+        let stderr: Vec<u8> = b"caf\xff done".to_vec();
+        let mut got: Vec<String> = Vec::new();
+        relay_stderr(io::Cursor::new(stderr), |line| got.push(line.to_owned()));
+        assert_eq!(got, vec!["caf\u{fffd} done".to_owned()]);
     }
 }
