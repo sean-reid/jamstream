@@ -105,21 +105,12 @@ impl Block {
 }
 
 impl DevicesScreen {
-    /// The full-screen route: a focused column like home and the wizard.
-    pub fn ui(
-        &mut self,
-        ui: &mut Ui,
-        catalog: &DeviceCatalog,
-        levels: &LevelsView,
-        mouth_to_ear_ms: Option<f32>,
-    ) {
-        let room = ui.available_height();
-        theme::focused_column(ui, 560.0, room, |ui, _| {
-            self.audio_ui(ui, Block::Panel, catalog, levels, mouth_to_ear_ms)
-        });
-    }
-
-    /// The audio blocks; also embedded in the settings drawer.
+    /// The audio blocks, as the settings drawer's Audio tab.
+    ///
+    /// There is no full-screen route any more. It was reachable from nothing
+    /// but a snapshot fixture, which made its baseline a picture of dead code
+    /// (#191); the tab is where these controls have lived since the drawer
+    /// existed, and it is reachable from every screen.
     ///
     /// Buffer size and the input meter come first because they are what a
     /// musician reaches for mid session, by ear and by meter, while the

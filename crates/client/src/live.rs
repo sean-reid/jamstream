@@ -272,10 +272,17 @@ impl Driver {
         }
     }
 
+    /// Whether the stream is dead and wants reopening.
+    ///
+    /// The offline arm answered a flat `false`, so `WavStream::errored` was
+    /// never read and the device-gone path in [`Worker::check_stream`] was
+    /// unreachable in every test: the only backend a test can drive could not
+    /// report a lost device, and the only backend that could report one needs
+    /// hardware to unplug.
     fn errored(&self) -> bool {
         match self {
             Driver::Real { handle, .. } => handle.as_ref().is_some_and(|h| h.errored()),
-            Driver::Offline { .. } => false,
+            Driver::Offline { stream, .. } => stream.as_ref().is_some_and(|s| s.errored()),
         }
     }
 

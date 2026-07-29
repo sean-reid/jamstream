@@ -48,9 +48,22 @@ fn host_harness_sized(size: egui::Vec2) -> Harness<'static> {
     host_harness_lamps(size, Lamps::Both)
 }
 
-/// An invite book with no invites in it: enough for the toggle to render,
-/// which is all these layout tests need from it.
+/// An invite book with no invites in it, and a key that can mint one.
+///
+/// The key is not decoration. `Mint invite` and `New link` sign with it, and
+/// this fixture used to set it to an empty string, so both buttons errored
+/// wherever it was used and nothing noticed (#218).
 fn empty_invites() -> jamstream_client::screens::invites::InvitesPanel {
+    invite_book(Vec::new(), "empty")
+}
+
+/// An invite book over `invites`, with a working issuer key, on a state file of
+/// its own so a mint or a revoke here cannot rewrite another test's.
+fn invite_book(
+    invites: Vec<jamstream_cli::state::InviteRecord>,
+    label: &str,
+) -> jamstream_client::screens::invites::InvitesPanel {
+    let issuer = jamstream_protocol::invite::Issuer::from_bytes(&[7u8; 32]);
     let state = jamstream_cli::state::SessionState {
         session_id_hex: "a3".repeat(16),
         provider: "local".to_owned(),
@@ -59,14 +72,86 @@ fn empty_invites() -> jamstream_client::screens::invites::InvitesPanel {
         address: "203.0.113.10:43210".to_owned(),
         created_unix: 1_784_000_000,
         hourly_microusd: 0,
-        issuer_private_key_b64: String::new(),
-        server_public_key_b64: String::new(),
-        invites: Vec::new(),
+        issuer_private_key_b64: data_encoding::BASE64.encode(&issuer.to_bytes()),
+        server_public_key_b64: data_encoding::BASE64.encode(&[9u8; 32]),
+        invites,
         status: jamstream_cli::state::SessionStatus::Running,
         ended_unix: None,
     };
-    let path = std::env::temp_dir().join("jamstream-interaction-invites.json");
+    let path = std::env::temp_dir().join(format!(
+        "jamstream-interaction-invites-{label}-{}.json",
+        std::process::id()
+    ));
     jamstream_client::screens::invites::InvitesPanel::new(state, path)
+}
+
+/// The two buttons in the invites panel that sign something, pressed.
+///
+/// Neither had ever been clicked. Every fixture in the suite set
+/// `issuer_private_key_b64` to an empty string, so both would have failed on
+/// the state file's key and put a red line under the mint row, and one of those
+/// fixtures is the published `session_invites.png` (#218). This drives them
+/// through the real app shell and asserts on the seats that come out.
+#[test]
+fn minting_and_refilling_a_seat_work_in_the_fixtures_state() {
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    let rt_ui = rt.clone();
+    let mut app = jamstream_client::app::JamApp::in_memory();
+    app.recent = Vec::new();
+    app.session.invites = Some(invite_book(Vec::new(), "mint"));
+    app.runtime = Some(Box::new(rt_ui));
+    app.screen = jamstream_client::app::Screen::Session;
+    app.settings_open = true;
+    app.settings_tab = SettingsTab::Invites;
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(2);
+
+    // Mint one. A seat appears, and no red line appears under the row.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Mint invite")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label_contains("issuer key").is_none(),
+        "Mint invite could not sign with the fixture's own key"
+    );
+    assert!(harness.query_by_label("Copy link").is_some());
+
+    // Revoke it, which frees the seat and puts New link on the row. The mixer
+    // strips behind the drawer carry a Revoke each, so this is the rightmost
+    // one, which is the seat's.
+    let seat_revoke = harness
+        .get_all_by_label("Revoke")
+        .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+        .expect("the seat's Revoke");
+    seat_revoke.click();
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(AkRole::Button, "Revoke invite")
+        .click();
+    harness.run_steps(2);
+    assert!(harness.get_all_by_label_contains("free").count() > 0);
+
+    // And New link mints straight back into the same seat.
+    harness.get_by_label("New link").click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("New link").is_none(),
+        "New link left the seat free"
+    );
+    assert!(harness.query_by_label("Copy link").is_some());
+
+    // The seat counts on screen agree that a musician seat is taken.
+    assert!(harness.query_by_label_contains("musicians").is_some());
 }
 
 /// Every window size the app can be in: its 800x600 minimum, its default,

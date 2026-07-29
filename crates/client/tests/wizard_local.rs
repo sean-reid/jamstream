@@ -1,10 +1,17 @@
 //! The wizard-to-real-session story, end to end through the production
 //! wizard code: provider local in a temp state dir, launch through the
 //! executor-backed job (real jamstreamd spawned, real reachability
-//! handshake), auto-join with the host invite over the offline WAV backend
-//! (the app path minus the sound card), the invites panel model listing
-//! the right labels with tokens, a revoke the server then enforces against
-//! a real join attempt, and end-session destroying the process.
+//! handshake), auto-join with the host invite, the invites panel model
+//! listing the right labels with tokens, a revoke the server then enforces
+//! against a real join attempt, and end-session destroying the process.
+//!
+//! The join and the end go through `JamApp::enter_hosted_session` and
+//! `JamApp::end_session`, the functions the app itself calls, with the only
+//! substitution being the offline WAV backend in place of the sound card.
+//! This file used to re-implement the body of the first of those by hand, so
+//! the app could have stopped wrapping the runtime in `CostedRuntime`, losing
+//! the cost meter and leaving the mixer's Revoke pointing at nothing, and
+//! every test here would still have passed (#218).
 //!
 //! One test function: the state directory and JAMSTREAMD_PATH overrides
 //! are process-global environment.
@@ -14,13 +21,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jamstream_audio_io::WavBackend;
+use jamstream_client::app::{JamApp, Screen};
 use jamstream_client::creds::{EnvReader, MemStore};
 use jamstream_client::exec::Executor;
-use jamstream_client::live::{AudioSettings, CostedRuntime, LiveRuntime};
+use jamstream_client::live::{AudioSettings, LiveRuntime};
 use jamstream_client::runtime::{Command, ConnState, RecordState, Runtime, Snapshot, TokenId};
 use jamstream_client::screens::host::{HostWizard, WizardEvent, WizardStep};
-use jamstream_client::screens::invites::{self, InvitesPanel, Seat};
+use jamstream_client::screens::invites::{InvitesPanel, Seat};
 use jamstream_client::screens::recording::RecordingChoice;
+use jamstream_client::screens::session::SettingsTab;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId};
 use jamstream_protocol::invite::Invite;
 
@@ -207,25 +216,38 @@ async fn wizard_hosts_a_real_local_session() {
     assert_eq!(outcome.state.invites[0].role, "host");
     assert!(outcome.state_path.is_file(), "state file must exist");
 
-    // Auto-join with the host invite, as the app does (offline backend in
-    // place of the sound card), wrapped the same way the app wraps it.
-    let mut panel = InvitesPanel::new(outcome.state.clone(), outcome.state_path.clone());
-    let host_invite = Invite::decode(&outcome.state.invites[0].invite).expect("host invite");
-    let live = Arc::new(
-        LiveRuntime::join_offline(&host_invite, settings(), WavBackend::new(None, None))
-            .expect("host join"),
+    // Auto-join with the host invite through the app's own entry point, with
+    // the offline WAV backend in place of the sound card and nothing else
+    // substituted. Everything asserted below the call is something
+    // `enter_hosted_session` decided, not something this test arranged.
+    let mut app = JamApp::in_memory();
+    app.join = Arc::new(|invite, settings| {
+        LiveRuntime::join_offline(invite, settings, WavBackend::new(None, None))
+    });
+    app.enter_hosted_session(outcome.clone());
+    assert_eq!(
+        app.wizard.launch_error, None,
+        "the app failed to join its own session"
     );
-    let rt = CostedRuntime::new(
-        Arc::clone(&live),
-        outcome.state.hourly_microusd,
-        outcome.state.created_unix,
-        panel.tokens(),
-    );
-    let snap = wait_for(&rt, "host joined", Duration::from_secs(15), |s| {
+    assert_eq!(app.screen, Screen::Session, "the app lands on the session");
+    // The drawer opens on the links, because sharing them is the next act.
+    assert!(app.settings_open);
+    assert_eq!(app.settings_tab, SettingsTab::Invites);
+    // Hosting is the only role that can stream, so only a host gets the panel.
+    assert!(app.session.destinations.is_some());
+
+    // Borrowed back out of the app for the rest of the story, because the app
+    // is the owner: the end below hands it the same runtime and the same book.
+    let owned = app.runtime.take().expect("the app holds the runtime");
+    let mut panel = app.session.invites.take().expect("the invite book");
+    let rt: &dyn Runtime = &*owned;
+    let snap = wait_for(rt, "host joined", Duration::from_secs(15), |s| {
         s.stats.state == ConnState::Joined
     });
     assert!(snap.is_host, "member 0 is the host");
-    // The wrapper injects the cost view and the invite-book token ids.
+    // The CostedRuntime wrapper the app put around the live one: the cost view
+    // and the invite book's token ids are both injected by it, and both are
+    // things a plain join does not have.
     assert!(snap.cost.is_some(), "wizard sessions carry the cost meter");
     assert_eq!(snap.cost.unwrap().hourly_microusd, 0);
     let me = snap
@@ -245,13 +267,13 @@ async fn wizard_hosts_a_real_local_session() {
         "nothing is captured before Record is pressed"
     );
     rt.send(Command::StartRecord);
-    wait_for(&rt, "the take started", Duration::from_secs(10), |s| {
+    wait_for(rt, "the take started", Duration::from_secs(10), |s| {
         s.record.state == RecordState::Recording
     });
     // Long enough for the recorder to see ticks and write frames.
     std::thread::sleep(Duration::from_millis(500));
     rt.send(Command::StopRecord);
-    wait_for(&rt, "the take finished", Duration::from_secs(15), |s| {
+    wait_for(rt, "the take finished", Duration::from_secs(15), |s| {
         s.record.state == RecordState::Idle
     });
     // The rename off .part happens on the recorder's own task, so it is waited
@@ -387,17 +409,26 @@ async fn wizard_hosts_a_real_local_session() {
     );
     drop(still_dead);
 
-    // End the session for everyone: leave, destroy through the recorded
-    // provider, mark the state file ended; the process must actually die.
-    rt.send(Command::Leave);
-    wait_for(&rt, "host left", Duration::from_secs(5), |s| {
-        s.stats.state == ConnState::Idle
-    });
+    // End the session for everyone, through the app's own path: it resolves
+    // the provider from the state file's provider name, hands the invite book
+    // to the teardown, drops the runtime, and lands on home.
     let instance_pid = panel.state.instance_id.clone();
-    let provider = jamstream_cli::providers::resolve("local").expect("local provider");
-    invites::end_session(provider.as_ref(), panel.state.clone(), panel.path.clone())
-        .await
-        .expect("end session");
+    app.runtime = Some(owned);
+    app.session.invites = Some(panel);
+    app.end_session();
+    assert!(app.runtime.is_none(), "ending drops the runtime");
+    assert_eq!(app.screen, Screen::Home);
+    assert!(app.ending(), "the teardown runs on the executor");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(result) = app.poll_ending() {
+            result.expect("end session");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the teardown never finished");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(app.home.error, None, "the teardown reported a problem");
 
     let ended = jamstream_cli::state::load(&outcome.state_path).expect("state reloads");
     assert_eq!(ended.status, jamstream_cli::state::SessionStatus::Ended);

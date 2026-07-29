@@ -35,7 +35,44 @@ fn preview_dir() -> PathBuf {
 /// Runs a fixed number of steps (animated widgets never settle), writes the
 /// preview copy, then asserts against the baseline.
 fn snapshot(harness: &mut Harness<'_>, name: &str) {
+    unpublish(name);
     render_and_compare(harness, name);
+}
+
+/// Drops `name` from the manifest if an earlier run put it there.
+///
+/// The manifest is appended to rather than rewritten, because nextest runs each
+/// test in its own process and no one of them owns the whole list, so it was
+/// never truncated: demoting a fixture out of [`snapshot_for_docs`], which is
+/// the act of declaring that an image no longer shows the product honestly,
+/// kept `site/copy-previews.sh --check` passing locally against the line the
+/// previous run left behind (#217). The demotion has to be the thing that
+/// removes the line, so this is that.
+///
+/// Read, filter, rename. The replacement is atomic, so no reader ever sees a
+/// partial list. Two processes doing it at once could lose an append that
+/// landed between the read and the rename, which leaves the manifest a line
+/// short and makes the docs check refuse to publish that image: it fails
+/// closed, never open. And it can only happen on the run straight after a
+/// demotion, because a name the file does not contain is not written at all.
+fn unpublish(name: &str) {
+    let manifest = preview_dir().join("publishable.txt");
+    let Ok(listed) = std::fs::read_to_string(&manifest) else {
+        return;
+    };
+    let line = format!("{name}.png");
+    if !listed.lines().any(|l| l == line) {
+        return;
+    }
+    let kept: String = listed
+        .lines()
+        .filter(|l| *l != line)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let staged = manifest.with_extension(format!("txt.{}", std::process::id()));
+    if std::fs::write(&staged, kept).is_ok() {
+        let _ = std::fs::rename(&staged, &manifest);
+    }
 }
 
 /// Like [`snapshot`], and additionally declares the baseline fit to publish
@@ -211,21 +248,22 @@ fn home_invalid_invite() {
 }
 
 #[test]
+fn home_narrow() {
+    // The smallest window the app opens, on the first screen anyone sees. The
+    // audit rendered this by hand and found it clean; nothing stopped that
+    // changing (#191).
+    let mut app = test_app(Theme::Dark);
+    app.recent = sample_recent();
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "home_narrow");
+}
+
+#[test]
 fn home_light() {
     let mut app = test_app(Theme::Light);
     app.recent = sample_recent();
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_light");
-}
-
-#[test]
-fn devices() {
-    // The frozen demo feeds the input meter a deterministic mid reading.
-    let mut app = test_app(Theme::Dark);
-    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
-    app.screen = Screen::Devices;
-    let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "devices");
 }
 
 #[test]
@@ -237,8 +275,10 @@ fn session_demo() {
 
 #[test]
 fn session_host() {
-    // The full host bar: four sheet toggles, the lamp, the session id, the
-    // timer, the cost, and Leave, beside the readouts on one row.
+    // The full host bar: the session id, the timer, the cost, Record, and
+    // Leave, beside the readouts on one row. This is also the cluster's empty
+    // case, so it reserves nothing and the bar is calm; `session_bar_idle`
+    // used to say that separately and was pixel-identical to this (#191).
     let app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_host");
@@ -390,6 +430,15 @@ fn home_settings() {
     let app = drawer_app(test_app(Theme::Dark), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_settings");
+}
+
+#[test]
+fn home_settings_narrow() {
+    // The drawer at the smallest window with no session behind it: three tabs,
+    // and the body scrolls rather than running past the bottom edge.
+    let app = drawer_app(test_app(Theme::Dark), SettingsTab::Audio);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "home_settings_narrow");
 }
 
 #[test]
@@ -717,8 +766,13 @@ fn live(platform: StreamPlatform) -> (StreamPlatform, DestinationState) {
 fn session_destinations() {
     // Nothing configured and no key anywhere: the empty state says what to do
     // next, and the on air lamp is dark.
+    //
+    // Scrolled, like every other destinations fixture. Unscrolled, this and its
+    // light twin were pixel-identical to the two stream mix baselines, so the
+    // reviewable empty state of Destinations had no image at all (#191).
     let app = destinations_app(Theme::Dark, &[], &[]);
     let mut harness = app_harness(app, WIDE);
+    scroll_drawer(&mut harness, WIDE);
     snapshot(&mut harness, "session_destinations");
 }
 
@@ -726,6 +780,7 @@ fn session_destinations() {
 fn session_destinations_light() {
     let app = destinations_app(Theme::Light, &[], &[]);
     let mut harness = app_harness(app, WIDE);
+    scroll_drawer(&mut harness, WIDE);
     snapshot(&mut harness, "session_destinations_light");
 }
 
@@ -844,14 +899,6 @@ fn session_on_air_musician() {
 // The bar's centre cluster, in the four combinations that matter. The lamps
 // are the loudest thing in the bar when lit and absent when not, so these
 // four are the fixtures the restructure lives or dies on.
-
-#[test]
-fn session_bar_idle() {
-    // Neither lamp lit: the cluster reserves nothing and the bar is calm.
-    let app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
-    let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_bar_idle");
-}
 
 #[test]
 fn session_bar_on_air() {
@@ -1310,6 +1357,35 @@ fn wizard_preview_narrow() {
     snapshot(&mut harness, "wizard_preview_narrow");
 }
 
+// The wizard at the smallest window the app opens. The preview step already
+// had one, because it is the tallest card; these are the other three, and the
+// question each asks is the same one: does the actions row keep the card's
+// bottom edge instead of sitting past the window's (#191).
+
+#[test]
+fn wizard_provider_narrow() {
+    let mut harness = app_harness(wizard_provider_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "wizard_provider_narrow");
+}
+
+#[test]
+fn wizard_setup_digitalocean_narrow() {
+    let mut harness = app_harness(wizard_setup_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "wizard_setup_digitalocean_narrow");
+}
+
+#[test]
+fn wizard_region_narrow() {
+    let mut harness = app_harness(wizard_region_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "wizard_region_narrow");
+}
+
+#[test]
+fn wizard_launching_narrow() {
+    let mut harness = app_harness(wizard_launching_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "wizard_launching_narrow");
+}
+
 #[test]
 fn wizard_launching() {
     wizard_snapshot(wizard_launching_app(Theme::Dark), "wizard_launching");
@@ -1323,6 +1399,16 @@ fn wizard_launching_light() {
 // The invites panel over the host session, fed from a real decodable state
 // record so labels and statuses come through the production path.
 
+/// A state record with a working issuer key.
+///
+/// The key matters. `Mint invite` and `New link` sign with
+/// `state.issuer_private_key_b64`, and every fixture in this file used to set
+/// it to an empty string, so both buttons errored in every one of them and
+/// `session_invites.png` was a published screenshot of a panel with two broken
+/// controls that nothing clicked (#218). It is the fixture's own issuer now,
+/// the same one that minted the seats, and
+/// `interactions.rs::minting_and_refilling_a_seat_work_in_the_fixtures_state`
+/// presses both.
 fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {
     use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
     use jamstream_protocol::invite::{Issuer, Token};
@@ -1356,8 +1442,8 @@ fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {
         address: address.to_string(),
         created_unix: 1_784_000_000,
         hourly_microusd: 0,
-        issuer_private_key_b64: String::new(),
-        server_public_key_b64: String::new(),
+        issuer_private_key_b64: data_encoding::BASE64.encode(&issuer.to_bytes()),
+        server_public_key_b64: data_encoding::BASE64.encode(&server_pk),
         invites: vec![
             mint(0, Role::Musician, "host"),
             mint(1, Role::Musician, "musician 1"),
