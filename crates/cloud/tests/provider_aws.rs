@@ -643,6 +643,62 @@ async fn ssm_ami_resolution_is_cached_per_region() {
     server.verify().await;
 }
 
+/// #223: the default class is t4g.medium, a burstable instance whose credits
+/// a long jam exhausts. Left on the API default credit mode, the box is
+/// clamped to a 20 percent baseline part way through the session, the mix
+/// tick overruns and every client sees latency that only grows.
+///
+/// Asserted on the parsed form rather than a body substring, so the value has
+/// to sit under that exact parameter name.
+#[tokio::test]
+async fn run_instances_asks_for_unlimited_cpu_credits() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", "AmazonSSM.GetParameter"))
+        .respond_with(ssm_parameter_response("ami-0123resolved456789"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=RunInstances"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(RUN_INSTANCES_XML))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    mount_security_group(&server, "sg-jamstream").await;
+
+    let p = provider(&server);
+    let spec = LaunchSpec {
+        instance_class: InstanceClass::Standard,
+        ..launch_spec(&p, "us-east-1")
+    };
+    p.launch(spec).await.unwrap();
+
+    let form = run_instances_form(&server).await;
+    assert_eq!(
+        form.get("InstanceType").map(String::as_str),
+        Some("t4g.medium")
+    );
+    assert_eq!(
+        form.get("CreditSpecification.CpuCredits")
+            .map(String::as_str),
+        Some("unlimited"),
+        "form was {form:?}"
+    );
+}
+
+/// The form parameters of the one RunInstances request the mock server
+/// received, decoded into a map so a test can name a parameter and its value.
+async fn run_instances_form(server: &MockServer) -> HashMap<String, String> {
+    let requests = server.received_requests().await.unwrap();
+    let body = requests
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .find(|b| b.contains("Action=RunInstances"))
+        .expect("a RunInstances request was received");
+    parse_form(&body)
+}
+
 // ---- Generic provider contract against a stateful fake EC2 ----
 
 #[derive(Clone)]
