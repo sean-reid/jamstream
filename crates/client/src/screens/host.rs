@@ -14,11 +14,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use data_encoding::{BASE64, HEXLOWER};
 use egui::{RichText, Ui, vec2};
 use jamstream_cloud::{
     BootConfig, CostPreview, InstanceClass, LaunchSpec, PinnedServerArtifacts, Price, ProbeMatrix,
     Provider, ProviderKind, Region, RegionId, SelfDestruct, ServerArch, rank, session_tag,
 };
+use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::SessionId;
 use jamstream_protocol::invite::{Invite, Issuer};
 use jamstream_protocol::transport::generate_keypair;
@@ -35,11 +37,6 @@ use crate::exec::{Executor, Job};
 use crate::screens::recording::{RecordingChoice, RecordingSetup};
 use crate::theme;
 use crate::widgets::{PICK_INDENT, pick_row, row_cell};
-
-/// Wizard providers in presentation order: local first (no account), then
-/// DigitalOcean as the recommended cloud, then the rest. The mock provider
-/// is deliberately absent; `--demo` exercises the fake session elsewhere.
-pub const WIZARD_PROVIDERS: &[&str] = &["local", "digitalocean", "aws", "gcp"];
 
 /// The UDP port a cloud session listens on. It is the provider's own default
 /// rather than a second copy of the number, because it is also the only port
@@ -88,26 +85,29 @@ pub struct ProviderRow {
 }
 
 /// Provider rows from the credential store with the environment fallback.
+///
+/// The wizard offers [`ProviderKind::ALL`], in that order: local first (no
+/// account), then DigitalOcean as the recommended cloud, then the rest. The
+/// mock provider is deliberately absent, and it is absent from the enum too,
+/// so this cannot forget a fifth provider or invent one.
 pub fn provider_rows(creds: &dyn CredStore, env: &EnvReader) -> Vec<ProviderRow> {
-    WIZARD_PROVIDERS
-        .iter()
-        .map(|name| {
-            let status = if *name == "local" {
-                ProviderStatus::NoAccountNeeded
-            } else if creds::build_provider(name, creds, env).is_ok() {
-                ProviderStatus::Ready
-            } else {
-                ProviderStatus::SetupNeeded
+    ProviderKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let name = kind.as_str();
+            let status = match kind {
+                ProviderKind::Local => ProviderStatus::NoAccountNeeded,
+                _ if creds::build_provider(name, creds, env).is_ok() => ProviderStatus::Ready,
+                _ => ProviderStatus::SetupNeeded,
             };
-            let hint = match *name {
-                "local" => "this computer; free, LAN or port-forwarded guests",
-                "digitalocean" => "recommended cloud: one token, transfer included",
-                "aws" => "more setup; fine if you already use AWS",
-                "gcp" => "most setup steps; egress billed on top",
-                _ => "",
+            let hint = match kind {
+                ProviderKind::Local => "this computer; free, LAN or port-forwarded guests",
+                ProviderKind::DigitalOcean => "recommended cloud: one token, transfer included",
+                ProviderKind::Aws => "more setup; fine if you already use AWS",
+                ProviderKind::Gcp => "most setup steps; egress billed on top",
             };
             ProviderRow {
-                name: (*name).to_owned(),
+                name: name.to_owned(),
                 status,
                 hint: hint.to_owned(),
             }
@@ -308,19 +308,15 @@ impl HostWizard {
     }
 
     pub fn is_local(&self) -> bool {
-        self.selected_provider_name() == Some("local")
+        self.selected_provider_kind() == Some(ProviderKind::Local)
     }
 
     /// The selected provider as the cloud crate names it, for the storage
-    /// lookups that are keyed by provider.
+    /// lookups that are keyed by provider. The row's name came from
+    /// [`ProviderKind::as_str`], so this is that function's own inverse
+    /// rather than a second table of the same four spellings.
     pub fn selected_provider_kind(&self) -> Option<ProviderKind> {
-        match self.selected_provider_name()? {
-            "local" => Some(ProviderKind::Local),
-            "digitalocean" => Some(ProviderKind::DigitalOcean),
-            "aws" => Some(ProviderKind::Aws),
-            "gcp" => Some(ProviderKind::Gcp),
-            _ => None,
-        }
+        self.selected_provider_name()?.parse().ok()
     }
 
     /// Why this session cannot record, if it cannot. A local session records to
@@ -1192,7 +1188,7 @@ async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), String> 
     let now = || start.elapsed().as_millis() as u64;
     let (mut core, init) = ClientCore::connect(invite, now()).map_err(|e| e.to_string())?;
     socket.send(&init).await.map_err(|e| e.to_string())?;
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; MAX_DATAGRAM_BYTES];
     while start.elapsed() < cap {
         for pkt in core.poll(now()) {
             socket.send(&pkt).await.map_err(|e| e.to_string())?;
@@ -1266,62 +1262,24 @@ pub(crate) fn unix_now() -> u64 {
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    HEXLOWER.encode(bytes)
 }
 
-/// Standard base64 with padding; enough to fill the CLI state schema
-/// without pulling an encoding crate into the client.
+/// Standard base64 with padding, the spelling the CLI state schema uses:
+/// `jamstream_cli` writes these fields with `data_encoding::BASE64` and this
+/// crate reads them back, so both sides go through the same codec.
 pub(crate) fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    BASE64.encode(bytes)
 }
 
 /// Inverse of [`base64`]; the invites panel reads the issuer key back out
-/// of the state file with it.
+/// of the state file with it. Whitespace is stripped first, because a state
+/// file that has been through a text editor is still a state file.
 pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
-    fn value(c: u8) -> Result<u32, String> {
-        match c {
-            b'A'..=b'Z' => Ok(u32::from(c - b'A')),
-            b'a'..=b'z' => Ok(u32::from(c - b'a') + 26),
-            b'0'..=b'9' => Ok(u32::from(c - b'0') + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(format!("invalid base64 byte 0x{c:02x}")),
-        }
-    }
-    let stripped: Vec<u8> = text
-        .bytes()
-        .filter(|b| !matches!(b, b'=' | b'\n' | b'\r' | b' '))
-        .collect();
-    let mut out = Vec::with_capacity(stripped.len() * 3 / 4);
-    for chunk in stripped.chunks(4) {
-        if chunk.len() == 1 {
-            return Err("truncated base64".to_owned());
-        }
-        let mut n = 0u32;
-        for (i, &b) in chunk.iter().enumerate() {
-            n |= value(b)? << (18 - 6 * i);
-        }
-        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        out.extend_from_slice(&bytes[..chunk.len() - 1]);
-    }
-    Ok(out)
+    let stripped: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    BASE64
+        .decode(stripped.as_bytes())
+        .map_err(|err| format!("invalid base64: {err}"))
 }
 
 // Rendering. One focused card per step: the step counter and title at the top,
@@ -2217,6 +2175,32 @@ mod tests {
         assert_eq!(rows[0].status, ProviderStatus::NoAccountNeeded);
         for row in &rows[1..] {
             assert_eq!(row.status, ProviderStatus::SetupNeeded, "{}", row.name);
+        }
+    }
+
+    /// The rows are the cloud crate's providers, in its order, spelled its
+    /// way, and every one of them comes back out through
+    /// [`HostWizard::selected_provider_kind`]. A fifth provider added to
+    /// `ProviderKind::ALL` appears here without an edit; a row this wizard
+    /// invented, or a spelling the cloud crate does not answer to, fails.
+    #[test]
+    fn every_row_is_a_provider_kind_and_maps_back_to_it() {
+        let rows = provider_rows(&MemStore::default(), &no_env());
+        let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+        let kinds: Vec<String> = ProviderKind::ALL
+            .iter()
+            .map(|k| k.as_str().to_owned())
+            .collect();
+        assert_eq!(names, kinds);
+        let mut w = wizard();
+        for (index, kind) in ProviderKind::ALL.into_iter().enumerate() {
+            assert!(w.select_provider(index), "row {index} must be selectable");
+            assert_eq!(w.selected_provider_kind(), Some(kind));
+            assert_eq!(w.is_local(), kind == ProviderKind::Local);
+            assert!(
+                !rows[index].hint.is_empty(),
+                "{kind} has no hint beside its row"
+            );
         }
     }
 

@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use data_encoding::HEXLOWER;
 use egui::{RichText, TextEdit, Ui};
 use jamstream_cloud::cloudinit::{RecordingStorage, StorageCredential};
 use jamstream_cloud::{ProviderKind, RegionId, Retention};
@@ -654,7 +655,7 @@ fn note(ui: &mut Ui, text: impl Into<String>) {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    HEXLOWER.encode(bytes)
 }
 
 #[cfg(test)]

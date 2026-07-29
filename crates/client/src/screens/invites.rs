@@ -24,6 +24,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use data_encoding::HEXLOWER;
 use egui::{Align2, Button, RichText, Ui, vec2};
 
 /// The seat label's cell, so a status word lands in the same place on every
@@ -419,15 +420,11 @@ pub async fn end_session(
 }
 
 fn hex_16(text: &str) -> Result<[u8; 16], String> {
-    if text.len() != 32 {
-        return Err("session id in the state file has the wrong length".to_owned());
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16)
-            .map_err(|_| "session id in the state file is not hex".to_owned())?;
-    }
-    Ok(out)
+    HEXLOWER
+        .decode(text.as_bytes())
+        .map_err(|_| "session id in the state file is not hex".to_owned())?
+        .try_into()
+        .map_err(|_| "session id in the state file has the wrong length".to_owned())
 }
 
 // Rendering: the Invites tab of the settings drawer. The confirmations stay
