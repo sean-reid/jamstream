@@ -1088,8 +1088,10 @@ mod tests {
             });
             // Nothing is deliverable while seq 0 is missing.
             assert!(b.receive(&dgram).unwrap().is_empty());
+            // Strictly inside: the slot at `recv_next` drains on arrival, so
+            // the 31 above it are all that can be held.
             assert!(
-                b.buffered() <= RECV_WINDOW as usize,
+                b.buffered() < RECV_WINDOW as usize,
                 "buffered {} frames after seq {seq}",
                 b.buffered()
             );
@@ -1140,12 +1142,15 @@ mod tests {
         assert!(!a.is_dead());
     }
 
-    /// The same defect end to end. The property test above this in
-    /// `tests/properties.rs` only finds it on some seeds, which is how it
-    /// reached main and then failed other people's branches, so the case it
-    /// shrank to is pinned here as an ordinary test: 38 messages, 50% loss in
-    /// both directions, and all 38 have to arrive. Before the send window,
-    /// m35 through m37 were abandoned with no packet loss to blame.
+    /// The same defect end to end, on the case the loss property in
+    /// `tests/properties.rs` shrank to while it was live: 38 messages, 50%
+    /// loss in both directions, and all 38 have to arrive. Before the send
+    /// window, m35 through m37 were abandoned with no packet loss to blame.
+    ///
+    /// A property that found a case once is not a gate that finds it again.
+    /// Replaying that seed no longer fails if the send limit goes, so the
+    /// per-poll bound below is what holds this end; without it, deleting the
+    /// limit fails one test in this file and nothing else.
     #[test]
     fn every_message_arrives_past_the_window_under_loss() {
         let count = 38u64;
@@ -1164,7 +1169,13 @@ mod tests {
         let mut got = Vec::new();
         let mut now = 0u64;
         while (got.len() as u64) < count && now < 120_000 {
-            for d in a.poll(now) {
+            let batch = a.poll(now);
+            assert!(
+                batch.len() <= RECV_WINDOW as usize,
+                "{} frames on the wire at {now} ms, past the window the peer accepts",
+                batch.len()
+            );
+            for d in batch {
                 if !lost() {
                     got.extend(b.receive(&d).unwrap());
                 }
