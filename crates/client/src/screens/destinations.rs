@@ -30,10 +30,17 @@ use crate::widgets::{lamp, row_cell};
 const NAME_W: f32 = 132.0;
 const STATE_W: f32 = 80.0;
 
-/// Any dropped frame is worth noticing; 30 is a second of video at the
-/// pipeline's 30 fps, which earns the meter's red.
+/// A lost frame is video the broadcast will never have, so any of them is worth
+/// noticing; 30 is a second of it at the pipeline's 30 fps, which earns the
+/// meter's red.
 const DROPPED_AMBER: u64 = 1;
 const DROPPED_RED: u64 = 30;
+
+/// A repeat costs nobody a picture, so one of them is not news: a machine that
+/// misses a single draw deadline in an hour is fine. A second of stutter is
+/// worth amber, ten seconds of it the red.
+const REPEATED_AMBER: u64 = 30;
+const REPEATED_RED: u64 = 300;
 
 /// Why a key cannot be sent, if it cannot. The control plane refuses these
 /// silently, so they are caught here where there is somewhere to say so.
@@ -335,7 +342,7 @@ impl DestinationsPanel {
         }
         ui.add_space(theme::SPACE_SM);
         ui.label(theme::muted(ui, self.encode.clone()).small());
-        dropped_frames(ui, snap);
+        frame_counts(ui, snap);
         if let Some(err) = self.error.clone() {
             ui.add_space(theme::SPACE_XS);
             theme::reason(ui, err);
@@ -592,46 +599,72 @@ impl DestinationsPanel {
 /// The bitrate is a line under the rows for the same reason, and this is the
 /// same shape of fact.
 ///
-/// What it counts is frames the machine could not keep up with, and the
-/// tooltip said "frames the broadcast had to skip", which is not what usually
-/// happens: the frame count is what holds video in step with the audio, so a
-/// frame there was no time to draw goes out again as the last picture. It is
-/// not never, either. Since #271 the video queue has a cap, and a frame the
-/// encoder cannot take is left out rather than repeated, which does leave the
-/// stream a picture short. The counter conflates the two (#278 tracks
-/// splitting it), so the line says the part a host can act on and claims
-/// neither.
-fn dropped_frames(ui: &mut Ui, snap: &Snapshot) {
-    // Every destination reports the same figure; taking the largest is how this
-    // stays right if one row's status is a frame behind another's.
-    let Some(n) = snap
-        .stream
-        .destinations
-        .iter()
-        .map(|d| d.dropped_frames)
-        .max()
-    else {
+/// Two counts, because one could not say which of two opposite things a host
+/// was looking at (#278). A repeat means the machine ran out of time to draw a
+/// frame and sent the last picture again: nothing is missing, the audio stays
+/// in step, and the cost is a stutter. A loss means the encoder's queue refused
+/// a frame, so the video is that many pictures short of its audio and the
+/// machine has already failed to deliver. The first says it is struggling; the
+/// second says it is too late.
+fn frame_counts(ui: &mut Ui, snap: &Snapshot) {
+    // Every destination reports the same pair; taking the largest of each is
+    // how this stays right if one row's status is a frame behind another's.
+    let destinations = &snap.stream.destinations;
+    if destinations.is_empty() {
+        return;
+    }
+    let repeated = destinations.iter().map(|d| d.repeated_frames).max();
+    let dropped = destinations.iter().map(|d| d.dropped_frames).max();
+    let (Some(repeated), Some(dropped)) = (repeated, dropped) else {
         return;
     };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = theme::SPACE_SM;
+        // Repeats first: they are the common case and the early warning.
+        count(
+            ui,
+            repeated,
+            "repeated",
+            REPEATED_AMBER,
+            REPEATED_RED,
+            "frames the machine had no time to draw, sent again as the last picture: nothing \
+             is missing and the sound stays in step, but the video stutters and the machine \
+             is at its limit",
+        );
+        ui.label(theme::mono_muted(ui, "·"));
+        // "dropped" keeps the word every streamer already has for a frame that
+        // never arrived. It is only now true of this counter: until #278 it
+        // covered repeats too, which are the opposite reading.
+        count(
+            ui,
+            dropped,
+            "dropped",
+            DROPPED_AMBER,
+            DROPPED_RED,
+            "frames the encoder would not take, so the video is that many pictures short of \
+             the sound. One count for the one encode every destination shares, so removing a \
+             destination does not bring it down",
+        );
+    });
+}
+
+/// One frame count in the meter's own colour language: this is a health
+/// reading, so it runs muted, amber, red.
+fn count(ui: &mut Ui, n: u64, word: &str, amber: u64, red: u64, hover: &str) {
     let p = theme::palette_of(ui);
-    // The meter's own colour language: this is a health reading, so it runs
-    // muted, amber, red.
-    let color = if n >= DROPPED_RED {
+    let color = if n >= red {
         p.meter_red
-    } else if n >= DROPPED_AMBER {
+    } else if n >= amber {
         p.meter_amber
     } else {
         p.text_muted
     };
     ui.label(
-        RichText::new(format!("{n} dropped"))
+        RichText::new(format!("{n} {word}"))
             .monospace()
             .color(theme::readable(color, p.surface1, p)),
     )
-    .on_hover_text(
-        "frames the session machine could not keep up with, mostly sent again as the last \
-         picture and sometimes left out; one count for the one encode every destination shares",
-    );
+    .on_hover_text(hover);
 }
 
 enum RowAction {

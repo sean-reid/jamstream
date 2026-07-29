@@ -4,7 +4,7 @@ The host can put a session on air to Twitch and YouTube Live, either one alone o
 
 Only the host can start or stop a broadcast. Everyone in the session sees the ON AIR lamp in the middle of the status bar, because everyone in the session is in the broadcast.
 
-![The Broadcast tab of Settings, both Twitch and YouTube Live reading live with zero dropped frames, and ON AIR lit in the status bar](../images/session_destinations_live_two.png)
+![The Broadcast tab of Settings, both Twitch and YouTube Live reading live with no repeated or dropped frames, and ON AIR lit in the status bar](../images/session_destinations_live_two.png)
 *On air to both platforms.*
 
 ## What goes out
@@ -49,11 +49,17 @@ Each row says what that platform is actually doing:
 | `live` | the platform is receiving the broadcast |
 | `failed` | it stopped, with the reason on the next line |
 
-**dropped** counts frames the machine could not keep up with. Most of them are repeats: the video runs at 30 frames a second and the frame count is what holds it in step with the audio, so a frame there was no time to draw goes out again as the last picture rather than being skipped. If the encoder falls far enough behind, a frame is left out instead, and the stream is short that picture. It is one count for the whole broadcast, so both rows show the same number, and it changes color as it rises. A number that rises means the session machine cannot draw and encode 30 frames a second; removing a destination does not bring it down, because one encode feeds every platform.
+Under the encode line are two frame counts, and they mean different things.
+
+**repeated** is frames the machine had no time to draw. The video runs at 30 frames a second and the frame count is what holds it in step with the sound, so a frame with no time to draw goes out again as the last picture. Nothing is missing and the sound stays in step; the video stutters. A figure that climbs means the machine is at its limit.
+
+**dropped** is frames the encoder would not take, and those are gone: the video is that many pictures short of the sound. Repeats come first and losses only once the machine is well past keeping up, so any dropped frame is worth acting on.
+
+Both are one count for the whole broadcast, so both rows show the same pair, and each changes color as it rises. Removing a destination brings neither down, because one encode feeds every platform. What helps is a shorter session, a smaller machine load, or one platform instead of two.
 
 ## When a platform fails
 
-![The Broadcast tab with Twitch live and YouTube Live failed, showing the reason and a red dropped frame count, and STREAM FAILED lit in the status bar](../images/session_destinations_failed.png)
+![The Broadcast tab with Twitch live and YouTube Live failed, showing the reason, the repeated and dropped frame counts in amber, and STREAM FAILED lit in the status bar](../images/session_destinations_failed.png)
 *One platform's connection failed; the other kept streaming.*
 
 A stream that dies quietly is worse than one that never started, so a failure shows in three places: the row goes red with the reason under it, the tab counts the failures, and the status bar lights STREAM FAILED beside ON AIR even with Settings closed.
