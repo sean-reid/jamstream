@@ -25,11 +25,30 @@ flate2.workspace = true
 # stays out of the musl binaries, where its C does not link for aarch64.
 default = ["gcp"]
 gcp = ["dep:aws-lc-rs"]
+# The mock provider, the in-memory store, and the two contract suites. Off
+# here and on in the dev-dependency below, so `cargo build` leaves all four
+# modules out and every test target still has them. jamstreamd is the reason:
+# it is downloaded at every VM boot, and it was linking a scriptable provider
+# double and two assert-only suites it can never call.
+#
+# Not cfg(test): the contract suites are the shared half of the provider and
+# object-store tests in tests/, which are separate crates and cannot see a
+# cfg(test) item. Consumers whose own tests need the doubles say so in their
+# dev-dependencies (jamstream-server), or in their dependencies when the
+# double is a shipped surface (jamstream-cli's `--provider mock`).
+testing = []
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
+# This crate, to turn its own `testing` feature on for test targets only.
+# default-features off keeps `cargo test --no-default-features` gcp-free: that
+# job is jamstreamd's shape, and an edge that pulled defaults back in would
+# stop building the configuration that ships.
+jamstream-cloud = { path = ".", default-features = false, features = [
+    "testing",
+] }
 proptest.workspace = true
 wiremock.workspace = true
 flate2.workspace = true

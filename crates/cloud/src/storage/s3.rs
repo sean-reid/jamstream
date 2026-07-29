@@ -127,32 +127,6 @@ impl S3Store {
         }
     }
 
-    /// AWS S3 with credentials from `AWS_ACCESS_KEY_ID` /
-    /// `AWS_SECRET_ACCESS_KEY`, the same pair the EC2 provider uses. The
-    /// key still needs S3 permissions on the recording bucket.
-    pub fn aws_from_env(region: impl Into<String>) -> Result<Self> {
-        Self::aws_from_env_lookup(region, |k| std::env::var(k).ok())
-    }
-
-    fn aws_from_env_lookup(
-        region: impl Into<String>,
-        get: impl Fn(&str) -> Option<String>,
-    ) -> Result<Self> {
-        let read = |key: &str| {
-            get(key).filter(|v| !v.is_empty()).ok_or_else(|| {
-                ProviderError::Auth(format!("{key} is not set; recording to S3 needs it"))
-            })
-        };
-        Ok(Self::aws(
-            region,
-            read("AWS_ACCESS_KEY_ID")?,
-            read("AWS_SECRET_ACCESS_KEY")?,
-        ))
-    }
-
-    /// DigitalOcean Spaces in `region` (a Spaces region slug such as
-    /// `nyc3`), signed with a **Spaces access key pair**. See the module
-    /// docs: this is not the DigitalOcean API token.
     /// Google Cloud Storage through its S3-compatible interop endpoint,
     /// signed with an HMAC key pair rather than a service account.
     ///
@@ -179,6 +153,9 @@ impl S3Store {
         }
     }
 
+    /// DigitalOcean Spaces in `region` (a Spaces region slug such as
+    /// `nyc3`), signed with a **Spaces access key pair**. See the module
+    /// docs: this is not the DigitalOcean API token.
     pub fn spaces(region: impl Into<String>, access_key_id: String, secret: String) -> Self {
         S3Store {
             access_key_id,
@@ -191,35 +168,6 @@ impl S3Store {
             http: http::client(),
             streaming: http::streaming_client(),
         }
-    }
-
-    /// Spaces credentials from `SPACES_ACCESS_KEY_ID` /
-    /// `SPACES_SECRET_ACCESS_KEY`. The error spells out that these are
-    /// separate from `DIGITALOCEAN_TOKEN`, because that is the mistake
-    /// everyone makes once.
-    pub fn spaces_from_env(region: impl Into<String>) -> Result<Self> {
-        Self::spaces_from_env_lookup(region, |k| std::env::var(k).ok())
-    }
-
-    fn spaces_from_env_lookup(
-        region: impl Into<String>,
-        get: impl Fn(&str) -> Option<String>,
-    ) -> Result<Self> {
-        let read = |key: &str| {
-            get(key).filter(|v| !v.is_empty()).ok_or_else(|| {
-                ProviderError::Auth(format!(
-                    "{key} is not set. DigitalOcean Spaces does not accept the \
-                     DIGITALOCEAN_TOKEN API token: it needs a separate Spaces access key pair. \
-                     Generate one under API > Spaces Keys and set SPACES_ACCESS_KEY_ID and \
-                     SPACES_SECRET_ACCESS_KEY."
-                ))
-            })
-        };
-        Ok(Self::spaces(
-            region,
-            read("SPACES_ACCESS_KEY_ID")?,
-            read("SPACES_SECRET_ACCESS_KEY")?,
-        ))
     }
 
     /// Routes every request at one base URL in path-style, for tests.
@@ -1190,49 +1138,6 @@ mod tests {
     fn empty_listing_parses_to_nothing() {
         assert!(parse_list("<ListBucketResult><Name>b</Name></ListBucketResult>").is_empty());
         assert!(parse_list("").is_empty());
-    }
-
-    // ---- Credentials ----
-
-    #[test]
-    fn spaces_env_error_names_both_variables_and_disowns_the_api_token() {
-        let err = S3Store::spaces_from_env_lookup("nyc3", |_| None).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("SPACES_ACCESS_KEY_ID"), "{msg}");
-        assert!(msg.contains("SPACES_SECRET_ACCESS_KEY"), "{msg}");
-        assert!(
-            msg.contains("DIGITALOCEAN_TOKEN"),
-            "the error has to say the API token is not it: {msg}"
-        );
-        assert!(matches!(err, ProviderError::Auth(_)));
-
-        // A secret without an id, and an empty value, both fail closed.
-        assert!(
-            S3Store::spaces_from_env_lookup("nyc3", |k| (k == "SPACES_SECRET_ACCESS_KEY")
-                .then(|| "s".to_owned()))
-            .is_err()
-        );
-        assert!(
-            S3Store::spaces_from_env_lookup("nyc3", |_| Some(String::new())).is_err(),
-            "an empty credential is not a credential"
-        );
-        let ok = S3Store::spaces_from_env_lookup("nyc3", |k| Some(format!("{k}-value"))).unwrap();
-        assert_eq!(ok.kind(), ProviderKind::DigitalOcean);
-    }
-
-    #[test]
-    fn aws_env_credentials_reuse_the_ec2_variables() {
-        let store =
-            S3Store::aws_from_env_lookup("us-east-1", |k| Some(format!("{k}-value"))).unwrap();
-        assert_eq!(store.access_key_id, "AWS_ACCESS_KEY_ID-value");
-        assert_eq!(store.kind(), ProviderKind::Aws);
-        for missing in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] {
-            let err = S3Store::aws_from_env_lookup("us-east-1", |k| {
-                (k != missing).then(|| "v".to_owned())
-            })
-            .unwrap_err();
-            assert!(err.to_string().contains(missing));
-        }
     }
 
     #[test]

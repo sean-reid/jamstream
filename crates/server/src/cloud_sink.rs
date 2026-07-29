@@ -86,7 +86,7 @@ impl RecordingSink for CloudSink {
         // entered; the task then runs on the worker thread regardless of
         // who blocks where.
         let _guard = self.rt.enter();
-        let sink = ObjectSink::open_with_marker_dir(
+        let sink = ObjectSink::open(
             Arc::clone(&self.store),
             self.bucket.clone(),
             format!("{}{name}", self.prefix),

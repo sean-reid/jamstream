@@ -38,14 +38,12 @@ pub struct PlatformSpec {
     pub display_name: String,
     /// `{key}` is substituted at pusher spawn, from memory, never logged.
     pub ingest_url: String,
-    pub ingest_url_plaintext: String,
     pub requires_cbr: bool,
     pub keyframe_secs: u32,
     pub aspect: String,
     pub max_video_kbps: u32,
     pub max_audio_kbps: u32,
     pub key_acquisition: String,
-    pub notes: String,
 }
 
 impl PlatformSpec {

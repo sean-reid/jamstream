@@ -18,16 +18,20 @@
 //! ```text
 //! let store: Arc<dyn ObjectStore> = storage.object_store()?;                      // per the host's provider
 //! store.set_retention(&bucket, &session_prefix(&session_id), retention).await?;    // before recording
-//! let sink = ObjectSink::open(store, bucket, key, FLAC_CONTENT_TYPE);              // one per take, key named
+//! let sink = ObjectSink::open(store, bucket, key, FLAC_CONTENT_TYPE, markers);     // one per take, key named
 //! sink.write(chunk).await?;                                                        // by the recorder
 //! sink.finish().await?;                                                            // then tear down
 //! ```
 
 pub mod artifact;
 pub mod cloudinit;
+/// The provider contract suite. Test-only: see the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
 pub mod contract;
 pub mod cost;
 pub mod http;
+/// The scriptable provider double. Test-only: see the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod private;
 pub mod probe;
@@ -48,8 +52,10 @@ pub use cloudinit::{
     BootConfig, MediaArtifact, MediaArtifacts, MediaTool, RecordingStorage, SelfDestruct,
     StorageCredential,
 };
+#[cfg(any(test, feature = "testing"))]
 pub use contract::assert_provider_contract;
 pub use cost::{CostPreview, LineItem};
+#[cfg(any(test, feature = "testing"))]
 pub use mock::MockProvider;
 pub use probe::{ProbeTarget, probe_all, probe_catalog};
 pub use provider::{Provider, ProviderError, Result, Sleeper, TokioSleeper, WaitOpts};
@@ -62,10 +68,11 @@ pub use solver::{MemberId, ProbeMatrix, RegionScore, rank};
 #[cfg(feature = "gcp")]
 pub use storage::GcsStore;
 pub use storage::{
-    BytesSource, ChunkSink, FLAC_CONTENT_TYPE, JSON_CONTENT_TYPE, MockStore, ObjectMeta,
-    ObjectSink, ObjectStore, PartSource, ReadSource, S3Store, assert_object_store_contract,
-    session_prefix,
+    BytesSource, ChunkSink, FLAC_CONTENT_TYPE, JSON_CONTENT_TYPE, ObjectMeta, ObjectSink,
+    ObjectStore, PartSource, ReadSource, S3Store, session_prefix,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use storage::{MockStore, assert_object_store_contract};
 pub use sweeper::{SweepFilter, SweepReport, sweep};
 pub use types::{
     ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec,

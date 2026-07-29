@@ -2939,6 +2939,7 @@ dependencies = [
  "aws-lc-rs",
  "data-encoding",
  "flate2",
+ "jamstream-cloud",
  "libc",
  "proptest",
  "reqwest",
