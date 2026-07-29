@@ -866,11 +866,56 @@ fn perf_budget_secs(laptop_secs: f64) -> f64 {
 
 /// How much slower than the reference laptop the machine running this suite is
 /// declared to be. 1.0 unless `JAMSTREAM_PERF_BUDGET_SECS` says otherwise.
+///
+/// It describes throughput and nothing else. What it cannot describe is a
+/// machine with no idle core, where a timed region loses the cpu in the middle
+/// and the sample records the scheduler instead of the work. Isolation is the
+/// answer to that, not a bigger number: see
+/// [`the_timed_gates_are_named_in_the_workflow`].
 fn perf_scale() -> f64 {
     std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS)
+}
+
+/// Two tests here time a wall clock, and ci.yml runs them on their own for a
+/// reason worth writing down.
+///
+/// Every other test in this suite is a cpu-bound simulation and nextest runs
+/// as many at once as the machine has cores, so a gate measured alongside them
+/// is measured on a machine with nothing left over. A p99 across a 600 us
+/// region does not survive that. windows-latest reported the broadcast tick at
+/// p99 19251 us against a 1213 us median and a 10000 us budget, on a
+/// comments-only change (#276), and the same shape reproduces on demand: on a
+/// 14-core laptop `tick_budget_at_capacity` measures p99 684 us against a
+/// median of 601 us with the machine idle, and p99 9725 us against a median of
+/// 946 us with 14 busy cores beside it. The median moved 1.6x and the tail
+/// moved 14x, which is what preemption looks like and not what tick cost looks
+/// like.
+///
+/// So the workflow names these two tests and runs them after everything else,
+/// one at a time. That pairs a name in a yaml file with a name in this one,
+/// which is the kind of pair that comes apart without anyone noticing. This is
+/// the half that notices.
+#[test]
+fn the_timed_gates_are_named_in_the_workflow() {
+    const CI: &str = include_str!("../../../.github/workflows/ci.yml");
+    let gates = CI
+        .lines()
+        .find(|l| l.trim_start().starts_with("TIMED_GATES:"))
+        .expect("ci.yml sets TIMED_GATES on the harness job");
+    for gate in [
+        "tick_budget_at_capacity",
+        "perf_sanity_sixty_seconds_regional",
+    ] {
+        assert!(
+            gates.contains(gate),
+            "{gate} times a wall clock, and ci.yml no longer runs it with the runner \
+             to itself, so its p99 is about to become a record of the scheduler. \
+             The workflow says: {gates}"
+        );
+    }
 }
 
 // Not a benchmark: a coarse guard that the simulation stays usable for
@@ -1020,7 +1065,9 @@ fn latency_at_capacity() {
 //    p99 and not a mean, because the deadline is per tick and a mean over all
 //    ticks divides the expensive one into the seven that are not. This is the
 //    only assertion that fails when the whole tick gets slower, which the two
-//    below cannot see.
+//    below cannot see. It is also the one that needs the machine to itself,
+//    which is why ci.yml runs this test alone; see
+//    `the_timed_gates_are_named_in_the_workflow`.
 // 2. The fanout ratio, broadcast median over ordinary median, at a limit of 5.
 //    Dimensionless, so it is tight without a knob, and it answers exactly one
 //    question: has per-listener work come back into the broadcast path. It is
@@ -1035,6 +1082,27 @@ fn latency_at_capacity() {
 // 339 us. With the pre-#78 per-listener broadcast encode restored: 4357 us and
 // 300 us, ratio 14.53. The ratio gate at 5 sits 2.5x above what the fanout
 // costs today and 2.9x below what one extra per-listener encode costs.
+//
+// And on the ci runners, which is where the budget is actually checked. These
+// are the first numbers this gate ever published: a passing test's output went
+// nowhere until #276, which is how #239 came to calibrate against an estimate.
+// Runner multiplier 4, so a 10000 us budget. Three runs per platform, so the
+// spread below is run-to-run variation on an idle runner and not a
+// distribution:
+//
+//   ubuntu-latest    median  675 to 825   p99  714 to  875    7 to  9% of budget
+//   macos-latest     median  681 to 744   p99  897 to 1663    9 to 17% of budget
+//   windows-latest   median  705 to 895   p99 1042 to 1092   10 to 11% of budget
+//
+// macos is the loose one, up to 2.4x its own median even with the runner to
+// itself, and windows is now the steadiest of the three. If this gate ever
+// needs a per-platform allowance it will be for macos, which is not where
+// anybody was looking.
+//
+// The same Windows runner, measured while the rest of the suite was running:
+// median 1213 us, p99 19251 us, max 33057 us, 193% of budget. The median
+// barely moved and the tail moved seventeen fold. That is why the two timed
+// gates get the runner to themselves and why the budget did not change.
 #[test]
 fn tick_budget_at_capacity() {
     // 20 ms broadcast frame accumulated over 2.5 ms master ticks.
