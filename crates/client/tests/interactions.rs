@@ -1906,17 +1906,16 @@ fn a_refused_device_puts_the_reason_over_the_strips() {
 
     let mut harness = static_harness(refused);
     harness.run_steps(3);
-    let sentence = format!("no audio device is running: {reason}");
     assert!(
-        harness.query_by_label(&sentence).is_some(),
-        "the device's own reason must be on the mixer"
+        harness.query_by_label(reason).is_some(),
+        "the device's own reason must be on the mixer, verbatim and unprefixed"
     );
     assert!(
         harness
-            .get_all_by_label_contains("The Audio tab in Settings")
+            .query_all_by_label_contains("The Audio tab in Settings")
             .next()
             .is_some(),
-        "and where to fix it"
+        "and what it costs and where to fix it"
     );
     // The session carries on around it: nothing here blocks the mixer.
     assert!(harness.query_by_label("Ana fader").is_some());
@@ -1925,7 +1924,7 @@ fn a_refused_device_puts_the_reason_over_the_strips() {
     let mut harness = static_harness(quiet);
     harness.run_steps(3);
     assert!(
-        harness.query_by_label(&sentence).is_none(),
+        harness.query_by_label(reason).is_none(),
         "a working device must say nothing"
     );
 }

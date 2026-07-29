@@ -209,11 +209,12 @@ impl DevicesScreen {
                     );
                     ui.end_row();
                 });
-            // The pick that will not open, in the device's own words, under
-            // the picker that made it.
+            // The pick that will not open, in the device's own words, under the
+            // picker that made it. No sentence of ours around it: the pickers
+            // are right above it, so what it is about is not in question.
             if let Some(reason) = refusal {
                 ui.add_space(theme::SPACE_XS);
-                theme::reason(ui, format!("no audio device is running: {reason}"));
+                theme::reason(ui, reason);
             }
         });
     }

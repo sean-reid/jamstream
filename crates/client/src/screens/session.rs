@@ -376,12 +376,18 @@ impl SessionScreen {
         // about it but not why, so a swap mid-song was silence with nothing on
         // screen (#263). Above the strips, in the danger step that reads on the
         // panel, never the accent, which means live.
+        //
+        // The device's words first and unprefixed, because a reason wrapped in
+        // a sentence of ours reads "no audio device is running: unsupported
+        // audio configuration: ...", which is the stutter #286 objects to a
+        // crate away. What it costs and what to do about it go underneath, in
+        // the muted step, the way the session-full and no-probe lines do it.
         if let Some(reason) = &snap.device_error {
-            theme::reason(ui, format!("no audio device is running: {reason}"));
+            theme::reason(ui, reason.clone());
             ui.label(theme::muted(
                 ui,
-                "Nobody can hear you until one opens. The Audio tab in Settings picks another \
-                 device.",
+                "No audio device is running, so nobody can hear you and you cannot hear the room. \
+                 The Audio tab in Settings picks another device.",
             ));
         }
 
