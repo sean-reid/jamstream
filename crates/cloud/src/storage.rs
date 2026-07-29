@@ -66,18 +66,24 @@ use crate::provider::{ProviderError, Result};
 use crate::retention::{Retention, RetentionEnforcement};
 use crate::types::ProviderKind;
 
+/// The object-store contract suite. Test-only: see the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
 pub mod contract;
 // Native GCS, which needs a service account token. Recording uses the S3
 // interop endpoint instead; see providers::mod on why that matters.
 #[cfg(feature = "gcp")]
 pub mod gcs;
+/// The in-memory store. Test-only: see the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod s3;
 pub mod sink;
 
+#[cfg(any(test, feature = "testing"))]
 pub use contract::assert_object_store_contract;
 #[cfg(feature = "gcp")]
 pub use gcs::GcsStore;
+#[cfg(any(test, feature = "testing"))]
 pub use mock::MockStore;
 pub use s3::S3Store;
 pub use sink::ObjectSink;
@@ -375,10 +381,14 @@ pub(crate) struct Part<'a> {
     /// 1-based part number, as S3 counts them.
     pub number: u32,
     /// Byte offset of this part within the object, which is what the GCS
-    /// resumable protocol needs for its `Content-Range`.
+    /// resumable protocol needs for its `Content-Range`. Unread in a build
+    /// without the native GCS backend, which is jamstreamd's: SigV4 addresses
+    /// a part by number alone.
+    #[cfg_attr(not(feature = "gcp"), allow(dead_code))]
     pub offset: u64,
     /// True for the final part. GCS learns the total object size from it;
-    /// S3 ignores it.
+    /// S3 ignores it, so this is unread without the `gcp` feature too.
+    #[cfg_attr(not(feature = "gcp"), allow(dead_code))]
     pub last: bool,
     pub body: &'a [u8],
 }

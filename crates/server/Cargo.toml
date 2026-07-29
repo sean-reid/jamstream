@@ -38,6 +38,9 @@ mimalloc.workspace = true
 [dev-dependencies]
 # The version reject story sends an init claiming a version we do not speak.
 jamstream-protocol = { workspace = true, features = ["testing"] }
+# testing: the recording tests upload into the in-memory object store. Not in
+# the dependency above, so jamstreamd links neither it nor the contract suites.
+jamstream-cloud = { workspace = true, features = ["testing"] }
 # The stream integration test scans the bytes a member receives.
 postcard.workspace = true
 # Recording tests decode the FLAC the recorder wrote with an encoder-

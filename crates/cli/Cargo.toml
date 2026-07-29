@@ -16,7 +16,10 @@ jamstream-protocol.workspace = true
 jamstream-session.workspace = true
 # gcp: this surface launches GCP sessions, so it wants the RSA signing
 # jamstreamd does without.
-jamstream-cloud = { workspace = true, features = ["gcp"] }
+# testing: `--provider mock` is a shipped surface of this binary, hidden from
+# help but resolvable by name (see providers.rs), so the double is a real
+# dependency here rather than a dev one. jamstreamd takes neither feature.
+jamstream-cloud = { workspace = true, features = ["gcp", "testing"] }
 
 clap.workspace = true
 clap_complete.workspace = true

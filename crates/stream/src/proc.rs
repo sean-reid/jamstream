@@ -825,8 +825,13 @@ fn open_fifo_write(_path: &std::path::Path) -> io::Result<std::fs::File> {
 // Fake implementation
 // ---------------------------------------------------------------------------
 
-/// A scriptable [`ProcessHost`] with a call log. Compiled unconditionally so
-/// integration tests in `tests/` can use it; it spawns nothing.
+/// A scriptable [`ProcessHost`] with a call log; it spawns nothing.
+///
+/// cfg(test), because the only callers are this crate's own unit tests. It
+/// used to be compiled unconditionally for integration tests in `tests/`, and
+/// the two that exist there drive real processes, so all that reached was
+/// jamstreamd.
+#[cfg(test)]
 pub mod fake {
     use super::{Exit, Feed, ProcId, ProcSpec, ProcessHost, Stdin};
     use std::collections::BTreeMap;
