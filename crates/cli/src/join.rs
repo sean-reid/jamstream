@@ -53,14 +53,27 @@ impl WavSource {
                 spec.channels
             )));
         }
-        let raw: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
-            hound::SampleFormat::Int => {
-                let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
+        // Same pairing audio-io applies, and for the same reason: the header
+        // decides the shift, so a depth outside 1..=32 has to be refused
+        // before it reaches one. A WAVEFORMATEXTENSIBLE header carries
+        // wValidBitsPerSample, which hound copies over the real depth
+        // unchecked, so any u16 arrives here from a file a user picked.
+        let raw: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+            (hound::SampleFormat::Float, 32) => {
+                reader.samples::<f32>().collect::<Result<_, _>>()?
+            }
+            (hound::SampleFormat::Int, bits @ 1..=32) => {
+                let scale = 1.0 / (1i64 << (bits - 1)) as f32;
                 reader
                     .samples::<i32>()
                     .map(|s| s.map(|v| v as f32 * scale))
                     .collect::<Result<_, _>>()?
+            }
+            (format, bits) => {
+                return Err(CliError::Usage(format!(
+                    "input wav {} is {bits}-bit {format:?}, which is not a depth this reads",
+                    path.display()
+                )));
             }
         };
         let samples = if spec.channels == 2 {
@@ -447,6 +460,52 @@ mod tests {
         let mut second = [1.0f32; FRAME_MONO];
         source.next_frame(&mut second);
         assert!(second.iter().all(|&s| s == 0.0));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A WAVEFORMATEXTENSIBLE fmt chunk naming `bits` in wValidBitsPerSample,
+    /// which is the field hound copies over the container depth unchecked.
+    fn extensible_wav(bits: u16) -> Vec<u8> {
+        const PCM_SUBFORMAT: [u8; 16] = [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38,
+            0x9b, 0x71,
+        ];
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&0xfffe_u16.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        fmt.extend_from_slice(&(SAMPLE_RATE * 4).to_le_bytes());
+        fmt.extend_from_slice(&4u16.to_le_bytes());
+        fmt.extend_from_slice(&32u16.to_le_bytes());
+        fmt.extend_from_slice(&22u16.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        fmt.extend_from_slice(&0u32.to_le_bytes());
+        fmt.extend_from_slice(&PCM_SUBFORMAT);
+
+        let data = [0u8; 4];
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(4 + 8 + fmt.len() as u32 + 8 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fmt);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    /// The scale factor is `1 << (bits - 1)`, so the header picks the shift.
+    /// A depth past 64 took the shift past the width of an i64 and the process
+    /// down with it, on a file the user merely picked.
+    #[test]
+    fn source_rejects_a_bit_depth_it_cannot_scale() {
+        let path = temp_wav("extensible.wav");
+        std::fs::write(&path, extensible_wav(u16::MAX)).unwrap();
+        assert!(matches!(
+            WavSource::load(&path),
+            Err(CliError::Usage(msg)) if msg.contains("65535-bit")
+        ));
         std::fs::remove_file(&path).unwrap();
     }
 
