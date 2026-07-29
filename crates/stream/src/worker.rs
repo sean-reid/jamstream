@@ -239,12 +239,13 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("jamstream-worker-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let mut cfg = StreamConfig::new("Worker Test");
-        cfg.width = 160;
-        cfg.height = 90;
-        cfg.work_dir = root.clone();
-        cfg.key_dir = root.join("keys");
-        cfg
+        StreamConfig {
+            width: 160,
+            height: 90,
+            work_dir: root.clone(),
+            key_dir: root.join("keys"),
+            ..StreamConfig::default()
+        }
     }
 
     /// Waits for a predicate on the published status, so the test does not

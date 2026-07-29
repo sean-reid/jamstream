@@ -7,8 +7,8 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use common::{H, W, config, roster};
-use jamstream_broadcast::Renderer;
+use common::{H, W, roster};
+use jamstream_broadcast::{Renderer, SceneConfig};
 
 struct CountingAlloc;
 
@@ -42,7 +42,7 @@ static ALLOC: CountingAlloc = CountingAlloc;
 
 #[test]
 fn render_is_allocation_free_after_warmup() {
-    let mut r = Renderer::new(config("alloc gate"));
+    let mut r = Renderer::new(SceneConfig::default());
     let mut members = roster(10);
     let mut out = vec![0u8; (W * H * 4) as usize];
 

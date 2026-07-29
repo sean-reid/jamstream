@@ -192,11 +192,13 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
     std::fs::create_dir_all(&root).expect("work dir");
     let out_file = root.join("broadcast.flv");
 
-    let mut cfg = StreamConfig::new("Real Encoder Test");
-    cfg.ffmpeg = ffmpeg.clone();
-    cfg.work_dir = root.clone();
-    cfg.key_dir = root.join("keys");
-    cfg.encoder_output = out_file.to_string_lossy().into_owned();
+    let cfg = StreamConfig {
+        ffmpeg: ffmpeg.clone(),
+        work_dir: root.clone(),
+        key_dir: root.join("keys"),
+        encoder_output: out_file.to_string_lossy().into_owned(),
+        ..StreamConfig::default()
+    };
 
     let (fps, keyframe_secs) = (cfg.fps, cfg.keyframe_secs);
     let (video_kbps, total_kbps) = (cfg.video_kbps, cfg.total_kbps());

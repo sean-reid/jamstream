@@ -4,8 +4,8 @@
 
 mod common;
 
-use common::{H, W, assert_snapshot, config, gradient_png, musician, roster, solid_png};
-use jamstream_broadcast::Renderer;
+use common::{H, W, assert_snapshot, gradient_png, musician, roster, solid_png};
+use jamstream_broadcast::{Renderer, SceneConfig};
 
 fn frame() -> Vec<u8> {
     vec![0u8; (W * H * 4) as usize]
@@ -13,7 +13,7 @@ fn frame() -> Vec<u8> {
 
 #[test]
 fn one_musician_large() {
-    let mut r = Renderer::new(config("late night takes"));
+    let mut r = Renderer::new(SceneConfig::default());
     let members = vec![musician("Ana Solari", None, 0.62, 0.40)];
     let mut out = frame();
     r.render(0, &members, 0, &mut out);
@@ -22,7 +22,7 @@ fn one_musician_large() {
 
 #[test]
 fn two_musicians_with_avatars() {
-    let mut r = Renderer::new(config("duo session"));
+    let mut r = Renderer::new(SceneConfig::default());
     let solid = solid_png([70, 110, 150], 64);
     let grad = gradient_png(96);
     let members = vec![
@@ -36,7 +36,7 @@ fn two_musicians_with_avatars() {
 
 #[test]
 fn four_musicians_mixed() {
-    let mut r = Renderer::new(config("thursday quartet"));
+    let mut r = Renderer::new(SceneConfig::default());
     let members = roster(4);
     let mut out = frame();
     r.render(0, &members, 0, &mut out);
@@ -45,7 +45,7 @@ fn four_musicians_mixed() {
 
 #[test]
 fn six_musicians() {
-    let mut r = Renderer::new(config("rehearsal room b"));
+    let mut r = Renderer::new(SceneConfig::default());
     // All initials discs: the no-avatar rendering at grid density.
     let members: Vec<_> = roster(6)
         .into_iter()
@@ -61,7 +61,7 @@ fn six_musicians() {
 
 #[test]
 fn ten_musicians() {
-    let mut r = Renderer::new(config("open jam"));
+    let mut r = Renderer::new(SceneConfig::default());
     let members = roster(10);
     let mut out = frame();
     r.render(0, &members, 0, &mut out);
@@ -70,7 +70,7 @@ fn ten_musicians() {
 
 #[test]
 fn long_names_ellipsize() {
-    let mut r = Renderer::new(config("naming things is hard"));
+    let mut r = Renderer::new(SceneConfig::default());
     let members = vec![
         musician("Bartholomew Featherstonehaugh-Cholmondeley", None, 0.5, 0.3),
         musician(
@@ -88,7 +88,7 @@ fn long_names_ellipsize() {
 
 #[test]
 fn disconnected_member_dims() {
-    let mut r = Renderer::new(config("waiting on drums"));
+    let mut r = Renderer::new(SceneConfig::default());
     let mut members = roster(4);
     members[2].connected = false;
     members[2].level_peak = 0.0;
@@ -100,7 +100,7 @@ fn disconnected_member_dims() {
 
 #[test]
 fn listener_line() {
-    let mut r = Renderer::new(config("friday show"));
+    let mut r = Renderer::new(SceneConfig::default());
     let members = roster(3);
     let mut out = frame();
     r.render(0, &members, 12, &mut out);
@@ -113,7 +113,7 @@ fn listener_line() {
 #[test]
 fn peak_hold_decay_is_deterministic() {
     let run = |grab: &[u64]| -> Vec<(u64, Vec<u8>)> {
-        let mut r = Renderer::new(config("hold test"));
+        let mut r = Renderer::new(SceneConfig::default());
         let mut members = roster(2);
         let mut out = frame();
         let mut grabbed = Vec::new();
@@ -146,7 +146,7 @@ fn peak_hold_decay_is_deterministic() {
 /// index: only meters move; the stage and footer bytes stay put.
 #[test]
 fn frame_index_moves_only_meters() {
-    let mut r = Renderer::new(config("static stage"));
+    let mut r = Renderer::new(SceneConfig::default());
     let mut members = roster(4);
     let mut a = frame();
     let mut b = frame();

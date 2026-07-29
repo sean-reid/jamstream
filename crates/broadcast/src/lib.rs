@@ -1,9 +1,9 @@
 //! Deterministic RGBA frames for the broadcast a live session's viewers
-//! watch. Audio is the star; this is the stage: near-black surface, the
-//! session name and members in the interface type, avatars in tight
-//! geometry, LED level meters as the only living element. Frames are pure
-//! functions of (config, members, listener_count, frame_index): no clocks,
-//! no randomness beyond a stable hash of member names.
+//! watch. Audio is the star; this is the stage: near-black surface, member
+//! names in the interface type, avatars in tight geometry, LED level meters
+//! as the only living element. Frames are pure functions of (config,
+//! members, listener_count, frame_index): no clocks, no randomness beyond a
+//! stable hash of member names.
 
 mod avatar;
 /// The stage palette and the initials-disc hue rule. Public so the desktop
@@ -22,18 +22,16 @@ pub use render::{MAX_CARDS, Renderer, initials};
 pub struct SceneConfig {
     pub width: u32,
     pub height: u32,
-    pub session_name: String,
     /// Draw the small jamstream lockup with the amber tuning dot, lower right.
     pub wordmark: bool,
 }
 
-impl SceneConfig {
+impl Default for SceneConfig {
     /// 1280x720 with the wordmark on, the standard broadcast frame.
-    pub fn new(session_name: impl Into<String>) -> Self {
+    fn default() -> Self {
         SceneConfig {
             width: 1280,
             height: 720,
-            session_name: session_name.into(),
             wordmark: true,
         }
     }

@@ -34,8 +34,6 @@ use crate::revocations::Revocations;
 
 const TICK: Duration = Duration::from_micros(2_500);
 const ACTIVITY_PERIOD: Duration = Duration::from_secs(1);
-/// Card title when provisioning supplied no session name.
-const DEFAULT_SESSION_NAME: &str = "JamStream session";
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -193,10 +191,9 @@ impl Server {
             issuer_pk,
         ));
         let socket = UdpSocket::bind(opts.bind).await?;
-        // The card title. The wire protocol carries no session name, so
-        // jamstreamd takes it as a flag (see with_stream_config); this is the
-        // fallback when nobody supplies one.
-        let stream_cfg = StreamConfig::new(DEFAULT_SESSION_NAME);
+        // Encode settings and VM paths; tests override them through
+        // with_stream_config.
+        let stream_cfg = StreamConfig::default();
         Ok(Server {
             core,
             socket,
@@ -273,8 +270,8 @@ impl Server {
     }
 
     /// Overrides the broadcast pipeline's configuration (ffmpeg path, relay
-    /// URL, working directories). Tests and local runs use it; the default is
-    /// the layout cloud-init creates on the session VM.
+    /// URL, working directories). Tests use it; the default is the layout
+    /// cloud-init creates on the session VM.
     pub fn with_stream_config(mut self, cfg: StreamConfig) -> Self {
         self.stream_cfg = cfg;
         self

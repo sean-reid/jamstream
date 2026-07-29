@@ -6,14 +6,10 @@
 use std::io::Cursor;
 use std::path::PathBuf;
 
-use jamstream_broadcast::{AvatarImage, MemberVisual, Role, SceneConfig};
+use jamstream_broadcast::{AvatarImage, MemberVisual, Role};
 
 pub const W: u32 = 1280;
 pub const H: u32 = 720;
-
-pub fn config(session_name: &str) -> SceneConfig {
-    SceneConfig::new(session_name)
-}
 
 /// Solid-color PNG bytes, the plainest possible avatar.
 pub fn solid_png(rgb: [u8; 3], size: u32) -> Vec<u8> {

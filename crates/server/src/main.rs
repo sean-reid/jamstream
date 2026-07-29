@@ -9,7 +9,6 @@ use jamstream_cloud::cloudinit::{
 use jamstream_server::config::Config;
 use jamstream_server::revocations::Revocations;
 use jamstream_server::runtime::{Options, RecordingOptions, Server};
-use jamstream_stream::pipeline::StreamConfig;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -128,14 +127,7 @@ fn main() -> ExitCode {
                 if let Some(path) = arg_value("--shutdown-file") {
                     server = server.with_shutdown_file(PathBuf::from(path));
                 }
-                // The broadcast card's title. A flag rather than a config key:
-                // the wire protocol has no session name, and /etc/jamstream/config
-                // is the provisioning contract, which no released host writes it
-                // into yet.
-                match arg_value("--session-name") {
-                    Some(name) => server.with_stream_config(StreamConfig::new(name)),
-                    None => server,
-                }
+                server
             }
             Err(err) => {
                 tracing::error!(%err, address = %bind, hint = bind_hint(&err), "cannot listen");

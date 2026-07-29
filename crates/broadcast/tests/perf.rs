@@ -6,8 +6,8 @@ mod common;
 
 use std::time::Instant;
 
-use common::{H, W, config, roster};
-use jamstream_broadcast::Renderer;
+use common::{H, W, roster};
+use jamstream_broadcast::{Renderer, SceneConfig};
 
 #[test]
 fn ten_member_scene_meets_frame_budget() {
@@ -16,7 +16,7 @@ fn ten_member_scene_meets_frame_budget() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(33.0);
 
-    let mut r = Renderer::new(config("perf gate"));
+    let mut r = Renderer::new(SceneConfig::default());
     let mut members = roster(10);
     let mut out = vec![0u8; (W * H * 4) as usize];
     r.render(0, &members, 25, &mut out);
