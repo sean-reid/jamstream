@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use data_encoding::HEXLOWER;
 use jamstream_audio_io::{
     AudioBackend, AudioError, CallbackBridge, EngineSide, StreamConfig, StreamHandle, WavBackend,
     WavStream,
@@ -36,10 +37,17 @@ use crate::runtime::{
 };
 use crate::screens::invites::TokenMap;
 
-const SAMPLE_RATE: u32 = 48_000;
+/// The session rate, from the protocol rather than a second copy of 48000:
+/// the device is opened at it and the offline pump paces against it, so a
+/// protocol that moved would otherwise leave this side opening the wrong rate.
+const SAMPLE_RATE: u32 = jamstream_protocol::SAMPLE_RATE;
 const CHANNELS: u16 = 2;
+/// The pace this side loops at and the frame it sends, both belonging to
+/// [`FrameDuration::Ms2_5`]. Its accessors are not const fns, so the numbers
+/// are spelled here and `the_frame_matches_the_wires_own_frame` holds them to
+/// the wire's answer.
 const TICK: Duration = Duration::from_micros(2_500);
-/// One 2.5 ms frame: 120 mono capture samples, 240 interleaved playout.
+/// One frame: 120 mono capture samples, 240 interleaved playout.
 const FRAME_FRAMES: usize = 120;
 const CHUNK_STEREO: usize = FRAME_FRAMES * 2;
 const CHAT_LIMIT: usize = 500;
@@ -148,10 +156,7 @@ struct SharedState {
 
 impl SharedState {
     fn new(invite: &Invite, server_addr: SocketAddr) -> Self {
-        let session_short = invite.session_id.0[..4]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let session_short = HEXLOWER.encode(&invite.session_id.0[..4]);
         SharedState {
             conn: ConnState::Connecting,
             rtt_ms: None,
@@ -1264,4 +1269,25 @@ fn loss_pct(stats: &ClientStats) -> f32 {
         stats.jitter.lost as f32 * 100.0 / stats.jitter.pulled as f32
     };
     down.max(stats.uplink_loss_pct.unwrap_or(0.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use jamstream_protocol::media::FrameDuration;
+
+    use super::*;
+
+    /// The numbers this file opens the device and paces the loop with, against
+    /// the protocol's own answers. Nothing else in the suite would notice them
+    /// drifting: the offline backend opens at whatever rate it is handed, so a
+    /// client sending 5 ms frames at 44.1 kHz would pass every test in
+    /// `live_runtime.rs` and be unintelligible to a real server.
+    #[test]
+    fn the_frame_matches_the_wires_own_frame() {
+        let frame = FrameDuration::Ms2_5;
+        assert_eq!(SAMPLE_RATE, jamstream_protocol::SAMPLE_RATE);
+        assert_eq!(FRAME_FRAMES as u32, frame.samples());
+        assert_eq!(TICK, Duration::from_micros(u64::from(frame.micros())));
+        assert_eq!(CHUNK_STEREO, FRAME_FRAMES * usize::from(CHANNELS));
+    }
 }

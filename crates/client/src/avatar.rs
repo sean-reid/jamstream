@@ -20,6 +20,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use data_encoding::HEXLOWER;
 use egui::Color32;
 use image::{ImageDecoder, Limits};
 
@@ -302,11 +303,7 @@ fn alloc_limit(max_alloc: u64) -> Limits {
 
 /// Lowercase hex of a content hash; the cache and texture key everywhere.
 pub fn hash_hex(hash: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(64);
-    for byte in hash {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    HEXLOWER.encode(hash)
 }
 
 /// Texture key for bytes we picked ourselves, before any session has hashed

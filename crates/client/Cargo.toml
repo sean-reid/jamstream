@@ -28,6 +28,10 @@ jamstream-cli.workspace = true
 # reads the same data file the server does so the two cannot disagree about
 # which platforms ship.
 jamstream-stream.workspace = true
+# Hex and base64. The CLI state file's key fields are written with this
+# codec on the CLI's side, and the app reads them back, so both halves of
+# that file go through one implementation.
+data-encoding.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
