@@ -2855,7 +2855,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jamstream-audio-io"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cpal",
  "hound",
@@ -2870,7 +2870,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-broadcast"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ab_glyph",
  "image",
@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "clap",
@@ -2905,7 +2905,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "data-encoding",
  "dirs",
@@ -2934,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-cloud"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2954,7 +2954,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-engine"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "jamstream-protocol",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-harness"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "jamstream-engine",
  "jamstream-protocol",
@@ -2978,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake2",
  "criterion",
@@ -2996,7 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "claxon",
  "criterion",
@@ -3018,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-session"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake2",
  "ed25519-dalek",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "jamstream-stream"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "jamstream-broadcast",
  "jamstream-cloud",
@@ -6936,7 +6936,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "hound",
 ]
