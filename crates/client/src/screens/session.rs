@@ -528,7 +528,7 @@ impl SessionScreen {
             // has is whether they are here. The dot used to carry your own
             // rtt and loss on every strip, so a green dot beside Ana said
             // nothing about Ana (#174).
-            presence_dot(ui, member.connected);
+            presence_dot(ui, member.connected, member.quiet);
             // Long names truncate inside the fixed strip; the full name is
             // one hover away.
             // Reserve room for the tag plus item spacing so the "you"

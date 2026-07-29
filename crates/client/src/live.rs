@@ -466,6 +466,7 @@ impl LiveRuntime {
                 name: m.name.clone(),
                 role: m.role,
                 connected: m.connected,
+                quiet: m.quiet,
                 is_you: s.me == Some(m.id),
                 fader: s.faders.get(&m.id).copied().unwrap_or(FaderView {
                     gain_db: 0.0,

@@ -123,6 +123,10 @@ pub struct MemberView {
     pub name: String,
     pub role: Role,
     pub connected: bool,
+    /// The server has heard nothing from this member lately and has not yet
+    /// given up on them. Only ever true alongside `connected`: the roster
+    /// clears it on disconnect, so gone is never also quiet.
+    pub quiet: bool,
     pub is_you: bool,
     pub fader: FaderView,
     /// The invite token admitting this member; what [`Command::Revoke`]

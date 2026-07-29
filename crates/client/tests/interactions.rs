@@ -886,7 +886,7 @@ fn a_strips_dot_follows_the_member_not_your_own_link() {
     use jamstream_client::widgets::{PRESENCE_AWAY, PRESENCE_HERE};
 
     let demo = DemoRuntime::frozen(FROZEN_FRAME, false);
-    demo.set_away(2, true); // Ben's client went quiet
+    demo.set_away(2, true); // the roster gave up on Ben
     let snap = demo.snapshot();
     assert!(
         snap.stats.rtt_ms.is_some_and(|rtt| rtt < 25.0),
@@ -926,6 +926,72 @@ fn a_strips_dot_follows_the_member_not_your_own_link() {
     assert!(
         harness.query_by_label_contains("mouth to ear").is_some(),
         "your own link stays in the bar"
+    );
+}
+
+/// #285: the roster carries three presence states now, and every one of them
+/// has to reach the console as itself. The middle one is the point: before it
+/// existed a member who stopped playing two seconds ago and a member playing
+/// looked identical for eight seconds, until the server gave up and the strip
+/// greyed out.
+///
+/// Read by label, not by pixel, because that is also what a screen reader gets
+/// off a painted dot.
+#[test]
+fn a_strip_says_which_of_the_three_presences_a_member_is_in() {
+    use jamstream_client::widgets::{PRESENCE_AWAY, PRESENCE_HERE, PRESENCE_QUIET};
+
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, false);
+    // Ana has gone quiet, Ben is gone, and the rest are playing.
+    demo.set_quiet(1, true);
+    demo.set_away(2, true);
+    let snap = demo.snapshot();
+    let musicians = snap
+        .members
+        .iter()
+        .filter(|m| m.role == jamstream_client::runtime::Role::Musician)
+        .count();
+    assert!(musicians >= 3, "three states need three musicians");
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let rt_ui = rt.clone();
+    let mut screen = SessionScreen::default();
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            let snap = rt_ui.snapshot();
+            screen.ui(ui, &snap, &*rt_ui);
+        });
+    harness.run_steps(3);
+
+    let quiet = harness.get_all_by_label(PRESENCE_QUIET).count();
+    let away = harness.get_all_by_label(PRESENCE_AWAY).count();
+    let here = harness.get_all_by_label(PRESENCE_HERE).count();
+    assert_eq!(quiet, 1, "exactly the member reported quiet reads quiet");
+    assert_eq!(away, 1, "and the member reported gone still reads gone");
+    assert_eq!(
+        here + quiet + away,
+        musicians,
+        "one dot per musician, each in exactly one of the three states"
+    );
+
+    // Quiet is not gone: the seat is held, so the strip keeps its controls and
+    // says nothing about being disconnected.
+    let ana = snap
+        .members
+        .iter()
+        .find(|m| m.quiet)
+        .expect("the roster reports one member quiet");
+    assert!(
+        ana.connected,
+        "a quiet member is still connected, or this is not the middle state"
+    );
+    assert_eq!(
+        harness.get_all_by_label("disconnected").count(),
+        1,
+        "only the member the roster gave up on reads disconnected"
     );
 }
 
