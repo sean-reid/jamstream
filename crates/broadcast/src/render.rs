@@ -8,22 +8,25 @@ use tiny_skia::{
 };
 
 use crate::avatar::AvatarImage;
+use crate::meter::{AMBER_FROM_DB, FLOOR_DB, HOLD_FADE_SECS, HOLD_SECS, RED_FROM_DB};
 use crate::palette::{self as pal, Rgb};
 use crate::text::{self, Fonts};
 use crate::{MemberVisual, Role, SceneConfig};
 
-/// At most this many musicians are carded; extras are not drawn.
+/// At most this many musicians are carded; extras are not drawn. The session's
+/// musician cap is the same fact; `jamstream-session` holds the two together.
 pub const MAX_CARDS: usize = 10;
 
-// Meter law, matching crates/client/src/widgets/meter.rs.
-const FLOOR_DB: f32 = -60.0;
-const AMBER_FROM_DB: f32 = -12.0;
-const RED_FROM_DB: f32 = -3.0;
 const UNLIT_BLEND: f32 = 0.16;
 
-/// Peak-hold: hold the top segment this many frames, then fade it out.
-const HOLD_FRAMES: u64 = 45;
-const HOLD_FADE_FRAMES: u64 = 15;
+/// The peak-hold in frames, worked out once from the scene's frame rate. The
+/// hold is a duration, so it cannot be a frame count here: see
+/// [`crate::meter`].
+#[derive(Clone, Copy, Debug)]
+struct HoldTiming {
+    hold: u64,
+    fade: u64,
+}
 
 pub struct Renderer {
     cfg: SceneConfig,
@@ -36,6 +39,7 @@ pub struct Renderer {
     key: SceneKey,
     meters: Vec<MeterGeom>,
     holds: [Hold; MAX_CARDS],
+    timing: HoldTiming,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -95,6 +99,10 @@ impl Renderer {
         paint_stage(&mut background);
         paint_footer(&mut background, &cfg, &fonts, scale);
         let static_scene = background.clone();
+        let timing = HoldTiming {
+            hold: crate::meter::frames_for(HOLD_SECS, cfg.fps),
+            fade: crate::meter::frames_for(HOLD_FADE_SECS, cfg.fps),
+        };
         Renderer {
             cfg,
             scale,
@@ -104,6 +112,7 @@ impl Renderer {
             key: SceneKey::default(),
             meters: Vec::new(),
             holds: [Hold::default(); MAX_CARDS],
+            timing,
         }
     }
 
@@ -158,6 +167,7 @@ impl Renderer {
                 h,
                 &geom,
                 &mut self.holds[slot],
+                self.timing,
                 frame_index,
                 m.level_peak,
                 m.level_rms,
@@ -615,6 +625,7 @@ fn draw_meter_live(
     h: u32,
     g: &MeterGeom,
     hold: &mut Hold,
+    timing: HoldTiming,
     frame: u64,
     peak: f32,
     rms: f32,
@@ -632,17 +643,17 @@ fn draw_meter_live(
     // `>=` keeps re-rendering the same frame idempotent.
     if !hold.active
         || peak_frac >= hold.frac
-        || frame.saturating_sub(hold.set_frame) >= HOLD_FRAMES + HOLD_FADE_FRAMES
+        || frame.saturating_sub(hold.set_frame) >= timing.hold + timing.fade
     {
         hold.frac = peak_frac;
         hold.set_frame = frame;
         hold.active = live;
     }
     let age = frame.saturating_sub(hold.set_frame);
-    let hold_alpha = if age <= HOLD_FRAMES {
+    let hold_alpha = if age <= timing.hold {
         1.0
     } else {
-        1.0 - (age - HOLD_FRAMES) as f32 / HOLD_FADE_FRAMES as f32
+        1.0 - (age - timing.hold) as f32 / timing.fade as f32
     };
 
     let count = g.count;

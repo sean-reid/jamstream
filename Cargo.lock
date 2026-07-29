@@ -2874,6 +2874,7 @@ version = "0.1.5"
 dependencies = [
  "ab_glyph",
  "image",
+ "jamstream-protocol",
  "thiserror 2.0.19",
  "tiny-skia",
 ]
@@ -3021,6 +3022,7 @@ version = "0.1.5"
 dependencies = [
  "blake2",
  "ed25519-dalek",
+ "jamstream-broadcast",
  "jamstream-engine",
  "jamstream-protocol",
  "postcard",

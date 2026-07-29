@@ -276,6 +276,10 @@ impl<H: ProcessHost> Pipeline<H> {
         let scene = SceneConfig {
             width: cfg.width,
             height: cfg.height,
+            // The catalog's rate, not a constant: the renderer's peak-hold is
+            // a duration, so a frame rate it does not know about would hold
+            // for the wrong length of time (#232).
+            fps: cfg.fps,
             wordmark: true,
         };
         let rgba = vec![0u8; (cfg.width * cfg.height * 4) as usize];

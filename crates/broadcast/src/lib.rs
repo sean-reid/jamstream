@@ -6,6 +6,10 @@
 //! stable hash of member names.
 
 mod avatar;
+/// The meter law, in seconds and decibels. Public for the same reason
+/// [`palette`] is: the app draws a meter for the same signal, so there is one
+/// copy of where green ends and how long a peak holds.
+pub mod meter;
 /// The stage palette and the initials-disc hue rule. Public so the desktop
 /// client can assert its own copy still agrees: a member must look the same
 /// in the app and on the stream card.
@@ -13,7 +17,7 @@ pub mod palette;
 mod render;
 mod text;
 
-pub use avatar::{AvatarError, AvatarImage};
+pub use avatar::{AvatarError, AvatarImage, MAX_BYTES, MAX_DIM};
 pub use render::{MAX_CARDS, Renderer, initials};
 
 /// Fixed per-stream scene parameters. Everything sized off these is
@@ -22,16 +26,21 @@ pub use render::{MAX_CARDS, Renderer, initials};
 pub struct SceneConfig {
     pub width: u32,
     pub height: u32,
+    /// Frames per second the stream is encoded at, from the platform catalog.
+    /// The renderer needs it because the meter's peak-hold is a duration:
+    /// see [`meter`] for what a wrong one does to a viewer.
+    pub fps: u32,
     /// Draw the small jamstream lockup with the amber tuning dot, lower right.
     pub wordmark: bool,
 }
 
 impl Default for SceneConfig {
-    /// 1280x720 with the wordmark on, the standard broadcast frame.
+    /// 1280x720 at 30 fps with the wordmark on, the standard broadcast frame.
     fn default() -> Self {
         SceneConfig {
             width: 1280,
             height: 720,
+            fps: 30,
             wordmark: true,
         }
     }

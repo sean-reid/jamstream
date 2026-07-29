@@ -12,3 +12,11 @@ tiny-skia.workspace = true
 ab_glyph.workspace = true
 image.workspace = true
 thiserror.workspace = true
+
+# Tests only, and on purpose: this crate draws frames and links nothing of
+# ours, which is what keeps it a pure function of its inputs. The avatar byte
+# cap is the transfer layer's number, though, and a renderer that accepted a
+# larger file than the control plane will carry is a renderer with a cap for
+# nothing, so `tests/avatars.rs` holds the two together (#232).
+[dev-dependencies]
+jamstream-protocol.workspace = true
