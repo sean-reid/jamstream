@@ -36,7 +36,7 @@ Broadcasting is the exception: one Twitch or YouTube destination is about 1.2 GB
 
 A cloud session records to a bucket, which adds two charges. Storage is the small one. A three hour take is about 1.2 GB for the mix or about 6 GB with stems, and at $0.023 per GB-month on S3 and about $0.02 on Cloud Storage, keeping the stems for the default 30 days is about $0.14. A DigitalOcean Spaces subscription is $5 a month including 250 GB, so a take fits inside what you already pay. Uploading costs nothing, because the machine and the bucket are at the same provider.
 
-The wizard shows both lines before you launch, and they move when you switch between the mix and stems.
+Both lines are in the preview before you launch, in the wizard and in `jamstream host --bucket`, and they move when you switch between the mix and stems.
 
 **The egress lands on the download.** Pulling 6 GB of stems out of S3 is about $0.56, out of Cloud Storage about $0.75, and free inside the 1 TB Spaces includes. That is the one cost in JamStream that arrives after a session has finished pricing itself, which is why `jamstream recordings get` prints the figure and waits for a yes before it moves a byte.
 
