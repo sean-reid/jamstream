@@ -7,27 +7,25 @@
 //! resulting per-destination status comes back to a member who is *not* the
 //! host, with no stream key anywhere in it.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
+use std::net::SocketAddr;
+
+use common::{Running, Session, budget, loopback};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use jamstream_protocol::control::{
     DestinationState, DestinationStatus, StreamKey, StreamOp, StreamPlatform,
 };
-use jamstream_protocol::ids::{DestinationId, MemberId, Role, SessionId, TokenId};
-use jamstream_protocol::invite::{Invite, Issuer, Token};
-use jamstream_protocol::transport::generate_keypair;
-use jamstream_server::config::Config;
+use jamstream_protocol::ids::{DestinationId, Role, TokenId};
+use jamstream_protocol::invite::Invite;
 use jamstream_server::runtime::{Options, Server};
 use jamstream_session::client::{ClientCore, ClientEvent};
 use jamstream_stream::pipeline::StreamConfig;
 use tokio::net::UdpSocket;
 
 const KEY: &str = "live_777_never_relay_me";
-
-fn loopback() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
 
 /// A stand-in ffmpeg: drains every FIFO named in argv and then its stdin, so
 /// the encoder's spawn and pipe handshake happen for real without needing a
@@ -113,17 +111,7 @@ async fn a_hosts_stream_request_reaches_the_pipeline_and_status_reaches_everyone
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
-    let issuer = Issuer::generate();
-    let server_keys = generate_keypair();
-    let session_id = SessionId::generate();
-    let cfg = Config {
-        session_id,
-        port: 0,
-        server_private_key: server_keys.private.to_vec(),
-        issuer_public_key: issuer.public_key().to_bytes(),
-        idle_shutdown_min: 0,
-        max_duration_min: 0,
-    };
+    let session = Session::new();
 
     let mut stream_cfg = StreamConfig::new("Integration Jam");
     stream_cfg.ffmpeg = fake_ffmpeg(&root);
@@ -136,7 +124,7 @@ async fn a_hosts_stream_request_reaches_the_pipeline_and_status_reaches_everyone
     stream_cfg.height = 180;
 
     let server = Server::bind(
-        &cfg,
+        &session.cfg,
         Options {
             bind: loopback(),
             activity_path: None,
@@ -146,24 +134,16 @@ async fn a_hosts_stream_request_reaches_the_pipeline_and_status_reaches_everyone
     .await
     .unwrap()
     .with_stream_config(stream_cfg);
-    let server_addr = server.local_addr().unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_task = tokio::spawn(server.run(async {
-        let _ = stop_rx.await;
-    }));
+    let server = Running::of(server);
+    let server_addr = server.addr;
 
     let mint = |member: u16, role: Role| {
-        issuer.mint(
-            session_id,
-            vec![server_addr],
-            server_keys.public,
-            Token {
-                member_id: MemberId(member),
-                role,
-                name_hint: Some(format!("member{member}")),
-                expires_unix: u64::MAX,
-                jti: TokenId::generate(),
-            },
+        session.invite(
+            member,
+            role,
+            TokenId::generate(),
+            Some(format!("member{member}")),
+            server_addr,
         )
     };
 
@@ -173,7 +153,7 @@ async fn a_hosts_stream_request_reaches_the_pipeline_and_status_reaches_everyone
     let mut host = Peer::connect(&mint(0, Role::Musician), server_addr, now()).await;
     let mut listener = Peer::connect(&mint(5, Role::Listener), server_addr, now()).await;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
     let mut asked = false;
     while Instant::now() < deadline {
         host.pump(now()).await;
@@ -232,7 +212,6 @@ async fn a_hosts_stream_request_reaches_the_pipeline_and_status_reaches_everyone
         assert!(entries.next().is_none(), "a key file is still on disk");
     }
 
-    let _ = stop_tx.send(());
-    server_task.await.unwrap().unwrap();
+    server.stop().await.unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -4,21 +4,15 @@
 //! guard's input signal: the activity file's mtime advances while musicians
 //! are connected and stops advancing once they all leave.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
-use jamstream_protocol::invite::{Issuer, Token};
-use jamstream_protocol::transport::generate_keypair;
-use jamstream_server::config::Config;
+use common::{Running, Session, budget, loopback, scratch_dir};
 use jamstream_server::runtime::{Options, Server};
 use jamstream_session::client::{ClientCore, ClientState};
 use tokio::net::UdpSocket;
-
-fn loopback() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
 
 struct Client {
     core: ClientCore,
@@ -55,36 +49,21 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activity_file_advances_with_musicians_and_stops_after_they_leave() {
-    let issuer = Issuer::generate();
-    let server_keys = generate_keypair();
-    let session_id = SessionId::generate();
-
-    let dir = std::env::temp_dir().join(format!("jamstream-deadman-{}", std::process::id()));
+    let session = Session::new();
+    let dir = scratch_dir("deadman");
     let activity = dir.join("activity");
-
-    let cfg = Config {
-        session_id,
-        port: 0,
-        server_private_key: server_keys.private.to_vec(),
-        issuer_public_key: issuer.public_key().to_bytes(),
-        idle_shutdown_min: 10,
-        max_duration_min: 720,
-    };
-    let server = Server::bind(
-        &cfg,
-        Options {
-            bind: loopback(),
-            activity_path: Some(activity.clone()),
-            recording: None,
-        },
-    )
-    .await
-    .unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_task = tokio::spawn(server.run(async {
-        let _ = stop_rx.await;
-    }));
+    let server = Running::of(
+        Server::bind(
+            &session.cfg,
+            Options {
+                activity_path: Some(activity.clone()),
+                ..Running::plain_options()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let server_addr = server.addr;
 
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
@@ -92,25 +71,14 @@ async fn activity_file_advances_with_musicians_and_stops_after_they_leave() {
     // Two musicians join over real UDP.
     let mut clients = Vec::new();
     for member in [1u16, 2] {
-        let invite = issuer.mint(
-            session_id,
-            vec![server_addr],
-            server_keys.public,
-            Token {
-                member_id: MemberId(member),
-                role: Role::Musician,
-                name_hint: None,
-                expires_unix: u64::MAX,
-                jti: TokenId::generate(),
-            },
-        );
+        let invite = session.musician(member, server_addr);
         let socket = UdpSocket::bind(loopback()).await.unwrap();
         socket.connect(server_addr).await.unwrap();
         let (core, first) = ClientCore::connect(&invite, now()).unwrap();
         socket.send(&first).await.unwrap();
         clients.push(Client { core, socket });
     }
-    let join_deadline = Instant::now() + Duration::from_secs(5);
+    let join_deadline = Instant::now() + budget(Duration::from_secs(5));
     while clients
         .iter()
         .any(|c| *c.core.state() != ClientState::Joined)
@@ -170,7 +138,6 @@ async fn activity_file_advances_with_musicians_and_stops_after_they_leave() {
         "activity mtime kept advancing after every musician left"
     );
 
-    let _ = stop_tx.send(());
-    server_task.await.unwrap().unwrap();
+    server.stop().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

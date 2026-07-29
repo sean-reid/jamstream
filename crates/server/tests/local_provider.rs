@@ -6,9 +6,12 @@
 //! and a server with --max-duration-min set exits at the cap even with a
 //! connected, actively sending musician.
 
+mod common;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use common::{BIND, ChildGuard, ReservedPort, budget, scratch_dir, server_binary};
 
 use jamstream_cloud::providers::local::LocalProvider;
 use jamstream_cloud::{BootConfig, InstanceClass, LaunchSpec, Provider, SelfDestruct, session_tag};
@@ -17,71 +20,6 @@ use jamstream_protocol::invite::{Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
 use jamstream_session::client::{ClientCore, ClientEvent};
 use tokio::net::UdpSocket;
-
-fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "jamstream-localmode-{label}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn server_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_jamstreamd"))
-}
-
-/// A port the kernel handed out, kept reserved by holding the socket until
-/// the server is about to take it. Bind-then-drop hands the port straight
-/// back, so between the pick and the spawn any of the other three tests in
-/// this binary (nextest runs them concurrently, each in its own process)
-/// can be given the same one and the loser's server dies on a bind error.
-/// Holding it narrows that window to the instant of the spawn itself.
-struct ReservedPort {
-    socket: Option<std::net::UdpSocket>,
-    port: u16,
-}
-
-impl ReservedPort {
-    fn reserve() -> ReservedPort {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = socket.local_addr().unwrap().port();
-        ReservedPort {
-            socket: Some(socket),
-            port,
-        }
-    }
-
-    /// Hands the port back to the kernel. Called immediately before the
-    /// server that is to bind it starts, and never earlier.
-    fn release(&mut self) {
-        self.socket.take();
-    }
-}
-
-/// Kills the spawned server unless it has already exited. These tests are
-/// about servers that outlive their launcher, so a panic between the spawn
-/// and the wait must not leave one running: the drop on the way out is the
-/// only thing that can clean up after a failure.
-struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            eprintln!("test left jamstreamd {} running; killing it", self.0.id());
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-}
-
-/// Every server these tests spawn is confined to loopback. Without it
-/// jamstreamd binds every interface, and the macOS Application Firewall
-/// filters incoming connections per binary: every rebuild is a new binary,
-/// so an unconfined server raises a dialog and drops this test's datagrams
-/// until somebody answers it. Loopback is the one path it does not govern.
-const BIND: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
 struct SessionMaterial {
     issuer: Issuer,
@@ -163,7 +101,7 @@ async fn join_musician(mat: &SessionMaterial, name: &str) -> (ClientCore, UdpSoc
 
     let mut joined = false;
     let mut buf = [0u8; 2048];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     while Instant::now() < deadline && !joined {
         for pkt in client.poll(now()) {
             socket.send(&pkt).await.unwrap();
@@ -187,7 +125,7 @@ async fn join_musician(mat: &SessionMaterial, name: &str) -> (ClientCore, UdpSoc
 
 #[tokio::test]
 async fn launch_join_destroy_end_to_end() {
-    let dir = temp_dir("e2e");
+    let dir = scratch_dir("localmode-e2e");
     let provider = LocalProvider::new(dir.clone())
         .with_server_binary(server_binary())
         .with_bind(IpAddr::V4(BIND));
@@ -237,7 +175,7 @@ async fn launch_join_destroy_end_to_end() {
         .await
         .expect("destroy");
     assert!(
-        killed_at.elapsed() < Duration::from_secs(5),
+        killed_at.elapsed() < budget(Duration::from_secs(5)),
         "destroy took longer than the 5 s budget"
     );
     assert!(
@@ -249,7 +187,7 @@ async fn launch_join_destroy_end_to_end() {
 
 #[tokio::test]
 async fn registry_survives_provider_restart() {
-    let dir = temp_dir("sweeper");
+    let dir = scratch_dir("localmode-sweeper");
     let mut mat = session_material(10);
     mat.reserved.release();
     let instance = {
@@ -283,7 +221,7 @@ async fn registry_survives_provider_restart() {
 /// must exit cleanly on its own.
 #[test]
 fn idle_exit_terminates_an_unjoined_server() {
-    let dir = temp_dir("idle");
+    let dir = scratch_dir("localmode-idle");
     let mut mat = session_material(10);
     let config_path = dir.join("config");
     std::fs::write(&config_path, &mat.flat_config).unwrap();
@@ -305,7 +243,7 @@ fn idle_exit_terminates_an_unjoined_server() {
             .expect("spawn jamstreamd"),
     );
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + budget(Duration::from_secs(15));
     let status = loop {
         if let Some(status) = child.0.try_wait().expect("try_wait") {
             break status;
@@ -331,7 +269,7 @@ fn idle_exit_terminates_an_unjoined_server() {
 /// fire; either way of finding out counts.
 #[tokio::test]
 async fn max_duration_ends_an_occupied_session() {
-    let dir = temp_dir("maxdur");
+    let dir = scratch_dir("localmode-maxdur");
     let mut mat = session_material(10);
     let config_path = dir.join("config");
     std::fs::write(&config_path, &mat.flat_config).unwrap();
@@ -360,7 +298,7 @@ async fn max_duration_ends_an_occupied_session() {
     // exit anyway, which is exactly what idle-exit would never do here.
     let mut buf = [0u8; 2048];
     let mut told = false;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + budget(Duration::from_secs(15));
     let status = loop {
         if let Some(status) = child.0.try_wait().expect("try_wait") {
             break status;
@@ -391,7 +329,7 @@ async fn max_duration_ends_an_occupied_session() {
 
     // The Bye may still be in the socket buffer, and a client that missed it
     // falls back to its 10 s connection timeout.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + budget(Duration::from_secs(20));
     while Instant::now() < deadline && !told {
         for pkt in client.poll(now()) {
             let _ = socket.send(&pkt).await;

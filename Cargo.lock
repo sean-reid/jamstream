@@ -3031,6 +3031,7 @@ name = "jamstream-stream"
 version = "0.1.5"
 dependencies = [
  "jamstream-broadcast",
+ "jamstream-cloud",
  "jamstream-protocol",
  "libc",
  "serde",

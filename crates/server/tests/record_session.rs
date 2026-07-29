@@ -4,21 +4,17 @@
 //! runtime over real UDP: the wire message drives the recorder that writes
 //! the file, not a test double on either side.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
 use std::time::{Duration, Instant};
 
+use common::{Running, Session, budget, loopback, scratch_dir};
 use jamstream_protocol::control::{RecordOp, RecordingState};
-use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
-use jamstream_protocol::invite::{Invite, Issuer, Token};
-use jamstream_protocol::transport::generate_keypair;
-use jamstream_server::config::Config;
+use jamstream_protocol::ids::HOST_MEMBER_ID;
+use jamstream_protocol::invite::Invite;
 use jamstream_server::runtime::{Options, RecordingOptions, Server};
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
 use tokio::net::UdpSocket;
-
-fn loopback() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
 
 struct Client {
     core: ClientCore,
@@ -67,75 +63,33 @@ impl Client {
     }
 }
 
-fn mint(issuer: &Issuer, session: SessionId, addr: SocketAddr, pk: [u8; 32], id: u16) -> Invite {
-    issuer.mint(
-        session,
-        vec![addr],
-        pk,
-        Token {
-            member_id: MemberId(id),
-            role: Role::Musician,
-            name_hint: None,
-            expires_unix: u64::MAX,
-            jti: TokenId::generate(),
-        },
-    )
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
-    let issuer = Issuer::generate();
-    let server_keys = generate_keypair();
-    let session_id = SessionId::generate();
-    let dir = std::env::temp_dir().join(format!(
-        "jamstream-record-session-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let cfg = Config {
-        session_id,
-        port: 0,
-        server_private_key: server_keys.private.to_vec(),
-        issuer_public_key: issuer.public_key().to_bytes(),
-        idle_shutdown_min: 10,
-        max_duration_min: 720,
-    };
-    let server = Server::bind(
-        &cfg,
-        Options {
-            bind: loopback(),
-            activity_path: None,
-            recording: Some(RecordingOptions::Disk {
-                dir: dir.clone(),
-                stems: false,
-            }),
-        },
-    )
-    .await
-    .unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_task = tokio::spawn(server.run(async {
-        let _ = stop_rx.await;
-    }));
+    let session = Session::new();
+    let dir = scratch_dir("record-session");
+    let server = Running::of(
+        Server::bind(
+            &session.cfg,
+            Options {
+                recording: Some(RecordingOptions::Disk {
+                    dir: dir.clone(),
+                    stems: false,
+                }),
+                ..Running::plain_options()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let server_addr = server.addr;
 
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
 
-    let pk = server_keys.public;
-    let mut host = Client::join(
-        &mint(&issuer, session_id, server_addr, pk, HOST_MEMBER_ID.0),
-        now(),
-    )
-    .await;
-    let mut guest = Client::join(&mint(&issuer, session_id, server_addr, pk, 1), now()).await;
+    let mut host = Client::join(&session.musician(HOST_MEMBER_ID.0, server_addr), now()).await;
+    let mut guest = Client::join(&session.musician(1, server_addr), now()).await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     while *host.core.state() != ClientState::Joined || *guest.core.state() != ClientState::Joined {
         assert!(Instant::now() < deadline, "clients never joined");
         host.pump(now()).await;
@@ -145,7 +99,7 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
     // The host presses record; the room is told, the host included, and
     // only by the server: no optimistic echo exists to fake this.
     host.core.record_ctl(RecordOp::Start).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     loop {
         host.pump(now()).await;
         guest.pump(now()).await;
@@ -163,8 +117,8 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
     }
 
     // A mid-take joiner is told on arrival, not on the next transition.
-    let mut late = Client::join(&mint(&issuer, session_id, server_addr, pk, 2), now()).await;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut late = Client::join(&session.musician(2, server_addr), now()).await;
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     while late.last_record_state() != Some(&RecordingState::Recording) {
         assert!(
             Instant::now() < deadline,
@@ -179,7 +133,7 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
     // Let the recorder see some ticks, then stop; everyone hears Idle.
     tokio::time::sleep(Duration::from_millis(300)).await;
     host.core.record_ctl(RecordOp::Stop).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget(Duration::from_secs(5));
     while host.last_record_state() != Some(&RecordingState::Idle)
         || late.last_record_state() != Some(&RecordingState::Idle)
     {
@@ -194,8 +148,7 @@ async fn a_take_driven_over_the_wire_lands_on_disk_and_everyone_is_told() {
         late.pump(now()).await;
     }
 
-    let _ = stop_tx.send(());
-    let _ = server_task.await;
+    let _ = server.stop().await;
 
     // One mix file, finished (no .part), and it decodes with an independent
     // decoder to a non-empty take.
