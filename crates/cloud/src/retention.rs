@@ -418,6 +418,17 @@ fn gcs_rule_is_ours(rule: &Value) -> bool {
 }
 
 /// What actually happened when a retention choice was applied.
+///
+/// `#[must_use]` because the two arms are the difference between a promise the
+/// bucket is keeping and a promise nobody is keeping, and the call that
+/// produces this also *does* something, so dropping the answer looks like a
+/// complete statement. That is #257: the wizard called `verify_bucket` for the
+/// effect and wrote `.map_err(...)?;`, which discards a
+/// `RetentionEnforcement`, and a host who picked "delete after 30 days" on a
+/// key that cannot write a lifecycle rule launched a session that looked
+/// exactly like one where the rule applied. Whoever holds this value owes the
+/// host [`RetentionEnforcement::describe`].
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetentionEnforcement {
     /// The provider now enforces the choice itself.

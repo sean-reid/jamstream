@@ -111,6 +111,13 @@ impl IdleExit {
     }
 
     /// True means exit now. A zero window never fires.
+    ///
+    /// `#[must_use]` because the call advances the countdown as well as
+    /// answering it, so a heartbeat that called it and dropped the answer
+    /// would look like a working switch and be a VM that bills until someone
+    /// notices. A dropped `true` here is the failure this whole type exists to
+    /// prevent.
+    #[must_use]
     pub fn observe(&mut self, now: Duration, musicians: usize) -> bool {
         if self.window.is_zero() {
             return false;
@@ -138,6 +145,12 @@ impl MaxDuration {
     }
 
     /// True means exit now. A zero window never fires.
+    ///
+    /// `#[must_use]` for the reason on [`IdleExit::observe`]: the hard cap is
+    /// the last thing standing between a forgotten session and an unbounded
+    /// bill, and the only way it can fail is a caller that does not act on the
+    /// answer.
+    #[must_use]
     pub fn observe(&self, now: Duration) -> bool {
         !self.window.is_zero() && now >= self.window
     }
