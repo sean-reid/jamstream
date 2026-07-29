@@ -737,6 +737,50 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
     let _ = std::fs::remove_file(&sine);
 }
 
+/// User story: a musician swaps interfaces mid-song, the new one will not run
+/// at 48 kHz, and the app tells them why on screen instead of going quiet.
+///
+/// The device's own words are the whole point. Before this, the reason lived in
+/// a `tracing::warn` inside `try_open` and the only visible notice was the chat
+/// line asserted above, which says what the app did and not why it had to.
+/// Nothing in the suite read the refusal, so it could be dropped entirely and
+/// stay green.
+#[test]
+fn a_device_that_refuses_the_session_rate_says_so_in_the_snapshot() {
+    let server = TestServer::start();
+    let sine = sine_fixture("device-refused", 440.0);
+    // The sequence a swapped cable puts a running session through: the device
+    // that joined is lost after half a second of pumping, and the one that
+    // answers the reopen runs at 44.1 kHz and will not take 48.
+    let backend = WavBackend::new(Some(sine.clone()), None)
+        .with_device_loss_after(200)
+        .refusing_reopen_at(44_100);
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+
+    let snap = wait_for(&rt, "the refusal", Duration::from_secs(10), |s| {
+        s.device_error.is_some()
+    });
+    let reason = snap.device_error.expect("the predicate above matched");
+    assert!(
+        reason.contains("44100") && reason.contains("48000"),
+        "the reason must name both rates a musician has to reconcile: {reason:?}"
+    );
+    assert_eq!(
+        snap.stats.state,
+        ConnState::Joined,
+        "a refused device must not drop the session"
+    );
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(rt);
+    let _ = std::fs::remove_file(&sine);
+}
+
 /// The other half of the same contract: a session nobody armed to record
 /// must say so in the lamp rather than swallow the press. That is what a
 /// host who launched from the app sees today, because the app's own launch

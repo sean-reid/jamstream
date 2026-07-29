@@ -1845,6 +1845,47 @@ fn a_strip_lays_out_identically_with_and_without_an_avatar() {
     }
 }
 
+/// A device that will not run has to be readable from inside the session: the
+/// reason the device gave, and one line saying what it costs and where to fix
+/// it, over strips that are all still there. Told, not stopped (#263).
+///
+/// The mixer used to draw nothing at all for this, so the whole of what a
+/// silent musician had was a chat line about the fallback and a log they were
+/// not reading mid-song.
+#[test]
+fn a_refused_device_puts_the_reason_over_the_strips() {
+    let reason = "unsupported audio configuration: \
+                  wav device runs at 44100 Hz and will not open at 48000 Hz";
+    let quiet = DemoRuntime::frozen(FROZEN_FRAME, true).snapshot();
+    let mut refused = quiet.clone();
+    refused.device_error = Some(reason.to_owned());
+
+    let mut harness = static_harness(refused);
+    harness.run_steps(3);
+    let sentence = format!("no audio device is running: {reason}");
+    assert!(
+        harness.query_by_label(&sentence).is_some(),
+        "the device's own reason must be on the mixer"
+    );
+    assert!(
+        harness
+            .get_all_by_label_contains("The Audio tab in Settings")
+            .next()
+            .is_some(),
+        "and where to fix it"
+    );
+    // The session carries on around it: nothing here blocks the mixer.
+    assert!(harness.query_by_label("Ana fader").is_some());
+
+    // And it is the state that draws it, not the screen always drawing it.
+    let mut harness = static_harness(quiet);
+    harness.run_steps(3);
+    assert!(
+        harness.query_by_label(&sentence).is_none(),
+        "a working device must say nothing"
+    );
+}
+
 /// The chat alignment invariant: message text starts at one x for every
 /// line, whatever the name beside it is. The long-names demo carries a
 /// 64-character name and the short scripted ones together.
