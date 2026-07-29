@@ -327,8 +327,15 @@ jobs:
       # One at a time and after the rest have finished, so the measurement has
       # the runner to itself. `--no-tests fail` is what makes the filter above
       # honest: a rename that empties this run goes red here.
+      #
+      # `--success-output immediate` because both tests print the distribution
+      # they measured and nextest otherwise shows it only when the gate fails.
+      # That is how #239 came to set the budget from an estimated ci p99 of 2.4
+      # to 5.9 ms instead of a measured one: the numbers were in the runner and
+      # nobody could read them. Two lines per job, and the next person to touch
+      # the budget can look up what it actually costs on each platform.
       - name: The timed gates, with the runner to themselves
-        run: cargo nextest run --locked -p jamstream-harness --test-threads 1 --no-tests fail -E '${{ env.TIMED_GATES }}'
+        run: cargo nextest run --locked -p jamstream-harness --test-threads 1 --no-tests fail --success-output immediate -E '${{ env.TIMED_GATES }}'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
 
