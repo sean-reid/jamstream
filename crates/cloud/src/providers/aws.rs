@@ -112,6 +112,29 @@ fn instance_type(class: InstanceClass) -> &'static str {
     }
 }
 
+/// True for the burstable EC2 families, which are T2 and later; T1 bursts
+/// too but has no unlimited mode.
+fn is_burstable(instance_type: &str) -> bool {
+    let family = instance_type.split('.').next().unwrap_or_default();
+    let mut chars = family.chars();
+    matches!(chars.next(), Some('t' | 'T'))
+        && chars
+            .next()
+            .and_then(|c| c.to_digit(10))
+            .is_some_and(|generation| generation >= 2)
+}
+
+/// The RunInstances credit-mode parameter for `instance_type`, or None for a
+/// family that would reject it.
+fn credit_specification(instance_type: &str) -> Option<(String, String)> {
+    is_burstable(instance_type).then(|| {
+        (
+            "CreditSpecification.CpuCredits".to_owned(),
+            "unlimited".to_owned(),
+        )
+    })
+}
+
 #[derive(Clone)]
 pub struct AwsProvider {
     access_key_id: String,
@@ -597,12 +620,10 @@ impl Provider for AwsProvider {
             .await
             .map_err(|e| e.while_doing("creating the session security group"))?;
 
+        let ec2_type = instance_type(spec.instance_class);
         let mut params = vec![
             ("ImageId".to_owned(), ami),
-            (
-                "InstanceType".to_owned(),
-                instance_type(spec.instance_class).to_owned(),
-            ),
+            ("InstanceType".to_owned(), ec2_type.to_owned()),
             ("MinCount".to_owned(), "1".to_owned()),
             ("MaxCount".to_owned(), "1".to_owned()),
             ("SecurityGroupId.1".to_owned(), group_id),
@@ -641,6 +662,12 @@ impl Provider for AwsProvider {
                 "instance".to_owned(),
             ),
         ];
+        // A burstable instance defaults to standard credit mode, where a long
+        // session drains its credits and gets clamped to a 20 percent
+        // baseline: the mix tick then overruns and clients absorb the catch-up
+        // as latency that grows all session. Surplus credits cost cents an
+        // hour, and the clamp shows up nowhere in the console.
+        params.extend(credit_specification(ec2_type));
         for (i, (key, value)) in spec.tags.iter().enumerate() {
             params.push((format!("TagSpecification.1.Tag.{}.Key", i + 1), key.clone()));
             params.push((
@@ -1911,6 +1938,56 @@ mod tests {
     fn instance_type_mapping() {
         assert_eq!(instance_type(InstanceClass::Small), "t4g.small");
         assert_eq!(instance_type(InstanceClass::Standard), "t4g.medium");
+    }
+
+    /// #223: both classes map to T instances, so both need the credit
+    /// parameter, not just the Standard default.
+    #[test]
+    fn every_class_launches_a_burstable_type() {
+        for class in [InstanceClass::Small, InstanceClass::Standard] {
+            assert!(is_burstable(instance_type(class)), "{class:?}");
+        }
+    }
+
+    #[test]
+    fn burstable_families_are_t2_and_later() {
+        for ty in [
+            "t2.micro",
+            "t3.medium",
+            "t3a.large",
+            "t4g.medium",
+            "t5.nano",
+            "T3.medium",
+        ] {
+            assert!(is_burstable(ty), "{ty}");
+        }
+        // t1 bursts without an unlimited mode; trn1 is Trainium, which starts
+        // with a t and is not burstable at all.
+        for ty in [
+            "t1.micro",
+            "trn1.2xlarge",
+            "m7g.medium",
+            "c7g.large",
+            "t",
+            "",
+        ] {
+            assert!(!is_burstable(ty), "{ty}");
+        }
+    }
+
+    /// The negative path is not reachable over the wire: `instance_type`
+    /// returns nothing but t4g sizes, so this is where a non-burstable
+    /// launch can be shown to omit the parameter AWS would reject.
+    #[test]
+    fn a_non_burstable_type_sends_no_credit_specification() {
+        assert_eq!(
+            credit_specification("t4g.medium"),
+            Some((
+                "CreditSpecification.CpuCredits".to_owned(),
+                "unlimited".to_owned()
+            ))
+        );
+        assert_eq!(credit_specification("m7g.medium"), None);
     }
 
     /// #139: every instance type here is Graviton and the AMI parameter is
