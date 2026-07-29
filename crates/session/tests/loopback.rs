@@ -2446,6 +2446,37 @@ fn listener_capacity_enforced() {
     assert_eq!(h.server.broadcast_tick().listeners, MAX_LISTENERS);
 }
 
+/// Pairs a test name with the function that carries it: `stringify!` and the
+/// `as fn()` coercion read the same identifier, so a rename cannot make the two
+/// disagree without failing to compile.
+macro_rules! named {
+    ($($f:ident),+ $(,)?) => { [$((stringify!($f), $f as fn())),+] };
+}
+
+/// Two tests in this file print a measurement, and `.config/nextest.toml` is
+/// what makes anyone able to read it: the default profile discards a passing
+/// test's stdout, so across this repo's history exactly one measurement line
+/// survives anywhere (#283). `tick_cost_at_capacity` additionally reads a wall
+/// clock, so the config gives it the machine to itself.
+///
+/// The filters there are exact matches, which pairs a name in a toml file with
+/// a name in this one. This is the half that notices when they come apart. The
+/// harness suite has its own copy for the names that live over there.
+#[test]
+fn the_measured_tests_are_named_in_the_nextest_config() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+    for (name, _) in named![
+        tick_cost_at_capacity,
+        a_set_avatar_flood_is_not_an_egress_amplifier,
+    ] {
+        assert!(
+            CONFIG.contains(&format!("test(={name})")),
+            ".config/nextest.toml no longer names {name}, so what it measures is either \
+             being timed on a busy machine or printed into a void"
+        );
+    }
+}
+
 /// The tick schedule at capacity, gated on the part of it that is a fact
 /// rather than a stopwatch reading.
 ///
@@ -2458,9 +2489,12 @@ fn listener_capacity_enforced() {
 /// The wall-clock half of this deadline is gated in the harness suite, where
 /// `JAMSTREAM_PERF_BUDGET_SECS` names how much slower the runner is than the
 /// reference laptop. The numbers are printed here too, because this is the
-/// cheapest place to get them:
-/// `cargo test -p jamstream-session --release --test loopback --
-/// --nocapture tick_cost_at_capacity`.
+/// cheapest place to get them: `cargo nextest run -p jamstream-session
+/// tick_cost_at_capacity` publishes the table, and `.config/nextest.toml`
+/// gives this test the machine to itself so the distribution is a record of
+/// the tick and not of the scheduler. The table went to nobody at all until
+/// #283: the default nextest profile discards a passing test's stdout, so
+/// nothing printed here had ever reached a log.
 #[test]
 fn tick_cost_at_capacity() {
     // 20 ms of broadcast accumulated over 2.5 ms master ticks.

@@ -1,0 +1,82 @@
+# nextest reads this on every path the tests run on: ci.yml, nightly.yml, and a
+# laptop. That is the whole reason the file exists. Both facts below were
+# command-line arguments in one workflow, which made them true in one place and
+# false in the two that mattered.
+#
+# Everything here is per-test rather than profile-wide. `test(=name)` is an
+# exact match, so a rename silently drops the override; the two tests
+# `the_measured_tests_are_named_in_the_nextest_config`, one in the harness suite
+# and one in the session suite, pair each name here with the function it names
+# and fail when they come apart.
+
+# `priority` below needs 0.9.91 or newer. Without this line an older binary
+# refuses the key outright, which is fine, but the message names a toml field
+# rather than a version; with it the error says what to upgrade.
+nextest-version = { required = "0.9.91" }
+
+[[profile.default.overrides]]
+# The tests that read a wall clock go last and get the machine to themselves.
+#
+# Almost every other test in these suites is a cpu-bound simulation and nextest
+# runs as many at once as the machine has cores, so a gate measured beside them
+# is measured on a machine with no idle core left. A p99 across a 600 us region
+# does not survive that: lose the cpu once inside the region and the sample
+# records a scheduler quantum instead of a tick, and a p99 over 1000 ticks needs
+# ten such samples to move.
+#
+# The numbers, from #276 and #282. windows-latest reported the broadcast tick at
+# p99 19251 us against a 1213 us median and a 10000 us budget, on a
+# comments-only change. Given the runner to itself the same platform measures
+# p99 1042 to 1092 us against a 705 to 895 us median. On a 14-core laptop the
+# shape reproduces on demand: p99 684 us idle, p99 9725 us against 14 busy
+# cores, median 601 us to 946 us. The median moves 1.6x and the tail moves 14x,
+# which is what preemption looks like and not what tick cost looks like. No
+# budget on any platform was widened for it.
+#
+# "num-test-threads" reserves the whole pool, so nextest waits for everything
+# else to finish and starts nothing beside these. The priority is what makes
+# that affordable, and the difference is measured on this workspace's 965 tests
+# on a 14-core laptop: 47 s with no isolation at all, 86 s isolated at the
+# default priority, 56 s isolated and last. An exclusive test reserves the pool
+# wherever the scheduler reaches it, so at the default priority each of the
+# three drains the machine mid-run and leaves it idle waiting; last in the queue
+# is one drain at the end instead of three in the middle. That is the same shape
+# #282 got from a second workflow step, and it costs 9 s.
+filter = """
+    test(=tick_budget_at_capacity)
+    or test(=perf_sanity_sixty_seconds_regional)
+    or test(=tick_cost_at_capacity)
+"""
+priority = -100
+threads-required = "num-test-threads"
+success-output = "immediate"
+
+[[profile.default.overrides]]
+# The measurements that are facts about the simulation rather than about the
+# machine: mouth-to-ear latency and buffer depth off the virtual clock, bytes
+# counted on the simulated network. Contention cannot move them, so they only
+# need publishing.
+#
+# Publishing is not the default because `success-output = "immediate"` prints
+# libtest's own six lines of preamble for every passing test whether it said
+# anything or not, and the workspace has over a thousand of them. So the tests
+# that measure something are named, and the rest stay quiet.
+#
+# This is the half of #283 that is not about parallelism. The default profile
+# discards a passing test's stdout, so across 586 ci runs and 935 harness jobs
+# in this repo's history exactly one measurement line survives, and the tick
+# budget in #239 was calibrated against an estimated ci p99 of 2.4 to 5.9 ms
+# because the measured one was produced on every run of every platform and
+# thrown away.
+filter = """
+    test(=latency_lan_fiber)
+    or test(=latency_regional_fiber)
+    or test(=latency_dsl)
+    or test(=latency_at_capacity)
+    or test(=drift_200ppm_stays_bounded)
+    or test(=drift_200ppm_with_resampler)
+    or test(=driver_stall_reanchors_and_audio_returns)
+    or test(=soak_ten_minutes_regional)
+    or test(=a_set_avatar_flood_is_not_an_egress_amplifier)
+"""
+success-output = "immediate"

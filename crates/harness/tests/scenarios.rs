@@ -871,7 +871,7 @@ fn perf_budget_secs(laptop_secs: f64) -> f64 {
 /// machine with no idle core, where a timed region loses the cpu in the middle
 /// and the sample records the scheduler instead of the work. Isolation is the
 /// answer to that, not a bigger number: see
-/// [`the_timed_gates_are_named_in_the_workflow`].
+/// [`the_measured_tests_are_named_in_the_nextest_config`].
 fn perf_scale() -> f64 {
     std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
         .ok()
@@ -879,8 +879,16 @@ fn perf_scale() -> f64 {
         .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS)
 }
 
-/// Two tests here time a wall clock, and ci.yml runs them on their own for a
-/// reason worth writing down.
+/// Pairs a test name with the function that carries it, so the two cannot
+/// disagree: `stringify!` and the `as fn()` coercion read the same identifier,
+/// and a rename that leaves the config behind fails to compile here rather than
+/// dropping an override quietly.
+macro_rules! named {
+    ($($f:ident),+ $(,)?) => { [$((stringify!($f), $f as fn())),+] };
+}
+
+/// Two tests here time a wall clock, and `.config/nextest.toml` runs them with
+/// the machine to themselves for a reason worth writing down.
 ///
 /// Every other test in this suite is a cpu-bound simulation and nextest runs
 /// as many at once as the machine has cores, so a gate measured alongside them
@@ -894,26 +902,36 @@ fn perf_scale() -> f64 {
 /// moved 14x, which is what preemption looks like and not what tick cost looks
 /// like.
 ///
-/// So the workflow names these two tests and runs them after everything else,
-/// one at a time. That pairs a name in a yaml file with a name in this one,
-/// which is the kind of pair that comes apart without anyone noticing. This is
-/// the half that notices.
+/// The rest of the list is the tests that print a measurement of the simulation
+/// rather than of the machine. Those need no isolation, only publishing: the
+/// default profile discards a passing test's stdout, which is why one
+/// measurement line exists in 935 harness jobs of history (#283).
+///
+/// Either way it pairs a name in a toml file with a name in this one, which is
+/// the kind of pair that comes apart without anyone noticing. This is the half
+/// that notices. The session suite has its own copy for the two names that live
+/// over there.
 #[test]
-fn the_timed_gates_are_named_in_the_workflow() {
-    const CI: &str = include_str!("../../../.github/workflows/ci.yml");
-    let gates = CI
-        .lines()
-        .find(|l| l.trim_start().starts_with("TIMED_GATES:"))
-        .expect("ci.yml sets TIMED_GATES on the harness job");
-    for gate in [
-        "tick_budget_at_capacity",
-        "perf_sanity_sixty_seconds_regional",
+fn the_measured_tests_are_named_in_the_nextest_config() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+    for (name, _) in named![
+        tick_budget_at_capacity,
+        perf_sanity_sixty_seconds_regional,
+        latency_lan_fiber,
+        latency_regional_fiber,
+        latency_dsl,
+        latency_at_capacity,
+        drift_200ppm_stays_bounded,
+        drift_200ppm_with_resampler,
+        driver_stall_reanchors_and_audio_returns,
+        soak_ten_minutes_regional,
     ] {
         assert!(
-            gates.contains(gate),
-            "{gate} times a wall clock, and ci.yml no longer runs it with the runner \
-             to itself, so its p99 is about to become a record of the scheduler. \
-             The workflow says: {gates}"
+            CONFIG.contains(&format!("test(={name})")),
+            ".config/nextest.toml no longer names {name}, so whatever it measures is \
+             either being timed on a busy machine or being printed into a void. \
+             Filters there are exact matches, so a rename has to be made in both \
+             places or in neither."
         );
     }
 }
