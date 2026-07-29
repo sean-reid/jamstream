@@ -32,10 +32,6 @@ impl ProbeMatrix {
             .insert(region, rtt_ms);
     }
 
-    pub fn member_count(&self) -> usize {
-        self.probes.len()
-    }
-
     /// Members whose minimum RTT across every probed region exceeds the
     /// outlier threshold. Sorted for determinism.
     pub fn outliers(&self) -> Vec<MemberId> {

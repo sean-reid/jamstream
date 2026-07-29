@@ -18,7 +18,7 @@
 //! ```text
 //! let store: Arc<dyn ObjectStore> = storage.object_store()?;                      // per the host's provider
 //! store.set_retention(&bucket, &session_prefix(&session_id), retention).await?;    // before recording
-//! let sink = ObjectSink::open(store, bucket, key, FLAC_CONTENT_TYPE);              // one per take, key named
+//! let sink = ObjectSink::open(store, bucket, key, FLAC_CONTENT_TYPE, markers);     // one per take, key named
 //! sink.write(chunk).await?;                                                        // by the recorder
 //! sink.finish().await?;                                                            // then tear down
 //! ```

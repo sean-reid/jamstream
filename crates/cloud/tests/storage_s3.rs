@@ -418,8 +418,7 @@ async fn sink_streams_chunks_through_a_real_multipart_upload() {
 
     let dir = std::env::temp_dir().join(format!("jamstream-s3-sink-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut sink =
-        ObjectSink::open_with_marker_dir(Arc::new(store(&server)), BUCKET, &key, FLAC, &dir);
+    let mut sink = ObjectSink::open(Arc::new(store(&server)), BUCKET, &key, FLAC, &dir);
     // Ragged chunks, none of them a part boundary, adding up to two full parts
     // and a short third: what the recorder does, at the part size it ships.
     let len = PART * 2 + 4;
@@ -479,8 +478,7 @@ async fn sink_abort_sends_a_real_abort_and_never_completes() {
 
     let dir = std::env::temp_dir().join(format!("jamstream-s3-sink-abort-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut sink =
-        ObjectSink::open_with_marker_dir(Arc::new(store(&server)), BUCKET, &key, FLAC, &dir);
+    let mut sink = ObjectSink::open(Arc::new(store(&server)), BUCKET, &key, FLAC, &dir);
     // Two full parts, so the upload is open and one part is already sent when
     // the sink is abandoned: the case that has to reach S3 as an abort.
     sink.write(body(PART * 2 + 1)).await.unwrap();

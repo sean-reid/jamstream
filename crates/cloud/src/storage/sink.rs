@@ -15,7 +15,6 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::cloudinit::UPLOAD_MARKER_DIR;
 use crate::provider::{ProviderError, Result};
 use crate::storage::{ObjectMeta, ObjectStore, PartSource, sanitize_component};
 
@@ -98,25 +97,15 @@ pub struct ObjectSink {
 }
 
 impl ObjectSink {
-    /// Opens an upload of `key` into `bucket`, with the in-flight marker
-    /// under [`UPLOAD_MARKER_DIR`]. Must be called on a Tokio runtime.
+    /// Opens an upload of `key` into `bucket`, with the in-flight marker in
+    /// `marker_dir`. Must be called on a Tokio runtime.
+    ///
+    /// The directory is the caller's because the one caller has it already:
+    /// `CloudSink` in the server crate defaults it to
+    /// [`crate::cloudinit::UPLOAD_MARKER_DIR`], which is the path cloud-init
+    /// creates and the idle guard watches, and a test points it at a scratch
+    /// directory instead.
     pub fn open(
-        store: Arc<dyn ObjectStore>,
-        bucket: impl Into<String>,
-        key: impl Into<String>,
-        content_type: impl Into<String>,
-    ) -> Self {
-        Self::open_with_marker_dir(
-            store,
-            bucket,
-            key,
-            content_type,
-            Path::new(UPLOAD_MARKER_DIR),
-        )
-    }
-
-    /// [`ObjectSink::open`] with the marker directory supplied, for tests.
-    pub fn open_with_marker_dir(
         store: Arc<dyn ObjectStore>,
         bucket: impl Into<String>,
         key: impl Into<String>,
@@ -219,7 +208,7 @@ mod tests {
     }
 
     fn sink(store: Arc<MockStore>, key: &str, dir: &Path) -> ObjectSink {
-        ObjectSink::open_with_marker_dir(store, "b", key, FLAC_CONTENT_TYPE, dir)
+        ObjectSink::open(store, "b", key, FLAC_CONTENT_TYPE, dir)
     }
 
     #[tokio::test]
@@ -382,7 +371,7 @@ mod tests {
         // A file where the directory should be: create_dir_all fails.
         let not_a_dir = dir.join("occupied");
         std::fs::write(&not_a_dir, b"x").unwrap();
-        let mut s = ObjectSink::open_with_marker_dir(
+        let mut s = ObjectSink::open(
             store.clone(),
             "b",
             "take.flac",

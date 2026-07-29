@@ -91,14 +91,6 @@ impl GcsStore {
         }
     }
 
-    /// Credentials from the environment, by the same rules as
-    /// [`crate::providers::gcp::GcpProvider::from_env`].
-    pub fn from_env() -> Result<Self> {
-        Ok(Self::new(
-            crate::providers::gcp::GcpProvider::from_env()?.token_source(),
-        ))
-    }
-
     /// Overrides the API endpoint (tests point this at a mock server).
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into().trim_end_matches('/').to_owned();

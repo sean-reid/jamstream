@@ -6,7 +6,9 @@
     "",
     "Refresh cadence: review at each release, and whenever a platform announces",
     "an ingest change. The fields that actually gate a stream are ingest_url,",
-    "requires_cbr and keyframe_secs; the rest is guidance surfaced in the UI.",
+    "requires_cbr and keyframe_secs; key_acquisition is guidance the app shows.",
+    "Keys beginning with an underscore are prose for whoever edits this file:",
+    "the parser does not read them, so nothing here reaches a stream or a UI.",
     "",
     "V1 ships Twitch and YouTube only: both take a persistent key with no",
     "account gating and both accept landscape 720p. Everything under 'deferred'",
@@ -33,27 +35,25 @@
       "id": "twitch",
       "display_name": "Twitch",
       "ingest_url": "rtmps://live.twitch.tv:443/app/{key}",
-      "ingest_url_plaintext": "rtmp://live.twitch.tv/app/{key}",
       "requires_cbr": true,
       "keyframe_secs": 2,
       "aspect": "16:9",
       "max_video_kbps": 6000,
       "max_audio_kbps": 160,
       "key_acquisition": "Creator Dashboard, Settings, Stream, Primary Stream key. Persistent until reset.",
-      "notes": "Twitch requires constant bitrate; variable bitrate shows up as viewer buffering rather than an ingest error. The regional ingest list is served over their API, but live.twitch.tv resolves to a nearby POP and is what the docs recommend for a fixed configuration."
+      "_note": "Twitch requires constant bitrate; variable bitrate shows up as viewer buffering rather than an ingest error. The regional ingest list is served over their API, but live.twitch.tv resolves to a nearby POP and is what the docs recommend for a fixed configuration."
     },
     {
       "id": "youtube",
       "display_name": "YouTube Live",
       "ingest_url": "rtmps://a.rtmps.youtube.com:443/live2/{key}",
-      "ingest_url_plaintext": "rtmp://a.rtmp.youtube.com/live2/{key}",
       "requires_cbr": false,
       "keyframe_secs": 2,
       "aspect": "16:9",
       "max_video_kbps": 9000,
       "max_audio_kbps": 128,
       "key_acquisition": "YouTube Studio, Go Live, Stream, Stream key. Persistent keys are the default; the channel needs live streaming enabled once, which can take 24 hours on a new account.",
-      "notes": "YouTube enforces a 4 s maximum keyframe interval and recommends 2 s. Sending 2 s satisfies both platforms with one encode."
+      "_note": "YouTube enforces a 4 s maximum keyframe interval and recommends 2 s. Sending 2 s satisfies both platforms with one encode."
     }
   ],
   "deferred": [
