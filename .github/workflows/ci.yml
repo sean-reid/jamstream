@@ -291,6 +291,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    env:
+      # The two tests in this suite that measure a wall clock, named once so
+      # the two runs below cannot disagree about which they are. A rename that
+      # forgets this list fails `the_timed_gates_are_named_in_the_workflow`.
+      TIMED_GATES: test(=tick_budget_at_capacity) or test(=perf_sanity_sixty_seconds_regional)
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -300,10 +305,31 @@ jobs:
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --locked -p jamstream-harness
+      # Two runs, because the rest of this suite is the load that breaks the
+      # timed one. Every test here is a cpu-bound simulation and nextest runs
+      # as many at once as there are cores, so on a 4 vcpu runner the tick
+      # gate was being timed on a machine with no idle core left. Wall clock
+      # across a 600 us region does not survive that: the scheduler takes a
+      # quantum out of the middle of the region and the sample lands in the
+      # p99. windows-latest reported p99 19251 us against median 1213 us and
+      # a 10000 us budget on a comments-only change (#276), and the shape
+      # reproduces on a 14-core laptop against 14 busy cores: p99 684 us with
+      # the machine idle, 9725 us contended, median 601 us to 946 us. A tail
+      # 16x the median is the scheduler, not tick cost, so the fix is to take
+      # the load away rather than to widen the budget until noise fits inside
+      # it.
+      - name: Everything except the timed gates, in parallel
+        run: cargo nextest run --locked -p jamstream-harness -E 'not (${{ env.TIMED_GATES }})'
         env:
           # Shared runners are several times slower than a developer
           # machine; the gate catches order-of-magnitude regressions.
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
+      # One at a time and after the rest have finished, so the measurement has
+      # the runner to itself. `--no-tests fail` is what makes the filter above
+      # honest: a rename that empties this run goes red here.
+      - name: The timed gates, with the runner to themselves
+        run: cargo nextest run --locked -p jamstream-harness --test-threads 1 --no-tests fail -E '${{ env.TIMED_GATES }}'
+        env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
 
 
