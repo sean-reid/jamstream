@@ -26,6 +26,7 @@ use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
 use jamstream_protocol::control::{RecordOp, RecordingState};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
 use jamstream_protocol::invite::Invite;
+use jamstream_protocol::media::FrameDuration;
 use jamstream_session::SessionError;
 use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 
@@ -43,12 +44,13 @@ use crate::screens::invites::TokenMap;
 const SAMPLE_RATE: u32 = jamstream_protocol::SAMPLE_RATE;
 const CHANNELS: u16 = 2;
 /// The pace this side loops at and the frame it sends, both belonging to
-/// [`FrameDuration::Ms2_5`]. Its accessors are not const fns, so the numbers
-/// are spelled here and `the_frame_matches_the_wires_own_frame` holds them to
-/// the wire's answer.
-const TICK: Duration = Duration::from_micros(2_500);
+/// [`FrameDuration::Ms2_5`] and both taken from it. They used to be hand
+/// computed here, with `the_frame_matches_the_wires_own_frame` holding them to
+/// the wire's answer; the accessors are const fns now, so the derivation
+/// replaces the assertion (#231).
+const TICK: Duration = Duration::from_micros(FrameDuration::Ms2_5.micros() as u64);
 /// One frame: 120 mono capture samples, 240 interleaved playout.
-const FRAME_FRAMES: usize = 120;
+const FRAME_FRAMES: usize = FrameDuration::Ms2_5.samples() as usize;
 const CHUNK_STEREO: usize = FRAME_FRAMES * 2;
 const CHAT_LIMIT: usize = 500;
 /// Meter fall per 2.5 ms tick; roughly a 170 ms half-life so levels look
@@ -1295,21 +1297,26 @@ fn loss_pct(stats: &ClientStats) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use jamstream_protocol::media::FrameDuration;
-
     use super::*;
 
-    /// The numbers this file opens the device and paces the loop with, against
-    /// the protocol's own answers. Nothing else in the suite would notice them
-    /// drifting: the offline backend opens at whatever rate it is handed, so a
-    /// client sending 5 ms frames at 44.1 kHz would pass every test in
-    /// `live_runtime.rs` and be unintelligible to a real server.
+    /// The loop's pace against the audio it moves. Both constants come off
+    /// [`FrameDuration::Ms2_5`] now, so asserting each against its own source
+    /// would only agree with itself; what is still worth holding is that the
+    /// two describe one frame, at the rate the device is opened at.
+    ///
+    /// Nothing else in the suite would notice this drifting: the offline
+    /// backend opens at whatever rate it is handed, so a client pacing at
+    /// 2.5 ms while sending 5 ms frames would pass every test in
+    /// `live_runtime.rs` and run its uplink clock at half speed against a real
+    /// server.
     #[test]
-    fn the_frame_matches_the_wires_own_frame() {
-        let frame = FrameDuration::Ms2_5;
-        assert_eq!(SAMPLE_RATE, jamstream_protocol::SAMPLE_RATE);
-        assert_eq!(FRAME_FRAMES as u32, frame.samples());
-        assert_eq!(TICK, Duration::from_micros(u64::from(frame.micros())));
+    fn the_loop_paces_at_the_frame_it_moves() {
+        let micros_of_a_frame = FRAME_FRAMES as u64 * 1_000_000 / u64::from(SAMPLE_RATE);
+        assert_eq!(
+            TICK,
+            Duration::from_micros(micros_of_a_frame),
+            "{FRAME_FRAMES} samples at {SAMPLE_RATE} Hz is not {TICK:?} of audio"
+        );
         assert_eq!(CHUNK_STEREO, FRAME_FRAMES * usize::from(CHANNELS));
     }
 }

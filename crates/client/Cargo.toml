@@ -28,6 +28,11 @@ jamstream-cli.workspace = true
 # reads the same data file the server does so the two cannot disagree about
 # which platforms ship.
 jamstream-stream.workspace = true
+# Facts the stream card and the app's own widgets share, and must not hold two
+# copies of: the meter law in decibels and seconds, and the avatar dimension
+# cap. The app still draws no stream frames; it reads those constants. Free in
+# the binary either way, because jamstream-stream links this crate already.
+jamstream-broadcast.workspace = true
 # Hex and base64. The CLI state file's key fields are written with this
 # codec on the CLI's side, and the app reads them back, so both halves of
 # that file go through one implementation.
@@ -49,10 +54,5 @@ zeroize.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true
-# Test-only: the initials disc must hash a name to the same hue here and on
-# the stream card, and the only honest way to assert that is against the
-# broadcast renderer itself. The app never draws stream frames, so this is
-# not a runtime dependency.
-jamstream-broadcast.workspace = true
 jamstream-server.workspace = true
 hound.workspace = true

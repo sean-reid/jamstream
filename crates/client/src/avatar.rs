@@ -30,10 +30,11 @@ use crate::runtime::AvatarHandle;
 /// refuse is refused here with the same number, before any decoding.
 pub const MAX_BYTES: usize = jamstream_protocol::control::MAX_AVATAR_BYTES;
 
-/// Decoded dimension cap per axis, mirroring crates/broadcast. Checked from
-/// the header before the full decode so a small file cannot decompress into
-/// a huge allocation.
-pub const MAX_DIM: u32 = 1024;
+/// Decoded dimension cap per axis, the broadcast renderer's own: a picture
+/// that would not fit on a stream card is not one to hold in the app either.
+/// Checked from the header before the full decode so a small file cannot
+/// decompress into a huge allocation.
+pub const MAX_DIM: u32 = jamstream_broadcast::MAX_DIM;
 
 /// The square [`load`] fits a picked picture into.
 ///
