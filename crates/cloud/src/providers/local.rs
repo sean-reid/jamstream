@@ -475,6 +475,12 @@ impl LocalProvider {
 
     /// A zero timeout means "check once": already-dead reads true, still
     /// alive reads false with no waiting at all.
+    ///
+    /// `#[must_use]` because this is the only thing that distinguishes a
+    /// teardown that worked from one that reported success over a server still
+    /// holding the port and the audio device. It waits, so a bare call reads
+    /// like a deliberate pause rather than a dropped verdict.
+    #[must_use]
     async fn wait_dead(&self, pid: u32, spawned: Spawned<'_>, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while self.pid_alive(pid, spawned) {
@@ -914,6 +920,12 @@ fn shutdown_path(session_dir: &Path) -> PathBuf {
 ///   group; it works from a different process than the one that spawned
 ///   the server (which is exactly the sweeper's situation), and it is one
 ///   code path on every platform.
+///
+/// `#[must_use]` because the write is the visible part and the answer is not:
+/// a caller that asks and drops the reply goes on to wait out the grace period
+/// for a request that never landed, then force-kills a server mid-upload. The
+/// grace is only owed to a server that was actually asked.
+#[must_use]
 fn request_graceful_shutdown(session_dir: &Path) -> bool {
     let path = shutdown_path(session_dir);
     // The content is for a human reading a stuck session dir; the server

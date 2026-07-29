@@ -25,6 +25,15 @@ impl SweepFilter {
     }
 }
 
+/// What one sweep did, and what it could not do.
+///
+/// `#[must_use]` for the same reason as [`crate::RetentionEnforcement`]:
+/// [`sweep`] destroys machines, so a caller can plausibly run it for the effect
+/// and drop the answer, and the answer is the only place `unswept` and `failed`
+/// exist. A sweep whose report is dropped is a host who was never told that an
+/// account still has a machine in it, which is the one thing this file
+/// promises.
+#[must_use]
 #[derive(Debug, Default)]
 pub struct SweepReport {
     pub found: Vec<Instance>,

@@ -858,10 +858,11 @@ async fn the_content_md5_matches_the_body_that_was_sent() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
-    store(&server)
+    let applied = store(&server)
         .set_retention(BUCKET, "jamstream/recordings/", Retention::Days90)
         .await
         .unwrap();
+    assert!(applied.is_server_side(), "{}", applied.describe());
 
     let requests = server.received_requests().await.unwrap();
     let request = requests
@@ -889,10 +890,12 @@ async fn keep_forever_omits_the_expiration_but_keeps_the_cleanup_rule() {
         .expect(1)
         .mount(&server)
         .await;
-    store(&server)
+    let applied = store(&server)
         .set_retention(BUCKET, "jamstream/recordings/", Retention::KeepForever)
         .await
         .unwrap();
+    assert!(applied.is_server_side(), "{}", applied.describe());
+    assert_eq!(applied.retention(), Retention::KeepForever);
     let body = lifecycle_put_body(&server).await;
     assert!(!body.contains("<Expiration>"), "{body}");
     assert!(body.contains("<AbortIncompleteMultipartUpload>"), "{body}");
@@ -1003,10 +1006,11 @@ async fn the_hosts_own_lifecycle_rules_survive_a_retention_apply() {
         .expect(1)
         .mount(&server)
         .await;
-    store(&server)
+    let applied = store(&server)
         .set_retention(BUCKET, &session_prefix("s1"), Retention::Days30)
         .await
         .unwrap();
+    assert!(applied.is_server_side(), "{}", applied.describe());
     let body = lifecycle_put_body(&server).await;
     assert!(
         body.contains("<ID>archive-my-masters</ID>"),
