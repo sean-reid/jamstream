@@ -1,8 +1,8 @@
 //! The two encoder pipes must make progress independently.
 //!
 //! This is the regression gate for issue #248, and it needs no ffmpeg. The
-//! encoder takes audio on stdin and whole 720p frames on a FIFO, both of them
-//! twenty-odd times a pipe buffer. Feeding them from one thread with blocking
+//! encoder takes audio on stdin and whole 720p frames on a FIFO, each frame
+//! many times a pipe buffer. Feeding them from one thread with blocking
 //! writes wedges the moment the child wants one while a write to the other is
 //! in flight, and that is not a race: it happened on every run, against every
 //! ffmpeg from 6.1 to 7.1.
@@ -20,10 +20,13 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use jamstream_stream::proc::{Feed, ProcSpec, ProcessHost, StdProcessHost, Stdin};
+use jamstream_stream::proc::{
+    AUDIO_QUEUE_BYTES, Feed, ProcSpec, ProcessHost, StdProcessHost, Stdin, VIDEO_QUEUE_BYTES,
+};
 
 /// A 720p yuv420p frame, which is what makes this hard: 1382400 bytes against
-/// a pipe that holds 65536.
+/// a pipe that holds tens of kilobytes, and how many tens is not the same on
+/// two kernels, so nothing here counts them.
 const FRAME: usize = 1280 * 720 * 3 / 2;
 /// One 2.5 ms tick of s16le stereo at 48 kHz.
 const TICK: usize = 480;
@@ -150,7 +153,7 @@ fn a_child_that_never_reads_video_still_gets_every_byte_of_audio() {
     let mut rig = Rig::new("videostall");
     // fd 3 holds the FIFO open, so our end opens and nothing ever reads it.
     let script = format!(
-        "cat 3< {fifo} | wc -c > {audio}",
+        "exec wc -c 3< {fifo} > {audio}",
         fifo = quote(&rig.fifo()),
         audio = quote(&rig.tally("audio")),
     );
@@ -160,13 +163,16 @@ fn a_child_that_never_reads_video_still_gets_every_byte_of_audio() {
     let started = Instant::now();
     let mut audio_bytes = 0usize;
     let (mut queued, mut dropped) = (0u32, 0u32);
-    for tick in 0..800u32 {
+    const TICKS: u32 = 800;
+    let mut submitted = 0u32;
+    for tick in 0..TICKS {
         let pcm = vec![(tick % 251) as u8; TICK];
         rig.host
             .write_stdin(id, &pcm)
             .expect("audio keeps flowing while video is stuck");
         audio_bytes += pcm.len();
         if tick % TICKS_PER_FRAME == 0 {
+            submitted += 1;
             match rig.host.write_fifo(id, 0, &frame(tick as u8)) {
                 Ok(Feed::Queued) => queued += 1,
                 Ok(Feed::Dropped) => dropped += 1,
@@ -191,7 +197,11 @@ fn a_child_that_never_reads_video_still_gets_every_byte_of_audio() {
         "the video queue took {queued} frames from a child that reads none of \
          them, so it has no cap"
     );
-    assert_eq!(queued + dropped, 62, "every due frame was accounted for");
+    assert_eq!(
+        queued + dropped,
+        submitted,
+        "every submitted frame was either taken or refused, and said so"
+    );
 
     // And the audio really arrived, all of it, rather than being shed to keep
     // things moving. Closing our end is what lets `wc` print.
@@ -205,28 +215,40 @@ fn a_child_that_never_reads_video_still_gets_every_byte_of_audio() {
 
 /// The mirror: a child that drains video and never touches audio.
 ///
-/// Video must keep flowing, and the audio backlog must be bounded. Audio is the
-/// master clock so it is never dropped, which leaves one honest answer to a
-/// child that has stopped reading it: report a broken feed and let the
-/// supervisor restart the encode. That is what this asserts, including that it
-/// happens on a timer rather than never.
+/// Video must keep flowing throughout, and the audio backlog must be bounded.
+/// Audio is the master clock so it is never dropped, which leaves one honest
+/// answer to a child that has stopped reading it: report a broken feed and let
+/// the supervisor restart the encode.
+///
+/// It does not assert that nothing was dropped, and an earlier version did,
+/// which was wrong and went red on macOS. Whether a child keeps up with 41 MB/s
+/// of 720p is a fact about a machine's pipes rather than about this code: a
+/// frame is 21 pipe fulls where a pipe holds 65536 and 84 where it holds 16384,
+/// and Darwin picks between those at runtime. The contract is that a submission
+/// reported as queued arrives whole and in order, and that acceptance keeps
+/// happening, so that is what this asserts.
 #[test]
-fn a_child_that_never_reads_audio_still_gets_every_frame() {
-    deadline("a_child_that_never_reads_audio_still_gets_every_frame");
+fn a_child_that_never_reads_audio_keeps_taking_video_throughout() {
+    deadline("a_child_that_never_reads_audio_keeps_taking_video_throughout");
     let mut rig = Rig::new("audiostall");
-    // fd 3 holds our audio pipe open and unread; stdin becomes the FIFO.
+    // fd 3 holds our audio pipe open and unread; stdin becomes the FIFO, and
+    // `wc` reads it directly. No `cat |` in front: that is a second pipe and a
+    // second copy of every frame for nothing.
     let script = format!(
-        "cat 3<&0 < {fifo} | wc -c > {video}",
+        "exec wc -c 3<&0 < {fifo} > {video}",
         fifo = quote(&rig.fifo()),
         video = quote(&rig.tally("video")),
     );
     let id = rig.start(script);
 
     let started = Instant::now();
-    let mut frames = 0usize;
+    let (mut queued, mut dropped) = (0usize, 0usize);
+    let mut last_accept = 0u32;
+    let mut ticks = 0u32;
     let mut audio_error = None;
     for tick in 0..8_000u32 {
         pace(started, tick);
+        ticks = tick;
         let pcm = vec![(tick % 251) as u8; TICK];
         if let Err(err) = rig.host.write_stdin(id, &pcm) {
             audio_error = Some(err);
@@ -234,8 +256,11 @@ fn a_child_that_never_reads_audio_still_gets_every_frame() {
         }
         if tick % TICKS_PER_FRAME == 0 {
             match rig.host.write_fifo(id, 0, &frame(tick as u8)) {
-                Ok(Feed::Queued) => frames += 1,
-                Ok(Feed::Dropped) => panic!("a frame was dropped by a child that reads them"),
+                Ok(Feed::Queued) => {
+                    queued += 1;
+                    last_accept = tick;
+                }
+                Ok(Feed::Dropped) => dropped += 1,
                 Err(err) => panic!("video submission failed: {err}"),
             }
         }
@@ -246,6 +271,10 @@ fn a_child_that_never_reads_audio_still_gets_every_frame() {
          without complaint, so the audio queue has no bound",
     );
     println!("audio gave up after {elapsed:?}: {err}");
+    println!(
+        "video: {queued} queued, {dropped} dropped, last accepted at tick \
+         {last_accept} of {ticks}"
+    );
 
     // On a timer, and a generous one, rather than on the first submission that
     // does not fit: a runner that pauses must not take the encode down.
@@ -260,22 +289,36 @@ fn a_child_that_never_reads_audio_still_gets_every_frame() {
     );
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
 
-    // Video was untouched by any of that: every frame submitted, none dropped,
-    // all of them delivered.
-    assert!(frames > 100, "only {frames} frames got through");
+    // Video kept moving while audio was stuck, and kept moving to the end
+    // rather than filling the queue once and stopping. The floor is several
+    // queue loads, so only a pipe that drained repeatedly can meet it, and it
+    // asks for a few MB/s rather than the 41 the old assertion needed.
+    let per_queue = VIDEO_QUEUE_BYTES / FRAME;
+    assert!(
+        queued > 3 * per_queue,
+        "only {queued} frames were accepted, near the {per_queue} the queue \
+         holds, so the video pipe filled once and stopped draining"
+    );
+    assert!(
+        last_accept * 4 > ticks * 3,
+        "the last frame was accepted at tick {last_accept} of {ticks}, so video \
+         stopped making progress partway through"
+    );
+    // The contract: what was reported as queued arrives, whole.
     rig.host.kill(id);
     assert_eq!(
         rig.counted("video"),
-        frames * FRAME,
-        "the child was short of video"
+        queued * FRAME,
+        "the child was short of video, or got a torn frame"
     );
 }
 
-/// A child reading both pipes at its own pace loses nothing.
+/// A child reading both pipes loses nothing it was promised.
 ///
-/// The queues exist to absorb a child that is briefly behind, and this is the
-/// case where dropping anything would be wrong: two `cat`s read on their own
-/// schedule, but they do read, so every frame and every sample must arrive.
+/// This is the case where dropping anything would be wrong, so the burst is
+/// sized from the caps: every submission below fits, which means a child that
+/// read nothing at all would still have all of it accepted. There is no
+/// throughput here to assert by accident, on any machine.
 #[test]
 fn a_child_that_reads_both_pipes_loses_nothing() {
     deadline("a_child_that_reads_both_pipes_loses_nothing");
@@ -285,8 +328,8 @@ fn a_child_that_reads_both_pipes_loses_nothing() {
     // /dev/null for stdin otherwise, and would count zero for ever.
     let script = format!(
         "exec 3<&0\n\
-         cat < {fifo} | wc -c > {video} &\n\
-         cat <&3 | wc -c > {audio} &\n\
+         wc -c < {fifo} > {video} &\n\
+         wc -c <&3 > {audio} &\n\
          wait\n",
         fifo = quote(&rig.fifo()),
         video = quote(&rig.tally("video")),
@@ -294,15 +337,14 @@ fn a_child_that_reads_both_pipes_loses_nothing() {
     );
     let id = rig.start(script);
 
-    let started = Instant::now();
+    let frames = VIDEO_QUEUE_BYTES / FRAME;
+    let ticks = AUDIO_QUEUE_BYTES / TICK;
     let mut audio_bytes = 0usize;
-    let mut frames = 0usize;
-    for tick in 0..800u32 {
-        pace(started, tick);
+    for tick in 0..ticks {
         let pcm = vec![(tick % 251) as u8; TICK];
         rig.host.write_stdin(id, &pcm).expect("audio flows");
         audio_bytes += pcm.len();
-        if tick % TICKS_PER_FRAME == 0 {
+        if tick < frames {
             let fed = rig
                 .host
                 .write_fifo(id, 0, &frame(tick as u8))
@@ -310,9 +352,8 @@ fn a_child_that_reads_both_pipes_loses_nothing() {
             assert_eq!(
                 fed,
                 Feed::Queued,
-                "a frame was dropped by a child that keeps up"
+                "a submission that fits inside the cap was refused"
             );
-            frames += 1;
         }
     }
     rig.host.kill(id);

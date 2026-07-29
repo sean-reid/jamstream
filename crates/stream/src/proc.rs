@@ -126,8 +126,15 @@ pub trait ProcessHost {
 /// ffmpeg up to and including 7.x demuxes every input on one thread and
 /// interleaves them by timestamp, so it reads whichever input is behind and
 /// will not touch the other until that read returns. A 720p yuv420p frame is
-/// 1382400 bytes and a pipe holds 65536, so a frame is twenty-odd pipe fulls
-/// and a writer is parked inside it almost all the time.
+/// 1382400 bytes and no pipe holds anything like that, so a frame is many pipe
+/// fulls and a writer is parked inside one almost all the time.
+///
+/// How many is deliberately not a number anything here relies on. Linux gives
+/// a pipe 65536 bytes; Darwin sizes them dynamically and falls back to 16384
+/// when it cannot get the large buffer, so the same frame is 21 pipe fulls on
+/// one machine and 84 on the next. A design that survives one figure and not
+/// the other has the bug at a different threshold, which is exactly how this
+/// one lasted as long as it did.
 ///
 /// Feeding both pipes from one thread therefore deadlocks, and did: the
 /// writer sat in the video FIFO waiting for a reader, ffmpeg sat in stdin
@@ -283,6 +290,13 @@ impl Feeder {
         state.closed = true;
         drop(state);
         self.queue.ready.notify_all();
+    }
+
+    /// True once the writer has emptied its queue and closed its end of the
+    /// pipe, which is the only moment at which the child has really seen end
+    /// of stream.
+    fn finished(&self) -> bool {
+        self.join.as_ref().is_none_or(|j| j.is_finished())
     }
 
     /// Joins the writer. Only call once the child is gone: a writer parked in
@@ -550,6 +564,15 @@ impl ProcessHost for StdProcessHost {
         }
         if live.drains_on_eof {
             let deadline = Instant::now() + Duration::from_millis(DRAIN_MS);
+            // Our own backlog first. Closing a queue is not an end of stream
+            // until the writer has sent what we already accepted, so waiting
+            // on the child before that waits for the wrong thing and can cut a
+            // frame we had promised to deliver in half.
+            while Instant::now() < deadline && !feeders.iter().all(Feeder::finished) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Then the child's own flush, on what is left of the same budget,
+            // so a wedged encoder costs one DRAIN_MS and not two.
             while Instant::now() < deadline {
                 match live.child.try_wait() {
                     Ok(Some(_)) => break,
