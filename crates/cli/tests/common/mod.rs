@@ -7,8 +7,32 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub use xtask::RATE;
+
+/// What the deadlines in this suite are worth on a quiet developer laptop,
+/// which is what `JAMSTREAM_PERF_BUDGET_SECS` is measured against in the
+/// harness. One variable describes the runner for the whole workspace, and
+/// this is the same reference `crates/server/tests/common/mod.rs` uses.
+const REFERENCE_LAPTOP_SECS: f64 = 30.0;
+
+/// The multiplier `JAMSTREAM_PERF_BUDGET_SECS` names, never below 1, so an
+/// unset or nonsense value can only be generous and never shorten a deadline.
+pub fn budget_scale(value: Option<&str>) -> f64 {
+    value
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS)
+        .max(1.0)
+}
+
+/// A wall-clock deadline, scaled for the machine running the suite. CI sets
+/// 120, which is 4x, against runners measured 3.7x slower than a quiet laptop.
+pub fn budget(laptop: Duration) -> Duration {
+    let raw = std::env::var("JAMSTREAM_PERF_BUDGET_SECS").ok();
+    Duration::from_secs_f64(laptop.as_secs_f64() * budget_scale(raw.as_deref()))
+}
 
 #[cfg(windows)]
 pub const BIN_NAME: &str = "jamstreamd.exe";
@@ -174,4 +198,27 @@ pub fn wav_tail_rms(path: &Path, secs: f64) -> f64 {
     let take = ((secs * f64::from(RATE)) as usize * 2).min(samples.len());
     assert!(take > 0, "window is empty for {path:?}");
     rms(&samples[samples.len() - take..])
+}
+
+/// How many milliseconds of a stereo 48 kHz file carry audio from `from_secs`
+/// onwards: the total width of the `block_ms` blocks whose RMS is above
+/// `threshold`, which need not be contiguous.
+///
+/// A total, and not the mean of a fixed window, because these recordings come
+/// off a wall-clock rig where three headless clients each run their own
+/// duration from their own join. Load moves where the audio sits inside a
+/// recording and can put silence at either end of it, and a mean over a window
+/// pinned to one end reports that as no audio at all. A total says what the
+/// story actually claims, that the session went on playing, and it reads zero
+/// when it did not, so the bar for what counts as audio does not have to move.
+pub fn wav_audio_ms_from(path: &Path, from_secs: f64, block_ms: f64, threshold: f64) -> f64 {
+    let samples = wav_samples(path);
+    // Stereo throughout: a frame is two samples.
+    let skip = ((from_secs * f64::from(RATE)) as usize * 2).min(samples.len());
+    let block = ((block_ms / 1_000.0 * f64::from(RATE)) as usize * 2).max(2);
+    samples[skip..]
+        .chunks(block)
+        .filter(|chunk| chunk.len() == block && rms(chunk) > threshold)
+        .count() as f64
+        * block_ms
 }

@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{ServerGuard, free_udp_port, jamstreamd_binary};
+use common::{ServerGuard, budget, free_udp_port, jamstreamd_binary};
 use jamstream_cli::cli::{EndArgs, HostArgs};
 use jamstream_cli::{end, host, providers, state};
 use jamstream_protocol::control::{RecordOp, RecordingState};
@@ -159,13 +159,13 @@ async fn a_recorded_local_host_puts_the_take_where_it_said_it_would() {
     let now = || start.elapsed().as_millis() as u64;
     let invite = Invite::decode(json["invites"][0]["invite"].as_str().unwrap()).unwrap();
     let mut wire = Wire::connect(&invite, now()).await;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
     while *wire.core.state() != ClientState::Joined {
         assert!(Instant::now() < deadline, "the host never joined");
         wire.pump(now()).await;
     }
     wire.core.record_ctl(RecordOp::Start).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
     while wire.last_record_state != Some(RecordingState::Recording) {
         assert!(
             Instant::now() < deadline,
@@ -176,13 +176,13 @@ async fn a_recorded_local_host_puts_the_take_where_it_said_it_would() {
     }
 
     // Let the recorder see some ticks, then stop the take.
-    let until = Instant::now() + Duration::from_millis(300);
+    let until = Instant::now() + budget(Duration::from_millis(300));
     while Instant::now() < until {
         wire.pump(now()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     wire.core.record_ctl(RecordOp::Stop).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
     while wire.last_record_state != Some(RecordingState::Idle) {
         assert!(
             Instant::now() < deadline,
@@ -197,7 +197,7 @@ async fn a_recorded_local_host_puts_the_take_where_it_said_it_would() {
     // The finished take is a .flac (never a .part) in the printed
     // directory, named as a mix. The rename happens on the recorder's own
     // task, so it is waited for rather than assumed.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
     let takes = loop {
         let takes = finished_takes(&record_dir);
         if !takes.is_empty() {
@@ -239,4 +239,29 @@ async fn a_recorded_local_host_puts_the_take_where_it_said_it_would() {
     );
 
     std::fs::remove_dir_all(&state_dir).unwrap();
+}
+
+/// The runner is described once, by the variable the harness already reads and
+/// `crates/server/tests/common/mod.rs` already scales against, and a deadline
+/// can only ever get longer from it. The two copies of this scaling are pinned
+/// to the same numbers by this test and its twin in the server suite, so a
+/// drift in either reference fails somewhere.
+#[test]
+fn a_deadline_scales_with_the_runner_and_never_shrinks() {
+    assert_eq!(
+        common::budget_scale(None),
+        1.0,
+        "unset is the laptop budget"
+    );
+    // What CI sets: 120 s against the harness's 30 s reference run.
+    assert_eq!(common::budget_scale(Some("120")), 4.0);
+    assert_eq!(common::budget_scale(Some("45")), 1.5);
+    for nonsense in ["0", "-30", "", "soon", "NaN", "inf"] {
+        assert_eq!(
+            common::budget_scale(Some(nonsense)),
+            1.0,
+            "{nonsense:?} must not shorten a deadline"
+        );
+    }
+    assert!(budget(Duration::from_secs(5)) >= Duration::from_secs(5));
 }
