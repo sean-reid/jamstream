@@ -3,9 +3,13 @@
 //! The mock is only the far end; every byte passes through the same
 //! encoder, sink bridge, and multipart driver a real launch uses.
 
+mod common;
+
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use common::{scratch_dir, wait_for};
 
 use jamstream_cloud::storage::{MockStore, ObjectStore, session_prefix};
 use jamstream_server::cloud_sink::CloudSink;
@@ -17,20 +21,7 @@ const BUCKET: &str = "my-jams";
 const SESSION: &str = "abc123";
 
 fn temp_marker_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "jamstream-cloud-record-{tag}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    scratch_dir(&format!("cloud-record-{tag}"))
 }
 
 #[test]
