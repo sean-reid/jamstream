@@ -1,14 +1,14 @@
 //! Shared helpers for the CLI end-to-end tests: deterministic audio
-//! fixtures regenerated on demand under target/fixtures/ (the generator
-//! mirrors `cargo xtask fixtures`; keep the two in sync), WAV energy
-//! measurements for asserting on captured mixes, and the jamstreamd
-//! build-and-kill plumbing the local session stories share.
+//! fixtures regenerated on demand under target/fixtures/ by the same
+//! generator `cargo xtask fixtures` calls, WAV energy measurements for
+//! asserting on captured mixes, and the jamstreamd build-and-kill plumbing
+//! the local session stories share.
 
 #![allow(dead_code)] // each test binary uses a different subset
 
 use std::path::{Path, PathBuf};
 
-pub const RATE: u32 = 48_000;
+pub use xtask::RATE;
 
 #[cfg(windows)]
 pub const BIN_NAME: &str = "jamstreamd.exe";
@@ -140,51 +140,13 @@ pub fn fixture(name: &str) -> PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    write_fixture(name, &tmp);
+    xtask::write_fixture(name, &tmp).expect("write fixture wav");
     // A racing process may have won; either file is identical.
     if std::fs::rename(&tmp, &path).is_err() {
         assert!(path.exists(), "fixture rename failed and {name} is absent");
         let _ = std::fs::remove_file(&tmp);
     }
     path
-}
-
-/// One deterministic mono 48 kHz 16-bit fixture, selected by file name.
-/// Duplicated from xtask/src/main.rs so tests need no dependency on xtask.
-fn write_fixture(name: &str, path: &Path) {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, spec).expect("create fixture wav");
-    let mut sine = |hz: f32, secs: u32| {
-        for i in 0..(secs * RATE) {
-            let t = i as f32 / RATE as f32;
-            let sample = (t * hz * std::f32::consts::TAU).sin() * 0.5;
-            writer
-                .write_sample((sample * f32::from(i16::MAX)) as i16)
-                .expect("write fixture sample");
-        }
-    };
-    match name {
-        "impulse-train-48k.wav" => {
-            for i in 0..(10 * RATE) {
-                let sample = if i % 4800 == 0 { i16::MAX } else { 0 };
-                writer.write_sample(sample).expect("write fixture sample");
-            }
-        }
-        "sine-440-48k.wav" => sine(440.0, 5),
-        "sine-880-48k.wav" => sine(880.0, 5),
-        "silence-48k.wav" => {
-            for _ in 0..(2 * RATE) {
-                writer.write_sample(0i16).expect("write fixture sample");
-            }
-        }
-        other => panic!("unknown fixture {other:?}"),
-    }
-    writer.finalize().expect("finalize fixture wav");
 }
 
 /// All samples of a WAV in the -1..1 domain, channels interleaved as stored.
