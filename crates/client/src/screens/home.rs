@@ -39,6 +39,8 @@ impl RecentSession {
 pub enum HomeAction {
     Join(Box<Invite>),
     Host,
+    /// The takes those sessions left, which outlive them.
+    Takes,
 }
 
 #[derive(Default)]
@@ -103,13 +105,27 @@ impl HomeScreen {
 
             theme::panel(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(theme::title(ui, "Recent sessions"));
                 if recent.is_empty() {
+                    ui.label(theme::title(ui, "Recent sessions"));
                     ui.label(theme::muted(
                         ui,
                         "No sessions yet; host one or paste an invite above.",
                     ));
                 } else {
+                    // Takes is the way to what those sessions recorded, and the
+                    // only thing to press on this card: the rows are a record of
+                    // what happened, and a take belongs to a session, so this is
+                    // where it hangs off rather than becoming a fourth card or a
+                    // fourth thing in the top bar. With no sessions there are no
+                    // takes either, so above there is nothing to press at.
+                    ui.horizontal(|ui| {
+                        ui.label(theme::title(ui, "Recent sessions"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Takes").clicked() {
+                                action = Some(HomeAction::Takes);
+                            }
+                        });
+                    });
                     // A record of what happened, not a list of things to press.
                     // These rows had no rejoin, no end, and no click, and they
                     // read as a list you could act on because each one carried

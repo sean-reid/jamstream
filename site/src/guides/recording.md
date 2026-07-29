@@ -90,7 +90,31 @@ A take still being written ends in `.part` and is renamed when it finishes, so a
 
 Under `jamstream/recordings/` and the session id, in the bucket you named. The take uploads while you play, so ending the session waits only for the last of it. Let the `UPLOADING` lamp clear before you end the session: the machine holds on for ten minutes to finish an upload and then shuts down regardless, and a take still in flight at that point is lost.
 
-`jamstream status` names the bucket each session recorded to, and [`jamstream recordings`](../cli/recordings.md) lists what is in it and fetches it. Takes outlive the session: one that ended weeks ago still lists until the retention rule deletes it. Downloading is where recording costs money, so the command prices the egress and waits for a yes before it moves a byte.
+Downloading is where recording costs money, because your cloud account bills egress on the way out and nothing on the way in.
+
+## Getting your takes
+
+**Takes**, on the Recent sessions card on Home, is every take this computer knows about, newest first.
+
+![The Takes screen: one card per session with its day, length and region, and under each a take with its mix and its stems, their sizes, and a button to reveal or download each](../images/takes.png)
+*A row is one take. The mix is already on this computer here, so it offers Reveal; the stems are still in the bucket and carry their price.*
+
+One row is one take, meaning one Record to Stop, so two takes of the same song are told apart by when they started and how big they are. The mix and the stems of a take are separate rows, because the stems are several times the bytes and pulling them is where the money is:
+
+- A take on this computer says so, and **Reveal in Finder** opens its folder with the file selected. On Windows the button reads **Show in File Explorer**, on Linux **Show in Files**. A local session's takes are here from the moment you press Stop.
+- A take in a bucket has a Download button carrying its size and what the download will cost. Clicking it starts the transfer at that price; there is nothing further to confirm.
+- Downloaded takes land in a `JamStream` folder in your music folder, one folder per session. The row then offers Reveal instead.
+
+A take can be gigabytes, so a download takes a while. The row shows how much of it has arrived, and the other takes wait until it finishes:
+
+![The same screen with a stems download running: the button on that row has been replaced by 1.40 GB of 4.40 GB and a filling bar, and the buttons on the other takes are dimmed](../images/takes_downloading.png)
+*One download at a time.*
+
+Takes outlive the session that made them: one from a session that ended weeks ago is still here. Where the bucket is really deleting them on a schedule, the row counts down to that, in red for the last three days. Where the retention choice could not be applied, the row says so rather than counting down to nothing. A take that is still uploading is not in the bucket yet, so it appears here when it finishes and not before.
+
+### From the terminal
+
+[`jamstream recordings`](../cli/recordings.md) lists and fetches the same takes, for scripts and machines with no screen. It reads the storage key from the environment and not from your keychain, so export the pair before you use it even if the app already has the key saved.
 
 ## The mix, and stems
 

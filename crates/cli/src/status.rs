@@ -151,6 +151,7 @@ mod tests {
             region: "eu-west-1".to_owned(),
             retention: "30d".to_owned(),
             stems: false,
+            applied: Some(state::RetentionApplied::ServerSide),
         };
         assert_eq!(takes(Some(&record)), "my-jams");
         record.stems = true;

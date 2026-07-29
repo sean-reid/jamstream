@@ -19,6 +19,7 @@ use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow, Reg
 use jamstream_client::screens::invites::InvitesPanel;
 use jamstream_client::screens::recording::RecordingChoice;
 use jamstream_client::screens::session::SettingsTab;
+use jamstream_client::screens::takes::Half;
 use jamstream_client::theme::{self, Theme};
 use jamstream_cloud::{Price, ProbeMatrix, ProviderKind, Region, RegionId, rank};
 
@@ -264,6 +265,178 @@ fn home_light() {
     app.recent = sample_recent();
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_light");
+}
+
+/// The Takes screen with everything it can say on it at once.
+///
+/// The rows are built by the screen's own [`rows_from`] and
+/// [`takes_from_objects`] out of session records, bucket sidecars, and a
+/// listing, so the grouping into takes, the sizes, the countdowns and the
+/// egress figures on the buttons are all the product's own arithmetic. Two
+/// things are set here rather than found: the objects a bucket listing would
+/// have returned, and, on the first session's older take, that its mix is
+/// already on this computer. The second is exactly what a finished download
+/// leaves behind, which is the state the primary action is Reveal in.
+///
+/// The paths are a plausible home directory rather than this machine's,
+/// because a baseline that rendered the developer's own would never match
+/// twice.
+fn takes_app(theme: Theme) -> JamApp {
+    use jamstream_cli::recordings::Take;
+    use jamstream_cli::state::{RecordingRecord, RetentionApplied, SessionStatus};
+    use jamstream_client::screens::takes::{LocalTake, rows_from, takes_from_objects};
+
+    // 2026-07-28 20:20 UTC, ten minutes after the last take of the night.
+    const NOW: u64 = 1_785_270_000;
+    let music = PathBuf::from("/Users/you/Music/JamStream");
+    let disk = PathBuf::from("/Users/you/Library/Application Support/jamstream/recordings");
+
+    let session =
+        |id: &str, created: u64, secs: u64, provider: &str| jamstream_cli::state::SessionState {
+            session_id_hex: id.to_owned(),
+            provider: provider.to_owned(),
+            region: if provider == "local" { "local" } else { "sfo3" }.to_owned(),
+            instance_id: "droplet-1".to_owned(),
+            address: "203.0.113.7:43210".to_owned(),
+            created_unix: created,
+            hourly_microusd: if provider == "local" { 0 } else { 16_800 },
+            issuer_private_key_b64: String::new(),
+            server_public_key_b64: "c2VydmVy".to_owned(),
+            invites: Vec::new(),
+            status: SessionStatus::Ended,
+            ended_unix: Some(created + secs),
+        };
+    let record = |applied: RetentionApplied| RecordingRecord {
+        provider: "digitalocean".to_owned(),
+        bucket: "our-takes".to_owned(),
+        region: "sfo3".to_owned(),
+        retention: "30d".to_owned(),
+        stems: true,
+        applied: Some(applied),
+    };
+    let unenforced = RetentionApplied::Unenforced {
+        note: "This bucket's key cannot read its lifecycle rules, so \"Delete after 30 days\" \
+               was not applied: nothing will delete these takes but you."
+            .to_owned(),
+    };
+    // A four piece: the mix, and one stereo stem each.
+    let objects = |base: &str, mix: u64, stem: u64| {
+        let mut out = vec![Take {
+            key: format!("jamstream/recordings/x/{base}-mix.flac"),
+            name: format!("{base}-mix.flac"),
+            size: mix,
+            last_modified: None,
+        }];
+        for player in ["Ana", "Ben", "Cass", "Dai"] {
+            out.push(Take {
+                key: format!("jamstream/recordings/x/{base}-{player}.flac"),
+                name: format!("{base}-{player}.flac"),
+                size: stem,
+                last_modified: None,
+            });
+        }
+        out
+    };
+
+    let sessions = vec![
+        (
+            session("a3f29c41deadbeef", 1_785_264_000, 2_820, "digitalocean"),
+            Some(record(RetentionApplied::ServerSide)),
+        ),
+        (
+            session("77c0de12beefcafe", 1_782_840_000, 5_400, "digitalocean"),
+            Some(record(RetentionApplied::ServerSide)),
+        ),
+        (
+            session("b41f0a99cafef00d", 1_785_100_000, 3_600, "digitalocean"),
+            Some(record(unenforced)),
+        ),
+        (
+            session("5c8e2b70feedface", 1_785_000_000, 7_800, "local"),
+            None,
+        ),
+    ];
+    let local = vec![LocalTake {
+        path: disk.join("jamstream-2026-07-25-1730-mix.flac"),
+        bytes: 2_400_000_000,
+        modified_unix: 1_785_000_600,
+    }];
+    let mut rows = rows_from(&sessions, &local, &disk, &music, NOW);
+    for row in &mut rows {
+        if row.record().is_none() {
+            continue;
+        }
+        // The take's own name, as the recorder builds it from the clock when
+        // Record is pressed: a few minutes into its session.
+        let base = match row.short_id.as_str() {
+            "77c0de12" => "jamstream-2026-06-30-1745",
+            "b41f0a99" => "jamstream-2026-07-26-2110",
+            _ => "jamstream-2026-07-28-1845",
+        };
+        let mut takes = takes_from_objects(&objects(base, 1_100_000_000, 1_100_000_000), &row.dir)
+            .expect("group the listing");
+        if row.short_id == "a3f29c41" {
+            // Its mix was fetched already, so that half is a Reveal.
+            for file in &mut takes[0].mix.files {
+                file.local = Some(row.dir.join(&file.name));
+            }
+        }
+        row.takes = takes;
+        row.listing = false;
+    }
+
+    let mut app = test_app(theme);
+    app.screen = Screen::Takes;
+    app.takes.rows = rows;
+    app
+}
+
+#[test]
+fn takes() {
+    let mut harness = app_harness(takes_app(Theme::Dark), WIDE);
+    snapshot_for_docs(&mut harness, "takes");
+}
+
+#[test]
+fn takes_downloading() {
+    // The state a musician spends the longest in: a take is gigabytes, so the
+    // wait is the part that would otherwise be a surprise. 1.4 GB of the 4.4 GB
+    // of stems is on disk, and the other buttons are out while it runs, because
+    // one download at a time is what the screen allows.
+    let mut app = takes_app(Theme::Dark);
+    app.takes.park_download(
+        "a3f29c41deadbeef",
+        "jamstream-2026-07-28-1845",
+        Half::Stems,
+        4_400_000_000,
+        1_400_000_000,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot_for_docs(&mut harness, "takes_downloading");
+}
+
+#[test]
+fn takes_light() {
+    let mut harness = app_harness(takes_app(Theme::Light), WIDE);
+    snapshot(&mut harness, "takes_light");
+}
+
+#[test]
+fn takes_narrow() {
+    // The smallest window the app opens. The cards scroll; a row's price and
+    // its button may not slide off the edge or over each other.
+    let mut harness = app_harness(takes_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "takes_narrow");
+}
+
+#[test]
+fn takes_empty() {
+    // A host who has never recorded. One sentence saying what to do, which is
+    // the rule for every empty state in the app.
+    let mut app = test_app(Theme::Dark);
+    app.screen = Screen::Takes;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "takes_empty");
 }
 
 #[test]

@@ -40,6 +40,41 @@ pub enum SessionStatus {
     Ended,
 }
 
+/// Whether the retention choice is actually being enforced on this session's
+/// prefix.
+///
+/// Recorded because the answer arrives once, at launch, from the bucket, and a
+/// surface that shows takes weeks later has no way to ask again. Without it a
+/// countdown to a deletion nothing is going to perform is the honest-looking
+/// thing to draw, which is the one thing `jamstream_cloud::retention` says a
+/// caller must not do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RetentionApplied {
+    /// The provider took the rule and is keeping the promise itself.
+    ServerSide,
+    /// Nothing is enforcing the choice; `note` is the store's own sentence
+    /// about why, which names the missing permission or the missing API.
+    Unenforced { note: String },
+}
+
+impl RetentionApplied {
+    /// What a launch's retention call left behind.
+    pub fn from_enforcement(applied: &jamstream_cloud::RetentionEnforcement) -> RetentionApplied {
+        if applied.is_server_side() {
+            RetentionApplied::ServerSide
+        } else {
+            RetentionApplied::Unenforced {
+                note: applied.describe(),
+            }
+        }
+    }
+
+    pub fn is_server_side(&self) -> bool {
+        matches!(self, RetentionApplied::ServerSide)
+    }
+}
+
 /// The bucket a cloud session recorded to: enough to find its takes again,
 /// and no credential.
 ///
@@ -58,6 +93,11 @@ pub struct RecordingRecord {
     /// The retention rule applied to this session's prefix, for display.
     pub retention: String,
     pub stems: bool,
+    /// What the bucket did with the retention rule. `None` for a session
+    /// launched before this was written down, which is not the same answer as
+    /// "nothing is enforcing it" and must not be shown as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<RetentionApplied>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -408,6 +448,7 @@ mod tests {
             region: "eu-west-1".to_owned(),
             retention: "30d".to_owned(),
             stems: true,
+            applied: Some(RetentionApplied::ServerSide),
         };
         assert_eq!(read_recording_at(&path).unwrap(), None);
         write_recording_to(&path, &record).unwrap();

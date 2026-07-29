@@ -2321,3 +2321,74 @@ fn the_launching_step_has_a_way_back_while_it_is_still_waiting() {
         "and the preview must say a machine may be running"
     );
 }
+
+/// The only way in to the takes, and the state the button is not in.
+///
+/// Home is three cards and stays three cards: Takes hangs off the Recent
+/// sessions card, because a take belongs to a session. With no sessions there
+/// are no takes, so there is nothing there to press. Driven through
+/// `JamApp::root_ui`, so the screen it lands on is the one the app routes to
+/// rather than one a test constructed.
+#[test]
+fn takes_is_reached_from_the_recent_sessions_card_and_only_when_there_are_any() {
+    use jamstream_client::app::JamApp;
+    use jamstream_client::screens::home::RecentSession;
+
+    let recent = vec![RecentSession {
+        short_id: "a3f29c41".to_owned(),
+        provider: "digitalocean".to_owned(),
+        region: "sfo3".to_owned(),
+        status: "ended".to_owned(),
+    }];
+    for rows in [Vec::new(), recent] {
+        let any = !rows.is_empty();
+        let mut app = JamApp::in_memory();
+        app.recent = rows;
+        // The assertions are about the way in and the screen it lands on, not
+        // about the rows: entering reads this machine's own session records,
+        // and its bucket listings go nowhere, because an in-memory app has no
+        // storage key and cannot reach the developer's keychain for one.
+        app.takes.rows = Vec::new();
+        let mut harness = Harness::builder()
+            .with_size(vec2(1280.0, 800.0))
+            .with_step_dt(0.05)
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+            });
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .query_by_role_and_label(AkRole::Button, "Takes")
+                .is_some(),
+            any,
+            "with {} recent sessions the way in must{} be there",
+            usize::from(any),
+            if any { "" } else { " not" }
+        );
+        if !any {
+            continue;
+        }
+        harness
+            .get_by_role_and_label(AkRole::Button, "Takes")
+            .click();
+        harness.run_steps(3);
+        // The screen's own line, which is on no other screen.
+        assert!(
+            harness
+                .query_by_label_contains("What your sessions recorded")
+                .is_some(),
+            "Takes must land on the takes screen"
+        );
+        // And back, through the top bar's Home, which exists on every screen
+        // that is not Home or a session.
+        harness
+            .get_by_role_and_label(AkRole::Button, "Home")
+            .click();
+        harness.run_steps(3);
+        assert!(
+            harness.query_by_label_contains("Join a session").is_some(),
+            "Home must come back to Home"
+        );
+    }
+}

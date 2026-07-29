@@ -20,6 +20,7 @@ use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
 use crate::screens::recording::RecordingPanel;
 use crate::screens::session::{SessionEvent, SessionScreen, SettingsTab};
+use crate::screens::takes::TakesScreen;
 use crate::theme::{self, Theme};
 use crate::widgets::{AVATAR_D_STRIP, avatar_disc, sweep_avatar_textures};
 
@@ -59,6 +60,9 @@ pub enum Screen {
     Home,
     HostWizard,
     Session,
+    /// The takes past sessions left. Off Home rather than inside a session,
+    /// because a take outlives the session that made it.
+    Takes,
 }
 
 impl Screen {
@@ -67,6 +71,7 @@ impl Screen {
             Screen::Home => "home",
             Screen::HostWizard => "host a session",
             Screen::Session => "session",
+            Screen::Takes => "takes",
         }
     }
 }
@@ -85,6 +90,10 @@ pub struct JamApp {
     /// every frame, so the wizard holds no second copy of the answer.
     pub recording: RecordingPanel,
     pub session: SessionScreen,
+    /// The Takes screen. Holds the keychain behind it, because fetching a take
+    /// needs the storage key the Recording tab saved, and it is the whole point
+    /// that the app does not send a host to a terminal for a key it has.
+    pub takes: TakesScreen,
     pub runtime: Option<Box<dyn Runtime>>,
     /// Concrete handle to the live runtime when one is active; device
     /// changes go through it (the [`Runtime`] contract has no device
@@ -164,6 +173,7 @@ impl JamApp {
                 prefs,
             ),
             session: SessionScreen::default(),
+            takes: TakesScreen::new(Arc::clone(&creds), Arc::clone(&env), Arc::clone(&exec)),
             runtime: None,
             live: None,
             settings_open: false,
@@ -442,6 +452,10 @@ impl JamApp {
                                 Err(err) => self.home.error = Some(err.to_string()),
                             }
                         }
+                        HomeAction::Takes => {
+                            self.screen = Screen::Takes;
+                            self.takes.reload();
+                        }
                         HomeAction::Host => {
                             self.wizard = HostWizard::new(
                                 Arc::clone(&self.creds),
@@ -453,6 +467,7 @@ impl JamApp {
                     }
                 }
             }
+            Screen::Takes => self.takes.ui(ui),
             Screen::HostWizard => {
                 // What this computer can record to, handed over as plain data
                 // every frame: a bucket saved in the Recording tab is armable
@@ -834,6 +849,7 @@ impl eframe::App for JamApp {
             || match self.screen {
                 Screen::Session => true,
                 Screen::HostWizard => self.wizard.busy() || self.settings_open,
+                Screen::Takes => self.takes.busy() || self.settings_open,
                 _ => self.settings_open,
             };
         if animating {
