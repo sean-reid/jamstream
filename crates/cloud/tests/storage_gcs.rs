@@ -17,17 +17,32 @@ use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use jamstream_cloud::providers::gcp::TokenSource;
 use jamstream_cloud::retention::Retention;
-use jamstream_cloud::storage::GcsStore;
+use jamstream_cloud::storage::{GcsStore, MIN_PART_SIZE};
 use jamstream_cloud::{
     BytesSource, ObjectStore, ProviderError, ProviderKind, Result, assert_object_store_contract,
-    mix_key, session_prefix,
+    session_prefix,
 };
 
 const TOKEN: &str = "ya29.test-token";
 const BUCKET: &str = "my-jams";
-const WAV: &str = "audio/wav";
-/// The mix key with `/` percent-encoded, as it appears in a GCS object path.
-const MIX_ENCODED: &str = "jamstream%2Frecordings%2Fs1%2Fmix.wav";
+const FLAC: &str = "audio/flac";
+/// The take key with `/` percent-encoded, as it appears in a GCS object path.
+const TAKE_ENCODED: &str = "jamstream%2Frecordings%2Fs1%2Fjamstream-2026-07-25-1030-mix.flac";
+
+/// The name a take actually gets: the session prefix from the cloud crate, the
+/// file name from the recorder in the server crate.
+fn take_key() -> String {
+    format!("{}jamstream-2026-07-25-1030-mix.flac", session_prefix("s1"))
+}
+
+/// The smallest chunk size GCS accepts for a non-final resumable chunk, which
+/// is what the resumable tests run at.
+const CHUNK: usize = MIN_PART_SIZE;
+
+/// Deterministic bytes, so an assertion can regenerate them.
+fn body(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
 
 struct FakeToken;
 
@@ -41,7 +56,7 @@ impl TokenSource for FakeToken {
 fn store(server: &MockServer) -> GcsStore {
     GcsStore::new(Arc::new(FakeToken))
         .with_base_url(server.uri())
-        .with_part_size(8)
+        .with_part_size(CHUNK)
 }
 
 fn authorized() -> impl Match {
@@ -54,7 +69,7 @@ fn object_json(name: &str, size: u64) -> Value {
         "name": name,
         "bucket": BUCKET,
         "size": size.to_string(),
-        "contentType": WAV,
+        "contentType": FLAC,
         "etag": "CJ0=",
         "updated": "2026-07-25T10:00:00.000Z",
     })
@@ -65,25 +80,25 @@ fn object_json(name: &str, size: u64) -> Value {
 #[tokio::test]
 async fn put_uses_the_media_upload_endpoint() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("POST"))
         .and(path(format!("/upload/storage/v1/b/{BUCKET}/o")))
         .and(query_param("uploadType", "media"))
         .and(query_param("name", key.as_str()))
         .and(authorized())
-        .and(header("content-type", WAV))
+        .and(header("content-type", FLAC))
         .respond_with(ResponseTemplate::new(200).set_body_json(object_json(&key, 14)))
         .expect(1)
         .mount(&server)
         .await;
 
     let meta = store(&server)
-        .put(BUCKET, &key, WAV, b"riff-ish bytes")
+        .put(BUCKET, &key, FLAC, b"riff-ish bytes")
         .await
         .unwrap();
     assert_eq!(meta.key, key);
     assert_eq!(meta.size, 14, "the size arrives as a JSON string");
-    assert_eq!(meta.content_type.as_deref(), Some(WAV));
+    assert_eq!(meta.content_type.as_deref(), Some(FLAC));
     assert_eq!(meta.etag.as_deref(), Some("CJ0="));
 }
 
@@ -92,16 +107,16 @@ async fn put_uses_the_media_upload_endpoint() {
 #[tokio::test]
 async fn resumable_upload_initiates_streams_chunks_and_finalizes() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     let session_uri = format!("{}/resumable/session-1", server.uri());
 
     Mock::given(method("POST"))
         .and(path(format!("/upload/storage/v1/b/{BUCKET}/o")))
         .and(query_param("uploadType", "resumable"))
         .and(authorized())
-        .and(header("x-upload-content-type", WAV))
+        .and(header("x-upload-content-type", FLAC))
         // The metadata body names the object and its type.
-        .and(body_json(json!({ "name": key, "contentType": WAV })))
+        .and(body_json(json!({ "name": key, "contentType": FLAC })))
         .respond_with(ResponseTemplate::new(200).insert_header("location", session_uri.as_str()))
         .expect(1)
         .named("start resumable session")
@@ -109,7 +124,8 @@ async fn resumable_upload_initiates_streams_chunks_and_finalizes() {
         .await;
 
     // Intermediate chunks: an open-ended range, answered with 308.
-    for (start, end) in [(0u64, 7u64), (8, 15)] {
+    let chunk = CHUNK as u64;
+    for (start, end) in [(0, chunk - 1), (chunk, chunk * 2 - 1)] {
         Mock::given(method("PUT"))
             .and(path("/resumable/session-1"))
             .and(authorized())
@@ -127,26 +143,25 @@ async fn resumable_upload_initiates_streams_chunks_and_finalizes() {
             .await;
     }
     // The final chunk declares the total, and the response is the object.
+    let len = CHUNK * 2 + 4;
     Mock::given(method("PUT"))
         .and(path("/resumable/session-1"))
         .and(authorized())
-        .and(header("content-range", "bytes 16-19/20"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(object_json(&key, 20)))
+        .and(header(
+            "content-range",
+            format!("bytes {}-{}/{len}", chunk * 2, len - 1).as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(object_json(&key, len as u64)))
         .expect(1)
         .named("final chunk")
         .mount(&server)
         .await;
 
     let meta = store(&server)
-        .put_stream(
-            BUCKET,
-            &key,
-            WAV,
-            &mut BytesSource::new((0..20u8).collect::<Vec<u8>>()),
-        )
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(len)))
         .await
         .unwrap();
-    assert_eq!(meta.size, 20);
+    assert_eq!(meta.size, len as u64);
     assert_eq!(meta.key, key);
     // There is no separate commit call and no cancel.
     let requests = server.received_requests().await.unwrap();
@@ -162,23 +177,20 @@ async fn resumable_upload_initiates_streams_chunks_and_finalizes() {
 #[tokio::test]
 async fn a_body_inside_one_chunk_uses_the_media_upload() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("POST"))
         .and(query_param("uploadType", "media"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(object_json(&key, 8)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(object_json(&key, CHUNK as u64)))
         .expect(1)
         .mount(&server)
         .await;
+    // Exactly one full chunk, the boundary case: the lookahead read comes back
+    // empty, so no resumable session is opened.
     let meta = store(&server)
-        .put_stream(
-            BUCKET,
-            &key,
-            WAV,
-            &mut BytesSource::new(b"12345678".to_vec()),
-        )
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(CHUNK)))
         .await
         .unwrap();
-    assert_eq!(meta.size, 8);
+    assert_eq!(meta.size, CHUNK as u64);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
@@ -194,9 +206,9 @@ async fn a_missing_location_header_fails_before_any_bytes_are_sent() {
     let err = store(&server)
         .put_stream(
             BUCKET,
-            &mix_key("s1"),
-            WAV,
-            &mut BytesSource::new((0..20u8).collect::<Vec<u8>>()),
+            &take_key(),
+            FLAC,
+            &mut BytesSource::new(body(CHUNK + 4)),
         )
         .await
         .unwrap_err();
@@ -210,7 +222,7 @@ async fn a_missing_location_header_fails_before_any_bytes_are_sent() {
 #[tokio::test]
 async fn a_failed_chunk_cancels_the_session_and_leaves_nothing_behind() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     let session_uri = format!("{}/resumable/session-1", server.uri());
 
     Mock::given(method("POST"))
@@ -219,14 +231,20 @@ async fn a_failed_chunk_cancels_the_session_and_leaves_nothing_behind() {
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
-        .and(header("content-range", "bytes 0-7/*"))
+        .and(header(
+            "content-range",
+            format!("bytes 0-{}/*", CHUNK - 1).as_str(),
+        ))
         .respond_with(ResponseTemplate::new(308))
         .expect(1)
         .mount(&server)
         .await;
     // The second chunk is rejected outright.
     Mock::given(method("PUT"))
-        .and(header("content-range", "bytes 8-15/*"))
+        .and(header(
+            "content-range",
+            format!("bytes {}-{}/*", CHUNK, CHUNK * 2 - 1).as_str(),
+        ))
         .respond_with(ResponseTemplate::new(400).set_body_string("bad chunk"))
         .expect(1)
         .mount(&server)
@@ -243,12 +261,7 @@ async fn a_failed_chunk_cancels_the_session_and_leaves_nothing_behind() {
         .await;
 
     let err = store(&server)
-        .put_stream(
-            BUCKET,
-            &key,
-            WAV,
-            &mut BytesSource::new((0..40u8).collect::<Vec<u8>>()),
-        )
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(CHUNK * 3)))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("bad chunk"), "{err}");
@@ -290,9 +303,9 @@ async fn a_session_that_never_finalizes_is_an_error_and_is_cancelled() {
     let err = store(&server)
         .put_stream(
             BUCKET,
-            &mix_key("s1"),
-            WAV,
-            &mut BytesSource::new((0..20u8).collect::<Vec<u8>>()),
+            &take_key(),
+            FLAC,
+            &mut BytesSource::new(body(CHUNK + 4)),
         )
         .await
         .unwrap_err();
@@ -304,7 +317,7 @@ async fn an_early_finalization_is_caught_and_cancelled() {
     // A 200 before the last chunk means GCS closed the object and the rest
     // of the recording would vanish silently.
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     let session_uri = format!("{}/resumable/session-1", server.uri());
     Mock::given(method("POST"))
         .and(query_param("uploadType", "resumable"))
@@ -312,8 +325,11 @@ async fn an_early_finalization_is_caught_and_cancelled() {
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
-        .and(header("content-range", "bytes 0-7/*"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(object_json(&key, 8)))
+        .and(header(
+            "content-range",
+            format!("bytes 0-{}/*", CHUNK - 1).as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(object_json(&key, CHUNK as u64)))
         .expect(1)
         .mount(&server)
         .await;
@@ -324,12 +340,7 @@ async fn an_early_finalization_is_caught_and_cancelled() {
         .await;
 
     let err = store(&server)
-        .put_stream(
-            BUCKET,
-            &key,
-            WAV,
-            &mut BytesSource::new((0..20u8).collect::<Vec<u8>>()),
-        )
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(CHUNK + 4)))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("finalized the upload"), "{err}");
@@ -340,9 +351,9 @@ async fn an_early_finalization_is_caught_and_cancelled() {
 #[tokio::test]
 async fn head_reads_the_object_resource() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("GET"))
-        .and(path(format!("/storage/v1/b/{BUCKET}/o/{MIX_ENCODED}")))
+        .and(path(format!("/storage/v1/b/{BUCKET}/o/{TAKE_ENCODED}")))
         .and(authorized())
         .respond_with(ResponseTemplate::new(200).set_body_json(object_json(&key, 1_382_400_044)))
         .expect(1)
@@ -366,10 +377,7 @@ async fn head_of_a_missing_object_is_not_found() {
         .expect(1)
         .mount(&server)
         .await;
-    let err = store(&server)
-        .head(BUCKET, &mix_key("s1"))
-        .await
-        .unwrap_err();
+    let err = store(&server).head(BUCKET, &take_key()).await.unwrap_err();
     assert!(matches!(err, ProviderError::NotFound(_)), "{err:?}");
 }
 
@@ -408,9 +416,9 @@ async fn list_follows_the_page_token() {
 #[tokio::test]
 async fn delete_is_idempotent_despite_gcs_returning_404() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("DELETE"))
-        .and(path(format!("/storage/v1/b/{BUCKET}/o/{MIX_ENCODED}")))
+        .and(path(format!("/storage/v1/b/{BUCKET}/o/{TAKE_ENCODED}")))
         .and(authorized())
         .respond_with(ResponseTemplate::new(204))
         .up_to_n_times(1)
@@ -431,10 +439,29 @@ async fn delete_is_idempotent_despite_gcs_returning_404() {
 
 // ---- Lifecycle ----
 
+/// Answers the read half of set_retention with `rules`, or with the empty body
+/// GCS sends for a bucket that has none.
+async fn mount_bucket_get(server: &MockServer, rules: Option<Value>) {
+    let body = match rules {
+        Some(rules) => json!({ "lifecycle": { "rule": rules } }),
+        None => json!({}),
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/storage/v1/b/{BUCKET}")))
+        .and(authorized())
+        .and(query_param("fields", "lifecycle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .named("the read before the patch")
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
 async fn lifecycle_patch_scopes_the_rule_to_the_prefix() {
     let server = MockServer::start().await;
     let prefix = session_prefix("s1");
+    mount_bucket_get(&server, None).await;
     Mock::given(method("PATCH"))
         .and(path(format!("/storage/v1/b/{BUCKET}")))
         .and(authorized())
@@ -466,20 +493,85 @@ async fn lifecycle_patch_scopes_the_rule_to_the_prefix() {
 }
 
 #[tokio::test]
-async fn keep_forever_clears_the_rule_list() {
+async fn keep_forever_clears_this_sessions_rule_and_leaves_the_rest() {
     let server = MockServer::start().await;
+    let ours = json!({
+        "action": { "type": "Delete" },
+        "condition": { "age": 7, "matchesPrefix": [session_prefix("s1")] },
+    });
+    let theirs = json!({
+        "action": { "type": "SetStorageClass", "storageClass": "NEARLINE" },
+        "condition": { "age": 10, "matchesPrefix": ["masters/"] },
+    });
+    mount_bucket_get(&server, Some(json!([theirs.clone(), ours]))).await;
     Mock::given(method("PATCH"))
-        .and(body_json(json!({ "lifecycle": { "rule": [] } })))
+        // Only this session's rule goes; the host's own stays. Sending an
+        // empty list, which is what "clear the expiration" used to mean,
+        // deleted every rule on the bucket.
+        .and(body_json(json!({ "lifecycle": { "rule": [theirs] } })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
-        .named("an empty rule list clears a previous expiration")
+        .named("keep forever drops one rule, not the list")
         .mount(&server)
         .await;
     let applied = store(&server)
-        .set_retention(BUCKET, "jamstream/recordings/", Retention::KeepForever)
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::KeepForever)
         .await
         .unwrap();
     assert!(applied.describe().contains("kept until you delete it"));
+}
+
+#[tokio::test]
+async fn a_second_recorded_session_keeps_the_first_ones_expiry_rule() {
+    let server = MockServer::start().await;
+    let first = json!({
+        "action": { "type": "Delete" },
+        "condition": { "age": 90, "matchesPrefix": [session_prefix("s1")] },
+    });
+    mount_bucket_get(&server, Some(json!([first.clone()]))).await;
+    Mock::given(method("PATCH"))
+        .and(body_json(json!({ "lifecycle": { "rule": [
+            first,
+            { "action": { "type": "Delete" },
+              "condition": { "age": 7, "matchesPrefix": [session_prefix("s2")] } },
+        ] } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .named("both sessions' rules")
+        .mount(&server)
+        .await;
+    let applied = store(&server)
+        .set_retention(BUCKET, &session_prefix("s2"), Retention::Days7)
+        .await
+        .unwrap();
+    assert!(applied.is_server_side());
+}
+
+#[tokio::test]
+async fn a_bucket_whose_rules_cannot_be_read_is_left_alone() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/storage/v1/b/{BUCKET}")))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": { "code": 403, "message": "storage.buckets.get denied" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .named("nothing may be written when the existing rules are unknown")
+        .mount(&server)
+        .await;
+    let applied = store(&server)
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::Days30)
+        .await
+        .unwrap();
+    assert!(!applied.is_server_side());
+    let note = applied.describe();
+    assert!(note.contains("storage.buckets.get"), "{note}");
+    assert!(note.contains("30 days unless you do"), "{note}");
 }
 
 #[tokio::test]
@@ -493,7 +585,7 @@ async fn an_unauthorized_token_is_an_auth_error_and_is_not_retried() {
         .mount(&server)
         .await;
     let err = store(&server)
-        .put(BUCKET, &mix_key("s1"), WAV, b"x")
+        .put(BUCKET, &take_key(), FLAC, b"x")
         .await
         .unwrap_err();
     assert!(matches!(err, ProviderError::Auth(_)), "{err:?}");
@@ -545,6 +637,10 @@ struct FakeState {
     /// session id -> (object name, bytes received so far).
     sessions: std::collections::BTreeMap<String, (String, Vec<u8>)>,
     next_session: u64,
+    /// The bucket's lifecycle rules. Held because the patch replaces the whole
+    /// list: a fake that answered every patch with 200 and forgot the body
+    /// could not show that a previous session's rule is gone.
+    lifecycle: Option<Value>,
 }
 
 impl FakeGcs {
@@ -721,7 +817,17 @@ impl Respond for FakeGcs {
                 .collect();
             ResponseTemplate::new(200).set_body_json(json!({ "items": items }))
         } else if method == "PATCH" && path == format!("/storage/v1/b/{BUCKET}") {
+            let patch: Value = serde_json::from_slice(&request.body).unwrap_or_else(|_| json!({}));
+            // The patch replaces the rule list wholesale, as GCS does.
+            state.lifecycle = patch.get("lifecycle").cloned();
             ResponseTemplate::new(200).set_body_json(json!({ "kind": "storage#bucket" }))
+        } else if method == "GET" && path == format!("/storage/v1/b/{BUCKET}") {
+            // fields=lifecycle on a bucket with no rules is an empty object.
+            let body = match &state.lifecycle {
+                Some(lifecycle) => json!({ "lifecycle": lifecycle }),
+                None => json!({}),
+            };
+            ResponseTemplate::new(200).set_body_json(body)
         } else {
             ResponseTemplate::new(501).set_body_string(format!("{method} {path}"))
         }

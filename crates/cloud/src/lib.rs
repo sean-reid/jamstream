@@ -63,8 +63,8 @@ pub use solver::{MemberId, ProbeMatrix, RegionScore, rank};
 pub use storage::GcsStore;
 pub use storage::{
     BytesSource, ChunkSink, FLAC_CONTENT_TYPE, JSON_CONTENT_TYPE, MockStore, ObjectMeta,
-    ObjectSink, ObjectStore, PartSource, ReadSource, S3Store, WAV_CONTENT_TYPE,
-    assert_object_store_contract, manifest_key, mix_key, session_prefix, stem_key,
+    ObjectSink, ObjectStore, PartSource, ReadSource, S3Store, assert_object_store_contract,
+    session_prefix,
 };
 pub use sweeper::{SweepFilter, SweepReport, sweep};
 pub use types::{

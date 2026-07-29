@@ -2,8 +2,8 @@
 //!
 //! It goes through the same [`crate::storage::drive_upload`] driver the real
 //! backends do, so a test that exercises `put_stream` against `MockStore`
-//! exercises the real escalation and abort logic — only the transport is
-//! fake. Failure injection ([`MockStore::fail_part`],
+//! exercises the real escalation and abort logic, with only the transport
+//! faked. Failure injection ([`MockStore::fail_part`],
 //! [`MockStore::fail_complete`]) makes the abort path reachable without a
 //! network, and [`MockStore::pending_uploads`] is how a test proves an
 //! aborted upload left nothing behind.
@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::provider::{ProviderError, Result};
-use crate::retention::{Retention, RetentionEnforcement, manual_note};
+use crate::retention::{Retention, RetentionEnforcement, manual_note, rule_id};
 use crate::storage::{
     ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
     drive_upload,
@@ -132,6 +132,12 @@ impl MockStore {
 
     /// Tiny parts, so a test can drive a multi-part upload with a handful of
     /// bytes instead of 48 MiB.
+    ///
+    /// Not clamped to [`crate::storage::MIN_PART_SIZE`] the way the real stores
+    /// are: nothing here is a provider, so no provider rule applies, and the
+    /// server and CLI tests that drive this store are about the upload
+    /// lifecycle rather than about part sizes. A test that cares what a
+    /// provider accepts has to talk to `S3Store` or `GcsStore`.
     pub fn with_part_size(mut self, bytes: usize) -> Self {
         self.part_size = bytes.max(1);
         self
@@ -470,10 +476,21 @@ impl ObjectStore for MockStore {
         }
         s.retention
             .insert((bucket.to_owned(), prefix.to_owned()), retention);
+        // The whole bucket's rules, because that is what the real stores
+        // return: both providers replace the entire lifecycle document on
+        // every write, so a store that reported only the rule it just set
+        // would hide the bug where the rest of them vanish.
+        let rule = s
+            .retention
+            .iter()
+            .filter(|((b, _), _)| b == bucket)
+            .map(|((_, p), r)| format!("{}: {p} -> {r}\n", rule_id(p)))
+            .collect();
         Ok(RetentionEnforcement::ServerSide {
             provider: self.kind,
             retention,
-            rule: format!("mock lifecycle rule: {prefix} -> {retention}"),
+            rule_id: rule_id(prefix),
+            rule,
         })
     }
 }
@@ -481,7 +498,12 @@ impl ObjectStore for MockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{BytesSource, WAV_CONTENT_TYPE, mix_key};
+    use crate::storage::{BytesSource, FLAC_CONTENT_TYPE, session_prefix};
+
+    /// A take's key, the shape the recorder produces.
+    fn take_key() -> String {
+        format!("{}jamstream-2026-07-25-1030-mix.flac", session_prefix("s1"))
+    }
 
     /// Body that spans three parts of 8 bytes plus a 3-byte tail.
     fn body(len: usize) -> Vec<u8> {
@@ -495,14 +517,14 @@ mod tests {
         let meta = store
             .put_stream(
                 "b",
-                "k.wav",
-                WAV_CONTENT_TYPE,
+                "take.flac",
+                FLAC_CONTENT_TYPE,
                 &mut BytesSource::new(bytes.clone()),
             )
             .await
             .unwrap();
         assert_eq!(meta.size, 27);
-        assert_eq!(store.body("b", "k.wav").unwrap(), bytes);
+        assert_eq!(store.body("b", "take.flac").unwrap(), bytes);
         assert!(store.pending_uploads().is_empty());
 
         // 8 + 8 + 8 + 3, with `last` only on the final part.
@@ -515,7 +537,7 @@ mod tests {
         assert_eq!(
             parts[0],
             StoreCall::Part {
-                key: "k.wav".to_owned(),
+                key: "take.flac".to_owned(),
                 number: 1,
                 offset: 0,
                 last: false,
@@ -525,7 +547,7 @@ mod tests {
         assert_eq!(
             parts[3],
             StoreCall::Part {
-                key: "k.wav".to_owned(),
+                key: "take.flac".to_owned(),
                 number: 4,
                 offset: 24,
                 last: true,
@@ -540,8 +562,8 @@ mod tests {
         store
             .put_stream(
                 "b",
-                "k.wav",
-                WAV_CONTENT_TYPE,
+                "take.flac",
+                FLAC_CONTENT_TYPE,
                 &mut BytesSource::new(body(64)),
             )
             .await
@@ -554,7 +576,7 @@ mod tests {
             "a single-part body must take the plain PUT path: {:?}",
             store.calls()
         );
-        assert_eq!(store.body("b", "k.wav").unwrap().len(), 64);
+        assert_eq!(store.body("b", "take.flac").unwrap().len(), 64);
     }
 
     #[tokio::test]
@@ -563,14 +585,14 @@ mod tests {
         let meta = store
             .put_stream(
                 "b",
-                "empty.wav",
-                WAV_CONTENT_TYPE,
+                "empty.flac",
+                FLAC_CONTENT_TYPE,
                 &mut BytesSource::new(vec![]),
             )
             .await
             .unwrap();
         assert_eq!(meta.size, 0);
-        assert_eq!(store.body("b", "empty.wav").unwrap(), Vec::<u8>::new());
+        assert_eq!(store.body("b", "empty.flac").unwrap(), Vec::<u8>::new());
         assert!(store.pending_uploads().is_empty());
     }
 
@@ -578,9 +600,14 @@ mod tests {
     async fn a_failed_part_aborts_and_leaves_nothing_behind() {
         let store = MockStore::new(ProviderKind::Aws).with_part_size(8);
         store.fail_part(3);
-        let key = mix_key("s1");
+        let key = take_key();
         let err = store
-            .put_stream("b", &key, WAV_CONTENT_TYPE, &mut BytesSource::new(body(40)))
+            .put_stream(
+                "b",
+                &key,
+                FLAC_CONTENT_TYPE,
+                &mut BytesSource::new(body(40)),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::Transient(_)), "{err:?}");
@@ -617,8 +644,8 @@ mod tests {
         let err = store
             .put_stream(
                 "b",
-                "k.wav",
-                WAV_CONTENT_TYPE,
+                "take.flac",
+                FLAC_CONTENT_TYPE,
                 &mut BytesSource::new(body(20)),
             )
             .await
@@ -652,7 +679,7 @@ mod tests {
         }
         let store = MockStore::new(ProviderKind::Aws).with_part_size(8);
         let err = store
-            .put_stream("b", "k.wav", WAV_CONTENT_TYPE, &mut Flaky(0))
+            .put_stream("b", "take.flac", FLAC_CONTENT_TYPE, &mut Flaky(0))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("disk went away"), "{err}");

@@ -31,7 +31,7 @@ Whether a session can record, and whether stems are captured alongside the mix, 
 
 With no bucket set up, the two recording rows are disabled and say so, pointing at the Recording tab. A local session has no such requirement: the rows are live and the takes land on this computer.
 
-Launching proves the key can write this session's own prefix and puts the retention rule in place before the machine is paid for.
+Launching proves the key can write this session's own prefix, and sets the retention rule before the machine is paid for. Setting it needs a key that may read the bucket's existing rules as well as write one; without that the session still records, but the takes are kept indefinitely and go on costing storage until you delete them. `jamstream host` says so in the line it prints after the bucket check. The fix is the read permission in the recording step of your [provider's page](providers.md).
 
 ## From the terminal
 

@@ -5,72 +5,89 @@
 //! everything at one mock server in path-style, so the real signer, the real
 //! request shapes, and the real XML parsers are all under test.
 
+mod signature;
+
 use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::retention::{LifecycleDialect, Retention};
-use jamstream_cloud::storage::{ChunkSink, S3Store};
+use jamstream_cloud::storage::{ChunkSink, DEFAULT_PART_SIZE, MIN_PART_SIZE, S3Store};
 use jamstream_cloud::{
     BytesSource, ObjectStore, Provider, ProviderError, ProviderKind, Result,
-    assert_object_store_contract, mix_key, session_prefix,
+    assert_object_store_contract, session_prefix,
 };
+use signature::Signer;
 use wiremock::matchers::{
     body_string_contains, header, header_exists, method, path, query_param, query_param_is_missing,
 };
 use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const ACCESS_KEY_ID: &str = "AKIDTEST";
+const SECRET: &str = "test-secret-key";
 const BUCKET: &str = "my-jams";
-const WAV: &str = "audio/wav";
+const FLAC: &str = "audio/flac";
+const SPACES_KEY_ID: &str = "DO00TEST";
+const SPACES_SECRET: &str = "spaces-secret";
+
+/// The name a take actually gets: the session prefix from the cloud crate, the
+/// file name from the recorder in the server crate. Written out here rather
+/// than built by a helper, because the helpers that used to name `mix.wav` are
+/// what made this suite test a scheme the product does not use.
+fn take_key() -> String {
+    format!("{}jamstream-2026-07-25-1030-mix.flac", session_prefix("s1"))
+}
+
+/// The smallest part size S3 accepts, which is what the multipart tests run at:
+/// a part below this is an EntityTooSmall from the real service.
+const PART: usize = MIN_PART_SIZE;
+
+/// Deterministic bytes, so an assertion can regenerate them instead of
+/// trusting what came back.
+fn body(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
 
 fn store(server: &MockServer) -> S3Store {
-    S3Store::aws(
-        "eu-west-1",
-        ACCESS_KEY_ID.to_owned(),
-        "test-secret-key".to_owned(),
-    )
-    .with_base_url(server.uri())
-    // Tiny parts so a multipart lifecycle costs a few bytes, not 48 MiB.
-    .with_part_size(8)
+    S3Store::aws("eu-west-1", ACCESS_KEY_ID.to_owned(), SECRET.to_owned())
+        .with_base_url(server.uri())
+        .with_part_size(PART)
 }
 
 fn spaces_store(server: &MockServer) -> S3Store {
-    S3Store::spaces("nyc3", "DO00TEST".to_owned(), "spaces-secret".to_owned())
+    S3Store::spaces("nyc3", SPACES_KEY_ID.to_owned(), SPACES_SECRET.to_owned())
         .with_base_url(server.uri())
-        .with_part_size(8)
+        .with_part_size(PART)
 }
 
-/// Matches a request carrying a well-formed SigV4 authorization for the S3
-/// service in `region`, with the payload hash header S3 requires.
-struct SignedForS3 {
-    region: &'static str,
-    access_key_id: &'static str,
+fn aws_signer() -> Signer {
+    Signer::s3(ACCESS_KEY_ID, SECRET, "eu-west-1")
 }
+
+fn spaces_signer() -> Signer {
+    Signer::s3(SPACES_KEY_ID, SPACES_SECRET, "nyc3")
+}
+
+/// Matches only a request whose signature, recomputed from what arrived, is the
+/// one that arrived. A store that signed a different path, a different query,
+/// a different body or nothing at all does not match.
+struct SignedForS3(Signer);
 
 impl Match for SignedForS3 {
     fn matches(&self, request: &Request) -> bool {
-        let Some(auth) = request
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-        else {
-            return false;
-        };
-        auth.starts_with(&format!(
-            "AWS4-HMAC-SHA256 Credential={}/",
-            self.access_key_id
-        ))
-            && auth.contains(&format!("/{}/s3/aws4_request", self.region))
-            // Every S3 request signs the payload hash, and it must be sent.
-            && auth.contains("x-amz-content-sha256")
-            && request.headers.get("x-amz-content-sha256").is_some()
-            && request.headers.get("x-amz-date").is_some()
+        match signature::verify(request, &self.0) {
+            Ok(()) => true,
+            Err(why) => {
+                eprintln!("unsigned or wrongly signed request: {why}");
+                false
+            }
+        }
     }
 }
 
 fn signed() -> SignedForS3 {
-    SignedForS3 {
-        region: "eu-west-1",
-        access_key_id: ACCESS_KEY_ID,
-    }
+    SignedForS3(aws_signer())
+}
+
+fn signed_for_spaces() -> SignedForS3 {
+    SignedForS3(spaces_signer())
 }
 
 fn object_path(key: &str) -> String {
@@ -82,11 +99,11 @@ fn object_path(key: &str) -> String {
 #[tokio::test]
 async fn put_signs_and_sends_the_object() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("PUT"))
         .and(path(object_path(&key)))
         .and(signed())
-        .and(header("content-type", WAV))
+        .and(header("content-type", FLAC))
         .and(body_string_contains("riff-ish"))
         .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"abc123\""))
         .expect(1)
@@ -94,7 +111,7 @@ async fn put_signs_and_sends_the_object() {
         .await;
 
     let meta = store(&server)
-        .put(BUCKET, &key, WAV, b"riff-ish bytes")
+        .put(BUCKET, &key, FLAC, b"riff-ish bytes")
         .await
         .unwrap();
     assert_eq!(meta.key, key);
@@ -127,13 +144,13 @@ impl Respond for PartEtag {
 #[tokio::test]
 async fn multipart_upload_initiates_sends_parts_and_completes() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
 
     Mock::given(method("POST"))
         .and(path(object_path(&key)))
         .and(query_param("uploads", ""))
         .and(signed())
-        .and(header("content-type", WAV))
+        .and(header("content-type", FLAC))
         .respond_with(ResponseTemplate::new(200).set_body_string(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <InitiateMultipartUploadResult>
@@ -185,13 +202,16 @@ async fn multipart_upload_initiates_sends_parts_and_completes() {
         .mount(&server)
         .await;
 
-    // 8 + 8 + 4 bytes at a part size of 8.
-    let body: Vec<u8> = (0..20u8).collect();
+    // Two full parts and a short one, at the smallest part size S3 accepts.
+    let len = PART * 2 + 4;
     let meta = store(&server)
-        .put_stream(BUCKET, &key, WAV, &mut BytesSource::new(body))
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(len)))
         .await
         .unwrap();
-    assert_eq!(meta.size, 20, "the completed object reports the full body");
+    assert_eq!(
+        meta.size, len as u64,
+        "the completed object reports the full body"
+    );
     assert_eq!(meta.etag.as_deref(), Some("final-etag-3"));
     // No DELETE: a successful upload must not abort.
     assert!(
@@ -208,7 +228,7 @@ async fn multipart_upload_initiates_sends_parts_and_completes() {
 #[tokio::test]
 async fn a_body_inside_one_part_never_initiates_a_multipart_upload() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("PUT"))
         .and(path(object_path(&key)))
         .and(query_param_is_missing("partNumber"))
@@ -216,17 +236,14 @@ async fn a_body_inside_one_part_never_initiates_a_multipart_upload() {
         .expect(1)
         .mount(&server)
         .await;
-    // Anything else, in particular a ?uploads POST, is an error.
+    // Exactly one full part, the boundary case: the lookahead read comes back
+    // empty, so this must not become a multipart upload. Anything else, in
+    // particular a ?uploads POST, is an error.
     let meta = store(&server)
-        .put_stream(
-            BUCKET,
-            &key,
-            WAV,
-            &mut BytesSource::new(b"12345678".to_vec()),
-        )
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(PART)))
         .await
         .unwrap();
-    assert_eq!(meta.size, 8);
+    assert_eq!(meta.size, PART as u64);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
@@ -235,7 +252,7 @@ async fn a_body_inside_one_part_never_initiates_a_multipart_upload() {
 #[tokio::test]
 async fn a_failed_part_aborts_the_upload_and_leaves_nothing_behind() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
 
     Mock::given(method("POST"))
         .and(path(object_path(&key)))
@@ -276,9 +293,13 @@ async fn a_failed_part_aborts_the_upload_and_leaves_nothing_behind() {
         .mount(&server)
         .await;
 
-    let body: Vec<u8> = (0..30u8).collect();
     let err = store(&server)
-        .put_stream(BUCKET, &key, WAV, &mut BytesSource::new(body))
+        .put_stream(
+            BUCKET,
+            &key,
+            FLAC,
+            &mut BytesSource::new(body(PART * 2 + 4)),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, ProviderError::Other(_)), "{err:?}");
@@ -315,7 +336,7 @@ async fn an_error_inside_a_200_completion_response_still_aborts() {
     // of a 200. Trusting the status code here would report a recording that
     // does not exist.
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
 
     Mock::given(method("POST"))
         .and(query_param("uploads", ""))
@@ -347,12 +368,7 @@ async fn an_error_inside_a_200_completion_response_still_aborts() {
         .await;
 
     let err = store(&server)
-        .put_stream(
-            BUCKET,
-            &key,
-            WAV,
-            &mut BytesSource::new((0..20u8).collect::<Vec<u8>>()),
-        )
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(PART + 1)))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("InternalError"), "{err}");
@@ -368,7 +384,7 @@ async fn sink_streams_chunks_through_a_real_multipart_upload() {
     use std::sync::Arc;
 
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("POST"))
         .and(path(object_path(&key)))
         .and(query_param("uploads", ""))
@@ -403,13 +419,16 @@ async fn sink_streams_chunks_through_a_real_multipart_upload() {
     let dir = std::env::temp_dir().join(format!("jamstream-s3-sink-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut sink =
-        ObjectSink::open_with_marker_dir(Arc::new(store(&server)), BUCKET, &key, WAV, &dir);
-    // 20 bytes in ragged chunks at a part size of 8: 8 + 8 + 4.
-    sink.write((0..5u8).collect()).await.unwrap();
-    sink.write((5..19u8).collect()).await.unwrap();
-    sink.write(vec![19]).await.unwrap();
+        ObjectSink::open_with_marker_dir(Arc::new(store(&server)), BUCKET, &key, FLAC, &dir);
+    // Ragged chunks, none of them a part boundary, adding up to two full parts
+    // and a short third: what the recorder does, at the part size it ships.
+    let len = PART * 2 + 4;
+    let all = body(len);
+    for chunk in [&all[..7], &all[7..PART + 3], &all[PART + 3..]] {
+        sink.write(chunk.to_vec()).await.unwrap();
+    }
     let meta = sink.finish().await.unwrap();
-    assert_eq!(meta.size, 20);
+    assert_eq!(meta.size, len as u64);
     assert_eq!(meta.etag.as_deref(), Some("sink-etag"));
     assert!(
         !server
@@ -431,7 +450,7 @@ async fn sink_abort_sends_a_real_abort_and_never_completes() {
     use std::sync::Arc;
 
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("POST"))
         .and(path(object_path(&key)))
         .and(query_param("uploads", ""))
@@ -461,8 +480,10 @@ async fn sink_abort_sends_a_real_abort_and_never_completes() {
     let dir = std::env::temp_dir().join(format!("jamstream-s3-sink-abort-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut sink =
-        ObjectSink::open_with_marker_dir(Arc::new(store(&server)), BUCKET, &key, WAV, &dir);
-    sink.write((0..30u8).collect()).await.unwrap();
+        ObjectSink::open_with_marker_dir(Arc::new(store(&server)), BUCKET, &key, FLAC, &dir);
+    // Two full parts, so the upload is open and one part is already sent when
+    // the sink is abandoned: the case that has to reach S3 as an abort.
+    sink.write(body(PART * 2 + 1)).await.unwrap();
     sink.abort().await;
 
     let requests = server.received_requests().await.unwrap();
@@ -482,7 +503,7 @@ async fn a_part_response_without_an_etag_fails_and_aborts() {
     // Without the ETag the completion body cannot be built, so continuing
     // would only waste the rest of the upload.
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("POST"))
         .and(query_param("uploads", ""))
         .respond_with(
@@ -505,12 +526,7 @@ async fn a_part_response_without_an_etag_fails_and_aborts() {
         .await;
 
     let err = store(&server)
-        .put_stream(
-            BUCKET,
-            &key,
-            WAV,
-            &mut BytesSource::new((0..20u8).collect::<Vec<u8>>()),
-        )
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(PART + 1)))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("no ETag"), "{err}");
@@ -521,7 +537,7 @@ async fn a_failed_abort_surfaces_the_original_error() {
     // The upload failure is the actionable one; the lifecycle rule reclaims
     // the parts if the abort cannot be delivered.
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("POST"))
         .and(query_param("uploads", ""))
         .respond_with(
@@ -545,12 +561,7 @@ async fn a_failed_abort_surfaces_the_original_error() {
         .await;
 
     let err = store(&server)
-        .put_stream(
-            BUCKET,
-            &key,
-            WAV,
-            &mut BytesSource::new((0..20u8).collect::<Vec<u8>>()),
-        )
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(PART + 1)))
         .await
         .unwrap_err();
     assert!(
@@ -564,14 +575,14 @@ async fn a_failed_abort_surfaces_the_original_error() {
 #[tokio::test]
 async fn head_reads_size_etag_and_type_from_headers() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("HEAD"))
         .and(path(object_path(&key)))
         .and(signed())
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-length", "1382400044")
-                .insert_header("content-type", WAV)
+                .insert_header("content-type", FLAC)
                 .insert_header("etag", "\"abc\"")
                 .insert_header("last-modified", "Sat, 25 Jul 2026 10:00:00 GMT"),
         )
@@ -580,7 +591,7 @@ async fn head_reads_size_etag_and_type_from_headers() {
         .await;
     let meta = store(&server).head(BUCKET, &key).await.unwrap();
     assert_eq!(meta.size, 1_382_400_044);
-    assert_eq!(meta.content_type.as_deref(), Some(WAV));
+    assert_eq!(meta.content_type.as_deref(), Some(FLAC));
     assert_eq!(meta.etag.as_deref(), Some("abc"));
     assert_eq!(
         meta.last_modified.as_deref(),
@@ -621,7 +632,7 @@ impl ChunkSink for Collector {
 #[tokio::test]
 async fn get_streams_a_signed_object_to_the_sink() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     // Deterministic bytes, regenerated in the assertion rather than compared
     // against anything the mock or the store handed back.
     let body: Vec<u8> = (0..600usize).map(|i| (i % 251) as u8).collect();
@@ -630,7 +641,7 @@ async fn get_streams_a_signed_object_to_the_sink() {
         .and(signed())
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("content-type", WAV)
+                .insert_header("content-type", FLAC)
                 .insert_header("etag", "\"take-etag\"")
                 .insert_header("last-modified", "Sat, 25 Jul 2026 10:00:00 GMT")
                 .set_body_bytes(body),
@@ -653,7 +664,7 @@ async fn get_streams_a_signed_object_to_the_sink() {
         Some("take-etag"),
         "quotes must be stripped"
     );
-    assert_eq!(meta.content_type.as_deref(), Some(WAV));
+    assert_eq!(meta.content_type.as_deref(), Some(FLAC));
     assert_eq!(
         meta.last_modified.as_deref(),
         Some("Sat, 25 Jul 2026 10:00:00 GMT")
@@ -674,7 +685,7 @@ async fn get_of_a_missing_object_is_not_found() {
         .await;
     let mut sink = Collector::default();
     let err = store(&server)
-        .get(BUCKET, &mix_key("s1"), &mut sink)
+        .get(BUCKET, &take_key(), &mut sink)
         .await
         .unwrap_err();
     assert!(matches!(err, ProviderError::NotFound(_)), "{err:?}");
@@ -713,6 +724,11 @@ async fn list_follows_the_continuation_token() {
     Mock::given(method("GET"))
         .and(path(format!("/{BUCKET}")))
         .and(query_param("continuation-token", "page2"))
+        // The one request in the suite whose parameters are added in an order
+        // that is not the canonical one: the continuation token goes on last
+        // and sorts first, so this is where a signer that signs the query as
+        // assembled rather than as canonicalized shows up.
+        .and(signed())
         .respond_with(ResponseTemplate::new(200).set_body_string(format!(
             r#"<ListBucketResult>
   <IsTruncated>false</IsTruncated>
@@ -734,7 +750,7 @@ async fn list_follows_the_continuation_token() {
 #[tokio::test]
 async fn delete_is_idempotent() {
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     // S3 answers 204 whether or not the key was there.
     Mock::given(method("DELETE"))
         .and(path(object_path(&key)))
@@ -750,10 +766,44 @@ async fn delete_is_idempotent() {
 
 // ---- Lifecycle configuration ----
 
+/// Answers the read half of set_retention with `document`, or with S3's
+/// no-configuration error when there is none.
+async fn mount_lifecycle_get(server: &MockServer, document: Option<&str>) {
+    let response = match document {
+        Some(document) => ResponseTemplate::new(200).set_body_string(document.to_owned()),
+        None => ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchLifecycleConfiguration</Code>\
+             <Message>The lifecycle configuration does not exist</Message></Error>",
+        ),
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/{BUCKET}")))
+        .and(query_param("lifecycle", ""))
+        .and(signed_for_any())
+        .respond_with(response)
+        .expect(1)
+        .named("the read before the write")
+        .mount(server)
+        .await;
+}
+
+/// The body of the one lifecycle PUT the store made.
+async fn lifecycle_put_body(server: &MockServer) -> String {
+    let requests = server.received_requests().await.unwrap();
+    let put = requests
+        .iter()
+        .find(|r| {
+            r.method.as_str() == "PUT" && r.url.query().is_some_and(|q| q.contains("lifecycle"))
+        })
+        .expect("a lifecycle PUT");
+    String::from_utf8(put.body.clone()).unwrap()
+}
+
 #[tokio::test]
 async fn aws_lifecycle_put_sends_the_filter_form_with_a_content_md5() {
     let server = MockServer::start().await;
     let prefix = session_prefix("s1");
+    mount_lifecycle_get(&server, None).await;
     Mock::given(method("PUT"))
         .and(path(format!("/{BUCKET}")))
         .and(query_param("lifecycle", ""))
@@ -761,8 +811,9 @@ async fn aws_lifecycle_put_sends_the_filter_form_with_a_content_md5() {
         .and(header("content-type", "application/xml"))
         // PutBucketLifecycleConfiguration wants a body integrity header.
         .and(header_exists("content-md5"))
+        // Per session, so a second session's document can carry both.
         .and(body_string_contains(
-            "<ID>jamstream-recording-retention</ID>",
+            "<ID>jamstream-recording-retention-s1</ID>",
         ))
         .and(body_string_contains(format!(
             "<Filter><Prefix>{prefix}</Prefix></Filter>"
@@ -789,6 +840,13 @@ async fn aws_lifecycle_put_sends_the_filter_form_with_a_content_md5() {
         "{}",
         applied.describe()
     );
+    assert!(
+        applied
+            .describe()
+            .contains("jamstream-recording-retention-s1"),
+        "{}",
+        applied.describe()
+    );
 }
 
 #[tokio::test]
@@ -796,6 +854,7 @@ async fn the_content_md5_matches_the_body_that_was_sent() {
     // A wrong Content-MD5 is a 400 from real S3, so the header has to be the
     // digest of this exact document.
     let server = MockServer::start().await;
+    mount_lifecycle_get(&server, None).await;
     Mock::given(method("PUT"))
         .and(query_param("lifecycle", ""))
         .respond_with(ResponseTemplate::new(200))
@@ -806,7 +865,11 @@ async fn the_content_md5_matches_the_body_that_was_sent() {
         .await
         .unwrap();
 
-    let request = &server.received_requests().await.unwrap()[0];
+    let requests = server.received_requests().await.unwrap();
+    let request = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .expect("a lifecycle PUT");
     let sent_md5 = request
         .headers
         .get("content-md5")
@@ -821,6 +884,7 @@ async fn the_content_md5_matches_the_body_that_was_sent() {
 #[tokio::test]
 async fn keep_forever_omits_the_expiration_but_keeps_the_cleanup_rule() {
     let server = MockServer::start().await;
+    mount_lifecycle_get(&server, None).await;
     Mock::given(method("PUT"))
         .and(query_param("lifecycle", ""))
         .respond_with(ResponseTemplate::new(200))
@@ -831,8 +895,7 @@ async fn keep_forever_omits_the_expiration_but_keeps_the_cleanup_rule() {
         .set_retention(BUCKET, "jamstream/recordings/", Retention::KeepForever)
         .await
         .unwrap();
-    let body =
-        String::from_utf8(server.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    let body = lifecycle_put_body(&server).await;
     assert!(!body.contains("<Expiration>"), "{body}");
     assert!(body.contains("<AbortIncompleteMultipartUpload>"), "{body}");
 }
@@ -841,14 +904,12 @@ async fn keep_forever_omits_the_expiration_but_keeps_the_cleanup_rule() {
 async fn spaces_lifecycle_put_uses_the_bare_prefix_dialect() {
     let server = MockServer::start().await;
     let prefix = session_prefix("s1");
+    mount_lifecycle_get(&server, None).await;
     Mock::given(method("PUT"))
         .and(path(format!("/{BUCKET}")))
         .and(query_param("lifecycle", ""))
         // Signed for the Spaces region slug with the Spaces access key.
-        .and(SignedForS3 {
-            region: "nyc3",
-            access_key_id: "DO00TEST",
-        })
+        .and(signed_for_spaces())
         .and(body_string_contains(format!("<Prefix>{prefix}</Prefix>")))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
@@ -865,12 +926,137 @@ async fn spaces_lifecycle_put_uses_the_bare_prefix_dialect() {
         "{}",
         applied.describe()
     );
-    let body =
-        String::from_utf8(server.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    let body = lifecycle_put_body(&server).await;
     assert!(
         !body.contains("<Filter>"),
         "Spaces rejects the Filter form: {body}"
     );
+}
+
+/// The defect in #226: the second recorded session in a bucket wrote a
+/// document holding only its own rule, so the first session's takes lost their
+/// expiry and lived on, billing.
+#[tokio::test]
+async fn a_second_recorded_session_keeps_the_first_ones_expiry_rule() {
+    let server = MockServer::start().await;
+    // Stateful lifecycle: the fake holds the document the way the bucket does,
+    // so the second call reads what the first one actually wrote.
+    server
+        .register(Mock::given(FakeS3Matcher).respond_with(FakeS3::default()))
+        .await;
+    let store = store(&server);
+
+    let first = store
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::KeepForever)
+        .await
+        .unwrap();
+    let second = store
+        .set_retention(BUCKET, &session_prefix("s2"), Retention::Days7)
+        .await
+        .unwrap();
+    assert!(second.is_server_side());
+
+    // The document the bucket now holds is the second PUT's body.
+    let requests = server.received_requests().await.unwrap();
+    let document = requests
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "PUT" && r.url.query().is_some_and(|q| q.contains("lifecycle"))
+        })
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .next_back()
+        .expect("two lifecycle PUTs");
+    assert!(
+        document.contains("<ID>jamstream-recording-retention-s1</ID>"),
+        "session one's rule is gone: {document}"
+    );
+    assert!(
+        document.contains("<ID>jamstream-recording-retention-s2</ID>"),
+        "{document}"
+    );
+    assert!(
+        document.contains(&format!(
+            "<Filter><Prefix>{}</Prefix></Filter>",
+            session_prefix("s1")
+        )),
+        "{document}"
+    );
+    // Session one chose "keep forever" and session two seven days; neither
+    // choice may end up applied to the other's prefix.
+    assert_eq!(document.matches("<Expiration>").count(), 1, "{document}");
+    assert_eq!(document.matches("<Rule>").count(), 2, "{document}");
+    // And the first call's own document, read back, is still what it was.
+    assert!(first.describe().contains("kept until you delete it"));
+}
+
+#[tokio::test]
+async fn the_hosts_own_lifecycle_rules_survive_a_retention_apply() {
+    let server = MockServer::start().await;
+    // A bucket the host uses for their own masters, with their own rule.
+    let theirs = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration>\
+<Rule><ID>archive-my-masters</ID><Filter><Prefix>masters/</Prefix></Filter>\
+<Status>Enabled</Status>\
+<Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule>\
+</LifecycleConfiguration>";
+    mount_lifecycle_get(&server, Some(theirs)).await;
+    Mock::given(method("PUT"))
+        .and(query_param("lifecycle", ""))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::Days30)
+        .await
+        .unwrap();
+    let body = lifecycle_put_body(&server).await;
+    assert!(
+        body.contains("<ID>archive-my-masters</ID>"),
+        "a rule of the host's was deleted: {body}"
+    );
+    assert!(
+        body.contains("<StorageClass>GLACIER</StorageClass>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<ID>jamstream-recording-retention-s1</ID>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_bucket_whose_rules_cannot_be_read_is_left_alone() {
+    // A key with the write half of the lifecycle permission and not the read
+    // half must write nothing: the PUT replaces the whole document, so a blind
+    // write would delete rules the host set themselves.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(query_param("lifecycle", ""))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>no GetLifecycleConfiguration</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(query_param("lifecycle", ""))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("nothing may be written when the existing rules are unknown")
+        .mount(&server)
+        .await;
+
+    let applied = store(&server)
+        .set_retention(BUCKET, &session_prefix("s1"), Retention::Days7)
+        .await
+        .unwrap();
+    assert!(
+        !applied.is_server_side(),
+        "an unwritten rule must not be reported as enforced"
+    );
+    let note = applied.describe();
+    assert!(note.contains("s3:GetLifecycleConfiguration"), "{note}");
+    assert!(note.contains("7 days unless you do"), "{note}");
 }
 
 #[tokio::test]
@@ -878,19 +1064,16 @@ async fn spaces_speaks_the_same_object_api_as_s3() {
     // The only differences are the endpoint, the credentials, and the
     // lifecycle dialect; the object calls are byte-identical in shape.
     let server = MockServer::start().await;
-    let key = mix_key("s1");
+    let key = take_key();
     Mock::given(method("PUT"))
         .and(path(object_path(&key)))
-        .and(SignedForS3 {
-            region: "nyc3",
-            access_key_id: "DO00TEST",
-        })
+        .and(signed_for_spaces())
         .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"spaces-etag\""))
         .expect(1)
         .mount(&server)
         .await;
     let meta = spaces_store(&server)
-        .put(BUCKET, &key, WAV, b"bytes")
+        .put(BUCKET, &key, FLAC, b"bytes")
         .await
         .unwrap();
     assert_eq!(meta.etag.as_deref(), Some("spaces-etag"));
@@ -909,7 +1092,7 @@ async fn a_rejected_signature_is_an_auth_error_and_is_not_retried() {
         .mount(&server)
         .await;
     let err = store(&server)
-        .put(BUCKET, "k.wav", WAV, b"x")
+        .put(BUCKET, "k.wav", FLAC, b"x")
         .await
         .unwrap_err();
     assert!(matches!(err, ProviderError::Auth(_)), "{err:?}");
@@ -930,7 +1113,7 @@ async fn a_transient_500_is_retried_by_the_shared_http_path() {
         .mount(&server)
         .await;
     let meta = store(&server)
-        .put(BUCKET, "k.wav", WAV, b"x")
+        .put(BUCKET, "k.wav", FLAC, b"x")
         .await
         .unwrap();
     assert_eq!(meta.etag.as_deref(), Some("ok"));
@@ -961,16 +1144,20 @@ struct SignedForEc2;
 
 impl Match for SignedForEc2 {
     fn matches(&self, request: &Request) -> bool {
-        let Some(auth) = request
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-        else {
-            return false;
+        let signer = Signer {
+            access_key_id: ACCESS_KEY_ID,
+            secret_access_key: SECRET,
+            region: "us-east-1",
+            service: "ec2",
         };
-        // The EC2 signed header set has no x-amz-content-sha256 in it.
-        auth.contains("/ec2/aws4_request")
-            && auth.contains("SignedHeaders=content-type;host;x-amz-date,")
+        // Recomputed like the S3 signatures, plus the one thing that is
+        // specific here: the EC2 header set does not carry the payload hash.
+        signature::verify(request, &signer).is_ok()
+            && request
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|auth| auth.contains("SignedHeaders=content-type;host;x-amz-date,"))
             && request.headers.get("x-amz-content-sha256").is_none()
     }
 }
@@ -983,16 +1170,52 @@ async fn s3_store_passes_the_object_store_contract() {
     server
         .register(Mock::given(FakeS3Matcher).respond_with(FakeS3::default()))
         .await;
-    // A part size above the contract's single-part cap of 1 KiB, so both the
-    // single-PUT and the multipart legs are exercised.
-    let store = S3Store::aws(
-        "eu-west-1",
-        ACCESS_KEY_ID.to_owned(),
-        "test-secret-key".to_owned(),
-    )
-    .with_base_url(server.uri())
-    .with_part_size(2048);
+    let store = S3Store::aws("eu-west-1", ACCESS_KEY_ID.to_owned(), SECRET.to_owned())
+        .with_base_url(server.uri())
+        .with_part_size(PART);
     assert_object_store_contract(&store, BUCKET).await;
+}
+
+/// The part size that ships. Everything else here runs at the 5 MiB floor to
+/// keep the suite quick, which leaves the one size real recordings use
+/// untested, and that is how a default nobody had ever sent survived.
+#[tokio::test]
+async fn the_default_part_size_goes_over_a_wire() {
+    let server = MockServer::start().await;
+    server
+        .register(Mock::given(FakeS3Matcher).respond_with(FakeS3::default()))
+        .await;
+    let store = S3Store::aws("eu-west-1", ACCESS_KEY_ID.to_owned(), SECRET.to_owned())
+        .with_base_url(server.uri());
+    assert_eq!(store.part_size(), DEFAULT_PART_SIZE);
+
+    let key = take_key();
+    // Two full 16 MiB parts and a short one: the shape of a real take's
+    // upload, at the size a real take is cut into.
+    let len = DEFAULT_PART_SIZE * 2 + 4;
+    let meta = store
+        .put_stream(BUCKET, &key, FLAC, &mut BytesSource::new(body(len)))
+        .await
+        .unwrap();
+    assert_eq!(meta.size, len as u64);
+
+    let parts: Vec<usize> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.query_pairs().any(|(k, _)| k == "partNumber"))
+        .map(|r| r.body.len())
+        .collect();
+    assert_eq!(
+        parts,
+        vec![DEFAULT_PART_SIZE, DEFAULT_PART_SIZE, 4],
+        "the parts that went over the wire are not the parts the store cuts"
+    );
+    // And the object the fake assembled is the body that went in.
+    let mut got = Collector::default();
+    store.get(BUCKET, &key, &mut got).await.unwrap();
+    assert_eq!(got.bytes, body(len), "the reassembled take is not the take");
 }
 
 #[tokio::test]
@@ -1001,27 +1224,45 @@ async fn spaces_store_passes_the_object_store_contract() {
     server
         .register(Mock::given(FakeS3Matcher).respond_with(FakeS3::default()))
         .await;
-    let store = S3Store::spaces("nyc3", "DO00TEST".to_owned(), "secret".to_owned())
+    let store = S3Store::spaces("nyc3", SPACES_KEY_ID.to_owned(), SPACES_SECRET.to_owned())
         .with_base_url(server.uri())
-        .with_part_size(2048)
+        .with_part_size(PART)
         .with_lifecycle_dialect(LifecycleDialect::SpacesV1);
     assert_object_store_contract(&store, BUCKET).await;
 }
 
-/// True for any well-formed SigV4 S3 signature, whatever the region or key.
+/// True when the request is correctly signed by one of the two stores that
+/// share this fake, with the signature recomputed from what arrived rather than
+/// pattern-matched: which of the two it is depends on the test, but it has to be
+/// one of them.
 fn signed_for_any_s3(request: &Request) -> bool {
-    let Some(auth) = request
-        .headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-    else {
-        return false;
-    };
-    auth.starts_with("AWS4-HMAC-SHA256 Credential=")
-        && auth.contains("/s3/aws4_request")
-        && auth.contains("x-amz-content-sha256")
-        && request.headers.get("x-amz-content-sha256").is_some()
-        && request.headers.get("x-amz-date").is_some()
+    let outcomes = [
+        signature::verify(request, &aws_signer()),
+        signature::verify(request, &spaces_signer()),
+    ];
+    if outcomes.iter().any(|outcome| outcome.is_ok()) {
+        return true;
+    }
+    for outcome in outcomes {
+        if let Err(why) = outcome {
+            eprintln!("unsigned or wrongly signed request: {why}");
+        }
+    }
+    false
+}
+
+/// [`signed_for_any_s3`] as a matcher, for the mocks shared by the AWS and
+/// Spaces stores, whose regions and keys differ.
+struct SignedForAnyS3;
+
+impl Match for SignedForAnyS3 {
+    fn matches(&self, request: &Request) -> bool {
+        signed_for_any_s3(request)
+    }
+}
+
+fn signed_for_any() -> SignedForAnyS3 {
+    SignedForAnyS3
 }
 
 /// Matches everything, so the fake sees every request.
@@ -1055,6 +1296,11 @@ struct FakeState {
     /// upload id -> in-flight upload.
     uploads: std::collections::BTreeMap<String, FakeUpload>,
     next_upload: u64,
+    /// The bucket's lifecycle document, absent until one is written. Held
+    /// because PutBucketLifecycleConfiguration replaces it: a fake that
+    /// answered every write with 200 and forgot the body could not show that
+    /// the rule a previous session wrote is gone.
+    lifecycle: Option<String>,
 }
 
 impl Respond for FakeS3 {
@@ -1089,8 +1335,18 @@ impl Respond for FakeS3 {
                         "<Error><Code>MissingContentMD5</Code><Message>md5</Message></Error>",
                     );
                 }
+                // The document replaces whatever was there, as S3 does.
+                state.lifecycle = Some(String::from_utf8_lossy(&request.body).into_owned());
                 ResponseTemplate::new(200)
             }
+            ("GET", None) if query.contains_key("lifecycle") => match &state.lifecycle {
+                Some(document) => ResponseTemplate::new(200).set_body_string(document.clone()),
+                // What S3 answers for a bucket with no configuration.
+                None => ResponseTemplate::new(404).set_body_string(
+                    "<Error><Code>NoSuchLifecycleConfiguration</Code>\
+                     <Message>The lifecycle configuration does not exist</Message></Error>",
+                ),
+            },
             ("GET", None) if query.get("list-type").map(String::as_str) == Some("2") => {
                 let prefix = query.get("prefix").cloned().unwrap_or_default();
                 let mut xml = String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");

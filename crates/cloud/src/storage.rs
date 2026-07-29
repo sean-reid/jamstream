@@ -10,11 +10,10 @@
 //! # Why multipart is not optional
 //!
 //! A two-hour broadcast mix at 48 kHz, 16-bit stereo is 1.38 GB, and turning
-//! on per-member stems multiplies that by the number of members. A single-shot
-//! PUT of 1.38 GB is a bad idea on every provider — S3 caps a single PUT at
-//! 5 GB, GCS wants a resumable session for anything large, and a transient
-//! failure 90% of the way through a one-shot upload costs the whole upload —
-//! and the session VM is racing an idle timer while it happens.
+//! on per-member stems multiplies that by the number of members. S3 caps a
+//! single PUT at 5 GB, GCS wants a resumable session for anything large, and a
+//! transient failure 90% of the way through a one-shot upload costs the whole
+//! upload while the session VM is racing an idle timer.
 //!
 //! So [`ObjectStore::put_stream`] is the upload path, and it escalates on its
 //! own: it reads one part, looks ahead one more, and if the source ended it
@@ -24,15 +23,13 @@
 //! # Abort semantics
 //!
 //! Failed multipart uploads are not free. Parts already sent keep billing as
-//! storage, and they do not appear in `list`, so nobody finds them. The
-//! driver in [`drive_upload`] therefore guarantees: **any** error after the
-//! upload is opened — reading the source, sending a part, hitting the part
-//! cap, or completing — is followed by an abort of that upload before the
-//! error is returned. If the abort itself fails it is logged and the original
-//! error is still what the caller sees, because the reason the upload failed
-//! is the more useful fact. Backends implement [`MultipartBackend`] and get
-//! this behavior for free, which is why the guarantee is testable once rather
-//! than three times.
+//! storage, and they do not appear in `list`, so nobody finds them. The driver
+//! in [`drive_upload`] therefore guarantees that **any** error after the upload
+//! is opened, whether reading the source, sending a part, hitting the part cap
+//! or completing, is followed by an abort of that upload before the error is
+//! returned. A failed abort is logged and the original error is still what the
+//! caller sees. Backends implement [`MultipartBackend`] and get this for free,
+//! so the guarantee is testable once rather than three times.
 //!
 //! Belt and braces: the lifecycle rule written by
 //! [`ObjectStore::set_retention`] also expires incomplete multipart uploads
@@ -58,7 +55,8 @@
 //! ([`MAX_PARTS`]), and bounds memory at one part in flight: parts are
 //! buffered because [`crate::http::send_retrying`] rebuilds each request per
 //! attempt, and a body that cannot be replayed cannot be retried.
-//! `with_part_size` on each store overrides it, which is how tests stay fast.
+//! `with_part_size` overrides it through [`clamp_part_size`], so no store can
+//! be configured with a size a provider would reject.
 
 use std::io::{ErrorKind, Read};
 
@@ -93,12 +91,24 @@ pub const DEFAULT_PART_SIZE: usize = 16 * 1024 * 1024;
 /// S3 caps a multipart upload at 10 000 parts.
 pub const MAX_PARTS: u32 = 10_000;
 
-/// Content type for WAV objects. Nothing records with it: the recorder writes
-/// FLAC. Kept for the contract suite, which uploads one of each.
-pub const WAV_CONTENT_TYPE: &str = "audio/wav";
+/// Rounds a requested part size up to one both providers accept: at least
+/// [`MIN_PART_SIZE`], and a whole number of [`PART_SIZE_MULTIPLE`].
+///
+/// `with_part_size` on every real store goes through this. It used to take the
+/// number as given, so every multipart test in the crate ran at 8 or 2048
+/// bytes, sizes S3 answers with EntityTooSmall and GCS with a 400, and the
+/// only part size that had ever crossed a wire in this repository was one no
+/// provider would accept.
+pub fn clamp_part_size(bytes: usize) -> usize {
+    bytes
+        .max(MIN_PART_SIZE)
+        .next_multiple_of(PART_SIZE_MULTIPLE)
+}
+
 /// Content type every recorded take is uploaded with.
 pub const FLAC_CONTENT_TYPE: &str = "audio/flac";
-/// Content type for the recording manifest.
+/// Content type for the JSON objects: the launch's write probe, and the GCS
+/// API's own request bodies.
 pub const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// Key prefix every JamStream recording object lives under. Retention rules
@@ -135,43 +145,33 @@ impl ObjectMeta {
 }
 
 /// The key prefix for one session's recording objects, always ending in `/`.
+///
+/// This is the whole key layout this crate owns. Everything after the prefix
+/// is a take's file name, which is built where the take is (`Recorder` in the
+/// server crate) and handed to [`ObjectSink`] with the prefix in front of it.
+/// There used to be `mix_key`, `stem_key` and `manifest_key` here as well,
+/// naming `mix.wav`, `stems/<member>.wav` and `manifest.json`: three objects
+/// nothing has ever written, in a format nothing has ever recorded. Every test
+/// in the crate built its keys from them, so the whole storage suite ran on a
+/// scheme the product does not use. Do not add one back; a function of the
+/// session id alone cannot name a take, because a session has many.
 pub fn session_prefix(session_id: &str) -> String {
     format!("{RECORDING_PREFIX}/{}/", sanitize_component(session_id))
 }
 
-/// A stable object key under a session's prefix, for tests and for callers
-/// that need somewhere to put one object.
-///
-/// This is NOT the name a recording gets. A session holds one object per
-/// take and every take carries its own timestamp, so no function of the
-/// session id alone can name a recording; the real names are built where the
-/// take is (`Recorder` in the server crate) and handed to the sink. These
-/// helpers once claimed to be the naming contract while saying `.wav`, which
-/// left two answers on record and the tests believing the wrong one.
-pub fn mix_key(session_id: &str) -> String {
-    format!("{}mix.wav", session_prefix(session_id))
-}
-
-/// A stable per-member key under a session's prefix; see [`mix_key`] on why
-/// this is not a recording's name. `member` is sanitized, because a `/` or
-/// `..` would place the object outside the session prefix where the
-/// retention rule does not reach.
-pub fn stem_key(session_id: &str, member: &str) -> String {
-    format!(
-        "{}stems/{}.wav",
-        session_prefix(session_id),
-        sanitize_component(member)
-    )
-}
-
-/// Key of the session's recording manifest: what was recorded, at what
-/// format, with which retention.
-pub fn manifest_key(session_id: &str) -> String {
-    format!("{}manifest.json", session_prefix(session_id))
-}
-
 /// Reduces one key component to `[A-Za-z0-9._-]`, mapping everything else to
 /// `-`.
+///
+/// This is the authority for the parts of an object key: the session id in
+/// [`session_prefix`], and the marker file name in [`ObjectSink`]. It is not
+/// the authority for a take's file name, which is `sanitize` in the server
+/// crate's `record` module, next to the code that builds take names from
+/// member names; that one drops disallowed characters instead of mapping them
+/// and never yields `unnamed`. Two sanitizers, because one names objects and
+/// the other names files on a musician's disk, and the file namer has to leave
+/// nothing that a shell or a Windows path would read as anything but a name.
+/// `fs_safe` in the local provider derives from this one, and DigitalOcean's
+/// tag encoder is not a name sanitizer at all.
 ///
 /// Dots survive, because member names and file extensions want them, but a
 /// leading dot is dropped and a run of dots collapses to one, so no component
@@ -620,22 +620,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_layout_stays_under_one_prefix() {
+    fn a_take_lands_under_its_session_prefix() {
         assert_eq!(session_prefix("abc123"), "jamstream/recordings/abc123/");
-        assert_eq!(mix_key("abc123"), "jamstream/recordings/abc123/mix.wav");
-        assert_eq!(
-            stem_key("abc123", "sean"),
-            "jamstream/recordings/abc123/stems/sean.wav"
-        );
-        assert_eq!(
-            manifest_key("abc123"),
-            "jamstream/recordings/abc123/manifest.json"
-        );
-        for key in [
-            mix_key("abc123"),
-            stem_key("abc123", "sean"),
-            manifest_key("abc123"),
+        // The names the recorder produces, which is the only naming scheme
+        // there is: the prefix from here, the file name from the server crate.
+        for take in [
+            "jamstream-2026-07-25-1030-mix.flac",
+            "jamstream-2026-07-25-1030-sean.flac",
         ] {
+            let key = format!("{}{take}", session_prefix("abc123"));
             assert!(
                 key.starts_with(&session_prefix("abc123")),
                 "{key} escaped the session prefix"
@@ -644,29 +637,23 @@ mod tests {
     }
 
     #[test]
-    fn member_names_cannot_escape_the_prefix() {
+    fn a_component_cannot_escape_the_prefix() {
         // A slash, a parent-directory hop, and a name that is nothing but
-        // punctuation: all have to land inside the session prefix, because
-        // the retention rule is scoped to it.
-        for name in ["../../etc/passwd", "a/b", "..", ".", "", "  ", "Sean's Amp"] {
-            let key = stem_key("s1", name);
-            assert!(
-                key.starts_with("jamstream/recordings/s1/stems/"),
-                "{name:?} produced {key}"
-            );
-            assert!(!key.contains(".."), "{name:?} produced {key}");
+        // punctuation: all have to reduce to one path component, because the
+        // retention rule is scoped to the prefix they sit in.
+        for raw in ["../../etc/passwd", "a/b", "..", ".", "", "  ", "Sean's Amp"] {
+            let component = sanitize_component(raw);
+            assert!(!component.contains('/'), "{raw:?} produced {component}");
+            assert!(!component.contains(".."), "{raw:?} produced {component}");
+            assert!(!component.is_empty(), "{raw:?} produced nothing");
         }
+        assert_eq!(sanitize_component("Sean's Amp"), "Sean-s-Amp");
+        assert_eq!(sanitize_component(".."), "unnamed");
+        assert_eq!(sanitize_component("../../etc/passwd"), "-.-etc-passwd");
+        // A take's own name survives it untouched.
         assert_eq!(
-            stem_key("s1", "Sean's Amp"),
-            "jamstream/recordings/s1/stems/Sean-s-Amp.wav"
-        );
-        assert_eq!(
-            stem_key("s1", ".."),
-            "jamstream/recordings/s1/stems/unnamed.wav"
-        );
-        assert_eq!(
-            stem_key("s1", "../../etc/passwd"),
-            "jamstream/recordings/s1/stems/-.-etc-passwd.wav"
+            sanitize_component("jamstream-2026-07-25-1030-mix.flac"),
+            "jamstream-2026-07-25-1030-mix.flac"
         );
     }
 
@@ -696,6 +683,28 @@ mod tests {
         let two_hour_mix: u64 = 1_382_400_044;
         let parts = two_hour_mix.div_ceil(DEFAULT_PART_SIZE as u64);
         assert!(parts < MAX_PARTS as u64, "{parts} parts");
+    }
+
+    #[test]
+    fn a_part_size_no_provider_would_take_is_raised_to_one_they_would() {
+        // The sizes every multipart test in this crate used to run at.
+        assert_eq!(clamp_part_size(8), MIN_PART_SIZE);
+        assert_eq!(clamp_part_size(2048), MIN_PART_SIZE);
+        assert_eq!(clamp_part_size(0), MIN_PART_SIZE);
+        // Already legal sizes are left alone.
+        assert_eq!(clamp_part_size(MIN_PART_SIZE), MIN_PART_SIZE);
+        assert_eq!(clamp_part_size(DEFAULT_PART_SIZE), DEFAULT_PART_SIZE);
+        // Above the floor but not a whole number of chunks: rounded up, never
+        // down, so it never falls back below the floor.
+        assert_eq!(
+            clamp_part_size(MIN_PART_SIZE + 1),
+            MIN_PART_SIZE + PART_SIZE_MULTIPLE
+        );
+        for requested in [0, 1, 8, 2048, MIN_PART_SIZE - 1, MIN_PART_SIZE + 7] {
+            let size = clamp_part_size(requested);
+            assert!(size >= MIN_PART_SIZE, "{requested} yielded {size}");
+            assert_eq!(size % PART_SIZE_MULTIPLE, 0, "{requested} yielded {size}");
+        }
     }
 
     #[tokio::test]

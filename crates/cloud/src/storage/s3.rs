@@ -8,30 +8,23 @@
 //!
 //! The DigitalOcean *API token* that launches droplets (`DIGITALOCEAN_TOKEN`,
 //! used by [`crate::providers::digitalocean::DigitalOceanProvider`]) cannot
-//! talk to Spaces at all. Spaces authenticates with a separate **Spaces
-//! access key** pair — an access key id and a secret, generated in a
-//! different part of the control panel — because it is an S3-compatible
-//! service signed with SigV4 rather than a bearer token.
+//! talk to Spaces at all. Spaces is an S3-compatible service signed with
+//! SigV4, so it takes a separate **Spaces access key** pair, generated in a
+//! different part of the control panel.
 //!
-//! This is a real product consequence, not an implementation detail. On
-//! DigitalOcean, the provider JamStream recommends precisely because setup is
-//! "one token in one screen", turning on recording is the one feature that
-//! makes a host go back and generate a *second* credential. The honest
-//! handling, which this API is shaped for:
-//!
-//! * recording stays optional and off by default, so the plain path still
-//!   needs one token;
-//! * a host who has not created a Spaces key gets a clear error naming the
-//!   two environment variables and saying they are not the API token, rather
-//!   than a 403 from a signer;
-//! * the credential is only needed on the host's machine to configure and
-//!   verify the bucket. What reaches the session VM is a narrower thing (see
-//!   the crate docs on what the server half needs).
+//! That is a product consequence, not an implementation detail: on the provider
+//! JamStream recommends for being "one token in one screen", turning on
+//! recording is the one feature that sends a host back for a second credential.
+//! So recording stays off by default, a missing Spaces key is an error naming
+//! the two variables rather than a 403 from a signer, and the key is only
+//! needed on the host's machine.
 //!
 //! AWS has the same shape for a different reason: the recording credential
 //! wants `s3:PutObject`, `s3:DeleteObject` (the launch probe) and
-//! `s3:AbortMultipartUpload` on one prefix, plus
-//! `s3:PutLifecycleConfiguration` on the bucket, which is not the EC2 policy.
+//! `s3:AbortMultipartUpload` on one prefix, plus `s3:GetLifecycleConfiguration`
+//! and `s3:PutLifecycleConfiguration` on the bucket (the retention rule is
+//! merged into the bucket's existing rules, so it is read before it is
+//! written), which is not the EC2 policy.
 //! It must not *be* the EC2 policy either, and nothing reads
 //! `AWS_ACCESS_KEY_ID` for it: this key is written into the session machine's
 //! user data. See `jamstream_cli::storage`.
@@ -56,10 +49,13 @@ use reqwest::{Method, Response};
 use crate::http;
 use crate::provider::{ProviderError, Result};
 use crate::providers::aws::{amz_date_now, aws_encode, sigv4, take_tag, xml_unescape, xml_value};
-use crate::retention::{LifecycleDialect, Retention, RetentionEnforcement, s3_lifecycle_xml};
+use crate::retention::{
+    LifecycleDialect, Retention, RetentionEnforcement, S3_MAX_LIFECYCLE_RULES, at_capacity_note,
+    merge_s3_lifecycle, rule_id, unreadable_note,
+};
 use crate::storage::{
     ChunkSink, DEFAULT_PART_SIZE, MultipartBackend, ObjectMeta, ObjectStore, Part, PartSource,
-    drain_body, drive_upload,
+    clamp_part_size, drain_body, drive_upload,
 };
 use crate::types::ProviderKind;
 
@@ -232,11 +228,12 @@ impl S3Store {
         self
     }
 
-    /// Overrides the multipart part size. Real uploads should keep the
-    /// default; tests use a few bytes so a multipart lifecycle is cheap to
-    /// exercise.
+    /// Overrides the multipart part size, raised to something S3 accepts by
+    /// [`clamp_part_size`]. Real uploads should keep the default; a test that
+    /// wants the cheapest possible multipart upload asks for
+    /// [`crate::storage::MIN_PART_SIZE`] and gets it.
     pub fn with_part_size(mut self, bytes: usize) -> Self {
-        self.part_size = bytes.max(1);
+        self.part_size = clamp_part_size(bytes);
         self
     }
 
@@ -347,11 +344,32 @@ impl S3Store {
         }
 
         let sends_body = matches!(req.method, "PUT" | "POST");
+        // A body on a method that does not send one is signed and then dropped,
+        // which S3 answers with SignatureDoesNotMatch and no hint as to why.
+        debug_assert!(
+            sends_body || req.body.is_empty(),
+            "{} carries a {}-byte body that would be signed and not sent",
+            req.method,
+            req.body.len()
+        );
         let build = || {
             let amz_date = amz_date_now();
             let mut headers = base.clone();
             headers.push(("x-amz-date".to_owned(), amz_date.clone()));
             headers.sort();
+            // SigV4 signs the header names in ascending order, lowercase, once
+            // each. A duplicate or a capital here produces a signature over a
+            // canonical request the far end cannot reproduce.
+            debug_assert!(
+                headers.windows(2).all(|w| w[0].0 < w[1].0),
+                "the signed header set is not sorted and unique: {headers:?}"
+            );
+            debug_assert!(
+                headers
+                    .iter()
+                    .all(|(name, _)| *name == name.to_ascii_lowercase()),
+                "the signed header set is not lowercase: {headers:?}"
+            );
             let refs: Vec<(&str, &str)> = headers
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -386,6 +404,34 @@ impl S3Store {
         };
 
         http::send_retrying(build).await
+    }
+
+    /// The bucket's current lifecycle document, empty when it has none, None
+    /// when this key may not read it.
+    ///
+    /// Reading is `s3:GetLifecycleConfiguration`, a separate permission from
+    /// the `s3:PutLifecycleConfiguration` that writes. A key with only the
+    /// write half must not blind-write, because the PUT replaces the whole
+    /// document and would delete rules the host set themselves.
+    async fn lifecycle_document(&self, bucket: &str) -> Result<Option<String>> {
+        let request = S3Request::new("GET", bucket, None).query("lifecycle", "");
+        match self.send(request).await {
+            Ok(resp) => Self::text(resp, "GetBucketLifecycleConfiguration")
+                .await
+                .map(Some),
+            // A bucket with no configuration answers 404
+            // NoSuchLifecycleConfiguration, which is an empty document.
+            Err(ProviderError::NotFound(_)) => Ok(Some(String::new())),
+            Err(ProviderError::Auth(err)) => {
+                tracing::warn!(
+                    bucket,
+                    error = %err,
+                    "cannot read the bucket's lifecycle rules, so no retention rule was written"
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Reads a response body as text, for the XML-bearing calls.
@@ -762,7 +808,27 @@ impl ObjectStore for S3Store {
         prefix: &str,
         retention: Retention,
     ) -> Result<RetentionEnforcement> {
-        let xml = s3_lifecycle_xml(prefix, retention, self.dialect);
+        // Read first: the PUT replaces the bucket's whole configuration, so
+        // the document has to carry every rule that is already there. See
+        // crate::retention.
+        let Some(existing) = self.lifecycle_document(bucket).await? else {
+            return Ok(RetentionEnforcement::Manual {
+                retention,
+                note: unreadable_note(retention, "s3:GetLifecycleConfiguration"),
+            });
+        };
+        let Some(xml) = merge_s3_lifecycle(
+            &existing,
+            prefix,
+            retention,
+            self.dialect,
+            S3_MAX_LIFECYCLE_RULES,
+        ) else {
+            return Ok(RetentionEnforcement::Manual {
+                retention,
+                note: at_capacity_note(retention, S3_MAX_LIFECYCLE_RULES),
+            });
+        };
         let body = xml.clone().into_bytes();
         // PutBucketLifecycleConfiguration is one of the few S3 calls that
         // wants a body integrity header; Content-MD5 is the form both AWS
@@ -778,6 +844,7 @@ impl ObjectStore for S3Store {
         Ok(RetentionEnforcement::ServerSide {
             provider: self.kind,
             retention,
+            rule_id: rule_id(prefix),
             rule: xml,
         })
     }
@@ -1182,11 +1249,20 @@ mod tests {
     #[test]
     fn part_size_defaults_and_overrides() {
         assert_eq!(aws_store().part_size(), DEFAULT_PART_SIZE);
-        assert_eq!(aws_store().with_part_size(8).part_size(), 8);
+        // An override S3 would refuse is raised to one it accepts rather than
+        // taken as given: EntityTooSmall on part two of a real recording is not
+        // something to discover in production.
+        assert_eq!(
+            aws_store().with_part_size(8).part_size(),
+            crate::storage::MIN_PART_SIZE
+        );
         assert_eq!(
             aws_store().with_part_size(0).part_size(),
-            1,
-            "a zero part size would loop forever"
+            crate::storage::MIN_PART_SIZE
+        );
+        assert_eq!(
+            aws_store().with_part_size(DEFAULT_PART_SIZE).part_size(),
+            DEFAULT_PART_SIZE
         );
     }
 }

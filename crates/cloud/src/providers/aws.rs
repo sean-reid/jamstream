@@ -1130,7 +1130,14 @@ fn parse_tags(chunk: &str) -> Vec<(String, String)> {
 ///   `?lifecycle`), and requires the payload hash to travel in a signed
 ///   `x-amz-content-sha256` header. [`authorization`] is implemented in
 ///   terms of it, so the exact-string tests below cover both.
-pub(crate) mod sigv4 {
+///
+/// Public so the integration tests can re-derive a signature from the request
+/// a wiremock fake received and compare it to the one that arrived. Checking
+/// the shape of the `Authorization` header is what let a signature over a
+/// canonical request nobody sent pass for years; re-deriving it from the wire
+/// is the only check that catches a signed-versus-sent divergence, and the
+/// primitives underneath are pinned by their own published vectors.
+pub mod sigv4 {
     use data_encoding::HEXLOWER;
 
     const BLOCK: usize = 64;
