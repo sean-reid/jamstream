@@ -58,26 +58,15 @@ use windows::Win32::System::Threading::{
 use windows::core::w;
 
 use crate::cpal_backend::CpalBackend;
-use crate::format::{self, FormatSpec, SampleFormat};
+use crate::format::{self, FormatSpec, SampleFormat, StageLayout};
 use crate::mode::{DeviceMode, set_active_device_mode};
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, Result, StreamConfig,
     StreamHandle,
 };
 use crate::wasapi_policy::{
-    self as policy, ExclusiveFailure, Fallback, MAX_PERIOD_FRAMES, MIN_PERIOD_FRAMES, RetryGate,
+    self as policy, EVENT_WAIT_MS, ExclusiveFailure, Fallback, MAX_CONSECUTIVE_TIMEOUTS, RetryGate,
 };
-
-/// How long a device thread blocks on its buffer event before looking at the
-/// stop flag again. Also the granularity of stream teardown: both threads are
-/// signalled together, so a close costs about this much in the worst case.
-const EVENT_WAIT_MS: u32 = 50;
-
-/// Consecutive event waits that may expire before the stream is declared dead.
-/// At [`EVENT_WAIT_MS`] this is half a second of silence from a device that
-/// should be signalling every few milliseconds, which lines up with the
-/// client's own 500 ms reopen cadence.
-const MAX_CONSECUTIVE_TIMEOUTS: u32 = 10;
 
 /// Packets read per buffer event before going back to the wait. Exclusive mode
 /// delivers one period per event; the extra passes only matter after a
@@ -118,7 +107,7 @@ pub struct WindowsBackend {
 }
 
 /// What makes two open requests "the same" for cooldown purposes.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RequestKey {
     capture: Option<String>,
     playback: Option<String>,
@@ -279,17 +268,7 @@ struct OpenFailure {
 
 impl OpenFailure {
     fn as_error(&self) -> AudioError {
-        let detail = &self.detail;
-        let reason = self.failure.as_str();
-        match self.failure {
-            ExclusiveFailure::DeviceNotFound | ExclusiveFailure::DeviceInvalidated => {
-                AudioError::DeviceGone
-            }
-            ExclusiveFailure::InvalidConfig | ExclusiveFailure::UnsupportedFormat => {
-                AudioError::Unsupported(format!("{reason}: {detail}"))
-            }
-            _ => AudioError::Backend(format!("{reason}: {detail}")),
-        }
+        policy::open_error(self.failure, &self.detail)
     }
 }
 
@@ -714,7 +693,7 @@ fn wait_for_period(event: &Handle, timeouts: &mut u32) -> bool {
         }
         Err(_) => {
             *timeouts += 1;
-            *timeouts < MAX_CONSECUTIVE_TIMEOUTS
+            !policy::stream_is_dead(*timeouts)
         }
     }
 }
@@ -865,10 +844,11 @@ fn negotiate(
         let Ok(accepted) = client.is_supported_exclusive_with_quirks(&wave_format(spec)) else {
             continue;
         };
-        if accepted.get_nchannels() == spec.channels
-            && accepted.get_samplespersec() == spec.sample_rate
-            && accepted.get_blockalign() as usize == spec.block_align()
-        {
+        if spec.frames_like(
+            accepted.get_nchannels(),
+            accepted.get_samplespersec(),
+            accepted.get_blockalign(),
+        ) {
             return Some((spec, accepted));
         }
         tracing::debug!(
@@ -936,20 +916,23 @@ struct Stage {
 
 impl Stage {
     /// `periods` buys headroom for a late wake-up that finds more than one
-    /// period waiting.
+    /// period waiting. The sizing itself is [`StageLayout`], which is pure
+    /// arithmetic and tested on every host.
     fn new(prepared: &Prepared, handler_channels: u16, periods: usize) -> Self {
-        let device_channels = usize::from(prepared.spec.channels.max(1));
-        let handler_channels = usize::from(handler_channels.max(1));
-        let block_align = prepared.spec.block_align();
-        let frames = periods * prepared.buffer_frames as usize;
-        Self {
-            format: prepared.spec.format,
-            block_align,
-            device_channels,
+        let layout = StageLayout::new(
+            prepared.spec,
             handler_channels,
-            bytes: vec![0; frames * block_align],
-            device_floats: vec![0.0; frames * device_channels],
-            handler_floats: vec![0.0; frames * handler_channels],
+            prepared.buffer_frames,
+            periods,
+        );
+        Self {
+            format: layout.format,
+            block_align: layout.block_align,
+            device_channels: layout.device_channels,
+            handler_channels: layout.handler_channels,
+            bytes: vec![0; layout.byte_len()],
+            device_floats: vec![0.0; layout.device_float_len()],
+            handler_floats: vec![0.0; layout.handler_float_len()],
         }
     }
 
@@ -1165,9 +1148,216 @@ fn exclusive_bounds(device: &Device) -> (Option<u32>, Option<u32>) {
     let Ok((_default_period, min_period)) = client.get_device_period() else {
         return (None, None);
     };
-    let device_min = policy::period_frames(min_period, spec.sample_rate);
-    (
-        Some(device_min.max(MIN_PERIOD_FRAMES)),
-        Some(MAX_PERIOD_FRAMES),
-    )
+    let Some((min, max)) = policy::exclusive_period_bounds(min_period, spec.sample_rate) else {
+        return (None, None);
+    };
+    (Some(min), Some(max))
+}
+
+/// What can be tested on Windows without a device.
+///
+/// Everything below runs in CI on the windows-latest runner, because none of
+/// it opens an endpoint: error classification, the format WAVEFORMATEX we
+/// offer, the cooldown key, and the gate wiring. The arithmetic these sit on
+/// lives in `wasapi_policy` and `format`, which are compiled and tested on
+/// every host.
+///
+/// What is left needs real hardware and is honestly out of reach here: the
+/// exclusive-mode `Initialize` negotiation against a driver, the
+/// buffer-alignment retry, the capture and render loops, MMCSS promotion, and
+/// the handover that starts the streams. `tests/cpal_devices.rs` and
+/// `tests/hardware_loopback.rs` are the tests for those, and they need a
+/// machine with a device.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::{Error as WinError, GUID, HRESULT};
+
+    fn windows_error(code: u32) -> WasapiError {
+        WasapiError::Windows(WinError::from_hresult(HRESULT(code as i32)))
+    }
+
+    /// Every arm of the classifier that is not the HRESULT delegation, because
+    /// the fallback table and the cooldown are chosen from the result and a
+    /// variant landing on `Other` gets the wrong one of both.
+    #[test]
+    fn wasapi_errors_classify_to_their_conditions() {
+        assert_eq!(
+            classify(&WasapiError::UnsupportedFormat),
+            ExclusiveFailure::UnsupportedFormat
+        );
+        assert_eq!(
+            classify(&WasapiError::UnsupportedSubformat(GUID::zeroed())),
+            ExclusiveFailure::UnsupportedFormat
+        );
+        assert_eq!(
+            classify(&WasapiError::DeviceNotFound("Speakers".into())),
+            ExclusiveFailure::DeviceNotFound
+        );
+        assert_eq!(
+            classify(&WasapiError::ClientNotInit),
+            ExclusiveFailure::DeviceInvalidated
+        );
+        assert_eq!(
+            classify(&WasapiError::EventTimeout),
+            ExclusiveFailure::DeviceInvalidated
+        );
+        assert_eq!(
+            classify(&WasapiError::RenderToCaptureDevice),
+            ExclusiveFailure::Other
+        );
+    }
+
+    /// The HRESULT path is what the driver actually fails through, and it has
+    /// to reach the same table `wasapi_policy` tests directly.
+    #[test]
+    fn a_windows_hresult_classifies_through_the_policy_table() {
+        for code in [
+            0x8889_000A_u32, // AUDCLNT_E_DEVICE_IN_USE
+            0x8889_000E,     // AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
+            0x8889_0019,     // AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
+            0x8889_0004,     // AUDCLNT_E_DEVICE_INVALIDATED
+            0x8000_4005,     // E_FAIL, deliberately unclassified
+        ] {
+            assert_eq!(
+                classify(&windows_error(code)),
+                policy::classify_hresult(code as i32),
+                "{code:#010x}"
+            );
+        }
+    }
+
+    /// The alignment retry only happens for one classification, and it is the
+    /// one failure `IAudioClient::Initialize` can be called again after.
+    #[test]
+    fn only_a_misaligned_buffer_is_retried_in_place() {
+        assert_eq!(
+            classify(&windows_error(0x8889_0019)),
+            ExclusiveFailure::BufferSizeNotAligned
+        );
+        for other in [0x8889_0008_u32, 0x8889_000A, 0x8889_0004, 0x8007_0057] {
+            assert_ne!(
+                classify(&windows_error(other)),
+                ExclusiveFailure::BufferSizeNotAligned,
+                "{other:#010x} must not be retried in place"
+            );
+        }
+    }
+
+    #[test]
+    fn directions_map_to_wasapi_endpoints() {
+        assert_eq!(
+            wasapi_direction(Direction::Capture),
+            WasapiDirection::Capture
+        );
+        assert_eq!(
+            wasapi_direction(Direction::Playback),
+            WasapiDirection::Render
+        );
+    }
+
+    /// The negotiation loop offers `wave_format(spec)` and then accepts the
+    /// driver's reply only if it frames audio the way `spec` says. So every
+    /// candidate we offer has to satisfy that check against its own
+    /// WAVEFORMATEX, or a compliant driver echoing our request back would be
+    /// rejected.
+    #[test]
+    fn every_offered_format_matches_the_spec_it_came_from() {
+        for spec in format::format_candidates(48_000, 2, Some(6)) {
+            let wave = wave_format(spec);
+            assert!(
+                spec.frames_like(
+                    wave.get_nchannels(),
+                    wave.get_samplespersec(),
+                    wave.get_blockalign()
+                ),
+                "{spec:?} does not match the WAVEFORMATEX built from it"
+            );
+            assert_eq!(
+                wave.get_bitspersample(),
+                spec.format.store_bits(),
+                "{spec:?}"
+            );
+            assert_eq!(
+                wave.get_validbitspersample(),
+                spec.format.valid_bits(),
+                "{spec:?}"
+            );
+        }
+    }
+
+    fn key(capture: Option<&str>, playback: Option<&str>, buffer_frames: u32) -> RequestKey {
+        RequestKey {
+            capture: capture.map(str::to_owned),
+            playback: playback.map(str::to_owned),
+            config: StreamConfig {
+                buffer_frames,
+                ..StreamConfig::default()
+            },
+        }
+    }
+
+    /// The cooldown is keyed on the whole request, because a user who changes
+    /// device or buffer size has changed the question, and the old verdict says
+    /// nothing about the new one.
+    #[test]
+    fn the_cooldown_key_is_the_whole_request() {
+        assert_eq!(
+            key(Some("a"), Some("b"), 240),
+            key(Some("a"), Some("b"), 240)
+        );
+        assert_ne!(
+            key(Some("a"), Some("b"), 240),
+            key(Some("a"), Some("b"), 480)
+        );
+        assert_ne!(
+            key(Some("a"), Some("b"), 240),
+            key(Some("c"), Some("b"), 240)
+        );
+        assert_ne!(
+            key(Some("a"), Some("b"), 240),
+            key(Some("a"), Some("c"), 240)
+        );
+        // The system default is a different request from naming that same
+        // device explicitly: the default can move underneath us.
+        assert_ne!(key(None, None, 240), key(Some("a"), Some("b"), 240));
+    }
+
+    /// The gate wiring on the backend, as opposed to the gate itself, which
+    /// `wasapi_policy` tests against an injected clock. Opens nothing.
+    #[test]
+    fn a_failure_gates_that_request_and_success_clears_it() {
+        let backend = WindowsBackend::new();
+        let failed = key(Some("interface"), Some("interface"), 240);
+        let other = key(Some("headphones"), Some("headphones"), 240);
+
+        assert!(backend.cooldown_remaining(&failed).is_none());
+
+        backend.note_failure(failed.clone(), Duration::from_secs(60));
+        let remaining = backend
+            .cooldown_remaining(&failed)
+            .expect("the request that failed is gated");
+        assert!(remaining <= Duration::from_secs(60));
+        assert!(
+            backend.cooldown_remaining(&other).is_none(),
+            "a different device must not inherit the verdict"
+        );
+
+        backend.clear_cooldown();
+        assert!(backend.cooldown_remaining(&failed).is_none());
+    }
+
+    /// A failure that carries no cooldown must not gate anything, or a device
+    /// that was merely unplugged and plugged back in would be stuck in shared
+    /// mode for the rest of the session.
+    #[test]
+    fn a_zero_cooldown_gates_nothing() {
+        let backend = WindowsBackend::new();
+        let request = key(None, None, 240);
+        backend.note_failure(
+            request.clone(),
+            policy::retry_cooldown(ExclusiveFailure::DeviceInvalidated),
+        );
+        assert!(backend.cooldown_remaining(&request).is_none());
+    }
 }
