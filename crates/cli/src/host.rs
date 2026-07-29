@@ -8,8 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use data_encoding::{BASE64, HEXLOWER};
 use jamstream_cloud::{
     BootConfig, CostPreview, HANDSHAKE_CAP, IP_POLL_PERIOD, IP_WAIT_CAP, InstanceClass, LaunchSpec,
-    Price, ProbeMatrix, ProbeTarget, Provider, ProviderKind, RecordingStorage, Region, RegionId,
-    RegionScore, RetentionEnforcement, SelfDestruct, rank, session_tag,
+    Price, ProbeMatrix, ProbeTarget, Provider, ProviderKind, RecordingEstimate, RecordingPlan,
+    RecordingStorage, Region, RegionId, RegionScore, RetentionEnforcement, SelfDestruct, rank,
+    session_tag,
 };
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
@@ -161,13 +162,7 @@ pub async fn run<W: Write>(
         None => None,
     };
 
-    let preview = CostPreview::compute(
-        &price,
-        args.hours,
-        args.musicians,
-        args.destinations,
-        args.listeners,
-    );
+    let preview = launch_preview(&price, args, recording.as_ref())?;
     if !args.json {
         writeln!(out)?;
         if is_local {
@@ -393,6 +388,50 @@ pub async fn run<W: Write>(
         }
     }
     Ok(())
+}
+
+/// The launch's cost as the host is shown it: the session, plus the recording
+/// when one is armed.
+///
+/// A recording is not free and it was not in this number. `--bucket` buys
+/// storage for the retention period and one download's worth of egress, which
+/// on a four piece recording stems for three hours is most of the bill, and the
+/// preview said nothing about it (#209). Storage prices in the bucket's own
+/// region, which is the region the launch is putting it in.
+pub fn launch_preview(
+    price: &Price,
+    args: &HostArgs,
+    recording: Option<&RecordingStorage>,
+) -> Result<CostPreview, CliError> {
+    let preview = CostPreview::compute(
+        price,
+        args.hours,
+        args.musicians,
+        args.destinations,
+        args.listeners,
+    );
+    let Some(storage) = recording else {
+        return Ok(preview);
+    };
+    // One stem per musician, because that is what the recorder writes: the flag
+    // is on or off and the count comes from the session.
+    let stems = if storage.stems { args.musicians } else { 0 };
+    let plan = RecordingPlan {
+        stems,
+        ..RecordingPlan::default()
+    }
+    .retention(storage.retention);
+    // Cannot fail here: `storage_for_launch` priced this same provider and
+    // region before it built the storage config, and refused a region with no
+    // bucket service. Propagated rather than dropped anyway, because a total
+    // that silently omits the recording is the defect this closes.
+    let estimate = RecordingEstimate::compute(
+        storage.provider,
+        &RegionId::new(storage.region.clone()),
+        &plan,
+        args.hours,
+    )?;
+    Ok(preview.with_recording(&estimate))
 }
 
 /// The bucket config a cloud launch carries to the VM, from the flags plus
@@ -964,6 +1003,74 @@ mod tests {
         assert_eq!(
             crate::storage::retention_label(&record),
             "Delete after 90 days"
+        );
+    }
+
+    /// #209: a host arming a recording was never shown what it costs. The
+    /// preview folds the recording in, so the total a host agrees to is the
+    /// total, and stems, which are the expensive choice, move it.
+    #[test]
+    fn the_preview_prices_the_recording_a_launch_is_arming() {
+        let price = Price {
+            hourly_microusd: 16_800,
+            egress_microusd_per_gb: 90_000,
+            included_egress_gb: 0,
+        };
+        let args = HostArgs {
+            bucket: Some("my-jams".to_owned()),
+            hours: 3.0,
+            musicians: 4,
+            record_stems: false,
+            ..recording_args()
+        };
+        let storage = |stems: bool| RecordingStorage {
+            provider: ProviderKind::Aws,
+            bucket: "my-jams".to_owned(),
+            region: "eu-west-1".to_owned(),
+            retention: args.retention,
+            credential: jamstream_cloud::StorageCredential::KeyPair {
+                access_key_id: "AKIDTEST".to_owned(),
+                secret_access_key: "hunter2".to_owned(),
+            },
+            stems,
+        };
+        let session = launch_preview(&price, &args, None).expect("a session with no bucket");
+        let mix = launch_preview(&price, &args, Some(&storage(false))).expect("mix only");
+        let stems = launch_preview(&price, &args, Some(&storage(true))).expect("mix and stems");
+
+        // Recording is never free, and it never used to be in this figure.
+        assert!(
+            mix.total_microusd > session.total_microusd,
+            "recording the mix has to cost something: {} vs {}",
+            mix.total_microusd,
+            session.total_microusd
+        );
+        // The whole point of showing it: stems are the choice with a price.
+        assert!(
+            stems.total_microusd > mix.total_microusd,
+            "four stems must cost more than the mix alone: {} vs {}",
+            stems.total_microusd,
+            mix.total_microusd
+        );
+        // The stem count is the session's, not a flag: the recorder writes one
+        // per musician, and the estimate has to price that many.
+        let rows = stems.display_table().join("\n");
+        assert!(rows.contains("mix + 4 stems"), "{rows}");
+        assert!(
+            mix.display_table().join("\n").contains("mix only"),
+            "the mix-only launch must not be priced for stems"
+        );
+        // Both halves of what a recording costs are named, because storage and
+        // the download are billed at different times.
+        assert!(rows.contains("Recording"), "{rows}");
+        assert!(rows.contains("Download once"), "{rows}");
+        // And the session's own lines survive the fold.
+        assert_eq!(session.line_items.len() + 2, stems.line_items.len());
+        assert_eq!(stems.line_items[0], session.line_items[0]);
+        assert_eq!(
+            stems.egress_bytes_estimate, session.egress_bytes_estimate,
+            "the recording's bytes are storage and a later download, not \
+             session egress"
         );
     }
 
