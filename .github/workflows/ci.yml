@@ -177,14 +177,28 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Recalibrated from 20 when this job's Windows leg took on the client
+    # suite, three-crate clippy, and the bench check, roughly doubling its
+    # work. The distribution that moved it: 15m29s warm-passing before the
+    # exe-resource and persistence deps, then 20m09s, 20m10s, and 20m15s
+    # cancelled cold, the last with every step green and only the cache
+    # save over the line. Warm runs measure 8 to 15 minutes and never use
+    # the headroom.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy
+      # cache-on-failure, or a dependency-adding PR can never converge on
+      # Windows: the cold build overruns the 20 minute ceiling, cancellation
+      # skips the cache save, and every retry is exactly as cold as the
+      # first. Saving what the failed run compiled makes the retry warm.
+      # The ceiling itself is untouched; it defends steady-state wall time.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+        with:
+          cache-on-failure: true
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       # ffmpeg is what makes crates/stream's real_ffmpeg test a test. Without it
