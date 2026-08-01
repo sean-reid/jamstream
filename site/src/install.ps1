@@ -125,13 +125,27 @@ try {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
-$onPath = ($env:Path -split ';') -contains $InstallDir
+$normalized = $InstallDir.TrimEnd('\')
+$onPath = (($env:Path -split ';') | ForEach-Object { $_.TrimEnd('\') }) -contains $normalized
 if (-not $onPath) {
-    Write-Host ''
-    Write-Host "note: $InstallDir is not on your Path. Add it for the current session with:"
-    Write-Host "  `$env:Path = `"$InstallDir;`" + `$env:Path"
-    Write-Host 'and permanently in Settings, System, About, Advanced system settings,'
-    Write-Host 'Environment Variables, by editing the user Path variable.'
+    try {
+        # The USER scope needs no admin rights and survives the session.
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $entries = @()
+        if ($userPath) { $entries = @($userPath -split ';' | Where-Object { $_ }) }
+        if (-not (($entries | ForEach-Object { $_.TrimEnd('\') }) -contains $normalized)) {
+            [Environment]::SetEnvironmentVariable('Path', (($entries + $InstallDir) -join ';'), 'User')
+        }
+        $env:Path = "$InstallDir;$env:Path"
+        Write-Host ''
+        Write-Host "added $InstallDir to your user Path; a new terminal picks it up."
+    } catch {
+        Write-Host ''
+        Write-Host "note: could not add $InstallDir to your Path. Add it for the current session with:"
+        Write-Host "  `$env:Path = `"$InstallDir;`" + `$env:Path"
+        Write-Host 'and permanently in Settings, System, About, Advanced system settings,'
+        Write-Host 'Environment Variables, by editing the user Path variable.'
+    }
 }
 
 Write-Host ''
