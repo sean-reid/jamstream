@@ -11,6 +11,9 @@
 # - install-scripts: the installer scripts the site serves at /install.sh
 #   and /install.ps1 (they live in site/src/, which mdBook copies into the
 #   built site verbatim) must stay shellcheck-clean and parseable.
+# - install-scripts-windows: the PowerShell pair must also survive a real
+#   install, smoke, and uninstall on a Windows runner against the latest
+#   published release.
 # - palette: crates/client/src/theme.rs is the single source of truth for
 #   JamStream's colors. The docs theme's custom properties, the docs
 #   theme-color meta, and the app icon's fills are generated from it by
@@ -103,3 +106,37 @@ jobs:
               }
               Write-Output "$script parses cleanly"
             }'
+
+  # The parse above runs on ubuntu, where the only branch these scripts can
+  # reach is the "this is not Windows" early exit; nothing ever executed
+  # their happy path on any OS. This job runs them for real against the
+  # latest published release: lint, install, run the installed CLI,
+  # uninstall, and assert the directory is gone. It is also the gate that
+  # pins the asset names install.ps1 downloads to what release.yml actually
+  # uploaded.
+  install-scripts-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # Error severity only: the scripts talk to the user through
+      # Write-Host, which the Warning set flags by design.
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          }
+          Invoke-ScriptAnalyzer -Path site/src/install.ps1, site/src/uninstall.ps1 -Severity Error -EnableExit
+      - name: Install, run, and uninstall against the latest release
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'jamstream-install-check'
+          powershell -ExecutionPolicy Bypass -File site/src/install.ps1 -InstallDir $dir
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
+          & (Join-Path $dir 'jamstream.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw "installed jamstream.exe exited $LASTEXITCODE" }
+          powershell -ExecutionPolicy Bypass -File site/src/uninstall.ps1 -InstallDir $dir -Yes
+          if ($LASTEXITCODE -ne 0) { throw "uninstall.ps1 exited $LASTEXITCODE" }
+          if (Test-Path (Join-Path $dir 'jamstream.exe')) { throw 'uninstall left jamstream.exe behind' }
