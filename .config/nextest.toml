@@ -80,3 +80,18 @@ filter = """
     or test(=a_set_avatar_flood_is_not_an_egress_amplifier)
 """
 success-output = "immediate"
+
+[[profile.default.overrides]]
+# The live_runtime suite drives two real client runtimes over loopback UDP
+# with wall-clock joins, then measures RMS in windows fixed against the
+# output file's length. Those windows assume the join and the audio start
+# land where an unloaded machine puts them. The suite only ever ran on
+# macOS runners until the client tests were opened up to every OS; the
+# first windows-latest run measured fader_mute_silences_the_member at an
+# rms of 7e-11 in a second that is audible on an idle machine, beside a
+# 50 s wizard test and two cores. Same medicine as the tick gates above:
+# the machine to themselves, last in the queue, no window or budget
+# widened for a scheduler artifact.
+filter = 'binary(live_runtime)'
+priority = -100
+threads-required = "num-test-threads"
