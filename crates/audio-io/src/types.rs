@@ -56,6 +56,19 @@ pub enum AudioError {
     Backend(String),
 }
 
+impl AudioError {
+    /// The message without the variant's own prefix, for embedding inside
+    /// another [`AudioError`] that already says what kind it is: composing
+    /// full Displays stacked "unsupported audio configuration:" twice in one
+    /// sentence.
+    pub fn detail(&self) -> &str {
+        match self {
+            AudioError::DeviceGone => "audio device is gone or was never present",
+            AudioError::Unsupported(msg) | AudioError::Backend(msg) => msg,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, AudioError>;
 
 type CaptureFn = Box<dyn FnMut(&[f32]) + Send>;

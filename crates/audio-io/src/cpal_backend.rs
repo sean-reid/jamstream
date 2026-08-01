@@ -353,8 +353,10 @@ impl RateContext<'_> {
             Direction::Playback => "playback",
         };
         let rate = self.rate;
+        // detail(), not Display: this string becomes another Unsupported,
+        // whose Display supplies the one prefix the sentence gets.
         let detail = match refusal {
-            Some(err) => format!(" ({err})"),
+            Some(err) => format!(" ({})", err.detail()),
             None => String::new(),
         };
         AudioError::Unsupported(format!(
@@ -634,19 +636,26 @@ mod tests {
     }
 
     /// An attempt that the host then refuses has to read as a rate refusal,
-    /// not as whatever the host called it.
+    /// not as whatever the host called it. The composed message carries the
+    /// inner error's text without its variant prefix, so the sentence a
+    /// musician reads says "unsupported audio configuration:" exactly once.
     #[test]
     fn a_refused_attempt_names_the_rates_and_carries_the_host_error() {
         let native = native(44_100, 2);
         let refusal = AudioError::Unsupported("ASBD not supported".into());
-        let AudioError::Unsupported(msg) =
-            ctx("CoreAudio").refused(Direction::Capture, &native, Some(&refusal))
-        else {
+        let err = ctx("CoreAudio").refused(Direction::Capture, &native, Some(&refusal));
+        let full = err.to_string();
+        assert_eq!(
+            full.matches("unsupported audio configuration:").count(),
+            1,
+            "{full}"
+        );
+        let AudioError::Unsupported(msg) = err else {
             panic!("expected Unsupported");
         };
         assert!(msg.starts_with("capture device runs at 44100 Hz"), "{msg}");
         assert!(msg.contains("48000 Hz"), "{msg}");
-        assert!(msg.contains("ASBD not supported"), "{msg}");
+        assert!(msg.contains("(ASBD not supported)"), "{msg}");
         assert!(msg.contains("Audio MIDI Setup"), "{msg}");
     }
 
