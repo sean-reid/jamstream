@@ -299,6 +299,20 @@ fn a_lost_device_is_reported_through_the_stream_handle() {
     assert!(stream.errored());
 }
 
+/// The unplug is one event, not a property of every future stream: the
+/// stream that answers the reopen models the replacement device, so a
+/// caller's device-gone path can prove the session survives the swap.
+#[test]
+fn the_stream_after_the_unplug_keeps_running() {
+    let backend = WavBackend::new(None, None).with_device_loss_after(480);
+    let mut first = backend.open_offline(config(2), passthrough()).unwrap();
+    first.pump(480).unwrap();
+    assert!(first.errored(), "the first stream loses its device");
+    let mut second = backend.open_offline(config(2), passthrough()).unwrap();
+    second.pump(960).unwrap();
+    assert!(!second.errored(), "the replacement device stays plugged in");
+}
+
 #[test]
 fn a_device_loss_can_be_triggered_on_demand() {
     let backend = WavBackend::new(None, None);

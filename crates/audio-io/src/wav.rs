@@ -30,6 +30,9 @@ pub struct WavBackend {
     device_period: Option<u32>,
     form_factor: FormFactor,
     lose_device_after: Option<u64>,
+    /// Latched by the stream that hit the loss threshold. Shared, so the
+    /// unplug happens once per backend however many streams reopen after it.
+    loss_fired: Arc<AtomicBool>,
     /// The rate every open after the first one runs at, when it differs.
     /// Shared, so the count survives the clone a caller keeps.
     reopen_rate: Option<u32>,
@@ -48,6 +51,7 @@ impl WavBackend {
             device_period: None,
             form_factor: FormFactor::Unknown,
             lose_device_after: None,
+            loss_fired: Arc::new(AtomicBool::new(false)),
             reopen_rate: None,
             opened: Arc::new(AtomicBool::new(false)),
         }
@@ -87,6 +91,8 @@ impl WavBackend {
     /// Models a device unplugged mid-session: once this many frames have been
     /// pumped the stream reports [`StreamHandle::errored`], so the caller's
     /// device-gone path runs offline instead of only against real hardware.
+    /// An unplug happens once: the stream that answers the reopen models the
+    /// replacement device and keeps running.
     #[must_use]
     pub fn with_device_loss_after(mut self, frames: u64) -> Self {
         self.lose_device_after = Some(frames);
@@ -153,7 +159,10 @@ impl WavBackend {
             capture_buf: Vec::new(),
             playback_buf: Vec::new(),
             pumped_frames: 0,
-            lose_device_after: self.lose_device_after,
+            lose_device_after: self
+                .lose_device_after
+                .filter(|_| !self.loss_fired.load(Ordering::Relaxed)),
+            loss_fired: Arc::clone(&self.loss_fired),
             errored: false,
             period: self.device_period.map(|p| p as usize),
             pending: 0,
@@ -210,6 +219,8 @@ pub struct WavStream {
     playback_buf: Vec<f32>,
     pumped_frames: u64,
     lose_device_after: Option<u64>,
+    /// Backend-shared latch marking the modelled unplug as spent.
+    loss_fired: Arc<AtomicBool>,
     errored: bool,
     /// Callback size the modelled device insists on; `None` delivers each
     /// pump as one callback, which is a device that honoured the request.
@@ -267,6 +278,7 @@ impl WavStream {
             .is_some_and(|f| self.pumped_frames >= f)
         {
             self.errored = true;
+            self.loss_fired.store(true, Ordering::Relaxed);
         }
         Ok(())
     }

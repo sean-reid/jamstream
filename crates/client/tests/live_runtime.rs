@@ -790,9 +790,9 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
         notice.text
     );
 
-    // And it comes back. The reopen runs on a 500 ms cadence and the WAV
-    // backend's fresh stream has not been pumped past its loss threshold, so
-    // the second open succeeds and the session was never dropped.
+    // And it comes back. The reopen runs on a 500 ms cadence and the
+    // modelled unplug is spent, so the replacement stream keeps running and
+    // the session was never dropped.
     let snap = wait_for(&rt, "the reopen", Duration::from_secs(10), |s| {
         s.chat
             .iter()
