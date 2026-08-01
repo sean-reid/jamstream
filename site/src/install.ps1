@@ -50,6 +50,14 @@ if ([Environment]::OSVersion.Version -lt [Version]'10.0.17763') {
     exit 1
 }
 
+# Expand-Archive -Force cannot overwrite a running exe; it aborts half-extracted.
+$running = Get-Process -Name jamstream, jamstream-app, jamstreamd -ErrorAction SilentlyContinue
+if ($running) {
+    $names = ($running | Select-Object -ExpandProperty ProcessName | Sort-Object -Unique) -join ', '
+    Write-Host "close JamStream first: still running: $names"
+    exit 1
+}
+
 # Returns $true on success, $false on HTTP 404, throws on anything else.
 function Get-Asset([string]$Name, [string]$Dest) {
     try {
