@@ -13,7 +13,7 @@ Each invite admits one person to one seat in one session, signed by the host's k
 
 ## Joining
 
-Paste the invite into the **Join a session** field on the home screen (hint text: "paste an invite, jamstream://join/...") and click Join, or press Enter. A malformed or expired invite shows the reason under the field instead of joining. If every seat for your role is taken, the screen reads "the session is full; waiting for a seat to free" and the app keeps trying, so you are in as soon as somebody leaves.
+Type your name into the **your name** field so the roster and any recorded stems say who you are instead of "musician 2"; it is remembered for next time, and it wins over whatever name the host put on your invite. Then paste the invite into the **Join a session** field (hint text: "paste an invite, jamstream://join/...") and click Join, or press Enter. A malformed or expired invite shows the reason under the field instead of joining. If every seat for your role is taken, the screen reads "the session is full; waiting for a seat to free" and the app keeps trying, so you are in as soon as somebody leaves.
 
 ## The session screen
 
@@ -46,9 +46,9 @@ Settings in the top bar opens over the session without covering the strips or th
 ![The Audio tab of the Settings drawer beside the session: buffer size choices with the current mouth to ear figure, an input level meter, and capture and playback pickers](../images/session_settings.png)
 *Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*
 
-- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that plays clean; crackles mean one step up. The mouth to ear figure under the choices moves with them, because the buffer is part of it.
+- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that plays clean; crackles mean one step up. The mouth to ear figure under the choices moves with them, because the buffer is part of it. A choice outside what the selected device can deliver is annotated with the device's own minimum or maximum, because that is what you will really get.
 - The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.
-- **Capture** and **Playback** list your machine's real audio devices, system default first. Changing one mid-session reopens the audio stream on the new device without leaving the session.
+- **Capture** and **Playback** list a System default entry first, then your machine's real audio devices. Changing one mid-session reopens the audio stream on the new device without leaving the session, and Rescan picks up an interface plugged in after launch. Device and buffer choices are remembered across launches; a remembered device that is not connected at startup falls back to the system default until it returns.
 - **Your avatar**, on the You tab, opens a file picker: pick a PNG or JPEG and everyone in the session gets the picture over the same encrypted link as the audio; a photo straight off a phone works as it is. The choice lasts for this run of the app; set it again after a restart. Remove drops it here and on your next join, though members already in the session keep the picture you sent them.
 
 ## From the terminal

@@ -75,6 +75,19 @@ fn ring_capacity(buffer_frames: u32) -> usize {
     2 * buffer_frames.max(FRAME_FRAMES as u32) as usize * usize::from(CHANNELS)
 }
 
+/// The device request as [`AudioSettings`] spells it: the session rate and
+/// channel layout are the protocol's, the buffer and the exclusive answer are
+/// the user's. One function so every open and reopen carries the whole of the
+/// settings; a half-plumbed flag here would pass every test the fake sees.
+fn stream_config(settings: &AudioSettings) -> StreamConfig {
+    StreamConfig {
+        sample_rate: SAMPLE_RATE,
+        buffer_frames: settings.buffer_frames.max(32),
+        channels: CHANNELS,
+        allow_exclusive: settings.allow_exclusive,
+    }
+}
+
 /// Frames the ring is sized from: the request, or the callback size the
 /// device negotiated when that is bigger. A device is free to ignore the
 /// request (WASAPI shared mode calls back at its period, ~480 frames against
@@ -86,11 +99,29 @@ fn ring_frames(requested: u32, negotiated: Option<u32>) -> u32 {
 
 /// Device selection plus buffer size, as picked on the settings screen.
 /// `None` device ids select the system default for that direction.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSettings {
     pub capture_id: Option<String>,
     pub playback_id: Option<String>,
     pub buffer_frames: u32,
+    /// Whether the open may take the device exclusively (Windows only);
+    /// rides [`StreamConfig::allow_exclusive`] to the backend on every open
+    /// and reopen, so the toggle applies mid-session too.
+    pub allow_exclusive: bool,
+}
+
+/// Manual rather than derived so the flag defaults on: exclusive is the
+/// latency the product exists for, and a derived `false` here would quietly
+/// contradict [`StreamConfig::default`].
+impl Default for AudioSettings {
+    fn default() -> Self {
+        AudioSettings {
+            capture_id: None,
+            playback_id: None,
+            buffer_frames: 0,
+            allow_exclusive: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -246,12 +277,8 @@ impl Driver {
     /// first sized from the request; when the stream then reports callbacks
     /// the ring cannot absorb, it is reopened once over a ring that can.
     fn open(&mut self, settings: &AudioSettings) -> Result<(EngineSide, u32), AudioError> {
-        let requested = settings.buffer_frames.max(32);
-        let config = StreamConfig {
-            sample_rate: SAMPLE_RATE,
-            buffer_frames: requested,
-            channels: CHANNELS,
-        };
+        let config = stream_config(settings);
+        let requested = config.buffer_frames;
         let mut frames = requested;
         let mut resized = false;
         loop {
@@ -494,6 +521,7 @@ impl LiveRuntime {
             avatar_failed: HashSet::new(),
             reopen_attempts: 0,
             last_reopen: None,
+            announced_failure: None,
         };
         let handle = std::thread::Builder::new()
             .name("jamstream-net".into())
@@ -581,6 +609,19 @@ impl LiveRuntime {
                 jitter_target: s.jitter_target,
                 loss_pct: s.loss_pct,
                 mouth_to_ear_ms: s.mouth_to_ear_ms,
+                // Straight off the backend's own report at read time: there
+                // is one device stream per process and these follow the last
+                // open, so no worker plumbing could say anything truer.
+                device_mode: match jamstream_audio_io::active_device_mode() {
+                    Some(jamstream_audio_io::DeviceMode::Exclusive) => {
+                        Some(crate::runtime::DeviceModeView::Exclusive)
+                    }
+                    Some(jamstream_audio_io::DeviceMode::Shared) => {
+                        Some(crate::runtime::DeviceModeView::Shared)
+                    }
+                    None => None,
+                },
+                render_converted: jamstream_audio_io::active_render_conversion(),
             },
             members,
             chat: s.chat.iter().cloned().collect(),
@@ -655,9 +696,12 @@ impl LiveRuntime {
                 // Stream state gets no optimistic echo on purpose: the
                 // pipeline is what decides whether a destination is live,
                 // and it says so within a second.
+                // The name included: the roster fanout is the echo, and it
+                // arrives within a tick.
                 Command::SendChat(_)
                 | Command::Leave
                 | Command::Revoke(_)
+                | Command::SetOwnName(_)
                 | Command::AddDestination { .. }
                 | Command::RemoveDestination(_)
                 | Command::StartStream
@@ -813,6 +857,9 @@ struct Worker {
     avatar_failed: HashSet<String>,
     reopen_attempts: u64,
     last_reopen: Option<Instant>,
+    /// The failure line last put in chat, so the 500 ms retry cadence
+    /// announces each distinct reason once instead of every half second.
+    announced_failure: Option<String>,
 }
 
 impl Worker {
@@ -937,6 +984,9 @@ impl Worker {
             Command::StopStream => self.core.stream_ctl(StreamOp::Stop),
             Command::StartRecord => self.core.record_ctl(RecordOp::Start),
             Command::StopRecord => self.core.record_ctl(RecordOp::Stop),
+            // Validated in the core against the wire's own cap; stored there
+            // and re-announced on every join, exactly like the avatar.
+            Command::SetOwnName(name) => self.core.set_name(&name),
             Command::SetOwnAvatar(None) => {
                 // The control protocol has no way to unset an avatar, so
                 // this is local only: your own strip falls back to the
@@ -968,8 +1018,11 @@ impl Worker {
     }
 
     /// Closes and reopens the audio stream with new settings; the network
-    /// side never pauses. On failure the periodic reopen path takes over
-    /// with system defaults.
+    /// side never pauses. On failure the user's selection is kept and the
+    /// 500 ms reopen cadence keeps trying exactly it: rewriting the settings
+    /// to the system default here left the Audio tab claiming a device the
+    /// stream did not run, from then on, with only a chat line to say so
+    /// (#327). The refusal itself stays on screen through `device_error`.
     fn reconfigure(&mut self, settings: AudioSettings) {
         // Drain what the old ring already captured so those samples reach
         // the core before the endpoints are dropped; orphaning them would
@@ -979,24 +1032,24 @@ impl Worker {
         self.driver.close();
         self.engine = None;
         self.settings = settings;
-        if !self.try_open() {
-            self.system_line("audio device change failed, falling back to the system default");
-            self.settings.capture_id = None;
-            self.settings.playback_id = None;
-            self.last_reopen = None;
+        if let Err(err) = self.try_open() {
+            self.announce_open_failure(&err);
+            self.last_reopen = Some(Instant::now());
         }
     }
 
-    /// Device-gone handling: a dead stream is closed, announced, and
-    /// replaced by the system default on a 500 ms retry cadence.
+    /// A dead stream is closed, announced for what is known about it, and
+    /// retried with the same settings on a 500 ms cadence. The old line
+    /// claimed "audio device disconnected" for every latched error, but the
+    /// exclusive path latches on any read or write hiccup, so a driver
+    /// stutter was reported as an unplug; the class is only knowable from
+    /// the reopen attempt, and the announcement waits for it.
     fn check_stream(&mut self) {
         if self.driver.errored() {
             self.driver.close();
             self.engine = None;
-            self.settings.capture_id = None;
-            self.settings.playback_id = None;
             self.last_reopen = None;
-            self.system_line("audio device disconnected, switching to the system default");
+            self.system_line("the audio stream stopped; retrying");
         }
         if self.engine.is_none()
             && self
@@ -1006,13 +1059,28 @@ impl Worker {
             self.last_reopen = Some(Instant::now());
             self.reopen_attempts += 1;
             tracing::warn!(attempt = self.reopen_attempts, "reopening audio stream");
-            if self.try_open() {
-                self.system_line("audio device reopened");
+            match self.try_open() {
+                Ok(()) => self.system_line("audio device reopened"),
+                Err(err) => self.announce_open_failure(&err),
             }
         }
     }
 
-    fn try_open(&mut self) -> bool {
+    /// One chat line per distinct failure, in the device's own words, so the
+    /// 500 ms retry cadence does not flood the conversation. Disconnection is
+    /// claimed only when the error class says the device is gone.
+    fn announce_open_failure(&mut self, err: &AudioError) {
+        let line = match err {
+            AudioError::DeviceGone => "audio device disconnected; retrying".to_owned(),
+            refused => format!("audio device refused: {}", refused.detail()),
+        };
+        if self.announced_failure.as_deref() != Some(line.as_str()) {
+            self.system_line(&line);
+            self.announced_failure = Some(line);
+        }
+    }
+
+    fn try_open(&mut self) -> Result<(), AudioError> {
         match self.driver.open(&self.settings) {
             Ok((mut engine, device_frames)) => {
                 let capacity = ring_capacity(device_frames);
@@ -1033,7 +1101,9 @@ impl Worker {
                 let mut shared = self.shared.lock().expect("live state");
                 shared.reopen_attempts = self.reopen_attempts;
                 shared.device_error = None;
-                true
+                drop(shared);
+                self.announced_failure = None;
+                Ok(())
             }
             Err(err) => {
                 tracing::warn!(%err, "audio stream open failed");
@@ -1042,7 +1112,7 @@ impl Worker {
                 // the session, and the log is the one place they will not be
                 // looking at mid-song.
                 self.shared.lock().expect("live state").device_error = Some(err.to_string());
-                false
+                Err(err)
             }
         }
     }
@@ -1448,5 +1518,26 @@ mod tests {
         assert_eq!(ring_frames(240, None), 240);
         // A smaller negotiation never shrinks the ring below the request.
         assert_eq!(ring_frames(240, Some(32)), 240);
+    }
+
+    /// The whole of the settings reaches the device request: the exclusive
+    /// answer rides every open and reopen, and the floor on the buffer stays.
+    #[test]
+    fn the_device_request_carries_the_users_exclusive_answer() {
+        let mut settings = AudioSettings {
+            buffer_frames: 120,
+            ..AudioSettings::default()
+        };
+        assert!(
+            stream_config(&settings).allow_exclusive,
+            "the default asks for the low-latency path"
+        );
+        settings.allow_exclusive = false;
+        let config = stream_config(&settings);
+        assert!(!config.allow_exclusive);
+        assert_eq!(config.sample_rate, SAMPLE_RATE);
+        assert_eq!(config.buffer_frames, 120);
+        settings.buffer_frames = 0;
+        assert_eq!(stream_config(&settings).buffer_frames, 32, "the floor");
     }
 }

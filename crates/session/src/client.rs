@@ -10,8 +10,8 @@ use jamstream_engine::{
     MediaPacket, Pull, RedundancyPolicy,
 };
 use jamstream_protocol::control::{
-    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MemberInfo, RecordOp,
-    RecordingState, StreamOp,
+    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN, MemberInfo,
+    RecordOp, RecordingState, StreamOp,
 };
 use jamstream_protocol::ids::{MemberId, Role, TokenId};
 use jamstream_protocol::invite::Invite;
@@ -234,6 +234,11 @@ pub struct ClientCore {
     /// Own avatar (hash, length); the bytes live pinned in the cache. Kept
     /// across reconnects and re-announced on every join.
     own_avatar: Option<(AvatarHash, u32)>,
+    /// Own display name, kept and re-announced exactly like the avatar: the
+    /// server rebuilds a member's name from the token's hint at every
+    /// admission, so a name that did not ride each join would silently
+    /// revert on reconnect.
+    own_name: Option<String>,
     avatar_cache: AvatarCache,
     /// Hashes requested from the server and not yet received.
     avatar_requested: BTreeSet<AvatarHash>,
@@ -350,6 +355,7 @@ impl ClientCore {
             playout_stage: VecDeque::new(),
             playout_frames_since_steer: 0,
             own_avatar: None,
+            own_name: None,
             avatar_cache: AvatarCache::new(AVATAR_CACHE_BYTES),
             avatar_requested: BTreeSet::new(),
             avatar_rx: None,
@@ -448,6 +454,10 @@ impl ClientCore {
                         // server asks for nothing and no chunk moves.
                         if let Some((hash, len)) = self.own_avatar {
                             let _ = self.link.send(ControlMsg::SetAvatar { hash, len });
+                        }
+                        // The name too: admission rebuilt it from the token.
+                        if let Some(name) = self.own_name.clone() {
+                            let _ = self.link.send(ControlMsg::SetName { name });
                         }
                     }
                     Err(retry) => {
@@ -889,6 +899,28 @@ impl ClientCore {
         self.avatar_cache.get(hash)
     }
 
+    /// Sets this member's display name on the roster, for everyone. Kept and
+    /// re-announced on every join like the avatar, because admission rebuilds
+    /// the name from the token's hint. Callable before joining; the announce
+    /// then rides the join. Empty after trimming or past [`MAX_NAME_LEN`]
+    /// bytes is refused here, with the same cap the roster itself enforces.
+    pub fn set_name(&mut self, name: &str) -> Result<(), SessionError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(SessionError::InvalidParam("name is empty"));
+        }
+        if name.len() > MAX_NAME_LEN {
+            return Err(SessionError::InvalidParam("name is too long"));
+        }
+        self.own_name = Some(name.to_owned());
+        if self.state == ClientState::Joined {
+            self.link.send(ControlMsg::SetName {
+                name: name.to_owned(),
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn send_chat(&mut self, text: &str) -> Result<(), SessionError> {
         let from = self.require_joined()?;
         self.link.send(ControlMsg::Chat {
@@ -1121,7 +1153,8 @@ impl ClientCore {
             | ControlMsg::Revoke { .. }
             | ControlMsg::SetAvatar { .. }
             | ControlMsg::StreamCtl { .. }
-            | ControlMsg::RecordCtl { .. } => {}
+            | ControlMsg::RecordCtl { .. }
+            | ControlMsg::SetName { .. } => {}
         }
     }
 

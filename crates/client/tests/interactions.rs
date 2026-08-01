@@ -2515,3 +2515,239 @@ fn the_two_frame_counts_are_named_apart() {
         );
     }
 }
+
+/// Closing the window while this app is the host raises one confirmation
+/// with three ways out (#322). "Keep it running and quit" leaves the session
+/// alive and lets the window go; Escape is Cancel; and the destructive
+/// answer is on screen but not pressed here, because it is the same
+/// `end_session` the Invites tab's covered button calls.
+///
+/// The dialog is raised by the close request itself in production; the
+/// fixture sets the flag directly because a kittest harness has no window
+/// manager to press the close button on. What is under test is everything
+/// after the request: the choices, their wiring, and the way back.
+#[test]
+fn quitting_while_hosting_confirms_and_keep_running_lets_the_window_go() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let hosting_app = || {
+        let mut app = JamApp::in_memory();
+        app.recent = Vec::new();
+        app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, true)));
+        app.screen = Screen::Session;
+        app.session.invites = Some(empty_invites());
+        assert!(app.hosting_live_session(), "the fixture is a host");
+        app.confirm_quit = true;
+        app
+    };
+    let watch = |mut app: JamApp, state: Arc<std::sync::Mutex<(bool, bool)>>| {
+        Harness::builder()
+            .with_size(vec2(1280.0, 800.0))
+            .with_step_dt(0.05)
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+                *state.lock().unwrap() = (app.confirm_quit, app.runtime.is_some());
+            })
+    };
+
+    let state = Arc::new(std::sync::Mutex::new((false, false)));
+    let mut harness = watch(hosting_app(), Arc::clone(&state));
+    harness.run_steps(2);
+
+    // All three answers are on screen, keyboard reachable like any button.
+    for label in ["End session and quit", "Keep it running and quit", "Cancel"] {
+        assert!(
+            harness
+                .query_by_role_and_label(AkRole::Button, label)
+                .is_some(),
+            "{label} is missing from the confirmation"
+        );
+    }
+    assert!(
+        harness
+            .query_by_label_contains("10 minutes after the last musician leaves")
+            .is_some(),
+        "the dialog has to say how a kept session ends"
+    );
+
+    // Escape is Cancel: the dialog goes, the session stays.
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    assert_eq!(*state.lock().unwrap(), (false, true));
+
+    // Raised again, "Keep it running and quit" closes only the window: the
+    // runtime is still there on the last frame the app drew.
+    let state2 = Arc::new(std::sync::Mutex::new((true, false)));
+    let mut harness = watch(hosting_app(), Arc::clone(&state2));
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(AkRole::Button, "Keep it running and quit")
+        .click_accesskit();
+    harness.run_steps(2);
+    let (confirming, running) = *state2.lock().unwrap();
+    assert!(!confirming, "the dialog answered");
+    assert!(running, "keep it running must not end the session");
+}
+
+/// A musician who merely joined gets no dialog: their seat is kept and no
+/// server is theirs to strand, so the window just closes.
+#[test]
+fn a_plain_join_is_not_interrogated_on_close() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let mut app = JamApp::in_memory();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Session;
+    assert!(!app.hosting_live_session());
+}
+
+/// Rescan keeps the selection by device id and falls back visibly. The
+/// enumerator is injected, because a test has no interface to unplug; what is
+/// under test is everything from the button to the note: the click reaches
+/// the app, the selection survives by id, and a device the new catalog no
+/// longer holds lands on System default with a sentence saying so (#325).
+#[test]
+fn rescan_keeps_the_selection_by_id_and_a_lost_device_falls_back_visibly() {
+    use jamstream_client::app::{JamApp, Screen};
+    use jamstream_client::screens::devices::{DeviceCatalog, DeviceInfo};
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    // The user picked the Scarlett explicitly; index 0 is System default.
+    app.devices.capture_idx = 1;
+    app.devices.playback_idx = 2;
+    // The next scan finds the speakers but not the Scarlett.
+    app.enumerate = Arc::new(|| {
+        let mut catalog = DeviceCatalog::demo();
+        catalog.capture.retain(|d| !d.name.contains("Scarlett"));
+        catalog.playback.push(DeviceInfo {
+            name: "USB DAC".to_owned(),
+            id: Some("demo:USB DAC".to_owned()),
+            min_buffer_frames: None,
+            max_buffer_frames: None,
+        });
+        Ok(catalog)
+    });
+    // The picker indexes, read back out of the app after each frame: the
+    // combo's selected text is painted, not a queryable node.
+    let picks = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+    let picks_ui = Arc::clone(&picks);
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+            *picks_ui.lock().unwrap() = (app.devices.capture_idx, app.devices.playback_idx);
+        });
+    harness.run_steps(3);
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Rescan")
+        .click();
+    harness.run_steps(3);
+
+    // The lost capture device fell back to System default and said so; the
+    // playback selection survived the reorder because it is matched by id.
+    assert!(
+        harness
+            .query_by_label_contains("Scarlett 2i2 input is no longer present")
+            .is_some(),
+        "a rescan that loses the selected device has to say so under the pickers"
+    );
+    let (capture_idx, playback_idx) = *picks.lock().unwrap();
+    assert_eq!(
+        capture_idx, 0,
+        "the lost capture pick lands on System default"
+    );
+    assert_eq!(
+        playback_idx, 2,
+        "the playback pick has to survive a rescan that kept its device"
+    );
+}
+
+/// The audio setup survives a relaunch: a buffer clicked and a device picked
+/// land in settings.json, and the next app restores them, by device id and
+/// only while the catalog still holds the device (#328). The write is driven
+/// by the real click, so the persistence hangs off the same change detection
+/// that reconfigures a live stream.
+#[test]
+fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    // A private subdirectory, not temp_dir() itself: the settings writer
+    // refuses a world-writable parent, and Linux's /tmp is one.
+    let dir = std::env::temp_dir().join(format!("jamstream-audio-prefs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    let path = dir.join("settings.json");
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    app.settings_path = Some(path.clone());
+    app.devices.capture_idx = 1; // Scarlett 2i2 input
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(AkRole::RadioButton, "240 frames (5.0 ms)")
+        .click_accesskit();
+    harness.run_steps(4);
+    harness
+        .get_by_role_and_label(
+            AkRole::CheckBox,
+            "Allow exclusive access (Windows, lowest latency)",
+        )
+        .click_accesskit();
+    harness.run_steps(4);
+
+    let saved = std::fs::read_to_string(&path).expect("the click has to write settings.json");
+    assert!(saved.contains("240"), "{saved}");
+    assert!(saved.contains("demo:Scarlett 2i2 input"), "{saved}");
+    assert!(
+        saved.contains("\"allow_exclusive\": false"),
+        "the exclusive answer has to persist: {saved}"
+    );
+
+    // The next launch: same file, and the device is still in the catalog.
+    let mut next = JamApp::in_memory();
+    next.settings_path = Some(path.clone());
+    next.restore_audio_prefs();
+    assert_eq!(next.devices.buffer_frames, 240);
+    assert_eq!(next.devices.capture_idx, 1, "restored by id, not by index");
+    assert!(!next.devices.allow_exclusive, "the toggle restores too");
+
+    // And a launch whose catalog no longer holds the device stays on the
+    // system default instead of showing some other device's name.
+    let mut unplugged = JamApp::in_memory();
+    unplugged
+        .catalog
+        .capture
+        .retain(|d| d.id.as_deref() != Some("demo:Scarlett 2i2 input"));
+    unplugged.settings_path = Some(path);
+    unplugged.restore_audio_prefs();
+    assert_eq!(unplugged.devices.capture_idx, 0);
+    assert_eq!(
+        unplugged.devices.buffer_frames, 240,
+        "the buffer still restores"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

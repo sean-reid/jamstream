@@ -377,6 +377,16 @@ pub enum ControlMsg {
         /// surfaces can show what a take holds. Fixed for the session.
         stems: bool,
     },
+    /// Client to server: the sender's own display name, replacing the
+    /// invite's `name_hint` or the member-N fallback on the roster. Self
+    /// only: the sender is the target, exactly as `Chat` forces `from`.
+    /// Names past [`MAX_NAME_LEN`] are refused at the link, the same cap the
+    /// roster enforces, so a name the roster could not carry never leaves
+    /// the client. Trailing variant, same postcard append-safety rule as
+    /// Stats.
+    SetName {
+        name: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -596,6 +606,9 @@ fn check_lengths(msg: &ControlMsg) -> Result<(), Error> {
         ControlMsg::Roster(members) if members.iter().any(|m| m.name.len() > MAX_NAME_LEN) => {
             Err(Error::Malformed)
         }
+        // The same cap on the way in: a SetName the roster could not relay
+        // would otherwise be accepted here and break fanout there.
+        ControlMsg::SetName { name } if name.len() > MAX_NAME_LEN => Err(Error::Malformed),
         _ => Ok(()),
     }
 }
@@ -1530,6 +1543,9 @@ mod tests {
                 avatar_hash: None,
                 quiet: false,
             }]),
+            ControlMsg::SetName {
+                name: "n".repeat(MAX_NAME_LEN + 1),
+            },
         ];
         for msg in oversized {
             let mut link = ControlLink::new();

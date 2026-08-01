@@ -11,8 +11,30 @@ use crate::widgets::{Meter, meter, pick_row};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub name: String,
-    /// Backend device id; `None` means the system default (demo entries).
+    /// Backend device id; `None` means the system default entry.
     pub id: Option<String>,
+    /// Buffer size bounds in frames, where the backend reports them. The
+    /// buffer picker annotates choices outside them; a device is free to
+    /// deliver its own period regardless (#328).
+    pub min_buffer_frames: Option<u32>,
+    pub max_buffer_frames: Option<u32>,
+}
+
+/// The label of the `id: None` entry that heads both pickers. Following the
+/// system default is a different act from picking the device that happens to
+/// be the default today: when the OS moves the default, the former follows it
+/// and the latter stays put.
+pub const SYSTEM_DEFAULT: &str = "System default";
+
+fn system_default_entry() -> DeviceInfo {
+    DeviceInfo {
+        name: SYSTEM_DEFAULT.to_owned(),
+        id: None,
+        // Which device the default resolves to is the OS's call, so no
+        // bounds can honestly be claimed for it.
+        min_buffer_frames: None,
+        max_buffer_frames: None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,16 +47,27 @@ impl DeviceCatalog {
     pub fn demo() -> Self {
         let dev = |name: &str| DeviceInfo {
             name: name.to_owned(),
-            id: None,
+            id: Some(format!("demo:{name}")),
+            min_buffer_frames: None,
+            max_buffer_frames: None,
         };
         DeviceCatalog {
-            capture: vec![dev("Scarlett 2i2 input"), dev("Built-in microphone")],
-            playback: vec![dev("Scarlett 2i2 output"), dev("Built-in speakers")],
+            capture: vec![
+                system_default_entry(),
+                dev("Scarlett 2i2 input"),
+                dev("Built-in microphone"),
+            ],
+            playback: vec![
+                system_default_entry(),
+                dev("Scarlett 2i2 output"),
+                dev("Built-in speakers"),
+            ],
         }
     }
 
-    /// Real enumeration, defaults listed first so index 0 is the device a
-    /// fresh install uses.
+    /// Real enumeration: the System default entry first, then every concrete
+    /// device with the current default at the top of them. Index 0 is what a
+    /// fresh install uses, and it follows the OS when the default moves.
     pub fn from_backend(devices: &[jamstream_audio_io::DeviceInfo]) -> Self {
         let pick = |direction| {
             let mut rows: Vec<&jamstream_audio_io::DeviceInfo> = devices
@@ -42,16 +75,29 @@ impl DeviceCatalog {
                 .filter(|d| d.direction == direction)
                 .collect();
             rows.sort_by_key(|d| !d.is_default);
-            rows.into_iter()
-                .map(|d| DeviceInfo {
+            std::iter::once(system_default_entry())
+                .chain(rows.into_iter().map(|d| DeviceInfo {
                     name: d.name.clone(),
                     id: Some(d.id.clone()),
-                })
+                    min_buffer_frames: d.min_buffer_frames,
+                    max_buffer_frames: d.max_buffer_frames,
+                }))
                 .collect()
         };
         DeviceCatalog {
             capture: pick(jamstream_audio_io::Direction::Capture),
             playback: pick(jamstream_audio_io::Direction::Playback),
+        }
+    }
+
+    /// The index of `id` in `list`, or index 0 (the System default) when the
+    /// device is not in this catalog. The bool says whether it was found, so a
+    /// rescan that loses the selected device can say so instead of silently
+    /// showing another name.
+    pub fn find(list: &[DeviceInfo], id: &Option<String>) -> (usize, bool) {
+        match list.iter().position(|d| d.id == *id) {
+            Some(idx) => (idx, true),
+            None => (0, false),
         }
     }
 }
@@ -63,10 +109,67 @@ fn buffer_label(frames: u32) -> String {
     format!("{frames} frames ({:.1} ms)", frames as f32 / 48.0)
 }
 
+/// The buffer bounds the selected pair of devices put on a choice: the
+/// stricter of the two minimums (either side padding forces the pair up) and
+/// the stricter of the two maximums. `None` where neither backend reports
+/// one, which is also every System default entry.
+pub fn buffer_bounds(
+    catalog: &DeviceCatalog,
+    capture_idx: usize,
+    playback_idx: usize,
+) -> (Option<u32>, Option<u32>) {
+    let of = |list: &[DeviceInfo], idx: usize| list.get(idx).cloned();
+    let devices = [
+        of(&catalog.capture, capture_idx),
+        of(&catalog.playback, playback_idx),
+    ];
+    let min = devices
+        .iter()
+        .flatten()
+        .filter_map(|d| d.min_buffer_frames)
+        .max();
+    let max = devices
+        .iter()
+        .flatten()
+        .filter_map(|d| d.max_buffer_frames)
+        .min();
+    (min, max)
+}
+
+/// The annotation a buffer choice earns against the device's own bounds, or
+/// `None` inside them. The choice stays clickable either way: the device
+/// negotiates what it really delivers and the ring follows it (#355), so a
+/// pick below the minimum costs the minimum, and the row says so instead of
+/// showing 2.5 ms while the device runs 10 (#328).
+pub fn buffer_choice_note(frames: u32, bounds: (Option<u32>, Option<u32>)) -> Option<String> {
+    let (min, max) = bounds;
+    if let Some(min) = min
+        && frames < min
+    {
+        return Some(format!("device delivers {min} minimum"));
+    }
+    if let Some(max) = max
+        && frames > max
+    {
+        return Some(format!("device delivers {max} maximum"));
+    }
+    None
+}
+
 pub struct DevicesScreen {
     pub capture_idx: usize,
     pub playback_idx: usize,
     pub buffer_frames: u32,
+    /// Whether an open may take the device exclusively (Windows). On by
+    /// default: exclusive is the low-latency path the product exists for,
+    /// but it mutes every other stream on the endpoint, so the setting and
+    /// its cost are on the tab instead of being a silent policy (#331).
+    pub allow_exclusive: bool,
+    /// What the last rescan had to say for itself: a selection that fell back
+    /// to the system default because its device is gone, or a scan that
+    /// failed. Shown under the pickers until the next rescan; a fallback
+    /// nobody is told about is the pickers lying about what is running.
+    pub rescan_note: Option<String>,
 }
 
 impl Default for DevicesScreen {
@@ -75,8 +178,19 @@ impl Default for DevicesScreen {
             capture_idx: 0,
             playback_idx: 0,
             buffer_frames: BUFFER_CHOICES[0],
+            allow_exclusive: true,
+            rescan_note: None,
         }
     }
+}
+
+/// What the Audio tab asks the app to do; the tab cannot reach the platform
+/// backend itself, which is what keeps every fixture off the real sound card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevicesEvent {
+    /// Re-enumerate the devices: something was plugged in or enabled since
+    /// the last look.
+    Rescan,
 }
 
 /// How a block is set. On its own screen each one is a panel, sitting on the
@@ -128,15 +242,22 @@ impl DevicesScreen {
         levels: &LevelsView,
         mouth_to_ear_ms: Option<f32>,
         refusal: Option<&str>,
-    ) {
-        self.buffer_ui(ui, block, mouth_to_ear_ms);
+    ) -> Option<DevicesEvent> {
+        self.buffer_ui(ui, block, catalog, mouth_to_ear_ms);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
         ui.add_space(theme::SPACE_MD);
-        self.devices_ui(ui, block, catalog, refusal);
+        self.devices_ui(ui, block, catalog, refusal)
     }
 
-    fn buffer_ui(&mut self, ui: &mut Ui, block: Block, mouth_to_ear_ms: Option<f32>) {
+    fn buffer_ui(
+        &mut self,
+        ui: &mut Ui,
+        block: Block,
+        catalog: &DeviceCatalog,
+        mouth_to_ear_ms: Option<f32>,
+    ) {
+        let bounds = buffer_bounds(catalog, self.capture_idx, self.playback_idx);
         block.show(ui, |ui| {
             ui.label(theme::title(ui, "Buffer size"));
             ui.label(theme::muted(
@@ -147,8 +268,12 @@ impl DevicesScreen {
             for frames in BUFFER_CHOICES {
                 let label = buffer_label(frames);
                 let selected = self.buffer_frames == frames;
+                let note = buffer_choice_note(frames, bounds);
                 let response = pick_row(ui, &label, selected, true, |ui| {
                     ui.label(label.clone());
+                    if let Some(note) = &note {
+                        ui.label(theme::muted(ui, note.clone()).small());
+                    }
                 });
                 if response.clicked() {
                     self.buffer_frames = frames;
@@ -176,9 +301,24 @@ impl DevicesScreen {
         block: Block,
         catalog: &DeviceCatalog,
         refusal: Option<&str>,
-    ) {
+    ) -> Option<DevicesEvent> {
+        let mut event = None;
         block.show(ui, |ui| {
-            ui.label(theme::title(ui, "Devices"));
+            ui.horizontal(|ui| {
+                ui.label(theme::title(ui, "Devices"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Rescan")
+                        .on_hover_text(
+                            "look for devices again; an interface plugged in after \
+                             launch appears here",
+                        )
+                        .clicked()
+                    {
+                        event = Some(DevicesEvent::Rescan);
+                    }
+                });
+            });
             // The pickers take the width that is left rather than a fixed
             // 280 px. A row wider than its container widens the sheet around
             // it, which is how the settings sheet came to be half again as
@@ -209,6 +349,27 @@ impl DevicesScreen {
                     );
                     ui.end_row();
                 });
+            ui.add_space(theme::SPACE_SM);
+            ui.checkbox(
+                &mut self.allow_exclusive,
+                "Allow exclusive access (Windows, lowest latency)",
+            );
+            ui.label(
+                theme::muted(
+                    ui,
+                    "Exclusive mutes other apps on the device while a session runs. \
+                     Off shares it with them and adds 10 to 20 ms.",
+                )
+                .small(),
+            );
+            // What the last rescan did to the selection, before the refusal:
+            // a device that vanished is why the picker reads System default
+            // now, and saying so is the difference between a fallback and a
+            // picker that quietly changed its answer.
+            if let Some(note) = &self.rescan_note {
+                ui.add_space(theme::SPACE_XS);
+                theme::reason(ui, note.clone());
+            }
             // The pick that will not open, in the device's own words, under the
             // picker that made it. No sentence of ours around it: the pickers
             // are right above it, so what it is about is not in question.
@@ -217,6 +378,7 @@ impl DevicesScreen {
                 theme::reason(ui, reason);
             }
         });
+        event
     }
 }
 
@@ -255,4 +417,56 @@ fn device_combo(ui: &mut Ui, id: &str, devices: &[DeviceInfo], selected: &mut us
                 ui.selectable_value(selected, i, dev.name.clone());
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(min: Option<u32>, max: Option<u32>) -> DeviceInfo {
+        DeviceInfo {
+            name: "dev".to_owned(),
+            id: Some("dev".to_owned()),
+            min_buffer_frames: min,
+            max_buffer_frames: max,
+        }
+    }
+
+    /// The pair's bounds are the stricter of each side's, because a stream
+    /// runs both directions at once and either one padding forces the pair.
+    #[test]
+    fn the_pairs_bounds_are_the_stricter_of_the_two_sides() {
+        let catalog = DeviceCatalog {
+            capture: vec![dev(Some(480), Some(4800))],
+            playback: vec![dev(Some(120), Some(960))],
+        };
+        assert_eq!(buffer_bounds(&catalog, 0, 0), (Some(480), Some(960)));
+        // A side with no report leaves the other side's bound in charge.
+        let catalog = DeviceCatalog {
+            capture: vec![dev(None, None)],
+            playback: vec![dev(Some(240), None)],
+        };
+        assert_eq!(buffer_bounds(&catalog, 0, 0), (Some(240), None));
+        // Nothing reported is nothing claimed, which is the demo catalog and
+        // every System default entry.
+        assert_eq!(buffer_bounds(&DeviceCatalog::demo(), 0, 0), (None, None));
+    }
+
+    /// The shape of #328: "120 frames (2.5 ms)" picked on a device whose
+    /// period is 480 gets an annotation naming the 480 it will really get,
+    /// and choices inside the bounds stay unannotated.
+    #[test]
+    fn choices_outside_the_devices_bounds_say_what_the_device_delivers() {
+        let bounds = (Some(480), Some(4800));
+        assert_eq!(
+            buffer_choice_note(120, bounds).as_deref(),
+            Some("device delivers 480 minimum")
+        );
+        assert_eq!(buffer_choice_note(480, bounds), None);
+        assert_eq!(
+            buffer_choice_note(9600, (None, Some(4800))).as_deref(),
+            Some("device delivers 4800 maximum")
+        );
+        assert_eq!(buffer_choice_note(120, (None, None)), None);
+    }
 }

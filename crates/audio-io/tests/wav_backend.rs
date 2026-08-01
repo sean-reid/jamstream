@@ -21,6 +21,7 @@ fn config(channels: u16) -> StreamConfig {
         sample_rate: 48_000,
         buffer_frames: 240,
         channels,
+        ..StreamConfig::default()
     }
 }
 

@@ -63,6 +63,7 @@ fn enumerate_and_open_default_duplex() {
         sample_rate: 48_000,
         buffer_frames: 240,
         channels: 2,
+        ..StreamConfig::default()
     };
     let handle = backend
         .open_duplex(None, None, config, handler)

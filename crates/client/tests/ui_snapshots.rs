@@ -468,6 +468,18 @@ fn session_host_narrow() {
 }
 
 #[test]
+fn session_quit_confirm() {
+    // The window's close button pressed while this app is the host: one
+    // confirmation, three ways out, and the kept-running exits named in it
+    // (#322). The flag is set directly because a harness has no window
+    // manager; the interaction tests drive the buttons.
+    let mut app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
+    app.confirm_quit = true;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_quit_confirm");
+}
+
+#[test]
 fn session_light() {
     let app = session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Light);
     let mut harness = app_harness(app, WIDE);

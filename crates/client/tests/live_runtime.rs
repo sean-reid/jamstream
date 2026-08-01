@@ -94,6 +94,10 @@ impl TestServer {
     }
 
     fn invite(&self, member: u16, name: &str) -> Invite {
+        self.invite_hinted(member, Some(name.to_owned()))
+    }
+
+    fn invite_hinted(&self, member: u16, name_hint: Option<String>) -> Invite {
         self.issuer.mint(
             self.session_id,
             vec![self.addr],
@@ -101,7 +105,7 @@ impl TestServer {
             Token {
                 member_id: MemberId(member),
                 role: Role::Musician,
-                name_hint: Some(name.to_owned()),
+                name_hint,
                 expires_unix: u64::MAX,
                 jti: TokenId::generate(),
             },
@@ -125,6 +129,7 @@ fn settings() -> AudioSettings {
         capture_id: None,
         playback_id: None,
         buffer_frames: 120,
+        ..AudioSettings::default()
     }
 }
 
@@ -567,6 +572,7 @@ fn reconfigure_audio_swaps_the_stream_mid_session() {
         capture_id: None,
         playback_id: None,
         buffer_frames: 240,
+        ..AudioSettings::default()
     });
     std::thread::sleep(Duration::from_millis(2_000));
 
@@ -841,8 +847,9 @@ fn a_44_1_interface_carries_the_session_both_ways() {
     }
 }
 
-/// A device unplugged mid-session: the stream is closed, the room is told, and
-/// the runtime reopens on the system default without losing the session.
+/// A device lost mid-session: the stream is closed, the room is told the
+/// stream stopped, and the runtime reopens with the same settings without
+/// losing the session.
 ///
 /// This is the test the offline backend existed for and could not run.
 /// `Driver::errored` answered a flat `false` for the offline arm, so
@@ -851,6 +858,10 @@ fn a_44_1_interface_carries_the_session_both_ways() {
 /// report a lost device, and the only one that could needs a hand on a cable.
 /// Both halves of the fix are in the same change, which is the point:
 /// `with_device_loss_after` on the backend, and reading it here.
+///
+/// The wording is part of the contract. A latched stream error carries no
+/// class, and the exclusive Windows path latches on any read or write hiccup,
+/// so this line may not claim a disconnection it cannot know about (#327).
 #[test]
 fn a_device_lost_mid_session_is_announced_and_reopened() {
     let server = TestServer::start();
@@ -868,17 +879,12 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
     let snap = wait_for(&rt, "the device notice", Duration::from_secs(10), |s| {
         s.chat
             .iter()
-            .any(|l| l.text.contains("audio device disconnected"))
+            .any(|l| l.text.contains("the audio stream stopped; retrying"))
     });
-    let notice = snap
-        .chat
-        .iter()
-        .find(|l| l.text.contains("audio device disconnected"))
-        .expect("the predicate above matched");
     assert!(
-        notice.text.contains("system default"),
-        "the notice must say what it did about it: {:?}",
-        notice.text
+        !snap.chat.iter().any(|l| l.text.contains("disconnected")),
+        "a classless stream error must not be reported as an unplug: {:?}",
+        snap.chat
     );
 
     // And it comes back. The reopen runs on a 500 ms cadence and the
@@ -1018,6 +1024,137 @@ fn a_device_the_reopen_cannot_open_says_so_in_the_snapshot() {
         snap.stats.state,
         ConnState::Joined,
         "a refused device must not drop the session"
+    );
+    // A refusal is not an unplug and no fallback happened, so neither may be
+    // claimed: both were, before #327.
+    assert!(
+        !snap
+            .chat
+            .iter()
+            .any(|l| l.text.contains("disconnected") || l.text.contains("system default")),
+        "a refusal must not read as an unplug or a fallback: {:?}",
+        snap.chat
+    );
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(rt);
+    let _ = std::fs::remove_file(&sine);
+}
+
+/// The client half of #357 against the real server: a member whose invite
+/// carried no name joins as the member-N fallback, says their own name
+/// through [`Command::SetOwnName`], and every roster in the session carries
+/// it, their bandmate's included. No fake in the middle: the name rides the
+/// real control link into the real jamstreamd roster and back out.
+#[test]
+fn a_name_set_after_join_reaches_every_roster() {
+    let server = TestServer::start();
+    let unnamed = LiveRuntime::join_offline(
+        &server.invite_hinted(1, None),
+        settings(),
+        WavBackend::new(None, None),
+    )
+    .expect("join unnamed");
+    let witness = join_silent(&server, 2, "cass");
+    wait_for(&unnamed, "joined", Duration::from_secs(10), joined);
+    let snap = wait_for(&witness, "both on roster", Duration::from_secs(10), |s| {
+        joined(s) && s.members.len() == 2
+    });
+    assert!(
+        snap.members.iter().any(|m| m.name == "member 1"),
+        "an unnamed invite starts as the fallback: {:?}",
+        snap.members
+    );
+
+    unnamed.send(Command::SetOwnName("Ana".to_owned()));
+    let snap = wait_for(&witness, "the rename", Duration::from_secs(10), |s| {
+        s.members.iter().any(|m| m.name == "Ana")
+    });
+    assert!(
+        !snap.members.iter().any(|m| m.name == "member 1"),
+        "the fallback must be gone from the bandmate's roster: {:?}",
+        snap.members
+    );
+    // And from your own: the strip under your fader is you by name.
+    wait_for(&unnamed, "own roster", Duration::from_secs(10), |s| {
+        s.members.iter().any(|m| m.is_you && m.name == "Ana")
+    });
+
+    for rt in [&unnamed, &witness] {
+        rt.send(Command::Leave);
+    }
+    drop(unnamed);
+    drop(witness);
+}
+
+/// The repro on #327, made honest: a mid-session device pick is refused (a
+/// 44.1 kHz interface whose input source the stream cannot read at its own
+/// rate, the refusal that outlives rung 3). The runtime keeps the selection
+/// it was handed and retries exactly it, the refusal lands in chat once in
+/// the device's own words, and nothing claims the fallback the old code
+/// silently made. Before this, `applied_audio` and the pickers said the new
+/// device while the system default ran, for the rest of the session.
+#[test]
+fn a_refused_reconfigure_keeps_the_selection_and_says_why() {
+    let server = TestServer::start();
+    // The first open (the join) succeeds at the session rate; every open
+    // after it answers at 44.1 kHz, and the 48 kHz input fixture is what
+    // the reopened stream cannot read.
+    let sine = sine_fixture("reconf-refused", 440.0, RATE);
+    let backend = WavBackend::new(Some(sine.clone()), None).reopening_at(44_100);
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+
+    rt.reconfigure_audio(AudioSettings {
+        capture_id: Some("BlackHole 2ch".to_owned()),
+        playback_id: None,
+        buffer_frames: 120,
+        ..AudioSettings::default()
+    });
+
+    let snap = wait_for(&rt, "the refusal", Duration::from_secs(10), |s| {
+        s.device_error.is_some()
+    });
+    let reason = snap.device_error.expect("the predicate above matched");
+    assert!(
+        reason.contains("44100") && reason.contains("48000"),
+        "the refusal must carry the device's own words: {reason:?}"
+    );
+    let snap = wait_for(&rt, "the chat notice", Duration::from_secs(10), |s| {
+        s.chat
+            .iter()
+            .any(|l| l.text.contains("audio device refused") && l.text.contains("44100"))
+    });
+    assert!(
+        !snap
+            .chat
+            .iter()
+            .any(|l| l.text.contains("disconnected") || l.text.contains("system default")),
+        "a refused pick must not be reported as an unplug or a fallback: {:?}",
+        snap.chat
+    );
+
+    // The 500 ms cadence keeps retrying the same refused device; each
+    // distinct reason is said once, not once per attempt.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let snap = rt.snapshot();
+    assert_eq!(
+        snap.chat
+            .iter()
+            .filter(|l| l.text.contains("audio device refused"))
+            .count(),
+        1,
+        "the retry cadence must not flood chat: {:?}",
+        snap.chat
+    );
+    assert_eq!(
+        snap.stats.state,
+        ConnState::Joined,
+        "a refused reconfigure must not drop the session"
     );
 
     rt.send(Command::Leave);

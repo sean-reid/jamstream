@@ -85,6 +85,10 @@ pub enum Command {
     /// a hash. Bytes past the transfer cap are refused with a log line, the
     /// same way the settings sheet refuses them before sending.
     SetOwnAvatar(Option<Vec<u8>>),
+    /// Your own display name, replacing the invite's hint or the member-N
+    /// fallback on everyone's roster. Sent at join with whatever the join
+    /// screen carried, and validated where the wire's cap lives.
+    SetOwnName(String),
     /// Host only: configure one broadcast destination. The id is minted on
     /// this side so add and remove name the same destination with no round
     /// trip. The only command that carries a secret: [`StreamKey`] redacts
@@ -162,6 +166,18 @@ pub enum ConnState {
     Idle,
 }
 
+/// How the device stream is talking to the endpoint, for the latency
+/// readout's hover. The runtime's copy of `jamstream_audio_io::DeviceMode`,
+/// so the UI contract stays free of the audio crate and a fixture can pin
+/// either answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceModeView {
+    /// WASAPI exclusive: the device is this session's alone, about 10 ms.
+    Exclusive,
+    /// Shared with the system mixer, 20 to 30 ms.
+    Shared,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsView {
     pub state: ConnState,
@@ -172,6 +188,14 @@ pub struct StatsView {
     pub loss_pct: f32,
     /// The headline number: capture to playout, end to end.
     pub mouth_to_ear_ms: Option<f32>,
+    /// Which sharing mode the device stream got. `None` before a stream
+    /// opens and on platforms with no shared/exclusive split, which is why
+    /// the readout says nothing rather than inventing an answer.
+    pub device_mode: Option<DeviceModeView>,
+    /// Whether the OS is resampling the render stream to the device's own
+    /// rate (`Some(true)`), with the unaccounted latency that carries.
+    /// Accepted by design (#347), but disclosed where the latency is read.
+    pub render_converted: Option<bool>,
 }
 
 /// Linear levels in 0..1. dB conversion is the meter widget's job.

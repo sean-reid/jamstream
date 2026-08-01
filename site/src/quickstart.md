@@ -6,7 +6,7 @@ Two paths from nothing to a running session, both in the desktop app. The local 
 
 Download the desktop app for your platform from the [Download](download.md) page and open it. The app carries its own `jamstreamd` session server, so there is nothing else to install.
 
-![JamStream home screen with a field to paste an invite and a button to host a session](images/home_empty.png)
+![JamStream home screen with a name field, a field to paste an invite, and a button to host a session](images/home_empty.png)
 *The home screen: paste an invite to join, or host a session.*
 
 ## 2. Host on this computer
@@ -29,7 +29,7 @@ Each row is one seat. Click **Copy link** on a row and send that link to exactly
 
 ## 4. Bandmates join
 
-Everyone else opens the app on their own machine, pastes their invite into the **Join a session** field on the home screen, and clicks Join or presses Enter. A malformed or expired invite shows the reason under the field instead of joining.
+Everyone else opens the app on their own machine, types their name, pastes their invite into the **Join a session** field on the home screen, and clicks Join or presses Enter. A malformed or expired invite shows the reason under the field instead of joining.
 
 Local invites carry your machine's network address (192.168.1.12 style), so they work from any machine on the same network. They do not work across the internet; bandmates elsewhere need the DigitalOcean path below, or router port forwarding, which [Playing on the same network](guides/local.md) explains honestly.
 

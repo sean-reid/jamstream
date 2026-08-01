@@ -50,7 +50,15 @@ pub struct HomeScreen {
 }
 
 impl HomeScreen {
-    pub fn ui(&mut self, ui: &mut Ui, recent: &[RecentSession]) -> Option<HomeAction> {
+    /// `name` is the app's own display name rather than this screen's state,
+    /// because a join is not the only thing that sends it: the host's
+    /// auto-join announces the same one.
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        recent: &[RecentSession],
+        name: &mut String,
+    ) -> Option<HomeAction> {
         let mut action = None;
         let room = ui.available_height();
         theme::focused_column(ui, 560.0, room, |ui, _| {
@@ -65,6 +73,19 @@ impl HomeScreen {
             theme::panel(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(theme::title(ui, "Join a session"));
+                // The name first: it is who the roster and the take files
+                // will say you are, and it is remembered, so most days it is
+                // already filled in (#357).
+                ui.horizontal(|ui| {
+                    ui.label(theme::muted(ui, "your name"));
+                    ui.add(
+                        TextEdit::singleline(name)
+                            .desired_width(200.0)
+                            .char_limit(64)
+                            .hint_text("how the roster shows you"),
+                    );
+                });
+                ui.add_space(theme::SPACE_XS);
                 ui.horizontal(|ui| {
                     let button_w = 52.0;
                     let field = ui.add(

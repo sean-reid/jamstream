@@ -16,7 +16,7 @@ An invite that names 192.168.1.12 means nothing outside your network. Reaching a
 
 ## Ending and the idle exit
 
-**End session for everyone** on the Invites tab kills the server process, and the same shared state means `jamstream end` from a terminal does too; for local sessions the instance id shown in `status` and `end` output is the process id. If you forget, the server watches its own activity and exits on its own after 10 minutes with no musicians connected. There is no bill either way. The local server also exits at the 12 hour hard cap, and the invites expire with it.
+**End session for everyone** on the Invites tab kills the server process, and the same shared state means `jamstream end` from a terminal does too; for local sessions the instance id shown in `status` and `end` output is the process id. Closing the app window mid-session asks whether to end it, keep it running, or stay, because the server deliberately outlives its launcher. If you forget, the server watches its own activity and exits on its own after 10 minutes with no musicians connected. There is no bill either way. The local server also exits at the 12 hour hard cap, and the invites expire with it.
 
 If a laptop dies mid-session or a state file is lost, `jamstream sweep` finds local strays the same way it finds cloud ones: the local provider keeps an on-disk registry of the processes it spawned, so a later sweep from a fresh shell still sees and kills them.
 

@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use crate::avatar::disc_color;
 use crate::runtime::{
     AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationId,
-    DestinationState, DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView,
-    RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView,
-    TokenId,
+    DestinationState, DestinationView, DeviceModeView, FaderView, LevelsView, MemberId, MemberView,
+    MetronomeView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamPlatform,
+    StreamView, TokenId,
 };
 use crate::theme;
 
@@ -128,6 +128,14 @@ struct DemoState {
     /// runtime fills this from the device that refused; a fixture pins it so
     /// the sentence a silent musician reads can be looked at.
     device_error: Option<String>,
+    /// The sharing mode and conversion report a fixture pins; the real
+    /// runtime reads them off the audio backend. None by default, which is
+    /// what every platform without the split reports.
+    device_mode: Option<DeviceModeView>,
+    render_converted: Option<bool>,
+    /// Your own display name, as [`Command::SetOwnName`] set it: the demo
+    /// stands in for the roster fanout the real server answers with.
+    own_name: Option<String>,
 }
 
 pub struct DemoRuntime {
@@ -283,6 +291,9 @@ impl DemoRuntime {
                 destinations: Vec::new(),
                 record: RecordView::default(),
                 device_error: None,
+                device_mode: None,
+                render_converted: None,
+                own_name: None,
             }),
             is_host,
             frozen,
@@ -350,6 +361,14 @@ impl DemoRuntime {
     pub fn set_device_error(&self, reason: Option<&str>) {
         let mut s = self.state.lock().expect("demo state");
         s.device_error = reason.map(str::to_owned);
+    }
+
+    /// Pins the sharing mode and the OS-conversion report, the pair the real
+    /// runtime reads off the audio backend after an open (#326).
+    pub fn set_device_mode(&self, mode: Option<DeviceModeView>, render_converted: Option<bool>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.device_mode = mode;
+        s.render_converted = render_converted;
     }
 
     /// Pins the recorder's reported state, the way [`Self::set_destinations`]
@@ -421,6 +440,8 @@ impl Runtime for DemoRuntime {
             jitter_target: 4,
             loss_pct: (0.2 + 0.15 * ((f as f64) * 0.011).sin() as f32).max(0.0),
             mouth_to_ear_ms: Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32),
+            device_mode: s.device_mode,
+            render_converted: s.render_converted,
         };
 
         let members = s
@@ -432,7 +453,12 @@ impl Runtime for DemoRuntime {
             .filter(|m| !s.revoked.contains(&m.id))
             .map(|m| MemberView {
                 id: MemberId(m.id),
-                name: m.name.to_owned(),
+                // Your strip carries the name you set, the way the roster
+                // fanout would answer a SetName.
+                name: match (&s.own_name, m.id) {
+                    (Some(name), 0) => name.clone(),
+                    _ => m.name.to_owned(),
+                },
                 role: m.role,
                 connected: !s.away.contains(&m.id),
                 // Never both: the server clears quiet when it gives up on a
@@ -596,6 +622,12 @@ impl Runtime for DemoRuntime {
             // needs is the one the button just asked for.
             Command::StartRecord => s.record.state = RecordState::Recording,
             Command::StopRecord => s.record.state = RecordState::Idle,
+            Command::SetOwnName(name) => {
+                let name = name.trim();
+                if !name.is_empty() {
+                    s.own_name = Some(name.to_owned());
+                }
+            }
             Command::Leave => s.left = true,
             Command::Revoke(jti) => {
                 // The demo token is the member id repeated; reverse it.
@@ -689,6 +721,23 @@ mod tests {
         assert_eq!(ana.fader.gain_db, 2.5);
         assert!(ana.fader.muted);
         assert_eq!(snap.chat.last().unwrap().text, "hello");
+    }
+
+    /// The demo answers a SetOwnName the way the server's roster fanout
+    /// does, so the join screen's field is exercised in fixtures too.
+    #[test]
+    fn set_own_name_renames_your_own_strip() {
+        let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+        rt.send(Command::SetOwnName("  Ana Lucia  ".to_owned()));
+        let snap = rt.snapshot();
+        let me = snap.members.iter().find(|m| m.is_you).expect("you");
+        assert_eq!(me.name, "Ana Lucia", "trimmed, like the wire's copy");
+        // Whitespace alone is not a name; nothing changes.
+        rt.send(Command::SetOwnName("   ".to_owned()));
+        let me_id = me.id;
+        let snap = rt.snapshot();
+        let me = snap.members.iter().find(|m| m.id == me_id).expect("you");
+        assert_eq!(me.name, "Ana Lucia");
     }
 
     #[test]

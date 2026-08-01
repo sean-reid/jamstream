@@ -109,6 +109,7 @@ fn settings() -> AudioSettings {
         capture_id: None,
         playback_id: None,
         buffer_frames: 120,
+        ..AudioSettings::default()
     }
 }
 

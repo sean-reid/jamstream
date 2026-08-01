@@ -14,7 +14,7 @@ use crate::live::{AudioSettings, CostedRuntime, LiveError, LiveRuntime};
 use crate::picker::{Pick, Picked};
 use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
-use crate::screens::devices::{Block, DeviceCatalog, DevicesScreen};
+use crate::screens::devices::{Block, DeviceCatalog, DeviceInfo, DevicesEvent, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
@@ -50,6 +50,23 @@ pub type Joiner = Arc<
 /// The production joiner: the real sound card, through the platform backend.
 pub fn system_joiner() -> Joiner {
     Arc::new(|invite, settings| LiveRuntime::join(invite, settings, jamstream_audio_io::backend()))
+}
+
+/// How the app enumerates audio devices, for the same reason [`Joiner`] is a
+/// parameter: enumeration reaches the platform's sound system, and a test
+/// pressing Rescan has no interface to unplug. Production asks the backend;
+/// tests hand in a catalog of their own.
+pub type Enumerator = Arc<dyn Fn() -> Result<DeviceCatalog, String> + Send + Sync>;
+
+/// The production enumerator, shared by startup and the Rescan button so both
+/// build the same catalog.
+pub fn system_enumerator() -> Enumerator {
+    Arc::new(|| {
+        jamstream_audio_io::backend()
+            .devices()
+            .map(|devices| DeviceCatalog::from_backend(&devices))
+            .map_err(|err| err.to_string())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,14 +134,37 @@ pub struct JamApp {
     avatar_dialog: Option<Pick>,
     /// The avatar you picked, decoded for the settings disc.
     pub own_avatar: Option<AvatarHandle>,
+    /// Your display name, as the join screen's field holds it: sent into
+    /// presence at every join and remembered in the preferences, so the
+    /// roster stops calling people musician N (#357). Empty means unset and
+    /// nothing is sent.
+    pub own_name: String,
     /// The same avatar's fitted bytes, kept so a join can announce it.
     own_avatar_bytes: Option<Vec<u8>>,
-    /// Device selection last applied to the live runtime, as
-    /// (capture_idx, playback_idx, buffer_frames).
-    applied_audio: (usize, usize, u32),
+    /// Device selection last handed to the live runtime, by id rather than by
+    /// picker index: a rescan reorders the catalog without moving the
+    /// selection, and comparing indexes across that would reopen the stream
+    /// for nothing.
+    applied_audio: AudioSettings,
+    /// How Rescan re-enumerates; see [`Enumerator`].
+    pub enumerate: Enumerator,
+    /// Where the audio setup is remembered between launches, `None` in tests
+    /// and in-memory apps so no fixture reads or rewrites the developer's
+    /// own (#328).
+    pub settings_path: Option<std::path::PathBuf>,
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
+    /// The close-the-window confirmation is up. Only a session this app
+    /// launched raises it: closing with one running strands jamstreamd
+    /// invisibly until the idle exit (#322). Public so a fixture can show
+    /// the dialog without a windowing system to close.
+    pub confirm_quit: bool,
+    /// The user answered the confirmation; the next close request passes.
+    allow_close: bool,
+    /// "End session and quit": close the window once the teardown confirms,
+    /// not before, or the provider call dies with the process.
+    quit_after_ending: bool,
     /// How a join is performed; see [`Joiner`].
     pub join: Joiner,
     creds: Arc<dyn CredStore>,
@@ -152,13 +192,8 @@ impl JamApp {
         prefs: Option<std::path::PathBuf>,
     ) -> Self {
         let devices = DevicesScreen::default();
-        let applied_audio = (
-            devices.capture_idx,
-            devices.playback_idx,
-            devices.buffer_frames,
-        );
         let exec = Arc::new(Executor::new());
-        JamApp {
+        let mut app = JamApp {
             theme: Theme::Dark,
             screen: Screen::Home,
             home: HomeScreen::default(),
@@ -182,14 +217,22 @@ impl JamApp {
             avatar_picture: None,
             avatar_dialog: None,
             own_avatar: None,
+            own_name: String::new(),
             own_avatar_bytes: None,
-            applied_audio,
+            applied_audio: AudioSettings::default(),
+            enumerate: Arc::new(|| Ok(DeviceCatalog::demo())),
+            settings_path: None,
             ending: None,
+            confirm_quit: false,
+            allow_close: false,
+            quit_after_ending: false,
             join: system_joiner(),
             creds,
             env,
             exec,
-        }
+        };
+        app.applied_audio = app.audio_settings();
+        app
     }
 
     /// An app whose credentials and environment live in this process and
@@ -216,8 +259,9 @@ impl JamApp {
         if let Err(err) = prefs {
             app.recording.error = Some(err);
         }
-        match jamstream_audio_io::backend().devices() {
-            Ok(devices) => app.catalog = DeviceCatalog::from_backend(&devices),
+        app.enumerate = system_enumerator();
+        match (app.enumerate)() {
+            Ok(catalog) => app.catalog = catalog,
             Err(err) => {
                 tracing::warn!(%err, "device enumeration failed");
                 app.catalog = DeviceCatalog {
@@ -226,7 +270,108 @@ impl JamApp {
                 };
             }
         }
+        app.settings_path = crate::prefs::app_path().ok();
+        app.restore_audio_prefs();
+        app.applied_audio = app.audio_settings();
         app
+    }
+
+    /// Puts the saved setup back where it is used: each device by id and
+    /// only when the catalog still holds it, so a selection whose interface
+    /// is unplugged today quietly stays on the system default; the buffer
+    /// only when it is one of the picker's own choices; the display name
+    /// onto the join screen's field.
+    pub fn restore_audio_prefs(&mut self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        let prefs = crate::prefs::AppPrefs::load_from(path);
+        if let Some(name) = prefs.display_name {
+            self.own_name = name;
+        }
+        if prefs.capture_id.is_some() {
+            let (idx, found) = DeviceCatalog::find(&self.catalog.capture, &prefs.capture_id);
+            if found {
+                self.devices.capture_idx = idx;
+            }
+        }
+        if prefs.playback_id.is_some() {
+            let (idx, found) = DeviceCatalog::find(&self.catalog.playback, &prefs.playback_id);
+            if found {
+                self.devices.playback_idx = idx;
+            }
+        }
+        if let Some(frames) = prefs.buffer_frames
+            && crate::screens::devices::BUFFER_CHOICES.contains(&frames)
+        {
+            self.devices.buffer_frames = frames;
+        }
+        if let Some(allow) = prefs.allow_exclusive {
+            self.devices.allow_exclusive = allow;
+        }
+    }
+
+    /// Writes the audio setup where the next launch reads it. Failure is a
+    /// log line: losing a remembered picker beats interrupting a session.
+    fn persist_audio_prefs(&self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        let settings = self.audio_settings();
+        let name = self.own_name.trim();
+        let prefs = crate::prefs::AppPrefs {
+            capture_id: settings.capture_id,
+            playback_id: settings.playback_id,
+            buffer_frames: Some(settings.buffer_frames),
+            allow_exclusive: Some(settings.allow_exclusive),
+            display_name: (!name.is_empty()).then(|| name.to_owned()),
+        };
+        if let Err(err) = prefs.save_to(path) {
+            tracing::warn!(%err, "audio preferences not saved");
+        }
+    }
+
+    /// Rescan: re-enumerate and keep the selection by device id. A selected
+    /// device the new catalog no longer holds falls back to the System
+    /// default entry with a note under the pickers saying so; falling back
+    /// with the old name still showing was the pickers lying (#325). The
+    /// note also covers the scan itself failing, which otherwise looks like
+    /// a button that does nothing.
+    pub fn rescan_devices(&mut self) {
+        let selected_capture = self.catalog.capture.get(self.devices.capture_idx).cloned();
+        let selected_playback = self
+            .catalog
+            .playback
+            .get(self.devices.playback_idx)
+            .cloned();
+        match (self.enumerate)() {
+            Ok(catalog) => {
+                self.catalog = catalog;
+                let mut lost = Vec::new();
+                let mut place = |list: &[DeviceInfo], selected: Option<DeviceInfo>| {
+                    let Some(selected) = selected else {
+                        return 0;
+                    };
+                    let (idx, found) = DeviceCatalog::find(list, &selected.id);
+                    if !found {
+                        lost.push(selected.name);
+                    }
+                    idx
+                };
+                self.devices.capture_idx = place(&self.catalog.capture, selected_capture);
+                self.devices.playback_idx = place(&self.catalog.playback, selected_playback);
+                self.devices.rescan_note = match lost.as_slice() {
+                    [] => None,
+                    names => Some(format!(
+                        "{} is no longer present; using the system default",
+                        names.join(" and ")
+                    )),
+                };
+            }
+            Err(err) => {
+                self.devices.rescan_note = Some(format!("device scan failed: {err}"));
+            }
+        }
     }
 
     /// `--demo`: straight into a live fake session as the host. It reaches
@@ -255,6 +400,7 @@ impl JamApp {
                 .get(self.devices.playback_idx)
                 .and_then(|d| d.id.clone()),
             buffer_frames: self.devices.buffer_frames,
+            allow_exclusive: self.devices.allow_exclusive,
         }
     }
 
@@ -309,6 +455,7 @@ impl JamApp {
                 self.recent = RecentSession::load();
                 self.screen = Screen::Session;
                 self.announce_own_avatar();
+                self.announce_own_name();
             }
             Err(err) => {
                 self.wizard.launch_error = Some(format!(
@@ -368,6 +515,13 @@ impl JamApp {
             if let Err(err) = result {
                 self.home.error = Some(format!("ending the session failed: {err}"));
             }
+            // "End session and quit": the window goes once the provider has
+            // answered, success or failure alike; a failure is in the state
+            // file and `jamstream sweep` collects what is left.
+            if self.quit_after_ending {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             return;
         }
         if !self.ending() {
@@ -414,6 +568,30 @@ impl JamApp {
             ui.add_space(theme::SPACE_SM);
         });
 
+        // The window's close button, when this app is the one hosting: closing
+        // would strand jamstreamd invisibly until the idle exit, with no CLI
+        // in an app-only install to end it (#322). The request is cancelled
+        // and the confirmation put up; anything else closes untouched.
+        if ui.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            if self.ending() {
+                // The teardown is already running; quitting now would kill
+                // the provider call mid-destroy. Hold the window until it
+                // answers, under the progress sheet that is already up.
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.quit_after_ending = true;
+            } else if self.hosting_live_session() {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_quit = true;
+            }
+        }
+        if self.confirm_quit
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.confirm_quit = false;
+        }
+
         // Before the sheet draws, so a picture that landed while the dialog
         // was open shows in the same frame it arrived.
         self.poll_avatar_pick();
@@ -436,7 +614,7 @@ impl JamApp {
 
         match self.screen {
             Screen::Home => {
-                if let Some(action) = self.home.ui(ui, &self.recent) {
+                if let Some(action) = self.home.ui(ui, &self.recent, &mut self.own_name) {
                     match action {
                         HomeAction::Join(invite) => {
                             let settings = self.audio_settings();
@@ -448,6 +626,10 @@ impl JamApp {
                                     self.session = SessionScreen::default();
                                     self.screen = Screen::Session;
                                     self.announce_own_avatar();
+                                    self.announce_own_name();
+                                    // The last-used name, remembered where
+                                    // the next launch pre-fills from.
+                                    self.persist_audio_prefs();
                                 }
                                 Err(err) => self.home.error = Some(err.to_string()),
                             }
@@ -510,6 +692,7 @@ impl JamApp {
         }
 
         self.ending_progress(ui.ctx());
+        self.quit_confirm_window(ui.ctx());
         self.close_the_other_sheet();
         // Last, so a session has already drawn its status bar and the drawer
         // knows where to stop. Ending the session is reached from in here now,
@@ -520,23 +703,73 @@ impl JamApp {
 
         // Device picks apply immediately: mid-session the live runtime
         // reopens its stream, otherwise the selection just waits for the
-        // next join.
-        let selected = (
-            self.devices.capture_idx,
-            self.devices.playback_idx,
-            self.devices.buffer_frames,
-        );
+        // next join. Compared by id, not picker index, so a rescan that only
+        // reordered the catalog does not reopen a healthy stream.
+        let selected = self.audio_settings();
         if selected != self.applied_audio {
-            self.applied_audio = selected;
+            self.applied_audio = selected.clone();
             if let Some(live) = &self.live {
-                live.reconfigure_audio(self.audio_settings());
+                live.reconfigure_audio(selected);
             }
+            self.persist_audio_prefs();
         }
 
         // Every surface has had its turn: whatever avatar texture nothing
         // drew this frame belongs to a member who left, or to a picture that
         // was replaced. Free it.
         sweep_avatar_textures(ui.ctx());
+    }
+
+    /// Whether closing the window right now would strand a server this app
+    /// launched. A plain join carries no invite book: leaving by closing the
+    /// window costs that musician nothing but their seat, which is kept.
+    pub fn hosting_live_session(&self) -> bool {
+        self.runtime.is_some() && self.session.invites.is_some()
+    }
+
+    /// The close-the-window confirmation: end the session, leave it running
+    /// with its own exits named, or stay. Centre screen like the other
+    /// confirmations, because destroying a server the band may be playing on
+    /// is not decided in a corner.
+    fn quit_confirm_window(&mut self, ctx: &Context) {
+        if !self.confirm_quit {
+            return;
+        }
+        egui::Window::new("Quit while hosting")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.label("This computer launched the session that is running.");
+                ui.add_space(theme::SPACE_SM);
+                ui.label(theme::muted(
+                    ui,
+                    "Kept running, the band can play on without you: the server \
+                     stops itself 10 minutes after the last musician leaves, at \
+                     its hard cap, or when you run jamstream end.",
+                ));
+                ui.add_space(theme::SPACE_SM);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_quit = false;
+                    }
+                    if ui.button("Keep it running and quit").clicked() {
+                        self.confirm_quit = false;
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    let p = theme::palette_of(ui);
+                    if ui
+                        .add(theme::danger_button(p, "End session and quit"))
+                        .clicked()
+                    {
+                        self.confirm_quit = false;
+                        self.quit_after_ending = true;
+                        self.end_session();
+                    }
+                });
+            });
     }
 
     /// The record sheet and the settings drawer are both anchored to the right
@@ -661,8 +894,12 @@ impl JamApp {
                 let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
                 let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
                 let refusal = snap.as_ref().and_then(|s| s.device_error.as_deref());
-                self.devices
-                    .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, refusal);
+                let event =
+                    self.devices
+                        .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, refusal);
+                if let Some(DevicesEvent::Rescan) = event {
+                    self.rescan_devices();
+                }
                 None
             }
             SettingsTab::Broadcast => {
@@ -828,6 +1065,25 @@ impl JamApp {
     fn announce_own_avatar(&self) {
         if let (Some(bytes), Some(rt)) = (&self.own_avatar_bytes, self.runtime.as_deref()) {
             rt.send(Command::SetOwnAvatar(Some(bytes.clone())));
+        }
+    }
+
+    /// Stamps the join screen's name into presence, beside the avatar
+    /// announcement: the runtime keeps it and re-announces on reconnect.
+    /// Cut to the wire's byte cap on a character boundary, so a name the
+    /// field accepted is never silently refused further down.
+    fn announce_own_name(&self) {
+        let mut name = self.own_name.trim();
+        while name.len() > jamstream_protocol::control::MAX_NAME_LEN {
+            let mut chars = name.chars();
+            chars.next_back();
+            name = chars.as_str();
+        }
+        if name.is_empty() {
+            return;
+        }
+        if let Some(rt) = self.runtime.as_deref() {
+            rt.send(Command::SetOwnName(name.to_owned()));
         }
     }
 }

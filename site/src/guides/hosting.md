@@ -47,6 +47,7 @@ One invite per seat is minted up front, on your machine, and the wizard opens Se
 - Each row is one seat with a live status: `not joined`, `connected`, or `free`. Revoking a seat frees it: the row keeps the name it had, greyed, and **New link** mints a replacement into the same chair. **Copy link** puts that person's invite on the clipboard; send it to exactly one person over a channel you trust.
 - **Revoke** ejects that member and kills their invite, with a confirmation step. The host also sees a Revoke button on each mixer strip.
 - **Mint invite** adds a musician or listener seat mid-session, up to 10 musicians (you included) and 20 listeners. Unused invites cost nothing.
+- The **for** field names the next link you mint. The name rides inside the invite, so the roster and any recorded stems say "Ana" from that person's first packet instead of "musician 2", and their unused seat reads `not joined, for Ana`. People can also set their own name when they join, which wins over the invite's.
 
 See [Joining a session](joining.md) for how invites behave on the other end. The CLI mints its seats at launch and cannot add more to a running session; the app's panel can, even for sessions the CLI hosted.
 
@@ -68,6 +69,8 @@ If tagged machines already exist in your account when you host again, the CLI wa
 ## Ending
 
 **End session for everyone** on the Invites tab destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended, with a progress sheet until the provider confirms. The invites are dead from that moment. Leaving is not ending: **Leave** disconnects you and the server keeps running until the host ends it or the idle exit fires.
+
+Closing the app window while your session runs asks the same question rather than deciding for you: end the session and quit, keep it running and quit (the band plays on; the server stops itself 10 minutes after the last musician leaves, at its hard cap, or with `jamstream end`), or cancel. No dialog appears when nothing you launched is running.
 
 ## From the terminal
 

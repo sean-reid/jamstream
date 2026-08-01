@@ -61,6 +61,13 @@ pub struct StreamConfig {
     /// Channel count the handler sees, on both the capture and playback
     /// side. Backends convert to and from the device's native layout.
     pub channels: u16,
+    /// Whether the open may take the device exclusively. Only the Windows
+    /// backend has the choice: exclusive costs about 10 ms and mutes every
+    /// other stream on the endpoint, shared costs 20-30 ms and coexists.
+    /// `false` skips the exclusive probe entirely rather than trying and
+    /// falling back, so the answer is the user's, not the driver's. Other
+    /// platforms ignore it; [`crate::active_device_mode`] reports what ran.
+    pub allow_exclusive: bool,
 }
 
 impl Default for StreamConfig {
@@ -69,6 +76,7 @@ impl Default for StreamConfig {
             sample_rate: 48_000,
             buffer_frames: 240,
             channels: 2,
+            allow_exclusive: true,
         }
     }
 }
@@ -198,4 +206,16 @@ pub trait AudioBackend: Send {
         config: StreamConfig,
         handler: DuplexHandler,
     ) -> Result<Box<dyn StreamHandle>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default answers for latency, which is the product's point; saying
+    /// no is a per-machine choice the client plumbs through (#331).
+    #[test]
+    fn exclusive_is_allowed_unless_someone_says_otherwise() {
+        assert!(StreamConfig::default().allow_exclusive);
+    }
 }

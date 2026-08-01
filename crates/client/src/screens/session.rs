@@ -1114,16 +1114,39 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
             ui.label(RichText::new("mouth to ear").size(9.5).color(p.text_muted));
         });
     });
-    let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
     ui.interact(
         group.response.rect,
         ui.id().with("latency-detail"),
         Sense::hover(),
     )
-    .on_hover_text(format!(
+    .on_hover_text(latency_hover(s));
+}
+
+/// The latency number's hover, line by line: the link's own figures, then
+/// what the device stream got from the OS. Which WASAPI mode won and whether
+/// the OS is resampling playback are the two facts that move this number
+/// between days on the same machine, and neither had a consumer until now
+/// (#326); a platform that reports neither adds no line, because a made-up
+/// answer is worse than none.
+fn latency_hover(s: &crate::runtime::StatsView) -> String {
+    let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
+    let mut text = format!(
         "rtt {rtt} ms\nbuffer {}/{} frames\nloss {:.1}%",
         s.jitter_depth, s.jitter_target, s.loss_pct
-    ));
+    );
+    match s.device_mode {
+        Some(crate::runtime::DeviceModeView::Exclusive) => {
+            text.push_str("\nexclusive mode device, about 10 ms");
+        }
+        Some(crate::runtime::DeviceModeView::Shared) => {
+            text.push_str("\nshared mode device, 20 to 30 ms");
+        }
+        None => {}
+    }
+    if s.render_converted == Some(true) {
+        text.push_str("\nplayback resampled by the OS to the device rate");
+    }
+    text
 }
 
 /// The centre cluster: every state that changes what leaves this room or what
@@ -1515,6 +1538,46 @@ mod tests {
             assert_eq!(entries[0].shape, LampShape::Filled);
             assert_eq!(entries[1].shape, LampShape::Ring);
         }
+    }
+
+    /// The hover behind the mouth-to-ear number names the sharing mode the
+    /// device stream got and whether the OS is resampling playback, because
+    /// those two are what move the number between days on one machine. A
+    /// platform that reports neither gets no line: `--` prose would be an
+    /// instrument reading a made-up value.
+    #[test]
+    fn the_latency_hover_names_the_mode_and_the_conversion() {
+        use crate::runtime::DeviceModeView;
+
+        let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+        let base = latency_hover(&rt.snapshot().stats);
+        assert!(base.contains("rtt") && base.contains("buffer") && base.contains("loss"));
+        assert!(
+            !base.contains("mode") && !base.contains("resampled"),
+            "an unreported mode must add nothing: {base:?}"
+        );
+
+        rt.set_device_mode(Some(DeviceModeView::Shared), Some(true));
+        let shared = latency_hover(&rt.snapshot().stats);
+        assert!(
+            shared.contains("shared mode device, 20 to 30 ms"),
+            "{shared:?}"
+        );
+        assert!(
+            shared.contains("playback resampled by the OS"),
+            "{shared:?}"
+        );
+
+        rt.set_device_mode(Some(DeviceModeView::Exclusive), Some(false));
+        let exclusive = latency_hover(&rt.snapshot().stats);
+        assert!(
+            exclusive.contains("exclusive mode device, about 10 ms"),
+            "{exclusive:?}"
+        );
+        assert!(
+            !exclusive.contains("resampled"),
+            "a device running at the stream rate is not converted: {exclusive:?}"
+        );
     }
 
     /// Audition is a lamp in the cluster, not a dot in the health zone.
