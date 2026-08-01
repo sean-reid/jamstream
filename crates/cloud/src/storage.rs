@@ -180,10 +180,13 @@ pub fn session_prefix(session_id: &str) -> String {
 /// tag encoder is not a name sanitizer at all.
 ///
 /// Dots survive, because member names and file extensions want them, but a
-/// leading dot is dropped and a run of dots collapses to one, so no component
-/// can be or contain `.` or `..`. S3 and GCS treat keys as opaque strings and
-/// would not care, but a host who runs `aws s3 sync` on their own bucket
-/// does. A component that reduces to nothing becomes `unnamed`.
+/// leading or trailing dot is dropped and a run of dots collapses to one, so
+/// no component can be or contain `.` or `..`. S3 and GCS treat keys as
+/// opaque strings and would not care, but a host who runs `aws s3 sync` on
+/// their own bucket does, so the output also clears [`windows_hazard`]: a
+/// component that lands on a DOS device name gets a `-` prefixed, which
+/// changes the stem Win32 resolves rather than the extension after it. A
+/// component that reduces to nothing becomes `unnamed`.
 pub fn sanitize_component(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
@@ -198,10 +201,62 @@ pub fn sanitize_component(raw: &str) -> String {
             out.push('-');
         }
     }
+    if out.ends_with('.') {
+        out.pop();
+    }
     if out.trim_matches(['-', '.', '_']).is_empty() {
         return "unnamed".to_owned();
     }
+    if reserved_device_name(&out) {
+        out.insert(0, '-');
+    }
     out
+}
+
+/// Why one path component would misbehave on a Windows filesystem, or `None`
+/// when the name works everywhere.
+///
+/// These are Win32 rules, but they apply on every platform: a bucket written
+/// by a Windows host is read on a mac and the other way around, so the
+/// namespace rules travel with the data, not with the OS reading it. A colon
+/// names an alternate data stream, `< > " | ? *`, backslash and control
+/// characters are refused outright, a trailing dot or space is silently
+/// stripped so the file collapses onto another name, and the DOS device names
+/// (`NUL`, `CON`, `COM1`...) open devices even with an extension attached.
+pub fn windows_hazard(component: &str) -> Option<&'static str> {
+    if component
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\') || c.is_control())
+    {
+        return Some("contains a character Windows reserves");
+    }
+    if component.ends_with('.') || component.ends_with(' ') {
+        return Some("ends with a dot or a space, which Windows strips");
+    }
+    if reserved_device_name(component) {
+        return Some("is a DOS device name");
+    }
+    None
+}
+
+/// True when Win32 would resolve the name to a device: `CON`, `PRN`, `AUX`,
+/// `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, case-insensitive, with or without
+/// an extension. `COM10` and `NULL` are ordinary names.
+fn reserved_device_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    if !stem.is_ascii() {
+        return false;
+    }
+    match stem.len() {
+        3 => ["con", "prn", "aux", "nul"]
+            .iter()
+            .any(|name| stem.eq_ignore_ascii_case(name)),
+        4 => {
+            (stem[..3].eq_ignore_ascii_case("com") || stem[..3].eq_ignore_ascii_case("lpt"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9')
+        }
+        _ => false,
+    }
 }
 
 /// Yields an object body one part at a time.
@@ -665,6 +720,95 @@ mod tests {
             sanitize_component("jamstream-2026-07-25-1030-mix.flac"),
             "jamstream-2026-07-25-1030-mix.flac"
         );
+    }
+
+    /// The doc promises a component nothing misreads, on any platform, so
+    /// every output has to clear the hazard check the CLI applies on the way
+    /// back down.
+    #[test]
+    fn sanitized_components_clear_the_windows_hazards() {
+        assert_eq!(sanitize_component("NUL"), "-NUL");
+        assert_eq!(sanitize_component("com1.flac"), "-com1.flac");
+        assert_eq!(sanitize_component("mix."), "mix");
+        for raw in [
+            "NUL",
+            "nul.flac",
+            "CON",
+            "com1",
+            "LPT9.txt",
+            "mix.",
+            "mix ",
+            "mix.flac:hidden",
+            "a<b>c",
+            "wh|at?.flac",
+            "star*",
+            "back\\slash",
+            "tab\there",
+            "..",
+            "Sean's Amp",
+            "jamstream-2026-07-25-1030-mix.flac",
+        ] {
+            let component = sanitize_component(raw);
+            assert_eq!(
+                windows_hazard(&component),
+                None,
+                "{raw:?} produced {component:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hazards_name_every_class_and_spare_the_lookalikes() {
+        for bad in [
+            "NUL",
+            "nul.flac",
+            "CON",
+            "PRN",
+            "AUX",
+            "com1",
+            "COM9.flac",
+            "lpt1",
+            "LPT9",
+        ] {
+            assert_eq!(windows_hazard(bad), Some("is a DOS device name"), "{bad}");
+        }
+        for bad in [
+            "mix.flac:hidden",
+            "a<b.flac",
+            "a>b.flac",
+            "quote\".flac",
+            "pipe|.flac",
+            "what?.flac",
+            "star*.flac",
+            "back\\slash.flac",
+            "bell\u{7}.flac",
+        ] {
+            assert_eq!(
+                windows_hazard(bad),
+                Some("contains a character Windows reserves"),
+                "{bad}"
+            );
+        }
+        for bad in ["mix.flac.", "mix.flac "] {
+            assert_eq!(
+                windows_hazard(bad),
+                Some("ends with a dot or a space, which Windows strips"),
+                "{bad}"
+            );
+        }
+        // Lookalikes that are ordinary names everywhere, including Windows.
+        for fine in [
+            "jamstream-2026-08-01-1930-mix.flac",
+            "NULL.flac",
+            "COM10.flac",
+            "lpt0",
+            "concert.flac",
+            "console",
+            "Sørén.flac",
+            "日本語.flac",
+        ] {
+            assert_eq!(windows_hazard(fine), None, "{fine}");
+        }
     }
 
     #[test]
