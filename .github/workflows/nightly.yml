@@ -156,10 +156,10 @@ jobs:
           if-no-files-found: warn
 
   # The full suite, harness gates and multi-second E2E user stories
-  # included, on every OS. Same client exclusion as ci.yml: the kittest
-  # snapshot baselines are macOS renders and headless ubuntu/windows
-  # runners lack a reliable wgpu adapter, so jamstream-client tests run
-  # only on macOS.
+  # included, on every OS. Same snapshot exclusion as ci.yml: only the
+  # client's ui_snapshots binary is macOS-bound (macOS-rendered pixel
+  # baselines, and headless ubuntu/windows runners lack a reliable wgpu
+  # adapter); the rest of the client suite runs everywhere.
   e2e:
     strategy:
       fail-fast: false
@@ -220,7 +220,7 @@ jobs:
       - if: runner.os != 'macOS'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
-        run: cargo nextest run --locked --workspace --exclude jamstream-client
+        run: cargo nextest run --locked --workspace -E 'not binary(ui_snapshots)'
       - if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@v7
         with:
@@ -273,7 +273,7 @@ jobs:
         run: cargo run --locked -p jamstream-cli --release -- sweep --dry-run --provider digitalocean
       # Later addition goes here: provision the cheapest real instance,
       # verify boot + handshake + self-termination, then assert a final
-      # sweep finds nothing (testing.md, "Cloud provider tests" item 3).
+      # sweep finds nothing.
       - name: Full launch and destroy smoke (not yet implemented)
         if: steps.creds.outputs.available == 'true'
         run: echo 'Placeholder; full provision/boot/self-terminate/sweep smoke lands in a later change.'

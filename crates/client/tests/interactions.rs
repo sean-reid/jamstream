@@ -78,11 +78,21 @@ fn invite_book(
         status: jamstream_cli::state::SessionStatus::Running,
         ended_unix: None,
     };
-    let path = std::env::temp_dir().join(format!(
-        "jamstream-interaction-invites-{label}-{}.json",
+    // A private subdirectory, not temp_dir() itself: the state writer
+    // refuses a world-writable parent, and Linux's /tmp is one, unlike the
+    // per-user temp dirs macOS and Windows hand out.
+    let dir = std::env::temp_dir().join(format!(
+        "jamstream-interaction-invites-{label}-{}",
         std::process::id()
     ));
-    jamstream_client::screens::invites::InvitesPanel::new(state, path)
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    jamstream_client::screens::invites::InvitesPanel::new(state, dir.join("state.json"))
 }
 
 /// The two buttons in the invites panel that sign something, pressed.
