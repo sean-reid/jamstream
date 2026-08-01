@@ -59,7 +59,7 @@ $ jamstream sweep --dry-run --provider gcp
 No jamstream-tagged instances found.
 ```
 
-That output means the credential authenticates and can list instances. The project id is read from the key file; set `GOOGLE_CLOUD_PROJECT` only if you need to override it.
+That output means the credential authenticates and can list instances. In PowerShell the export line is `$env:GOOGLE_APPLICATION_CREDENTIALS = "$HOME\keys\jamstream-gcp.json"`. The project id is read from the key file; set `GOOGLE_CLOUD_PROJECT` only if you need to override it.
 
 No key file, or key creation blocked? JamStream also accepts a pre-minted token, which expires after about an hour. This mode is environment-only, in the app and the CLI alike:
 
@@ -68,4 +68,4 @@ $ export GOOGLE_CLOUD_PROJECT=jamstream-123456
 $ export GCP_ACCESS_TOKEN=$(gcloud auth print-access-token)
 ```
 
-The app reads the same variables as a silent fallback, so a machine set up either way is `ready` in the wizard with nothing pasted.
+In PowerShell those are `$env:GOOGLE_CLOUD_PROJECT = 'jamstream-123456'` and `$env:GCP_ACCESS_TOKEN = gcloud auth print-access-token`. The app reads the same variables as a silent fallback, so a machine set up either way is `ready` in the wizard with nothing pasted.

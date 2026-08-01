@@ -71,6 +71,8 @@ $ export JAMSTREAM_RECORDING_ACCESS_KEY_ID=...
 $ export JAMSTREAM_RECORDING_SECRET_ACCESS_KEY=...
 ```
 
+In PowerShell: `$env:JAMSTREAM_RECORDING_ACCESS_KEY_ID = '...'` and `$env:JAMSTREAM_RECORDING_SECRET_ACCESS_KEY = '...'`.
+
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are deliberately not read here, because they are the pair that launches instances and this key is written into a machine's user data. Scope this key to writing the recordings prefix of one bucket; the last section of your [provider's page](../guides/providers.md) creates it.
 
 `SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY` on DigitalOcean, and `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY` on GCP, are read as well: neither pair is a launch credential on its provider.

@@ -74,4 +74,4 @@ $ jamstream sweep --dry-run --provider digitalocean
 No jamstream-tagged instances found.
 ```
 
-That output means the token authenticates and can list droplets. Add the export to your shell profile if you host from the terminal regularly, or keep the token in a password manager and export it per session. The app reads `DIGITALOCEAN_TOKEN` as a silent fallback too, so a machine set up this way is `ready` in the wizard with nothing pasted.
+That output means the token authenticates and can list droplets. In PowerShell the export line is `$env:DIGITALOCEAN_TOKEN = 'dop_v1_your_token_here'`. Add the export to your shell profile if you host from the terminal regularly, or keep the token in a password manager and export it per session. The app reads `DIGITALOCEAN_TOKEN` as a silent fallback too, so a machine set up this way is `ready` in the wizard with nothing pasted.
