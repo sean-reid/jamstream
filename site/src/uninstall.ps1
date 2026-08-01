@@ -10,7 +10,7 @@
 # somewhere.
 #
 # Parameters (when run as a saved script rather than piped to iex):
-#   -Purge        also delete the JamStream data directory
+#   -Purge        also delete session data and recordings
 #   -Yes          do not stop for a session that is still running
 #   -InstallDir   look here; defaults to JAMSTREAM_INSTALL_DIR if set,
 #                 otherwise $env:LOCALAPPDATA\Programs\jamstream
@@ -83,18 +83,28 @@ if ($removed -eq 0) {
     Write-Host 'Advanced system settings, Environment Variables, user Path.'
 }
 
-# Data: session records under the local app data directory. Credentials are
-# in Windows Credential Manager, which this script does not reach into.
-$dataDir = Join-Path $env:LOCALAPPDATA 'jamstream'
+# Data: session records and recordings under the local app data directory,
+# plus the JAMSTREAM_STATE_DIR override when the CLI runs with one set.
+$dataDirs = @(Join-Path $env:LOCALAPPDATA 'jamstream')
+if ($env:JAMSTREAM_STATE_DIR) { $dataDirs += $env:JAMSTREAM_STATE_DIR }
 if ($Purge) {
-    if (Test-Path $dataDir) {
-        Remove-Item -Recurse -Force $dataDir
-        Write-Host "removed $dataDir"
-    } else {
-        Write-Host "no data directory at $dataDir"
+    $found = $false
+    foreach ($dataDir in $dataDirs) {
+        if (Test-Path $dataDir) {
+            Remove-Item -Recurse -Force $dataDir
+            Write-Host "removed $dataDir"
+            $found = $true
+        }
     }
-} elseif (Test-Path $dataDir) {
-    Write-Host "kept session data at $dataDir (rerun with -Purge to delete it)"
+    if (-not $found) {
+        Write-Host "no data directory at $($dataDirs -join ' or ')"
+    }
+} else {
+    foreach ($dataDir in $dataDirs) {
+        if (Test-Path $dataDir) {
+            Write-Host "kept session data and recordings at $dataDir (rerun with -Purge to delete them)"
+        }
+    }
 }
 
 Write-Host 'Cloud credentials, if you saved any, are in Credential Manager: search for jamstream and remove the entries.'
