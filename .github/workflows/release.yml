@@ -173,9 +173,10 @@ jobs:
           done
       # Placeholder: artifact signing (signature published beside the
       # tarball; cloud-init verifies it before boot) lands with the
-      # signing milestone.
-      - name: Sign server artifact (not yet implemented)
-        run: echo 'Placeholder; detached signature for cloud-init verification lands with the signing milestone.'
+      # signing milestone. The step name starts with "Unsigned" so its
+      # green tick cannot be misread as signing having happened.
+      - name: 'Unsigned: no detached signature on the server artifacts'
+        run: echo 'The server artifacts are UNSIGNED; the detached signature cloud-init verifies lands with the signing milestone.' >> "$GITHUB_STEP_SUMMARY"
 
   # Universal (arm64 + x86_64) app bundle in a signed DMG, plus a universal
   # CLI tarball. Signing follows the keychain pattern sign-smoke.yml proved
@@ -482,9 +483,12 @@ jobs:
             Write-Output 'dumpbin not found; import tables not recorded this release'
           }
       # Placeholder: Authenticode signing of both .exe files lands once a
-      # Windows code-signing certificate exists.
-      - name: Sign Windows binaries (not yet implemented)
-        run: echo 'Placeholder; Authenticode signing lands once a Windows certificate exists.'
+      # Windows code-signing certificate exists. The step name starts with
+      # "Unsigned" so its green tick cannot be misread as signing having
+      # happened.
+      - name: 'Unsigned: no Authenticode signature on the exes'
+        shell: bash
+        run: echo 'The Windows exes are UNSIGNED; Authenticode signing lands once a Windows certificate exists.' >> "$GITHUB_STEP_SUMMARY"
       # The app zip carries jamstreamd.exe beside jamstream-app.exe; the
       # local provider resolves the app-adjacent helper, so hosting on this
       # computer works straight from the unzipped folder. The exe itself
@@ -509,9 +513,12 @@ jobs:
             jamstream-app-windows-x86_64.zip \
             --clobber
       # The winget manifest itself exists now (the packaging job renders it
-      # for the zip); only a signed MSI is still missing.
-      - name: Build signed MSI (not yet implemented)
-        run: echo 'Placeholder; a signed MSI lands with the installer milestone. The winget manifest for the zip is rendered by the packaging job.'
+      # for the zip); only a signed MSI is still missing. The step name
+      # starts with "Unsigned" so its green tick cannot be misread as an
+      # MSI having been built and signed.
+      - name: 'Unsigned: no signed MSI, the zip is the only installer'
+        shell: bash
+        run: echo 'No signed MSI yet; it lands with the installer milestone. The winget manifest for the zip is rendered by the packaging job.' >> "$GITHUB_STEP_SUMMARY"
 
   linux:
     needs: server-musl
