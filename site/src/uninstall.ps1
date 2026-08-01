@@ -10,7 +10,7 @@
 # somewhere.
 #
 # Parameters (when run as a saved script rather than piped to iex):
-#   -Purge        also delete the JamStream data directory
+#   -Purge        also delete session data, recordings, and saved credentials
 #   -Yes          do not stop for a session that is still running
 #   -InstallDir   look here; defaults to JAMSTREAM_INSTALL_DIR if set,
 #                 otherwise $env:LOCALAPPDATA\Programs\jamstream
@@ -31,8 +31,10 @@ if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
 }
 
 # Exactly the files the two install archives contain. Anything else in the
-# directory is not ours to delete.
-$owned = @('jamstream.exe', 'jamstream-app.exe', 'jamstreamd.exe', 'jamstream.ico')
+# directory is not ours to delete. jamstream.exe goes last: it is the recovery
+# tool the error guidance leans on, so a lock elsewhere must not orphan things
+# with the CLI already gone.
+$owned = @('jamstream-app.exe', 'jamstreamd.exe', 'jamstream.ico', 'jamstream.exe')
 
 $cli = Join-Path $InstallDir 'jamstream.exe'
 if (Test-Path $cli) {
@@ -52,6 +54,14 @@ if (Test-Path $cli) {
     }
 }
 
+# A running exe cannot be deleted; Remove-Item would die partway through the loop.
+$running = Get-Process -Name jamstream-app, jamstreamd -ErrorAction SilentlyContinue
+if ($running) {
+    $names = ($running | Select-Object -ExpandProperty ProcessName | Sort-Object -Unique) -join ', '
+    Write-Host "close JamStream first: still running: $names"
+    exit 1
+}
+
 $removed = 0
 foreach ($name in $owned) {
     $file = Join-Path $InstallDir $name
@@ -64,6 +74,8 @@ foreach ($name in $owned) {
 
 if ($removed -eq 0) {
     Write-Host "nothing to remove: no JamStream binaries in $InstallDir"
+    Write-Host 'A zip extracted by hand is uninstalled by deleting that folder. Data lives'
+    Write-Host "at $env:LOCALAPPDATA\jamstream, credentials in Credential Manager."
 } elseif ((Test-Path $InstallDir) -and -not (Get-ChildItem -Force $InstallDir)) {
     Remove-Item -Force $InstallDir
     Write-Host "removed the empty $InstallDir"
@@ -71,18 +83,49 @@ if ($removed -eq 0) {
     Write-Host 'Advanced system settings, Environment Variables, user Path.'
 }
 
-# Data: session records under the local app data directory. Credentials are
-# in Windows Credential Manager, which this script does not reach into.
-$dataDir = Join-Path $env:LOCALAPPDATA 'jamstream'
+# Data: session records and recordings under the local app data directory,
+# plus the JAMSTREAM_STATE_DIR override when the CLI runs with one set.
+$dataDirs = @(Join-Path $env:LOCALAPPDATA 'jamstream')
+if ($env:JAMSTREAM_STATE_DIR) { $dataDirs += $env:JAMSTREAM_STATE_DIR }
 if ($Purge) {
-    if (Test-Path $dataDir) {
-        Remove-Item -Recurse -Force $dataDir
-        Write-Host "removed $dataDir"
-    } else {
-        Write-Host "no data directory at $dataDir"
+    $found = $false
+    foreach ($dataDir in $dataDirs) {
+        if (Test-Path $dataDir) {
+            Remove-Item -Recurse -Force $dataDir
+            Write-Host "removed $dataDir"
+            $found = $true
+        }
     }
-} elseif (Test-Path $dataDir) {
-    Write-Host "kept session data at $dataDir (rerun with -Purge to delete it)"
+    if (-not $found) {
+        Write-Host "no data directory at $($dataDirs -join ' or ')"
+    }
+
+    # Credentials the app saved: keyring entries with service "jamstream" and
+    # user "<provider>.<field>", which Windows keeps as generic credentials
+    # named <provider>.<field>.jamstream.
+    $targets = @()
+    foreach ($line in (cmdkey /list 2>$null)) {
+        if ($line -match 'target=([^\s]+\.jamstream)\s*$') { $targets += $Matches[1] }
+    }
+    if ($targets.Count -eq 0) {
+        Write-Host 'no jamstream entries in Credential Manager'
+    }
+    foreach ($target in $targets) {
+        cmdkey /delete:$target | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "removed Credential Manager entry $target"
+        } else {
+            Write-Host "could not remove $target; delete it in Credential Manager by hand"
+        }
+    }
+} else {
+    foreach ($dataDir in $dataDirs) {
+        if (Test-Path $dataDir) {
+            Write-Host "kept session data and recordings at $dataDir (rerun with -Purge to delete them)"
+        }
+    }
 }
 
-Write-Host 'Cloud credentials, if you saved any, are in Credential Manager: search for jamstream and remove the entries.'
+if (-not $Purge) {
+    Write-Host 'Cloud credentials, if you saved any, are in Credential Manager: search for jamstream and remove the entries, or rerun with -Purge.'
+}
