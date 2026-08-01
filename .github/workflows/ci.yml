@@ -144,6 +144,18 @@ jobs:
       # shellcheck-clean (shellcheck is preinstalled on ubuntu runners).
       - name: Shellcheck release scripts
         run: shellcheck scripts/*.sh
+      # .gitattributes normalizes everything to LF so the bash steps Windows
+      # runners execute and the byte-compare gates keep working; this proves
+      # the index stayed normalized after checkouts from misconfigured
+      # machines. i/none and i/-text are fine (no line endings, binary).
+      - name: Every text file is stored with LF
+        run: |
+          bad=$(git ls-files --eol | grep -E '^i/(crlf|mixed)' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            echo "CRLF or mixed line endings in the index; run git add --renormalize ." >&2
+            exit 1
+          fi
 
   # Unit, property, integration, and E2E story tests, plus a production
   # build of every binary. The harness gate suite runs in its own job below

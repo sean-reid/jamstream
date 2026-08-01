@@ -2,3 +2,6 @@
 *.png binary
 *.ttf binary
 *.wav binary
+*.ico binary
+*.icns binary
+crates/protocol/fuzz/corpus/** binary
