@@ -123,6 +123,36 @@ async fn join_musician(mat: &SessionMaterial, name: &str) -> (ClientCore, UdpSoc
     (client, socket, start)
 }
 
+/// The command line of a live pid, asked of the OS directly.
+#[cfg(unix)]
+fn command_line_of(pid: &str) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-p", pid, "-o", "command="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// CIM through PowerShell, because tasklist never shows arguments and wmic
+/// is gone from Windows 11 24H2. A PowerShell startup costs a few hundred
+/// ms, which is fine once in a test and exactly what production liveness
+/// refuses to pay per probe (see tasklist_probe in the local provider).
+#[cfg(windows)]
+fn command_line_of(pid: &str) -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+    let out = std::process::Command::new(format!(
+        "{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    ))
+    .args([
+        "-NoProfile",
+        "-Command",
+        &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"),
+    ])
+    .output()
+    .expect("powershell Get-CimInstance");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 #[tokio::test]
 async fn launch_join_destroy_end_to_end() {
     let dir = scratch_dir("localmode-e2e");
@@ -142,22 +172,15 @@ async fn launch_join_destroy_end_to_end() {
     // The provider must forward both self-exit windows from the flat
     // config to the spawned server's command line (session_material sets
     // idle_shutdown_min = 10 and max_duration_min = 720).
-    #[cfg(unix)]
-    {
-        let out = std::process::Command::new("ps")
-            .args(["-p", &instance.id, "-o", "command="])
-            .output()
-            .expect("ps");
-        let cmdline = String::from_utf8_lossy(&out.stdout).to_string();
-        assert!(
-            cmdline.contains("--idle-exit-min 10"),
-            "idle window not forwarded: {cmdline}"
-        );
-        assert!(
-            cmdline.contains("--max-duration-min 720"),
-            "max duration not forwarded: {cmdline}"
-        );
-    }
+    let cmdline = command_line_of(&instance.id);
+    assert!(
+        cmdline.contains("--idle-exit-min 10"),
+        "idle window not forwarded: {cmdline}"
+    );
+    assert!(
+        cmdline.contains("--max-duration-min 720"),
+        "max duration not forwarded: {cmdline}"
+    );
 
     // A real client joins through loopback; the invite address is local
     // regardless of the LAN ip the instance advertises.
