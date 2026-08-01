@@ -273,7 +273,7 @@ jobs:
         run: cargo run --locked -p jamstream-cli --release -- sweep --dry-run --provider digitalocean
       # Later addition goes here: provision the cheapest real instance,
       # verify boot + handshake + self-termination, then assert a final
-      # sweep finds nothing (testing.md, "Cloud provider tests" item 3).
+      # sweep finds nothing.
       - name: Full launch and destroy smoke (not yet implemented)
         if: steps.creds.outputs.available == 'true'
         run: echo 'Placeholder; full provision/boot/self-terminate/sweep smoke lands in a later change.'
