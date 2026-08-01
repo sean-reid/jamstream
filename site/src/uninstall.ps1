@@ -54,6 +54,14 @@ if (Test-Path $cli) {
     }
 }
 
+# A running exe cannot be deleted; Remove-Item would die partway through the loop.
+$running = Get-Process -Name jamstream-app, jamstreamd -ErrorAction SilentlyContinue
+if ($running) {
+    $names = ($running | Select-Object -ExpandProperty ProcessName | Sort-Object -Unique) -join ', '
+    Write-Host "close JamStream first: still running: $names"
+    exit 1
+}
+
 $removed = 0
 foreach ($name in $owned) {
     $file = Join-Path $InstallDir $name
