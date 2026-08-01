@@ -11,6 +11,10 @@ publish.workspace = true
 thiserror.workspace = true
 rtrb.workspace = true
 hound.workspace = true
+# The boundary converter for devices that cannot clock at the session rate
+# (#347 rung 3). Same crate and major the engine's drift compensators are
+# already written against, so this adds nothing to the dependency graph.
+rubato.workspace = true
 
 # The hardware loopback test codes its tone with the session's real Opus
 # settings, so a format or scaling bug shows up as a frequency-domain failure
