@@ -123,6 +123,36 @@ async fn join_musician(mat: &SessionMaterial, name: &str) -> (ClientCore, UdpSoc
     (client, socket, start)
 }
 
+/// The command line of a live pid, asked of the OS directly.
+#[cfg(unix)]
+fn command_line_of(pid: &str) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-p", pid, "-o", "command="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// CIM through PowerShell, because tasklist never shows arguments and wmic
+/// is gone from Windows 11 24H2. A PowerShell startup costs a few hundred
+/// ms, which is fine once in a test and exactly what production liveness
+/// refuses to pay per probe (see tasklist_probe in the local provider).
+#[cfg(windows)]
+fn command_line_of(pid: &str) -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+    let out = std::process::Command::new(format!(
+        "{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    ))
+    .args([
+        "-NoProfile",
+        "-Command",
+        &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"),
+    ])
+    .output()
+    .expect("powershell Get-CimInstance");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 #[tokio::test]
 async fn launch_join_destroy_end_to_end() {
     let dir = scratch_dir("localmode-e2e");
@@ -132,32 +162,36 @@ async fn launch_join_destroy_end_to_end() {
     let mut mat = session_material(10);
 
     mat.reserved.release();
+    let spawn_started = Instant::now();
     let instance = provider
         .launch(launch_spec(&provider, &mat, "e2e-session"))
         .await
         .expect("launch");
+    // launch() waits READY_TIMEOUT for the spawned jamstreamd, a fixed 5 s
+    // that JAMSTREAM_PERF_BUDGET_SECS does not scale, and it is tightest on
+    // the platform where CreateProcess plus Defender's first-run scan of a
+    // fresh binary costs the most (#339). Published from every run of every
+    // platform via .config/nextest.toml so the window can be judged against
+    // measurements; nothing gates on it.
+    println!(
+        "local spawn-to-ready: {:.0} ms",
+        spawn_started.elapsed().as_secs_f64() * 1e3
+    );
     assert!(instance.public_ip.is_some(), "instance must carry an ip");
     assert_eq!(instance.session_id(), Some("e2e-session"));
 
     // The provider must forward both self-exit windows from the flat
     // config to the spawned server's command line (session_material sets
     // idle_shutdown_min = 10 and max_duration_min = 720).
-    #[cfg(unix)]
-    {
-        let out = std::process::Command::new("ps")
-            .args(["-p", &instance.id, "-o", "command="])
-            .output()
-            .expect("ps");
-        let cmdline = String::from_utf8_lossy(&out.stdout).to_string();
-        assert!(
-            cmdline.contains("--idle-exit-min 10"),
-            "idle window not forwarded: {cmdline}"
-        );
-        assert!(
-            cmdline.contains("--max-duration-min 720"),
-            "max duration not forwarded: {cmdline}"
-        );
-    }
+    let cmdline = command_line_of(&instance.id);
+    assert!(
+        cmdline.contains("--idle-exit-min 10"),
+        "idle window not forwarded: {cmdline}"
+    );
+    assert!(
+        cmdline.contains("--max-duration-min 720"),
+        "max duration not forwarded: {cmdline}"
+    );
 
     // A real client joins through loopback; the invite address is local
     // regardless of the LAN ip the instance advertises.
@@ -183,6 +217,24 @@ async fn launch_join_destroy_end_to_end() {
         "destroyed session still listed"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The spawn-to-ready line above only exists on passing runs because
+/// `.config/nextest.toml` names this test for publishing, and filters there
+/// are exact matches: a rename has to land in both places or in neither.
+/// Same pairing the harness and session suites keep for their measurements.
+#[test]
+fn the_measured_tests_are_named_in_the_nextest_config() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+    let (name, _) = (
+        stringify!(launch_join_destroy_end_to_end),
+        launch_join_destroy_end_to_end as fn(),
+    );
+    assert!(
+        CONFIG.contains(&format!("test(={name})")),
+        ".config/nextest.toml no longer names {name}, so its spawn-to-ready \
+         measurement is being printed into a void"
+    );
 }
 
 #[tokio::test]

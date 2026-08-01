@@ -223,7 +223,28 @@ async fn local_host_join_and_end_story() {
                 .starts_with('Z');
         assert!(!alive, "jamstreamd pid {instance_pid} survived end");
     }
-    #[cfg(not(unix))]
+    // The same question through tasklist, the exact-pid CSV shape production
+    // liveness parses. No zombie state here: a terminated process leaves the
+    // task list even while the unreaped child handle keeps its pid pinned.
+    #[cfg(windows)]
+    {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+        let out = std::process::Command::new(format!("{root}\\System32\\tasklist.exe"))
+            .args([
+                "/FI",
+                &format!("PID eq {instance_pid}"),
+                "/NH",
+                "/FO",
+                "CSV",
+            ])
+            .output()
+            .expect("tasklist");
+        let alive = String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+            line.starts_with('"') && line.contains(&format!("\",\"{instance_pid}\",\""))
+        });
+        assert!(!alive, "jamstreamd pid {instance_pid} survived end");
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = instance_pid;
 
     // A fresh provider on the same state dir sees an empty registry, and a
