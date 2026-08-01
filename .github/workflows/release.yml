@@ -694,3 +694,47 @@ jobs:
           git commit -m "jamstream $TAG"
           git push origin "HEAD:refs/heads/$BRANCH"
           echo "pushed $TAG to https://github.com/$TAP_REPO ($BRANCH)"
+      # Scoop is the same shape as the tap: a bucket is just a git
+      # repository, so the release publishes it the same way, gated on a
+      # token so a release never fails for the channel. SCOOP_BUCKET_TOKEN
+      # is preferred; the tap token works as a fallback when one classic
+      # PAT covers both repositories.
+      - name: Push the Scoop bucket
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN || secrets.HOMEBREW_TAP_TOKEN }}
+          BUCKET_REPO: sean-reid/scoop-jamstream
+        run: |
+          set -eu
+          if [ -z "${SCOOP_BUCKET_TOKEN:-}" ]; then
+            echo "::warning::SCOOP BUCKET PUSH SKIPPED: no SCOOP_BUCKET_TOKEN or HOMEBREW_TAP_TOKEN secret. The rendered manifests are attached to this release inside jamstream-packaging.tar.gz."
+            exit 0
+          fi
+          STATUS=$(curl -sS -o bucket-repo.json -w '%{http_code}' \
+            -H "Authorization: Bearer $SCOOP_BUCKET_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$BUCKET_REPO")
+          if [ "$STATUS" = 404 ]; then
+            echo "::warning::SCOOP BUCKET PUSH SKIPPED: https://github.com/$BUCKET_REPO does not exist, or the token cannot see it."
+            exit 0
+          fi
+          if [ "$STATUS" != 200 ]; then
+            echo "::error::the GitHub API returned $STATUS for $BUCKET_REPO; check the token"
+            exit 1
+          fi
+          BRANCH=$(sed -n 's/.*"default_branch": *"\([^"]*\)".*/\1/p' bucket-repo.json | head -1)
+          [ -n "$BRANCH" ] || BRANCH=main
+          git clone "https://x-access-token:$SCOOP_BUCKET_TOKEN@github.com/$BUCKET_REPO.git" bucket
+          mkdir -p bucket/bucket
+          cp rendered/scoop/bucket/jamstream.json bucket/bucket/jamstream.json
+          cp rendered/scoop/bucket/jamstream-app.json bucket/bucket/jamstream-app.json
+          cd bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/jamstream.json bucket/jamstream-app.json
+          if git diff --cached --quiet; then
+            echo "the bucket already carries $TAG; nothing to push"
+            exit 0
+          fi
+          git commit -m "jamstream $TAG"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "pushed $TAG to https://github.com/$BUCKET_REPO ($BRANCH)"
