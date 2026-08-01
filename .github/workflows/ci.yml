@@ -225,11 +225,15 @@ jobs:
         run: cargo nextest run --locked --workspace --exclude jamstream-harness -E 'not binary(ui_snapshots)'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
-      # The compile surface nextest leaves dark: benches and examples.
-      # Cheap on the warm cache, and Windows is the OS where a cfg'd arm
-      # nothing else builds would otherwise ship broken.
+      # The compile surface nextest leaves dark is exactly the bench
+      # targets; everything else compiles in the nextest build or the
+      # clippy step below. A workspace-wide --all-targets check here
+      # duplicated those builds in another profile and, with the exe
+      # resource scripts and persistence deps added, pushed this leg past
+      # its 20 minute ceiling; scoping to the three bench crates keeps
+      # the coverage and drops the duplicate work.
       - if: runner.os == 'Windows'
-        run: cargo check --locked --workspace --all-targets
+        run: cargo check --locked --benches -p jamstream-engine -p jamstream-protocol -p jamstream-server
       # nextest does not run doctests, and nothing else did either, so a doctest
       # would have compiled on the author's machine and never once in CI (#295).
       # It costs a doc-mode build to find zero of them today, because every
