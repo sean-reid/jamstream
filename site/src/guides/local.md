@@ -26,4 +26,4 @@ If a laptop dies mid-session or a state file is lost, `jamstream sweep` finds lo
 
 Unlike the app, the CLI does not bundle the server, so local mode needs a `jamstreamd` binary already on your machine; nothing is downloaded. It is taken from `JAMSTREAMD_PATH`, then from beside the running executable, then from your PATH, and `host` fails before starting anything with an error naming every place it looked; on Linux x86_64 the [install script's](../download.md) `--with-server` flag puts one in the second of those places.
 
-If a local server exits at startup, the first place to look is its `server.log`, in the session's own directory under your platform's data directory in `jamstream/sessions/`.
+If a local server exits at startup, the first place to look is its `server.log`, in the session's own directory under your platform's data directory in `jamstream/sessions/`; on Windows that is `%LOCALAPPDATA%\jamstream\sessions\<id>\server.log`.
