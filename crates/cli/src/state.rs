@@ -148,6 +148,15 @@ impl SessionState {
     pub fn forget_issuer_key(&mut self) {
         self.issuer_private_key_b64 = String::new();
     }
+
+    /// Closes the record for an instance that no longer exists, whichever
+    /// way it went: `jamstream end`, a sweep, the server's own timers, or a
+    /// crash. The key is forgotten for the same reason `end` forgets it.
+    pub fn mark_ended(&mut self, ended_unix: u64) {
+        self.status = SessionStatus::Ended;
+        self.ended_unix = Some(ended_unix);
+        self.forget_issuer_key();
+    }
 }
 
 /// Where session records live: [`STATE_DIR_ENV`] when set, else a
@@ -425,6 +434,17 @@ mod tests {
         // The public half and the identity stay visible.
         assert!(rendered.contains("c2VydmVy"));
         assert!(rendered.contains("deadbeefcafef00d"));
+    }
+
+    /// One helper closes a record however the session died, so every path
+    /// (end, sweep, a crash noticed later) leaves the same shape behind.
+    #[test]
+    fn mark_ended_closes_the_record_and_drops_the_key() {
+        let mut state = sample();
+        state.mark_ended(1_784_000_777);
+        assert_eq!(state.status, SessionStatus::Ended);
+        assert_eq!(state.ended_unix, Some(1_784_000_777));
+        assert!(state.issuer_private_key_b64.is_empty());
     }
 
     #[test]
