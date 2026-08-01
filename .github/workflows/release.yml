@@ -452,13 +452,15 @@ jobs:
           ./target/release/jamstream.exe --version
           ./target/release/jamstream.exe --version | grep -qF "${TAG#v}"
           ./target/release/jamstreamd.exe --version
-      # Machine type is a hard gate; the subsystem and import table are
-      # printed as measurements. Tightening imports to an allowlist wants
-      # the distribution from a few real releases first, and asserting the
-      # GUI subsystem waits on the windows_subsystem change itself.
-      - name: The exes are x64, and what they import is on the record
+      # Machine type and subsystem are hard gates: the app must be a GUI
+      # binary (no console window on a double-click, which is the one place
+      # a regression here shows) while the CLI and server stay console. The
+      # import table is printed as a measurement; tightening it to an
+      # allowlist wants the distribution from a few real releases first.
+      - name: The exes are x64 with the right subsystems, imports on the record
         shell: powershell
         run: |
+          $want = @{ 'jamstream.exe' = 3; 'jamstream-app.exe' = 2; 'jamstreamd.exe' = 3 }
           foreach ($exe in 'jamstream.exe', 'jamstream-app.exe', 'jamstreamd.exe') {
             $b = [IO.File]::ReadAllBytes("target/release/$exe")
             $pe = [BitConverter]::ToInt32($b, 0x3C)
@@ -466,6 +468,7 @@ jobs:
             $subsystem = [BitConverter]::ToUInt16($b, $pe + 24 + 68)
             '{0}: machine=0x{1:X4} subsystem={2}' -f $exe, $machine, $subsystem
             if ($machine -ne 0x8664) { throw "$exe is not an x86_64 PE image" }
+            if ($subsystem -ne $want[$exe]) { throw "$exe subsystem is $subsystem, expected $($want[$exe])" }
           }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -property installationPath
