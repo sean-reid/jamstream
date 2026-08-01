@@ -31,8 +31,10 @@ if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
 }
 
 # Exactly the files the two install archives contain. Anything else in the
-# directory is not ours to delete.
-$owned = @('jamstream.exe', 'jamstream-app.exe', 'jamstreamd.exe', 'jamstream.ico')
+# directory is not ours to delete. jamstream.exe goes last: it is the recovery
+# tool the error guidance leans on, so a lock elsewhere must not orphan things
+# with the CLI already gone.
+$owned = @('jamstream-app.exe', 'jamstreamd.exe', 'jamstream.ico', 'jamstream.exe')
 
 $cli = Join-Path $InstallDir 'jamstream.exe'
 if (Test-Path $cli) {
