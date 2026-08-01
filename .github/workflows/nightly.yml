@@ -175,6 +175,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      # The pinned ffmpeg, for the reasons documented in ci.yml: this job runs
+      # crates/stream's tests too, and real_ffmpeg fails on Linux when the
+      # encoder a session VM actually boots with is not on PATH.
+      - if: runner.os == 'Linux'
+        name: Install the ffmpeg a session VM runs
+        run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
+      - if: runner.os == 'Linux'
+        run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-nextest
