@@ -18,7 +18,7 @@ Click **Host a session**. The wizard's first step asks where the session server 
 
 Pick **local** and click Continue. Local has no region to pick, so the wizard jumps to a "Before you start" step where you set the number of musician and listener seats and it confirms the session costs nothing. Click **Start the session**.
 
-The app starts a real `jamstreamd` process on your machine, completes a full encrypted handshake with it before showing you anything, joins you automatically, and opens Settings on the Invites tab.
+The app starts a real `jamstreamd` process on your machine, completes a full encrypted handshake with it before showing you anything, joins you automatically, and opens Settings on the Invites tab. On Windows, the first local host raises a Defender Firewall prompt for `jamstreamd.exe`: allow it on both Private and Public networks, or bandmates on your network time out after 10 seconds when they join.
 
 ## 3. Share the invites
 

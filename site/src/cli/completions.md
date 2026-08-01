@@ -20,4 +20,11 @@ $ source <(jamstream completions bash)
 
 # fish
 $ jamstream completions fish > ~/.config/fish/completions/jamstream.fish
+
+# PowerShell ($PROFILE)
+jamstream completions powershell | Out-String | Invoke-Expression
 ```
+
+PowerShell only runs `$PROFILE` scripts under an execution policy other
+than Restricted, the default; `Set-ExecutionPolicy -Scope CurrentUser
+RemoteSigned` is enough.

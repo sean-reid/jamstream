@@ -174,4 +174,4 @@ $ jamstream sweep --dry-run --provider aws
 No jamstream-tagged instances found.
 ```
 
-That output means the key authenticates and can list instances. JamStream reads exactly these two variables; it does not read `~/.aws/config` profiles in the current build. The app reads the same variables as a silent fallback, so a machine set up this way is `ready` in the wizard with nothing pasted.
+That output means the key authenticates and can list instances. In PowerShell the export lines are `$env:AWS_ACCESS_KEY_ID = 'AKIA...'` and `$env:AWS_SECRET_ACCESS_KEY = 'your_secret_here'`. JamStream reads exactly these two variables; it does not read `~/.aws/config` profiles in the current build. The app reads the same variables as a silent fallback, so a machine set up this way is `ready` in the wizard with nothing pasted.
