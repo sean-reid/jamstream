@@ -73,7 +73,7 @@ function Get-Asset([string]$Name, [string]$Dest) {
     }
 }
 
-function Install-Archive([string]$Asset, [string]$SumsPath, [string]$Dir, [string]$Tmp) {
+function Install-Archive([string]$Asset, [string]$Binary, [string]$SumsPath, [string]$Dir, [string]$Tmp) {
     $zip = Join-Path $Tmp $Asset
     if (-not (Get-Asset $Asset $zip)) {
         throw "The latest release has no asset named $Asset; if a release was just published, its uploads may still be running, so retry in a few minutes."
@@ -86,6 +86,9 @@ function Install-Archive([string]$Asset, [string]$SumsPath, [string]$Dir, [strin
         throw "Checksum mismatch for ${Asset}: expected $expected, got $actual. Delete the download and retry; if it repeats, report it."
     }
     Expand-Archive -Path $zip -DestinationPath $Dir -Force
+    if (-not (Test-Path (Join-Path $Dir $Binary))) {
+        throw "the archive $Asset did not contain a $Binary binary"
+    }
     Write-Host "installed $Asset into $Dir (sha256 verified)"
 }
 
@@ -108,9 +111,9 @@ try {
         exit 1
     }
 
-    Install-Archive 'jamstream-cli-windows-x86_64.zip' $sums $InstallDir $tmp
+    Install-Archive 'jamstream-cli-windows-x86_64.zip' 'jamstream.exe' $sums $InstallDir $tmp
     if ($WithApp) {
-        Install-Archive 'jamstream-app-windows-x86_64.zip' $sums $InstallDir $tmp
+        Install-Archive 'jamstream-app-windows-x86_64.zip' 'jamstream-app.exe' $sums $InstallDir $tmp
     }
     if ($WithServer) {
         Write-Host 'jamstreamd binaries are published for Linux x86_64 (musl) only.'
