@@ -85,6 +85,8 @@ function Install-Archive([string]$Asset, [string]$Binary, [string]$SumsPath, [st
     if ($expected.ToLowerInvariant() -ne $actual.ToLowerInvariant()) {
         throw "Checksum mismatch for ${Asset}: expected $expected, got $actual. Delete the download and retry; if it repeats, report it."
     }
+    # Created only now, once there is something verified to put in it.
+    if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Path $Dir | Out-Null }
     Expand-Archive -Path $zip -DestinationPath $Dir -Force
     if (-not (Test-Path (Join-Path $Dir $Binary))) {
         throw "the archive $Asset did not contain a $Binary binary"
@@ -92,13 +94,33 @@ function Install-Archive([string]$Asset, [string]$Binary, [string]$SumsPath, [st
     Write-Host "installed $Asset into $Dir (sha256 verified)"
 }
 
+# Refuse an unwritable target before anything downloads, with the one-line
+# refusal install.sh gives rather than a raw UnauthorizedAccessException.
+# The probe lands in the nearest existing ancestor, because the directory
+# itself is not created until an archive has been verified.
+$probeDir = $InstallDir
+while (-not (Test-Path $probeDir)) {
+    $parent = Split-Path -Parent $probeDir
+    if (-not $parent -or $parent -eq $probeDir) { break }
+    $probeDir = $parent
+}
+$probe = Join-Path $probeDir ('jamstream-probe-' + [IO.Path]::GetRandomFileName())
+try {
+    New-Item -ItemType File -Path $probe -Force | Out-Null
+    Remove-Item -Force $probe
+} catch {
+    Write-Host "$InstallDir is not writable; set JAMSTREAM_INSTALL_DIR to a per-user path such as $env:LOCALAPPDATA\Programs\jamstream."
+    exit 1
+}
+
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("jamstream-install-" + [IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmp | Out-Null
-New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
 Write-Host 'JamStream installer'
 Write-Host "install directory: $InstallDir"
 
+$createdInstallDir = -not (Test-Path $InstallDir)
+$installed = $false
 try {
     $sums = Join-Path $tmp 'SHA256SUMS'
     if (-not (Get-Asset 'SHA256SUMS' $sums)) {
@@ -121,8 +143,15 @@ try {
         Write-Host 'On Windows, local mode uses the jamstreamd that ships next to the'
         Write-Host 'desktop app, or a from-source build: cargo install --path crates/server'
     }
+    $installed = $true
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    # A failed install leaves nothing behind: drop the directory again when
+    # this run created it and nothing landed in it.
+    if (-not $installed -and $createdInstallDir -and (Test-Path $InstallDir) -and
+        -not (Get-ChildItem -Force $InstallDir)) {
+        Remove-Item -Force $InstallDir -ErrorAction SilentlyContinue
+    }
 }
 
 $normalized = $InstallDir.TrimEnd('\')
