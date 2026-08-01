@@ -35,8 +35,18 @@ if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
     Write-Host '  curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh'
     exit 1
 }
+# Is64BitOperatingSystem is true on ARM64 too, where only emulated x64 would run.
+if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+    Write-Host 'Releases cover x86_64 only; there is no Windows ARM64 build yet.'
+    exit 1
+}
 if (-not [Environment]::Is64BitOperatingSystem) {
     Write-Host 'Releases cover 64-bit Windows on x86_64 only.'
+    exit 1
+}
+# The same floor the winget manifest declares.
+if ([Environment]::OSVersion.Version -lt [Version]'10.0.17763') {
+    Write-Host 'JamStream needs Windows 10 version 1809 (build 17763) or newer.'
     exit 1
 }
 
