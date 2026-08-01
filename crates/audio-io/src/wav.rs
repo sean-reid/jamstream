@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::resample::{converting_capture, converting_playback};
+use crate::resample::{converting_capture, converting_playback, session_frames};
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
     StreamConfig, StreamHandle,
@@ -386,14 +386,6 @@ impl StreamHandle for WavStream {
 
 fn wav_err(e: hound::Error) -> AudioError {
     AudioError::Backend(e.to_string())
-}
-
-/// A device-rate callback size in session-rate frames, rounded up: what a
-/// converting stream can hand the handler per callback, and therefore what
-/// [`StreamHandle::buffer_frames`] reports so everything sized around
-/// callbacks keeps one unit.
-fn session_frames(device_frames: u32, session_rate: u32, device_rate: u32) -> u32 {
-    (u64::from(device_frames) * u64::from(session_rate)).div_ceil(u64::from(device_rate)) as u32
 }
 
 /// Read the whole input file, asserting the device's rate, and convert to

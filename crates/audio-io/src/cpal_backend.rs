@@ -3,22 +3,27 @@
 //! `WindowsBackend`, which prefers the direct WASAPI exclusive-mode path; see
 //! `backend()` in lib.rs.
 //!
-//! Every stream runs at the session rate or not at all, because jamstream
-//! never resamples. Which of those two happens is decided in one place,
-//! [`plan_open`], and it turns on whether the host reports a stream it could
-//! not open at the rate asked for: see [`verifies_negotiated_rate`]. The OS
-//! itself may still resample on the render side (WASAPI's AUTOCONVERTPCM,
-//! PipeWire's graph); [`render_conversion`] detects that and every open
-//! discloses it through [`crate::active_render_conversion`].
+//! The handler always sees the session rate; the #347 ladder decides how
+//! each direction gets there, in one place, [`plan_direction`]. A device
+//! that runs at the session rate opens as it is. A device that does not is
+//! asked for it anyway where the host can be trusted to answer honestly
+//! ([`verifies_negotiated_rate`]): CoreAudio moves the whole device clock,
+//! WASAPI render and PipeWire convert in the OS. When the host refuses, or
+//! cannot be trusted to try (ALSA), the stream opens at the device's own
+//! rate with the boundary converter from [`crate::resample`] wrapped around
+//! that direction's handler half. The refusal that used to be the whole
+//! policy survives only for a device whose native-rate open itself fails,
+//! and for a Bluetooth hands-free microphone, which has no rate worth
+//! carrying (#330).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::format::map_frames;
 use crate::mode::set_render_conversion;
-use crate::resample::MAX_CHUNK_FRAMES;
+use crate::resample::{MAX_CHUNK_FRAMES, converting_capture, converting_playback, session_frames};
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
     StreamConfig, StreamHandle,
@@ -136,53 +141,51 @@ impl AudioBackend for CpalBackend {
             rate: config.sample_rate,
             host: self.host.id().name(),
         };
-        let converts = verifies_negotiated_rate(rates.host);
+        let host_converts = verifies_negotiated_rate(rates.host);
         let in_device = self.find_device(capture, Direction::Capture)?;
         let out_device = self.find_device(playback, Direction::Playback)?;
-        let in_form = form_factor_of(&in_device);
-        let out_form = form_factor_of(&out_device);
-        let in_native = in_device.default_input_config().map_err(|e| map_err(&e))?;
-        let out_native = out_device
-            .default_output_config()
-            .map_err(|e| map_err(&e))?;
-        let (in_open, in_attempted) = plan_open(
-            &in_native,
+        let in_side = SideContext {
+            device: &in_device,
+            direction: Direction::Capture,
+            native: in_device.default_input_config().map_err(|e| map_err(&e))?,
+            form: form_factor_of(&in_device),
+        };
+        let out_side = SideContext {
+            device: &out_device,
+            direction: Direction::Playback,
+            native: out_device
+                .default_output_config()
+                .map_err(|e| map_err(&e))?,
+            form: form_factor_of(&out_device),
+        };
+        let in_plan = plan_direction(
+            rates,
+            Direction::Capture,
+            &in_side.native,
             in_device
                 .supported_input_configs()
                 .map_err(|e| map_err(&e))?,
-            config.sample_rate,
-            converts,
-        )
-        .ok_or_else(|| rates.refused(Direction::Capture, &in_native, in_form, None))?;
-        let (out_open, out_attempted) = plan_open(
-            &out_native,
+            host_converts,
+            in_side.form,
+        )?;
+        let out_plan = plan_direction(
+            rates,
+            Direction::Playback,
+            &out_side.native,
             out_device
                 .supported_output_configs()
                 .map_err(|e| map_err(&e))?,
-            config.sample_rate,
-            converts,
-        )
-        .ok_or_else(|| rates.refused(Direction::Playback, &out_native, out_form, None))?;
+            host_converts,
+            out_side.form,
+        )?;
 
         let (on_capture, on_playback) = handler.into_parts();
         let errored = Arc::new(AtomicBool::new(false));
 
-        let input =
-            build_input(&in_device, &in_open, &config, on_capture, &errored).map_err(|e| {
-                if in_attempted {
-                    rates.refused(Direction::Capture, &in_native, in_form, Some(&e))
-                } else {
-                    e
-                }
-            })?;
-        let output =
-            build_output(&out_device, &out_open, &config, on_playback, &errored).map_err(|e| {
-                if out_attempted {
-                    rates.refused(Direction::Playback, &out_native, out_form, Some(&e))
-                } else {
-                    e
-                }
-            })?;
+        let (input, in_rate, _in_added) =
+            open_capture_side(&in_side, in_plan, &config, rates, on_capture, &errored)?;
+        let (output, out_rate, _out_added) =
+            open_playback_side(&out_side, out_plan, &config, rates, on_playback, &errored)?;
 
         // cpal 0.18 streams start paused.
         input.play().map_err(|e| map_err(&e))?;
@@ -191,15 +194,16 @@ impl AudioBackend for CpalBackend {
         // Render-side conversion disclosure: once per open, plus the report
         // the UI polls. The device's default config is its engine rate (the
         // WASAPI mix format, the PipeWire graph rate), which is what an OS
-        // converter would be bridging to.
+        // converter would be bridging to; a rung 3 stream opened at that rate
+        // itself, so nothing OS-side converts it.
         if let Some(converting) =
-            render_conversion(rates.host, out_native.sample_rate(), config.sample_rate)
+            render_conversion(rates.host, out_side.native.sample_rate(), out_rate)
         {
             set_render_conversion(converting);
             if converting {
                 tracing::warn!(
-                    device_rate = out_native.sample_rate(),
-                    stream_rate = config.sample_rate,
+                    device_rate = out_side.native.sample_rate(),
+                    stream_rate = out_rate,
                     host = rates.host,
                     "the OS is resampling the render stream to the playback \
                      device's rate, adding latency the buffer sizes do not show"
@@ -209,10 +213,19 @@ impl AudioBackend for CpalBackend {
 
         // Negotiated callback sizes, per host: the WASAPI shared-mode device
         // period, the ALSA period, CoreAudio's device frame size, PipeWire's
-        // last quantum (the request until the first callback lands). Their sum
-        // is the best latency estimate cpal exposes; the larger one is what a
-        // callback-sized consumer has to absorb.
-        let (in_frames, out_frames) = (input.buffer_size().ok(), output.buffer_size().ok());
+        // last quantum (the request until the first callback lands). Each is
+        // scaled from its direction's opened rate to session-rate frames, the
+        // unit `buffer_frames` promises. Their sum is the best latency
+        // estimate cpal exposes; the larger one is what a callback-sized
+        // consumer has to absorb.
+        let in_frames = input
+            .buffer_size()
+            .ok()
+            .map(|n| session_frames(n, config.sample_rate, in_rate));
+        let out_frames = output
+            .buffer_size()
+            .ok()
+            .map(|n| session_frames(n, config.sample_rate, out_rate));
         let latency_frames = match (in_frames, out_frames) {
             (Some(i), Some(o)) => Some(i + o),
             (one, other) => one.or(other),
@@ -230,6 +243,157 @@ impl AudioBackend for CpalBackend {
             buffer_frames,
         }))
     }
+}
+
+/// One direction's device, native config, and reported shape: what the open
+/// path needs to build the stream and to word a refusal.
+struct SideContext<'a> {
+    device: &'a cpal::Device,
+    direction: Direction,
+    native: cpal::SupportedStreamConfig,
+    form: FormFactor,
+}
+
+/// Builds the capture stream for its plan. An attempted session-rate open
+/// that the host refuses falls to the boundary converter at the device's own
+/// rate (#347 rung 3); the refusal survives only when that native-rate open
+/// fails too. Returns the stream, the rate it opened at, and the converter's
+/// added latency when this direction converts.
+fn open_capture_side(
+    side: &SideContext<'_>,
+    plan: DirectionPlan,
+    config: &StreamConfig,
+    rates: RateContext,
+    on_capture: CaptureFn,
+    errored: &Arc<AtomicBool>,
+) -> Result<(cpal::Stream, u32, Option<f32>)> {
+    let refused = |e: &AudioError| rates.refused(side.direction, &side.native, side.form, Some(e));
+    if plan.convert {
+        let device_rate = plan.open.sample_rate();
+        let (wrapped, added) =
+            converting_capture(on_capture, config.sample_rate, device_rate, config.channels);
+        let stream = build_input(side.device, &plan.open, config, wrapped, errored)
+            .map_err(|e| refused(&e))?;
+        return Ok((stream, device_rate, Some(added)));
+    }
+    if !plan.attempted {
+        let stream = build_input(side.device, &plan.open, config, on_capture, errored)?;
+        return Ok((stream, plan.open.sample_rate(), None));
+    }
+    // The attempt: a session-rate config the device never advertised, put to
+    // a host that reports honestly. cpal consumes the callback even when the
+    // build fails, so it rides in a slot the fallback can take back.
+    let (shim, slot) = recoverable_capture(on_capture);
+    let failure = match build_input(side.device, &plan.open, config, shim, errored) {
+        Ok(stream) => return Ok((stream, plan.open.sample_rate(), None)),
+        Err(e) => e,
+    };
+    let Some(inner) = slot.lock().ok().and_then(|mut s| s.take()) else {
+        return Err(refused(&failure));
+    };
+    tracing::info!(
+        host = rates.host,
+        device_rate = side.native.sample_rate(),
+        error = %failure,
+        "capture will not open at the session rate; converting at the device's own"
+    );
+    let device_rate = side.native.sample_rate();
+    let (wrapped, added) =
+        converting_capture(inner, config.sample_rate, device_rate, config.channels);
+    let stream = build_input(side.device, &side.native, config, wrapped, errored)
+        .map_err(|e| refused(&e))?;
+    Ok((stream, device_rate, Some(added)))
+}
+
+/// [`open_capture_side`]'s mirror for the playback half.
+fn open_playback_side(
+    side: &SideContext<'_>,
+    plan: DirectionPlan,
+    config: &StreamConfig,
+    rates: RateContext,
+    on_playback: PlaybackFn,
+    errored: &Arc<AtomicBool>,
+) -> Result<(cpal::Stream, u32, Option<f32>)> {
+    let refused = |e: &AudioError| rates.refused(side.direction, &side.native, side.form, Some(e));
+    if plan.convert {
+        let device_rate = plan.open.sample_rate();
+        let (wrapped, added) = converting_playback(
+            on_playback,
+            config.sample_rate,
+            device_rate,
+            config.channels,
+        );
+        let stream = build_output(side.device, &plan.open, config, wrapped, errored)
+            .map_err(|e| refused(&e))?;
+        return Ok((stream, device_rate, Some(added)));
+    }
+    if !plan.attempted {
+        let stream = build_output(side.device, &plan.open, config, on_playback, errored)?;
+        return Ok((stream, plan.open.sample_rate(), None));
+    }
+    let (shim, slot) = recoverable_playback(on_playback);
+    let failure = match build_output(side.device, &plan.open, config, shim, errored) {
+        Ok(stream) => return Ok((stream, plan.open.sample_rate(), None)),
+        Err(e) => e,
+    };
+    let Some(inner) = slot.lock().ok().and_then(|mut s| s.take()) else {
+        return Err(refused(&failure));
+    };
+    tracing::info!(
+        host = rates.host,
+        device_rate = side.native.sample_rate(),
+        error = %failure,
+        "playback will not open at the session rate; converting at the device's own"
+    );
+    let device_rate = side.native.sample_rate();
+    let (wrapped, added) =
+        converting_playback(inner, config.sample_rate, device_rate, config.channels);
+    let stream = build_output(side.device, &side.native, config, wrapped, errored)
+        .map_err(|e| refused(&e))?;
+    Ok((stream, device_rate, Some(added)))
+}
+
+/// Wraps a handler half so a failed build can recover it: cpal takes the data
+/// callback by value and drops it on failure, and the native-rate retry needs
+/// the same closure back. After a successful build the shim claims the inner
+/// closure from the slot on the first callback; the lock is uncontended by
+/// construction, because the only other locker is the failure path, which
+/// runs strictly before any callback can.
+fn recoverable_capture(inner: CaptureFn) -> (CaptureFn, Arc<Mutex<Option<CaptureFn>>>) {
+    let slot = Arc::new(Mutex::new(Some(inner)));
+    let shared = Arc::clone(&slot);
+    let mut claimed: Option<CaptureFn> = None;
+    let shim: CaptureFn = Box::new(move |samples: &[f32]| {
+        if claimed.is_none() {
+            let Ok(mut slot) = shared.try_lock() else {
+                return;
+            };
+            claimed = slot.take();
+        }
+        if let Some(inner) = claimed.as_mut() {
+            inner(samples);
+        }
+    });
+    (shim, slot)
+}
+
+/// [`recoverable_capture`]'s mirror for the playback half.
+fn recoverable_playback(inner: PlaybackFn) -> (PlaybackFn, Arc<Mutex<Option<PlaybackFn>>>) {
+    let slot = Arc::new(Mutex::new(Some(inner)));
+    let shared = Arc::clone(&slot);
+    let mut claimed: Option<PlaybackFn> = None;
+    let shim: PlaybackFn = Box::new(move |out: &mut [f32]| {
+        if claimed.is_none() {
+            let Ok(mut slot) = shared.try_lock() else {
+                return;
+            };
+            claimed = slot.take();
+        }
+        if let Some(inner) = claimed.as_mut() {
+            inner(out);
+        }
+    });
+    (shim, slot)
 }
 
 fn map_err(e: &cpal::Error) -> AudioError {
@@ -334,30 +498,62 @@ const fn render_conversion(host: &str, device_rate: u32, stream_rate: u32) -> Op
     }
 }
 
-/// The device config to open at `rate`, and whether opening it is an attempt.
-///
-/// An attempt is a config the device never advertised, offered to a host that
-/// [reports a rate it could not honour](verifies_negotiated_rate). None means
-/// there is nothing worth trying: the device does not run at the session rate
-/// and this host would play everything at the wrong pitch and speed rather
-/// than say so.
-fn plan_open(
+/// How one direction opens, decided by [`plan_direction`].
+#[derive(Debug, Clone, Copy)]
+struct DirectionPlan {
+    /// The config to build the stream with.
+    open: cpal::SupportedStreamConfig,
+    /// The config was never advertised; the host is being asked to honour it,
+    /// and a refusal falls to the converter at the device's own rate.
+    attempted: bool,
+    /// Open at the device's own rate with the boundary converter wrapped
+    /// around this direction's handler half (#347 rung 3).
+    convert: bool,
+}
+
+/// The #347 ladder for one direction. A device that advertises the session
+/// rate opens at it (on CoreAudio that open moves the device clock; rung 2
+/// lives inside cpal). One that does not is attempted anyway on a host that
+/// [reports a rate it could not honour](verifies_negotiated_rate), and opens
+/// at its own rate through the converter everywhere else. The refusal
+/// survives only for a Bluetooth hands-free microphone: converting an 8 or
+/// 16 kHz voice-profile capture would carry the session in telephone
+/// quality, and #330 decided the honest answer is another microphone.
+fn plan_direction(
+    rates: RateContext,
+    direction: Direction,
     native: &cpal::SupportedStreamConfig,
     supported: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
-    rate: u32,
     host_converts: bool,
-) -> Option<(cpal::SupportedStreamConfig, bool)> {
-    if let Some(config) = config_at_rate(native, supported, rate) {
-        return Some((config, false));
+    form: FormFactor,
+) -> Result<DirectionPlan> {
+    if let Some(open) = config_at_rate(native, supported, rates.rate) {
+        return Ok(DirectionPlan {
+            open,
+            attempted: false,
+            convert: false,
+        });
     }
-    host_converts.then(|| {
-        let attempt = cpal::SupportedStreamConfig::new(
+    if telephony_mic(direction, native.sample_rate(), form) {
+        return Err(rates.refused(direction, native, form, None));
+    }
+    if host_converts {
+        let open = cpal::SupportedStreamConfig::new(
             native.channels(),
-            rate,
+            rates.rate,
             *native.buffer_size(),
             native.sample_format(),
         );
-        (attempt, true)
+        return Ok(DirectionPlan {
+            open,
+            attempted: true,
+            convert: false,
+        });
+    }
+    Ok(DirectionPlan {
+        open: *native,
+        attempted: false,
+        convert: true,
     })
 }
 
@@ -420,9 +616,21 @@ const fn is_telephony_rate(rate: u32) -> bool {
     matches!(rate, 8_000 | 16_000)
 }
 
-/// What the person at the keyboard can do about a device that will not run at
-/// the session rate. jamstream does not resample, so this sentence is the
-/// entire remedy, and it is per host rather than per platform because the two
+/// A capture endpoint in a hands-free voice profile: a telephony native rate,
+/// or a Bluetooth or headset form factor. The one class of device the ladder
+/// still refuses, because no rung helps it; both signals trigger it, since
+/// Windows swaps a headset between profiles underneath a running session.
+fn telephony_mic(direction: Direction, native_rate: u32, form: FormFactor) -> bool {
+    direction == Direction::Capture
+        && (is_telephony_rate(native_rate)
+            || matches!(form, FormFactor::Bluetooth | FormFactor::Headset))
+}
+
+/// What the person at the keyboard can do about a device that will not open
+/// at any rate the ladder can carry. Rare since #347: the converter takes
+/// what used to be refused, so this sentence is read only when the
+/// native-rate open itself failed. Per host rather than per platform, because
+/// the two
 /// Linux hosts fail for opposite reasons.
 fn rate_remedy(host: &str, rate: u32) -> String {
     match host {
@@ -464,9 +672,9 @@ struct RateContext<'a> {
 }
 
 impl RateContext<'_> {
-    /// This device will not run at the session rate. `refusal` is the host's
-    /// own error when the open was attempted, and None when the device never
-    /// advertised the rate and this host cannot be trusted to try.
+    /// This device will not carry the session at all. `refusal` is the
+    /// host's own error when an open was attempted, and None for the one
+    /// refusal decided without asking: the hands-free microphone.
     ///
     /// A capture endpoint at a telephony rate, or on a Bluetooth or headset
     /// form factor, gets its own remedy: its hands-free mode has no 48 kHz
@@ -490,10 +698,7 @@ impl RateContext<'_> {
             Some(err) => format!(" ({})", err.detail()),
             None => String::new(),
         };
-        let telephony_mic = direction == Direction::Capture
-            && (is_telephony_rate(native.sample_rate())
-                || matches!(form, FormFactor::Bluetooth | FormFactor::Headset));
-        let remedy = if telephony_mic {
+        let remedy = if telephony_mic(direction, native.sample_rate(), form) {
             format!(
                 "that is a Bluetooth or headset microphone with no {rate} Hz \
                  mode, so use another capture device"
@@ -684,21 +889,35 @@ mod tests {
         assert_eq!(chosen.channels(), 2);
     }
 
-    /// The bug this guards: a 44.1 kHz-only device used to be opened at 48 kHz
-    /// anyway, which plays the session sharp and fast instead of failing.
+    /// The #347 ladder on a host that cannot be trusted to convert: a
+    /// 44.1 kHz-only device opens at its own rate through the boundary
+    /// converter instead of the old refusal. Opening it at 48 kHz anyway
+    /// would play the session sharp and fast, and refusing it is what #327
+    /// showed musicians cannot act on.
     #[test]
-    fn a_44_1_only_device_is_refused_rather_than_pitch_shifted() {
+    fn a_44_1_only_device_converts_rather_than_being_refused() {
         let native = native(44_100, 2);
         let ranges = [
             range(8_000, 44_100, 2, SampleFormat::F32),
             range(22_050, 44_100, 1, SampleFormat::I16),
         ];
         assert!(config_at_rate(&native, ranges.into_iter(), 48_000).is_none());
-        let err = ctx("ALSA").refused(Direction::Capture, &native, FormFactor::Unknown, None);
-        let AudioError::Unsupported(msg) = err else {
-            panic!("expected Unsupported, got {err:?}");
-        };
-        assert!(msg.contains("44100") && msg.contains("48000"), "{msg}");
+        let plan = plan_direction(
+            ctx("ALSA"),
+            Direction::Capture,
+            &native,
+            ranges.into_iter(),
+            false,
+            FormFactor::Unknown,
+        )
+        .expect("rung 3 takes what used to be refused");
+        assert!(plan.convert);
+        assert!(!plan.attempted);
+        assert_eq!(
+            plan.open.sample_rate(),
+            44_100,
+            "the device keeps its clock"
+        );
     }
 
     #[test]
@@ -721,30 +940,98 @@ mod tests {
     fn a_graph_that_advertises_only_44_1_is_attempted_on_a_converting_host() {
         let native = native(44_100, 2);
         let ranges = [range(44_100, 44_100, 2, SampleFormat::F32)];
-        let (open, attempted) = plan_open(&native, ranges.into_iter(), 48_000, true)
-            .expect("a converting host is asked, not pre-refused");
-        assert!(attempted);
-        assert_eq!(open.sample_rate(), 48_000);
-        assert_eq!(open.channels(), 2);
+        let plan = plan_direction(
+            ctx("PipeWire"),
+            Direction::Capture,
+            &native,
+            ranges.into_iter(),
+            true,
+            FormFactor::Unknown,
+        )
+        .expect("a converting host is asked, not pre-refused");
+        assert!(plan.attempted);
+        assert!(!plan.convert);
+        assert_eq!(plan.open.sample_rate(), 48_000);
+        assert_eq!(plan.open.channels(), 2);
     }
 
     /// And the other half: on a host that would run the card at 44.1 without
-    /// saying so, there is nothing to attempt.
+    /// saying so, the attempt is skipped and the converter takes it directly.
     #[test]
-    fn the_same_device_is_still_refused_on_a_host_that_converts_nothing() {
+    fn the_same_device_converts_on_a_host_that_converts_nothing() {
         let native = native(44_100, 2);
         let ranges = [range(44_100, 44_100, 2, SampleFormat::F32)];
-        assert!(plan_open(&native, ranges.into_iter(), 48_000, false).is_none());
+        let plan = plan_direction(
+            ctx("ALSA"),
+            Direction::Playback,
+            &native,
+            ranges.into_iter(),
+            false,
+            FormFactor::Unknown,
+        )
+        .expect("rung 3 is unconditional");
+        assert!(plan.convert);
+        assert_eq!(plan.open.sample_rate(), 44_100);
     }
 
     #[test]
     fn an_advertised_rate_is_never_an_attempt() {
         let native = native(44_100, 2);
         let ranges = [range(44_100, 96_000, 2, SampleFormat::F32)];
-        let (open, attempted) =
-            plan_open(&native, ranges.into_iter(), 48_000, true).expect("48 kHz is advertised");
-        assert!(!attempted);
-        assert_eq!(open.sample_rate(), 48_000);
+        let plan = plan_direction(
+            ctx("CoreAudio"),
+            Direction::Capture,
+            &native,
+            ranges.into_iter(),
+            true,
+            FormFactor::Unknown,
+        )
+        .expect("48 kHz is advertised");
+        assert!(!plan.attempted);
+        assert!(!plan.convert);
+        assert_eq!(plan.open.sample_rate(), 48_000);
+    }
+
+    /// The one refusal the ladder keeps: a hands-free microphone has no rate
+    /// worth carrying, so no rung is offered and the #330 remedy stands. Both
+    /// signals refuse, on converting and non-converting hosts alike, while
+    /// Bluetooth playback still converts: the profile problem is capture's.
+    #[test]
+    fn a_hands_free_microphone_is_refused_not_converted() {
+        for (rate, form, host_converts) in [
+            (16_000, FormFactor::Unknown, true),
+            (8_000, FormFactor::Unknown, false),
+            (44_100, FormFactor::Bluetooth, true),
+            (44_100, FormFactor::Headset, false),
+        ] {
+            let native = native(rate, 1);
+            let ranges = [range(rate, rate, 1, SampleFormat::F32)];
+            let err = plan_direction(
+                ctx("WASAPI"),
+                Direction::Capture,
+                &native,
+                ranges.into_iter(),
+                host_converts,
+                form,
+            )
+            .expect_err("a hands-free mic earns no rung");
+            assert!(
+                err.detail().contains("use another capture device"),
+                "{rate} Hz {form:?}: {err}"
+            );
+        }
+        let native = native(44_100, 2);
+        let ranges = [range(44_100, 44_100, 2, SampleFormat::F32)];
+        let plan = plan_direction(
+            ctx("ALSA"),
+            Direction::Playback,
+            &native,
+            ranges.into_iter(),
+            false,
+            FormFactor::Bluetooth,
+        )
+        .expect("Bluetooth speakers convert like any playback device");
+        assert!(plan.convert);
     }
 
     #[test]

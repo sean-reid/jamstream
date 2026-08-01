@@ -38,6 +38,14 @@ const CHUNK: usize = 120;
 type CaptureFn = Box<dyn FnMut(&[f32]) + Send>;
 type PlaybackFn = Box<dyn FnMut(&mut [f32]) + Send>;
 
+/// A device-rate callback size in session-rate frames, rounded up: what a
+/// converting stream can hand the handler per callback, and therefore what
+/// [`crate::StreamHandle::buffer_frames`] reports so everything sized around
+/// callbacks keeps one unit.
+pub(crate) fn session_frames(device_frames: u32, session_rate: u32, device_rate: u32) -> u32 {
+    (u64::from(device_frames) * u64::from(session_rate)).div_ceil(u64::from(device_rate)) as u32
+}
+
 /// Sinc quality for the boundary: 64 taps with the automatic cutoff keeps
 /// aliasing below the Blackman2 sidelobe level at tens of microseconds per
 /// callback, and linear interpolation over 128x oversampling is transparent
@@ -426,6 +434,23 @@ mod tests {
         assert!(
             (playback_added - 3.158).abs() < 0.01,
             "playback adds {playback_added} ms"
+        );
+    }
+
+    /// The scaling behind [`crate::StreamHandle::buffer_frames`]'s one-unit
+    /// contract: device-rate callback sizes become session-rate frames,
+    /// rounded up so a ring sized from the answer always fits the callback.
+    #[test]
+    fn callback_sizes_scale_to_session_rate_frames() {
+        // The negotiated sizes real 44.1 kHz devices deliver: the WASAPI
+        // 10 ms period, a half-period, and the 120-frame request.
+        assert_eq!(session_frames(441, SESSION, DEVICE), 480);
+        assert_eq!(session_frames(480, SESSION, DEVICE), 523);
+        assert_eq!(session_frames(120, SESSION, DEVICE), 131);
+        assert_eq!(
+            session_frames(240, SESSION, SESSION),
+            240,
+            "unity is untouched"
         );
     }
 
