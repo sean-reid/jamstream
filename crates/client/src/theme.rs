@@ -570,6 +570,28 @@ pub fn reason(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
     ui.add(egui::Label::new(RichText::new(text.into()).color(color)).wrap())
 }
 
+/// The most height a failure may occupy before it scrolls instead of
+/// growing: about four lines, enough for any sentence of ours.
+const REASON_MAX_HEIGHT: f32 = 72.0;
+
+/// [`reason`] with a ceiling. An error that quotes another system is that
+/// system's length, not ours, so a row that draws one caps it: the text
+/// scrolls past a few lines rather than sizing the screen. The salt keeps
+/// two capped reasons in one layout from sharing scroll state.
+pub fn reason_capped(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    text: impl Into<String>,
+) {
+    egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .max_height(REASON_MAX_HEIGHT)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            reason(ui, text);
+        });
+}
+
 /// The fill and the label a selected control carries: the accent, opaque,
 /// stepped until whichever end of the palette reads on it clears the AA text
 /// floor.

@@ -432,6 +432,30 @@ fn takes_narrow() {
 }
 
 #[test]
+fn takes_listing_refused() {
+    // A bucket that said no, drawn as the shipped mapping renders it: the
+    // row a real S3 AccessDenied produces is a sentence with the remedy,
+    // never the XML document, which carries the AWS account number and is
+    // exactly what someone would screenshot.
+    let denied = jamstream_cli::CliError::Provider(jamstream_cloud::ProviderError::Auth(
+        "http 403 Forbidden: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>AccessDenied</Code><Message>User: \
+         arn:aws:iam::887762372032:user/jamstream-recordings is not \
+         authorized to perform: s3:ListBucket</Message>\
+         <RequestId>Q0YMR4GFKCH1Y688</RequestId></Error>"
+            .to_owned(),
+    ));
+    let mut app = takes_app(Theme::Dark);
+    app.takes.rows[0].takes.clear();
+    app.takes.rows[0].error = Some(jamstream_client::screens::takes::error_sentence(
+        "listing a3f29c41",
+        &denied,
+    ));
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "takes_listing_refused");
+}
+
+#[test]
 fn takes_empty() {
     // A host who has never recorded. One sentence saying what to do, which is
     // the rule for every empty state in the app.
