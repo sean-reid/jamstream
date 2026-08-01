@@ -60,9 +60,23 @@ pub fn init() -> Option<PathBuf> {
 }
 
 fn open_log_file() -> Option<(PathBuf, File)> {
-    let path = log_path()?;
+    open_log_file_at(log_path()?)
+}
+
+fn open_log_file_at(path: PathBuf) -> Option<(PathBuf, File)> {
     std::fs::create_dir_all(path.parent()?).ok()?;
-    let file = File::create(&path).ok()?;
+    let mut file = File::create(&path).ok()?;
+    // Written directly, past the filter: only warnings and panics log, so
+    // a healthy run's file would otherwise be empty, and an empty file is
+    // indistinguishable from a sink that never worked. The Windows console
+    // fix makes this the app's only diagnostic surface, so it has to prove
+    // itself on every run.
+    let _ = writeln!(
+        file,
+        "jamstream-app {} log; warnings and panics land here; empty after \
+         this line is a healthy run",
+        env!("CARGO_PKG_VERSION")
+    );
     Some((path, file))
 }
 
@@ -105,5 +119,25 @@ mod tests {
             path.parent().and_then(|p| p.parent()),
             jamstream_cli::state::data_dir().ok().as_deref()
         );
+    }
+
+    /// A fresh log opens with the banner, and reopening truncates back to
+    /// exactly one: the file always proves the sink ran, and an otherwise
+    /// empty file means a healthy run rather than a broken sink.
+    #[test]
+    fn the_log_opens_with_a_banner_and_truncates_on_reopen() {
+        let dir = std::env::temp_dir().join(format!("jamstream-log-banner-{}", std::process::id()));
+        let path = dir.join("app.log");
+        for _ in 0..2 {
+            let (p, file) = open_log_file_at(path.clone()).expect("open log");
+            drop(file);
+            let text = std::fs::read_to_string(&p).expect("read log");
+            assert!(
+                text.starts_with(&format!("jamstream-app {}", env!("CARGO_PKG_VERSION"))),
+                "{text:?}"
+            );
+            assert_eq!(text.lines().count(), 1, "{text:?}");
+            assert!(text.contains("empty after this line is a healthy run"));
+        }
     }
 }
