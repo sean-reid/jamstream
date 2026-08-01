@@ -466,13 +466,17 @@ fn stem_name(roster: &[(MemberId, String)], used: &[String], id: MemberId) -> St
     name
 }
 
-/// Keeps letters, digits, `-` and `_`; spaces become `-`; anything else is
-/// dropped. Member names are attacker-supplied and this becomes a file name.
+/// Keeps letters and digits of any script plus `-` and `_`; whitespace
+/// becomes `-`; anything else is dropped. Member names are attacker-supplied
+/// and this becomes a file name, so nothing `jamstream_cloud::windows_hazard`
+/// refuses can survive: the allowlist admits no reserved character or dot,
+/// and whitespace never trails. But a musician named in another script keeps
+/// their name on the take.
 fn sanitize(name: &str) -> String {
     name.chars()
         .filter_map(|c| match c {
-            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' => Some(c),
-            ' ' => Some('-'),
+            c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c),
+            c if c.is_whitespace() => Some('-'),
             _ => None,
         })
         .collect()
@@ -790,6 +794,53 @@ mod tests {
                 "member-5"
             ]
         );
+    }
+
+    /// A musician named in another script keeps their name on the take; only
+    /// a name with no letters at all falls back to member-N.
+    #[test]
+    fn stem_names_keep_every_script() {
+        assert_eq!(sanitize("Sørén"), "Sørén");
+        assert_eq!(sanitize("日本語"), "日本語");
+        assert_eq!(sanitize("Мария Петрова"), "Мария-Петрова");
+        // ASCII behaves exactly as before.
+        assert_eq!(sanitize("Ana Q"), "Ana-Q");
+        assert_eq!(sanitize("../../../etc/passwd"), "etcpasswd");
+        // All emoji reduces to nothing, so the id names the take.
+        let roster = vec![(MemberId(7), "\u{1F3B8}\u{1F3B6}".to_owned())];
+        assert_eq!(stem_name(&roster, &[], MemberId(7)), "member-7");
+    }
+
+    /// The names this recorder writes are the names the CLI later refuses or
+    /// accepts, so every stem file has to clear the same hazard check, with
+    /// no fake in the middle.
+    #[test]
+    fn stem_file_names_clear_the_windows_hazards() {
+        let hostile = [
+            "Sørén",
+            "日本語",
+            "NUL",
+            "mix.flac:hidden",
+            "a<b>c|d?e*f\"g\\h",
+            "trailing. ",
+            "\u{1F3B8}",
+        ];
+        let roster: Vec<(MemberId, String)> = hostile
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (MemberId(i as u16), (*name).to_owned()))
+            .collect();
+        let mut used = Vec::new();
+        for (id, _) in &roster {
+            let name = stem_name(&roster, &used, *id);
+            let file = format!("{}-{name}.flac", take_base(STAMP));
+            assert_eq!(
+                jamstream_cloud::windows_hazard(&file),
+                None,
+                "{file:?} would not survive every filesystem"
+            );
+            used.push(name);
+        }
     }
 
     #[test]
