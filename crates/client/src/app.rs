@@ -14,7 +14,9 @@ use crate::live::{AudioSettings, CostedRuntime, LiveError, LiveRuntime};
 use crate::picker::{Pick, Picked};
 use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
-use crate::screens::devices::{Block, DeviceCatalog, DeviceInfo, DevicesEvent, DevicesScreen};
+use crate::screens::devices::{
+    Block, DeviceCatalog, DeviceInfo, DevicesEvent, DevicesScreen, StreamNotes,
+};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
@@ -893,10 +895,18 @@ impl JamApp {
             SettingsTab::Audio => {
                 let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
                 let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
-                let refusal = snap.as_ref().and_then(|s| s.device_error.as_deref());
+                let rate_lines = snap
+                    .as_ref()
+                    .and_then(|s| s.stats.rate)
+                    .map(|r| r.lines())
+                    .unwrap_or_default();
+                let notes = StreamNotes {
+                    refusal: snap.as_ref().and_then(|s| s.device_error.as_deref()),
+                    rate_lines: &rate_lines,
+                };
                 let event =
                     self.devices
-                        .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, refusal);
+                        .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, notes);
                 if let Some(DevicesEvent::Rescan) = event {
                     self.rescan_devices();
                 }

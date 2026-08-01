@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use jamstream_audio_io::WavBackend;
 use jamstream_client::live::{AudioSettings, LiveRuntime};
-use jamstream_client::runtime::{Command, ConnState, MemberId, RecordState, Runtime, Snapshot};
+use jamstream_client::runtime::{
+    Command, ConnState, MemberId, RateOutcomeView, RecordState, Runtime, Snapshot,
+};
 use jamstream_protocol::ids::{HOST_MEMBER_ID, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
@@ -847,6 +849,70 @@ fn a_44_1_interface_carries_the_session_both_ways() {
     }
 }
 
+/// The disclosure that rides with rung 3 (#347): a member on a 44.1 kHz
+/// interface sees the Resampled outcome in the snapshot with the converter's
+/// own added milliseconds, one chat line per converted direction at join,
+/// and a mouth-to-ear figure that grew by exactly the disclosed amount.
+#[test]
+fn a_converting_stream_discloses_itself_and_prices_the_latency() {
+    let server = TestServer::start();
+    let rt = LiveRuntime::join_offline(
+        &server.invite(1, "solo"),
+        settings(),
+        WavBackend::new(None, None).with_device_rate(44_100),
+    )
+    .expect("join offline");
+    let snap = wait_for(&rt, "joined with stats", Duration::from_secs(10), |s| {
+        joined(s) && s.stats.mouth_to_ear_ms.is_some()
+    });
+
+    let rate = snap.stats.rate.expect("a running stream reports its rungs");
+    let (capture_ms, playback_ms) = match (rate.capture, rate.playback) {
+        (
+            RateOutcomeView::Resampled {
+                device: 44_100,
+                added_ms: capture_ms,
+            },
+            RateOutcomeView::Resampled {
+                device: 44_100,
+                added_ms: playback_ms,
+            },
+        ) => (capture_ms, playback_ms),
+        other => panic!("both directions must convert at 44.1: {other:?}"),
+    };
+    assert!(capture_ms > 0.0 && playback_ms > 0.0);
+
+    // Said once per direction, at join, in the state chat carries.
+    for side in ["capture", "playback"] {
+        let line = format!("converting {side} 44.1 kHz to 48 kHz");
+        assert_eq!(
+            snap.chat.iter().filter(|l| l.text.contains(&line)).count(),
+            1,
+            "{side} notice: {:?}",
+            snap.chat
+        );
+    }
+
+    // Mouth to ear grew by the disclosed amount: strip the link terms this
+    // same snapshot reports and the capture-buffer term, and what is left is
+    // the converter's own figure. The buffer term is the negotiated callback
+    // in session-rate frames: the 120-frame request on a 44.1 kHz device is
+    // ceil(120 * 160/147) = 131.
+    let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
+    let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
+    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + 131.0 / 48.0;
+    let disclosed = capture_ms + playback_ms;
+    assert!(
+        (m2e - link_ms - disclosed).abs() < 0.01,
+        "mouth to ear {m2e} ms must carry the disclosed {disclosed} ms over {link_ms} ms of link"
+    );
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+}
+
 /// A device lost mid-session: the stream is closed, the room is told the
 /// stream stopped, and the runtime reopens with the same settings without
 /// losing the session.
@@ -913,8 +979,8 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
 /// 44.1 kHz, and the music keeps playing through the boundary converter
 /// (#347 rung 3) where it used to be refused. What arrives on the swapped-in
 /// interface must still be the room's audio: at level, at pitch, and free of
-/// underrun padding. The on-screen conversion disclosure lands with the
-/// rate-outcome surface in a later change.
+/// underrun padding; and the swap is disclosed, in chat once and in the
+/// snapshot's rate outcome for as long as the converter runs.
 #[test]
 fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
     let server = TestServer::start();
@@ -961,6 +1027,28 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
         snap.device_error.is_none(),
         "nothing was refused: {:?}",
         snap.device_error
+    );
+    // The swap is disclosed: the snapshot carries the converting outcome and
+    // chat was told once, not once per reopen-cadence tick.
+    let rate = snap
+        .stats
+        .rate
+        .expect("the swapped-in stream reports rungs");
+    assert!(
+        matches!(
+            rate.playback,
+            RateOutcomeView::Resampled { device: 44_100, .. }
+        ),
+        "the swapped-in interface converts: {rate:?}"
+    );
+    assert_eq!(
+        snap.chat
+            .iter()
+            .filter(|l| l.text.contains("converting playback 44.1 kHz to 48 kHz"))
+            .count(),
+        1,
+        "one disclosure line for the swap: {:?}",
+        snap.chat
     );
     b.send(Command::Leave);
     wait_for(&b, "b idle", Duration::from_secs(3), |s| {

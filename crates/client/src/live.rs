@@ -33,8 +33,8 @@ use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 use crate::avatar;
 use crate::runtime::{
     AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationView,
-    FaderView, LevelsView, MemberId, MemberView, MetronomeView, RecordState, RecordView, Role,
-    Runtime, Snapshot, StatsView, StreamView,
+    FaderView, LevelsView, MemberId, MemberView, MetronomeView, RateOutcomeView, RateOutcomesView,
+    RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamView,
 };
 use crate::screens::invites::TokenMap;
 
@@ -201,6 +201,10 @@ struct SharedState {
     /// reads it the way it reads the connection state rather than being told
     /// once in a chat line it may already have scrolled past.
     device_error: Option<String>,
+    /// How each direction of the running stream reaches the session rate
+    /// (#347), from the backend's report at open; None while there is no
+    /// stream, so the UI never shows a dead stream's outcome.
+    rate: Option<RateOutcomesView>,
 }
 
 impl SharedState {
@@ -234,6 +238,7 @@ impl SharedState {
             server_addr: server_addr.to_string(),
             reopen_attempts: 0,
             device_error: None,
+            rate: None,
         }
     }
 
@@ -272,21 +277,26 @@ impl Driver {
     /// callers close the previous stream first so real backends never see
     /// two streams on one device.
     ///
-    /// Returns the engine side and the frames the ring was sized from. The
-    /// callback size is only knowable from an open stream, so the ring is
-    /// first sized from the request; when the stream then reports callbacks
-    /// the ring cannot absorb, it is reopened once over a ring that can.
-    fn open(&mut self, settings: &AudioSettings) -> Result<(EngineSide, u32), AudioError> {
+    /// Returns the engine side, the frames the ring was sized from, and the
+    /// stream's own rate-outcome report. The callback size is only knowable
+    /// from an open stream, so the ring is first sized from the request;
+    /// when the stream then reports callbacks the ring cannot absorb, it is
+    /// reopened once over a ring that can.
+    fn open(
+        &mut self,
+        settings: &AudioSettings,
+    ) -> Result<(EngineSide, u32, Option<RateOutcomesView>), AudioError> {
         let config = stream_config(settings);
         let requested = config.buffer_frames;
         let mut frames = requested;
         let mut resized = false;
         loop {
             let (device, engine) = CallbackBridge::new(ring_capacity(frames));
-            let negotiated = self.open_stream(config, device.into_handler(), settings)?;
+            let (negotiated, rate) = self.open_stream(config, device.into_handler(), settings)?;
+            let rate = rate.map(rate_view);
             let needed = ring_frames(requested, negotiated);
             if needed <= frames {
-                return Ok((engine, frames));
+                return Ok((engine, frames, rate));
             }
             if resized {
                 // Two different answers in a row; chasing it would reopen
@@ -297,7 +307,7 @@ impl Driver {
                     ring = frames,
                     "device callback size will not settle; keeping the ring"
                 );
-                return Ok((engine, frames));
+                return Ok((engine, frames, rate));
             }
             tracing::info!(
                 requested,
@@ -311,13 +321,14 @@ impl Driver {
     }
 
     /// Opens the stream itself and reports the callback size the device
-    /// negotiated, where the backend can say.
+    /// negotiated and the rate outcomes it landed on, where the backend can
+    /// say.
     fn open_stream(
         &mut self,
         config: StreamConfig,
         handler: DuplexHandler,
         settings: &AudioSettings,
-    ) -> Result<Option<u32>, AudioError> {
+    ) -> Result<(Option<u32>, Option<jamstream_audio_io::RateOutcomes>), AudioError> {
         match self {
             Driver::Real { backend, handle } => {
                 let new = backend.open_duplex(
@@ -326,9 +337,9 @@ impl Driver {
                     config,
                     handler,
                 )?;
-                let negotiated = new.buffer_frames();
+                let report = (new.buffer_frames(), new.rate_outcomes());
                 *handle = Some(new);
-                Ok(negotiated)
+                Ok(report)
             }
             Driver::Offline {
                 backend,
@@ -337,11 +348,11 @@ impl Driver {
                 pumped_frames,
             } => {
                 let new = Box::new(backend.open_offline(config, handler)?);
-                let negotiated = new.buffer_frames();
+                let report = (new.buffer_frames(), new.rate_outcomes());
                 *stream = Some(new);
                 *epoch = Instant::now();
                 *pumped_frames = 0;
-                Ok(negotiated)
+                Ok(report)
             }
         }
     }
@@ -484,12 +495,24 @@ impl LiveRuntime {
         mut driver: Driver,
     ) -> Result<LiveRuntime, LiveError> {
         let addr = *invite.addresses.first().ok_or(LiveError::NoAddress)?;
-        let (mut engine, device_frames) = driver.open(&settings).map_err(LiveError::Audio)?;
+        let (mut engine, device_frames, rate) = driver.open(&settings).map_err(LiveError::Audio)?;
         let socket = connect_socket(addr).map_err(LiveError::Io)?;
         let (core, init) = ClientCore::connect(invite, 0).map_err(LiveError::Session)?;
         let _ = socket.send(&init);
 
-        let shared = Arc::new(Mutex::new(SharedState::new(invite, addr)));
+        let mut state = SharedState::new(invite, addr);
+        // The join-time rung disclosure: the worker announces changes on
+        // every later open, so the first open's outcome is told here or
+        // never.
+        state.rate = rate;
+        if let Some(rate) = rate {
+            for (side, outcome) in [("capture", rate.capture), ("playback", rate.playback)] {
+                if let Some(line) = rate_change_line(None, outcome, side) {
+                    push_system_line(&mut state, 0, &line);
+                }
+            }
+        }
+        let shared = Arc::new(Mutex::new(state));
         let (tx, rx) = mpsc::channel();
         let capture_capacity = ring_capacity(device_frames);
         // A fresh ring starts at its steady-state depth, as in try_open:
@@ -522,6 +545,7 @@ impl LiveRuntime {
             reopen_attempts: 0,
             last_reopen: None,
             announced_failure: None,
+            announced_rate: rate,
         };
         let handle = std::thread::Builder::new()
             .name("jamstream-net".into())
@@ -610,7 +634,7 @@ impl LiveRuntime {
                 loss_pct: s.loss_pct,
                 mouth_to_ear_ms: s.mouth_to_ear_ms,
                 // Straight off the backend's own report at read time: there
-                // is one device stream per process and these follow the last
+                // is one device stream per process and it follows the last
                 // open, so no worker plumbing could say anything truer.
                 device_mode: match jamstream_audio_io::active_device_mode() {
                     Some(jamstream_audio_io::DeviceMode::Exclusive) => {
@@ -621,7 +645,7 @@ impl LiveRuntime {
                     }
                     None => None,
                 },
-                render_converted: jamstream_audio_io::active_render_conversion(),
+                rate: s.rate,
             },
             members,
             chat: s.chat.iter().cloned().collect(),
@@ -860,6 +884,9 @@ struct Worker {
     /// The failure line last put in chat, so the 500 ms retry cadence
     /// announces each distinct reason once instead of every half second.
     announced_failure: Option<String>,
+    /// The rate outcomes last announced in chat, so a reopen on the same
+    /// rung says nothing and a rung change is said exactly once.
+    announced_rate: Option<RateOutcomesView>,
 }
 
 impl Worker {
@@ -1049,6 +1076,8 @@ impl Worker {
             self.driver.close();
             self.engine = None;
             self.last_reopen = None;
+            // A dead stream has no rate outcome to show.
+            self.shared.lock().expect("live state").rate = None;
             self.system_line("the audio stream stopped; retrying");
         }
         if self.engine.is_none()
@@ -1082,7 +1111,7 @@ impl Worker {
 
     fn try_open(&mut self) -> Result<(), AudioError> {
         match self.driver.open(&self.settings) {
-            Ok((mut engine, device_frames)) => {
+            Ok((mut engine, device_frames, rate)) => {
                 let capacity = ring_capacity(device_frames);
                 self.capture_buf.resize(capacity, 0.0);
                 // Prefill the fresh playout ring (its steady-state depth) with
@@ -1101,8 +1130,10 @@ impl Worker {
                 let mut shared = self.shared.lock().expect("live state");
                 shared.reopen_attempts = self.reopen_attempts;
                 shared.device_error = None;
+                shared.rate = rate;
                 drop(shared);
                 self.announced_failure = None;
+                self.announce_rate(rate);
                 Ok(())
             }
             Err(err) => {
@@ -1111,10 +1142,29 @@ impl Worker {
                 // device is the one failure a musician can act on from inside
                 // the session, and the log is the one place they will not be
                 // looking at mid-song.
-                self.shared.lock().expect("live state").device_error = Some(err.to_string());
+                let mut shared = self.shared.lock().expect("live state");
+                shared.device_error = Some(err.to_string());
+                shared.rate = None;
                 Err(err)
             }
         }
+    }
+
+    /// One chat line per direction whose rung changed at this open: rungs 2
+    /// and 3 are said once, never per reopen; rung 1 and the OS converter add
+    /// nothing here (the latency hover carries them).
+    fn announce_rate(&mut self, rate: Option<RateOutcomesView>) {
+        let Some(rate) = rate else { return };
+        let old = self.announced_rate;
+        for (side, old, new) in [
+            ("capture", old.map(|r| r.capture), rate.capture),
+            ("playback", old.map(|r| r.playback), rate.playback),
+        ] {
+            if let Some(line) = rate_change_line(old, new, side) {
+                self.system_line(&line);
+            }
+        }
+        self.announced_rate = Some(rate);
     }
 
     fn drain_socket(&mut self) {
@@ -1392,11 +1442,15 @@ impl Worker {
         // + 2.5 ms                       one media frame of encode latency
         // + device_frames / 48 ms        the capture device buffer, as the
         //                                device negotiated it, not as asked
+        // + converter added ms           the boundary resampler's disclosed
+        //                                figure, per converted direction
+        let convert_ms = s.rate.map_or(0.0, |r| r.added_ms());
         s.mouth_to_ear_ms = stats.rtt_ms_last.map(|rtt| {
             rtt / 2.0
                 + stats.jitter.depth_frames as f32 * 2.5
                 + 2.5
                 + self.device_frames as f32 / 48.0
+                + convert_ms
         });
         s.levels = self.levels;
     }
@@ -1430,14 +1484,67 @@ impl Worker {
     }
 
     fn system_line(&self, text: &str) {
-        tracing::info!(text, "audio notice");
         let at_ms = self.now_ms();
-        self.shared.lock().expect("live state").push_chat(ChatLine {
-            from_name: "system".to_owned(),
-            from_id: SYSTEM_MEMBER,
-            text: text.to_owned(),
-            at_ms,
-        });
+        push_system_line(&mut self.shared.lock().expect("live state"), at_ms, text);
+    }
+}
+
+/// A system chat line, logged and pushed: [`Worker::system_line`] plus the
+/// join-time rate disclosure in [`LiveRuntime::start`], which runs before a
+/// worker exists.
+fn push_system_line(state: &mut SharedState, at_ms: u64, text: &str) {
+    tracing::info!(text, "audio notice");
+    state.push_chat(ChatLine {
+        from_name: "system".to_owned(),
+        from_id: SYSTEM_MEMBER,
+        text: text.to_owned(),
+        at_ms,
+    });
+}
+
+/// The runtime's view of the backend's rate outcomes.
+fn rate_view(outcomes: jamstream_audio_io::RateOutcomes) -> RateOutcomesView {
+    let map = |o: jamstream_audio_io::RateOutcome| match o {
+        jamstream_audio_io::RateOutcome::Native => RateOutcomeView::Native,
+        jamstream_audio_io::RateOutcome::ClockSet { from } => RateOutcomeView::ClockSet { from },
+        jamstream_audio_io::RateOutcome::OsConverted { device } => {
+            RateOutcomeView::OsConverted { device }
+        }
+        jamstream_audio_io::RateOutcome::Resampled { device, added_ms } => {
+            RateOutcomeView::Resampled { device, added_ms }
+        }
+    };
+    RateOutcomesView {
+        capture: map(outcomes.capture),
+        playback: map(outcomes.playback),
+    }
+}
+
+/// The chat notice one direction's rung earns at an open, given the rung it
+/// was on before. Rung 1 is not news, the OS converter is hover-only, and an
+/// unchanged rung is silence, so the 500 ms reopen cadence can never flood
+/// the room. A converter that replaces a clock this app had set names the
+/// contest: that is the one demotion a musician might otherwise chase into
+/// their other software's settings.
+fn rate_change_line(
+    old: Option<RateOutcomeView>,
+    new: RateOutcomeView,
+    side: &str,
+) -> Option<String> {
+    if old == Some(new) {
+        return None;
+    }
+    match new {
+        RateOutcomeView::Native | RateOutcomeView::OsConverted { .. } => None,
+        RateOutcomeView::ClockSet { .. } => new.line(side),
+        RateOutcomeView::Resampled { .. } => {
+            let line = new.line(side)?;
+            if matches!(old, Some(RateOutcomeView::ClockSet { .. })) {
+                Some(format!("another app took the device clock back; {line}"))
+            } else {
+                Some(line)
+            }
+        }
     }
 }
 
@@ -1518,6 +1625,61 @@ mod tests {
         assert_eq!(ring_frames(240, None), 240);
         // A smaller negotiation never shrinks the ring below the request.
         assert_eq!(ring_frames(240, Some(32)), 240);
+    }
+
+    /// The chat copy per rung change, the #347 disclosure contract: rung 2
+    /// and rung 3 are announced once, an unchanged rung and rung 1 say
+    /// nothing (so the reopen cadence cannot flood chat), the OS converter
+    /// stays hover-only, and a converter that replaced a clock this app set
+    /// names the contest instead of reading like a random downgrade.
+    #[test]
+    fn rung_changes_earn_one_honest_chat_line() {
+        let clock_set = RateOutcomeView::ClockSet { from: 44_100 };
+        let resampled = RateOutcomeView::Resampled {
+            device: 44_100,
+            added_ms: 3.2,
+        };
+        assert_eq!(
+            rate_change_line(None, clock_set, "capture").as_deref(),
+            Some("moved the capture device to 48 kHz (was 44.1)")
+        );
+        assert_eq!(
+            rate_change_line(None, resampled, "capture").as_deref(),
+            Some("converting capture 44.1 kHz to 48 kHz (+3.2 ms)")
+        );
+        assert_eq!(
+            rate_change_line(Some(clock_set), resampled, "playback").as_deref(),
+            Some(
+                "another app took the device clock back; \
+                 converting playback 44.1 kHz to 48 kHz (+3.2 ms)"
+            )
+        );
+        // Silence: rung 1, the OS converter, and any unchanged rung.
+        assert_eq!(
+            rate_change_line(None, RateOutcomeView::Native, "capture"),
+            None
+        );
+        assert_eq!(
+            rate_change_line(Some(resampled), RateOutcomeView::Native, "capture"),
+            None,
+            "returning to native is visible in the tag, not the chat"
+        );
+        assert_eq!(
+            rate_change_line(
+                None,
+                RateOutcomeView::OsConverted { device: 44_100 },
+                "playback"
+            ),
+            None
+        );
+        assert_eq!(
+            rate_change_line(Some(resampled), resampled, "capture"),
+            None
+        );
+        assert_eq!(
+            rate_change_line(Some(clock_set), clock_set, "capture"),
+            None
+        );
     }
 
     /// The whole of the settings reaches the device request: the exclusive

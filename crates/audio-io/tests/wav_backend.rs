@@ -238,6 +238,8 @@ fn without_a_period_the_request_is_the_negotiated_size() {
 /// handler-side frames.
 #[test]
 fn a_44_1_device_opens_a_48_khz_session_through_the_converter() {
+    use jamstream_audio_io::{RateOutcome, RateOutcomes};
+
     let backend = WavBackend::new(None, None).with_device_rate(44_100);
     let stream = backend.open_offline(config(2), passthrough()).unwrap();
     assert_eq!(stream.device_rate(), 44_100);
@@ -246,17 +248,42 @@ fn a_44_1_device_opens_a_48_khz_session_through_the_converter() {
         .resample_added_ms()
         .expect("a converting stream reports its added latency");
     assert!(capture_ms > 0.0 && playback_ms > 0.0);
+    // The handle's rung report carries the converter's own figures, never a
+    // copy that could drift from them.
+    assert_eq!(
+        stream.rate_outcomes(),
+        Some(RateOutcomes {
+            capture: RateOutcome::Resampled {
+                device: 44_100,
+                added_ms: capture_ms,
+            },
+            playback: RateOutcome::Resampled {
+                device: 44_100,
+                added_ms: playback_ms,
+            },
+        })
+    );
 }
 
 /// A device at the session rate converts nothing and says so, which is what
 /// the disclosure surface reads to stay silent.
 #[test]
 fn a_48_k_device_reports_no_conversion_and_no_added_latency() {
+    use jamstream_audio_io::{RateOutcome, RateOutcomes};
+
     let backend = WavBackend::new(None, None);
     let stream = backend.open_offline(config(2), passthrough()).unwrap();
     assert_eq!(stream.device_rate(), 48_000);
     assert_eq!(stream.resample_added_ms(), None);
     assert_eq!(stream.buffer_frames(), Some(240), "no scaling at unity");
+    assert_eq!(
+        stream.rate_outcomes(),
+        Some(RateOutcomes {
+            capture: RateOutcome::Native,
+            playback: RateOutcome::Native,
+        }),
+        "rung 1 on both directions"
+    );
 }
 
 /// The Windows shape on a 44.1 endpoint: the device ignores the request and
@@ -322,17 +349,6 @@ fn a_device_at_44_1_opens_at_its_own_rate() {
     let mut stream = backend.open_offline(cfg, passthrough()).unwrap();
     stream.pump(441).unwrap();
     assert!(!stream.errored());
-}
-
-/// Every open publishes the render-conversion report the way a real backend
-/// does, and no OS ever converts this device: a mismatched rate runs through
-/// the crate's own boundary converter, which is a different disclosure. Safe
-/// alongside parallel tests because every wav open publishes the same value.
-#[test]
-fn an_open_reports_that_nothing_is_converting() {
-    let backend = WavBackend::new(None, None);
-    let _stream = backend.open_offline(config(2), passthrough()).unwrap();
-    assert_eq!(jamstream_audio_io::active_render_conversion(), Some(false));
 }
 
 /// Device loss is observable offline, so the caller's device-gone path is no

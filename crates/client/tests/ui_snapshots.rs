@@ -12,7 +12,9 @@ use jamstream_client::app::{JamApp, Screen};
 use jamstream_client::creds::{self, CredStore, EnvReader, MemStore};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
 use jamstream_client::exec::Executor;
-use jamstream_client::runtime::{DestinationState, RecordState, StreamPlatform};
+use jamstream_client::runtime::{
+    DestinationState, RateOutcomeView, RateOutcomesView, RecordState, StreamPlatform,
+};
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
 use jamstream_client::screens::host::{HostWizard, ProviderStatus, RegionRow, RegionSurvey};
@@ -606,6 +608,39 @@ fn session_device_refused_narrow() {
     snapshot(&mut harness, "session_device_refused_narrow");
 }
 
+/// A session riding the boundary converter on both directions (#347 rung 3),
+/// the shape a 44.1 kHz interface gives a session on a host with no clock to
+/// move: the status bar carries the muted device-rate tag beside mouth to
+/// ear, and the Audio tab names each conversion and its cost.
+fn converting_app(theme: Theme) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_rate(Some(RateOutcomesView {
+        capture: RateOutcomeView::Resampled {
+            device: 44_100,
+            added_ms: 3.2,
+        },
+        playback: RateOutcomeView::Resampled {
+            device: 44_100,
+            added_ms: 3.2,
+        },
+    }));
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_converting() {
+    let mut harness = app_harness(converting_app(Theme::Dark), WIDE);
+    snapshot(&mut harness, "session_converting");
+}
+
+#[test]
+fn session_converting_narrow() {
+    // The tag competes with the meters for the bar's tightest layout; it may
+    // never push the readout out of the zone.
+    let mut harness = app_harness(converting_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "session_converting_narrow");
+}
+
 /// The drawer open on one tab. Every settings fixture goes through here, so
 /// the tab row in each of them is the one the app really builds for that
 /// role and screen.
@@ -661,6 +696,16 @@ fn session_settings_device_refused() {
     let app = drawer_app(device_refused_app(Theme::Dark), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_device_refused");
+}
+
+#[test]
+fn session_settings_converting() {
+    // The conversion's cost under the pickers that caused it: the Audio tab
+    // is where the pick gets changed, so the disclosure sits with the
+    // controls rather than only behind the status bar's hover.
+    let app = drawer_app(converting_app(Theme::Dark), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_converting");
 }
 
 #[test]

@@ -1113,6 +1113,16 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
             );
             ui.label(RichText::new("mouth to ear").size(9.5).color(p.text_muted));
         });
+        // The persistent converting tag (#347): while a direction rides the
+        // boundary converter, the device's own rate sits beside the number
+        // its cost is inside of. Muted, because it is a fact, not a fault.
+        if let Some(device) = s.rate.and_then(|r| r.resampled_rate()) {
+            ui.label(
+                RichText::new(format!("{} kHz", crate::runtime::khz(device)))
+                    .size(9.5)
+                    .color(p.text_muted),
+            );
+        }
     });
     ui.interact(
         group.response.rect,
@@ -1123,11 +1133,11 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
 }
 
 /// The latency number's hover, line by line: the link's own figures, then
-/// what the device stream got from the OS. Which WASAPI mode won and whether
-/// the OS is resampling playback are the two facts that move this number
-/// between days on the same machine, and neither had a consumer until now
-/// (#326); a platform that reports neither adds no line, because a made-up
-/// answer is worse than none.
+/// what the device stream got from the OS. Which WASAPI mode won and how
+/// each direction reaches the session rate are the facts that move this
+/// number between days on the same machine (#326, #347); a platform that
+/// reports neither adds no line, because a made-up answer is worse than
+/// none.
 fn latency_hover(s: &crate::runtime::StatsView) -> String {
     let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
     let mut text = format!(
@@ -1143,8 +1153,11 @@ fn latency_hover(s: &crate::runtime::StatsView) -> String {
         }
         None => {}
     }
-    if s.render_converted == Some(true) {
-        text.push_str("\nplayback resampled by the OS to the device rate");
+    if let Some(rate) = &s.rate {
+        for line in rate.lines() {
+            text.push('\n');
+            text.push_str(&line);
+        }
     }
     text
 }
@@ -1541,43 +1554,72 @@ mod tests {
     }
 
     /// The hover behind the mouth-to-ear number names the sharing mode the
-    /// device stream got and whether the OS is resampling playback, because
-    /// those two are what move the number between days on one machine. A
-    /// platform that reports neither gets no line: `--` prose would be an
+    /// device stream got and how each direction reaches the session rate,
+    /// because those are what move the number between days on one machine.
+    /// A platform that reports neither gets no line: `--` prose would be an
     /// instrument reading a made-up value.
     #[test]
-    fn the_latency_hover_names_the_mode_and_the_conversion() {
-        use crate::runtime::DeviceModeView;
+    fn the_latency_hover_names_the_mode_and_the_rate_outcomes() {
+        use crate::runtime::{DeviceModeView, RateOutcomeView, RateOutcomesView};
 
         let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
         let base = latency_hover(&rt.snapshot().stats);
         assert!(base.contains("rtt") && base.contains("buffer") && base.contains("loss"));
         assert!(
-            !base.contains("mode") && !base.contains("resampled"),
+            !base.contains("mode") && !base.contains("converting"),
             "an unreported mode must add nothing: {base:?}"
         );
 
-        rt.set_device_mode(Some(DeviceModeView::Shared), Some(true));
+        rt.set_device_mode(Some(DeviceModeView::Shared));
+        rt.set_rate(Some(RateOutcomesView {
+            capture: RateOutcomeView::Resampled {
+                device: 44_100,
+                added_ms: 3.2,
+            },
+            playback: RateOutcomeView::OsConverted { device: 44_100 },
+        }));
         let shared = latency_hover(&rt.snapshot().stats);
         assert!(
             shared.contains("shared mode device, 20 to 30 ms"),
             "{shared:?}"
         );
         assert!(
-            shared.contains("playback resampled by the OS"),
+            shared.contains("converting capture 44.1 kHz to 48 kHz (+3.2 ms)"),
+            "{shared:?}"
+        );
+        assert!(
+            shared.contains("the OS is converting playback to this device's 44.1 kHz"),
             "{shared:?}"
         );
 
-        rt.set_device_mode(Some(DeviceModeView::Exclusive), Some(false));
+        rt.set_device_mode(Some(DeviceModeView::Exclusive));
+        rt.set_rate(Some(RateOutcomesView {
+            capture: RateOutcomeView::Native,
+            playback: RateOutcomeView::Native,
+        }));
         let exclusive = latency_hover(&rt.snapshot().stats);
         assert!(
             exclusive.contains("exclusive mode device, about 10 ms"),
             "{exclusive:?}"
         );
         assert!(
-            !exclusive.contains("resampled"),
-            "a device running at the stream rate is not converted: {exclusive:?}"
+            !exclusive.contains("converting"),
+            "native directions are not news: {exclusive:?}"
         );
+
+        // The clock-set rung reads as the move it was, and macOS reports no
+        // sharing mode, so the rate line stands alone.
+        rt.set_device_mode(None);
+        rt.set_rate(Some(RateOutcomesView {
+            capture: RateOutcomeView::ClockSet { from: 44_100 },
+            playback: RateOutcomeView::Native,
+        }));
+        let moved = latency_hover(&rt.snapshot().stats);
+        assert!(
+            moved.contains("moved the capture device to 48 kHz (was 44.1)"),
+            "{moved:?}"
+        );
+        assert!(!moved.contains("mode device"), "{moved:?}");
     }
 
     /// Audition is a lamp in the cluster, not a dot in the health zone.
