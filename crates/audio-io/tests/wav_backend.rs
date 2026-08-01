@@ -8,7 +8,9 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use jamstream_audio_io::{AudioError, DuplexHandler, StreamConfig, StreamHandle, WavBackend};
+use jamstream_audio_io::{
+    AudioError, CallbackBridge, DuplexHandler, StreamConfig, StreamHandle, WavBackend,
+};
 
 fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("jamstream-audio-io-{}-{name}", std::process::id()))
@@ -177,6 +179,55 @@ fn int16_input_is_scaled() {
     let _ = std::fs::remove_file(&output_path);
 }
 
+/// WASAPI shared mode, modelled: the request says 120 frames, the device
+/// calls back at its own 480-frame period, and the handle reports the period
+/// the way cpal's `Stream::buffer_size` does on that host. Pumps accumulate
+/// until a full period is owed, because a real device does not call back
+/// mid-period either.
+#[test]
+fn a_device_period_overrides_the_request_and_batches_callbacks() {
+    let sizes = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let capture_sizes = Arc::clone(&sizes);
+    let handler = DuplexHandler::new(
+        move |samples: &[f32]| capture_sizes.lock().unwrap().push(samples.len()),
+        move |_out: &mut [f32]| {},
+    );
+    let backend = WavBackend::new(None, None).with_device_period(480);
+    let cfg = StreamConfig {
+        buffer_frames: 120,
+        ..config(2)
+    };
+    let mut stream = backend.open_offline(cfg, handler).unwrap();
+    assert_eq!(
+        stream.buffer_frames(),
+        Some(480),
+        "the handle must report the period, not the request"
+    );
+
+    for _ in 0..3 {
+        stream.pump(120).unwrap();
+    }
+    assert!(
+        sizes.lock().unwrap().is_empty(),
+        "three 120-frame pumps are short of a period; no callback yet"
+    );
+    stream.pump(120).unwrap();
+    assert_eq!(
+        sizes.lock().unwrap().as_slice(),
+        &[480 * 2],
+        "the fourth pump completes one period: one callback, 480 stereo frames"
+    );
+}
+
+/// Without a period the fake delivers what it is pumped, which is a device
+/// that honoured the request, so the handle reports the request.
+#[test]
+fn without_a_period_the_request_is_the_negotiated_size() {
+    let backend = WavBackend::new(None, None);
+    let stream = backend.open_offline(config(2), passthrough()).unwrap();
+    assert_eq!(stream.buffer_frames(), Some(240));
+}
+
 /// The 44.1 kHz interface, modelled: the session runs at 48 kHz and the fake
 /// refuses the same way the cpal backend now does, rather than opening and
 /// playing sharp.
@@ -225,6 +276,155 @@ fn a_device_loss_can_be_triggered_on_demand() {
     assert!(!stream.errored());
     stream.report_device_lost();
     assert!(stream.errored());
+}
+
+/// Stereo float WAV whose samples are their own indices, so any dropped or
+/// padded sample breaks an exact equality somewhere downstream.
+fn write_ramp(path: &PathBuf, frames: usize) -> Vec<f32> {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 48_000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).unwrap();
+    let samples: Vec<f32> = (0..frames * 2).map(|i| i as f32).collect();
+    for &s in &samples {
+        writer.write_sample(s).unwrap();
+    }
+    writer.finalize().unwrap();
+    samples
+}
+
+/// Drives one pump of `frames` with the playout ring topped up first and the
+/// capture ring drained after, the way the client's worker services the
+/// bridge between device bites. `next_play` is the ramp value the playout
+/// side continues from.
+fn service_and_pump(
+    engine: &mut jamstream_audio_io::EngineSide,
+    stream: &mut jamstream_audio_io::WavStream,
+    frames: usize,
+    next_play: &mut f32,
+    captured: &mut Vec<f32>,
+    scratch: &mut [f32],
+) {
+    loop {
+        let chunk: Vec<f32> = (0..240).map(|i| *next_play + i as f32).collect();
+        let pushed = engine.push_playout(&chunk);
+        *next_play += pushed as f32;
+        if pushed < chunk.len() {
+            break;
+        }
+    }
+    stream.pump(frames).unwrap();
+    let got = engine.pull_captured(scratch);
+    captured.extend_from_slice(&scratch[..got]);
+}
+
+/// The whole shape of the ring defect, through the bridge: a device that
+/// ignores the 120-frame request and calls back at a 480-frame period, over
+/// a ring sized from the delivered callback with the client's 2x headroom.
+/// The engine services 120-frame bites between callbacks; every captured
+/// sample must survive and every rendered sample must be the one pushed,
+/// with both counters still at zero.
+#[test]
+fn a_device_period_beyond_the_request_survives_a_ring_sized_for_it() {
+    let input_path = temp_path("period-ring-in.wav");
+    let output_path = temp_path("period-ring-out.wav");
+    let input = write_ramp(&input_path, 4_800);
+
+    // 2x the 480-frame callback, stereo: the client's sizing convention.
+    let capacity = 2 * 480 * 2;
+    let (device, mut engine) = CallbackBridge::new(capacity);
+    let backend = WavBackend::new(Some(input_path.clone()), Some(output_path.clone()))
+        .with_device_period(480);
+    let cfg = StreamConfig {
+        buffer_frames: 120,
+        ..config(2)
+    };
+    let mut stream = backend.open_offline(cfg, device.into_handler()).unwrap();
+
+    let mut captured = Vec::new();
+    let mut next_play = 0.0f32;
+    let mut scratch = vec![0.0f32; capacity];
+    for _ in 0..40 {
+        service_and_pump(
+            &mut engine,
+            &mut stream,
+            120,
+            &mut next_play,
+            &mut captured,
+            &mut scratch,
+        );
+    }
+    stream.finish().unwrap();
+
+    assert_eq!(engine.overruns(), 0, "capture must fit the sized ring");
+    assert_eq!(engine.underruns(), 0, "render must never find the ring dry");
+    // No dropped tail on capture: 40 pumps cover ten full periods, and every
+    // one of those samples came through in order.
+    assert_eq!(captured.len(), 10 * 480 * 2);
+    assert_eq!(&captured[..], &input[..captured.len()]);
+    // No padded silence on render: the file is the pushed ramp, contiguous.
+    let (_, written) = read_all(&output_path);
+    let expected: Vec<f32> = (0..written.len()).map(|i| i as f32).collect();
+    assert_eq!(written.len(), 10 * 480 * 2);
+    assert_eq!(written, expected);
+
+    let _ = std::fs::remove_file(&input_path);
+    let _ = std::fs::remove_file(&output_path);
+}
+
+/// The counter-case that was #323: the same device against a ring sized from
+/// the request alone. The bridge counters move, which is what the client now
+/// watches for; the fake would have caught the defect had anything looked.
+#[test]
+fn a_device_period_beyond_the_request_overwhelms_a_request_sized_ring() {
+    let input_path = temp_path("period-starve-in.wav");
+    let input = write_ramp(&input_path, 4_800);
+
+    let capacity = 2 * 120 * 2;
+    let (device, mut engine) = CallbackBridge::new(capacity);
+    let backend = WavBackend::new(Some(input_path.clone()), None).with_device_period(480);
+    let cfg = StreamConfig {
+        buffer_frames: 120,
+        ..config(2)
+    };
+    let mut stream = backend.open_offline(cfg, device.into_handler()).unwrap();
+
+    let mut captured = Vec::new();
+    let mut next_play = 0.0f32;
+    let mut scratch = vec![0.0f32; capacity];
+    for _ in 0..40 {
+        service_and_pump(
+            &mut engine,
+            &mut stream,
+            120,
+            &mut next_play,
+            &mut captured,
+            &mut scratch,
+        );
+    }
+
+    assert!(
+        engine.overruns() > 0,
+        "a 480-frame callback cannot fit a 240-frame ring"
+    );
+    assert!(
+        engine.underruns() > 0,
+        "a 480-frame pull drains a 240-frame ring and pads the rest"
+    );
+    assert!(
+        captured.len() < 10 * 480 * 2,
+        "the dropped capture tails must be visible in the total"
+    );
+    assert_ne!(
+        &captured[..],
+        &input[..captured.len()],
+        "what survives is no longer contiguous"
+    );
+
+    let _ = std::fs::remove_file(&input_path);
 }
 
 #[test]

@@ -29,7 +29,7 @@ pub struct StreamConfig {
     pub sample_rate: u32,
     /// Requested frames per device callback. Backends fall back to the
     /// nearest supported size; the negotiated value is visible through
-    /// [`StreamHandle::latency_frames`].
+    /// [`StreamHandle::buffer_frames`].
     pub buffer_frames: u32,
     /// Channel count the handler sees, on both the capture and playback
     /// side. Backends convert to and from the device's native layout.
@@ -134,6 +134,13 @@ pub trait StreamHandle: Send {
     /// Best-effort estimate of device round-trip latency in frames, i.e. the
     /// sum of the negotiated capture and playback buffer sizes where known.
     fn latency_frames(&self) -> Option<u32>;
+
+    /// Largest frames-per-callback the device actually delivers, across both
+    /// directions, where the backend can report it. A host is free to ignore
+    /// the requested [`StreamConfig::buffer_frames`] (WASAPI shared mode
+    /// calls back at the device period), so anything sized around callbacks
+    /// must be sized from this, not from the request.
+    fn buffer_frames(&self) -> Option<u32>;
 
     /// True once the backend reported a fatal stream error (device unplugged,
     /// configuration invalidated). The app should surface a device-gone state

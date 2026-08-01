@@ -422,6 +422,7 @@ impl ExclusiveBackend {
                 stop,
                 threads: vec![capture_thread, render_thread],
                 latency_frames: Some(capture_frames + render_frames),
+                buffer_frames: Some(capture_frames.max(render_frames)),
             }));
         }
 
@@ -468,6 +469,7 @@ struct ExclusiveStream {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     latency_frames: Option<u32>,
+    buffer_frames: Option<u32>,
 }
 
 impl ExclusiveStream {
@@ -484,6 +486,10 @@ impl ExclusiveStream {
 impl StreamHandle for ExclusiveStream {
     fn latency_frames(&self) -> Option<u32> {
         self.latency_frames
+    }
+
+    fn buffer_frames(&self) -> Option<u32> {
+        self.buffer_frames
     }
 
     fn errored(&self) -> bool {
