@@ -440,7 +440,12 @@ pub fn destination(dir: &Path, take: &Take) -> Result<PathBuf, CliError> {
             dir.display()
         )));
     }
-    Ok(dir.join(relative))
+    // One component at a time: take names use forward slashes, and joining
+    // the name whole on Windows keeps them verbatim inside a
+    // backslash-separated path.
+    Ok(relative
+        .components()
+        .fold(dir.to_owned(), |path, part| path.join(part)))
 }
 
 /// Decides each take's fate before any egress is spent. A local file of a
@@ -773,8 +778,14 @@ mod tests {
             last_modified: None,
         };
         assert_eq!(
+            destination(dir, &take("mix.flac")).unwrap(),
+            dir.join("mix.flac")
+        );
+        // Joined per component, so the platform's own separator lands
+        // between stems and the file on every platform.
+        assert_eq!(
             destination(dir, &take("stems/bass.flac")).unwrap(),
-            dir.join("stems/bass.flac")
+            dir.join("stems").join("bass.flac")
         );
         for hostile in [
             "../../../etc/passwd",
