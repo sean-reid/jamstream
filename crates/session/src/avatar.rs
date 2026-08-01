@@ -33,8 +33,9 @@ pub fn chunk_total(len: usize) -> u16 {
 /// least-recently-referenced entry whose hash is not pinned (callers pin
 /// the hashes the current roster references), so a returning bandmate's
 /// avatar is still here and transfers zero bytes. Pinned entries never
-/// leave; the budget can overshoot by at most the pinned set, which the
-/// roster size bounds to a few dozen 256 KB entries.
+/// leave, and neither does the entry an insert just added, so the budget
+/// can overshoot by the pinned set (which the roster size bounds to a few
+/// dozen 256 KB entries) plus one entry, until a later insert reclaims it.
 pub struct AvatarCache {
     max_bytes: usize,
     total_bytes: usize,
@@ -75,20 +76,23 @@ impl AvatarCache {
 
     /// Inserts hash-verified bytes, then evicts unpinned entries (never the
     /// one just inserted) oldest-reference-first until back under budget.
+    /// Re-inserting a cached hash is a touch, but still evicts: an earlier
+    /// insert can leave the overshoot documented above, and every insert is
+    /// the cache's chance to get back under budget.
     pub fn insert(&mut self, hash: AvatarHash, bytes: Vec<u8>, pinned: &BTreeSet<AvatarHash>) {
         if self.contains(&hash) {
             self.touch(&hash);
-            return;
+        } else {
+            self.clock += 1;
+            self.total_bytes += bytes.len();
+            self.entries.insert(
+                hash,
+                Entry {
+                    bytes,
+                    last_ref: self.clock,
+                },
+            );
         }
-        self.clock += 1;
-        self.total_bytes += bytes.len();
-        self.entries.insert(
-            hash,
-            Entry {
-                bytes,
-                last_ref: self.clock,
-            },
-        );
         while self.total_bytes > self.max_bytes {
             let victim = self
                 .entries
@@ -255,6 +259,27 @@ mod tests {
         cache.insert(h(1), vec![0; 4], &pins);
         cache.insert(h(5), vec![0; 1], &BTreeSet::new());
         assert!(cache.contains(&h(1)), "reinsert refreshed h(1)");
+    }
+
+    #[test]
+    fn reinsert_reclaims_an_earlier_overshoot() {
+        // Found by the avatar_rx_push fuzz target (nightly 2026-08-01,
+        // corpus seed reinsert_reclaims_overshoot): with h(1) pinned, the
+        // oversized h(2) rightly stays at its own insert, but re-inserting
+        // h(1) used to return on the touch path without evicting, so the
+        // cache held h(2)'s overshoot for as long as the inserts kept
+        // being duplicates.
+        let mut cache = AvatarCache::new(10);
+        let pins: BTreeSet<AvatarHash> = [h(1)].into();
+        cache.insert(h(1), vec![0; 8], &pins);
+        cache.insert(h(2), vec![0; 20], &pins);
+        assert!(cache.contains(&h(2)), "the entry just inserted stays");
+        cache.insert(h(1), vec![0; 8], &pins);
+        assert!(cache.contains(&h(1)));
+        assert!(
+            !cache.contains(&h(2)),
+            "re-inserting h(1) reclaims h(2)'s overshoot"
+        );
     }
 
     #[test]

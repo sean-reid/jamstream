@@ -50,7 +50,9 @@
 //! and full 256-chunk transfers that complete and verify, eviction under a
 //! tiny budget with a pinned survivor, a cross-transfer completion, a
 //! wrong-hash announce, a declared length past the cap, and truncations of
-//! the single- and two-chunk programs.
+//! the single- and two-chunk programs. `reinsert_reclaims_overshoot` is the
+//! program this target found on 2026-08-01: a duplicate insert took the
+//! touch path without evicting, so an earlier overshoot never drained.
 
 #![no_main]
 
