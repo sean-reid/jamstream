@@ -188,6 +188,14 @@ pub trait StreamHandle: Send {
         false
     }
 
+    /// How each direction of this stream reaches the session rate (#347):
+    /// natively, over a device clock the backend moved, through an OS
+    /// converter, or through the boundary resampler with its disclosed cost.
+    /// `None` when the backend cannot say.
+    fn rate_outcomes(&self) -> Option<crate::RateOutcomes> {
+        None
+    }
+
     fn close(self: Box<Self>);
 }
 

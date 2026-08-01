@@ -8,8 +8,8 @@ use crate::avatar::disc_color;
 use crate::runtime::{
     AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationId,
     DestinationState, DestinationView, DeviceModeView, FaderView, LevelsView, MemberId, MemberView,
-    MetronomeView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamPlatform,
-    StreamView, TokenId,
+    MetronomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView,
+    StreamPlatform, StreamView, TokenId,
 };
 use crate::theme;
 
@@ -128,11 +128,12 @@ struct DemoState {
     /// runtime fills this from the device that refused; a fixture pins it so
     /// the sentence a silent musician reads can be looked at.
     device_error: Option<String>,
-    /// The sharing mode and conversion report a fixture pins; the real
+    /// The sharing mode and rate-outcome report a fixture pins; the real
     /// runtime reads them off the audio backend. None by default, which is
-    /// what every platform without the split reports.
+    /// what every platform without the split reports and what a session with
+    /// no stream shows.
     device_mode: Option<DeviceModeView>,
-    render_converted: Option<bool>,
+    rate: Option<RateOutcomesView>,
     /// Your own display name, as [`Command::SetOwnName`] set it: the demo
     /// stands in for the roster fanout the real server answers with.
     own_name: Option<String>,
@@ -292,7 +293,7 @@ impl DemoRuntime {
                 record: RecordView::default(),
                 device_error: None,
                 device_mode: None,
-                render_converted: None,
+                rate: None,
                 own_name: None,
             }),
             is_host,
@@ -363,12 +364,18 @@ impl DemoRuntime {
         s.device_error = reason.map(str::to_owned);
     }
 
-    /// Pins the sharing mode and the OS-conversion report, the pair the real
-    /// runtime reads off the audio backend after an open (#326).
-    pub fn set_device_mode(&self, mode: Option<DeviceModeView>, render_converted: Option<bool>) {
+    /// Pins the sharing mode, as the real runtime reads it off the audio
+    /// backend after an open (#326).
+    pub fn set_device_mode(&self, mode: Option<DeviceModeView>) {
         let mut s = self.state.lock().expect("demo state");
         s.device_mode = mode;
-        s.render_converted = render_converted;
+    }
+
+    /// Pins the rate outcomes, as the real runtime publishes them after an
+    /// open (#347): which rung each direction landed on and what it costs.
+    pub fn set_rate(&self, rate: Option<RateOutcomesView>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.rate = rate;
     }
 
     /// Pins the recorder's reported state, the way [`Self::set_destinations`]
@@ -441,7 +448,7 @@ impl Runtime for DemoRuntime {
             loss_pct: (0.2 + 0.15 * ((f as f64) * 0.011).sin() as f32).max(0.0),
             mouth_to_ear_ms: Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32),
             device_mode: s.device_mode,
-            render_converted: s.render_converted,
+            rate: s.rate,
         };
 
         let members = s

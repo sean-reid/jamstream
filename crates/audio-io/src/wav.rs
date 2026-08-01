@@ -163,10 +163,10 @@ impl WavBackend {
             )
         };
 
-        // Publish the conversion report exactly like a real backend: the OS
-        // never converts this device, because a rate mismatch runs through
-        // our own boundary converter instead.
-        crate::mode::set_render_conversion(false);
+        // Report the rate outcomes exactly like a real backend: no OS ever
+        // converts this device, so each direction is native or on the
+        // boundary converter, never anything else.
+        crate::rate::log_rate_outcomes(&rate_outcomes(rate, resample_added_ms));
 
         let device_frames = self.device_period.unwrap_or(config.buffer_frames);
         Ok(WavStream {
@@ -379,8 +379,28 @@ impl StreamHandle for WavStream {
         self.errored
     }
 
+    fn rate_outcomes(&self) -> Option<crate::RateOutcomes> {
+        Some(rate_outcomes(self.device_rate, self.resample_added_ms))
+    }
+
     fn close(mut self: Box<Self>) {
         let _ = self.finish_inner();
+    }
+}
+
+/// The offline stream's outcomes from its own state: each direction is
+/// native or on the boundary converter, never anything else.
+fn rate_outcomes(device_rate: u32, resample_added_ms: Option<(f32, f32)>) -> crate::RateOutcomes {
+    let outcome = |added_ms: Option<f32>| match added_ms {
+        Some(added_ms) => crate::RateOutcome::Resampled {
+            device: device_rate,
+            added_ms,
+        },
+        None => crate::RateOutcome::Native,
+    };
+    crate::RateOutcomes {
+        capture: outcome(resample_added_ms.map(|(c, _)| c)),
+        playback: outcome(resample_added_ms.map(|(_, p)| p)),
     }
 }
 

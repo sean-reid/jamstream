@@ -178,6 +178,95 @@ pub enum DeviceModeView {
     Shared,
 }
 
+/// How one direction of the device stream reached the 48 kHz session rate.
+/// The runtime's copy of `jamstream_audio_io::RateOutcome`, for the same
+/// reason as [`DeviceModeView`]: the UI contract stays free of the audio
+/// crate and a fixture can pin any rung.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RateOutcomeView {
+    /// The device runs at the session rate on its own; not news.
+    Native,
+    /// This app moved the device clock there, away from `from`.
+    ClockSet { from: u32 },
+    /// The OS converts between the stream and the device's own rate.
+    OsConverted { device: u32 },
+    /// The boundary converter carries the difference, at `added_ms`.
+    Resampled { device: u32, added_ms: f32 },
+}
+
+impl RateOutcomeView {
+    /// The sentence this outcome earns on the latency hover and the devices
+    /// sheet, or `None` for rung 1: native is not news. `side` is "capture"
+    /// or "playback".
+    #[must_use]
+    pub fn line(&self, side: &str) -> Option<String> {
+        let session = khz(jamstream_protocol::SAMPLE_RATE);
+        match *self {
+            RateOutcomeView::Native => None,
+            RateOutcomeView::ClockSet { from } => Some(format!(
+                "moved the {side} device to {session} kHz (was {})",
+                khz(from)
+            )),
+            RateOutcomeView::OsConverted { device } => Some(format!(
+                "the OS is converting {side} to this device's {} kHz",
+                khz(device)
+            )),
+            RateOutcomeView::Resampled { device, added_ms } => Some(format!(
+                "converting {side} {} kHz to {session} kHz (+{added_ms:.1} ms)",
+                khz(device)
+            )),
+        }
+    }
+}
+
+/// Both directions' rate outcomes, as the stream that is running got them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateOutcomesView {
+    pub capture: RateOutcomeView,
+    pub playback: RateOutcomeView,
+}
+
+impl RateOutcomesView {
+    /// What the boundary converter adds to mouth to ear, both directions
+    /// summed; zero when nothing resamples.
+    #[must_use]
+    pub fn added_ms(&self) -> f32 {
+        [self.capture, self.playback]
+            .iter()
+            .map(|o| match o {
+                RateOutcomeView::Resampled { added_ms, .. } => *added_ms,
+                _ => 0.0,
+            })
+            .sum()
+    }
+
+    /// The device rate behind the status bar's converting tag: the rate of a
+    /// direction on the boundary converter, `None` while nothing resamples.
+    #[must_use]
+    pub fn resampled_rate(&self) -> Option<u32> {
+        [self.capture, self.playback].iter().find_map(|o| match o {
+            RateOutcomeView::Resampled { device, .. } => Some(*device),
+            _ => None,
+        })
+    }
+
+    /// Each direction's disclosure line, capture first; empty when both
+    /// directions are native.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        [("capture", self.capture), ("playback", self.playback)]
+            .iter()
+            .filter_map(|(side, outcome)| outcome.line(side))
+            .collect()
+    }
+}
+
+/// A sample rate in kHz for UI copy: 44100 reads "44.1", 48000 reads "48".
+#[must_use]
+pub fn khz(rate: u32) -> String {
+    format!("{}", f64::from(rate) / 1000.0)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsView {
     pub state: ConnState,
@@ -186,16 +275,17 @@ pub struct StatsView {
     pub jitter_depth: usize,
     pub jitter_target: usize,
     pub loss_pct: f32,
-    /// The headline number: capture to playout, end to end.
+    /// The headline number: capture to playout, end to end. Includes what
+    /// the boundary converter discloses when a direction resamples.
     pub mouth_to_ear_ms: Option<f32>,
     /// Which sharing mode the device stream got. `None` before a stream
     /// opens and on platforms with no shared/exclusive split, which is why
     /// the readout says nothing rather than inventing an answer.
     pub device_mode: Option<DeviceModeView>,
-    /// Whether the OS is resampling the render stream to the device's own
-    /// rate (`Some(true)`), with the unaccounted latency that carries.
-    /// Accepted by design (#347), but disclosed where the latency is read.
-    pub render_converted: Option<bool>,
+    /// How each direction reached the session rate (#347): the device's own
+    /// clock, a clock this app moved, an OS converter, or the boundary
+    /// resampler with its cost. `None` while there is no stream.
+    pub rate: Option<RateOutcomesView>,
 }
 
 /// Linear levels in 0..1. dB conversion is the meter widget's job.

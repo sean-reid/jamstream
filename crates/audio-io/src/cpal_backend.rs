@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::format::map_frames;
-use crate::mode::set_render_conversion;
+use crate::rate::{RateOutcome, RateOutcomes, log_rate_outcomes};
 use crate::resample::{MAX_CHUNK_FRAMES, converting_capture, converting_playback, session_frames};
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
@@ -182,34 +182,23 @@ impl AudioBackend for CpalBackend {
         let (on_capture, on_playback) = handler.into_parts();
         let errored = Arc::new(AtomicBool::new(false));
 
-        let (input, in_rate, _in_added) =
+        let (input, in_rate, in_added) =
             open_capture_side(&in_side, in_plan, &config, rates, on_capture, &errored)?;
-        let (output, out_rate, _out_added) =
+        let (output, out_rate, out_added) =
             open_playback_side(&out_side, out_plan, &config, rates, on_playback, &errored)?;
 
         // cpal 0.18 streams start paused.
         input.play().map_err(|e| map_err(&e))?;
         output.play().map_err(|e| map_err(&e))?;
 
-        // Render-side conversion disclosure: once per open, plus the report
-        // the UI polls. The device's default config is its engine rate (the
-        // WASAPI mix format, the PipeWire graph rate), which is what an OS
-        // converter would be bridging to; a rung 3 stream opened at that rate
-        // itself, so nothing OS-side converts it.
-        if let Some(converting) =
-            render_conversion(rates.host, out_side.native.sample_rate(), out_rate)
-        {
-            set_render_conversion(converting);
-            if converting {
-                tracing::warn!(
-                    device_rate = out_side.native.sample_rate(),
-                    stream_rate = out_rate,
-                    host = rates.host,
-                    "the OS is resampling the render stream to the playback \
-                     device's rate, adding latency the buffer sizes do not show"
-                );
-            }
-        }
+        // The rung each direction landed on, carried on the handle so a
+        // reopen racing a read can never show one stream the other's
+        // outcome.
+        let rate = RateOutcomes {
+            capture: rate_outcome(rates, in_side.native.sample_rate(), in_rate, in_added),
+            playback: rate_outcome(rates, out_side.native.sample_rate(), out_rate, out_added),
+        };
+        log_rate_outcomes(&rate);
 
         // Negotiated callback sizes, per host: the WASAPI shared-mode device
         // period, the ALSA period, CoreAudio's device frame size, PipeWire's
@@ -241,6 +230,7 @@ impl AudioBackend for CpalBackend {
             errored,
             latency_frames,
             buffer_frames,
+            rate,
         }))
     }
 }
@@ -471,30 +461,41 @@ fn verifies_negotiated_rate(host: &str) -> bool {
     rate_policy(host).unwrap_or(false)
 }
 
-/// Whether a render stream that opened at `stream_rate` is being resampled by
-/// the OS, given that the device's own engine runs at `device_rate`.
+/// The rung one direction's open landed on, from what actually happened.
 ///
-/// Acceptable by design since the #347 decision, but it must be disclosed:
-/// the conversion adds latency the buffer arithmetic never sees. Per host,
-/// because the same rate mismatch means different things:
+/// The converter's presence decides rung 3. Otherwise a native rate other
+/// than the session's means the host bridged the difference, and which way
+/// is a property of the host, because the same mismatch means different
+/// things:
 ///
+/// - CoreAudio sets the device's nominal rate to the stream's inside
+///   `build_*_stream`, so the whole device clock moved: rung 2.
 /// - WASAPI opens output with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`, so the
-///   engine keeps its mix rate and converts our stream into it.
-/// - PipeWire keeps its graph rate and converts client streams the same way.
-/// - CoreAudio sets the device's nominal rate to the stream's, so a stream
-///   that opened is really running at its rate; a device that could not
-///   reclock was refused up front.
-/// - ALSA converts nothing: a stream that opened at the session rate is
-///   running at it.
-///
-/// `None` for a host the table does not know, which is also what the report
-/// shows: an unknown host earns no claim either way.
-const fn render_conversion(host: &str, device_rate: u32, stream_rate: u32) -> Option<bool> {
-    // `const fn` cannot match on &str, so this is a byte comparison chain.
-    match host.as_bytes() {
-        b"WASAPI" | b"PipeWire" => Some(device_rate != stream_rate),
-        b"CoreAudio" | b"ALSA" => Some(false),
-        _ => None,
+///   engine keeps its mix rate and converts our stream into it; PipeWire
+///   does the same between its graph rate and a client stream.
+/// - On ALSA and unknown hosts a stream only ever opens at a rate the card
+///   advertised, whatever the default config reads, which is rung 1.
+fn rate_outcome(
+    rates: RateContext,
+    native_rate: u32,
+    opened_rate: u32,
+    resample_added_ms: Option<f32>,
+) -> RateOutcome {
+    if let Some(added_ms) = resample_added_ms {
+        return RateOutcome::Resampled {
+            device: opened_rate,
+            added_ms,
+        };
+    }
+    if native_rate == rates.rate {
+        return RateOutcome::Native;
+    }
+    match rates.host {
+        "CoreAudio" => RateOutcome::ClockSet { from: native_rate },
+        "WASAPI" | "PipeWire" => RateOutcome::OsConverted {
+            device: native_rate,
+        },
+        _ => RateOutcome::Native,
     }
 }
 
@@ -826,6 +827,7 @@ struct CpalStreamHandle {
     errored: Arc<AtomicBool>,
     latency_frames: Option<u32>,
     buffer_frames: Option<u32>,
+    rate: RateOutcomes,
 }
 
 impl StreamHandle for CpalStreamHandle {
@@ -839,6 +841,10 @@ impl StreamHandle for CpalStreamHandle {
 
     fn errored(&self) -> bool {
         self.errored.load(Ordering::Acquire)
+    }
+
+    fn rate_outcomes(&self) -> Option<RateOutcomes> {
+        Some(self.rate)
     }
 
     fn close(self: Box<Self>) {
@@ -1240,36 +1246,47 @@ mod tests {
         }
     }
 
-    /// The disclosure table: a rate mismatch means OS conversion only on the
-    /// hosts that convert. CoreAudio moved the device clock, ALSA never opened
-    /// a rate the card does not run, and an unknown host earns no claim.
+    /// The disclosure table: what a 44.1 kHz native rate means once the
+    /// stream opened at 48 kHz is a property of the host. CoreAudio moved
+    /// the whole device clock, WASAPI and PipeWire converted in the OS, and
+    /// on ALSA or an unknown host a stream only opens at a rate the card
+    /// advertised, so the mismatch in the default config is not a claim.
+    /// A converter on the stream is rung 3 wherever it runs.
     #[test]
-    fn render_conversion_is_claimed_only_where_the_os_converts() {
+    fn rate_outcomes_follow_the_host_that_bridged_the_rate() {
+        assert_eq!(
+            rate_outcome(ctx("CoreAudio"), 44_100, 48_000, None),
+            RateOutcome::ClockSet { from: 44_100 }
+        );
         for host in ["WASAPI", "PipeWire"] {
             assert_eq!(
-                render_conversion(host, 44_100, 48_000),
-                Some(true),
-                "{host}"
-            );
-            assert_eq!(
-                render_conversion(host, 48_000, 48_000),
-                Some(false),
+                rate_outcome(ctx(host), 44_100, 48_000, None),
+                RateOutcome::OsConverted { device: 44_100 },
                 "{host}"
             );
         }
-        for host in ["CoreAudio", "ALSA"] {
+        for host in ["ALSA", "Frobnicator"] {
             assert_eq!(
-                render_conversion(host, 44_100, 48_000),
-                Some(false),
-                "{host}"
-            );
-            assert_eq!(
-                render_conversion(host, 48_000, 48_000),
-                Some(false),
+                rate_outcome(ctx(host), 44_100, 48_000, None),
+                RateOutcome::Native,
                 "{host}"
             );
         }
-        assert_eq!(render_conversion("Frobnicator", 44_100, 48_000), None);
+        for host in ["CoreAudio", "WASAPI", "PipeWire", "ALSA"] {
+            assert_eq!(
+                rate_outcome(ctx(host), 48_000, 48_000, None),
+                RateOutcome::Native,
+                "{host}: native is not news"
+            );
+            assert_eq!(
+                rate_outcome(ctx(host), 44_100, 44_100, Some(3.2)),
+                RateOutcome::Resampled {
+                    device: 44_100,
+                    added_ms: 3.2
+                },
+                "{host}: the converter is rung 3 everywhere"
+            );
+        }
     }
 
     #[test]

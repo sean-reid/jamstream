@@ -184,6 +184,16 @@ impl Default for DevicesScreen {
     }
 }
 
+/// What the stream has to say for itself under the pickers: the refusal
+/// reason while there is no stream, and the rate disclosures (#347) while
+/// there is one. Both are consequences of the pick, so they render beside
+/// the controls that made it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamNotes<'a> {
+    pub refusal: Option<&'a str>,
+    pub rate_lines: &'a [String],
+}
+
 /// What the Audio tab asks the app to do; the tab cannot reach the platform
 /// backend itself, which is what keeps every fixture off the real sound card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,10 +240,11 @@ impl DevicesScreen {
     /// musician reaches for mid session, by ear and by meter, while the
     /// device pickers are set once. Whatever is last is what a short window
     /// puts behind a scroll, so the order is the priority.
-    /// `refusal` is why there is no audio stream right now, when there is
-    /// none: the pickers are what a musician came here to change, so the
-    /// reason belongs beside them rather than only over the mixer they cannot
-    /// see with this drawer open (#263).
+    /// `notes` is what the stream reports about the pick: the refusal while
+    /// there is no stream, the rate disclosures while there is one. The
+    /// pickers are what a musician came here to change, so both belong
+    /// beside them rather than only over the mixer they cannot see with
+    /// this drawer open (#263).
     pub fn audio_ui(
         &mut self,
         ui: &mut Ui,
@@ -241,13 +252,13 @@ impl DevicesScreen {
         catalog: &DeviceCatalog,
         levels: &LevelsView,
         mouth_to_ear_ms: Option<f32>,
-        refusal: Option<&str>,
+        notes: StreamNotes<'_>,
     ) -> Option<DevicesEvent> {
         self.buffer_ui(ui, block, catalog, mouth_to_ear_ms);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
         ui.add_space(theme::SPACE_MD);
-        self.devices_ui(ui, block, catalog, refusal)
+        self.devices_ui(ui, block, catalog, notes)
     }
 
     fn buffer_ui(
@@ -300,7 +311,7 @@ impl DevicesScreen {
         ui: &mut Ui,
         block: Block,
         catalog: &DeviceCatalog,
-        refusal: Option<&str>,
+        notes: StreamNotes<'_>,
     ) -> Option<DevicesEvent> {
         let mut event = None;
         block.show(ui, |ui| {
@@ -362,6 +373,14 @@ impl DevicesScreen {
                 )
                 .small(),
             );
+            // How the running stream reaches 48 kHz, when that is anything
+            // other than the device's own clock (#347): the consequence of
+            // the pick belongs beside the pickers that made it. Muted, not a
+            // warning; the stream is working.
+            for line in notes.rate_lines {
+                ui.add_space(theme::SPACE_XS);
+                ui.label(theme::muted(ui, line.clone()).small());
+            }
             // What the last rescan did to the selection, before the refusal:
             // a device that vanished is why the picker reads System default
             // now, and saying so is the difference between a fallback and a
@@ -373,7 +392,7 @@ impl DevicesScreen {
             // The pick that will not open, in the device's own words, under the
             // picker that made it. No sentence of ours around it: the pickers
             // are right above it, so what it is about is not in question.
-            if let Some(reason) = refusal {
+            if let Some(reason) = notes.refusal {
                 ui.add_space(theme::SPACE_XS);
                 theme::reason(ui, reason);
             }
