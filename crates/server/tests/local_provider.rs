@@ -162,10 +162,21 @@ async fn launch_join_destroy_end_to_end() {
     let mut mat = session_material(10);
 
     mat.reserved.release();
+    let spawn_started = Instant::now();
     let instance = provider
         .launch(launch_spec(&provider, &mat, "e2e-session"))
         .await
         .expect("launch");
+    // launch() waits READY_TIMEOUT for the spawned jamstreamd, a fixed 5 s
+    // that JAMSTREAM_PERF_BUDGET_SECS does not scale, and it is tightest on
+    // the platform where CreateProcess plus Defender's first-run scan of a
+    // fresh binary costs the most (#339). Published from every run of every
+    // platform via .config/nextest.toml so the window can be judged against
+    // measurements; nothing gates on it.
+    println!(
+        "local spawn-to-ready: {:.0} ms",
+        spawn_started.elapsed().as_secs_f64() * 1e3
+    );
     assert!(instance.public_ip.is_some(), "instance must carry an ip");
     assert_eq!(instance.session_id(), Some("e2e-session"));
 
@@ -206,6 +217,24 @@ async fn launch_join_destroy_end_to_end() {
         "destroyed session still listed"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The spawn-to-ready line above only exists on passing runs because
+/// `.config/nextest.toml` names this test for publishing, and filters there
+/// are exact matches: a rename has to land in both places or in neither.
+/// Same pairing the harness and session suites keep for their measurements.
+#[test]
+fn the_measured_tests_are_named_in_the_nextest_config() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+    let (name, _) = (
+        stringify!(launch_join_destroy_end_to_end),
+        launch_join_destroy_end_to_end as fn(),
+    );
+    assert!(
+        CONFIG.contains(&format!("test(={name})")),
+        ".config/nextest.toml no longer names {name}, so its spawn-to-ready \
+         measurement is being printed into a void"
+    );
 }
 
 #[tokio::test]
