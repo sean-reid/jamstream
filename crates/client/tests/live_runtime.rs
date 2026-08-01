@@ -135,19 +135,20 @@ fn temp_path(test: &str, name: &str) -> PathBuf {
     ))
 }
 
-/// 30 s mono 16-bit sine at half scale: long enough to outlast any test
-/// even when a loaded machine stretches the joins and waits.
-fn sine_fixture(test: &str, hz: f32) -> PathBuf {
-    let path = temp_path(test, &format!("sine-{hz}.wav"));
+/// 30 s mono 16-bit sine at half scale, on the given device clock: long
+/// enough to outlast any test even when a loaded machine stretches the
+/// joins and waits.
+fn sine_fixture(test: &str, hz: f32, rate: u32) -> PathBuf {
+    let path = temp_path(test, &format!("sine-{hz}-{rate}.wav"));
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: RATE,
+        sample_rate: rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(&path, spec).expect("fixture wav");
-    for i in 0..(30 * RATE) {
-        let t = i as f32 / RATE as f32;
+    for i in 0..(30 * rate) {
+        let t = i as f32 / rate as f32;
         let s = (t * hz * std::f32::consts::TAU).sin() * 0.5;
         writer
             .write_sample((s * f32::from(i16::MAX)) as i16)
@@ -157,13 +158,21 @@ fn sine_fixture(test: &str, hz: f32) -> PathBuf {
     path
 }
 
-/// Samples of a 32-bit float WAV, as the offline backend writes them.
-fn wav_samples(path: &Path) -> Vec<f32> {
+/// A 32-bit float WAV with its own clock, as the offline backend writes
+/// them: the capture file of a 44.1 kHz device runs at 44.1, so every
+/// measurement reads the rate from the file instead of assuming RATE.
+fn rate_and_samples(path: &Path) -> (u32, Vec<f32>) {
     let mut reader = hound::WavReader::open(path).expect("open capture wav");
-    reader
+    let rate = reader.spec().sample_rate;
+    let samples = reader
         .samples::<f32>()
         .map(|s| s.expect("wav sample"))
-        .collect()
+        .collect();
+    (rate, samples)
+}
+
+fn wav_samples(path: &Path) -> Vec<f32> {
+    rate_and_samples(path).1
 }
 
 fn rms(samples: &[f32]) -> f64 {
@@ -176,12 +185,29 @@ fn rms(samples: &[f32]) -> f64 {
         .sqrt()
 }
 
+/// The final `secs` seconds of a stereo capture file, with the file's rate.
+fn tail(path: &Path, secs: f64) -> (u32, Vec<f32>) {
+    let (rate, samples) = rate_and_samples(path);
+    let take = ((secs * f64::from(rate)) as usize * 2).min(samples.len());
+    assert!(take > 0, "window is empty for {path:?}");
+    (rate, samples[samples.len() - take..].to_vec())
+}
+
 /// RMS of the final `secs` seconds of a stereo capture file.
 fn tail_rms(path: &Path, secs: f64) -> f64 {
-    let samples = wav_samples(path);
-    let take = ((secs * f64::from(RATE)) as usize * 2).min(samples.len());
-    assert!(take > 0, "window is empty for {path:?}");
-    rms(&samples[samples.len() - take..])
+    rms(&tail(path, secs).1)
+}
+
+/// Zero-crossing pitch of channel 0 over the final `secs` seconds of a
+/// stereo capture file, measured on the file's own clock.
+fn tail_pitch_hz(path: &Path, secs: f64) -> f64 {
+    let (rate, samples) = tail(path, secs);
+    let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
+    let cycles = left
+        .windows(2)
+        .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
+        .count();
+    cycles as f64 / (left.len() as f64 / f64::from(rate))
 }
 
 /// Polls snapshots until `pred` holds; panics with the last state on timeout.
@@ -251,7 +277,7 @@ fn join_reaches_joined_and_stats_populate() {
 #[test]
 fn two_runtimes_hear_each_other() {
     let server = TestServer::start();
-    let sine = sine_fixture("hear", 440.0);
+    let sine = sine_fixture("hear", 440.0, RATE);
     let out_b = temp_path("hear", "out-b.wav");
 
     let a = LiveRuntime::join_offline(
@@ -324,7 +350,7 @@ fn chat_crosses_between_runtimes() {
 #[test]
 fn fader_mute_silences_the_member() {
     let server = TestServer::start();
-    let sine = sine_fixture("mute", 440.0);
+    let sine = sine_fixture("mute", 440.0, RATE);
     let out_a = temp_path("mute", "out-a.wav");
 
     let a = LiveRuntime::join_offline(
@@ -512,7 +538,7 @@ fn leave_tears_down_and_shrinks_the_roster() {
 #[test]
 fn reconfigure_audio_swaps_the_stream_mid_session() {
     let server = TestServer::start();
-    let sine = sine_fixture("reconf", 440.0);
+    let sine = sine_fixture("reconf", 440.0, RATE);
     let out_b = temp_path("reconf", "out-b.wav");
 
     let a = LiveRuntime::join_offline(
@@ -603,7 +629,7 @@ fn the_host_pressing_record_lands_a_take_and_lights_the_lamp() {
     let takes = temp_path("record", "takes");
     let _ = std::fs::remove_dir_all(&takes);
     let server = TestServer::recording_to(&takes);
-    let sine = sine_fixture("record", 440.0);
+    let sine = sine_fixture("record", 440.0, RATE);
 
     // Member 0 is the host seat, and the server refuses record control
     // from anybody else, so it is the only seat this could pass from.
@@ -698,7 +724,7 @@ fn longest_zero_run(samples: &[f32]) -> usize {
 #[test]
 fn a_device_period_larger_than_the_request_still_carries_audio() {
     let server = TestServer::start();
-    let sine = sine_fixture("period", 440.0);
+    let sine = sine_fixture("period", 440.0, RATE);
     let out_b = temp_path("period", "out-b.wav");
 
     let a = LiveRuntime::join_offline(
@@ -750,6 +776,71 @@ fn a_device_period_larger_than_the_request_still_carries_audio() {
     }
 }
 
+/// The #347 ladder's rung 3, end to end: both members sit on 44.1 kHz
+/// interfaces while the wire and engine stay at 48 kHz. A captures a 440 Hz
+/// sine from a 44.1 fixture, B renders to a 44.1 capture file, and the audio
+/// crosses two boundary conversions plus the server, arriving at level, at
+/// pitch, and without underrun padding.
+///
+/// This is also the test that holds the offline pump to the device's own
+/// clock: paced at 48 000 frames per second, a 44.1 kHz uplink runs 8.8%
+/// fast, which is far past the compensators' authority and shows up here as
+/// concealment instead of music.
+#[test]
+fn a_44_1_interface_carries_the_session_both_ways() {
+    let server = TestServer::start();
+    let sine = sine_fixture("rung3", 440.0, 44_100);
+    let out_b = temp_path("rung3", "out-b.wav");
+
+    let a = LiveRuntime::join_offline(
+        &server.invite(1, "a"),
+        settings(),
+        WavBackend::new(Some(sine.clone()), None).with_device_rate(44_100),
+    )
+    .expect("join a");
+    let b = LiveRuntime::join_offline(
+        &server.invite(2, "b"),
+        settings(),
+        WavBackend::new(None, Some(out_b.clone())).with_device_rate(44_100),
+    )
+    .expect("join b");
+
+    wait_for(&a, "a joined", Duration::from_secs(10), joined);
+    wait_for(&b, "b sees both members", Duration::from_secs(10), |s| {
+        joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+    });
+
+    std::thread::sleep(Duration::from_millis(2_500));
+    b.send(Command::Leave);
+    wait_for(&b, "b idle", Duration::from_secs(3), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(b);
+    drop(a);
+
+    let (rate, samples) = tail(&out_b, 1.0);
+    assert_eq!(rate, 44_100, "b's device writes on its own clock");
+    let energy = rms(&samples);
+    assert!(
+        energy > 0.02,
+        "b heard near-silence (rms {energy}); a's audio never arrived"
+    );
+    let run = longest_zero_run(&samples);
+    assert!(
+        run < 240,
+        "steady-state playout contains a {run}-sample silence run"
+    );
+    let hz = tail_pitch_hz(&out_b, 1.0);
+    assert!(
+        (hz - 440.0).abs() < 20.0,
+        "the sine crossed two conversions off pitch: {hz:.1} Hz"
+    );
+
+    for p in [&sine, &out_b] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// A device unplugged mid-session: the stream is closed, the room is told, and
 /// the runtime reopens on the system default without losing the session.
 ///
@@ -763,7 +854,7 @@ fn a_device_period_larger_than_the_request_still_carries_audio() {
 #[test]
 fn a_device_lost_mid_session_is_announced_and_reopened() {
     let server = TestServer::start();
-    let sine = sine_fixture("device-loss", 440.0);
+    let sine = sine_fixture("device-loss", 440.0, RATE);
     // Two hundred frames is half a second of pumping at 2.5 ms, so the loss
     // lands well after the join and well inside the test's own patience.
     let backend = WavBackend::new(Some(sine.clone()), None).with_device_loss_after(200);
@@ -812,24 +903,105 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
     let _ = std::fs::remove_file(&sine);
 }
 
-/// User story: a musician swaps interfaces mid-song, the new one will not run
-/// at 48 kHz, and the app tells them why on screen instead of going quiet.
-///
-/// The device's own words are the whole point. Before this, the reason lived in
-/// a `tracing::warn` inside `try_open` and the only visible notice was the chat
-/// line asserted above, which says what the app did and not why it had to.
-/// Nothing in the suite read the refusal, so it could be dropped entirely and
-/// stay green.
+/// User story: a musician swaps interfaces mid-song, the new one runs at
+/// 44.1 kHz, and the music keeps playing through the boundary converter
+/// (#347 rung 3) where it used to be refused. What arrives on the swapped-in
+/// interface must still be the room's audio: at level, at pitch, and free of
+/// underrun padding. The on-screen conversion disclosure lands with the
+/// rate-outcome surface in a later change.
 #[test]
-fn a_device_that_refuses_the_session_rate_says_so_in_the_snapshot() {
+fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
     let server = TestServer::start();
-    let sine = sine_fixture("device-refused", 440.0);
-    // The sequence a swapped cable puts a running session through: the device
-    // that joined is lost after half a second of pumping, and the one that
-    // answers the reopen runs at 44.1 kHz and will not take 48.
+    let sine = sine_fixture("swap-44-1", 440.0, RATE);
+    let out_b = temp_path("swap-44-1", "out-b.wav");
+
+    let a = LiveRuntime::join_offline(
+        &server.invite(1, "a"),
+        settings(),
+        WavBackend::new(Some(sine.clone()), None),
+    )
+    .expect("join a");
+    // B's first device is unplugged moments after the join; the interface
+    // that answers the reopen is clocked at 44.1 kHz.
+    let b = LiveRuntime::join_offline(
+        &server.invite(2, "b"),
+        settings(),
+        WavBackend::new(None, Some(out_b.clone()))
+            .with_device_loss_after(200)
+            .reopening_at(44_100),
+    )
+    .expect("join b");
+
+    wait_for(&a, "a joined", Duration::from_secs(10), joined);
+    wait_for(&b, "b sees both members", Duration::from_secs(10), |s| {
+        joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+    });
+    wait_for(&b, "the reopen", Duration::from_secs(10), |s| {
+        s.chat
+            .iter()
+            .any(|l| l.text.contains("audio device reopened"))
+    });
+
+    // Two seconds of the room through the swapped-in interface. The reopen
+    // recreated the capture file, so everything in it is post-swap audio.
+    std::thread::sleep(Duration::from_millis(2_000));
+    let snap = b.snapshot();
+    assert_eq!(
+        snap.stats.state,
+        ConnState::Joined,
+        "the swap must not drop the session"
+    );
+    assert!(
+        snap.device_error.is_none(),
+        "nothing was refused: {:?}",
+        snap.device_error
+    );
+    b.send(Command::Leave);
+    wait_for(&b, "b idle", Duration::from_secs(3), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(b);
+    drop(a);
+
+    let (rate, samples) = tail(&out_b, 1.0);
+    assert_eq!(
+        rate, 44_100,
+        "the swapped-in device writes on its own clock"
+    );
+    let energy = rms(&samples);
+    assert!(
+        energy > 0.02,
+        "b heard near-silence after the swap (rms {energy})"
+    );
+    let run = longest_zero_run(&samples);
+    assert!(
+        run < 240,
+        "post-swap playout contains a {run}-sample silence run"
+    );
+    let hz = tail_pitch_hz(&out_b, 1.0);
+    assert!(
+        (hz - 440.0).abs() < 20.0,
+        "a's sine arrived off pitch: {hz:.1} Hz"
+    );
+
+    for p in [&sine, &out_b] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// The refusal that outlives rung 3, and the surface that carries it: a
+/// device the reopen cannot open at the device's own rate (the #242 final
+/// fallback). The swapped-in interface's 44.1 kHz clock no longer refuses,
+/// so the failure modelled here is its input source: a 48 kHz fixture the
+/// 44.1 stream cannot read. The reason must land in the snapshot for the
+/// UI, not only in a log, and the session must survive.
+#[test]
+fn a_device_the_reopen_cannot_open_says_so_in_the_snapshot() {
+    let server = TestServer::start();
+    let sine = sine_fixture("device-refused", 440.0, RATE);
     let backend = WavBackend::new(Some(sine.clone()), None)
         .with_device_loss_after(200)
-        .refusing_reopen_at(44_100);
+        .reopening_at(44_100);
     let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
         .expect("join offline");
     wait_for(&rt, "joined", Duration::from_secs(10), joined);

@@ -39,8 +39,9 @@ use crate::runtime::{
 use crate::screens::invites::TokenMap;
 
 /// The session rate, from the protocol rather than a second copy of 48000:
-/// the device is opened at it and the offline pump paces against it, so a
-/// protocol that moved would otherwise leave this side opening the wrong rate.
+/// the device is opened at it, so a protocol that moved would otherwise
+/// leave this side opening the wrong rate. The offline pump paces from the
+/// device's own rate instead; see [`Driver::pump_one`].
 const SAMPLE_RATE: u32 = jamstream_protocol::SAMPLE_RATE;
 const CHANNELS: u16 = 2;
 /// The pace this side loops at and the frame it sends, both belonging to
@@ -58,10 +59,11 @@ const CHAT_LIMIT: usize = 500;
 const LEVEL_DECAY: f32 = 0.99;
 /// Backoff between attempts to reopen a lost or misconfigured stream.
 const REOPEN_INTERVAL: Duration = Duration::from_millis(500);
-/// Longest offline-pump stall replayed sample-for-sample; two seconds is
-/// comfortably past the server jitter buffer's 512-frame (1.28 s)
-/// stream-restart threshold, so an abandoned backlog always trips it.
-const PUMP_REPLAY_MAX: u64 = 2 * SAMPLE_RATE as u64;
+/// Longest offline-pump stall replayed sample-for-sample, in seconds of
+/// device time; two seconds is comfortably past the server jitter buffer's
+/// 512-frame (1.28 s) stream-restart threshold, so an abandoned backlog
+/// always trips it.
+const PUMP_REPLAY_MAX_SECS: u64 = 2;
 /// Synthetic sender id for system chat lines (device notices). Real member
 /// ids are assigned from zero, far below this.
 const SYSTEM_MEMBER: MemberId = MemberId(u16::MAX);
@@ -348,11 +350,11 @@ impl Driver {
         }
     }
 
-    /// Offline only: advance the WAV stream by at most one 2.5 ms bite when
-    /// wall time owes it one. Returns whether it pumped, so the worker can
-    /// service the rings between bites; the rings are only a couple of
-    /// device buffers deep, and pumping a whole catch-up burst against
-    /// unserviced rings would play silence and drop capture.
+    /// Offline only: advance the WAV stream by at most one frame-sized bite
+    /// (~2.5 ms) when wall time owes it one. Returns whether it pumped, so
+    /// the worker can service the rings between bites; the rings are only a
+    /// couple of device buffers deep, and pumping a whole catch-up burst
+    /// against unserviced rings would play silence and drop capture.
     fn pump_one(&mut self) -> bool {
         let Driver::Offline {
             stream: Some(stream),
@@ -363,7 +365,11 @@ impl Driver {
         else {
             return false;
         };
-        let due = (epoch.elapsed().as_secs_f64() * f64::from(SAMPLE_RATE)) as u64;
+        // Pumped frames are device-rate frames, so the debt is counted on
+        // the device's clock. Pacing a 44.1 kHz stream at SAMPLE_RATE would
+        // run the offline uplink 8.8% fast, far past any compensator.
+        let rate = stream.device_rate();
+        let due = (epoch.elapsed().as_secs_f64() * f64::from(rate)) as u64;
         let backlog = due.saturating_sub(*pumped_frames);
         if backlog == 0 {
             return false;
@@ -377,7 +383,7 @@ impl Driver {
         // sample-for-sample; longer ones (a debugger pause) drop the whole
         // backlog, a discontinuity big enough to trip that stream-restart
         // reset and re-anchor cleanly.
-        if backlog > PUMP_REPLAY_MAX {
+        if backlog > PUMP_REPLAY_MAX_SECS * u64::from(rate) {
             *pumped_frames = due;
             return false;
         }

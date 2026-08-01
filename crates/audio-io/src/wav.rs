@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::resample::{converting_capture, converting_playback};
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
     StreamConfig, StreamHandle,
@@ -57,8 +58,10 @@ impl WavBackend {
         }
     }
 
-    /// Models an interface running at `rate`: opening at any other rate fails
-    /// the way a real device does, instead of playing back pitch shifted.
+    /// Models an interface clocked at `rate`: a session at any other rate
+    /// opens through the boundary converter (#347 rung 3), so the handler
+    /// keeps seeing session-rate audio while [`WavStream::pump`], the input
+    /// WAV, and the capture output all move in device-rate frames.
     #[must_use]
     pub fn with_device_rate(mut self, rate: u32) -> Self {
         self.device_rate = rate;
@@ -70,7 +73,8 @@ impl WavBackend {
     /// frames at 48 kHz against a 120-frame request). Pumped frames accumulate
     /// and the handler runs once per full period, so the caller sees the same
     /// burstiness a real device delivers; [`StreamHandle::buffer_frames`]
-    /// reports the period, exactly as cpal reports it on that host.
+    /// reports the period, exactly as cpal reports it on that host, scaled to
+    /// session-rate frames when the stream converts.
     #[must_use]
     pub fn with_device_period(mut self, frames: u32) -> Self {
         self.device_period = Some(frames);
@@ -99,36 +103,36 @@ impl WavBackend {
         self
     }
 
-    /// Models the interface a musician swaps to mid-song: the first open is the
-    /// device they started on, and every one after it runs at `rate`, so a
-    /// reopen is refused the way [`Self::with_device_rate`] refuses a join.
-    /// Pair it with [`Self::with_device_loss_after`] for the whole sequence a
-    /// swapped cable puts a running session through.
+    /// Models the interface a musician swaps to mid-song: the first open is
+    /// the device they started on, and every one after it runs at `rate`,
+    /// converting at the boundary when the session rate differs, exactly as
+    /// [`Self::with_device_rate`] does from the start. Pair it with
+    /// [`Self::with_device_loss_after`] for the whole sequence a swapped
+    /// cable puts a running session through.
     #[must_use]
-    pub fn refusing_reopen_at(mut self, rate: u32) -> Self {
+    pub fn reopening_at(mut self, rate: u32) -> Self {
         self.reopen_rate = Some(rate);
         self
     }
 
     /// Concrete-typed variant of [`AudioBackend::open_duplex`] so callers can
     /// reach [`WavStream::pump`] without downcasting.
+    ///
+    /// A device rate other than `config.sample_rate` opens with the boundary
+    /// converter wrapped around each handler half, the #347 rung 3 shape:
+    /// the stream, its files, and its pump run in device-rate frames while
+    /// the handler keeps its session-rate view.
     pub fn open_offline(&self, config: StreamConfig, handler: DuplexHandler) -> Result<WavStream> {
         let rate = match self.reopen_rate {
             Some(rate) if self.opened.swap(true, Ordering::Relaxed) => rate,
             _ => self.device_rate,
         };
-        if config.sample_rate != rate {
-            return Err(AudioError::Unsupported(format!(
-                "wav device runs at {rate} Hz and will not open at {} Hz",
-                config.sample_rate
-            )));
-        }
         if config.channels == 0 {
             return Err(AudioError::Unsupported("zero channels".into()));
         }
 
         let input = match &self.input_wav {
-            Some(path) => read_input(path, config.channels, config.sample_rate)?,
+            Some(path) => read_input(path, config.channels, rate)?,
             None => Vec::new(),
         };
 
@@ -136,7 +140,7 @@ impl WavBackend {
             Some(path) => {
                 let spec = hound::WavSpec {
                     channels: config.channels,
-                    sample_rate: config.sample_rate,
+                    sample_rate: rate,
                     bits_per_sample: 32,
                     sample_format: hound::SampleFormat::Float,
                 };
@@ -145,10 +149,26 @@ impl WavBackend {
             None => None,
         };
 
-        // Publish the conversion report exactly like a real backend: this
-        // device never converts, because a rate mismatch was refused above.
+        let (handler, resample_added_ms) = if config.sample_rate == rate {
+            (handler, None)
+        } else {
+            let (capture, playback) = handler.into_parts();
+            let (capture, capture_ms) =
+                converting_capture(capture, config.sample_rate, rate, config.channels);
+            let (playback, playback_ms) =
+                converting_playback(playback, config.sample_rate, rate, config.channels);
+            (
+                DuplexHandler::from_parts(capture, playback),
+                Some((capture_ms, playback_ms)),
+            )
+        };
+
+        // Publish the conversion report exactly like a real backend: the OS
+        // never converts this device, because a rate mismatch runs through
+        // our own boundary converter instead.
         crate::mode::set_render_conversion(false);
 
+        let device_frames = self.device_period.unwrap_or(config.buffer_frames);
         Ok(WavStream {
             handler,
             input,
@@ -156,6 +176,8 @@ impl WavBackend {
             exhausted: false,
             writer,
             channels: usize::from(config.channels),
+            device_rate: rate,
+            resample_added_ms,
             capture_buf: Vec::new(),
             playback_buf: Vec::new(),
             pumped_frames: 0,
@@ -166,7 +188,7 @@ impl WavBackend {
             errored: false,
             period: self.device_period.map(|p| p as usize),
             pending: 0,
-            buffer_frames: self.device_period.unwrap_or(config.buffer_frames),
+            buffer_frames: session_frames(device_frames, config.sample_rate, rate),
         })
     }
 }
@@ -206,7 +228,9 @@ impl AudioBackend for WavBackend {
     }
 }
 
-/// Offline stream. The caller advances virtual time with [`pump`](Self::pump).
+/// Offline stream. The caller advances virtual time with [`pump`](Self::pump);
+/// pumped frames are device-rate frames, the clock the modelled device runs
+/// at, so a pacing caller must pace from [`device_rate`](Self::device_rate).
 pub struct WavStream {
     handler: DuplexHandler,
     /// Input samples already converted to the configured channel layout.
@@ -215,6 +239,10 @@ pub struct WavStream {
     exhausted: bool,
     writer: Option<hound::WavWriter<BufWriter<File>>>,
     channels: usize,
+    device_rate: u32,
+    /// `(capture, playback)` latency the boundary converter adds, when this
+    /// stream converts.
+    resample_added_ms: Option<(f32, f32)>,
     capture_buf: Vec<f32>,
     playback_buf: Vec<f32>,
     pumped_frames: u64,
@@ -289,6 +317,24 @@ impl WavStream {
         self.errored = true;
     }
 
+    /// The rate the modelled device is clocked at. [`pump`](Self::pump)
+    /// frames represent wall time at this rate, never at the session rate:
+    /// a 44.1 kHz stream pumped at 48 000 frames per second would run 8.8%
+    /// fast, far past what any drift compensator absorbs.
+    #[must_use]
+    pub fn device_rate(&self) -> u32 {
+        self.device_rate
+    }
+
+    /// Latency the boundary converter adds in milliseconds, as
+    /// `(capture, playback)`, or `None` when the device runs at the session
+    /// rate and nothing converts. The figures come from the converter's own
+    /// constructor; the rate disclosure reads them at open.
+    #[must_use]
+    pub fn resample_added_ms(&self) -> Option<(f32, f32)> {
+        self.resample_added_ms
+    }
+
     /// True once a pump has run past the end of the input WAV (or from the
     /// first pump when there is no input file).
     #[must_use]
@@ -342,7 +388,15 @@ fn wav_err(e: hound::Error) -> AudioError {
     AudioError::Backend(e.to_string())
 }
 
-/// Read the whole input file, asserting the stream's rate, and convert to
+/// A device-rate callback size in session-rate frames, rounded up: what a
+/// converting stream can hand the handler per callback, and therefore what
+/// [`StreamHandle::buffer_frames`] reports so everything sized around
+/// callbacks keeps one unit.
+fn session_frames(device_frames: u32, session_rate: u32, device_rate: u32) -> u32 {
+    (u64::from(device_frames) * u64::from(session_rate)).div_ceil(u64::from(device_rate)) as u32
+}
+
+/// Read the whole input file, asserting the device's rate, and convert to
 /// `channels`: matching layouts copy through, mono fans out to every channel,
 /// and a wider source contributes its first `channels` channels.
 fn read_input(path: &PathBuf, channels: u16, sample_rate: u32) -> Result<Vec<f32>> {
