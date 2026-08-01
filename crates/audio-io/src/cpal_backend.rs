@@ -16,6 +16,7 @@
 //! and for a Bluetooth hands-free microphone, which has no rate worth
 //! carrying (#330).
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +37,15 @@ type PlaybackFn = Box<dyn FnMut(&mut [f32]) + Send>;
 /// Platform default cpal host.
 pub struct CpalBackend {
     host: cpal::Host,
+    /// Devices whose clock this app set and then lost the stream on: the
+    /// contested-clock demotion (#347). Another app snapping the nominal
+    /// rate back kills the stream; re-setting the clock on the reopen would
+    /// play tug-of-war with a musician's other software, so a demoted
+    /// device is opened at its own rate through the boundary converter for
+    /// the rest of this backend's life, which is the session's. No retry,
+    /// no fight. Shared with every stream handle, which is what records the
+    /// demotion when it dies.
+    demoted: Arc<Mutex<HashSet<String>>>,
 }
 
 impl CpalBackend {
@@ -43,6 +53,7 @@ impl CpalBackend {
     pub fn new() -> Self {
         Self {
             host: cpal::default_host(),
+            demoted: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -167,6 +178,7 @@ impl AudioBackend for CpalBackend {
                 .map_err(|e| map_err(&e))?,
             host_converts,
             in_side.form,
+            device_demoted(&self.demoted, &in_device),
         )?;
         let out_plan = plan_direction(
             rates,
@@ -177,6 +189,7 @@ impl AudioBackend for CpalBackend {
                 .map_err(|e| map_err(&e))?,
             host_converts,
             out_side.form,
+            device_demoted(&self.demoted, &out_device),
         )?;
 
         let (on_capture, on_playback) = handler.into_parts();
@@ -199,6 +212,20 @@ impl AudioBackend for CpalBackend {
             playback: rate_outcome(rates, out_side.native.sample_rate(), out_rate, out_added),
         };
         log_rate_outcomes(&rate);
+
+        // The devices whose clock this open moved, remembered on the handle:
+        // if this stream dies, they are demoted rather than fought over.
+        let mut clock_set = Vec::new();
+        if matches!(rate.capture, RateOutcome::ClockSet { .. })
+            && let Ok(id) = in_device.id()
+        {
+            clock_set.push(id.id().to_string());
+        }
+        if matches!(rate.playback, RateOutcome::ClockSet { .. })
+            && let Ok(id) = out_device.id()
+        {
+            clock_set.push(id.id().to_string());
+        }
 
         // Negotiated callback sizes, per host: the WASAPI shared-mode device
         // period, the ALSA period, CoreAudio's device frame size, PipeWire's
@@ -231,7 +258,34 @@ impl AudioBackend for CpalBackend {
             latency_frames,
             buffer_frames,
             rate,
+            clock_set,
+            demoted: Arc::clone(&self.demoted),
+            demotion_noted: AtomicBool::new(false),
         }))
+    }
+}
+
+/// Whether a device sits in the backend's contested-clock demotion set.
+fn device_demoted(demoted: &Mutex<HashSet<String>>, device: &cpal::Device) -> bool {
+    device
+        .id()
+        .is_ok_and(|id| demoted.lock().is_ok_and(|set| set.contains(id.id())))
+}
+
+/// Records a dead clock-set stream's devices as demoted, once each, so every
+/// later open in this backend converts for them instead of re-setting the
+/// clock (#347's contested-clock decision: no retry, no fight).
+fn demote(demoted: &Mutex<HashSet<String>>, clock_set: &[String]) {
+    let Ok(mut set) = demoted.lock() else { return };
+    for id in clock_set {
+        if set.insert(id.clone()) {
+            tracing::warn!(
+                device = %id,
+                "a stream that had moved this device's clock died; opening it \
+                 through the boundary converter from now on instead of \
+                 re-setting the clock"
+            );
+        }
     }
 }
 
@@ -520,6 +574,12 @@ struct DirectionPlan {
 /// survives only for a Bluetooth hands-free microphone: converting an 8 or
 /// 16 kHz voice-profile capture would carry the session in telephone
 /// quality, and #330 decided the honest answer is another microphone.
+///
+/// `demoted` short-circuits the whole ladder to the converter while the
+/// device runs away from the session rate: its clock was set once, another
+/// app took it back, and asking again is the fight the demotion exists to
+/// end. A demoted device found back at the session rate opens natively;
+/// there is no contest left to lose.
 fn plan_direction(
     rates: RateContext,
     direction: Direction,
@@ -527,7 +587,15 @@ fn plan_direction(
     supported: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
     host_converts: bool,
     form: FormFactor,
+    demoted: bool,
 ) -> Result<DirectionPlan> {
+    if demoted && native.sample_rate() != rates.rate {
+        return Ok(DirectionPlan {
+            open: *native,
+            attempted: false,
+            convert: true,
+        });
+    }
     if let Some(open) = config_at_rate(native, supported, rates.rate) {
         return Ok(DirectionPlan {
             open,
@@ -828,6 +896,11 @@ struct CpalStreamHandle {
     latency_frames: Option<u32>,
     buffer_frames: Option<u32>,
     rate: RateOutcomes,
+    /// Devices whose clock this stream's open moved, joined to the backend's
+    /// `demoted` set the first time [`StreamHandle::errored`] reads true.
+    clock_set: Vec<String>,
+    demoted: Arc<Mutex<HashSet<String>>>,
+    demotion_noted: AtomicBool,
 }
 
 impl StreamHandle for CpalStreamHandle {
@@ -840,7 +913,17 @@ impl StreamHandle for CpalStreamHandle {
     }
 
     fn errored(&self) -> bool {
-        self.errored.load(Ordering::Acquire)
+        let errored = self.errored.load(Ordering::Acquire);
+        // A dead stream that had set a device clock demotes that device
+        // before the caller's reopen can ask for the session rate again.
+        // Polled off the RT path, so the lock inside is fine.
+        if errored
+            && !self.clock_set.is_empty()
+            && !self.demotion_noted.swap(true, Ordering::Relaxed)
+        {
+            demote(&self.demoted, &self.clock_set);
+        }
+        errored
     }
 
     fn rate_outcomes(&self) -> Option<RateOutcomes> {
@@ -915,6 +998,7 @@ mod tests {
             ranges.into_iter(),
             false,
             FormFactor::Unknown,
+            false,
         )
         .expect("rung 3 takes what used to be refused");
         assert!(plan.convert);
@@ -953,6 +1037,7 @@ mod tests {
             ranges.into_iter(),
             true,
             FormFactor::Unknown,
+            false,
         )
         .expect("a converting host is asked, not pre-refused");
         assert!(plan.attempted);
@@ -974,6 +1059,7 @@ mod tests {
             ranges.into_iter(),
             false,
             FormFactor::Unknown,
+            false,
         )
         .expect("rung 3 is unconditional");
         assert!(plan.convert);
@@ -991,6 +1077,7 @@ mod tests {
             ranges.into_iter(),
             true,
             FormFactor::Unknown,
+            false,
         )
         .expect("48 kHz is advertised");
         assert!(!plan.attempted);
@@ -1019,6 +1106,7 @@ mod tests {
                 ranges.into_iter(),
                 host_converts,
                 form,
+                false,
             )
             .expect_err("a hands-free mic earns no rung");
             assert!(
@@ -1035,9 +1123,61 @@ mod tests {
             ranges.into_iter(),
             false,
             FormFactor::Bluetooth,
+            false,
         )
         .expect("Bluetooth speakers convert like any playback device");
         assert!(plan.convert);
+    }
+
+    /// The contested-clock decision on #347: a device whose clock this app
+    /// set and then lost the stream on is never asked again. While it runs
+    /// away from the session rate the whole ladder short-circuits to the
+    /// converter, even though 48 kHz is advertised; found back at the
+    /// session rate it opens natively, because there is no contest left.
+    #[test]
+    fn a_demoted_device_converts_instead_of_reclaiming_the_clock() {
+        let snapped_back = native(44_100, 2);
+        let ranges = [range(44_100, 96_000, 2, SampleFormat::F32)];
+        let plan = plan_direction(
+            ctx("CoreAudio"),
+            Direction::Capture,
+            &snapped_back,
+            ranges.into_iter(),
+            true,
+            FormFactor::Unknown,
+            true,
+        )
+        .expect("demotion is not a refusal");
+        assert!(plan.convert);
+        assert!(!plan.attempted);
+        assert_eq!(plan.open.sample_rate(), 44_100, "no clock is touched");
+
+        let at_rate = native(48_000, 2);
+        let plan = plan_direction(
+            ctx("CoreAudio"),
+            Direction::Capture,
+            &at_rate,
+            ranges.into_iter(),
+            true,
+            FormFactor::Unknown,
+            true,
+        )
+        .expect("a device back at the session rate opens as it is");
+        assert!(!plan.convert);
+        assert!(!plan.attempted);
+        assert_eq!(plan.open.sample_rate(), 48_000);
+    }
+
+    /// The demotion record itself: a dead clock-set stream's devices land in
+    /// the set once each, and repeats are not re-announced.
+    #[test]
+    fn a_dead_clock_set_stream_demotes_its_devices_once() {
+        let demoted = Mutex::new(HashSet::new());
+        demote(&demoted, &["dev-a".to_owned(), "dev-b".to_owned()]);
+        demote(&demoted, &["dev-a".to_owned()]);
+        let set = demoted.lock().unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("dev-a") && set.contains("dev-b"));
     }
 
     #[test]
