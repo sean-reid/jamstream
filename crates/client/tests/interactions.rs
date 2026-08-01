@@ -2515,3 +2515,69 @@ fn the_two_frame_counts_are_named_apart() {
         );
     }
 }
+
+/// Rescan keeps the selection by device id and falls back visibly. The
+/// enumerator is injected, because a test has no interface to unplug; what is
+/// under test is everything from the button to the note: the click reaches
+/// the app, the selection survives by id, and a device the new catalog no
+/// longer holds lands on System default with a sentence saying so (#325).
+#[test]
+fn rescan_keeps_the_selection_by_id_and_a_lost_device_falls_back_visibly() {
+    use jamstream_client::app::{JamApp, Screen};
+    use jamstream_client::screens::devices::{DeviceCatalog, DeviceInfo};
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    // The user picked the Scarlett explicitly; index 0 is System default.
+    app.devices.capture_idx = 1;
+    app.devices.playback_idx = 2;
+    // The next scan finds the speakers but not the Scarlett.
+    app.enumerate = Arc::new(|| {
+        let mut catalog = DeviceCatalog::demo();
+        catalog.capture.retain(|d| !d.name.contains("Scarlett"));
+        catalog.playback.push(DeviceInfo {
+            name: "USB DAC".to_owned(),
+            id: Some("demo:USB DAC".to_owned()),
+        });
+        Ok(catalog)
+    });
+    // The picker indexes, read back out of the app after each frame: the
+    // combo's selected text is painted, not a queryable node.
+    let picks = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+    let picks_ui = Arc::clone(&picks);
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+            *picks_ui.lock().unwrap() = (app.devices.capture_idx, app.devices.playback_idx);
+        });
+    harness.run_steps(3);
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "Rescan")
+        .click();
+    harness.run_steps(3);
+
+    // The lost capture device fell back to System default and said so; the
+    // playback selection survived the reorder because it is matched by id.
+    assert!(
+        harness
+            .query_by_label_contains("Scarlett 2i2 input is no longer present")
+            .is_some(),
+        "a rescan that loses the selected device has to say so under the pickers"
+    );
+    let (capture_idx, playback_idx) = *picks.lock().unwrap();
+    assert_eq!(
+        capture_idx, 0,
+        "the lost capture pick lands on System default"
+    );
+    assert_eq!(
+        playback_idx, 2,
+        "the playback pick has to survive a rescan that kept its device"
+    );
+}

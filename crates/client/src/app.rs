@@ -14,7 +14,7 @@ use crate::live::{AudioSettings, CostedRuntime, LiveError, LiveRuntime};
 use crate::picker::{Pick, Picked};
 use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
-use crate::screens::devices::{Block, DeviceCatalog, DevicesScreen};
+use crate::screens::devices::{Block, DeviceCatalog, DeviceInfo, DevicesEvent, DevicesScreen};
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
@@ -50,6 +50,23 @@ pub type Joiner = Arc<
 /// The production joiner: the real sound card, through the platform backend.
 pub fn system_joiner() -> Joiner {
     Arc::new(|invite, settings| LiveRuntime::join(invite, settings, jamstream_audio_io::backend()))
+}
+
+/// How the app enumerates audio devices, for the same reason [`Joiner`] is a
+/// parameter: enumeration reaches the platform's sound system, and a test
+/// pressing Rescan has no interface to unplug. Production asks the backend;
+/// tests hand in a catalog of their own.
+pub type Enumerator = Arc<dyn Fn() -> Result<DeviceCatalog, String> + Send + Sync>;
+
+/// The production enumerator, shared by startup and the Rescan button so both
+/// build the same catalog.
+pub fn system_enumerator() -> Enumerator {
+    Arc::new(|| {
+        jamstream_audio_io::backend()
+            .devices()
+            .map(|devices| DeviceCatalog::from_backend(&devices))
+            .map_err(|err| err.to_string())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,9 +136,13 @@ pub struct JamApp {
     pub own_avatar: Option<AvatarHandle>,
     /// The same avatar's fitted bytes, kept so a join can announce it.
     own_avatar_bytes: Option<Vec<u8>>,
-    /// Device selection last applied to the live runtime, as
-    /// (capture_idx, playback_idx, buffer_frames).
-    applied_audio: (usize, usize, u32),
+    /// Device selection last handed to the live runtime, by id rather than by
+    /// picker index: a rescan reorders the catalog without moving the
+    /// selection, and comparing indexes across that would reopen the stream
+    /// for nothing.
+    applied_audio: AudioSettings,
+    /// How Rescan re-enumerates; see [`Enumerator`].
+    pub enumerate: Enumerator,
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
@@ -152,13 +173,8 @@ impl JamApp {
         prefs: Option<std::path::PathBuf>,
     ) -> Self {
         let devices = DevicesScreen::default();
-        let applied_audio = (
-            devices.capture_idx,
-            devices.playback_idx,
-            devices.buffer_frames,
-        );
         let exec = Arc::new(Executor::new());
-        JamApp {
+        let mut app = JamApp {
             theme: Theme::Dark,
             screen: Screen::Home,
             home: HomeScreen::default(),
@@ -183,13 +199,16 @@ impl JamApp {
             avatar_dialog: None,
             own_avatar: None,
             own_avatar_bytes: None,
-            applied_audio,
+            applied_audio: AudioSettings::default(),
+            enumerate: Arc::new(|| Ok(DeviceCatalog::demo())),
             ending: None,
             join: system_joiner(),
             creds,
             env,
             exec,
-        }
+        };
+        app.applied_audio = app.audio_settings();
+        app
     }
 
     /// An app whose credentials and environment live in this process and
@@ -216,8 +235,9 @@ impl JamApp {
         if let Err(err) = prefs {
             app.recording.error = Some(err);
         }
-        match jamstream_audio_io::backend().devices() {
-            Ok(devices) => app.catalog = DeviceCatalog::from_backend(&devices),
+        app.enumerate = system_enumerator();
+        match (app.enumerate)() {
+            Ok(catalog) => app.catalog = catalog,
             Err(err) => {
                 tracing::warn!(%err, "device enumeration failed");
                 app.catalog = DeviceCatalog {
@@ -226,7 +246,51 @@ impl JamApp {
                 };
             }
         }
+        app.applied_audio = app.audio_settings();
         app
+    }
+
+    /// Rescan: re-enumerate and keep the selection by device id. A selected
+    /// device the new catalog no longer holds falls back to the System
+    /// default entry with a note under the pickers saying so; falling back
+    /// with the old name still showing was the pickers lying (#325). The
+    /// note also covers the scan itself failing, which otherwise looks like
+    /// a button that does nothing.
+    pub fn rescan_devices(&mut self) {
+        let selected_capture = self.catalog.capture.get(self.devices.capture_idx).cloned();
+        let selected_playback = self
+            .catalog
+            .playback
+            .get(self.devices.playback_idx)
+            .cloned();
+        match (self.enumerate)() {
+            Ok(catalog) => {
+                self.catalog = catalog;
+                let mut lost = Vec::new();
+                let mut place = |list: &[DeviceInfo], selected: Option<DeviceInfo>| {
+                    let Some(selected) = selected else {
+                        return 0;
+                    };
+                    let (idx, found) = DeviceCatalog::find(list, &selected.id);
+                    if !found {
+                        lost.push(selected.name);
+                    }
+                    idx
+                };
+                self.devices.capture_idx = place(&self.catalog.capture, selected_capture);
+                self.devices.playback_idx = place(&self.catalog.playback, selected_playback);
+                self.devices.rescan_note = match lost.as_slice() {
+                    [] => None,
+                    names => Some(format!(
+                        "{} is no longer present; using the system default",
+                        names.join(" and ")
+                    )),
+                };
+            }
+            Err(err) => {
+                self.devices.rescan_note = Some(format!("device scan failed: {err}"));
+            }
+        }
     }
 
     /// `--demo`: straight into a live fake session as the host. It reaches
@@ -520,16 +584,13 @@ impl JamApp {
 
         // Device picks apply immediately: mid-session the live runtime
         // reopens its stream, otherwise the selection just waits for the
-        // next join.
-        let selected = (
-            self.devices.capture_idx,
-            self.devices.playback_idx,
-            self.devices.buffer_frames,
-        );
+        // next join. Compared by id, not picker index, so a rescan that only
+        // reordered the catalog does not reopen a healthy stream.
+        let selected = self.audio_settings();
         if selected != self.applied_audio {
-            self.applied_audio = selected;
+            self.applied_audio = selected.clone();
             if let Some(live) = &self.live {
-                live.reconfigure_audio(self.audio_settings());
+                live.reconfigure_audio(selected);
             }
         }
 
@@ -661,8 +722,12 @@ impl JamApp {
                 let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
                 let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
                 let refusal = snap.as_ref().and_then(|s| s.device_error.as_deref());
-                self.devices
-                    .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, refusal);
+                let event =
+                    self.devices
+                        .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, refusal);
+                if let Some(DevicesEvent::Rescan) = event {
+                    self.rescan_devices();
+                }
                 None
             }
             SettingsTab::Broadcast => {

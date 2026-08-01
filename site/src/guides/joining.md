@@ -48,7 +48,7 @@ Settings in the top bar opens over the session without covering the strips or th
 
 - **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that plays clean; crackles mean one step up. The mouth to ear figure under the choices moves with them, because the buffer is part of it.
 - The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.
-- **Capture** and **Playback** list your machine's real audio devices, system default first. Changing one mid-session reopens the audio stream on the new device without leaving the session.
+- **Capture** and **Playback** list a System default entry first, then your machine's real audio devices. Changing one mid-session reopens the audio stream on the new device without leaving the session, and Rescan picks up an interface plugged in after launch.
 - **Your avatar**, on the You tab, opens a file picker: pick a PNG or JPEG and everyone in the session gets the picture over the same encrypted link as the audio; a photo straight off a phone works as it is. The choice lasts for this run of the app; set it again after a restart. Remove drops it here and on your next join, though members already in the session keep the picture you sent them.
 
 ## From the terminal

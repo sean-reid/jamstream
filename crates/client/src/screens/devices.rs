@@ -15,6 +15,19 @@ pub struct DeviceInfo {
     pub id: Option<String>,
 }
 
+/// The label of the `id: None` entry that heads both pickers. Following the
+/// system default is a different act from picking the device that happens to
+/// be the default today: when the OS moves the default, the former follows it
+/// and the latter stays put.
+pub const SYSTEM_DEFAULT: &str = "System default";
+
+fn system_default_entry() -> DeviceInfo {
+    DeviceInfo {
+        name: SYSTEM_DEFAULT.to_owned(),
+        id: None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCatalog {
     pub capture: Vec<DeviceInfo>,
@@ -25,16 +38,25 @@ impl DeviceCatalog {
     pub fn demo() -> Self {
         let dev = |name: &str| DeviceInfo {
             name: name.to_owned(),
-            id: None,
+            id: Some(format!("demo:{name}")),
         };
         DeviceCatalog {
-            capture: vec![dev("Scarlett 2i2 input"), dev("Built-in microphone")],
-            playback: vec![dev("Scarlett 2i2 output"), dev("Built-in speakers")],
+            capture: vec![
+                system_default_entry(),
+                dev("Scarlett 2i2 input"),
+                dev("Built-in microphone"),
+            ],
+            playback: vec![
+                system_default_entry(),
+                dev("Scarlett 2i2 output"),
+                dev("Built-in speakers"),
+            ],
         }
     }
 
-    /// Real enumeration, defaults listed first so index 0 is the device a
-    /// fresh install uses.
+    /// Real enumeration: the System default entry first, then every concrete
+    /// device with the current default at the top of them. Index 0 is what a
+    /// fresh install uses, and it follows the OS when the default moves.
     pub fn from_backend(devices: &[jamstream_audio_io::DeviceInfo]) -> Self {
         let pick = |direction| {
             let mut rows: Vec<&jamstream_audio_io::DeviceInfo> = devices
@@ -42,16 +64,27 @@ impl DeviceCatalog {
                 .filter(|d| d.direction == direction)
                 .collect();
             rows.sort_by_key(|d| !d.is_default);
-            rows.into_iter()
-                .map(|d| DeviceInfo {
+            std::iter::once(system_default_entry())
+                .chain(rows.into_iter().map(|d| DeviceInfo {
                     name: d.name.clone(),
                     id: Some(d.id.clone()),
-                })
+                }))
                 .collect()
         };
         DeviceCatalog {
             capture: pick(jamstream_audio_io::Direction::Capture),
             playback: pick(jamstream_audio_io::Direction::Playback),
+        }
+    }
+
+    /// The index of `id` in `list`, or index 0 (the System default) when the
+    /// device is not in this catalog. The bool says whether it was found, so a
+    /// rescan that loses the selected device can say so instead of silently
+    /// showing another name.
+    pub fn find(list: &[DeviceInfo], id: &Option<String>) -> (usize, bool) {
+        match list.iter().position(|d| d.id == *id) {
+            Some(idx) => (idx, true),
+            None => (0, false),
         }
     }
 }
@@ -67,6 +100,11 @@ pub struct DevicesScreen {
     pub capture_idx: usize,
     pub playback_idx: usize,
     pub buffer_frames: u32,
+    /// What the last rescan had to say for itself: a selection that fell back
+    /// to the system default because its device is gone, or a scan that
+    /// failed. Shown under the pickers until the next rescan; a fallback
+    /// nobody is told about is the pickers lying about what is running.
+    pub rescan_note: Option<String>,
 }
 
 impl Default for DevicesScreen {
@@ -75,8 +113,18 @@ impl Default for DevicesScreen {
             capture_idx: 0,
             playback_idx: 0,
             buffer_frames: BUFFER_CHOICES[0],
+            rescan_note: None,
         }
     }
+}
+
+/// What the Audio tab asks the app to do; the tab cannot reach the platform
+/// backend itself, which is what keeps every fixture off the real sound card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevicesEvent {
+    /// Re-enumerate the devices: something was plugged in or enabled since
+    /// the last look.
+    Rescan,
 }
 
 /// How a block is set. On its own screen each one is a panel, sitting on the
@@ -128,12 +176,12 @@ impl DevicesScreen {
         levels: &LevelsView,
         mouth_to_ear_ms: Option<f32>,
         refusal: Option<&str>,
-    ) {
+    ) -> Option<DevicesEvent> {
         self.buffer_ui(ui, block, mouth_to_ear_ms);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
         ui.add_space(theme::SPACE_MD);
-        self.devices_ui(ui, block, catalog, refusal);
+        self.devices_ui(ui, block, catalog, refusal)
     }
 
     fn buffer_ui(&mut self, ui: &mut Ui, block: Block, mouth_to_ear_ms: Option<f32>) {
@@ -176,9 +224,24 @@ impl DevicesScreen {
         block: Block,
         catalog: &DeviceCatalog,
         refusal: Option<&str>,
-    ) {
+    ) -> Option<DevicesEvent> {
+        let mut event = None;
         block.show(ui, |ui| {
-            ui.label(theme::title(ui, "Devices"));
+            ui.horizontal(|ui| {
+                ui.label(theme::title(ui, "Devices"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Rescan")
+                        .on_hover_text(
+                            "look for devices again; an interface plugged in after \
+                             launch appears here",
+                        )
+                        .clicked()
+                    {
+                        event = Some(DevicesEvent::Rescan);
+                    }
+                });
+            });
             // The pickers take the width that is left rather than a fixed
             // 280 px. A row wider than its container widens the sheet around
             // it, which is how the settings sheet came to be half again as
@@ -209,6 +272,14 @@ impl DevicesScreen {
                     );
                     ui.end_row();
                 });
+            // What the last rescan did to the selection, before the refusal:
+            // a device that vanished is why the picker reads System default
+            // now, and saying so is the difference between a fallback and a
+            // picker that quietly changed its answer.
+            if let Some(note) = &self.rescan_note {
+                ui.add_space(theme::SPACE_XS);
+                theme::reason(ui, note.clone());
+            }
             // The pick that will not open, in the device's own words, under the
             // picker that made it. No sentence of ours around it: the pickers
             // are right above it, so what it is about is not in question.
@@ -217,6 +288,7 @@ impl DevicesScreen {
                 theme::reason(ui, reason);
             }
         });
+        event
     }
 }
 
