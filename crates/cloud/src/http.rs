@@ -161,6 +161,18 @@ fn error_message(status: StatusCode, snippet: &str) -> String {
     }
 }
 
+/// The provider's own error code from a classified error: `AccessDenied`,
+/// `NoSuchBucket`, `ExpiredToken`. Extracted from the S3-style XML error
+/// body and owned; never the body itself. The rest of the document names
+/// the caller's account, IAM user, RequestId and HostId, so a surface that
+/// wants to say what went wrong takes the code from here and writes its
+/// own sentence, which cannot leak what it never reads. The full body
+/// stays on the error's `Display` for the log.
+pub fn error_code(err: &ProviderError) -> Option<String> {
+    let body = error_body(err)?;
+    crate::providers::aws::xml_value(body, "Code").map(|code| code.trim().to_owned())
+}
+
 /// Extracts the response-body snippet embedded by this module in a
 /// classified error, if any. The structured escape hatch for providers
 /// that want to parse the body (EC2 error XML, DO error JSON) instead of
@@ -330,6 +342,26 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "http 400 Bad Request");
         assert_eq!(error_body(&err), None);
+    }
+
+    /// The code comes out of an S3-style error body alone; everything else,
+    /// including a body with no XML in it, yields nothing rather than a
+    /// guess.
+    #[test]
+    fn error_code_extracts_the_code_and_nothing_else() {
+        let denied = ProviderError::Auth(
+            "http 403 Forbidden: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>AccessDenied</Code><Message>User: \
+             arn:aws:iam::887762372032:user/take-reader is not authorized to \
+             perform: s3:ListBucket</Message><RequestId>Q0YMR4GFKCH1Y688\
+             </RequestId><HostId>EE3WMENDEauoc0QS4v1XCZK1RcDA4A</HostId>\
+             </Error>"
+                .to_owned(),
+        );
+        assert_eq!(error_code(&denied), Some("AccessDenied".to_owned()));
+        let json = ProviderError::Other(r#"http 422: {"message":"bad region"}"#.to_owned());
+        assert_eq!(error_code(&json), None);
+        assert_eq!(error_code(&ProviderError::Other("boom".to_owned())), None);
     }
 
     #[test]
