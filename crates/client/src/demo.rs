@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use crate::avatar::disc_color;
 use crate::runtime::{
     AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationId,
-    DestinationState, DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView,
-    RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView,
-    TokenId,
+    DestinationState, DestinationView, DeviceModeView, FaderView, LevelsView, MemberId, MemberView,
+    MetronomeView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamPlatform,
+    StreamView, TokenId,
 };
 use crate::theme;
 
@@ -128,6 +128,11 @@ struct DemoState {
     /// runtime fills this from the device that refused; a fixture pins it so
     /// the sentence a silent musician reads can be looked at.
     device_error: Option<String>,
+    /// The sharing mode and conversion report a fixture pins; the real
+    /// runtime reads them off the audio backend. None by default, which is
+    /// what every platform without the split reports.
+    device_mode: Option<DeviceModeView>,
+    render_converted: Option<bool>,
 }
 
 pub struct DemoRuntime {
@@ -283,6 +288,8 @@ impl DemoRuntime {
                 destinations: Vec::new(),
                 record: RecordView::default(),
                 device_error: None,
+                device_mode: None,
+                render_converted: None,
             }),
             is_host,
             frozen,
@@ -350,6 +357,14 @@ impl DemoRuntime {
     pub fn set_device_error(&self, reason: Option<&str>) {
         let mut s = self.state.lock().expect("demo state");
         s.device_error = reason.map(str::to_owned);
+    }
+
+    /// Pins the sharing mode and the OS-conversion report, the pair the real
+    /// runtime reads off the audio backend after an open (#326).
+    pub fn set_device_mode(&self, mode: Option<DeviceModeView>, render_converted: Option<bool>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.device_mode = mode;
+        s.render_converted = render_converted;
     }
 
     /// Pins the recorder's reported state, the way [`Self::set_destinations`]
@@ -421,6 +436,8 @@ impl Runtime for DemoRuntime {
             jitter_target: 4,
             loss_pct: (0.2 + 0.15 * ((f as f64) * 0.011).sin() as f32).max(0.0),
             mouth_to_ear_ms: Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32),
+            device_mode: s.device_mode,
+            render_converted: s.render_converted,
         };
 
         let members = s

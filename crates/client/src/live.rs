@@ -582,6 +582,19 @@ impl LiveRuntime {
                 jitter_target: s.jitter_target,
                 loss_pct: s.loss_pct,
                 mouth_to_ear_ms: s.mouth_to_ear_ms,
+                // Straight off the backend's own report at read time: there
+                // is one device stream per process and these follow the last
+                // open, so no worker plumbing could say anything truer.
+                device_mode: match jamstream_audio_io::active_device_mode() {
+                    Some(jamstream_audio_io::DeviceMode::Exclusive) => {
+                        Some(crate::runtime::DeviceModeView::Exclusive)
+                    }
+                    Some(jamstream_audio_io::DeviceMode::Shared) => {
+                        Some(crate::runtime::DeviceModeView::Shared)
+                    }
+                    None => None,
+                },
+                render_converted: jamstream_audio_io::active_render_conversion(),
             },
             members,
             chat: s.chat.iter().cloned().collect(),
