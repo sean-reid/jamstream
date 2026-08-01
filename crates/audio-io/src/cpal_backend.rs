@@ -6,7 +6,10 @@
 //! Every stream runs at the session rate or not at all, because jamstream
 //! never resamples. Which of those two happens is decided in one place,
 //! [`plan_open`], and it turns on whether the host reports a stream it could
-//! not open at the rate asked for: see [`verifies_negotiated_rate`].
+//! not open at the rate asked for: see [`verifies_negotiated_rate`]. The OS
+//! itself may still resample on the render side (WASAPI's AUTOCONVERTPCM,
+//! PipeWire's graph); [`render_conversion`] detects that and every open
+//! discloses it through [`crate::active_render_conversion`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,10 +17,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::format::map_frames;
+use crate::mode::set_render_conversion;
 use crate::types::{
-    AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, Result, StreamConfig,
-    StreamHandle,
+    AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
+    StreamConfig, StreamHandle,
 };
+use crate::wasapi_policy;
 
 /// Largest per-callback chunk converted in one pass. Bigger device callbacks
 /// are processed in slices of this many frames, so the conversion scratch
@@ -85,10 +90,13 @@ impl AudioBackend for CpalBackend {
         for device in self.host.devices().map_err(|e| map_err(&e))? {
             // A device can vanish mid-enumeration; skip rather than fail.
             let Ok(id) = device.id() else { continue };
-            let name = device
-                .description()
-                .map(|d| d.name().to_string())
-                .unwrap_or_else(|_| id.id().to_string());
+            let (name, form_factor) = match device.description() {
+                Ok(d) => (
+                    d.name().to_string(),
+                    form_factor(d.device_type(), d.interface_type()),
+                ),
+                Err(_) => (id.id().to_string(), FormFactor::Unknown),
+            };
 
             if let Ok(config) = device.default_input_config() {
                 let (min, max) = buffer_bounds(config.buffer_size());
@@ -97,6 +105,7 @@ impl AudioBackend for CpalBackend {
                     name: name.clone(),
                     is_default: default_in.as_ref() == Some(&id),
                     direction: Direction::Capture,
+                    form_factor,
                     min_buffer_frames: min,
                     max_buffer_frames: max,
                 });
@@ -108,6 +117,7 @@ impl AudioBackend for CpalBackend {
                     name,
                     is_default: default_out.as_ref() == Some(&id),
                     direction: Direction::Playback,
+                    form_factor,
                     min_buffer_frames: min,
                     max_buffer_frames: max,
                 });
@@ -133,6 +143,8 @@ impl AudioBackend for CpalBackend {
         let converts = verifies_negotiated_rate(rates.host);
         let in_device = self.find_device(capture, Direction::Capture)?;
         let out_device = self.find_device(playback, Direction::Playback)?;
+        let in_form = form_factor_of(&in_device);
+        let out_form = form_factor_of(&out_device);
         let in_native = in_device.default_input_config().map_err(|e| map_err(&e))?;
         let out_native = out_device
             .default_output_config()
@@ -145,7 +157,7 @@ impl AudioBackend for CpalBackend {
             config.sample_rate,
             converts,
         )
-        .ok_or_else(|| rates.refused(Direction::Capture, &in_native, None))?;
+        .ok_or_else(|| rates.refused(Direction::Capture, &in_native, in_form, None))?;
         let (out_open, out_attempted) = plan_open(
             &out_native,
             out_device
@@ -154,7 +166,7 @@ impl AudioBackend for CpalBackend {
             config.sample_rate,
             converts,
         )
-        .ok_or_else(|| rates.refused(Direction::Playback, &out_native, None))?;
+        .ok_or_else(|| rates.refused(Direction::Playback, &out_native, out_form, None))?;
 
         let (on_capture, on_playback) = handler.into_parts();
         let errored = Arc::new(AtomicBool::new(false));
@@ -162,7 +174,7 @@ impl AudioBackend for CpalBackend {
         let input =
             build_input(&in_device, &in_open, &config, on_capture, &errored).map_err(|e| {
                 if in_attempted {
-                    rates.refused(Direction::Capture, &in_native, Some(&e))
+                    rates.refused(Direction::Capture, &in_native, in_form, Some(&e))
                 } else {
                     e
                 }
@@ -170,7 +182,7 @@ impl AudioBackend for CpalBackend {
         let output =
             build_output(&out_device, &out_open, &config, on_playback, &errored).map_err(|e| {
                 if out_attempted {
-                    rates.refused(Direction::Playback, &out_native, Some(&e))
+                    rates.refused(Direction::Playback, &out_native, out_form, Some(&e))
                 } else {
                     e
                 }
@@ -179,6 +191,25 @@ impl AudioBackend for CpalBackend {
         // cpal 0.18 streams start paused.
         input.play().map_err(|e| map_err(&e))?;
         output.play().map_err(|e| map_err(&e))?;
+
+        // Render-side conversion disclosure: once per open, plus the report
+        // the UI polls. The device's default config is its engine rate (the
+        // WASAPI mix format, the PipeWire graph rate), which is what an OS
+        // converter would be bridging to.
+        if let Some(converting) =
+            render_conversion(rates.host, out_native.sample_rate(), config.sample_rate)
+        {
+            set_render_conversion(converting);
+            if converting {
+                tracing::warn!(
+                    device_rate = out_native.sample_rate(),
+                    stream_rate = config.sample_rate,
+                    host = rates.host,
+                    "the OS is resampling the render stream to the playback \
+                     device's rate, adding latency the buffer sizes do not show"
+                );
+            }
+        }
 
         // Negotiated callback sizes, per host: the WASAPI shared-mode device
         // period, the ALSA period, CoreAudio's device frame size, PipeWire's
@@ -213,8 +244,34 @@ fn map_err(e: &cpal::Error) -> AudioError {
         cpal::ErrorKind::UnsupportedConfig | cpal::ErrorKind::UnsupportedOperation => {
             AudioError::Unsupported(e.to_string())
         }
-        _ => AudioError::Backend(e.to_string()),
+        _ => {
+            let message = e.to_string();
+            if is_windows_access_denied(&message) {
+                // Same walk to the setting as the exclusive path's
+                // AccessDenied classification, so the two paths agree.
+                AudioError::Unsupported(format!(
+                    "microphone access denied by Windows privacy settings ({message}); {}",
+                    wasapi_policy::MIC_PRIVACY_REMEDY
+                ))
+            } else {
+                AudioError::Backend(message)
+            }
+        }
     }
+}
+
+/// True when a cpal error is Windows' `E_ACCESSDENIED` (0x80070005), which in
+/// practice is "Let desktop apps access your microphone" switched off.
+///
+/// cpal's WASAPI host has no classification for it: the HRESULT falls through
+/// to `ErrorKind::BackendError` carrying `io::Error`'s rendering of the code,
+/// which is the raw value (-2147024891 is 0x80070005 as an i32) or, where the
+/// system message table resolves it, "Access is denied". Matching the message
+/// is the only handle cpal leaves.
+fn is_windows_access_denied(message: &str) -> bool {
+    message.contains("0x80070005")
+        || message.contains("-2147024891")
+        || message.contains("Access is denied")
 }
 
 /// Whether `host` reports a stream it could not open at the rate that was
@@ -252,6 +309,33 @@ const fn rate_policy(host: &str) -> Option<bool> {
 
 fn verifies_negotiated_rate(host: &str) -> bool {
     rate_policy(host).unwrap_or(false)
+}
+
+/// Whether a render stream that opened at `stream_rate` is being resampled by
+/// the OS, given that the device's own engine runs at `device_rate`.
+///
+/// Acceptable by design since the #347 decision, but it must be disclosed:
+/// the conversion adds latency the buffer arithmetic never sees. Per host,
+/// because the same rate mismatch means different things:
+///
+/// - WASAPI opens output with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`, so the
+///   engine keeps its mix rate and converts our stream into it.
+/// - PipeWire keeps its graph rate and converts client streams the same way.
+/// - CoreAudio sets the device's nominal rate to the stream's, so a stream
+///   that opened is really running at its rate; a device that could not
+///   reclock was refused up front.
+/// - ALSA converts nothing: a stream that opened at the session rate is
+///   running at it.
+///
+/// `None` for a host the table does not know, which is also what the report
+/// shows: an unknown host earns no claim either way.
+const fn render_conversion(host: &str, device_rate: u32, stream_rate: u32) -> Option<bool> {
+    // `const fn` cannot match on &str, so this is a byte comparison chain.
+    match host.as_bytes() {
+        b"WASAPI" | b"PipeWire" => Some(device_rate != stream_rate),
+        b"CoreAudio" | b"ALSA" => Some(false),
+        _ => None,
+    }
 }
 
 /// The device config to open at `rate`, and whether opening it is an attempt.
@@ -304,6 +388,42 @@ fn config_at_rate(
         })
 }
 
+/// [`FormFactor`] from cpal's decoded device description. cpal fills the
+/// description from `PKEY_AudioEndpoint_FormFactor` and the device enumerator
+/// on WASAPI and from device properties on PipeWire; CoreAudio fills nothing,
+/// so macOS devices land on `Unknown`. Bluetooth is checked first because the
+/// transport, not the shape, is what the 48 kHz refusal keys on.
+fn form_factor(device_type: cpal::DeviceType, interface: cpal::InterfaceType) -> FormFactor {
+    if interface == cpal::InterfaceType::Bluetooth {
+        return FormFactor::Bluetooth;
+    }
+    match device_type {
+        cpal::DeviceType::Speaker => FormFactor::Speakers,
+        cpal::DeviceType::Headphones => FormFactor::Headphones,
+        cpal::DeviceType::Headset => FormFactor::Headset,
+        cpal::DeviceType::Microphone => FormFactor::Microphone,
+        _ => match interface {
+            cpal::InterfaceType::Line => FormFactor::LineLevel,
+            cpal::InterfaceType::Hdmi | cpal::InterfaceType::DisplayPort => FormFactor::Hdmi,
+            _ => FormFactor::Unknown,
+        },
+    }
+}
+
+fn form_factor_of(device: &cpal::Device) -> FormFactor {
+    device
+        .description()
+        .map(|d| form_factor(d.device_type(), d.interface_type()))
+        .unwrap_or(FormFactor::Unknown)
+}
+
+/// Native rates that mark a telephony endpoint: the Bluetooth hands-free
+/// profile and its wideband variant. A capture device at one of these has no
+/// 48 kHz mode to switch to, whatever its settings pages suggest.
+const fn is_telephony_rate(rate: u32) -> bool {
+    matches!(rate, 8_000 | 16_000)
+}
+
 /// What the person at the keyboard can do about a device that will not run at
 /// the session rate. jamstream does not resample, so this sentence is the
 /// entire remedy, and it is per host rather than per platform because the two
@@ -351,10 +471,16 @@ impl RateContext<'_> {
     /// This device will not run at the session rate. `refusal` is the host's
     /// own error when the open was attempted, and None when the device never
     /// advertised the rate and this host cannot be trusted to try.
+    ///
+    /// A capture endpoint at a telephony rate, or on a Bluetooth or headset
+    /// form factor, gets its own remedy: its hands-free mode has no 48 kHz
+    /// setting anywhere, so pointing at the host's rate settings would send
+    /// the user hunting for an entry that does not exist (#330).
     fn refused(
         self,
         direction: Direction,
         native: &cpal::SupportedStreamConfig,
+        form: FormFactor,
         refusal: Option<&AudioError>,
     ) -> AudioError {
         let side = match direction {
@@ -368,10 +494,20 @@ impl RateContext<'_> {
             Some(err) => format!(" ({})", err.detail()),
             None => String::new(),
         };
-        AudioError::Unsupported(format!(
-            "{side} device runs at {} Hz and will not open at {rate} Hz{detail}; {}",
-            native.sample_rate(),
+        let telephony_mic = direction == Direction::Capture
+            && (is_telephony_rate(native.sample_rate())
+                || matches!(form, FormFactor::Bluetooth | FormFactor::Headset));
+        let remedy = if telephony_mic {
+            format!(
+                "that is a Bluetooth or headset microphone with no {rate} Hz \
+                 mode, so use another capture device"
+            )
+        } else {
             rate_remedy(self.host, rate)
+        };
+        AudioError::Unsupported(format!(
+            "{side} device runs at {} Hz and will not open at {rate} Hz{detail}; {remedy}",
+            native.sample_rate(),
         ))
     }
 }
@@ -562,7 +698,7 @@ mod tests {
             range(22_050, 44_100, 1, SampleFormat::I16),
         ];
         assert!(config_at_rate(&native, ranges.into_iter(), 48_000).is_none());
-        let err = ctx("ALSA").refused(Direction::Capture, &native, None);
+        let err = ctx("ALSA").refused(Direction::Capture, &native, FormFactor::Unknown, None);
         let AudioError::Unsupported(msg) = err else {
             panic!("expected Unsupported, got {err:?}");
         };
@@ -657,7 +793,12 @@ mod tests {
     fn a_refused_attempt_names_the_rates_and_carries_the_host_error() {
         let native = native(44_100, 2);
         let refusal = AudioError::Unsupported("ASBD not supported".into());
-        let err = ctx("CoreAudio").refused(Direction::Capture, &native, Some(&refusal));
+        let err = ctx("CoreAudio").refused(
+            Direction::Capture,
+            &native,
+            FormFactor::Unknown,
+            Some(&refusal),
+        );
         let full = err.to_string();
         assert_eq!(
             full.matches("unsupported audio configuration:").count(),
@@ -671,6 +812,38 @@ mod tests {
         assert!(msg.contains("48000 Hz"), "{msg}");
         assert!(msg.contains("(ASBD not supported)"), "{msg}");
         assert!(msg.contains("Audio MIDI Setup"), "{msg}");
+    }
+
+    /// The Windows microphone privacy toggle reaches this backend as cpal's
+    /// unclassified BackendError carrying io::Error's rendering of
+    /// E_ACCESSDENIED, in whichever of its shapes; every shape must land on
+    /// the actionable message, and nothing else may.
+    #[test]
+    fn a_windows_privacy_denial_names_the_setting_on_the_shared_path() {
+        for message in [
+            "IAudioClient::Initialize failed: 0x80070005",
+            "OS Error -2147024891 (FormatMessageW() returned error)",
+            "Access is denied. (os error 5)",
+        ] {
+            let err = cpal::Error::with_message(cpal::ErrorKind::BackendError, message.to_owned());
+            let mapped = map_err(&err);
+            let AudioError::Unsupported(msg) = mapped else {
+                panic!("expected Unsupported for {message:?}, got {mapped:?}");
+            };
+            assert!(
+                msg.contains("microphone access denied by Windows privacy settings"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("Settings, Privacy and security, Microphone"),
+                "{msg}"
+            );
+            assert!(msg.contains(message), "the host's own words survive: {msg}");
+        }
+
+        // Any other unclassified failure stays a plain backend error.
+        let other = cpal::Error::with_message(cpal::ErrorKind::BackendError, "OS Error 1450");
+        assert!(matches!(map_err(&other), AudioError::Backend(_)));
     }
 
     /// The remedy is the whole feature, so each host gets the one that is true
@@ -698,6 +871,130 @@ mod tests {
 
         for host in ["WASAPI", "CoreAudio", "PipeWire", "ALSA", "Frobnicator"] {
             assert!(rate_remedy(host, 48_000).contains("48000"), "{host}");
+        }
+    }
+
+    /// A Bluetooth hands-free capture endpoint has no 48000 entry on any
+    /// settings page, so the remedy must say to use another microphone rather
+    /// than send the user hunting for one. Both signals trigger it: a
+    /// telephony native rate even when the form factor did not decode, and a
+    /// Bluetooth or headset form factor even at a non-telephony rate (Windows
+    /// swaps a headset between profiles underneath a running session).
+    #[test]
+    fn a_telephony_or_bluetooth_mic_is_told_to_use_another_device() {
+        let cases = [
+            (16_000, FormFactor::Unknown),
+            (8_000, FormFactor::Unknown),
+            (16_000, FormFactor::Bluetooth),
+            (44_100, FormFactor::Bluetooth),
+            (44_100, FormFactor::Headset),
+        ];
+        for (rate, form) in cases {
+            let native = native(rate, 1);
+            let err = ctx("WASAPI").refused(Direction::Capture, &native, form, None);
+            let AudioError::Unsupported(msg) = err else {
+                panic!("expected Unsupported");
+            };
+            assert!(
+                msg.contains("Bluetooth or headset microphone"),
+                "{rate} Hz {form:?}: {msg}"
+            );
+            assert!(
+                msg.contains("use another capture device"),
+                "{rate} Hz {form:?}: {msg}"
+            );
+            assert!(
+                !msg.contains("Default Format"),
+                "no pointer at a settings entry that does not exist: {msg}"
+            );
+        }
+    }
+
+    /// The special remedy stays capture-only and telephony-only: a 44.1 kHz
+    /// interface still gets the host's settings walk, and Bluetooth speakers
+    /// refusing playback are not a hands-free microphone problem.
+    #[test]
+    fn other_refusals_keep_the_host_remedy() {
+        let interface = native(44_100, 2);
+        let err = ctx("WASAPI").refused(Direction::Capture, &interface, FormFactor::Unknown, None);
+        assert!(err.detail().contains("Default Format"), "{err}");
+
+        let bt_speakers = native(44_100, 2);
+        let err = ctx("WASAPI").refused(
+            Direction::Playback,
+            &bt_speakers,
+            FormFactor::Bluetooth,
+            None,
+        );
+        assert!(err.detail().contains("Default Format"), "{err}");
+        assert!(!err.detail().contains("capture device"), "{err}");
+    }
+
+    /// The decode is a straight table plus one precedence rule: the Bluetooth
+    /// transport outranks the shape, because it is what the refusal keys on.
+    #[test]
+    fn form_factors_decode_from_the_cpal_description() {
+        use cpal::{DeviceType as D, InterfaceType as I};
+        let cases = [
+            (D::Speaker, I::BuiltIn, FormFactor::Speakers),
+            (D::Headphones, I::Usb, FormFactor::Headphones),
+            (D::Headset, I::Usb, FormFactor::Headset),
+            (D::Microphone, I::Usb, FormFactor::Microphone),
+            (D::Unknown, I::Line, FormFactor::LineLevel),
+            (D::Unknown, I::Hdmi, FormFactor::Hdmi),
+            (D::Unknown, I::DisplayPort, FormFactor::Hdmi),
+            (D::Headset, I::Bluetooth, FormFactor::Bluetooth),
+            (D::Speaker, I::Bluetooth, FormFactor::Bluetooth),
+            (D::Unknown, I::BuiltIn, FormFactor::Unknown),
+            (D::Virtual, I::Virtual, FormFactor::Unknown),
+        ];
+        for (device_type, interface, want) in cases {
+            assert_eq!(
+                form_factor(device_type, interface),
+                want,
+                "{device_type:?} over {interface:?}"
+            );
+        }
+    }
+
+    /// The disclosure table: a rate mismatch means OS conversion only on the
+    /// hosts that convert. CoreAudio moved the device clock, ALSA never opened
+    /// a rate the card does not run, and an unknown host earns no claim.
+    #[test]
+    fn render_conversion_is_claimed_only_where_the_os_converts() {
+        for host in ["WASAPI", "PipeWire"] {
+            assert_eq!(
+                render_conversion(host, 44_100, 48_000),
+                Some(true),
+                "{host}"
+            );
+            assert_eq!(
+                render_conversion(host, 48_000, 48_000),
+                Some(false),
+                "{host}"
+            );
+        }
+        for host in ["CoreAudio", "ALSA"] {
+            assert_eq!(
+                render_conversion(host, 44_100, 48_000),
+                Some(false),
+                "{host}"
+            );
+            assert_eq!(
+                render_conversion(host, 48_000, 48_000),
+                Some(false),
+                "{host}"
+            );
+        }
+        assert_eq!(render_conversion("Frobnicator", 44_100, 48_000), None);
+    }
+
+    #[test]
+    fn telephony_rates_are_the_hands_free_profiles_only() {
+        assert!(is_telephony_rate(8_000));
+        assert!(is_telephony_rate(16_000));
+        for rate in [22_050, 44_100, 48_000, 96_000] {
+            assert!(!is_telephony_rate(rate), "{rate}");
         }
     }
 }

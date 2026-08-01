@@ -241,6 +241,26 @@ fn a_device_at_44_1_refuses_a_48_khz_session() {
     assert!(msg.contains("44100") && msg.contains("48000"), "{msg}");
 }
 
+/// The offline backend reports a form factor like the real hosts do: Unknown
+/// by default, which is what a host that cannot decode one reports, and the
+/// configured shape on both endpoints when a test models a Bluetooth headset.
+#[test]
+fn devices_carry_the_modelled_form_factor() {
+    use jamstream_audio_io::{AudioBackend, FormFactor};
+
+    let plain = WavBackend::new(None, None);
+    for device in plain.devices().unwrap() {
+        assert_eq!(device.form_factor, FormFactor::Unknown, "{}", device.id);
+    }
+
+    let headset = WavBackend::new(None, None).with_form_factor(FormFactor::Bluetooth);
+    let devices = headset.devices().unwrap();
+    assert_eq!(devices.len(), 2);
+    for device in devices {
+        assert_eq!(device.form_factor, FormFactor::Bluetooth, "{}", device.id);
+    }
+}
+
 #[test]
 fn a_device_at_44_1_opens_at_its_own_rate() {
     let backend = WavBackend::new(None, None).with_device_rate(44_100);
@@ -251,6 +271,17 @@ fn a_device_at_44_1_opens_at_its_own_rate() {
     let mut stream = backend.open_offline(cfg, passthrough()).unwrap();
     stream.pump(441).unwrap();
     assert!(!stream.errored());
+}
+
+/// Every open publishes the render-conversion report the way a real backend
+/// does, and this backend never converts: a mismatched rate is refused, so an
+/// open stream is running at the device rate. Safe alongside parallel tests
+/// because every wav open publishes the same value.
+#[test]
+fn an_open_reports_that_nothing_is_converting() {
+    let backend = WavBackend::new(None, None);
+    let _stream = backend.open_offline(config(2), passthrough()).unwrap();
+    assert_eq!(jamstream_audio_io::active_render_conversion(), Some(false));
 }
 
 /// Device loss is observable offline, so the caller's device-gone path is no

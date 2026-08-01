@@ -29,7 +29,14 @@ mod hr {
     pub(super) const AUDCLNT_E_INVALID_DEVICE_PERIOD: i32 = 0x8889_0020_u32 as i32;
     pub(super) const AUDCLNT_E_RESOURCES_INVALIDATED: i32 = 0x8889_0026_u32 as i32;
     pub(super) const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
+    pub(super) const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
 }
+
+/// What to do about a Windows microphone privacy denial, appended to both the
+/// exclusive-path error and the cpal shared-path one so the two paths cannot
+/// drift apart.
+pub(crate) const MIC_PRIVACY_REMEDY: &str = "allow desktop apps to access your \
+     microphone in Settings, Privacy and security, Microphone";
 
 /// Why an exclusive-mode open did not happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +50,10 @@ pub(crate) enum ExclusiveFailure {
     UnsupportedFormat,
     /// Another process already holds the endpoint in exclusive mode.
     DeviceInUse,
+    /// Windows denied access to the endpoint (`E_ACCESSDENIED`), which in
+    /// practice is the microphone privacy toggle: "Let desktop apps access
+    /// your microphone" is off.
+    AccessDenied,
     /// "Allow applications to take exclusive control" is off for the endpoint.
     ExclusiveNotAllowed,
     /// The driver wants a buffer size we did not align to; we retry once with
@@ -69,6 +80,7 @@ impl ExclusiveFailure {
             Self::DeviceNotFound => "device not found",
             Self::UnsupportedFormat => "no exclusive-mode format accepted",
             Self::DeviceInUse => "device held exclusively by another application",
+            Self::AccessDenied => "microphone access denied by Windows privacy settings",
             Self::ExclusiveNotAllowed => "exclusive mode disabled for this endpoint",
             Self::BufferSizeNotAligned => "driver rejected the buffer alignment",
             Self::InvalidDevicePeriod => "driver rejected the device period",
@@ -91,19 +103,23 @@ pub(crate) enum Fallback {
 
 /// The fallback decision table.
 ///
-/// Everything that describes a *device* condition falls back to shared mode,
-/// because every one of those conditions still leaves a working shared-mode
-/// endpoint: an exclusive holder does not block shared clients, a driver that
-/// refuses our formats still talks to the audio engine, and a disabled
-/// exclusive-mode checkbox is exactly the case the fallback exists for. Only a
-/// malformed request is rejected, since shared mode would reject it too and
-/// the clearer error is the useful one.
+/// A condition falls back to shared mode only when a shared-mode stream can
+/// actually survive it: a driver that refuses our exclusive formats still
+/// talks to the audio engine, and a disabled exclusive-mode checkbox is
+/// exactly the case the fallback exists for. The rest reject instead.
+/// A malformed request would be rejected by shared mode too, and the clearer
+/// error is the useful one. A device held exclusively by another application
+/// blocks shared clients as well: `AUDCLNT_E_DEVICE_IN_USE` fails shared-mode
+/// `Initialize` just like exclusive, so falling back only traded the
+/// classifier's words for cpal's generic "temporarily busy" error (#324).
+/// The microphone privacy toggle blocks every open the same way (#329).
 pub(crate) const fn fallback_decision(failure: ExclusiveFailure) -> Fallback {
     match failure {
-        ExclusiveFailure::InvalidConfig => Fallback::Reject,
+        ExclusiveFailure::InvalidConfig
+        | ExclusiveFailure::DeviceInUse
+        | ExclusiveFailure::AccessDenied => Fallback::Reject,
         ExclusiveFailure::DeviceNotFound
         | ExclusiveFailure::UnsupportedFormat
-        | ExclusiveFailure::DeviceInUse
         | ExclusiveFailure::ExclusiveNotAllowed
         | ExclusiveFailure::BufferSizeNotAligned
         | ExclusiveFailure::InvalidDevicePeriod
@@ -118,20 +134,22 @@ pub(crate) const fn fallback_decision(failure: ExclusiveFailure) -> Fallback {
 /// failure.
 ///
 /// The client reopens a dead or reconfigured stream on a 500 ms cadence, so
-/// without a cooldown a musician whose interface is owned by a DAW would pay
+/// without a cooldown an endpoint that will never open exclusively would pay
 /// (and log) a doomed exclusive probe twice a second forever. The durations
 /// track how likely the condition is to clear on its own: a settings toggle or
-/// a driver's format list will not change mid-session, another application's
-/// grip might, and an invalidated device means the next open sees different
-/// hardware, so it gets no cooldown at all.
+/// a driver's format list will not change mid-session, a wedged driver might
+/// recover, and an invalidated device means the next open sees different
+/// hardware, so it gets no cooldown at all. Rejected conditions never arm the
+/// gate at all; their entries exist so the table stays total.
 pub(crate) const fn retry_cooldown(failure: ExclusiveFailure) -> Duration {
     match failure {
-        // Static properties of the endpoint or its driver.
+        // Static properties of the endpoint, its driver, or a settings toggle.
         ExclusiveFailure::ExclusiveNotAllowed
         | ExclusiveFailure::UnsupportedFormat
         | ExclusiveFailure::BufferSizeNotAligned
-        | ExclusiveFailure::InvalidDevicePeriod => Duration::from_secs(60),
-        // Might clear when another application lets go.
+        | ExclusiveFailure::InvalidDevicePeriod
+        | ExclusiveFailure::AccessDenied => Duration::from_secs(60),
+        // Might clear when another application lets go or a driver recovers.
         ExclusiveFailure::DeviceInUse
         | ExclusiveFailure::EndpointCreateFailed
         | ExclusiveFailure::ServiceNotRunning
@@ -162,6 +180,9 @@ pub(crate) const fn classify_hresult(code: i32) -> ExclusiveFailure {
         // A bad period or format reaches IAudioClient::Initialize as
         // E_INVALIDARG on some drivers rather than a specific AUDCLNT code.
         hr::E_INVALIDARG => ExclusiveFailure::InvalidDevicePeriod,
+        // "Let desktop apps access your microphone" is off; the driver never
+        // even sees the request.
+        hr::E_ACCESSDENIED => ExclusiveFailure::AccessDenied,
         _ => ExclusiveFailure::Other,
     }
 }
@@ -182,6 +203,11 @@ pub(crate) fn open_error(failure: ExclusiveFailure, detail: &str) -> AudioError 
         }
         ExclusiveFailure::InvalidConfig | ExclusiveFailure::UnsupportedFormat => {
             AudioError::Unsupported(format!("{reason}: {detail}"))
+        }
+        // A privacy denial is a setting a human has to flip, so the error
+        // carries the remedy along with the classification.
+        ExclusiveFailure::AccessDenied => {
+            AudioError::Unsupported(format!("{reason}: {detail}; {MIC_PRIVACY_REMEDY}"))
         }
         _ => AudioError::Backend(format!("{reason}: {detail}")),
     }
@@ -328,11 +354,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_device_condition_falls_back_to_shared() {
+    fn conditions_a_shared_stream_survives_fall_back_to_shared() {
         for failure in [
             ExclusiveFailure::DeviceNotFound,
             ExclusiveFailure::UnsupportedFormat,
-            ExclusiveFailure::DeviceInUse,
             ExclusiveFailure::ExclusiveNotAllowed,
             ExclusiveFailure::BufferSizeNotAligned,
             ExclusiveFailure::InvalidDevicePeriod,
@@ -349,11 +374,34 @@ mod tests {
         }
     }
 
+    /// Shared mode cannot save any of these: it rejects a malformed request
+    /// too, `AUDCLNT_E_DEVICE_IN_USE` fails shared-mode `Initialize` while
+    /// another process holds the endpoint exclusively, and the microphone
+    /// privacy toggle blocks shared and exclusive opens alike.
     #[test]
-    fn only_a_malformed_request_is_rejected() {
-        assert_eq!(
-            fallback_decision(ExclusiveFailure::InvalidConfig),
-            Fallback::Reject
+    fn conditions_shared_mode_cannot_save_are_rejected() {
+        for failure in [
+            ExclusiveFailure::InvalidConfig,
+            ExclusiveFailure::DeviceInUse,
+            ExclusiveFailure::AccessDenied,
+        ] {
+            assert_eq!(fallback_decision(failure), Fallback::Reject, "{failure:?}");
+        }
+    }
+
+    /// The whole point of rejecting DeviceInUse: the words the user sees name
+    /// the exclusive holder instead of cpal's generic "temporarily busy",
+    /// which is what falling back used to produce.
+    #[test]
+    fn a_device_held_exclusively_rejects_with_the_classifier_words() {
+        let message = open_error(
+            ExclusiveFailure::DeviceInUse,
+            "IAudioClient::Initialize: 0x8889000A",
+        )
+        .to_string();
+        assert!(
+            message.contains("device held exclusively by another application"),
+            "{message}"
         );
     }
 
@@ -365,6 +413,10 @@ mod tests {
         );
         assert_eq!(
             retry_cooldown(ExclusiveFailure::UnsupportedFormat),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            retry_cooldown(ExclusiveFailure::AccessDenied),
             Duration::from_secs(60)
         );
         assert_eq!(
@@ -395,6 +447,7 @@ mod tests {
             (0x8889_0020_u32, ExclusiveFailure::InvalidDevicePeriod),
             (0x8889_0006_u32, ExclusiveFailure::InvalidDevicePeriod),
             (0x8007_0057_u32, ExclusiveFailure::InvalidDevicePeriod),
+            (0x8007_0005_u32, ExclusiveFailure::AccessDenied),
             (0x8889_000F_u32, ExclusiveFailure::EndpointCreateFailed),
             (0x8889_0004_u32, ExclusiveFailure::DeviceInvalidated),
             (0x8889_0026_u32, ExclusiveFailure::DeviceInvalidated),
@@ -423,6 +476,7 @@ mod tests {
             0x8889_0008_u32,
             0x8889_0019_u32,
             0x8007_0057_u32,
+            0x8007_0005_u32,
         ] {
             assert!(
                 !is_device_loss(code as i32),
@@ -438,6 +492,7 @@ mod tests {
             ExclusiveFailure::DeviceNotFound,
             ExclusiveFailure::UnsupportedFormat,
             ExclusiveFailure::DeviceInUse,
+            ExclusiveFailure::AccessDenied,
             ExclusiveFailure::ExclusiveNotAllowed,
             ExclusiveFailure::BufferSizeNotAligned,
             ExclusiveFailure::InvalidDevicePeriod,
@@ -466,6 +521,7 @@ mod tests {
         for failure in [
             ExclusiveFailure::InvalidConfig,
             ExclusiveFailure::UnsupportedFormat,
+            ExclusiveFailure::AccessDenied,
         ] {
             assert!(
                 matches!(open_error(failure, "detail"), AudioError::Unsupported(_)),
@@ -496,6 +552,7 @@ mod tests {
             ExclusiveFailure::InvalidConfig,
             ExclusiveFailure::UnsupportedFormat,
             ExclusiveFailure::DeviceInUse,
+            ExclusiveFailure::AccessDenied,
             ExclusiveFailure::ExclusiveNotAllowed,
             ExclusiveFailure::BufferSizeNotAligned,
             ExclusiveFailure::InvalidDevicePeriod,
@@ -507,6 +564,23 @@ mod tests {
             assert!(message.contains("0x88890008"), "{failure:?}: {message}");
             assert!(message.contains(failure.as_str()), "{failure:?}: {message}");
         }
+    }
+
+    /// The privacy toggle is a setting a human has to flip, so the error the
+    /// user reads carries the walk to it, not just the classification.
+    #[test]
+    fn a_privacy_denial_names_the_setting_to_flip() {
+        let message =
+            open_error(ExclusiveFailure::AccessDenied, "IAudioClient::Initialize").to_string();
+        assert!(
+            message.contains("microphone access denied by Windows privacy settings"),
+            "{message}"
+        );
+        assert!(message.contains(MIC_PRIVACY_REMEDY), "{message}");
+        assert!(
+            message.contains("Settings, Privacy and security, Microphone"),
+            "{message}"
+        );
     }
 
     /// A late device gets waited for; a silent one gets declared dead. The
@@ -677,6 +751,7 @@ mod tests {
             ExclusiveFailure::DeviceNotFound,
             ExclusiveFailure::UnsupportedFormat,
             ExclusiveFailure::DeviceInUse,
+            ExclusiveFailure::AccessDenied,
             ExclusiveFailure::ExclusiveNotAllowed,
             ExclusiveFailure::BufferSizeNotAligned,
             ExclusiveFailure::InvalidDevicePeriod,
@@ -705,7 +780,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn constants_match_the_windows_crate() {
-        use windows::Win32::Foundation::E_INVALIDARG;
+        use windows::Win32::Foundation::{E_ACCESSDENIED, E_INVALIDARG};
         use windows::Win32::Media::Audio::{
             AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, AUDCLNT_E_BUFFER_TOO_LARGE, AUDCLNT_E_DEVICE_IN_USE,
             AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_ENDPOINT_CREATE_FAILED,
@@ -751,6 +826,7 @@ mod tests {
                 AUDCLNT_E_RESOURCES_INVALIDATED,
             ),
             (hr::E_INVALIDARG, E_INVALIDARG),
+            (hr::E_ACCESSDENIED, E_ACCESSDENIED),
         ] {
             assert_eq!(ours, theirs.0, "{theirs:?}");
         }
