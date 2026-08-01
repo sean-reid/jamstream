@@ -10,7 +10,7 @@
 # somewhere.
 #
 # Parameters (when run as a saved script rather than piped to iex):
-#   -Purge        also delete session data and recordings
+#   -Purge        also delete session data, recordings, and saved credentials
 #   -Yes          do not stop for a session that is still running
 #   -InstallDir   look here; defaults to JAMSTREAM_INSTALL_DIR if set,
 #                 otherwise $env:LOCALAPPDATA\Programs\jamstream
@@ -99,6 +99,25 @@ if ($Purge) {
     if (-not $found) {
         Write-Host "no data directory at $($dataDirs -join ' or ')"
     }
+
+    # Credentials the app saved: keyring entries with service "jamstream" and
+    # user "<provider>.<field>", which Windows keeps as generic credentials
+    # named <provider>.<field>.jamstream.
+    $targets = @()
+    foreach ($line in (cmdkey /list 2>$null)) {
+        if ($line -match 'target=([^\s]+\.jamstream)\s*$') { $targets += $Matches[1] }
+    }
+    if ($targets.Count -eq 0) {
+        Write-Host 'no jamstream entries in Credential Manager'
+    }
+    foreach ($target in $targets) {
+        cmdkey /delete:$target | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "removed Credential Manager entry $target"
+        } else {
+            Write-Host "could not remove $target; delete it in Credential Manager by hand"
+        }
+    }
 } else {
     foreach ($dataDir in $dataDirs) {
         if (Test-Path $dataDir) {
@@ -107,4 +126,6 @@ if ($Purge) {
     }
 }
 
-Write-Host 'Cloud credentials, if you saved any, are in Credential Manager: search for jamstream and remove the entries.'
+if (-not $Purge) {
+    Write-Host 'Cloud credentials, if you saved any, are in Credential Manager: search for jamstream and remove the entries, or rerun with -Purge.'
+}
