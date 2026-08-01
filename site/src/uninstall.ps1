@@ -74,6 +74,8 @@ foreach ($name in $owned) {
 
 if ($removed -eq 0) {
     Write-Host "nothing to remove: no JamStream binaries in $InstallDir"
+    Write-Host 'A zip extracted by hand is uninstalled by deleting that folder. Data lives'
+    Write-Host "at $env:LOCALAPPDATA\jamstream, credentials in Credential Manager."
 } elseif ((Test-Path $InstallDir) -and -not (Get-ChildItem -Force $InstallDir)) {
     Remove-Item -Force $InstallDir
     Write-Host "removed the empty $InstallDir"
