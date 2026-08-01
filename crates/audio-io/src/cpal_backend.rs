@@ -301,9 +301,13 @@ fn config_at_rate(
 /// Linux hosts fail for opposite reasons.
 fn rate_remedy(host: &str, rate: u32) -> String {
     match host {
+        // mmsys.cpl by name, because Windows 11's Settings app no longer has
+        // Recording and Playback tabs to walk to; the applet is the one entry
+        // point that exists on every Windows this can run on.
         "WASAPI" => format!(
-            "set that device to {rate} Hz in Sound, Recording or Playback, the \
-             device's Properties, Advanced, Default Format"
+            "set that device to {rate} Hz: run mmsys.cpl (Settings > System > \
+             Sound > More sound settings), Recording or Playback, the device's \
+             Properties, Advanced, Default Format"
         ),
         "CoreAudio" => format!(
             "check Audio MIDI Setup, Format, for a {rate} Hz entry on that \
@@ -652,6 +656,10 @@ mod tests {
     #[test]
     fn each_host_gets_a_remedy_that_is_true_for_it() {
         let windows = rate_remedy("WASAPI", 48_000);
+        // mmsys.cpl is the load-bearing part: Windows 11's Settings app has
+        // no Recording or Playback tab to send anyone to.
+        assert!(windows.contains("mmsys.cpl"), "{windows}");
+        assert!(windows.contains("More sound settings"), "{windows}");
         assert!(windows.contains("Advanced, Default Format"), "{windows}");
 
         let macos = rate_remedy("CoreAudio", 48_000);
