@@ -127,7 +127,13 @@ jobs:
           if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
             Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
           }
-          Invoke-ScriptAnalyzer -Path site/src/install.ps1, site/src/uninstall.ps1 -Severity Error -EnableExit
+          $failed = $false
+          foreach ($script in 'site/src/install.ps1', 'site/src/uninstall.ps1') {
+            $findings = Invoke-ScriptAnalyzer -Path $script -Severity Error
+            if ($findings) { $findings | Format-Table -AutoSize | Out-String | Write-Output; $failed = $true }
+            else { Write-Output "$script analyzes cleanly" }
+          }
+          if ($failed) { exit 1 }
       - name: Install, run, and uninstall against the latest release
         shell: powershell
         run: |
