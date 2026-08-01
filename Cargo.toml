@@ -161,7 +161,11 @@ keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync
 # because it only serves rfd's parent-window handle, which we do not set: the
 # app's window handle is not reachable from inside the settings sheet.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
-eframe = "0.35"
+# persistence: eframe itself saves and restores the native window
+# geometry (NativeOptions::persist_window defaults to true), so size,
+# position, monitor, and maximized state survive a restart with no
+# App::save implementation on our side.
+eframe = { version = "0.35", features = ["persistence"] }
 egui = "0.35"
 egui_extras = "0.35"
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
