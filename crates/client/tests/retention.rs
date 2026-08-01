@@ -62,11 +62,19 @@ fn outcome_with(retention: Option<RetentionEnforcement>) -> LaunchOutcome {
         status: jamstream_cli::state::SessionStatus::Running,
         ended_unix: None,
     };
-    let state_path =
-        std::env::temp_dir().join(format!("jamstream-retention-{}.json", std::process::id()));
+    // A private subdirectory, not temp_dir() itself: the state writer
+    // refuses a world-writable parent, and Linux's /tmp is one.
+    let dir = std::env::temp_dir().join(format!("jamstream-retention-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
     LaunchOutcome {
         state,
-        state_path,
+        state_path: dir.join("state.json"),
         retention,
     }
 }
