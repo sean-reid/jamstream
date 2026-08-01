@@ -45,6 +45,11 @@ jobs:
       # tee, so a failure is readable in the log and not only in the summary.
       # The grep drops criterion's per-benchmark progress chatter and its
       # outlier counts; the tick table and every `time:` line survive it.
+      #
+      # The copy in bench.out is what the next step counts. It cannot read
+      # GITHUB_STEP_SUMMARY instead: that path is unique per step, so the
+      # check would grep its own empty file and fail on 0 forever, which is
+      # how this job spent its first five nights.
       - name: Benchmark the engine and protocol hot paths
         run: |
           {
@@ -53,13 +58,13 @@ jobs:
             cargo bench --locked -p jamstream-engine -p jamstream-protocol 2>&1 \
               | grep -vE '^(Benchmarking|Found [0-9]+ outliers)'
             echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-      # A summary with no `time:` lines in it means cargo bench found no bench
+          } | tee bench.out | tee -a "$GITHUB_STEP_SUMMARY"
+      # A run with no `time:` lines in it means cargo bench found no bench
       # targets and exited happy, which is exactly the silent no-op this job
       # exists to prevent. Fail loudly instead.
       - name: Check the summary holds real measurements
         run: |
-          count=$(grep -c 'time:' "$GITHUB_STEP_SUMMARY" || true)
+          count=$(grep -c 'time:' bench.out || true)
           echo "criterion reported $count measurements"
           test "$count" -ge 20
       - if: always()
@@ -170,6 +175,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+      # The pinned ffmpeg, for the reasons documented in ci.yml: this job runs
+      # crates/stream's tests too, and real_ffmpeg fails on Linux when the
+      # encoder a session VM actually boots with is not on PATH.
+      - if: runner.os == 'Linux'
+        name: Install the ffmpeg a session VM runs
+        run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
+      - if: runner.os == 'Linux'
+        run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-nextest
