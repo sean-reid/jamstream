@@ -1,6 +1,13 @@
 //! The jamstream desktop app. `--demo` opens a live fake session so the
 //! whole interface can be exercised without a server.
 
+// Release builds launch without a console window; `cargo run` keeps one
+// for debugging. A GUI-subsystem parent has no console to lend children,
+// so every Windows child spawn in crates/cloud/src/providers/local.rs
+// carries CREATE_NO_WINDOW; remove either half and Windows either shows
+// a console per launch or pops one per spawned process.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use jamstream_client::app::JamApp;
 
 /// The committed 512px render of the app icon (source of record:

@@ -610,7 +610,7 @@ impl Provider for LocalProvider {
                 command.arg("--record-stems");
             }
         }
-        let child = command
+        let child = quiet(&mut command)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().map_err(|e| {
                 ProviderError::Other(format!("cannot clone server log handle: {e}"))
@@ -878,6 +878,22 @@ fn create_log_file(path: &Path) -> std::io::Result<std::fs::File> {
         opts.mode(0o600);
     }
     opts.open(path)
+}
+
+/// On Windows every child spawn carries CREATE_NO_WINDOW: the desktop app
+/// is built for the GUI subsystem (crates/client/src/main.rs), and a GUI
+/// parent has no console to lend, so without the flag each spawned console
+/// binary (jamstreamd, tasklist, taskkill) pops its own window.
+#[cfg(windows)]
+fn quiet(command: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(windows))]
+fn quiet(command: &mut Command) -> &mut Command {
+    command
 }
 
 /// One path component for a session id: the object-key rule from
@@ -1536,9 +1552,14 @@ mod process {
 
     /// See [`super::tasklist_probe`] for the parse and the pid-reuse rule.
     pub fn probe(pid: u32, spawned: Spawned<'_>) -> PidProbe {
-        match Command::new(tasklist())
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .output()
+        match super::quiet(Command::new(tasklist()).args([
+            "/FI",
+            &format!("PID eq {pid}"),
+            "/NH",
+            "/FO",
+            "CSV",
+        ]))
+        .output()
         {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout);
@@ -1576,9 +1597,8 @@ mod process {
     /// insurance for the day jamstreamd runs windowed, not the mechanism we
     /// rely on, so its status is ignored.
     pub fn terminate(pid: u32) {
-        let _ = Command::new(taskkill())
-            .args(["/PID", &pid.to_string(), "/T"])
-            .output();
+        let _ =
+            super::quiet(Command::new(taskkill()).args(["/PID", &pid.to_string(), "/T"])).output();
     }
 
     /// The SIGKILL equivalent: kill the process and its children outright.
@@ -1586,8 +1606,7 @@ mod process {
     /// process ... has been terminated" chatter does not land in the CLI's
     /// own stdout.
     pub fn kill(pid: u32) {
-        let _ = Command::new(taskkill())
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
+        let _ = super::quiet(Command::new(taskkill()).args(["/PID", &pid.to_string(), "/T", "/F"]))
             .output();
     }
 }
@@ -2693,6 +2712,21 @@ mod tests {
             !matches!(after, PidProbe::Alive { .. }),
             "a waited child must read dead, got {after:?}"
         );
+    }
+
+    /// std offers no way to read creation flags back off a Command, so
+    /// this asserts what it can: a quieted child still spawns, runs, and
+    /// pipes its output, meaning CREATE_NO_WINDOW is a value CreateProcess
+    /// accepts alongside piped stdio. That no window appears is only
+    /// checkable on hardware and sits on the release checklist.
+    #[cfg(windows)]
+    #[test]
+    fn a_quieted_child_still_runs_and_pipes_output() {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "echo quiet"]);
+        let out = quiet(&mut command).output().unwrap();
+        assert!(out.status.success(), "quieted cmd /C echo failed: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "quiet");
     }
 
     #[test]
