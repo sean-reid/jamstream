@@ -184,7 +184,14 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # cache-on-failure, or a dependency-adding PR can never converge on
+      # Windows: the cold build overruns the 20 minute ceiling, cancellation
+      # skips the cache save, and every retry is exactly as cold as the
+      # first. Saving what the failed run compiled makes the retry warm.
+      # The ceiling itself is untouched; it defends steady-state wall time.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+        with:
+          cache-on-failure: true
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       # ffmpeg is what makes crates/stream's real_ffmpeg test a test. Without it
