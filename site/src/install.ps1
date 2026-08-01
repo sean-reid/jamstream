@@ -22,6 +22,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# PowerShell 5.1 downloads an order of magnitude slower with the progress
+# bar, and its .NET default can predate the TLS that GitHub requires.
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $repo = 'sean-reid/jamstream'
 $base = "https://github.com/$repo/releases/latest/download"
