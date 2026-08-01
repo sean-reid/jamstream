@@ -41,3 +41,6 @@ wiremock.workspace = true
 # cannot drift apart. A path dependency and not a workspace one: nothing
 # ships xtask, and it has no business in the workspace dependency table.
 xtask = { path = "../../xtask" }
+
+[build-dependencies]
+winresource.workspace = true
