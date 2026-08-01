@@ -1196,9 +1196,13 @@ fn exclusive_bounds(device: &Device) -> (Option<u32>, Option<u32>) {
 /// What is left needs real hardware and is honestly out of reach here: the
 /// exclusive-mode `Initialize` negotiation against a driver, the
 /// buffer-alignment retry, the capture and render loops, MMCSS promotion, and
-/// the handover that starts the streams. `tests/cpal_devices.rs` and
-/// `tests/hardware_loopback.rs` are the tests for those, and they need a
-/// machine with a device.
+/// the handover that starts the streams. Those paths are verified by hand on
+/// real hardware only. The hosted CI runners have no audio endpoint and no
+/// workflow passes `--run-ignored`, so a regression there keeps every gate
+/// green; nothing automated stands behind them. The two ignored tests,
+/// `tests/cpal_devices.rs` and `tests/hardware_loopback.rs`, are the manual
+/// pre-release checks: run both on a Windows machine with a real device
+/// before shipping a release that touches this file.
 #[cfg(test)]
 mod tests {
     use super::*;

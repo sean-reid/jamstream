@@ -4,6 +4,12 @@
 #
 #   usage: render-packaging.sh [options] <tag>
 #
+#     -c, --check           render into a temp dir and compare against the
+#                           committed tree instead of writing; exits 1
+#                           naming every file that drifted, so a job can
+#                           fail when the committed manifests fall behind
+#                           a release (same shape as render-palette.sh
+#                           --check and render-icon.sh --check)
 #     -o, --output-dir DIR  write under DIR instead of ./packaging
 #     -s, --sums FILE       use a local SHA256SUMS instead of downloading
 #                           the release's (for tests). The license texts and
@@ -23,10 +29,11 @@
 # packaging/winget/manifests/, which is versioned by winget's own layout.
 #
 # What the committed files under packaging/ are for: they are the source of
-# truth a human copies into the three third-party repositories (a Homebrew
-# tap, microsoft/winget-pkgs, the AUR). release.yml re-renders them for the
-# tag it is building, attaches the result as a release asset, and pushes
-# the Homebrew tap when a token exists; see the packaging job there.
+# truth a human copies into the four third-party repositories (a Homebrew
+# tap, microsoft/winget-pkgs, the AUR, the Scoop bucket). release.yml
+# re-renders them for the tag it is building, attaches the result as a
+# release asset, and pushes the Homebrew tap when a token exists; see the
+# packaging job there.
 #
 # POSIX sh. Kept shellcheck-clean by ci.yml (shellcheck scripts/*.sh).
 set -eu
@@ -45,8 +52,11 @@ usage() {
   cat <<'USAGE'
 usage: render-packaging.sh [options] <tag>
 
-Renders the Homebrew, winget, and AUR manifests for a published release.
+Renders the Homebrew, winget, AUR, and Scoop manifests for a published
+release.
 
+  -c, --check           compare against the committed tree instead of
+                        writing; exit 1 naming every drifted file
   -o, --output-dir DIR  write under DIR instead of ./packaging
   -s, --sums FILE       use a local SHA256SUMS instead of downloading it
   -h, --help            show this help
@@ -60,9 +70,14 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TAG=""
 OUT_DIR=""
 SUMS_FILE=""
+MODE=render
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    -c | --check)
+      MODE=check
+      shift
+      ;;
     -o | --output-dir)
       [ "$#" -ge 2 ] || fail "$1 needs a directory"
       OUT_DIR=$2
@@ -118,6 +133,13 @@ fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
+
+# In check mode everything renders into the temp dir and the committed
+# tree is only read, so a failing check leaves it untouched.
+TARGET_DIR=$OUT_DIR
+if [ "$MODE" = check ]; then
+  OUT_DIR="$TMP/render"
+fi
 
 # api_get <url>: authenticated when GH_TOKEN is set (CI), anonymous
 # otherwise (the unauthenticated rate limit is plenty for one release).
@@ -175,6 +197,7 @@ SHA_CLI_MACOS=$(sum_for jamstream-cli-macos-universal.tar.gz)
 SHA_APP_LINUX=$(sum_for jamstream-app-linux-x86_64.tar.gz)
 SHA_CLI_LINUX=$(sum_for jamstream-cli-linux-x86_64.tar.gz)
 SHA_APP_WINDOWS=$(sum_for jamstream-app-windows-x86_64.zip)
+SHA_CLI_WINDOWS=$(sum_for jamstream-cli-windows-x86_64.zip)
 SHA_LICENSE_MIT=$(license_sum LICENSE-MIT)
 SHA_LICENSE_APACHE=$(license_sum LICENSE-APACHE)
 
@@ -609,6 +632,131 @@ srcinfo_cli() {
 srcinfo_app > "$OUT_DIR/aur/jamstream-bin/.SRCINFO"
 srcinfo_cli > "$OUT_DIR/aur/jamstream-cli-bin/.SRCINFO"
 
+# ------------------------------------------------------------------- Scoop
+# A Scoop bucket is a plain git repository with manifests under bucket/,
+# so scoop/bucket/ here mirrors sean-reid/scoop-jamstream verbatim, the
+# way homebrew/ mirrors the tap.
+#
+# Naming: Scoop's audience lives in the terminal, so the plain name
+# installs the CLI, matching its binary (jamstream.exe), and the app
+# takes -app, matching its own exe. That is the Homebrew split reversed:
+# there the cask owns the plain token because the app is what mac users
+# mean by "install jamstream".
+#
+# The app manifest declares a Start Menu shortcut, which is what a zip of
+# portable binaries cannot get from winget; the app zip carries
+# jamstream.ico beside the exe for exactly this entry. checkver's github
+# strategy reads the latest stable release, so a manifest rendered from a
+# prerelease tag sits still until the next stable release, which is what
+# a bucket should do.
+mkdir -p "$OUT_DIR/scoop/bucket"
+
+cat > "$OUT_DIR/scoop/bucket/jamstream.json" <<SCOOP_CLI
+{
+    "##": "$GENERATED",
+    "version": "$VERSION",
+    "description": "Terminal client for jam sessions hosted in your own cloud account",
+    "homepage": "$HOMEPAGE",
+    "license": "MIT|Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/$REPO/releases/download/$TAG/jamstream-cli-windows-x86_64.zip",
+            "hash": "$SHA_CLI_WINDOWS"
+        }
+    },
+    "bin": "jamstream.exe",
+    "suggest": {
+        "Desktop app and the jamstreamd session server": "jamstream/jamstream-app"
+    },
+    "checkver": {
+        "github": "https://github.com/$REPO"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/$REPO/releases/download/v\$version/jamstream-cli-windows-x86_64.zip"
+            }
+        },
+        "hash": {
+            "url": "https://github.com/$REPO/releases/download/v\$version/SHA256SUMS"
+        }
+    }
+}
+SCOOP_CLI
+
+cat > "$OUT_DIR/scoop/bucket/jamstream-app.json" <<SCOOP_APP
+{
+    "##": "$GENERATED",
+    "version": "$VERSION",
+    "description": "Host a short-lived jam server in your own cloud account and play together",
+    "homepage": "$HOMEPAGE",
+    "license": "MIT|Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/$REPO/releases/download/$TAG/jamstream-app-windows-x86_64.zip",
+            "hash": "$SHA_APP_WINDOWS"
+        }
+    },
+    "bin": [
+        "jamstream-app.exe",
+        "jamstreamd.exe"
+    ],
+    "shortcuts": [
+        [
+            "jamstream-app.exe",
+            "JamStream",
+            "",
+            "jamstream.ico"
+        ]
+    ],
+    "checkver": {
+        "github": "https://github.com/$REPO"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/$REPO/releases/download/v\$version/jamstream-app-windows-x86_64.zip"
+            }
+        },
+        "hash": {
+            "url": "https://github.com/$REPO/releases/download/v\$version/SHA256SUMS"
+        }
+    }
+}
+SCOOP_APP
+
+# ------------------------------------------------------------------- check
+if [ "$MODE" = check ]; then
+  DRIFT="$TMP/drift"
+  : > "$DRIFT"
+  # Every rendered file must match its committed copy byte for byte.
+  (cd "$OUT_DIR" && find . -type f) | sort | while IFS= read -r rel; do
+    rel=${rel#./}
+    cmp -s "$OUT_DIR/$rel" "$TARGET_DIR/$rel" 2> /dev/null ||
+      printf '%s\n' "$rel" >> "$DRIFT"
+  done
+  # And the committed channel directories must hold nothing this render
+  # did not produce, or a winget version directory the render would have
+  # pruned survives the check.
+  for channel in homebrew winget aur scoop; do
+    [ -d "$TARGET_DIR/$channel" ] || continue
+    (cd "$TARGET_DIR" && find "$channel" -type f) | sort | while IFS= read -r rel; do
+      [ -f "$OUT_DIR/$rel" ] || printf '%s\n' "$rel" >> "$DRIFT"
+    done
+  done
+  if [ -s "$DRIFT" ]; then
+    {
+      printf 'render-packaging: %s does not match what this script renders for %s:\n' \
+        "$TARGET_DIR" "$TAG"
+      sort -u "$DRIFT" | sed 's/^/  /'
+      printf 'Run scripts/render-packaging.sh %s and commit the result.\n' "$TAG"
+    } >&2
+    exit 1
+  fi
+  printf 'packaging: every committed manifest matches the %s release\n' "$TAG"
+  exit 0
+fi
+
 printf 'wrote:\n'
 printf '  %s\n' \
   "$OUT_DIR/homebrew/Casks/jamstream.rb" \
@@ -619,4 +767,6 @@ printf '  %s\n' \
   "$OUT_DIR/aur/jamstream-bin/PKGBUILD" \
   "$OUT_DIR/aur/jamstream-bin/.SRCINFO" \
   "$OUT_DIR/aur/jamstream-cli-bin/PKGBUILD" \
-  "$OUT_DIR/aur/jamstream-cli-bin/.SRCINFO"
+  "$OUT_DIR/aur/jamstream-cli-bin/.SRCINFO" \
+  "$OUT_DIR/scoop/bucket/jamstream.json" \
+  "$OUT_DIR/scoop/bucket/jamstream-app.json"

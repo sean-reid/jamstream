@@ -4,15 +4,28 @@
 # false in the two that mattered.
 #
 # Everything here is per-test rather than profile-wide. `test(=name)` is an
-# exact match, so a rename silently drops the override; the two tests
-# `the_measured_tests_are_named_in_the_nextest_config`, one in the harness suite
-# and one in the session suite, pair each name here with the function it names
-# and fail when they come apart.
+# exact match, so a rename silently drops the override; the tests
+# `the_measured_tests_are_named_in_the_nextest_config` in the harness suite, the
+# session suite, and the server's local_provider suite pair each name here with
+# the function it names and fail when they come apart.
 
 # `priority` below needs 0.9.91 or newer. Without this line an older binary
 # refuses the key outright, which is fine, but the message names a toml field
 # rather than a version; with it the error says what to upgrade.
 nextest-version = { required = "0.9.91" }
+
+[test-groups]
+# Everything that spawns target/<profile>/jamstreamd, one at a time, because
+# that path is a file cargo rewrites mid-run. The cli and client local-mode
+# suites run `cargo build -p jamstream-server` at test start (CARGO_BIN_EXE_
+# does not cover another package's binary), and cargo re-uplifts the binary on
+# every invocation, even a fully fresh no-op build; on Windows the uplift is a
+# whole-file copy, not a hardlink. The server suites spawn the same path, and
+# CreateProcess on a half-copied image fails with error 216,
+# ERROR_EXE_MACHINE_TYPE_MISMATCH, which is how #354's windows leg found this.
+# One test at a time means a rewrite can never overlap a spawn. Grouped by
+# binary rather than by test name so a renamed test cannot silently leave.
+jamstreamd-uplift = { max-threads = 1 }
 
 [[profile.default.overrides]]
 # The tests that read a wall clock go last and get the machine to themselves.
@@ -80,6 +93,28 @@ filter = """
     or test(=a_set_avatar_flood_is_not_an_egress_amplifier)
 """
 success-output = "immediate"
+
+[[profile.default.overrides]]
+# One measurement of the machine rather than of the simulation: how long the
+# local provider's launch takes from spawn to ready. READY_TIMEOUT is a fixed
+# 5 s that JAMSTREAM_PERF_BUDGET_SECS does not scale, and #339 suspects it is
+# tightest on windows-latest, where CreateProcess plus Defender's first-run
+# scan of a fresh jamstreamd can cost seconds by itself. Nothing gates on the
+# number; it only has to exist on passing runs so the window can be judged
+# against data. The pairing test sits in the server suite beside the println.
+filter = "test(=launch_join_destroy_end_to_end)"
+success-output = "immediate"
+
+[[profile.default.overrides]]
+# The jamstreamd-uplift group, defined at the top of the file: the server
+# suites that spawn target/<profile>/jamstreamd plus the cli and client suites
+# whose `cargo build` rewrites it.
+filter = """
+    (package(jamstream-server) and (binary(=local_provider) or binary(=shutdown) or binary(=version)))
+    or (package(jamstream-cli) and (binary(=local_host) or binary(=local_record)))
+    or (package(jamstream-client) and binary(=wizard_local))
+"""
+test-group = "jamstreamd-uplift"
 
 [[profile.default.overrides]]
 # The live_runtime suite drives two real client runtimes over loopback UDP

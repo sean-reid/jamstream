@@ -1,6 +1,6 @@
 pkgbase = jamstream-cli-bin
 	pkgdesc = Terminal client for jam sessions hosted in your own cloud account
-	pkgver = 0.1.1beta
+	pkgver = 0.1.6
 	pkgrel = 1
 	url = https://sean-reid.github.io/jamstream
 	arch = x86_64
@@ -12,10 +12,10 @@ pkgbase = jamstream-cli-bin
 	conflicts = jamstream
 	options = !strip
 	options = !debug
-	source = jamstream-cli-0.1.1beta-x86_64.tar.gz::https://github.com/sean-reid/jamstream/releases/download/v0.1.1-beta/jamstream-cli-linux-x86_64.tar.gz
-	source = LICENSE-MIT-0.1.1beta::https://raw.githubusercontent.com/sean-reid/jamstream/v0.1.1-beta/LICENSE-MIT
-	source = LICENSE-APACHE-0.1.1beta::https://raw.githubusercontent.com/sean-reid/jamstream/v0.1.1-beta/LICENSE-APACHE
-	sha256sums = a4c57cea53dbcc6545b103dd615e8c7fe11e3ce9e61a347128d65912c804109d
+	source = jamstream-cli-0.1.6-x86_64.tar.gz::https://github.com/sean-reid/jamstream/releases/download/v0.1.6/jamstream-cli-linux-x86_64.tar.gz
+	source = LICENSE-MIT-0.1.6::https://raw.githubusercontent.com/sean-reid/jamstream/v0.1.6/LICENSE-MIT
+	source = LICENSE-APACHE-0.1.6::https://raw.githubusercontent.com/sean-reid/jamstream/v0.1.6/LICENSE-APACHE
+	sha256sums = a83085a68348986eb3bcf8d68df0f0f4aef13b186064304eebcbc9a140b77acc
 	sha256sums = d12dbc3496ed7b8a8d25f3905a8845362f11b2b3213793a2340a0879700ebb66
 	sha256sums = cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
 
