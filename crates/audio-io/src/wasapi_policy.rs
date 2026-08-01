@@ -91,19 +91,20 @@ pub(crate) enum Fallback {
 
 /// The fallback decision table.
 ///
-/// Everything that describes a *device* condition falls back to shared mode,
-/// because every one of those conditions still leaves a working shared-mode
-/// endpoint: an exclusive holder does not block shared clients, a driver that
-/// refuses our formats still talks to the audio engine, and a disabled
-/// exclusive-mode checkbox is exactly the case the fallback exists for. Only a
-/// malformed request is rejected, since shared mode would reject it too and
-/// the clearer error is the useful one.
+/// A condition falls back to shared mode only when a shared-mode stream can
+/// actually survive it: a driver that refuses our exclusive formats still
+/// talks to the audio engine, and a disabled exclusive-mode checkbox is
+/// exactly the case the fallback exists for. Two conditions reject instead.
+/// A malformed request would be rejected by shared mode too, and the clearer
+/// error is the useful one. A device held exclusively by another application
+/// blocks shared clients as well: `AUDCLNT_E_DEVICE_IN_USE` fails shared-mode
+/// `Initialize` just like exclusive, so falling back only traded the
+/// classifier's words for cpal's generic "temporarily busy" error (#324).
 pub(crate) const fn fallback_decision(failure: ExclusiveFailure) -> Fallback {
     match failure {
-        ExclusiveFailure::InvalidConfig => Fallback::Reject,
+        ExclusiveFailure::InvalidConfig | ExclusiveFailure::DeviceInUse => Fallback::Reject,
         ExclusiveFailure::DeviceNotFound
         | ExclusiveFailure::UnsupportedFormat
-        | ExclusiveFailure::DeviceInUse
         | ExclusiveFailure::ExclusiveNotAllowed
         | ExclusiveFailure::BufferSizeNotAligned
         | ExclusiveFailure::InvalidDevicePeriod
@@ -118,12 +119,13 @@ pub(crate) const fn fallback_decision(failure: ExclusiveFailure) -> Fallback {
 /// failure.
 ///
 /// The client reopens a dead or reconfigured stream on a 500 ms cadence, so
-/// without a cooldown a musician whose interface is owned by a DAW would pay
+/// without a cooldown an endpoint that will never open exclusively would pay
 /// (and log) a doomed exclusive probe twice a second forever. The durations
 /// track how likely the condition is to clear on its own: a settings toggle or
-/// a driver's format list will not change mid-session, another application's
-/// grip might, and an invalidated device means the next open sees different
-/// hardware, so it gets no cooldown at all.
+/// a driver's format list will not change mid-session, a wedged driver might
+/// recover, and an invalidated device means the next open sees different
+/// hardware, so it gets no cooldown at all. Rejected conditions never arm the
+/// gate at all; their entries exist so the table stays total.
 pub(crate) const fn retry_cooldown(failure: ExclusiveFailure) -> Duration {
     match failure {
         // Static properties of the endpoint or its driver.
@@ -131,7 +133,7 @@ pub(crate) const fn retry_cooldown(failure: ExclusiveFailure) -> Duration {
         | ExclusiveFailure::UnsupportedFormat
         | ExclusiveFailure::BufferSizeNotAligned
         | ExclusiveFailure::InvalidDevicePeriod => Duration::from_secs(60),
-        // Might clear when another application lets go.
+        // Might clear when another application lets go or a driver recovers.
         ExclusiveFailure::DeviceInUse
         | ExclusiveFailure::EndpointCreateFailed
         | ExclusiveFailure::ServiceNotRunning
@@ -328,11 +330,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_device_condition_falls_back_to_shared() {
+    fn conditions_a_shared_stream_survives_fall_back_to_shared() {
         for failure in [
             ExclusiveFailure::DeviceNotFound,
             ExclusiveFailure::UnsupportedFormat,
-            ExclusiveFailure::DeviceInUse,
             ExclusiveFailure::ExclusiveNotAllowed,
             ExclusiveFailure::BufferSizeNotAligned,
             ExclusiveFailure::InvalidDevicePeriod,
@@ -349,11 +350,32 @@ mod tests {
         }
     }
 
+    /// Shared mode cannot save either of these: it rejects a malformed request
+    /// too, and `AUDCLNT_E_DEVICE_IN_USE` fails shared-mode `Initialize` while
+    /// another process holds the endpoint exclusively.
     #[test]
-    fn only_a_malformed_request_is_rejected() {
-        assert_eq!(
-            fallback_decision(ExclusiveFailure::InvalidConfig),
-            Fallback::Reject
+    fn conditions_shared_mode_cannot_save_are_rejected() {
+        for failure in [
+            ExclusiveFailure::InvalidConfig,
+            ExclusiveFailure::DeviceInUse,
+        ] {
+            assert_eq!(fallback_decision(failure), Fallback::Reject, "{failure:?}");
+        }
+    }
+
+    /// The whole point of rejecting DeviceInUse: the words the user sees name
+    /// the exclusive holder instead of cpal's generic "temporarily busy",
+    /// which is what falling back used to produce.
+    #[test]
+    fn a_device_held_exclusively_rejects_with_the_classifier_words() {
+        let message = open_error(
+            ExclusiveFailure::DeviceInUse,
+            "IAudioClient::Initialize: 0x8889000A",
+        )
+        .to_string();
+        assert!(
+            message.contains("device held exclusively by another application"),
+            "{message}"
         );
     }
 
