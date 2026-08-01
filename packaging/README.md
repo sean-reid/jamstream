@@ -1,11 +1,11 @@
 # Packaging
 
-Package-manager manifests for the three channels JamStream targets. This
+Package-manager manifests for the four channels JamStream targets. This
 page is the only hand-maintained file in this directory; every manifest
 below it is generated and must not be edited by hand:
 
 ```console
-$ scripts/render-packaging.sh v0.1.1-beta
+$ scripts/render-packaging.sh v0.1.6
 ```
 
 The script downloads that release's `SHA256SUMS` and writes every hash from
@@ -13,7 +13,9 @@ it, so a manifest can never carry a checksum nobody verified. The only
 hashes not taken from `SHA256SUMS` are the two license texts, which are
 repository files rather than release assets and are fetched from
 raw.githubusercontent at the tag. Rerunning the script for the same tag
-rewrites the same bytes.
+rewrites the same bytes, and `--check` renders into a temp dir and
+compares instead of writing, exiting nonzero and naming every committed
+file that has drifted from the tag it is given.
 
 `release.yml`'s `packaging` job runs the same script for the tag it is
 building and attaches the result to the release as
@@ -28,20 +30,19 @@ track the most recent release.
 | `winget/manifests/s/SeanReid/JamStream/<version>/` | desktop app | `microsoft/winget-pkgs` |
 | `aur/jamstream-bin/` | desktop app | `ssh://aur@aur.archlinux.org/jamstream-bin.git` |
 | `aur/jamstream-cli-bin/` | CLI | `ssh://aur@aur.archlinux.org/jamstream-cli-bin.git` |
+| `scoop/bucket/` | CLI and desktop app | `sean-reid/scoop-jamstream` |
 
-None of the three channels is live yet. What each one needs:
+Homebrew and Scoop are live; winget and AUR are not. What each channel
+needs or has:
 
 ## Homebrew
 
-Create `sean-reid/homebrew-jamstream` as a public repository (the
-`homebrew-` prefix is what makes `brew tap sean-reid/jamstream` work), then
-add a `HOMEBREW_TAP_TOKEN` secret to this repository holding a personal
-access token with `contents: write` on the tap. The next release pushes
-`Casks/jamstream.rb` and `Formula/jamstream-cli.rb` into it automatically;
-without the secret the release still succeeds and the job warns.
-
-The first push can also be done by hand: copy `homebrew/Casks` and
-`homebrew/Formula` into the tap and commit.
+Live: `sean-reid/homebrew-jamstream` is the tap (the `homebrew-` prefix is
+what makes `brew tap sean-reid/jamstream` work), and every release pushes
+`Casks/jamstream.rb` and `Formula/jamstream-cli.rb` into it using the
+`HOMEBREW_TAP_TOKEN` secret, a personal access token with
+`contents: write` on the tap. Without the secret the release still
+succeeds and the job warns.
 
 Naming: the cask holds the plain `jamstream` token because it installs
 `JamStream.app`, and the CLI formula takes `-cli`. Homebrew cannot resolve
@@ -64,7 +65,8 @@ the trust anchor the missing Authenticode signature would otherwise be.
 Because the artifact is a plain zip with no installer, the package uses
 `InstallerType: zip` with `NestedInstallerType: portable`, which extracts
 the archive and puts `jamstream-app` and `jamstreamd` on PATH as command
-aliases. There is no Start Menu entry until a real installer exists.
+aliases. There is no Start Menu entry until a real installer exists;
+Scoop, which can declare one for a plain zip, does.
 
 ## AUR
 
@@ -75,7 +77,7 @@ naming requires. Publishing each one is a git push:
 ```console
 $ git clone ssh://aur@aur.archlinux.org/jamstream-bin.git
 $ cp packaging/aur/jamstream-bin/PKGBUILD packaging/aur/jamstream-bin/.SRCINFO jamstream-bin/
-$ cd jamstream-bin && git add -A && git commit -m 'jamstream-bin 0.1.1beta-1' && git push
+$ cd jamstream-bin && git add -A && git commit -m 'jamstream-bin 0.1.6-1' && git push
 ```
 
 An AUR account with an SSH key is the only prerequisite. Run
@@ -98,3 +100,25 @@ window-system libraries at runtime (`libwayland-client.so.0`,
 `libEGL.so.1`), which no linker check can see and the app cannot open a
 window without, so they are hard `depends` too. The CLI links glibc, libm,
 and libgcc only.
+
+## Scoop
+
+Live: `sean-reid/scoop-jamstream` is the bucket, a plain git repository
+holding `scoop/bucket/` verbatim, the same shape as the tap.
+
+```console
+$ scoop bucket add jamstream https://github.com/sean-reid/scoop-jamstream
+$ scoop install jamstream
+```
+
+`jamstream` installs the CLI; `jamstream-app` installs the desktop app and
+`jamstreamd` with a Start Menu shortcut, whose icon is the `jamstream.ico`
+the app zip carries. The plain name goes to the CLI here, the reverse of
+the Homebrew split, because Scoop's audience lives in the terminal.
+
+Publishing a release is a copy of `scoop/bucket/` into the bucket and a
+push. Each manifest also carries `checkver` and `autoupdate` against
+GitHub releases, so Scoop's own checkver tooling can bump the bucket from
+a new tag without touching this repository. The zip is unsigned like the
+winget one, and the manifest hash from `SHA256SUMS` is the same trust
+anchor.
