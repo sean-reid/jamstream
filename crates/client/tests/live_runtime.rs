@@ -675,6 +675,81 @@ fn the_host_pressing_record_lands_a_take_and_lights_the_lamp() {
     let _ = std::fs::remove_dir_all(&takes);
 }
 
+/// Longest run of consecutive exact-zero samples. Underrun padding writes
+/// literal 0.0 into the device buffer; decoded audio of a running sine does
+/// not produce long runs of exact zeros.
+fn longest_zero_run(samples: &[f32]) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for &s in samples {
+        run = if s == 0.0 { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
+}
+
+/// WASAPI shared mode, end to end: the settings ask for 120-frame buffers,
+/// both devices ignore that and call back at a 480-frame period, and the
+/// audio still crosses intact. Before #323 the ring was sized from the
+/// request alone, so every render callback padded roughly half its period
+/// with silence and every capture callback dropped its tail; the padding
+/// would show here as long runs of exact zeros in the steady-state tail of
+/// B's capture file.
+#[test]
+fn a_device_period_larger_than_the_request_still_carries_audio() {
+    let server = TestServer::start();
+    let sine = sine_fixture("period", 440.0);
+    let out_b = temp_path("period", "out-b.wav");
+
+    let a = LiveRuntime::join_offline(
+        &server.invite(1, "a"),
+        settings(),
+        WavBackend::new(Some(sine.clone()), None).with_device_period(480),
+    )
+    .expect("join a");
+    let b = LiveRuntime::join_offline(
+        &server.invite(2, "b"),
+        settings(),
+        WavBackend::new(None, Some(out_b.clone())).with_device_period(480),
+    )
+    .expect("join b");
+
+    wait_for(&a, "a joined", Duration::from_secs(10), joined);
+    wait_for(&b, "b sees both members", Duration::from_secs(10), |s| {
+        joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+    });
+
+    std::thread::sleep(Duration::from_millis(2_500));
+    b.send(Command::Leave);
+    wait_for(&b, "b idle", Duration::from_secs(3), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(b);
+    drop(a);
+
+    let samples = wav_samples(&out_b);
+    let take = ((1.0 * f64::from(RATE)) as usize * 2).min(samples.len());
+    let tail = &samples[samples.len() - take..];
+    // A's sine arrived at all (capture side made it through the ring)...
+    let energy = rms(tail);
+    assert!(
+        energy > 0.02,
+        "b heard near-silence (rms {energy}); a's audio never arrived"
+    );
+    // ...and B's render never went hungry: an undersized ring pads ~480
+    // zeros per callback, so anything close to that run length is padding,
+    // not music.
+    let run = longest_zero_run(tail);
+    assert!(
+        run < 240,
+        "steady-state playout contains a {run}-sample silence run; the ring underran"
+    );
+
+    for p in [&sine, &out_b] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// A device unplugged mid-session: the stream is closed, the room is told, and
 /// the runtime reopens on the system default without losing the session.
 ///
