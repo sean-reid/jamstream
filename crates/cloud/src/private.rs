@@ -59,13 +59,36 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         // lands under the name after a crash be what we wrote.
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path)
+        rename_with_retry(&tmp, path)
     };
     let result = write();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Renames `from` over `to`, retrying a few times before giving up.
+///
+/// On Windows a freshly written file is routinely still open in an antivirus
+/// or indexing scan, and the rename fails with a sharing violation that
+/// clears within milliseconds; losing a session state file over one after
+/// the VM is already launched and billing is not an answer. A rename that
+/// keeps failing still fails, with the last error. On unix the first try is
+/// the only one that ever runs.
+pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    const TRIES: u32 = 5;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(_) if attempt < TRIES => {
+                attempt += 1;
+                std::thread::sleep(PAUSE);
+            }
+            result => return result,
+        }
+    }
 }
 
 /// A name in the target's own directory, so the rename stays on one
@@ -309,6 +332,25 @@ mod tests {
             .filter(|name| name != "config")
             .collect();
         assert!(strays.is_empty(), "temporaries left behind: {strays:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The retry exists for Windows sharing violations, which no test can
+    /// stage deterministically; what is checkable everywhere is that a clean
+    /// rename moves the bytes and a rename that cannot ever work still fails
+    /// with the real error instead of hanging or lying.
+    #[test]
+    fn a_retried_rename_moves_the_file_and_still_reports_a_real_failure() {
+        let root = temp_dir("rename");
+        let from = root.join("from");
+        let to = root.join("to");
+        std::fs::write(&from, b"payload").unwrap();
+        rename_with_retry(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+        assert!(!from.exists());
+
+        let err = rename_with_retry(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
         let _ = std::fs::remove_dir_all(&root);
     }
 

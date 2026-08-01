@@ -183,9 +183,10 @@ fn resolve_data_dir(platform: Option<PathBuf>) -> Result<PathBuf, CliError> {
     platform.map(|dir| dir.join("jamstream")).ok_or_else(|| {
         CliError::Usage(format!(
             "no private directory to keep session keys in: this environment has no \
-             platform data directory (on unix that means HOME is unset or not absolute, \
-             which is common under systemd, cron, and some sudo configurations). \
-             Set HOME, or set {STATE_DIR_ENV} to a directory only you can write."
+             platform data directory. Set {STATE_DIR_ENV} to a directory only you \
+             can write; on unix the usual cause is HOME being unset or not absolute \
+             (common under systemd, cron, and some sudo configurations), so setting \
+             HOME also works there."
         ))
     })
 }
@@ -365,6 +366,14 @@ mod tests {
     fn no_data_directory_is_an_error_not_a_detour_through_tmp() {
         let err = resolve_data_dir(None).unwrap_err().to_string();
         assert!(err.contains(STATE_DIR_ENV), "error was: {err}");
+        // The remedy that works on every platform leads; HOME is scoped to
+        // unix, because on Windows the failed lookup was %LOCALAPPDATA% and
+        // "Set HOME" fixes nothing.
+        assert!(
+            err.find(STATE_DIR_ENV) < err.find("HOME"),
+            "error was: {err}"
+        );
+        assert!(err.contains("on unix"), "error was: {err}");
         let tmp = std::env::temp_dir();
         assert!(
             !err.contains(&tmp.display().to_string()),

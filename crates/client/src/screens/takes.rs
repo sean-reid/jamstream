@@ -914,10 +914,25 @@ fn read_sessions() -> Result<Vec<(SessionState, Option<RecordingRecord>)>, Strin
 /// Each session gets its own folder under it, because two sessions can record
 /// takes a minute apart and the recorder names by clock time.
 pub fn downloads_dir() -> PathBuf {
-    dirs::audio_dir()
-        .or_else(dirs::download_dir)
-        .or_else(dirs::home_dir)
-        .map(|dir| dir.join("JamStream"))
+    resolve_downloads_dir(
+        dirs::audio_dir()
+            .or_else(dirs::download_dir)
+            .or_else(dirs::home_dir)
+            // The CLI's state dir refuses outright with no platform
+            // directory, because it holds keys. This is where downloads land
+            // and what the reveal button opens, so refusal would kill the
+            // feature; the current directory keeps the path absolute, where
+            // the bare name resolved against whatever the process started in
+            // (System32, from the Windows Start menu).
+            .or_else(|| std::env::current_dir().ok()),
+    )
+}
+
+/// The chosen base with our folder inside it; no base at all leaves the bare
+/// relative name, the honest floor when even the current directory is
+/// unknowable.
+fn resolve_downloads_dir(base: Option<PathBuf>) -> PathBuf {
+    base.map(|dir| dir.join("JamStream"))
         .unwrap_or_else(|| PathBuf::from("JamStream"))
 }
 
@@ -1552,5 +1567,25 @@ mod tests {
             16_000_000,
             "the second take continues the total rather than restarting it"
         );
+    }
+
+    /// The folder is ours by name wherever it lands, and a machine that can
+    /// name any directory at all gets an absolute path: a relative one
+    /// resolves against whatever the process started in, which for a Start
+    /// menu launch on Windows is System32, and both the reveal button and
+    /// the "landed in" line would point there.
+    #[test]
+    fn the_downloads_dir_is_absolute_whenever_any_base_exists() {
+        let base = std::env::temp_dir();
+        assert_eq!(
+            resolve_downloads_dir(Some(base.clone())),
+            base.join("JamStream")
+        );
+        assert_eq!(resolve_downloads_dir(None), PathBuf::from("JamStream"));
+        // The live chain ends at current_dir, so on any machine where this
+        // test can run the real answer is absolute.
+        let dir = downloads_dir();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(dir.ends_with("JamStream"), "{}", dir.display());
     }
 }

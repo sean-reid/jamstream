@@ -87,8 +87,14 @@ impl RecordingObject for DiskObject {
     }
 
     fn finish(self: Box<Self>) -> io::Result<()> {
-        self.file.sync_all()?;
-        std::fs::rename(&self.part, &self.done)
+        let DiskObject { file, part, done } = *self;
+        file.sync_all()?;
+        // Closed before the rename, and the rename retried: on Windows our
+        // own open handle and an antivirus scan of the fresh .part file each
+        // fail the rename with a sharing violation, and either one reported
+        // a finished take as failed.
+        drop(file);
+        jamstream_cloud::private::rename_with_retry(&part, &done)
     }
 
     fn abort(self: Box<Self>) -> io::Result<()> {
@@ -1090,6 +1096,28 @@ mod tests {
         );
         drop(release); // Un-wedge so the worker can finish and join.
         worker.stop();
+    }
+
+    /// The disk contract in one object: finish closes the handle and renames
+    /// the .part into place, so the done name holds the exact bytes and
+    /// nothing that looks like a recording is left half-made. Closing before
+    /// the rename is unobservable on unix, so the behavior is what is pinned.
+    #[test]
+    fn a_disk_object_finishes_by_renaming_its_part_file_into_place() {
+        let dir =
+            std::env::temp_dir().join(format!("jamstream-record-finish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DiskSink::new(&dir);
+        let mut object = sink.open("take.flac").unwrap();
+        object.write(b"flac bytes").unwrap();
+        assert!(dir.join("take.flac.part").exists());
+        object.finish().unwrap();
+        assert_eq!(std::fs::read(dir.join("take.flac")).unwrap(), b"flac bytes");
+        assert!(
+            !dir.join("take.flac.part").exists(),
+            "the part file must not survive finish"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

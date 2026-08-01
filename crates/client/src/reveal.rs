@@ -43,11 +43,24 @@ fn reveal(path: &Path) -> Result<(), String> {
     run(Command::new("open").arg("-R").arg(path))
 }
 
+/// Spawned rather than waited on: explorer exits 1 even when the window opens
+/// with the file selected, so its exit code carries no verdict and judging it
+/// through [`run`] called every success a failure. What can still fail is
+/// starting it at all, and that is the one error worth reporting.
 #[cfg(target_os = "windows")]
 fn reveal(path: &Path) -> Result<(), String> {
-    // No space after the comma: explorer takes the rest of the argument as the
-    // path, and a space makes it open Documents instead.
-    run(Command::new("explorer").arg(format!("/select,{}", path.display())))
+    Command::new("explorer")
+        .arg(select_argument(path))
+        .spawn()
+        .map(drop)
+        .map_err(|err| format!("explorer could not be started: {err}"))
+}
+
+/// No space after the comma: explorer takes the rest of the argument as the
+/// path, and a space makes it open Documents instead.
+#[cfg(any(target_os = "windows", test))]
+fn select_argument(path: &Path) -> String {
+    format!("/select,{}", path.display())
 }
 
 /// GNOME Files and Dolphin both implement the freedesktop file manager
@@ -84,7 +97,9 @@ fn reveal(path: &Path) -> Result<(), String> {
 
 /// Runs the command and reports what the platform said. Waits for it: a file
 /// manager that refuses does so immediately, and a caller that showed nothing
-/// would be the dead button this module exists to avoid.
+/// would be the dead button this module exists to avoid. Windows opts out
+/// above because explorer's exit code says nothing.
+#[cfg(not(target_os = "windows"))]
 fn run(command: &mut Command) -> Result<(), String> {
     let name = command.get_program().to_string_lossy().into_owned();
     let output = command
@@ -111,6 +126,20 @@ mod tests {
         assert!(
             ["Reveal in Finder", "Show in File Explorer", "Show in Files"].contains(&LABEL),
             "{LABEL}"
+        );
+    }
+
+    /// The comma binds the path to /select: `explorer /select, C:\x` with a
+    /// space opens Documents instead of revealing anything, which the comment
+    /// on [`select_argument`] warns about and this pins.
+    #[test]
+    fn the_explorer_select_switch_takes_the_path_with_no_space_between() {
+        let arg = select_argument(Path::new("takes/jamstream-mix.flac"));
+        assert!(arg.starts_with("/select,"), "{arg}");
+        assert!(!arg.contains("/select, "), "{arg}");
+        assert_eq!(
+            arg.strip_prefix("/select,"),
+            Some("takes/jamstream-mix.flac")
         );
     }
 

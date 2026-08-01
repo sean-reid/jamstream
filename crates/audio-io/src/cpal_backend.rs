@@ -301,9 +301,13 @@ fn config_at_rate(
 /// Linux hosts fail for opposite reasons.
 fn rate_remedy(host: &str, rate: u32) -> String {
     match host {
+        // mmsys.cpl by name, because Windows 11's Settings app no longer has
+        // Recording and Playback tabs to walk to; the applet is the one entry
+        // point that exists on every Windows this can run on.
         "WASAPI" => format!(
-            "set that device to {rate} Hz in Sound, Recording or Playback, the \
-             device's Properties, Advanced, Default Format"
+            "set that device to {rate} Hz: run mmsys.cpl (Settings > System > \
+             Sound > More sound settings), Recording or Playback, the device's \
+             Properties, Advanced, Default Format"
         ),
         "CoreAudio" => format!(
             "check Audio MIDI Setup, Format, for a {rate} Hz entry on that \
@@ -349,8 +353,10 @@ impl RateContext<'_> {
             Direction::Playback => "playback",
         };
         let rate = self.rate;
+        // detail(), not Display: this string becomes another Unsupported,
+        // whose Display supplies the one prefix the sentence gets.
         let detail = match refusal {
-            Some(err) => format!(" ({err})"),
+            Some(err) => format!(" ({})", err.detail()),
             None => String::new(),
         };
         AudioError::Unsupported(format!(
@@ -630,19 +636,26 @@ mod tests {
     }
 
     /// An attempt that the host then refuses has to read as a rate refusal,
-    /// not as whatever the host called it.
+    /// not as whatever the host called it. The composed message carries the
+    /// inner error's text without its variant prefix, so the sentence a
+    /// musician reads says "unsupported audio configuration:" exactly once.
     #[test]
     fn a_refused_attempt_names_the_rates_and_carries_the_host_error() {
         let native = native(44_100, 2);
         let refusal = AudioError::Unsupported("ASBD not supported".into());
-        let AudioError::Unsupported(msg) =
-            ctx("CoreAudio").refused(Direction::Capture, &native, Some(&refusal))
-        else {
+        let err = ctx("CoreAudio").refused(Direction::Capture, &native, Some(&refusal));
+        let full = err.to_string();
+        assert_eq!(
+            full.matches("unsupported audio configuration:").count(),
+            1,
+            "{full}"
+        );
+        let AudioError::Unsupported(msg) = err else {
             panic!("expected Unsupported");
         };
         assert!(msg.starts_with("capture device runs at 44100 Hz"), "{msg}");
         assert!(msg.contains("48000 Hz"), "{msg}");
-        assert!(msg.contains("ASBD not supported"), "{msg}");
+        assert!(msg.contains("(ASBD not supported)"), "{msg}");
         assert!(msg.contains("Audio MIDI Setup"), "{msg}");
     }
 
@@ -652,6 +665,10 @@ mod tests {
     #[test]
     fn each_host_gets_a_remedy_that_is_true_for_it() {
         let windows = rate_remedy("WASAPI", 48_000);
+        // mmsys.cpl is the load-bearing part: Windows 11's Settings app has
+        // no Recording or Playback tab to send anyone to.
+        assert!(windows.contains("mmsys.cpl"), "{windows}");
+        assert!(windows.contains("More sound settings"), "{windows}");
         assert!(windows.contains("Advanced, Default Format"), "{windows}");
 
         let macos = rate_remedy("CoreAudio", 48_000);

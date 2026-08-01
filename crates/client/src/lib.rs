@@ -9,6 +9,7 @@ pub mod creds;
 pub mod demo;
 pub mod exec;
 pub mod live;
+pub mod logging;
 pub mod picker;
 pub mod prefs;
 pub mod reveal;
