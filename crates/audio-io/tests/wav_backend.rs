@@ -241,6 +241,26 @@ fn a_device_at_44_1_refuses_a_48_khz_session() {
     assert!(msg.contains("44100") && msg.contains("48000"), "{msg}");
 }
 
+/// The offline backend reports a form factor like the real hosts do: Unknown
+/// by default, which is what a host that cannot decode one reports, and the
+/// configured shape on both endpoints when a test models a Bluetooth headset.
+#[test]
+fn devices_carry_the_modelled_form_factor() {
+    use jamstream_audio_io::{AudioBackend, FormFactor};
+
+    let plain = WavBackend::new(None, None);
+    for device in plain.devices().unwrap() {
+        assert_eq!(device.form_factor, FormFactor::Unknown, "{}", device.id);
+    }
+
+    let headset = WavBackend::new(None, None).with_form_factor(FormFactor::Bluetooth);
+    let devices = headset.devices().unwrap();
+    assert_eq!(devices.len(), 2);
+    for device in devices {
+        assert_eq!(device.form_factor, FormFactor::Bluetooth, "{}", device.id);
+    }
+}
+
 #[test]
 fn a_device_at_44_1_opens_at_its_own_rate() {
     let backend = WavBackend::new(None, None).with_device_rate(44_100);

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::types::{
-    AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, Result, StreamConfig,
-    StreamHandle,
+    AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
+    StreamConfig, StreamHandle,
 };
 
 const WAV_CAPTURE_ID: &str = "wav-capture";
@@ -28,6 +28,7 @@ pub struct WavBackend {
     capture_output: Option<PathBuf>,
     device_rate: u32,
     device_period: Option<u32>,
+    form_factor: FormFactor,
     lose_device_after: Option<u64>,
     /// The rate every open after the first one runs at, when it differs.
     /// Shared, so the count survives the clone a caller keeps.
@@ -45,6 +46,7 @@ impl WavBackend {
             capture_output,
             device_rate: 48_000,
             device_period: None,
+            form_factor: FormFactor::Unknown,
             lose_device_after: None,
             reopen_rate: None,
             opened: Arc::new(AtomicBool::new(false)),
@@ -68,6 +70,17 @@ impl WavBackend {
     #[must_use]
     pub fn with_device_period(mut self, frames: u32) -> Self {
         self.device_period = Some(frames);
+        self
+    }
+
+    /// Models the form factor the host would report for both endpoints, the
+    /// way pairing one Bluetooth headset yields a capture and a playback
+    /// device with the same shape. The default is `Unknown`, which is also
+    /// what a real host reports when it cannot decode one, so callers must
+    /// treat `Unknown` as "no information", never as "not Bluetooth".
+    #[must_use]
+    pub fn with_form_factor(mut self, form_factor: FormFactor) -> Self {
+        self.form_factor = form_factor;
         self
     }
 
@@ -153,6 +166,7 @@ impl AudioBackend for WavBackend {
                 name: "WAV file capture".into(),
                 is_default: true,
                 direction: Direction::Capture,
+                form_factor: self.form_factor,
                 min_buffer_frames: None,
                 max_buffer_frames: None,
             },
@@ -161,6 +175,7 @@ impl AudioBackend for WavBackend {
                 name: "WAV file playback".into(),
                 is_default: true,
                 direction: Direction::Playback,
+                form_factor: self.form_factor,
                 min_buffer_frames: None,
                 max_buffer_frames: None,
             },

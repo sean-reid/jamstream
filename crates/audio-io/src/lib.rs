@@ -32,8 +32,8 @@ mod wasapi_backend;
 pub use bridge::{CallbackBridge, DeviceSide, EngineSide};
 pub use mode::{DeviceMode, active_device_mode};
 pub use types::{
-    AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, Result, StreamConfig,
-    StreamHandle,
+    AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
+    StreamConfig, StreamHandle,
 };
 pub use wav::{WavBackend, WavStream};
 

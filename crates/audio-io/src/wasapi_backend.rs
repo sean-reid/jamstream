@@ -61,8 +61,8 @@ use crate::cpal_backend::CpalBackend;
 use crate::format::{self, FormatSpec, SampleFormat, StageLayout};
 use crate::mode::{DeviceMode, set_active_device_mode};
 use crate::types::{
-    AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, Result, StreamConfig,
-    StreamHandle,
+    AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
+    StreamConfig, StreamHandle,
 };
 use crate::wasapi_policy::{
     self as policy, EVENT_WAIT_MS, ExclusiveFailure, Fallback, MAX_CONSECUTIVE_TIMEOUTS, RetryGate,
@@ -181,9 +181,27 @@ impl AudioBackend for WindowsBackend {
     /// Falls back to cpal's enumeration if the WASAPI enumeration itself
     /// fails, so a broken exclusive path never costs the user their device
     /// list.
+    ///
+    /// Form factors come from cpal's enumeration of the same endpoints: the
+    /// `wasapi` crate exposes no property-store access, cpal's WASAPI host
+    /// already decodes `PKEY_AudioEndpoint_FormFactor` and the Bluetooth
+    /// enumerator, and the ids are the same `IMMDevice::GetId` strings on
+    /// both paths, so the decode is borrowed rather than duplicated.
     fn devices(&self) -> Result<Vec<DeviceInfo>> {
         match self.exclusive.devices() {
-            Ok(devices) => Ok(devices),
+            Ok(mut devices) => {
+                if let Ok(shared) = self.shared.devices() {
+                    for device in &mut devices {
+                        if let Some(described) = shared
+                            .iter()
+                            .find(|s| s.id == device.id && s.direction == device.direction)
+                        {
+                            device.form_factor = described.form_factor;
+                        }
+                    }
+                }
+                Ok(devices)
+            }
             Err(err) => {
                 tracing::warn!(%err, "wasapi enumeration failed, using cpal's");
                 self.shared.devices()
@@ -1128,6 +1146,10 @@ fn enumerate() -> Result<Vec<DeviceInfo>> {
                 id,
                 name,
                 direction,
+                // The wasapi crate exposes no property-store access;
+                // WindowsBackend::devices overlays the form factor from
+                // cpal's enumeration of the same endpoints.
+                form_factor: FormFactor::Unknown,
                 min_buffer_frames,
                 max_buffer_frames,
             });

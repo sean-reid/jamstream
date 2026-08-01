@@ -8,6 +8,31 @@ pub enum Direction {
     Playback,
 }
 
+/// Physical shape of an endpoint, as far as the host reports one.
+///
+/// Windows exposes it as `PKEY_AudioEndpoint_FormFactor` plus the device
+/// enumerator (Bluetooth endpoints arrive through BTHENUM), PipeWire through
+/// device properties; CoreAudio reports nothing, so macOS devices are
+/// [`Unknown`](Self::Unknown). `Bluetooth` wins over the device kind because
+/// the connection, not the shape, is what decides whether a capture endpoint
+/// can run at 48 kHz. Consumed next by the client's device picker, so a
+/// musician can see which microphone is the Bluetooth one before it refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FormFactor {
+    Speakers,
+    Headphones,
+    /// Earphones with an attached microphone: on Windows this is what a
+    /// Bluetooth hands-free endpoint usually reports.
+    Headset,
+    Microphone,
+    LineLevel,
+    /// Any endpoint on a Bluetooth transport, whatever its shape.
+    Bluetooth,
+    /// Digital display audio: HDMI or DisplayPort.
+    Hdmi,
+    Unknown,
+}
+
 /// A single device endpoint as reported by a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -17,6 +42,8 @@ pub struct DeviceInfo {
     pub name: String,
     pub is_default: bool,
     pub direction: Direction,
+    /// What the endpoint physically is, where the host says.
+    pub form_factor: FormFactor,
     /// Supported buffer size bounds in frames, when the backend can report them.
     pub min_buffer_frames: Option<u32>,
     pub max_buffer_frames: Option<u32>,
