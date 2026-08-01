@@ -11,8 +11,14 @@ use jamstream_cli::storage::EnvStores;
 use jamstream_cli::{CliError, end, host, join, providers, recordings, status, sweep};
 
 fn main() -> ExitCode {
+    // Warnings by default: with RUST_LOG unset, from_default_env dropped
+    // every warn!, including the security-relevant Windows degradations
+    // (icacls failed, directory ACL left inherited). RUST_LOG still wins.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .with_writer(std::io::stderr)
         .init();
 
