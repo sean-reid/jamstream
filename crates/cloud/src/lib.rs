@@ -69,7 +69,7 @@ pub use solver::{MemberId, ProbeMatrix, RegionScore, rank};
 pub use storage::GcsStore;
 pub use storage::{
     BytesSource, ChunkSink, FLAC_CONTENT_TYPE, JSON_CONTENT_TYPE, ObjectMeta, ObjectSink,
-    ObjectStore, PartSource, ReadSource, S3Store, session_prefix,
+    ObjectStore, PartSource, ReadSource, S3Store, session_prefix, windows_hazard,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use storage::{MockStore, assert_object_store_contract};
