@@ -14,6 +14,19 @@
 # rather than a version; with it the error says what to upgrade.
 nextest-version = { required = "0.9.91" }
 
+[test-groups]
+# Everything that spawns target/<profile>/jamstreamd, one at a time, because
+# that path is a file cargo rewrites mid-run. The cli and client local-mode
+# suites run `cargo build -p jamstream-server` at test start (CARGO_BIN_EXE_
+# does not cover another package's binary), and cargo re-uplifts the binary on
+# every invocation, even a fully fresh no-op build; on Windows the uplift is a
+# whole-file copy, not a hardlink. The server suites spawn the same path, and
+# CreateProcess on a half-copied image fails with error 216,
+# ERROR_EXE_MACHINE_TYPE_MISMATCH, which is how #354's windows leg found this.
+# One test at a time means a rewrite can never overlap a spawn. Grouped by
+# binary rather than by test name so a renamed test cannot silently leave.
+jamstreamd-uplift = { max-threads = 1 }
+
 [[profile.default.overrides]]
 # The tests that read a wall clock go last and get the machine to themselves.
 #
@@ -91,6 +104,17 @@ success-output = "immediate"
 # against data. The pairing test sits in the server suite beside the println.
 filter = "test(=launch_join_destroy_end_to_end)"
 success-output = "immediate"
+
+[[profile.default.overrides]]
+# The jamstreamd-uplift group, defined at the top of the file: the server
+# suites that spawn target/<profile>/jamstreamd plus the cli and client suites
+# whose `cargo build` rewrites it.
+filter = """
+    (package(jamstream-server) and (binary(=local_provider) or binary(=shutdown) or binary(=version)))
+    or (package(jamstream-cli) and (binary(=local_host) or binary(=local_record)))
+    or (package(jamstream-client) and binary(=wizard_local))
+"""
+test-group = "jamstreamd-uplift"
 
 [[profile.default.overrides]]
 # The live_runtime suite drives two real client runtimes over loopback UDP
