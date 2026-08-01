@@ -59,7 +59,7 @@ use windows::core::w;
 
 use crate::cpal_backend::CpalBackend;
 use crate::format::{self, FormatSpec, SampleFormat, StageLayout};
-use crate::mode::{DeviceMode, set_active_device_mode};
+use crate::mode::{DeviceMode, set_active_device_mode, set_render_conversion};
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
     StreamConfig, StreamHandle,
@@ -234,6 +234,9 @@ impl AudioBackend for WindowsBackend {
             Ok(stream) => {
                 self.clear_cooldown();
                 set_active_device_mode(DeviceMode::Exclusive);
+                // Exclusive mode negotiated the wire format with the driver
+                // itself; there is no audio engine in between to convert.
+                set_render_conversion(false);
                 tracing::info!(
                     latency_frames = ?stream.latency_frames(),
                     "wasapi exclusive mode active"

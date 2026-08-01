@@ -273,6 +273,17 @@ fn a_device_at_44_1_opens_at_its_own_rate() {
     assert!(!stream.errored());
 }
 
+/// Every open publishes the render-conversion report the way a real backend
+/// does, and this backend never converts: a mismatched rate is refused, so an
+/// open stream is running at the device rate. Safe alongside parallel tests
+/// because every wav open publishes the same value.
+#[test]
+fn an_open_reports_that_nothing_is_converting() {
+    let backend = WavBackend::new(None, None);
+    let _stream = backend.open_offline(config(2), passthrough()).unwrap();
+    assert_eq!(jamstream_audio_io::active_render_conversion(), Some(false));
+}
+
 /// Device loss is observable offline, so the caller's device-gone path is no
 /// longer reachable only from real hardware.
 #[test]

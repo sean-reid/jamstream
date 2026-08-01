@@ -26,6 +26,7 @@ jamstream-protocol.workspace = true
 # backend() in lib.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal.workspace = true
+tracing.workspace = true
 
 # wasapi: HEnquist's IAudioClient wrapper, the CamillaDSP precedent, used for
 # exclusive-mode streams. windows: MMCSS thread promotion and the AUDCLNT
@@ -46,3 +47,4 @@ windows = { version = "0.62", features = [
 # leaking into non-Linux builds.
 [target.'cfg(target_os = "linux")'.dependencies]
 cpal = { workspace = true, features = ["pipewire", "realtime-dbus"] }
+tracing.workspace = true

@@ -6,7 +6,10 @@
 //! Every stream runs at the session rate or not at all, because jamstream
 //! never resamples. Which of those two happens is decided in one place,
 //! [`plan_open`], and it turns on whether the host reports a stream it could
-//! not open at the rate asked for: see [`verifies_negotiated_rate`].
+//! not open at the rate asked for: see [`verifies_negotiated_rate`]. The OS
+//! itself may still resample on the render side (WASAPI's AUTOCONVERTPCM,
+//! PipeWire's graph); [`render_conversion`] detects that and every open
+//! discloses it through [`crate::active_render_conversion`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::format::map_frames;
+use crate::mode::set_render_conversion;
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
     StreamConfig, StreamHandle,
@@ -188,6 +192,25 @@ impl AudioBackend for CpalBackend {
         input.play().map_err(|e| map_err(&e))?;
         output.play().map_err(|e| map_err(&e))?;
 
+        // Render-side conversion disclosure: once per open, plus the report
+        // the UI polls. The device's default config is its engine rate (the
+        // WASAPI mix format, the PipeWire graph rate), which is what an OS
+        // converter would be bridging to.
+        if let Some(converting) =
+            render_conversion(rates.host, out_native.sample_rate(), config.sample_rate)
+        {
+            set_render_conversion(converting);
+            if converting {
+                tracing::warn!(
+                    device_rate = out_native.sample_rate(),
+                    stream_rate = config.sample_rate,
+                    host = rates.host,
+                    "the OS is resampling the render stream to the playback \
+                     device's rate, adding latency the buffer sizes do not show"
+                );
+            }
+        }
+
         // Negotiated callback sizes, per host: the WASAPI shared-mode device
         // period, the ALSA period, CoreAudio's device frame size, PipeWire's
         // last quantum (the request until the first callback lands). Their sum
@@ -286,6 +309,33 @@ const fn rate_policy(host: &str) -> Option<bool> {
 
 fn verifies_negotiated_rate(host: &str) -> bool {
     rate_policy(host).unwrap_or(false)
+}
+
+/// Whether a render stream that opened at `stream_rate` is being resampled by
+/// the OS, given that the device's own engine runs at `device_rate`.
+///
+/// Acceptable by design since the #347 decision, but it must be disclosed:
+/// the conversion adds latency the buffer arithmetic never sees. Per host,
+/// because the same rate mismatch means different things:
+///
+/// - WASAPI opens output with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`, so the
+///   engine keeps its mix rate and converts our stream into it.
+/// - PipeWire keeps its graph rate and converts client streams the same way.
+/// - CoreAudio sets the device's nominal rate to the stream's, so a stream
+///   that opened is really running at its rate; a device that could not
+///   reclock was refused up front.
+/// - ALSA converts nothing: a stream that opened at the session rate is
+///   running at it.
+///
+/// `None` for a host the table does not know, which is also what the report
+/// shows: an unknown host earns no claim either way.
+const fn render_conversion(host: &str, device_rate: u32, stream_rate: u32) -> Option<bool> {
+    // `const fn` cannot match on &str, so this is a byte comparison chain.
+    match host.as_bytes() {
+        b"WASAPI" | b"PipeWire" => Some(device_rate != stream_rate),
+        b"CoreAudio" | b"ALSA" => Some(false),
+        _ => None,
+    }
 }
 
 /// The device config to open at `rate`, and whether opening it is an attempt.
@@ -905,6 +955,38 @@ mod tests {
                 "{device_type:?} over {interface:?}"
             );
         }
+    }
+
+    /// The disclosure table: a rate mismatch means OS conversion only on the
+    /// hosts that convert. CoreAudio moved the device clock, ALSA never opened
+    /// a rate the card does not run, and an unknown host earns no claim.
+    #[test]
+    fn render_conversion_is_claimed_only_where_the_os_converts() {
+        for host in ["WASAPI", "PipeWire"] {
+            assert_eq!(
+                render_conversion(host, 44_100, 48_000),
+                Some(true),
+                "{host}"
+            );
+            assert_eq!(
+                render_conversion(host, 48_000, 48_000),
+                Some(false),
+                "{host}"
+            );
+        }
+        for host in ["CoreAudio", "ALSA"] {
+            assert_eq!(
+                render_conversion(host, 44_100, 48_000),
+                Some(false),
+                "{host}"
+            );
+            assert_eq!(
+                render_conversion(host, 48_000, 48_000),
+                Some(false),
+                "{host}"
+            );
+        }
+        assert_eq!(render_conversion("Frobnicator", 44_100, 48_000), None);
     }
 
     #[test]

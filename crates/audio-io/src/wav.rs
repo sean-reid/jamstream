@@ -139,6 +139,10 @@ impl WavBackend {
             None => None,
         };
 
+        // Publish the conversion report exactly like a real backend: this
+        // device never converts, because a rate mismatch was refused above.
+        crate::mode::set_render_conversion(false);
+
         Ok(WavStream {
             handler,
             input,
