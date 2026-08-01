@@ -1614,12 +1614,11 @@ mod process {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The contract test spawns a shell-script fake server, so it and its
-    // import are unix-gated.
-    #[cfg(unix)]
     use crate::contract::assert_provider_contract;
     use crate::types::InstanceClass;
 
+    /// Private (0700 on unix), because the system temp dir's parent is
+    /// world-writable and some of what lands here gets executed.
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "jamstream-local-{label}-{}-{:?}",
@@ -1627,8 +1626,18 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        create_private_dir(&dir).unwrap();
         dir
+    }
+
+    /// Body of a Windows stand-in server: `prelude` lines run first, then it
+    /// waits out the test on a pinned ping, because `timeout` refuses the
+    /// redirected stdin every spawn here has. CRLF throughout: cmd's label
+    /// scanner is only dependable with it.
+    #[cfg(windows)]
+    fn cmd_body(prelude: &str) -> String {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+        format!("@echo off\r\n{prelude}\"{root}\\System32\\ping.exe\" -n 601 127.0.0.1 > nul\r\n")
     }
 
     /// A stand-in server: exec keeps the script's pid, SIGTERM kills it.
@@ -1666,6 +1675,20 @@ mod tests {
         path
     }
 
+    /// The Windows stand-in is a `.cmd`, which std runs through cmd.exe, so
+    /// the pid the provider records belongs to cmd.exe while the recorded
+    /// image is `fake-jamstreamd.cmd`: the tasklist probe would read that as
+    /// a recycled pid. That confines this fake to tests where liveness is
+    /// answered by the launching provider's own child handle, or where the
+    /// probe is meant to find nothing to corroborate; the identity-sensitive
+    /// sweeper tests stay unix.
+    #[cfg(windows)]
+    fn fake_server(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-jamstreamd.cmd");
+        std::fs::write(&path, cmd_body("")).unwrap();
+        path
+    }
+
     /// [`fake_server`] with one extra line: it writes the arguments it was
     /// spawned with, one per line, before exec'ing. Everything else about
     /// it, the symlinked image and why, is the same.
@@ -1685,9 +1708,31 @@ mod tests {
         script
     }
 
+    /// [`fake_server`] that first writes its argv, one per line. `%~1`
+    /// strips the quotes cmd wrapped around path-shaped arguments; the dump
+    /// is appended a line per open, so it goes to a temporary and lands with
+    /// one move, or [`read_when_written`] could return a half-written file.
+    #[cfg(windows)]
+    fn recording_server(dir: &Path, args_file: &Path) -> PathBuf {
+        let path = dir.join("fake-jamstreamd.cmd");
+        let tmp = args_file.with_extension("tmp");
+        let prelude = format!(
+            ":args\r\n\
+             if \"%~1\"==\"\" goto run\r\n\
+             >> \"{tmp}\" echo %~1\r\n\
+             shift\r\n\
+             goto args\r\n\
+             :run\r\n\
+             move /y \"{tmp}\" \"{args}\" > nul\r\n",
+            tmp = tmp.display(),
+            args = args_file.display()
+        );
+        std::fs::write(&path, cmd_body(&prelude)).unwrap();
+        path
+    }
+
     /// Reads a file a spawned process is expected to write, waiting for it
     /// rather than assuming it is already there.
-    #[cfg(unix)]
     async fn read_when_written(path: &Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1705,7 +1750,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn local_provider_passes_contract() {
         let dir = temp_dir("contract");
@@ -1757,7 +1801,6 @@ mod tests {
     /// The other half of the same contract: the resolved window has to
     /// reach the process. A fake server that records its own argv proves
     /// the flag is spelled the way jamstreamd's argument scan reads it.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_config_with_no_windows_still_spawns_a_server_that_will_exit() {
         let dir = temp_dir("windows");
@@ -1804,7 +1847,6 @@ mod tests {
     /// The recording half of the same spawn contract: `with_record` reaches
     /// the process as the flags jamstreamd's argument scan reads, and the
     /// directory exists before the first take could need it.
-    #[cfg(unix)]
     #[tokio::test]
     async fn with_record_reaches_the_spawned_server_as_flags() {
         let dir = temp_dir("record");
@@ -1869,7 +1911,6 @@ mod tests {
     /// the LAN address for a server bound to loopback would mint invites
     /// pointing at a port nothing answers on, which is the same silence a
     /// firewall produces and just as hard to read.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_bound_session_is_reported_at_the_address_it_listens_on() {
         let dir = temp_dir("bind");
@@ -1912,7 +1953,6 @@ mod tests {
     /// the app/CLI binary, and resolution must find it there with no
     /// override, no env var, and no PATH entry. The test binary stands in
     /// for the app executable.
-    #[cfg(unix)]
     #[test]
     fn resolves_the_binary_beside_the_current_executable() {
         if std::env::var_os("JAMSTREAMD_PATH").is_some_and(|v| !v.is_empty()) {
@@ -1923,7 +1963,8 @@ mod tests {
         }
         let exe = std::env::current_exe().unwrap();
         let sibling = exe.parent().unwrap().join(BIN_NAME);
-        std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
+        // Resolution only asks whether the file exists; nothing runs it.
+        std::fs::write(&sibling, b"stand-in for a bundled jamstreamd\n").unwrap();
         let provider = LocalProvider::new(temp_dir("adjacent").join("state"));
         let resolved = provider.resolve_server_binary().unwrap();
         assert_eq!(resolved, sibling);
@@ -2523,6 +2564,21 @@ mod tests {
             .is_ok_and(|out| out.status.success())
     }
 
+    /// Asks the OS directly rather than through the probe under test: a raw
+    /// tasklist run, judged only on whether a quoted row carries the exact
+    /// pid field.
+    #[cfg(windows)]
+    fn pid_is_running(pid: u32) -> bool {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+        let out = Command::new(format!("{root}\\System32\\tasklist.exe"))
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line.starts_with('"') && line.contains(&format!("\",\"{pid}\",\"")))
+    }
+
     #[cfg(unix)]
     fn wait_for_image(pid: u32, want: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2601,16 +2657,27 @@ mod tests {
         path
     }
 
+    /// On Windows every windowless console stand-in is already stubborn:
+    /// the polite step posts WM_CLOSE, which nothing here can see. The
+    /// `.ready` marker keeps the same spawn-completed shape as unix.
+    #[cfg(windows)]
+    fn stubborn_server(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-jamstreamd.cmd");
+        std::fs::write(&path, cmd_body("break > \"%~f0.ready\"\r\n")).unwrap();
+        path
+    }
+
     /// The migration policy under real signals: an entry with nothing to
-    /// corroborate gets the sentinel and the SIGTERM but never the SIGKILL,
-    /// and destroy says what it skipped. The stand-in ignores the TERM, so
-    /// only the skip keeps it alive.
-    #[cfg(unix)]
+    /// corroborate gets the sentinel and the polite step but never the
+    /// forced kill, and destroy says what it skipped. The stand-in shrugs
+    /// the polite step off, so only the skip keeps it alive.
     #[tokio::test]
     async fn destroy_never_force_kills_a_pid_it_cannot_corroborate() {
         let dir = temp_dir("unverified");
         let state = dir.join("state");
-        let launcher = LocalProvider::new(state.clone()).with_server_binary(stubborn_server(&dir));
+        let server = stubborn_server(&dir);
+        let ready = PathBuf::from(format!("{}.ready", server.display()));
+        let launcher = LocalProvider::new(state.clone()).with_server_binary(server);
         let instance = launcher
             .launch(LaunchSpec {
                 region: LocalProvider::local_region(),
@@ -2622,9 +2689,8 @@ mod tests {
             .unwrap();
         let pid: u32 = instance.id.parse().unwrap();
 
-        // Only once the trap is armed is the TERM below guaranteed to be
-        // ignored rather than fatal.
-        let ready = dir.join("fake-jamstreamd.ready");
+        // Only once the marker exists (on unix: once the trap is armed) is
+        // the polite step below guaranteed to be ignored rather than fatal.
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready.exists() {
             assert!(
@@ -2651,8 +2717,9 @@ mod tests {
             .destroy(&RegionId::new(REGION_ID), &instance.id)
             .await
             .unwrap_err();
+        let skipped = format!("skipped the forced {}", process::FORCED_KILL);
         assert!(
-            err.to_string().contains("skipped the forced SIGKILL"),
+            err.to_string().contains(&skipped),
             "destroy must say what it skipped, said: {err}"
         );
         assert!(
