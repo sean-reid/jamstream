@@ -663,10 +663,27 @@ mod tests {
     #[test]
     fn windows_pre_existing_state_dirs_are_hardened_too() {
         let root = temp_dir("preacl");
-        let dir = root.join("state");
+        // The shared-root shape, staged rather than assumed: the CI runner's
+        // temp hands children explicit ACEs and nothing inherited, so the
+        // parent gets an inheritable multi-account ACE of its own (Everyone,
+        // by SID, read-only so nothing real is exposed while the test runs).
+        let parent = root.join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(&parent)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(RX)"])
+            .output()
+            .unwrap();
+        assert!(
+            granted.status.success(),
+            "cannot stage the inheritable ACE: {}",
+            String::from_utf8_lossy(&granted.stderr)
+        );
+
         // A plain create, as a user making the dir themselves would: it
-        // inherits its parent's ACEs, which is what makes the assertion
+        // inherits the parent's ACEs, which is what makes the assertion
         // after create_private_dir mean something.
+        let dir = parent.join("state");
         std::fs::create_dir(&dir).unwrap();
         let before = acl_of(&dir);
         assert!(
@@ -683,6 +700,20 @@ mod tests {
         assert!(
             !after.contains("(I)"),
             "inherited ACEs survived on a pre-existing directory: {after}"
+        );
+        // And the staged ACE is gone outright, not merely re-marked as
+        // explicit: /findsid names the directory only on a match, which
+        // holds in any locale.
+        let found = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/findsid", "*S-1-1-0"])
+            .output()
+            .unwrap();
+        assert!(found.status.success(), "icacls /findsid failed");
+        let report = String::from_utf8_lossy(&found.stdout).into_owned();
+        assert!(
+            !report.contains(&dir.display().to_string()),
+            "the Everyone ACE survived the hardening: {report}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
