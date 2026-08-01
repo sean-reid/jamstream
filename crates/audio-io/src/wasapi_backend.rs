@@ -216,6 +216,15 @@ impl AudioBackend for WindowsBackend {
         config: StreamConfig,
         handler: DuplexHandler,
     ) -> Result<Box<dyn StreamHandle>> {
+        // The user said no to exclusive: go straight to shared, with no probe
+        // to fall back from. The probe would grab the endpoint for a moment
+        // even when it fails, which is exactly the interruption they opted
+        // out of (#331).
+        if !config.allow_exclusive {
+            tracing::info!("exclusive mode is disallowed by the request; opening shared");
+            return self.open_shared(capture, playback, config, handler);
+        }
+
         let key = RequestKey {
             capture: capture.map(str::to_owned),
             playback: playback.map(str::to_owned),

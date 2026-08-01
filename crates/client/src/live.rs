@@ -75,6 +75,19 @@ fn ring_capacity(buffer_frames: u32) -> usize {
     2 * buffer_frames.max(FRAME_FRAMES as u32) as usize * usize::from(CHANNELS)
 }
 
+/// The device request as [`AudioSettings`] spells it: the session rate and
+/// channel layout are the protocol's, the buffer and the exclusive answer are
+/// the user's. One function so every open and reopen carries the whole of the
+/// settings; a half-plumbed flag here would pass every test the fake sees.
+fn stream_config(settings: &AudioSettings) -> StreamConfig {
+    StreamConfig {
+        sample_rate: SAMPLE_RATE,
+        buffer_frames: settings.buffer_frames.max(32),
+        channels: CHANNELS,
+        allow_exclusive: settings.allow_exclusive,
+    }
+}
+
 /// Frames the ring is sized from: the request, or the callback size the
 /// device negotiated when that is bigger. A device is free to ignore the
 /// request (WASAPI shared mode calls back at its period, ~480 frames against
@@ -86,11 +99,29 @@ fn ring_frames(requested: u32, negotiated: Option<u32>) -> u32 {
 
 /// Device selection plus buffer size, as picked on the settings screen.
 /// `None` device ids select the system default for that direction.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSettings {
     pub capture_id: Option<String>,
     pub playback_id: Option<String>,
     pub buffer_frames: u32,
+    /// Whether the open may take the device exclusively (Windows only);
+    /// rides [`StreamConfig::allow_exclusive`] to the backend on every open
+    /// and reopen, so the toggle applies mid-session too.
+    pub allow_exclusive: bool,
+}
+
+/// Manual rather than derived so the flag defaults on: exclusive is the
+/// latency the product exists for, and a derived `false` here would quietly
+/// contradict [`StreamConfig::default`].
+impl Default for AudioSettings {
+    fn default() -> Self {
+        AudioSettings {
+            capture_id: None,
+            playback_id: None,
+            buffer_frames: 0,
+            allow_exclusive: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -246,12 +277,8 @@ impl Driver {
     /// first sized from the request; when the stream then reports callbacks
     /// the ring cannot absorb, it is reopened once over a ring that can.
     fn open(&mut self, settings: &AudioSettings) -> Result<(EngineSide, u32), AudioError> {
-        let requested = settings.buffer_frames.max(32);
-        let config = StreamConfig {
-            sample_rate: SAMPLE_RATE,
-            buffer_frames: requested,
-            channels: CHANNELS,
-        };
+        let config = stream_config(settings);
+        let requested = config.buffer_frames;
         let mut frames = requested;
         let mut resized = false;
         loop {
@@ -1485,5 +1512,26 @@ mod tests {
         assert_eq!(ring_frames(240, None), 240);
         // A smaller negotiation never shrinks the ring below the request.
         assert_eq!(ring_frames(240, Some(32)), 240);
+    }
+
+    /// The whole of the settings reaches the device request: the exclusive
+    /// answer rides every open and reopen, and the floor on the buffer stays.
+    #[test]
+    fn the_device_request_carries_the_users_exclusive_answer() {
+        let mut settings = AudioSettings {
+            buffer_frames: 120,
+            ..AudioSettings::default()
+        };
+        assert!(
+            stream_config(&settings).allow_exclusive,
+            "the default asks for the low-latency path"
+        );
+        settings.allow_exclusive = false;
+        let config = stream_config(&settings);
+        assert!(!config.allow_exclusive);
+        assert_eq!(config.sample_rate, SAMPLE_RATE);
+        assert_eq!(config.buffer_frames, 120);
+        settings.buffer_frames = 0;
+        assert_eq!(stream_config(&settings).buffer_frames, 32, "the floor");
     }
 }

@@ -160,6 +160,11 @@ pub struct DevicesScreen {
     pub capture_idx: usize,
     pub playback_idx: usize,
     pub buffer_frames: u32,
+    /// Whether an open may take the device exclusively (Windows). On by
+    /// default: exclusive is the low-latency path the product exists for,
+    /// but it mutes every other stream on the endpoint, so the setting and
+    /// its cost are on the tab instead of being a silent policy (#331).
+    pub allow_exclusive: bool,
     /// What the last rescan had to say for itself: a selection that fell back
     /// to the system default because its device is gone, or a scan that
     /// failed. Shown under the pickers until the next rescan; a fallback
@@ -173,6 +178,7 @@ impl Default for DevicesScreen {
             capture_idx: 0,
             playback_idx: 0,
             buffer_frames: BUFFER_CHOICES[0],
+            allow_exclusive: true,
             rescan_note: None,
         }
     }
@@ -343,6 +349,19 @@ impl DevicesScreen {
                     );
                     ui.end_row();
                 });
+            ui.add_space(theme::SPACE_SM);
+            ui.checkbox(
+                &mut self.allow_exclusive,
+                "Allow exclusive access (Windows, lowest latency)",
+            );
+            ui.label(
+                theme::muted(
+                    ui,
+                    "Exclusive mutes other apps on the device while a session runs. \
+                     Off shares it with them and adds 10 to 20 ms.",
+                )
+                .small(),
+            );
             // What the last rescan did to the selection, before the refusal:
             // a device that vanished is why the picker reads System default
             // now, and saying so is the difference between a fallback and a

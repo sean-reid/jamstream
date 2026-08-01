@@ -283,6 +283,9 @@ impl JamApp {
         {
             self.devices.buffer_frames = frames;
         }
+        if let Some(allow) = prefs.allow_exclusive {
+            self.devices.allow_exclusive = allow;
+        }
     }
 
     /// Writes the audio setup where the next launch reads it. Failure is a
@@ -296,6 +299,7 @@ impl JamApp {
             capture_id: settings.capture_id,
             playback_id: settings.playback_id,
             buffer_frames: Some(settings.buffer_frames),
+            allow_exclusive: Some(settings.allow_exclusive),
         };
         if let Err(err) = prefs.save_to(path) {
             tracing::warn!(%err, "audio preferences not saved");
@@ -371,6 +375,7 @@ impl JamApp {
                 .get(self.devices.playback_idx)
                 .and_then(|d| d.id.clone()),
             buffer_frames: self.devices.buffer_frames,
+            allow_exclusive: self.devices.allow_exclusive,
         }
     }
 

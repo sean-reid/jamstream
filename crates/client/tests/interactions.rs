@@ -2624,10 +2624,21 @@ fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
         .get_by_role_and_label(AkRole::RadioButton, "240 frames (5.0 ms)")
         .click_accesskit();
     harness.run_steps(4);
+    harness
+        .get_by_role_and_label(
+            AkRole::CheckBox,
+            "Allow exclusive access (Windows, lowest latency)",
+        )
+        .click_accesskit();
+    harness.run_steps(4);
 
     let saved = std::fs::read_to_string(&path).expect("the click has to write settings.json");
     assert!(saved.contains("240"), "{saved}");
     assert!(saved.contains("demo:Scarlett 2i2 input"), "{saved}");
+    assert!(
+        saved.contains("\"allow_exclusive\": false"),
+        "the exclusive answer has to persist: {saved}"
+    );
 
     // The next launch: same file, and the device is still in the catalog.
     let mut next = JamApp::in_memory();
@@ -2635,6 +2646,7 @@ fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
     next.restore_audio_prefs();
     assert_eq!(next.devices.buffer_frames, 240);
     assert_eq!(next.devices.capture_idx, 1, "restored by id, not by index");
+    assert!(!next.devices.allow_exclusive, "the toggle restores too");
 
     // And a launch whose catalog no longer holds the device stays on the
     // system default instead of showing some other device's name.

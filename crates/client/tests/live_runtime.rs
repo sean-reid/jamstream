@@ -125,6 +125,7 @@ fn settings() -> AudioSettings {
         capture_id: None,
         playback_id: None,
         buffer_frames: 120,
+        ..AudioSettings::default()
     }
 }
 
@@ -567,6 +568,7 @@ fn reconfigure_audio_swaps_the_stream_mid_session() {
         capture_id: None,
         playback_id: None,
         buffer_frames: 240,
+        ..AudioSettings::default()
     });
     std::thread::sleep(Duration::from_millis(2_000));
 
@@ -1061,6 +1063,7 @@ fn a_refused_reconfigure_keeps_the_selection_and_says_why() {
         capture_id: Some("BlackHole 2ch".to_owned()),
         playback_id: None,
         buffer_frames: 120,
+        ..AudioSettings::default()
     });
 
     let snap = wait_for(&rt, "the refusal", Duration::from_secs(10), |s| {

@@ -102,6 +102,10 @@ pub struct AppPrefs {
     /// edit cannot smuggle in a size no picker offers.
     #[serde(default)]
     pub buffer_frames: Option<u32>,
+    /// The exclusive-access answer (Windows). `None`, a file from before the
+    /// setting existed, reads as the default: allowed.
+    #[serde(default)]
+    pub allow_exclusive: Option<bool>,
 }
 
 impl AppPrefs {
@@ -248,9 +252,16 @@ mod tests {
             capture_id: Some("coreaudio:scarlett-in".to_owned()),
             playback_id: None,
             buffer_frames: Some(240),
+            allow_exclusive: Some(false),
         };
         prefs.save_to(&path).expect("save");
         assert_eq!(AppPrefs::load_from(&path), prefs);
+
+        // A file from before the exclusive setting existed reads as None,
+        // which the app treats as the default: allowed.
+        let old: AppPrefs =
+            serde_json::from_str("{\"buffer_frames\":240}").expect("an old file decodes");
+        assert_eq!(old.allow_exclusive, None);
 
         // Unlike the recording prefs, a broken settings file is defaults with
         // a log line, not a refusal: nothing here loses data silently.
