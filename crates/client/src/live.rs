@@ -494,6 +494,7 @@ impl LiveRuntime {
             avatar_failed: HashSet::new(),
             reopen_attempts: 0,
             last_reopen: None,
+            announced_failure: None,
         };
         let handle = std::thread::Builder::new()
             .name("jamstream-net".into())
@@ -813,6 +814,9 @@ struct Worker {
     avatar_failed: HashSet<String>,
     reopen_attempts: u64,
     last_reopen: Option<Instant>,
+    /// The failure line last put in chat, so the 500 ms retry cadence
+    /// announces each distinct reason once instead of every half second.
+    announced_failure: Option<String>,
 }
 
 impl Worker {
@@ -968,8 +972,11 @@ impl Worker {
     }
 
     /// Closes and reopens the audio stream with new settings; the network
-    /// side never pauses. On failure the periodic reopen path takes over
-    /// with system defaults.
+    /// side never pauses. On failure the user's selection is kept and the
+    /// 500 ms reopen cadence keeps trying exactly it: rewriting the settings
+    /// to the system default here left the Audio tab claiming a device the
+    /// stream did not run, from then on, with only a chat line to say so
+    /// (#327). The refusal itself stays on screen through `device_error`.
     fn reconfigure(&mut self, settings: AudioSettings) {
         // Drain what the old ring already captured so those samples reach
         // the core before the endpoints are dropped; orphaning them would
@@ -979,24 +986,24 @@ impl Worker {
         self.driver.close();
         self.engine = None;
         self.settings = settings;
-        if !self.try_open() {
-            self.system_line("audio device change failed, falling back to the system default");
-            self.settings.capture_id = None;
-            self.settings.playback_id = None;
-            self.last_reopen = None;
+        if let Err(err) = self.try_open() {
+            self.announce_open_failure(&err);
+            self.last_reopen = Some(Instant::now());
         }
     }
 
-    /// Device-gone handling: a dead stream is closed, announced, and
-    /// replaced by the system default on a 500 ms retry cadence.
+    /// A dead stream is closed, announced for what is known about it, and
+    /// retried with the same settings on a 500 ms cadence. The old line
+    /// claimed "audio device disconnected" for every latched error, but the
+    /// exclusive path latches on any read or write hiccup, so a driver
+    /// stutter was reported as an unplug; the class is only knowable from
+    /// the reopen attempt, and the announcement waits for it.
     fn check_stream(&mut self) {
         if self.driver.errored() {
             self.driver.close();
             self.engine = None;
-            self.settings.capture_id = None;
-            self.settings.playback_id = None;
             self.last_reopen = None;
-            self.system_line("audio device disconnected, switching to the system default");
+            self.system_line("the audio stream stopped; retrying");
         }
         if self.engine.is_none()
             && self
@@ -1006,13 +1013,28 @@ impl Worker {
             self.last_reopen = Some(Instant::now());
             self.reopen_attempts += 1;
             tracing::warn!(attempt = self.reopen_attempts, "reopening audio stream");
-            if self.try_open() {
-                self.system_line("audio device reopened");
+            match self.try_open() {
+                Ok(()) => self.system_line("audio device reopened"),
+                Err(err) => self.announce_open_failure(&err),
             }
         }
     }
 
-    fn try_open(&mut self) -> bool {
+    /// One chat line per distinct failure, in the device's own words, so the
+    /// 500 ms retry cadence does not flood the conversation. Disconnection is
+    /// claimed only when the error class says the device is gone.
+    fn announce_open_failure(&mut self, err: &AudioError) {
+        let line = match err {
+            AudioError::DeviceGone => "audio device disconnected; retrying".to_owned(),
+            refused => format!("audio device refused: {}", refused.detail()),
+        };
+        if self.announced_failure.as_deref() != Some(line.as_str()) {
+            self.system_line(&line);
+            self.announced_failure = Some(line);
+        }
+    }
+
+    fn try_open(&mut self) -> Result<(), AudioError> {
         match self.driver.open(&self.settings) {
             Ok((mut engine, device_frames)) => {
                 let capacity = ring_capacity(device_frames);
@@ -1033,7 +1055,9 @@ impl Worker {
                 let mut shared = self.shared.lock().expect("live state");
                 shared.reopen_attempts = self.reopen_attempts;
                 shared.device_error = None;
-                true
+                drop(shared);
+                self.announced_failure = None;
+                Ok(())
             }
             Err(err) => {
                 tracing::warn!(%err, "audio stream open failed");
@@ -1042,7 +1066,7 @@ impl Worker {
                 // the session, and the log is the one place they will not be
                 // looking at mid-song.
                 self.shared.lock().expect("live state").device_error = Some(err.to_string());
-                false
+                Err(err)
             }
         }
     }
