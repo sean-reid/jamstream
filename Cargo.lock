@@ -2898,6 +2898,7 @@ dependencies = [
  "jamstream-engine",
  "jamstream-protocol",
  "rtrb",
+ "rubato",
  "thiserror 2.0.19",
  "tracing",
  "wasapi",

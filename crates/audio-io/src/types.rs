@@ -139,11 +139,10 @@ impl DuplexHandler {
         (self.capture, self.playback)
     }
 
-    /// Reassemble halves from [`into_parts`](Self::into_parts). A backend that
-    /// splits a handler and then fails to open needs to hand it back so
-    /// another backend can try, which is what the Windows exclusive-mode path
-    /// does before falling back to shared mode.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    /// Reassemble halves from [`into_parts`](Self::into_parts): after the
+    /// boundary converter wrapped each half for a mismatched-rate device,
+    /// and on Windows when the exclusive-mode path fails to open and hands
+    /// the handler back for the shared-mode fallback to try.
     pub(crate) fn from_parts(capture: CaptureFn, playback: PlaybackFn) -> Self {
         Self { capture, playback }
     }
@@ -167,6 +166,11 @@ pub trait StreamHandle: Send {
     /// the requested [`StreamConfig::buffer_frames`] (WASAPI shared mode
     /// calls back at the device period), so anything sized around callbacks
     /// must be sized from this, not from the request.
+    ///
+    /// The unit is frames per callback as the handler sees them, at the
+    /// session rate: a backend converting for a mismatched-rate device
+    /// scales its device-rate callback size up before reporting, so ring
+    /// sizing never mixes clocks.
     fn buffer_frames(&self) -> Option<u32>;
 
     /// True once the backend reported a fatal stream error (device unplugged,

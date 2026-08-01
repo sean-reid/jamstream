@@ -18,16 +18,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::format::map_frames;
 use crate::mode::set_render_conversion;
+use crate::resample::MAX_CHUNK_FRAMES;
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
     StreamConfig, StreamHandle,
 };
 use crate::wasapi_policy;
-
-/// Largest per-callback chunk converted in one pass. Bigger device callbacks
-/// are processed in slices of this many frames, so the conversion scratch
-/// buffers stay fixed after stream construction.
-const MAX_CHUNK_FRAMES: usize = 4096;
 
 type CaptureFn = Box<dyn FnMut(&[f32]) + Send>;
 type PlaybackFn = Box<dyn FnMut(&mut [f32]) + Send>;

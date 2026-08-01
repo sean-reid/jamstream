@@ -24,11 +24,12 @@ fn config(channels: u16) -> StreamConfig {
     }
 }
 
-/// 48 kHz float WAV with a per-channel sine so channels are distinguishable.
-fn write_sine(path: &PathBuf, channels: u16, frames: usize) -> Vec<f32> {
+/// Float WAV with a per-channel sine so channels are distinguishable:
+/// channel 0 carries 440 Hz, channel 1 carries 880, at half scale.
+fn write_sine(path: &PathBuf, channels: u16, frames: usize, rate: u32) -> Vec<f32> {
     let spec = hound::WavSpec {
         channels,
-        sample_rate: 48_000,
+        sample_rate: rate,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
@@ -37,7 +38,7 @@ fn write_sine(path: &PathBuf, channels: u16, frames: usize) -> Vec<f32> {
     for i in 0..frames {
         for ch in 0..channels {
             let hz = 440.0 * f32::from(ch + 1);
-            let s = 0.5 * (2.0 * std::f32::consts::PI * hz * i as f32 / 48_000.0).sin();
+            let s = 0.5 * (2.0 * std::f32::consts::PI * hz * i as f32 / rate as f32).sin();
             writer.write_sample(s).unwrap();
             samples.push(s);
         }
@@ -72,7 +73,7 @@ fn passthrough_case(name: &str, wav_channels: u16, stream_channels: u16) {
     let input_path = temp_path(&format!("{name}-in.wav"));
     let output_path = temp_path(&format!("{name}-out.wav"));
     let frames = 480;
-    let input = write_sine(&input_path, wav_channels, frames);
+    let input = write_sine(&input_path, wav_channels, frames, 48_000);
 
     let backend = WavBackend::new(Some(input_path.clone()), Some(output_path.clone()));
     let mut stream = backend
@@ -228,17 +229,66 @@ fn without_a_period_the_request_is_the_negotiated_size() {
     assert_eq!(stream.buffer_frames(), Some(240));
 }
 
-/// The 44.1 kHz interface, modelled: the session runs at 48 kHz and the fake
-/// refuses the same way the cpal backend now does, rather than opening and
-/// playing sharp.
+/// The 44.1 kHz interface, modelled: the session runs at 48 kHz, the device
+/// opens at its own rate, and the boundary converter carries the difference
+/// (#347 rung 3) instead of the old refusal. The handle reports the callback
+/// size in session-rate frames, so everything sized around callbacks keeps
+/// one clock: 240 device frames per callback are ceil(240 * 160/147) = 262
+/// handler-side frames.
 #[test]
-fn a_device_at_44_1_refuses_a_48_khz_session() {
+fn a_44_1_device_opens_a_48_khz_session_through_the_converter() {
     let backend = WavBackend::new(None, None).with_device_rate(44_100);
-    let err = backend.open_offline(config(2), passthrough()).unwrap_err();
+    let stream = backend.open_offline(config(2), passthrough()).unwrap();
+    assert_eq!(stream.device_rate(), 44_100);
+    assert_eq!(stream.buffer_frames(), Some(262));
+    let (capture_ms, playback_ms) = stream
+        .resample_added_ms()
+        .expect("a converting stream reports its added latency");
+    assert!(capture_ms > 0.0 && playback_ms > 0.0);
+}
+
+/// A device at the session rate converts nothing and says so, which is what
+/// the disclosure surface reads to stay silent.
+#[test]
+fn a_48_k_device_reports_no_conversion_and_no_added_latency() {
+    let backend = WavBackend::new(None, None);
+    let stream = backend.open_offline(config(2), passthrough()).unwrap();
+    assert_eq!(stream.device_rate(), 48_000);
+    assert_eq!(stream.resample_added_ms(), None);
+    assert_eq!(stream.buffer_frames(), Some(240), "no scaling at unity");
+}
+
+/// The Windows shape on a 44.1 endpoint: the device ignores the request and
+/// calls back at its own 441-frame (10 ms) period, which is exactly 480
+/// session-rate frames per callback on the handler side.
+#[test]
+fn a_44_1_device_period_is_reported_in_session_rate_frames() {
+    let backend = WavBackend::new(None, None)
+        .with_device_rate(44_100)
+        .with_device_period(441);
+    let cfg = StreamConfig {
+        buffer_frames: 120,
+        ..config(2)
+    };
+    let stream = backend.open_offline(cfg, passthrough()).unwrap();
+    assert_eq!(stream.buffer_frames(), Some(480));
+}
+
+/// The refusal that remains after rung 3: a device the backend cannot feed
+/// at the device's own rate. The session-rate mismatch converts; the input
+/// fixture must still match the device clock, the way 44.1 tests need 44.1
+/// fixtures.
+#[test]
+fn an_input_wav_must_match_the_device_rate_not_the_session_rate() {
+    let input_path = temp_path("48k-on-44-1-in.wav");
+    write_sine(&input_path, 1, 480, 48_000);
+    let backend = WavBackend::new(Some(input_path.clone()), None).with_device_rate(44_100);
+    let err = backend.open_offline(config(1), passthrough()).unwrap_err();
     let AudioError::Unsupported(msg) = err else {
         panic!("expected Unsupported, got {err:?}");
     };
     assert!(msg.contains("44100") && msg.contains("48000"), "{msg}");
+    let _ = std::fs::remove_file(&input_path);
 }
 
 /// The offline backend reports a form factor like the real hosts do: Unknown
@@ -274,9 +324,9 @@ fn a_device_at_44_1_opens_at_its_own_rate() {
 }
 
 /// Every open publishes the render-conversion report the way a real backend
-/// does, and this backend never converts: a mismatched rate is refused, so an
-/// open stream is running at the device rate. Safe alongside parallel tests
-/// because every wav open publishes the same value.
+/// does, and no OS ever converts this device: a mismatched rate runs through
+/// the crate's own boundary converter, which is a different disclosure. Safe
+/// alongside parallel tests because every wav open publishes the same value.
 #[test]
 fn an_open_reports_that_nothing_is_converting() {
     let backend = WavBackend::new(None, None);
@@ -297,6 +347,20 @@ fn a_lost_device_is_reported_through_the_stream_handle() {
     // And it stays gone, the way a real invalidated stream does.
     stream.pump(240).unwrap();
     assert!(stream.errored());
+}
+
+/// The unplug is one event, not a property of every future stream: the
+/// stream that answers the reopen models the replacement device, so a
+/// caller's device-gone path can prove the session survives the swap.
+#[test]
+fn the_stream_after_the_unplug_keeps_running() {
+    let backend = WavBackend::new(None, None).with_device_loss_after(480);
+    let mut first = backend.open_offline(config(2), passthrough()).unwrap();
+    first.pump(480).unwrap();
+    assert!(first.errored(), "the first stream loses its device");
+    let mut second = backend.open_offline(config(2), passthrough()).unwrap();
+    second.pump(960).unwrap();
+    assert!(!second.errored(), "the replacement device stays plugged in");
 }
 
 #[test]
@@ -456,6 +520,167 @@ fn a_device_period_beyond_the_request_overwhelms_a_request_sized_ring() {
     );
 
     let _ = std::fs::remove_file(&input_path);
+}
+
+/// Positive-going zero crossings, i.e. whole cycles of a sine.
+fn cycles(samples: &[f32]) -> usize {
+    samples
+        .windows(2)
+        .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
+        .count()
+}
+
+fn rms(samples: &[f32]) -> f64 {
+    (samples
+        .iter()
+        .map(|&s| f64::from(s) * f64::from(s))
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt()
+}
+
+/// Longest run of consecutive exact-zero samples: underrun padding writes
+/// literal 0.0, running audio does not.
+fn longest_zero_run(samples: &[f32]) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for &s in samples {
+        run = if s == 0.0 { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
+}
+
+/// Every other sample of an interleaved stereo signal: channel 0.
+fn left(samples: &[f32]) -> Vec<f32> {
+    samples.iter().copied().step_by(2).collect()
+}
+
+/// Rung 3 spanning the bridge, both directions at once, the way a session
+/// runs: a 44.1 kHz device captures a 440 Hz sine into the 48 kHz ring while
+/// its playback side renders a 440 Hz sine pushed at 48 kHz. The engine side
+/// must see session-rate audio, sample-accurately: the count scaled by
+/// exactly 160/147 and the pitch still 440 (an unconverted path reads 479
+/// here). The capture file must hold device-rate audio at pitch and level
+/// with no padded runs at steady state, and neither bridge counter may move.
+fn bridge_conversion_case(name: &str, period: Option<u32>) {
+    let input_path = temp_path(&format!("{name}-in.wav"));
+    let output_path = temp_path(&format!("{name}-out.wav"));
+    let device_frames_total = 88_200usize; // two seconds at 44.1 kHz
+    write_sine(&input_path, 2, device_frames_total, 44_100);
+
+    // The client's sizing convention: 2x the callback size the handle
+    // reports, in session-rate frames, stereo.
+    let callback_frames = period.unwrap_or(120);
+    let session_callback = (callback_frames as usize * 48_000).div_ceil(44_100);
+    let capacity = 2 * session_callback * 2;
+    let (device, mut engine) = jamstream_audio_io::CallbackBridge::new(capacity);
+
+    let mut backend = WavBackend::new(Some(input_path.clone()), Some(output_path.clone()))
+        .with_device_rate(44_100);
+    if let Some(p) = period {
+        backend = backend.with_device_period(p);
+    }
+    let cfg = StreamConfig {
+        buffer_frames: 120,
+        ..config(2)
+    };
+    let mut stream = backend.open_offline(cfg, device.into_handler()).unwrap();
+    assert_eq!(stream.buffer_frames(), Some(session_callback as u32));
+
+    // Three seconds of 440 Hz at 48 kHz to render, more than the run needs.
+    let play: Vec<f32> = (0..3 * 48_000 * 2)
+        .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * (i / 2) as f32 / 48_000.0).sin())
+        .collect();
+    let mut play_pos = 0usize;
+    let mut captured = Vec::new();
+    let mut scratch = vec![0.0f32; capacity];
+    for _ in 0..device_frames_total / 120 {
+        // Top up the playout ring, then pump one device bite, then drain
+        // capture: the worker's servicing pattern.
+        loop {
+            let end = (play_pos + 240).min(play.len());
+            let want = end - play_pos;
+            if want == 0 {
+                break;
+            }
+            let pushed = engine.push_playout(&play[play_pos..end]);
+            play_pos += pushed;
+            if pushed < want {
+                break;
+            }
+        }
+        stream.pump(120).unwrap();
+        let got = engine.pull_captured(&mut scratch);
+        captured.extend_from_slice(&scratch[..got]);
+    }
+    stream.finish().unwrap();
+    assert!(play_pos < play.len(), "the render source ran out");
+
+    assert_eq!(engine.overruns(), 0, "capture must fit the sized ring");
+    assert_eq!(engine.underruns(), 0, "render must never find the ring dry");
+
+    // Capture direction: 88 200 device frames are exactly 96 000 session
+    // frames; anything beyond buffering slack means dropped or invented
+    // audio.
+    let captured_frames = captured.len() / 2;
+    let expected = device_frames_total * 160 / 147;
+    assert!(
+        captured_frames <= expected && expected - captured_frames <= 3 * 120,
+        "expected ~{expected} session frames, got {captured_frames}"
+    );
+    let steady = left(&captured[2 * 480..]);
+    let secs = steady.len() as f64 / 48_000.0;
+    let hz = cycles(&steady) as f64 / secs;
+    assert!(
+        (hz - 440.0).abs() < 2.0,
+        "capture pitch moved: {hz:.2} Hz out of 440 in"
+    );
+    let level = rms(&steady);
+    assert!(
+        (level - 0.3536).abs() < 0.02,
+        "capture level moved: rms {level:.4}"
+    );
+
+    // Playback direction: the file is device-rate audio of the pushed sine.
+    let (spec, written) = read_all(&output_path);
+    assert_eq!(
+        spec.sample_rate, 44_100,
+        "the file runs on the device clock"
+    );
+    assert_eq!(written.len(), device_frames_total * 2);
+    let tail = left(&written[2 * 4_410..]);
+    let secs = tail.len() as f64 / 44_100.0;
+    let hz = cycles(&tail) as f64 / secs;
+    assert!(
+        (hz - 440.0).abs() < 2.0,
+        "render pitch moved: {hz:.2} Hz out of 440 in"
+    );
+    let run = longest_zero_run(&tail);
+    assert!(
+        run < 240,
+        "steady-state render holds a {run}-sample zero run"
+    );
+    let level = rms(&tail);
+    assert!(
+        (level - 0.3536).abs() < 0.02,
+        "render level moved: rms {level:.4}"
+    );
+
+    let _ = std::fs::remove_file(&input_path);
+    let _ = std::fs::remove_file(&output_path);
+}
+
+#[test]
+fn a_44_1_device_carries_a_48_khz_session_through_the_bridge() {
+    bridge_conversion_case("bridge-44-1", None);
+}
+
+/// The combined Windows shape: 44.1 kHz device clock and a 441-frame device
+/// period, pumped in the same 120-frame bites the client uses.
+#[test]
+fn a_44_1_device_period_carries_a_48_khz_session_through_the_bridge() {
+    bridge_conversion_case("bridge-44-1-period", Some(441));
 }
 
 #[test]

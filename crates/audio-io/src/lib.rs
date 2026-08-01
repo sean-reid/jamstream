@@ -9,6 +9,7 @@
 
 mod bridge;
 mod mode;
+mod resample;
 mod types;
 mod wav;
 
