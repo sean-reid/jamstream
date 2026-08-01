@@ -149,17 +149,16 @@ jobs:
   # build of every binary. The harness gate suite runs in its own job below
   # so this one is not serialized behind ~3 minutes of simulation.
   #
-  # jamstream-client tests run only on macOS, deliberately:
-  #   - The kittest UI snapshot baselines were rendered on macOS; pixel
-  #     comparison only holds on the OS that rendered them, so a Linux or
-  #     Windows run could never assert against them anyway.
-  #   - kittest renders through wgpu, which needs a GPU adapter that
-  #     headless ubuntu/windows runners do not reliably provide, and the
-  #     crate has no env-var escape hatch we could set without touching
-  #     src (off-limits here).
-  # So: full workspace on macOS, --exclude jamstream-client elsewhere. The
-  # client still COMPILES on all three OSes via clippy --all-targets (lint
-  # job, Linux) and the release build below.
+  # Of the client crate's test binaries, exactly one is macOS-only:
+  # ui_snapshots renders pixels through wgpu against baselines rendered on
+  # macOS, so a Linux or Windows run could never assert against them, and
+  # headless runners lack a reliable adapter anyway. Everything else in the
+  # crate (the unit tests and the interaction, runtime, takes, retention,
+  # perf, and wizard suites) drives egui headlessly and runs on any OS.
+  # This job used to exclude the whole crate off macOS, which let a
+  # Windows-only compile break in the crate Windows users actually run
+  # merge green and surface on main at the push-gated release build. So:
+  # full workspace on macOS, everything but the snapshot binary elsewhere.
   test:
     strategy:
       fail-fast: false
@@ -211,9 +210,14 @@ jobs:
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
       - if: runner.os != 'macOS'
-        run: cargo nextest run --locked --workspace --exclude jamstream-harness --exclude jamstream-client
+        run: cargo nextest run --locked --workspace --exclude jamstream-harness -E 'not binary(ui_snapshots)'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
+      # The compile surface nextest leaves dark: benches and examples.
+      # Cheap on the warm cache, and Windows is the OS where a cfg'd arm
+      # nothing else builds would otherwise ship broken.
+      - if: runner.os == 'Windows'
+        run: cargo check --locked --workspace --all-targets
       # nextest does not run doctests, and nothing else did either, so a doctest
       # would have compiled on the author's machine and never once in CI (#295).
       # It costs a doc-mode build to find zero of them today, because every
@@ -255,13 +259,13 @@ jobs:
           done
           echo "$matched fixtures generated identically by both copies"
           test "$matched" -ge 3
-      # The nextest run above already compiles the cfg(windows) WASAPI
-      # exclusive-mode backend (lib and tests, with RUSTFLAGS=-D warnings), so
-      # it is the Windows compile gate. Clippy, though, only runs on Linux in
-      # the lint job, where that whole module is cfg'd out; lint it here, scoped
-      # to the one crate that has Windows-only code.
+      # Clippy only runs on Linux in the lint job, where every cfg(windows)
+      # module is cfg'd out; lint them here. Three crates carry Windows-only
+      # code: audio-io (the WASAPI backend), cloud (icacls hardening and the
+      # tasklist/taskkill process module), and client (reveal, and whatever
+      # arrives next in the crate Windows users run).
       - if: runner.os == 'Windows'
-        run: cargo clippy --locked -p jamstream-audio-io --all-targets -- -D warnings
+        run: cargo clippy --locked -p jamstream-audio-io -p jamstream-cloud -p jamstream-client --all-targets -- -D warnings
       # The snapshot tests drop a human-reviewable PNG of every screen under
       # target/ui-previews/; upload them even when a pixel diff fails, since
       # a failing run is exactly when a human wants to look.
