@@ -18,6 +18,7 @@ use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, Result, StreamConfig,
     StreamHandle,
 };
+use crate::wasapi_policy;
 
 /// Largest per-callback chunk converted in one pass. Bigger device callbacks
 /// are processed in slices of this many frames, so the conversion scratch
@@ -213,8 +214,34 @@ fn map_err(e: &cpal::Error) -> AudioError {
         cpal::ErrorKind::UnsupportedConfig | cpal::ErrorKind::UnsupportedOperation => {
             AudioError::Unsupported(e.to_string())
         }
-        _ => AudioError::Backend(e.to_string()),
+        _ => {
+            let message = e.to_string();
+            if is_windows_access_denied(&message) {
+                // Same walk to the setting as the exclusive path's
+                // AccessDenied classification, so the two paths agree.
+                AudioError::Unsupported(format!(
+                    "microphone access denied by Windows privacy settings ({message}); {}",
+                    wasapi_policy::MIC_PRIVACY_REMEDY
+                ))
+            } else {
+                AudioError::Backend(message)
+            }
+        }
     }
+}
+
+/// True when a cpal error is Windows' `E_ACCESSDENIED` (0x80070005), which in
+/// practice is "Let desktop apps access your microphone" switched off.
+///
+/// cpal's WASAPI host has no classification for it: the HRESULT falls through
+/// to `ErrorKind::BackendError` carrying `io::Error`'s rendering of the code,
+/// which is the raw value (-2147024891 is 0x80070005 as an i32) or, where the
+/// system message table resolves it, "Access is denied". Matching the message
+/// is the only handle cpal leaves.
+fn is_windows_access_denied(message: &str) -> bool {
+    message.contains("0x80070005")
+        || message.contains("-2147024891")
+        || message.contains("Access is denied")
 }
 
 /// Whether `host` reports a stream it could not open at the rate that was
@@ -671,6 +698,38 @@ mod tests {
         assert!(msg.contains("48000 Hz"), "{msg}");
         assert!(msg.contains("(ASBD not supported)"), "{msg}");
         assert!(msg.contains("Audio MIDI Setup"), "{msg}");
+    }
+
+    /// The Windows microphone privacy toggle reaches this backend as cpal's
+    /// unclassified BackendError carrying io::Error's rendering of
+    /// E_ACCESSDENIED, in whichever of its shapes; every shape must land on
+    /// the actionable message, and nothing else may.
+    #[test]
+    fn a_windows_privacy_denial_names_the_setting_on_the_shared_path() {
+        for message in [
+            "IAudioClient::Initialize failed: 0x80070005",
+            "OS Error -2147024891 (FormatMessageW() returned error)",
+            "Access is denied. (os error 5)",
+        ] {
+            let err = cpal::Error::with_message(cpal::ErrorKind::BackendError, message.to_owned());
+            let mapped = map_err(&err);
+            let AudioError::Unsupported(msg) = mapped else {
+                panic!("expected Unsupported for {message:?}, got {mapped:?}");
+            };
+            assert!(
+                msg.contains("microphone access denied by Windows privacy settings"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("Settings, Privacy and security, Microphone"),
+                "{msg}"
+            );
+            assert!(msg.contains(message), "the host's own words survive: {msg}");
+        }
+
+        // Any other unclassified failure stays a plain backend error.
+        let other = cpal::Error::with_message(cpal::ErrorKind::BackendError, "OS Error 1450");
+        assert!(matches!(map_err(&other), AudioError::Backend(_)));
     }
 
     /// The remedy is the whole feature, so each host gets the one that is true
