@@ -150,6 +150,16 @@ pub struct JamApp {
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
+    /// The close-the-window confirmation is up. Only a session this app
+    /// launched raises it: closing with one running strands jamstreamd
+    /// invisibly until the idle exit (#322). Public so a fixture can show
+    /// the dialog without a windowing system to close.
+    pub confirm_quit: bool,
+    /// The user answered the confirmation; the next close request passes.
+    allow_close: bool,
+    /// "End session and quit": close the window once the teardown confirms,
+    /// not before, or the provider call dies with the process.
+    quit_after_ending: bool,
     /// How a join is performed; see [`Joiner`].
     pub join: Joiner,
     creds: Arc<dyn CredStore>,
@@ -207,6 +217,9 @@ impl JamApp {
             enumerate: Arc::new(|| Ok(DeviceCatalog::demo())),
             settings_path: None,
             ending: None,
+            confirm_quit: false,
+            allow_close: false,
+            quit_after_ending: false,
             join: system_joiner(),
             creds,
             env,
@@ -489,6 +502,13 @@ impl JamApp {
             if let Err(err) = result {
                 self.home.error = Some(format!("ending the session failed: {err}"));
             }
+            // "End session and quit": the window goes once the provider has
+            // answered, success or failure alike; a failure is in the state
+            // file and `jamstream sweep` collects what is left.
+            if self.quit_after_ending {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             return;
         }
         if !self.ending() {
@@ -534,6 +554,30 @@ impl JamApp {
             });
             ui.add_space(theme::SPACE_SM);
         });
+
+        // The window's close button, when this app is the one hosting: closing
+        // would strand jamstreamd invisibly until the idle exit, with no CLI
+        // in an app-only install to end it (#322). The request is cancelled
+        // and the confirmation put up; anything else closes untouched.
+        if ui.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            if self.ending() {
+                // The teardown is already running; quitting now would kill
+                // the provider call mid-destroy. Hold the window until it
+                // answers, under the progress sheet that is already up.
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.quit_after_ending = true;
+            } else if self.hosting_live_session() {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_quit = true;
+            }
+        }
+        if self.confirm_quit
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.confirm_quit = false;
+        }
 
         // Before the sheet draws, so a picture that landed while the dialog
         // was open shows in the same frame it arrived.
@@ -631,6 +675,7 @@ impl JamApp {
         }
 
         self.ending_progress(ui.ctx());
+        self.quit_confirm_window(ui.ctx());
         self.close_the_other_sheet();
         // Last, so a session has already drawn its status bar and the drawer
         // knows where to stop. Ending the session is reached from in here now,
@@ -656,6 +701,58 @@ impl JamApp {
         // drew this frame belongs to a member who left, or to a picture that
         // was replaced. Free it.
         sweep_avatar_textures(ui.ctx());
+    }
+
+    /// Whether closing the window right now would strand a server this app
+    /// launched. A plain join carries no invite book: leaving by closing the
+    /// window costs that musician nothing but their seat, which is kept.
+    pub fn hosting_live_session(&self) -> bool {
+        self.runtime.is_some() && self.session.invites.is_some()
+    }
+
+    /// The close-the-window confirmation: end the session, leave it running
+    /// with its own exits named, or stay. Centre screen like the other
+    /// confirmations, because destroying a server the band may be playing on
+    /// is not decided in a corner.
+    fn quit_confirm_window(&mut self, ctx: &Context) {
+        if !self.confirm_quit {
+            return;
+        }
+        egui::Window::new("Quit while hosting")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.label("This computer launched the session that is running.");
+                ui.add_space(theme::SPACE_SM);
+                ui.label(theme::muted(
+                    ui,
+                    "Kept running, the band can play on without you: the server \
+                     stops itself 10 minutes after the last musician leaves, at \
+                     its hard cap, or when you run jamstream end.",
+                ));
+                ui.add_space(theme::SPACE_SM);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_quit = false;
+                    }
+                    if ui.button("Keep it running and quit").clicked() {
+                        self.confirm_quit = false;
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    let p = theme::palette_of(ui);
+                    if ui
+                        .add(theme::danger_button(p, "End session and quit"))
+                        .clicked()
+                    {
+                        self.confirm_quit = false;
+                        self.quit_after_ending = true;
+                        self.end_session();
+                    }
+                });
+            });
     }
 
     /// The record sheet and the settings drawer are both anchored to the right

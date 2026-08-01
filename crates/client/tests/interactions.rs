@@ -2516,6 +2516,92 @@ fn the_two_frame_counts_are_named_apart() {
     }
 }
 
+/// Closing the window while this app is the host raises one confirmation
+/// with three ways out (#322). "Keep it running and quit" leaves the session
+/// alive and lets the window go; Escape is Cancel; and the destructive
+/// answer is on screen but not pressed here, because it is the same
+/// `end_session` the Invites tab's covered button calls.
+///
+/// The dialog is raised by the close request itself in production; the
+/// fixture sets the flag directly because a kittest harness has no window
+/// manager to press the close button on. What is under test is everything
+/// after the request: the choices, their wiring, and the way back.
+#[test]
+fn quitting_while_hosting_confirms_and_keep_running_lets_the_window_go() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let hosting_app = || {
+        let mut app = JamApp::in_memory();
+        app.recent = Vec::new();
+        app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, true)));
+        app.screen = Screen::Session;
+        app.session.invites = Some(empty_invites());
+        assert!(app.hosting_live_session(), "the fixture is a host");
+        app.confirm_quit = true;
+        app
+    };
+    let watch = |mut app: JamApp, state: Arc<std::sync::Mutex<(bool, bool)>>| {
+        Harness::builder()
+            .with_size(vec2(1280.0, 800.0))
+            .with_step_dt(0.05)
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+                *state.lock().unwrap() = (app.confirm_quit, app.runtime.is_some());
+            })
+    };
+
+    let state = Arc::new(std::sync::Mutex::new((false, false)));
+    let mut harness = watch(hosting_app(), Arc::clone(&state));
+    harness.run_steps(2);
+
+    // All three answers are on screen, keyboard reachable like any button.
+    for label in ["End session and quit", "Keep it running and quit", "Cancel"] {
+        assert!(
+            harness
+                .query_by_role_and_label(AkRole::Button, label)
+                .is_some(),
+            "{label} is missing from the confirmation"
+        );
+    }
+    assert!(
+        harness
+            .query_by_label_contains("10 minutes after the last musician leaves")
+            .is_some(),
+        "the dialog has to say how a kept session ends"
+    );
+
+    // Escape is Cancel: the dialog goes, the session stays.
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    assert_eq!(*state.lock().unwrap(), (false, true));
+
+    // Raised again, "Keep it running and quit" closes only the window: the
+    // runtime is still there on the last frame the app drew.
+    let state2 = Arc::new(std::sync::Mutex::new((true, false)));
+    let mut harness = watch(hosting_app(), Arc::clone(&state2));
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(AkRole::Button, "Keep it running and quit")
+        .click_accesskit();
+    harness.run_steps(2);
+    let (confirming, running) = *state2.lock().unwrap();
+    assert!(!confirming, "the dialog answered");
+    assert!(running, "keep it running must not end the session");
+}
+
+/// A musician who merely joined gets no dialog: their seat is kept and no
+/// server is theirs to strand, so the window just closes.
+#[test]
+fn a_plain_join_is_not_interrogated_on_close() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let mut app = JamApp::in_memory();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Session;
+    assert!(!app.hosting_live_session());
+}
+
 /// Rescan keeps the selection by device id and falls back visibly. The
 /// enumerator is injected, because a test has no interface to unplug; what is
 /// under test is everything from the button to the note: the click reaches
