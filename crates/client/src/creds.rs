@@ -1,7 +1,9 @@
 //! Credential storage for the host wizard. Secrets live in the platform
 //! keychain (service "jamstream", account "<provider>.<field>"); the same
 //! environment variables the CLI reads remain a silent fallback so a
-//! terminal-configured machine works in the app with no extra setup.
+//! terminal-configured machine works in the app with no extra setup. A
+//! secret the keychain itself refuses as too long lands in a private file
+//! instead; see [`KeyringStore`].
 //!
 //! # No field in this product reveals a secret
 //!
@@ -24,9 +26,11 @@
 //! same class of secret was safe to put on a screen (#184). It is not.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use jamstream_cloud::cloudinit::StorageCredential;
+use jamstream_cloud::private::{create_private_dir, write_private};
 use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::providers::digitalocean::DigitalOceanProvider;
 use jamstream_cloud::providers::gcp::GcpProvider;
@@ -144,34 +148,140 @@ pub trait CredStore: Send + Sync {
     fn delete(&self, provider: &str, field: &str);
 }
 
-/// Platform keychain via the keyring crate.
-pub struct KeyringStore;
+/// The keychain itself, under [`KeyringStore`]. A trait so the fallback
+/// logic can be exercised against the refusal the Windows backend makes,
+/// with the error still typed: the fallback matches
+/// [`keyring::Error::TooLong`] and nothing else.
+trait Keychain: Send + Sync {
+    fn get(&self, account: &str) -> Option<String>;
+    fn set(&self, account: &str, value: &str) -> Result<(), keyring::Error>;
+    fn delete(&self, account: &str);
+}
+
+/// The operating system's keychain via the keyring crate.
+struct SystemKeychain;
+
+impl SystemKeychain {
+    fn entry(account: &str) -> Result<keyring::Entry, keyring::Error> {
+        keyring::Entry::new(SERVICE, account)
+    }
+}
+
+impl Keychain for SystemKeychain {
+    fn get(&self, account: &str) -> Option<String> {
+        Self::entry(account).ok()?.get_password().ok()
+    }
+
+    fn set(&self, account: &str, value: &str) -> Result<(), keyring::Error> {
+        Self::entry(account)?.set_password(value)
+    }
+
+    fn delete(&self, account: &str) {
+        if let Ok(entry) = Self::entry(account) {
+            let _ = entry.delete_credential();
+        }
+    }
+}
+
+/// Platform keychain via the keyring crate, with a private file as the
+/// fallback for the one secret the keychain refuses to hold.
+///
+/// Windows Credential Manager caps a credential blob at 2560 bytes of
+/// UTF-16, about 1280 characters, and a GCP service account key is
+/// typically near twice that, so on Windows the host wizard's check would
+/// pass and the save would then fail, every time. The keychain stays
+/// primary; only a [`keyring::Error::TooLong`] refusal diverts the secret
+/// to `<data dir>/credentials/<provider>.<field>`, written through
+/// [`jamstream_cloud::private`] so the file is 0600 on unix and on Windows
+/// inherits from a directory whose ACL was tightened at creation. Reads
+/// ask the keychain first and fall through to the file, so which place
+/// holds a secret is never recorded anywhere.
+pub struct KeyringStore {
+    keychain: Box<dyn Keychain>,
+    /// Where an oversized secret lands; the CLI's own data directory
+    /// resolution, so everything this machine keeps stays under one root.
+    /// The `Err` is shown only if a too-long save actually needs the dir.
+    fallback_dir: Result<PathBuf, String>,
+}
 
 impl KeyringStore {
-    fn entry(provider: &str, field: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(SERVICE, &format!("{provider}.{field}"))
-            .map_err(|e| format!("keychain: {e}"))
+    /// The production store: the system keychain, with the fallback beside
+    /// the CLI's session state.
+    pub fn system() -> Self {
+        KeyringStore {
+            keychain: Box::new(SystemKeychain),
+            fallback_dir: jamstream_cli::state::data_dir()
+                .map(|dir| dir.join("credentials"))
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    fn account(provider: &str, field: &str) -> String {
+        format!("{provider}.{field}")
+    }
+
+    fn fallback_path(&self, provider: &str, field: &str) -> Result<PathBuf, String> {
+        self.fallback_dir
+            .as_ref()
+            .map(|dir| dir.join(Self::account(provider, field)))
+            .map_err(Clone::clone)
+    }
+
+    fn set_fallback(&self, provider: &str, field: &str, value: &str) -> Result<(), String> {
+        let too_long = "this key is longer than the keychain allows";
+        let path = self.fallback_path(provider, field).map_err(|e| {
+            format!("{too_long}, and there is no private directory to keep it in instead: {e}")
+        })?;
+        let dir = self.fallback_dir.as_ref().expect("path implies dir");
+        create_private_dir(dir)
+            .and_then(|()| write_private(&path, value.as_bytes()))
+            .map_err(|e| {
+                format!(
+                    "{too_long}, and keeping it as a private file failed: cannot write {}: {e}",
+                    path.display()
+                )
+            })
     }
 }
 
 impl CredStore for KeyringStore {
     fn get(&self, provider: &str, field: &str) -> Option<String> {
-        Self::entry(provider, field)
-            .ok()?
-            .get_password()
-            .ok()
+        self.keychain
+            .get(&Self::account(provider, field))
             .filter(|v| !v.is_empty())
+            .or_else(|| {
+                let path = self.fallback_path(provider, field).ok()?;
+                std::fs::read_to_string(path).ok().filter(|v| !v.is_empty())
+            })
     }
 
     fn set(&self, provider: &str, field: &str, value: &str) -> Result<(), String> {
-        Self::entry(provider, field)?
-            .set_password(value)
-            .map_err(|e| format!("keychain: {e}"))
+        match self.keychain.set(&Self::account(provider, field), value) {
+            Ok(()) => {
+                // A shorter secret saved over an oversized one must not
+                // leave the old one on disk under the fallback name, where
+                // nothing would ever overwrite or read it again.
+                if let Ok(path) = self.fallback_path(provider, field) {
+                    let _ = std::fs::remove_file(path);
+                }
+                Ok(())
+            }
+            Err(keyring::Error::TooLong(..)) => {
+                self.set_fallback(provider, field, value)?;
+                // A refused save leaves the keychain's previous value in
+                // place, and reads ask the keychain first; without this the
+                // stale shorter secret would shadow the file just written.
+                self.keychain.delete(&Self::account(provider, field));
+                Ok(())
+            }
+            Err(e) => Err(format!("keychain: {e}")),
+        }
     }
 
     fn delete(&self, provider: &str, field: &str) {
-        if let Ok(entry) = Self::entry(provider, field) {
-            let _ = entry.delete_credential();
+        self.keychain.delete(&Self::account(provider, field));
+        if let Ok(path) = self.fallback_path(provider, field) {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -563,6 +673,154 @@ mod tests {
             !has_storage_credential(&store, &launch_pair, ProviderKind::Aws),
             "the launch pair must never be read as a recording key"
         );
+    }
+
+    /// The Windows Credential Manager blob cap: `CRED_MAX_CREDENTIAL_BLOB_SIZE`
+    /// bytes, which the password fills as UTF-16.
+    const WINDOWS_BLOB_CAP_BYTES: usize = 2560;
+
+    /// A keychain that refuses what keyring's windows-native backend
+    /// refuses: a password whose UTF-16 encoding exceeds the blob cap. The
+    /// check and the error are the backend's own, so the fallback is tested
+    /// against the refusal production actually makes, including the part
+    /// where a refused save leaves the previous value in place.
+    #[derive(Default)]
+    struct CappedKeychain {
+        values: Mutex<HashMap<String, String>>,
+    }
+
+    impl Keychain for CappedKeychain {
+        fn get(&self, account: &str) -> Option<String> {
+            self.values.lock().expect("keychain").get(account).cloned()
+        }
+
+        fn set(&self, account: &str, value: &str) -> Result<(), keyring::Error> {
+            if value.encode_utf16().count() * 2 > WINDOWS_BLOB_CAP_BYTES {
+                return Err(keyring::Error::TooLong(
+                    "password encoded as UTF-16".to_owned(),
+                    WINDOWS_BLOB_CAP_BYTES as u32,
+                ));
+            }
+            self.values
+                .lock()
+                .expect("keychain")
+                .insert(account.to_owned(), value.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) {
+            self.values.lock().expect("keychain").remove(account);
+        }
+    }
+
+    /// A store over the capped keychain, with the fallback under a fresh
+    /// temp path. The directory is not pre-created: whether it exists is
+    /// itself an assertion.
+    fn capped_store(label: &str) -> (KeyringStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "jamstream-creds-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = KeyringStore {
+            keychain: Box::new(CappedKeychain::default()),
+            fallback_dir: Ok(dir.clone()),
+        };
+        (store, dir)
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// A GCP service account key sized secret: the keychain refuses it, the
+    /// file takes it, and set/get/delete behave as if the keychain had.
+    #[test]
+    fn a_secret_the_keychain_refuses_round_trips_through_a_private_file() {
+        let (store, dir) = capped_store("oversized");
+        let (provider, field) = GCP_SERVICE_ACCOUNT_JSON;
+        let secret = "x".repeat(2500);
+        store.set(provider, field, &secret).expect("set");
+
+        let path = dir.join("gcp.service_account_json");
+        assert!(path.is_file(), "the fallback file was not written");
+        assert_eq!(
+            store.keychain.get("gcp.service_account_json"),
+            None,
+            "the keychain must hold nothing for a slot the file owns"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_of(&dir), 0o700);
+            assert_eq!(mode_of(&path), 0o600);
+        }
+        assert_eq!(store.get(provider, field), Some(secret));
+
+        store.delete(provider, field);
+        assert!(!path.exists(), "delete left the file behind");
+        assert_eq!(store.get(provider, field), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A secret the keychain takes never reaches the disk: not the file,
+    /// not even the directory.
+    #[test]
+    fn a_keychain_sized_secret_never_touches_the_file_path() {
+        let (store, dir) = capped_store("small");
+        store.set(DO_TOKEN.0, DO_TOKEN.1, "dop_v1_x").expect("set");
+        assert!(!dir.exists(), "a fitting secret created the fallback dir");
+        assert_eq!(
+            store.get(DO_TOKEN.0, DO_TOKEN.1).as_deref(),
+            Some("dop_v1_x")
+        );
+        store.delete(DO_TOKEN.0, DO_TOKEN.1);
+        assert_eq!(store.get(DO_TOKEN.0, DO_TOKEN.1), None);
+    }
+
+    /// The boundary is the backend's: 1280 ASCII characters is the last
+    /// password that fits, one more falls back. And because a refused save
+    /// leaves the keychain's old value in place, the fallback has to evict
+    /// it or every later read would return the stale shorter secret.
+    #[test]
+    fn the_fallback_starts_exactly_past_the_blob_cap_and_evicts_the_stale_entry() {
+        let (store, dir) = capped_store("boundary");
+        let (provider, field) = GCP_SERVICE_ACCOUNT_JSON;
+        store.set(provider, field, &"a".repeat(1280)).expect("set");
+        assert!(!dir.exists(), "1280 chars fits the cap");
+
+        let grown = "b".repeat(1281);
+        store.set(provider, field, &grown).expect("set");
+        assert!(dir.join("gcp.service_account_json").is_file());
+        assert_eq!(
+            store.get(provider, field),
+            Some(grown),
+            "the keychain's stale value shadowed the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reverse move: a shorter secret saved over an oversized one lands
+    /// in the keychain and must take the file with it, or a credential
+    /// nothing will ever read again stays on disk.
+    #[test]
+    fn a_shorter_secret_saved_over_an_oversized_one_removes_the_file() {
+        let (store, dir) = capped_store("shrink");
+        let (provider, field) = GCP_SERVICE_ACCOUNT_JSON;
+        store.set(provider, field, &"x".repeat(2500)).expect("set");
+        let path = dir.join("gcp.service_account_json");
+        assert!(path.is_file());
+
+        store.set(provider, field, "small").expect("set");
+        assert!(!path.exists(), "the oversized copy stayed on disk");
+        assert_eq!(store.get(provider, field).as_deref(), Some("small"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
