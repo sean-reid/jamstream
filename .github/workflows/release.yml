@@ -441,6 +441,43 @@ jobs:
       # compile offline.
       - run: cargo fetch --locked
       - run: cargo build --locked --offline --release -p jamstream-client -p jamstream-cli -p jamstream-server
+      # The peer of the other platforms' artifact checks (lipo -archs on
+      # macOS, file + readelf on Linux). Windows had none: a zip whose exe
+      # could not start would have shipped checksummed and verified. The
+      # app exe opens a window, so its smoke is the header check below.
+      - name: The built binaries run and match the tag
+        shell: bash
+        run: |
+          set -eu
+          ./target/release/jamstream.exe --version
+          ./target/release/jamstream.exe --version | grep -qF "${TAG#v}"
+          ./target/release/jamstreamd.exe --version
+      # Machine type is a hard gate; the subsystem and import table are
+      # printed as measurements. Tightening imports to an allowlist wants
+      # the distribution from a few real releases first, and asserting the
+      # GUI subsystem waits on the windows_subsystem change itself.
+      - name: The exes are x64, and what they import is on the record
+        shell: powershell
+        run: |
+          foreach ($exe in 'jamstream.exe', 'jamstream-app.exe', 'jamstreamd.exe') {
+            $b = [IO.File]::ReadAllBytes("target/release/$exe")
+            $pe = [BitConverter]::ToInt32($b, 0x3C)
+            $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+            $subsystem = [BitConverter]::ToUInt16($b, $pe + 24 + 68)
+            '{0}: machine=0x{1:X4} subsystem={2}' -f $exe, $machine, $subsystem
+            if ($machine -ne 0x8664) { throw "$exe is not an x86_64 PE image" }
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe "$vs\VC\Tools\MSVC" |
+            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          if ($dumpbin) {
+            foreach ($exe in 'jamstream.exe', 'jamstream-app.exe', 'jamstreamd.exe') {
+              & $dumpbin.FullName /nologo /dependents "target/release/$exe"
+            }
+          } else {
+            Write-Output 'dumpbin not found; import tables not recorded this release'
+          }
       # Placeholder: Authenticode signing of both .exe files lands once a
       # Windows code-signing certificate exists.
       - name: Sign Windows binaries (not yet implemented)
@@ -455,6 +492,14 @@ jobs:
         run: |
           7z a jamstream-cli-windows-x86_64.zip ./target/release/jamstream.exe
           7z a jamstream-app-windows-x86_64.zip ./target/release/jamstream-app.exe ./target/release/jamstreamd.exe ./crates/client/assets/icon/jamstream.ico
+          # install.ps1 extracts by name and uninstall.ps1 deletes exactly
+          # this list; a stored path prefix or a missing member breaks both,
+          # so the layout is asserted rather than trusted. 7z was handed
+          # multi-segment paths above and derives the stored names itself.
+          7z l -ba -slt jamstream-cli-windows-x86_64.zip | tr -d '\r' | sed -n 's/^Path = //p' | sort > cli-contents.txt
+          printf 'jamstream.exe\n' | cmp - cli-contents.txt
+          7z l -ba -slt jamstream-app-windows-x86_64.zip | tr -d '\r' | sed -n 's/^Path = //p' | sort > app-contents.txt
+          printf 'jamstream-app.exe\njamstream.ico\njamstreamd.exe\n' | cmp - app-contents.txt
           gh release upload "$TAG" \
             jamstream-cli-windows-x86_64.zip \
             jamstream-app-windows-x86_64.zip \
