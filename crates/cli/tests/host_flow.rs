@@ -95,19 +95,29 @@ async fn host_end_and_sweep_flow() {
     assert_eq!(running.len(), 1);
     assert_eq!(running[0].session_id(), Some(session_id));
 
-    // Status sees the running session.
+    // Status sees the running session, corroborated against a provider that
+    // still lists its instance.
     let mut out = Vec::new();
     status::run(
         &StatusArgs {
             hours: 3.0,
             json: false,
         },
+        |name| {
+            assert_eq!(name, "mock");
+            let p = MockProvider::with_default_regions(ProviderKind::Aws);
+            let region = p.regions()[0].clone();
+            p.seed_instance(&region, vec![session_tag(session_id)]);
+            Ok(Box::new(p))
+        },
         &mut out,
     )
+    .await
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains(&session_id[..8]));
     assert!(text.contains("running"));
+    assert!(!text.contains("stale"), "status output: {text}");
 
     // End by prefix destroys the instance and flips the state file.
     let end_args = EndArgs {

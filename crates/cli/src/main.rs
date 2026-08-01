@@ -43,7 +43,7 @@ async fn dispatch<W: Write + Send>(cli: Cli, out: &mut W) -> Result<(), CliError
             let provider = providers::resolve_for_host(&args)?;
             host::run(&args, provider.as_ref(), out).await
         }
-        Command::Status(args) => status::run(&args, out),
+        Command::Status(args) => status::run(&args, providers::resolve, out).await,
         Command::End(args) => {
             let (path, session) = end::select(&args)?;
             let provider = end::resolve_provider(&session)?;

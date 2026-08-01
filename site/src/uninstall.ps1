@@ -72,15 +72,17 @@ foreach ($name in $owned) {
     }
 }
 
-if ($removed -eq 0) {
-    Write-Host "nothing to remove: no JamStream binaries in $InstallDir"
-    Write-Host 'A zip extracted by hand is uninstalled by deleting that folder. Data lives'
-    Write-Host "at $env:LOCALAPPDATA\jamstream, credentials in Credential Manager."
-} elseif ((Test-Path $InstallDir) -and -not (Get-ChildItem -Force $InstallDir)) {
+# An empty directory goes even when no binary was found; a failed install
+# can leave one behind, and it is still ours.
+if ((Test-Path $InstallDir) -and -not (Get-ChildItem -Force $InstallDir)) {
     Remove-Item -Force $InstallDir
     Write-Host "removed the empty $InstallDir"
     Write-Host 'If you added it to your Path, remove it there too: Settings, System, About,'
     Write-Host 'Advanced system settings, Environment Variables, user Path.'
+} elseif ($removed -eq 0) {
+    Write-Host "nothing to remove: no JamStream binaries in $InstallDir"
+    Write-Host 'A zip extracted by hand is uninstalled by deleting that folder. Data lives'
+    Write-Host "at $env:LOCALAPPDATA\jamstream, credentials in Credential Manager."
 }
 
 # Data: session records and recordings under the local app data directory,

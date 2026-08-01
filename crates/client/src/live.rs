@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use data_encoding::HEXLOWER;
 use jamstream_audio_io::{
-    AudioBackend, AudioError, CallbackBridge, EngineSide, StreamConfig, StreamHandle, WavBackend,
-    WavStream,
+    AudioBackend, AudioError, CallbackBridge, DuplexHandler, EngineSide, StreamConfig,
+    StreamHandle, WavBackend, WavStream,
 };
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
 use jamstream_protocol::control::{RecordOp, RecordingState};
@@ -71,6 +71,15 @@ const SYSTEM_MEMBER: MemberId = MemberId(u16::MAX);
 /// ~2x buffer_frames. Floor of one 2.5 ms frame of slack.
 fn ring_capacity(buffer_frames: u32) -> usize {
     2 * buffer_frames.max(FRAME_FRAMES as u32) as usize * usize::from(CHANNELS)
+}
+
+/// Frames the ring is sized from: the request, or the callback size the
+/// device negotiated when that is bigger. A device is free to ignore the
+/// request (WASAPI shared mode calls back at its period, ~480 frames against
+/// the 120 default), and a ring sized from the request alone then underruns
+/// on every render callback and drops the tail of every capture (#323).
+fn ring_frames(requested: u32, negotiated: Option<u32>) -> u32 {
+    negotiated.unwrap_or(0).max(requested)
 }
 
 /// Device selection plus buffer size, as picked on the settings screen.
@@ -229,23 +238,68 @@ impl Driver {
     /// Opens a fresh bridge and stream for `settings`, replacing nothing:
     /// callers close the previous stream first so real backends never see
     /// two streams on one device.
-    fn open(&mut self, settings: &AudioSettings) -> Result<EngineSide, AudioError> {
-        let buffer_frames = settings.buffer_frames.max(32);
+    ///
+    /// Returns the engine side and the frames the ring was sized from. The
+    /// callback size is only knowable from an open stream, so the ring is
+    /// first sized from the request; when the stream then reports callbacks
+    /// the ring cannot absorb, it is reopened once over a ring that can.
+    fn open(&mut self, settings: &AudioSettings) -> Result<(EngineSide, u32), AudioError> {
+        let requested = settings.buffer_frames.max(32);
         let config = StreamConfig {
             sample_rate: SAMPLE_RATE,
-            buffer_frames,
+            buffer_frames: requested,
             channels: CHANNELS,
         };
-        let (device, engine) = CallbackBridge::new(ring_capacity(buffer_frames));
+        let mut frames = requested;
+        let mut resized = false;
+        loop {
+            let (device, engine) = CallbackBridge::new(ring_capacity(frames));
+            let negotiated = self.open_stream(config, device.into_handler(), settings)?;
+            let needed = ring_frames(requested, negotiated);
+            if needed <= frames {
+                return Ok((engine, frames));
+            }
+            if resized {
+                // Two different answers in a row; chasing it would reopen
+                // forever, so keep this ring and let the bridge counters
+                // say whether it falls short.
+                tracing::warn!(
+                    negotiated = needed,
+                    ring = frames,
+                    "device callback size will not settle; keeping the ring"
+                );
+                return Ok((engine, frames));
+            }
+            tracing::info!(
+                requested,
+                negotiated = needed,
+                "device delivers bigger callbacks than requested; resizing the ring"
+            );
+            self.close();
+            frames = needed;
+            resized = true;
+        }
+    }
+
+    /// Opens the stream itself and reports the callback size the device
+    /// negotiated, where the backend can say.
+    fn open_stream(
+        &mut self,
+        config: StreamConfig,
+        handler: DuplexHandler,
+        settings: &AudioSettings,
+    ) -> Result<Option<u32>, AudioError> {
         match self {
             Driver::Real { backend, handle } => {
                 let new = backend.open_duplex(
                     settings.capture_id.as_deref(),
                     settings.playback_id.as_deref(),
                     config,
-                    device.into_handler(),
+                    handler,
                 )?;
+                let negotiated = new.buffer_frames();
                 *handle = Some(new);
+                Ok(negotiated)
             }
             Driver::Offline {
                 backend,
@@ -253,14 +307,14 @@ impl Driver {
                 epoch,
                 pumped_frames,
             } => {
-                *stream = Some(Box::new(
-                    backend.open_offline(config, device.into_handler())?,
-                ));
+                let new = Box::new(backend.open_offline(config, handler)?);
+                let negotiated = new.buffer_frames();
+                *stream = Some(new);
                 *epoch = Instant::now();
                 *pumped_frames = 0;
+                Ok(negotiated)
             }
         }
-        Ok(engine)
     }
 
     fn close(&mut self) {
@@ -397,14 +451,18 @@ impl LiveRuntime {
         mut driver: Driver,
     ) -> Result<LiveRuntime, LiveError> {
         let addr = *invite.addresses.first().ok_or(LiveError::NoAddress)?;
-        let engine = driver.open(&settings).map_err(LiveError::Audio)?;
+        let (mut engine, device_frames) = driver.open(&settings).map_err(LiveError::Audio)?;
         let socket = connect_socket(addr).map_err(LiveError::Io)?;
         let (core, init) = ClientCore::connect(invite, 0).map_err(LiveError::Session)?;
         let _ = socket.send(&init);
 
         let shared = Arc::new(Mutex::new(SharedState::new(invite, addr)));
         let (tx, rx) = mpsc::channel();
-        let capture_capacity = ring_capacity(settings.buffer_frames.max(32));
+        let capture_capacity = ring_capacity(device_frames);
+        // A fresh ring starts at its steady-state depth, as in try_open:
+        // real device callbacks begin before the worker's first top-up, and
+        // an empty ring would read as an underrun at every session start.
+        engine.push_playout(&vec![0.0; capture_capacity]);
         let worker = Worker {
             core,
             socket,
@@ -413,6 +471,9 @@ impl LiveRuntime {
             ever_joined: false,
             driver,
             engine: Some(engine),
+            device_frames,
+            ring_underrun_warned: false,
+            ring_overrun_warned: false,
             settings,
             shared: Arc::clone(&shared),
             rx,
@@ -718,6 +779,14 @@ struct Worker {
     /// None while the stream is lost or being reopened; the network side
     /// keeps running so the session survives an unplugged interface.
     engine: Option<EngineSide>,
+    /// Frames the current ring was sized from: the settings' request, or the
+    /// device's own callback size when the device negotiated a bigger one.
+    device_frames: u32,
+    /// One warn per stream when each bridge counter first moves; the
+    /// counters had no other consumer, so a ring the device outgrew was
+    /// audible but invisible (#323).
+    ring_underrun_warned: bool,
+    ring_overrun_warned: bool,
     settings: AudioSettings,
     shared: Arc<Mutex<SharedState>>,
     rx: mpsc::Receiver<ThreadMsg>,
@@ -797,6 +866,8 @@ impl Worker {
                 break;
             }
         }
+
+        self.watch_ring_health();
 
         let now_ms = self.now_ms();
         for pkt in self.core.poll(now_ms) {
@@ -937,8 +1008,8 @@ impl Worker {
 
     fn try_open(&mut self) -> bool {
         match self.driver.open(&self.settings) {
-            Ok(mut engine) => {
-                let capacity = ring_capacity(self.settings.buffer_frames.max(32));
+            Ok((mut engine, device_frames)) => {
+                let capacity = ring_capacity(device_frames);
                 self.capture_buf.resize(capacity, 0.0);
                 // Prefill the fresh playout ring (its steady-state depth) with
                 // silence. Refilling it from the core would burst-pull several
@@ -948,6 +1019,9 @@ impl Worker {
                 // would stay silent for the rest of the session.
                 engine.push_playout(&vec![0.0; capacity]);
                 self.engine = Some(engine);
+                self.device_frames = device_frames;
+                self.ring_underrun_warned = false;
+                self.ring_overrun_warned = false;
                 self.carry_pos = 0;
                 self.carry_len = 0;
                 let mut shared = self.shared.lock().expect("live state");
@@ -1046,6 +1120,35 @@ impl Worker {
         };
         self.levels.output_peak = inst_peak.max(self.levels.output_peak * LEVEL_DECAY);
         self.levels.output_rms = inst_rms.max(self.levels.output_rms * LEVEL_DECAY);
+    }
+
+    /// One warn per stream when each bridge counter first moves. Steady
+    /// movement means the ring is undersized for the callbacks the device
+    /// really delivers, which is exactly the shape of #323; the log is the
+    /// one place that class of defect shows as something other than bad
+    /// audio.
+    fn watch_ring_health(&mut self) {
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let underruns = engine.underruns();
+        if underruns > 0 && !self.ring_underrun_warned {
+            self.ring_underrun_warned = true;
+            tracing::warn!(
+                underruns,
+                ring_frames = self.device_frames,
+                "playout ring ran dry; the device padded silence"
+            );
+        }
+        let overruns = engine.overruns();
+        if overruns > 0 && !self.ring_overrun_warned {
+            self.ring_overrun_warned = true;
+            tracing::warn!(
+                overruns,
+                ring_frames = self.device_frames,
+                "capture ring overflowed; captured audio was dropped"
+            );
+        }
     }
 
     fn drain_events(&mut self, now_ms: u64) {
@@ -1211,12 +1314,13 @@ impl Worker {
         //   rtt / 2                      the downlink network leg
         // + jitter depth * 2.5 ms        playout buffering ahead of decode
         // + 2.5 ms                       one media frame of encode latency
-        // + buffer_frames / 48 ms        the capture device buffer
+        // + device_frames / 48 ms        the capture device buffer, as the
+        //                                device negotiated it, not as asked
         s.mouth_to_ear_ms = stats.rtt_ms_last.map(|rtt| {
             rtt / 2.0
                 + stats.jitter.depth_frames as f32 * 2.5
                 + 2.5
-                + self.settings.buffer_frames as f32 / 48.0
+                + self.device_frames as f32 / 48.0
         });
         s.levels = self.levels;
     }
@@ -1319,5 +1423,24 @@ mod tests {
             "{FRAME_FRAMES} samples at {SAMPLE_RATE} Hz is not {TICK:?} of audio"
         );
         assert_eq!(CHUNK_STEREO, FRAME_FRAMES * usize::from(CHANNELS));
+    }
+
+    /// The sizing at the heart of #323: the ring must fit the callbacks the
+    /// device really delivers, and the request is only a lower bound.
+    #[test]
+    fn the_ring_is_sized_from_what_the_device_delivers() {
+        // WASAPI shared mode: 120 asked for, the ~10 ms device period given.
+        assert_eq!(ring_frames(120, Some(480)), 480);
+        assert_eq!(
+            ring_capacity(ring_frames(120, Some(480))),
+            2 * 480 * usize::from(CHANNELS),
+            "the 2x headroom applies to the negotiated size"
+        );
+        // A device that honours the request keeps the requested cushion.
+        assert_eq!(ring_frames(120, Some(120)), 120);
+        // A backend that cannot say leaves the request in charge.
+        assert_eq!(ring_frames(240, None), 240);
+        // A smaller negotiation never shrinks the ring below the request.
+        assert_eq!(ring_frames(240, Some(32)), 240);
     }
 }

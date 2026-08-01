@@ -422,11 +422,19 @@ pub enum Action {
     Have,
 }
 
-/// Where one take is written, refusing a name that would land outside `dir`.
+/// Where one take is written, refusing a name that would land outside `dir`
+/// or that some filesystem would misread.
 ///
 /// The server writes takes under a sanitized prefix, but the bucket belongs to
 /// the host and an object store key is an arbitrary string: `..` in one is a
 /// valid key and would be a write into somebody's home directory.
+///
+/// The Win32 name rules are checked on every platform, not just Windows: a
+/// bucket written by a Windows host is read on a mac and the other way
+/// around, so the namespace rules travel with the data. Without this,
+/// `NUL.flac` opens the device and reports success with no file, a colon
+/// writes an alternate data stream, and a trailing dot collapses onto
+/// another take's name.
 pub fn destination(dir: &Path, take: &Take) -> Result<PathBuf, CliError> {
     let relative = Path::new(&take.name);
     let contained = !take.name.is_empty()
@@ -439,6 +447,17 @@ pub fn destination(dir: &Path, take: &Take) -> Result<PathBuf, CliError> {
             take.key,
             dir.display()
         )));
+    }
+    // Split on the key's own separator rather than the platform's, so a
+    // backslash inside a component is judged, not swallowed as a separator.
+    for part in take.name.split('/') {
+        if let Some(hazard) = jamstream_cloud::windows_hazard(part) {
+            return Err(CliError::Failed(format!(
+                "refusing to download {:?}: {part:?} {hazard}, and a take's name has to work on \
+                 every platform",
+                take.key
+            )));
+        }
     }
     // One component at a time: take names use forward slashes, and joining
     // the name whole on Windows keeps them verbatim inside a
@@ -799,6 +818,68 @@ mod tests {
         }
         // And the plan refuses before anything is priced or downloaded.
         assert!(plan_downloads(&[take("../escape.flac")], dir).is_err());
+    }
+
+    /// The Win32 name rules travel with the bucket, so a key only some
+    /// filesystems can hold is refused on every platform: on Windows it would
+    /// open a device, write an alternate data stream, or collapse onto
+    /// another name, and a mac downloading it would upload it right back.
+    #[test]
+    fn a_key_only_some_filesystems_can_hold_is_refused() {
+        let dir = Path::new("/tmp/takes");
+        let take = |name: &str| Take {
+            key: format!("jamstream/recordings/s1/{name}"),
+            name: name.to_owned(),
+            size: 4,
+            last_modified: None,
+        };
+        for hostile in [
+            // DOS device names, bare, cased, with an extension, and nested.
+            "NUL",
+            "nul.flac",
+            "CON",
+            "com1.flac",
+            "LPT9",
+            "stems/NUL.flac",
+            // A colon writes an alternate data stream.
+            "mix.flac:hidden",
+            // The other reserved characters.
+            "a<b.flac",
+            "a>b.flac",
+            "quote\".flac",
+            "pipe|.flac",
+            "what?.flac",
+            "star*.flac",
+            "back\\slash.flac",
+            // Win32 strips these, collapsing the file onto another name.
+            "mix.flac.",
+            "mix.flac ",
+            "stems /bass.flac",
+        ] {
+            let err = destination(dir, &take(hostile)).unwrap_err().to_string();
+            assert!(
+                err.contains("has to work on every platform"),
+                "{hostile:?}: {err}"
+            );
+        }
+        // The names the recorder produces, and their lookalikes, keep working.
+        for fine in [
+            "jamstream-2026-08-01-1930-mix.flac",
+            "stems/bass.flac",
+            "jamstream-2026-08-01-1930-Sørén.flac",
+            "NULL.flac",
+            "COM10.flac",
+            "concert.flac",
+        ] {
+            let name = fine.split('/').next_back().unwrap();
+            assert_eq!(
+                destination(dir, &take(fine)).unwrap().file_name().unwrap(),
+                std::ffi::OsStr::new(name),
+                "{fine:?} must keep working"
+            );
+        }
+        // And the plan refuses a hazard before anything is priced.
+        assert!(plan_downloads(&[take("NUL.flac")], dir).is_err());
     }
 
     /// Progress has to be readable in a log, so a pipe gets whole lines at
