@@ -332,11 +332,9 @@ impl LocalProvider {
         }
         if let Ok(exe) = std::env::current_exe()
             && let Some(dir) = exe.parent()
+            && let Some(sibling) = resolve_beside(dir)
         {
-            let sibling = dir.join(BIN_NAME);
-            if sibling.is_file() {
-                return Ok(sibling);
-            }
+            return Ok(sibling);
         }
         if let Some(on_path) = find_on_path(BIN_NAME) {
             return Ok(on_path);
@@ -1009,6 +1007,16 @@ fn self_limit(user_data: &str, key: &str, fallback: u32) -> String {
             fallback.to_string()
         }
     }
+}
+
+/// The app-adjacent step of the resolution order: the `jamstreamd` release
+/// artifacts place in `dir`, which production always passes as the current
+/// executable's own directory. Split out so the rule is testable against a
+/// directory the test owns: an exe-named fixture in the live target/ dir
+/// loses sharing-violation races on Windows.
+fn resolve_beside(dir: &Path) -> Option<PathBuf> {
+    let sibling = dir.join(BIN_NAME);
+    sibling.is_file().then_some(sibling)
 }
 
 fn find_on_path(bin: &str) -> Option<PathBuf> {
@@ -1951,24 +1959,20 @@ mod tests {
 
     /// The app-bundling story: release artifacts place jamstreamd beside
     /// the app/CLI binary, and resolution must find it there with no
-    /// override, no env var, and no PATH entry. The test binary stands in
-    /// for the app executable.
+    /// override, no env var, and no PATH entry. Asserted against a private
+    /// directory standing in for the install dir: this test used to drop
+    /// its fixture beside the real test executable, and on Windows a new
+    /// exe-named file in the shared target/ dir loses sharing-violation
+    /// races with the scanners watching it.
     #[test]
     fn resolves_the_binary_beside_the_current_executable() {
-        if std::env::var_os("JAMSTREAMD_PATH").is_some_and(|v| !v.is_empty()) {
-            // The env var outranks the sibling by design; this test is
-            // about the sibling step, so a preconfigured env skips it.
-            eprintln!("skipping: JAMSTREAMD_PATH is set in this environment");
-            return;
-        }
-        let exe = std::env::current_exe().unwrap();
-        let sibling = exe.parent().unwrap().join(BIN_NAME);
+        let dir = temp_dir("adjacent");
+        assert_eq!(resolve_beside(&dir), None, "an empty dir offers nothing");
+        let sibling = dir.join(BIN_NAME);
         // Resolution only asks whether the file exists; nothing runs it.
         std::fs::write(&sibling, b"stand-in for a bundled jamstreamd\n").unwrap();
-        let provider = LocalProvider::new(temp_dir("adjacent").join("state"));
-        let resolved = provider.resolve_server_binary().unwrap();
-        assert_eq!(resolved, sibling);
-        let _ = std::fs::remove_file(&sibling);
+        assert_eq!(resolve_beside(&dir), Some(sibling));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `destroy` removes the session directory, so the id it comes from has
