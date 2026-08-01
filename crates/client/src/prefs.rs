@@ -1,16 +1,18 @@
-//! Machine-local recording preferences: which bucket a provider's takes go to
-//! and how long they are kept.
+//! Machine-local preferences: which bucket a provider's takes go to and how
+//! long they are kept ([`RecordingPrefs`]), and the audio setup this computer
+//! uses ([`AppPrefs`]).
 //!
-//! A file rather than the keychain, because none of it is secret: the key that
-//! writes the bucket is in the keychain and nothing here can hold one. A file
-//! rather than session state, because a bucket is set up once per computer,
-//! before the session that needs it exists.
+//! Files rather than the keychain, because none of it is secret: the key that
+//! writes the bucket is in the keychain and nothing here can hold one. Files
+//! rather than session state, because these are set up once per computer,
+//! before the session that needs them exists.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use jamstream_cloud::Retention;
 use jamstream_cloud::private::{create_private_dir, write_private};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// One provider's bucket: its name and the region it lives in. The region is
@@ -79,22 +81,64 @@ impl RecordingPrefs {
     /// will not decode is an error rather than silent defaults: a host who set a
     /// bucket should not find recording quietly off.
     pub fn load_from(path: &Path) -> Result<RecordingPrefs, String> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
-                .map_err(|e| format!("cannot read {}: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RecordingPrefs::default()),
-            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-        }
+        load_json(path)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            create_private_dir(parent).map_err(|e| e.to_string())?;
-        }
-        let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        write_private(path, body.as_bytes()).map_err(|e| e.to_string())?;
-        Ok(())
+        save_json(path, self)
     }
+}
+
+/// The audio setup this computer uses, restored at the next launch: the
+/// selected devices by backend id (`None` is the System default entry), and
+/// the buffer size. Every launch used to start back on the defaults (#328).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppPrefs {
+    #[serde(default)]
+    pub capture_id: Option<String>,
+    #[serde(default)]
+    pub playback_id: Option<String>,
+    /// Applied only when it is one of the picker's own choices, so a hand
+    /// edit cannot smuggle in a size no picker offers.
+    #[serde(default)]
+    pub buffer_frames: Option<u32>,
+}
+
+impl AppPrefs {
+    /// Reads `path`, or the defaults when there is no file yet. Unlike the
+    /// recording prefs, a file that will not decode falls back to the
+    /// defaults with a log line: nothing in here is a promise whose silent
+    /// loss costs data, and refusing to start the audio setup over it would
+    /// punish the wrong thing.
+    pub fn load_from(path: &Path) -> AppPrefs {
+        load_json(path).unwrap_or_else(|err| {
+            tracing::warn!(%err, "audio preferences unreadable; using defaults");
+            AppPrefs::default()
+        })
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        save_json(path, self)
+    }
+}
+
+fn load_json<T: Default + DeserializeOwned>(path: &Path) -> Result<T, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|e| format!("cannot read {}: {e}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    write_private(path, body.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// `recording.json` beside the session records this machine already keeps.
@@ -106,6 +150,15 @@ impl RecordingPrefs {
 pub fn path() -> Result<PathBuf, String> {
     jamstream_cli::state::state_dir()
         .map(|dir| dir.join("recording.json"))
+        .map_err(|e| e.to_string())
+}
+
+/// `settings.json` beside `recording.json`, holding [`AppPrefs`]. Its own
+/// file rather than more fields in recording.json, because that file is the
+/// Recording tab's and reads like the session records beside it.
+pub fn app_path() -> Result<PathBuf, String> {
+    jamstream_cli::state::state_dir()
+        .map(|dir| dir.join("settings.json"))
         .map_err(|e| e.to_string())
 }
 
@@ -181,6 +234,28 @@ mod tests {
         std::fs::write(&path, "{not json").expect("write");
         let err = RecordingPrefs::load_from(&path).expect_err("a broken file is not defaults");
         assert!(err.contains("recording.json"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_preferences_round_trip_and_a_broken_file_reads_as_defaults() {
+        let dir = std::env::temp_dir().join(format!("jamstream-app-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        assert_eq!(AppPrefs::load_from(&path), AppPrefs::default());
+
+        let prefs = AppPrefs {
+            capture_id: Some("coreaudio:scarlett-in".to_owned()),
+            playback_id: None,
+            buffer_frames: Some(240),
+        };
+        prefs.save_to(&path).expect("save");
+        assert_eq!(AppPrefs::load_from(&path), prefs);
+
+        // Unlike the recording prefs, a broken settings file is defaults with
+        // a log line, not a refusal: nothing here loses data silently.
+        std::fs::write(&path, "{not json").expect("write");
+        assert_eq!(AppPrefs::load_from(&path), AppPrefs::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

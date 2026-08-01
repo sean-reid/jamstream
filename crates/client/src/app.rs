@@ -143,6 +143,10 @@ pub struct JamApp {
     applied_audio: AudioSettings,
     /// How Rescan re-enumerates; see [`Enumerator`].
     pub enumerate: Enumerator,
+    /// Where the audio setup is remembered between launches, `None` in tests
+    /// and in-memory apps so no fixture reads or rewrites the developer's
+    /// own (#328).
+    pub settings_path: Option<std::path::PathBuf>,
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
@@ -201,6 +205,7 @@ impl JamApp {
             own_avatar_bytes: None,
             applied_audio: AudioSettings::default(),
             enumerate: Arc::new(|| Ok(DeviceCatalog::demo())),
+            settings_path: None,
             ending: None,
             join: system_joiner(),
             creds,
@@ -246,8 +251,55 @@ impl JamApp {
                 };
             }
         }
+        app.settings_path = crate::prefs::app_path().ok();
+        app.restore_audio_prefs();
         app.applied_audio = app.audio_settings();
         app
+    }
+
+    /// Puts the saved audio setup back on the pickers: each device by id and
+    /// only when the catalog still holds it, so a selection whose interface
+    /// is unplugged today quietly stays on the system default, and the buffer
+    /// only when it is one of the picker's own choices.
+    pub fn restore_audio_prefs(&mut self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        let prefs = crate::prefs::AppPrefs::load_from(path);
+        if prefs.capture_id.is_some() {
+            let (idx, found) = DeviceCatalog::find(&self.catalog.capture, &prefs.capture_id);
+            if found {
+                self.devices.capture_idx = idx;
+            }
+        }
+        if prefs.playback_id.is_some() {
+            let (idx, found) = DeviceCatalog::find(&self.catalog.playback, &prefs.playback_id);
+            if found {
+                self.devices.playback_idx = idx;
+            }
+        }
+        if let Some(frames) = prefs.buffer_frames
+            && crate::screens::devices::BUFFER_CHOICES.contains(&frames)
+        {
+            self.devices.buffer_frames = frames;
+        }
+    }
+
+    /// Writes the audio setup where the next launch reads it. Failure is a
+    /// log line: losing a remembered picker beats interrupting a session.
+    fn persist_audio_prefs(&self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        let settings = self.audio_settings();
+        let prefs = crate::prefs::AppPrefs {
+            capture_id: settings.capture_id,
+            playback_id: settings.playback_id,
+            buffer_frames: Some(settings.buffer_frames),
+        };
+        if let Err(err) = prefs.save_to(path) {
+            tracing::warn!(%err, "audio preferences not saved");
+        }
     }
 
     /// Rescan: re-enumerate and keep the selection by device id. A selected
@@ -592,6 +644,7 @@ impl JamApp {
             if let Some(live) = &self.live {
                 live.reconfigure_audio(selected);
             }
+            self.persist_audio_prefs();
         }
 
         // Every surface has had its turn: whatever avatar texture nothing

@@ -2541,6 +2541,8 @@ fn rescan_keeps_the_selection_by_id_and_a_lost_device_falls_back_visibly() {
         catalog.playback.push(DeviceInfo {
             name: "USB DAC".to_owned(),
             id: Some("demo:USB DAC".to_owned()),
+            min_buffer_frames: None,
+            max_buffer_frames: None,
         });
         Ok(catalog)
     });
@@ -2580,4 +2582,74 @@ fn rescan_keeps_the_selection_by_id_and_a_lost_device_falls_back_visibly() {
         playback_idx, 2,
         "the playback pick has to survive a rescan that kept its device"
     );
+}
+
+/// The audio setup survives a relaunch: a buffer clicked and a device picked
+/// land in settings.json, and the next app restores them, by device id and
+/// only while the catalog still holds the device (#328). The write is driven
+/// by the real click, so the persistence hangs off the same change detection
+/// that reconfigures a live stream.
+#[test]
+fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    // A private subdirectory, not temp_dir() itself: the settings writer
+    // refuses a world-writable parent, and Linux's /tmp is one.
+    let dir = std::env::temp_dir().join(format!("jamstream-audio-prefs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    let path = dir.join("settings.json");
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    app.settings_path = Some(path.clone());
+    app.devices.capture_idx = 1; // Scarlett 2i2 input
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(AkRole::RadioButton, "240 frames (5.0 ms)")
+        .click_accesskit();
+    harness.run_steps(4);
+
+    let saved = std::fs::read_to_string(&path).expect("the click has to write settings.json");
+    assert!(saved.contains("240"), "{saved}");
+    assert!(saved.contains("demo:Scarlett 2i2 input"), "{saved}");
+
+    // The next launch: same file, and the device is still in the catalog.
+    let mut next = JamApp::in_memory();
+    next.settings_path = Some(path.clone());
+    next.restore_audio_prefs();
+    assert_eq!(next.devices.buffer_frames, 240);
+    assert_eq!(next.devices.capture_idx, 1, "restored by id, not by index");
+
+    // And a launch whose catalog no longer holds the device stays on the
+    // system default instead of showing some other device's name.
+    let mut unplugged = JamApp::in_memory();
+    unplugged
+        .catalog
+        .capture
+        .retain(|d| d.id.as_deref() != Some("demo:Scarlett 2i2 input"));
+    unplugged.settings_path = Some(path);
+    unplugged.restore_audio_prefs();
+    assert_eq!(unplugged.devices.capture_idx, 0);
+    assert_eq!(
+        unplugged.devices.buffer_frames, 240,
+        "the buffer still restores"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

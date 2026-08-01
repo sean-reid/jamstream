@@ -11,8 +11,13 @@ use crate::widgets::{Meter, meter, pick_row};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub name: String,
-    /// Backend device id; `None` means the system default (demo entries).
+    /// Backend device id; `None` means the system default entry.
     pub id: Option<String>,
+    /// Buffer size bounds in frames, where the backend reports them. The
+    /// buffer picker annotates choices outside them; a device is free to
+    /// deliver its own period regardless (#328).
+    pub min_buffer_frames: Option<u32>,
+    pub max_buffer_frames: Option<u32>,
 }
 
 /// The label of the `id: None` entry that heads both pickers. Following the
@@ -25,6 +30,10 @@ fn system_default_entry() -> DeviceInfo {
     DeviceInfo {
         name: SYSTEM_DEFAULT.to_owned(),
         id: None,
+        // Which device the default resolves to is the OS's call, so no
+        // bounds can honestly be claimed for it.
+        min_buffer_frames: None,
+        max_buffer_frames: None,
     }
 }
 
@@ -39,6 +48,8 @@ impl DeviceCatalog {
         let dev = |name: &str| DeviceInfo {
             name: name.to_owned(),
             id: Some(format!("demo:{name}")),
+            min_buffer_frames: None,
+            max_buffer_frames: None,
         };
         DeviceCatalog {
             capture: vec![
@@ -68,6 +79,8 @@ impl DeviceCatalog {
                 .chain(rows.into_iter().map(|d| DeviceInfo {
                     name: d.name.clone(),
                     id: Some(d.id.clone()),
+                    min_buffer_frames: d.min_buffer_frames,
+                    max_buffer_frames: d.max_buffer_frames,
                 }))
                 .collect()
         };
@@ -94,6 +107,53 @@ pub const BUFFER_CHOICES: [u32; 3] = [120, 240, 480];
 
 fn buffer_label(frames: u32) -> String {
     format!("{frames} frames ({:.1} ms)", frames as f32 / 48.0)
+}
+
+/// The buffer bounds the selected pair of devices put on a choice: the
+/// stricter of the two minimums (either side padding forces the pair up) and
+/// the stricter of the two maximums. `None` where neither backend reports
+/// one, which is also every System default entry.
+pub fn buffer_bounds(
+    catalog: &DeviceCatalog,
+    capture_idx: usize,
+    playback_idx: usize,
+) -> (Option<u32>, Option<u32>) {
+    let of = |list: &[DeviceInfo], idx: usize| list.get(idx).cloned();
+    let devices = [
+        of(&catalog.capture, capture_idx),
+        of(&catalog.playback, playback_idx),
+    ];
+    let min = devices
+        .iter()
+        .flatten()
+        .filter_map(|d| d.min_buffer_frames)
+        .max();
+    let max = devices
+        .iter()
+        .flatten()
+        .filter_map(|d| d.max_buffer_frames)
+        .min();
+    (min, max)
+}
+
+/// The annotation a buffer choice earns against the device's own bounds, or
+/// `None` inside them. The choice stays clickable either way: the device
+/// negotiates what it really delivers and the ring follows it (#355), so a
+/// pick below the minimum costs the minimum, and the row says so instead of
+/// showing 2.5 ms while the device runs 10 (#328).
+pub fn buffer_choice_note(frames: u32, bounds: (Option<u32>, Option<u32>)) -> Option<String> {
+    let (min, max) = bounds;
+    if let Some(min) = min
+        && frames < min
+    {
+        return Some(format!("device delivers {min} minimum"));
+    }
+    if let Some(max) = max
+        && frames > max
+    {
+        return Some(format!("device delivers {max} maximum"));
+    }
+    None
 }
 
 pub struct DevicesScreen {
@@ -177,14 +237,21 @@ impl DevicesScreen {
         mouth_to_ear_ms: Option<f32>,
         refusal: Option<&str>,
     ) -> Option<DevicesEvent> {
-        self.buffer_ui(ui, block, mouth_to_ear_ms);
+        self.buffer_ui(ui, block, catalog, mouth_to_ear_ms);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
         ui.add_space(theme::SPACE_MD);
         self.devices_ui(ui, block, catalog, refusal)
     }
 
-    fn buffer_ui(&mut self, ui: &mut Ui, block: Block, mouth_to_ear_ms: Option<f32>) {
+    fn buffer_ui(
+        &mut self,
+        ui: &mut Ui,
+        block: Block,
+        catalog: &DeviceCatalog,
+        mouth_to_ear_ms: Option<f32>,
+    ) {
+        let bounds = buffer_bounds(catalog, self.capture_idx, self.playback_idx);
         block.show(ui, |ui| {
             ui.label(theme::title(ui, "Buffer size"));
             ui.label(theme::muted(
@@ -195,8 +262,12 @@ impl DevicesScreen {
             for frames in BUFFER_CHOICES {
                 let label = buffer_label(frames);
                 let selected = self.buffer_frames == frames;
+                let note = buffer_choice_note(frames, bounds);
                 let response = pick_row(ui, &label, selected, true, |ui| {
                     ui.label(label.clone());
+                    if let Some(note) = &note {
+                        ui.label(theme::muted(ui, note.clone()).small());
+                    }
                 });
                 if response.clicked() {
                     self.buffer_frames = frames;
@@ -327,4 +398,56 @@ fn device_combo(ui: &mut Ui, id: &str, devices: &[DeviceInfo], selected: &mut us
                 ui.selectable_value(selected, i, dev.name.clone());
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(min: Option<u32>, max: Option<u32>) -> DeviceInfo {
+        DeviceInfo {
+            name: "dev".to_owned(),
+            id: Some("dev".to_owned()),
+            min_buffer_frames: min,
+            max_buffer_frames: max,
+        }
+    }
+
+    /// The pair's bounds are the stricter of each side's, because a stream
+    /// runs both directions at once and either one padding forces the pair.
+    #[test]
+    fn the_pairs_bounds_are_the_stricter_of_the_two_sides() {
+        let catalog = DeviceCatalog {
+            capture: vec![dev(Some(480), Some(4800))],
+            playback: vec![dev(Some(120), Some(960))],
+        };
+        assert_eq!(buffer_bounds(&catalog, 0, 0), (Some(480), Some(960)));
+        // A side with no report leaves the other side's bound in charge.
+        let catalog = DeviceCatalog {
+            capture: vec![dev(None, None)],
+            playback: vec![dev(Some(240), None)],
+        };
+        assert_eq!(buffer_bounds(&catalog, 0, 0), (Some(240), None));
+        // Nothing reported is nothing claimed, which is the demo catalog and
+        // every System default entry.
+        assert_eq!(buffer_bounds(&DeviceCatalog::demo(), 0, 0), (None, None));
+    }
+
+    /// The shape of #328: "120 frames (2.5 ms)" picked on a device whose
+    /// period is 480 gets an annotation naming the 480 it will really get,
+    /// and choices inside the bounds stay unannotated.
+    #[test]
+    fn choices_outside_the_devices_bounds_say_what_the_device_delivers() {
+        let bounds = (Some(480), Some(4800));
+        assert_eq!(
+            buffer_choice_note(120, bounds).as_deref(),
+            Some("device delivers 480 minimum")
+        );
+        assert_eq!(buffer_choice_note(480, bounds), None);
+        assert_eq!(
+            buffer_choice_note(9600, (None, Some(4800))).as_deref(),
+            Some("device delivers 4800 maximum")
+        );
+        assert_eq!(buffer_choice_note(120, (None, None)), None);
+    }
 }
