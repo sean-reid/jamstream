@@ -51,7 +51,19 @@ irm https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS -
 
 ## Package managers
 
-Homebrew, winget, and the AUR are all planned; none is live yet. Until they are, use the direct downloads above or the one-line install below.
+Homebrew (macOS and Linux) and Scoop (Windows) are live; winget and the AUR are planned. Both channels track releases on their own once added.
+
+```console
+$ brew install --cask sean-reid/jamstream/jamstream   # desktop app
+$ brew install sean-reid/jamstream/jamstream-cli      # CLI, with completions
+```
+
+```console
+scoop bucket add jamstream https://github.com/sean-reid/scoop-jamstream
+scoop install jamstream
+```
+
+`scoop install jamstream-app` installs the desktop app with a Start Menu shortcut; `jamstream` alone is the CLI.
 
 ## Install the CLI in one line
 
