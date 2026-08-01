@@ -103,11 +103,12 @@ try {
     $sums = Join-Path $tmp 'SHA256SUMS'
     if (-not (Get-Asset 'SHA256SUMS' $sums)) {
         Write-Host ''
-        Write-Host 'No JamStream release has been published yet, so there is nothing to download.'
-        Write-Host 'The repository builds from source (Rust toolchain required):'
+        Write-Host 'The latest release has no SHA256SUMS; if a release was just published,'
+        Write-Host 'its uploads may still be running, so retry in a few minutes.'
+        Write-Host 'If no release has been published yet, the repository builds from source'
+        Write-Host '(Rust toolchain required):'
         Write-Host "  git clone https://github.com/$repo; cd jamstream"
         Write-Host '  cargo install --path crates/cli'
-        Write-Host 'This script starts working with the first release.'
         exit 1
     }
 
@@ -116,7 +117,7 @@ try {
         Install-Archive 'jamstream-app-windows-x86_64.zip' 'jamstream-app.exe' $sums $InstallDir $tmp
     }
     if ($WithServer) {
-        Write-Host 'jamstreamd binaries are published for Linux x86_64 (musl) only.'
+        Write-Host 'jamstreamd binaries are published for Linux (musl, x86_64 and aarch64) only.'
         Write-Host 'On Windows, local mode uses the jamstreamd that ships next to the'
         Write-Host 'desktop app, or a from-source build: cargo install --path crates/server'
     }
