@@ -1665,7 +1665,10 @@ impl HostWizard {
             match &self.check_result {
                 Some(Ok(())) => {
                     let p = theme::palette_of(ui);
-                    ui.label(RichText::new("Works. Saved to your keychain.").color(p.meter_green));
+                    // "On this computer", not "keychain": a key the keychain
+                    // refuses as too long (a GCP key on Windows) is kept as a
+                    // private file instead, and this line covers both.
+                    ui.label(RichText::new("Works. Saved on this computer.").color(p.meter_green));
                 }
                 Some(Err(err)) => {
                     theme::reason(ui, err.clone());

@@ -209,7 +209,7 @@ impl JamApp {
         // says why it could not remember it.
         let prefs = crate::prefs::path();
         let mut app = Self::new(
-            Arc::new(KeyringStore),
+            Arc::new(KeyringStore::system()),
             creds::system_env(),
             prefs.as_ref().ok().cloned(),
         );
