@@ -69,6 +69,10 @@ pub struct Seat {
     pub role: Role,
     /// None once the seat is revoked, which is what makes it free.
     pub invite: Option<SeatInvite>,
+    /// The name the invite was minted for, from the token's own `name_hint`:
+    /// the link knows who it is for, so the row can say whose seat is still
+    /// empty (#357).
+    pub hint: Option<String>,
     /// Who the revoke removed, kept greyed on the row as context. Cleared
     /// when someone else takes the seat.
     pub was: Option<String>,
@@ -100,6 +104,10 @@ pub struct InvitesPanel {
     pub seats: Vec<Seat>,
     tokens: TokenMap,
     pub mint_role: Role,
+    /// The optional name the next minted link is for, stamped into the
+    /// token's `name_hint` so the roster and the take files carry it from
+    /// the first packet. Cleared by the mint that uses it.
+    pub mint_name: String,
     /// A mint or a state-file write that failed, shown under the mint row.
     /// Capacity is not one of these: the button is disabled instead, with
     /// the reason on hover.
@@ -126,6 +134,7 @@ impl InvitesPanel {
                             token: invite.token.jti,
                             encoded: record.invite.clone(),
                         }),
+                        hint: invite.token.name_hint.clone(),
                         was: None,
                     });
                 }
@@ -144,6 +153,7 @@ impl InvitesPanel {
             seats,
             tokens: TokenMap::default(),
             mint_role: Role::Musician,
+            mint_name: String::new(),
             error: None,
             confirm_revoke: None,
             confirm_end: false,
@@ -268,10 +278,20 @@ impl InvitesPanel {
             self.state.address.parse().map_err(|_| {
                 format!("state file address {:?} does not parse", self.state.address)
             })?;
+        // The name field, trimmed to the roster's own byte cap on a char
+        // boundary; the server drops an oversized hint entirely, and a hint
+        // it minted itself should never be one it will not read.
+        let mut hint = self.mint_name.trim();
+        while hint.len() > jamstream_protocol::control::MAX_NAME_LEN {
+            let mut chars = hint.chars();
+            chars.next_back();
+            hint = chars.as_str();
+        }
+        let hint = (!hint.is_empty()).then(|| hint.to_owned());
         let token = Token {
             member_id: member,
             role,
-            name_hint: None,
+            name_hint: hint.clone(),
             expires_unix: self.expires_unix,
             // A fresh jti every time, which is what makes reusing a member
             // id safe: the revoked credential and this one are not the same
@@ -288,6 +308,7 @@ impl InvitesPanel {
                 token: jti,
                 encoded: encoded.clone(),
             }),
+            hint,
             was: None,
         };
         self.state.invites.push(InviteRecord {
@@ -302,6 +323,7 @@ impl InvitesPanel {
                 self.seats.sort_by_key(|s| s.member.0);
             }
         }
+        self.mint_name.clear();
         self.publish_tokens();
         Ok(())
     }
@@ -335,7 +357,12 @@ impl InvitesPanel {
         {
             "connected".to_owned()
         } else {
-            "not joined".to_owned()
+            // Whose link is still unused, when the link knows: ten grey
+            // "not joined" rows say nothing about who to chase.
+            match &seat.hint {
+                Some(name) => format!("not joined, for {name}"),
+                None => "not joined".to_owned(),
+            }
         }
     }
 }
@@ -548,6 +575,18 @@ impl InvitesPanel {
                 ));
                 ui.add_space(theme::SPACE_MD);
             }
+        });
+        // Who it is for, before which kind: the name is what makes the link
+        // theirs, and it lands in the token so the roster knows it at the
+        // first packet.
+        ui.horizontal(|ui| {
+            ui.label(theme::muted(ui, "for"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.mint_name)
+                    .desired_width(180.0)
+                    .char_limit(64)
+                    .hint_text("name on the invite"),
+            );
         });
         // Which kind, then the act: at the drawer's width the two role
         // buttons and Mint invite do not share a line.
@@ -763,6 +802,55 @@ mod tests {
         assert!(
             err.contains(&format!("all {MAX_LISTENERS} listener seats")),
             "error was {err:?}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A link minted for somebody carries their name in the token (#357):
+    /// the roster and the take files read it from the first packet, and the
+    /// seat row says whose link is still unused. The name field is consumed
+    /// by the mint that uses it, so the next link is not accidentally Ana's
+    /// too.
+    #[test]
+    fn a_named_mint_stamps_the_token_and_the_seat_row() {
+        let (state, path) = fixture("named");
+        let mut panel = InvitesPanel::new(state, path.clone());
+        panel.mint_name = "  Ana  ".to_owned();
+        panel.mint(Role::Musician).expect("mint named");
+        let seat = panel.seats.last().unwrap().clone();
+        assert_eq!(seat.hint.as_deref(), Some("Ana"), "trimmed and stamped");
+        let decoded = Invite::decode(&seat.invite.clone().unwrap().encoded).expect("decodes");
+        assert_eq!(decoded.token.name_hint.as_deref(), Some("Ana"));
+        assert_eq!(panel.mint_name, "", "the field is spent by the mint");
+
+        // The row for an unused named link says who to chase; a connected
+        // member's row does not repeat their name beside the roster's. The
+        // demo's member 4 holds this seat's id, so it is marked away to
+        // model the person who has not joined yet.
+        let rt = crate::demo::DemoRuntime::frozen(0, true);
+        rt.set_away(seat.member.0, true);
+        let snap = crate::runtime::Runtime::snapshot(&rt);
+        assert_eq!(panel.status_of(&seat, &snap), "not joined, for Ana");
+
+        // A name past the roster's 64-byte cap is cut on a char boundary
+        // rather than minted into a hint the server would drop whole.
+        panel.mint_name = "é".repeat(40);
+        panel.mint(Role::Listener).expect("mint long");
+        let long = panel.seats.last().unwrap().hint.clone().expect("a hint");
+        assert!(long.len() <= 64, "{} bytes", long.len());
+        assert_eq!(long, "é".repeat(32));
+
+        // And reloading the state file keeps the hints: the panel reads them
+        // back out of the invites themselves.
+        let reloaded = jamstream_cli::state::load(&path).expect("state reloads");
+        let restarted = InvitesPanel::new(reloaded, path.clone());
+        assert!(
+            restarted
+                .seats
+                .iter()
+                .any(|s| s.hint.as_deref() == Some("Ana")),
+            "the hint survives a restart"
         );
 
         std::fs::remove_file(&path).ok();

@@ -133,6 +133,9 @@ struct DemoState {
     /// what every platform without the split reports.
     device_mode: Option<DeviceModeView>,
     render_converted: Option<bool>,
+    /// Your own display name, as [`Command::SetOwnName`] set it: the demo
+    /// stands in for the roster fanout the real server answers with.
+    own_name: Option<String>,
 }
 
 pub struct DemoRuntime {
@@ -290,6 +293,7 @@ impl DemoRuntime {
                 device_error: None,
                 device_mode: None,
                 render_converted: None,
+                own_name: None,
             }),
             is_host,
             frozen,
@@ -449,7 +453,12 @@ impl Runtime for DemoRuntime {
             .filter(|m| !s.revoked.contains(&m.id))
             .map(|m| MemberView {
                 id: MemberId(m.id),
-                name: m.name.to_owned(),
+                // Your strip carries the name you set, the way the roster
+                // fanout would answer a SetName.
+                name: match (&s.own_name, m.id) {
+                    (Some(name), 0) => name.clone(),
+                    _ => m.name.to_owned(),
+                },
                 role: m.role,
                 connected: !s.away.contains(&m.id),
                 // Never both: the server clears quiet when it gives up on a
@@ -613,6 +622,12 @@ impl Runtime for DemoRuntime {
             // needs is the one the button just asked for.
             Command::StartRecord => s.record.state = RecordState::Recording,
             Command::StopRecord => s.record.state = RecordState::Idle,
+            Command::SetOwnName(name) => {
+                let name = name.trim();
+                if !name.is_empty() {
+                    s.own_name = Some(name.to_owned());
+                }
+            }
             Command::Leave => s.left = true,
             Command::Revoke(jti) => {
                 // The demo token is the member id repeated; reverse it.
@@ -706,6 +721,23 @@ mod tests {
         assert_eq!(ana.fader.gain_db, 2.5);
         assert!(ana.fader.muted);
         assert_eq!(snap.chat.last().unwrap().text, "hello");
+    }
+
+    /// The demo answers a SetOwnName the way the server's roster fanout
+    /// does, so the join screen's field is exercised in fixtures too.
+    #[test]
+    fn set_own_name_renames_your_own_strip() {
+        let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+        rt.send(Command::SetOwnName("  Ana Lucia  ".to_owned()));
+        let snap = rt.snapshot();
+        let me = snap.members.iter().find(|m| m.is_you).expect("you");
+        assert_eq!(me.name, "Ana Lucia", "trimmed, like the wire's copy");
+        // Whitespace alone is not a name; nothing changes.
+        rt.send(Command::SetOwnName("   ".to_owned()));
+        let me_id = me.id;
+        let snap = rt.snapshot();
+        let me = snap.members.iter().find(|m| m.id == me_id).expect("you");
+        assert_eq!(me.name, "Ana Lucia");
     }
 
     #[test]

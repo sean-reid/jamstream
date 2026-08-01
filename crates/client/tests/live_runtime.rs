@@ -94,6 +94,10 @@ impl TestServer {
     }
 
     fn invite(&self, member: u16, name: &str) -> Invite {
+        self.invite_hinted(member, Some(name.to_owned()))
+    }
+
+    fn invite_hinted(&self, member: u16, name_hint: Option<String>) -> Invite {
         self.issuer.mint(
             self.session_id,
             vec![self.addr],
@@ -101,7 +105,7 @@ impl TestServer {
             Token {
                 member_id: MemberId(member),
                 role: Role::Musician,
-                name_hint: Some(name.to_owned()),
+                name_hint,
                 expires_unix: u64::MAX,
                 jti: TokenId::generate(),
             },
@@ -1038,6 +1042,52 @@ fn a_device_the_reopen_cannot_open_says_so_in_the_snapshot() {
     });
     drop(rt);
     let _ = std::fs::remove_file(&sine);
+}
+
+/// The client half of #357 against the real server: a member whose invite
+/// carried no name joins as the member-N fallback, says their own name
+/// through [`Command::SetOwnName`], and every roster in the session carries
+/// it, their bandmate's included. No fake in the middle: the name rides the
+/// real control link into the real jamstreamd roster and back out.
+#[test]
+fn a_name_set_after_join_reaches_every_roster() {
+    let server = TestServer::start();
+    let unnamed = LiveRuntime::join_offline(
+        &server.invite_hinted(1, None),
+        settings(),
+        WavBackend::new(None, None),
+    )
+    .expect("join unnamed");
+    let witness = join_silent(&server, 2, "cass");
+    wait_for(&unnamed, "joined", Duration::from_secs(10), joined);
+    let snap = wait_for(&witness, "both on roster", Duration::from_secs(10), |s| {
+        joined(s) && s.members.len() == 2
+    });
+    assert!(
+        snap.members.iter().any(|m| m.name == "member 1"),
+        "an unnamed invite starts as the fallback: {:?}",
+        snap.members
+    );
+
+    unnamed.send(Command::SetOwnName("Ana".to_owned()));
+    let snap = wait_for(&witness, "the rename", Duration::from_secs(10), |s| {
+        s.members.iter().any(|m| m.name == "Ana")
+    });
+    assert!(
+        !snap.members.iter().any(|m| m.name == "member 1"),
+        "the fallback must be gone from the bandmate's roster: {:?}",
+        snap.members
+    );
+    // And from your own: the strip under your fader is you by name.
+    wait_for(&unnamed, "own roster", Duration::from_secs(10), |s| {
+        s.members.iter().any(|m| m.is_you && m.name == "Ana")
+    });
+
+    for rt in [&unnamed, &witness] {
+        rt.send(Command::Leave);
+    }
+    drop(unnamed);
+    drop(witness);
 }
 
 /// The repro on #327, made honest: a mid-session device pick is refused (a

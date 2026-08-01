@@ -1826,6 +1826,24 @@ impl ServerCore {
                     self.violation(now_ms, from, "record control by non-host");
                 }
             }
+            ControlMsg::SetName { name } => {
+                // Self only, like Chat's forced `from`: the sender is the
+                // target. The link already refused anything past
+                // MAX_NAME_LEN; empty after trimming is dropped here the way
+                // an oversized name_hint is dropped at admission, costing
+                // the sender their name and the session nothing.
+                let name = name.trim();
+                if name.is_empty() {
+                    tracing::debug!(member = from.0, "empty SetName ignored");
+                    return;
+                }
+                if let Some(m) = self.members.get_mut(&from)
+                    && m.name != name
+                {
+                    m.name = name.to_owned();
+                    self.queue_roster();
+                }
+            }
             ControlMsg::Roster(_) => self.violation(now_ms, from, "roster from client"),
             ControlMsg::Stats { .. } => self.violation(now_ms, from, "stats from client"),
             ControlMsg::StreamStatus { .. } => {

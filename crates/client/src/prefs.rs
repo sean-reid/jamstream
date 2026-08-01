@@ -106,6 +106,10 @@ pub struct AppPrefs {
     /// setting existed, reads as the default: allowed.
     #[serde(default)]
     pub allow_exclusive: Option<bool>,
+    /// The display name last joined with, pre-filling the join screen so a
+    /// band member types who they are once, not once per session (#357).
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 impl AppPrefs {
@@ -253,6 +257,7 @@ mod tests {
             playback_id: None,
             buffer_frames: Some(240),
             allow_exclusive: Some(false),
+            display_name: Some("Ana".to_owned()),
         };
         prefs.save_to(&path).expect("save");
         assert_eq!(AppPrefs::load_from(&path), prefs);

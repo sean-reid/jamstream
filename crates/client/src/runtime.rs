@@ -85,6 +85,10 @@ pub enum Command {
     /// a hash. Bytes past the transfer cap are refused with a log line, the
     /// same way the settings sheet refuses them before sending.
     SetOwnAvatar(Option<Vec<u8>>),
+    /// Your own display name, replacing the invite's hint or the member-N
+    /// fallback on everyone's roster. Sent at join with whatever the join
+    /// screen carried, and validated where the wire's cap lives.
+    SetOwnName(String),
     /// Host only: configure one broadcast destination. The id is minted on
     /// this side so add and remove name the same destination with no round
     /// trip. The only command that carries a secret: [`StreamKey`] redacts

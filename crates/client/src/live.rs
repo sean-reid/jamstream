@@ -696,9 +696,12 @@ impl LiveRuntime {
                 // Stream state gets no optimistic echo on purpose: the
                 // pipeline is what decides whether a destination is live,
                 // and it says so within a second.
+                // The name included: the roster fanout is the echo, and it
+                // arrives within a tick.
                 Command::SendChat(_)
                 | Command::Leave
                 | Command::Revoke(_)
+                | Command::SetOwnName(_)
                 | Command::AddDestination { .. }
                 | Command::RemoveDestination(_)
                 | Command::StartStream
@@ -981,6 +984,9 @@ impl Worker {
             Command::StopStream => self.core.stream_ctl(StreamOp::Stop),
             Command::StartRecord => self.core.record_ctl(RecordOp::Start),
             Command::StopRecord => self.core.record_ctl(RecordOp::Stop),
+            // Validated in the core against the wire's own cap; stored there
+            // and re-announced on every join, exactly like the avatar.
+            Command::SetOwnName(name) => self.core.set_name(&name),
             Command::SetOwnAvatar(None) => {
                 // The control protocol has no way to unset an avatar, so
                 // this is local only: your own strip falls back to the

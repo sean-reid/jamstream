@@ -1489,6 +1489,66 @@ fn a_name_hint_past_the_cap_cannot_stop_the_roster() {
     assert_ne!(long.len(), MAX_NAME_LEN);
 }
 
+/// A member can say their own name (#357): `set_name` reaches every roster,
+/// replacing the member-N fallback the token left them with, and only their
+/// own row moves. Sent through the real link and the real server, because
+/// half of this contract lives in each.
+#[test]
+fn a_member_who_says_their_name_is_named_on_every_roster() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_host = h.mint_named(0, Role::Musician, Some("ana".into()));
+    let inv_b = h.mint(1, Role::Musician);
+    h.add_client(&inv_host, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    h.run_ms(500);
+
+    // Before: the unnamed invite reads as the fallback everywhere.
+    for i in [0, b] {
+        let names: Vec<&str> = h
+            .last_roster(i)
+            .expect("roster")
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, ["ana", "member 1"], "client {i}");
+    }
+
+    // Whitespace is trimmed on the client, so the wire never carries it.
+    h.clients[b].core.set_name("  Ben  ").expect("set_name");
+    h.run_ms(500);
+    for i in [0, b] {
+        let names: Vec<&str> = h
+            .last_roster(i)
+            .expect("roster")
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, ["ana", "Ben"], "client {i}");
+    }
+
+    // The names the client cannot mean are refused before they leave it.
+    assert!(h.clients[b].core.set_name("   ").is_err(), "empty");
+    assert!(
+        h.clients[b]
+            .core
+            .set_name(&"n".repeat(MAX_NAME_LEN + 1))
+            .is_err(),
+        "past the roster's own cap"
+    );
+    h.run_ms(500);
+    let names: Vec<&str> = h
+        .last_roster(0)
+        .expect("roster")
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["ana", "Ben"],
+        "a refused rename must change nothing"
+    );
+}
+
 /// The click is per member, decided by the member and not the host: enabling
 /// the metronome must not put a click in the monitor of somebody who turned it
 /// off, and turning it off must not take it away from anybody else.

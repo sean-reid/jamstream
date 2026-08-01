@@ -134,6 +134,11 @@ pub struct JamApp {
     avatar_dialog: Option<Pick>,
     /// The avatar you picked, decoded for the settings disc.
     pub own_avatar: Option<AvatarHandle>,
+    /// Your display name, as the join screen's field holds it: sent into
+    /// presence at every join and remembered in the preferences, so the
+    /// roster stops calling people musician N (#357). Empty means unset and
+    /// nothing is sent.
+    pub own_name: String,
     /// The same avatar's fitted bytes, kept so a join can announce it.
     own_avatar_bytes: Option<Vec<u8>>,
     /// Device selection last handed to the live runtime, by id rather than by
@@ -212,6 +217,7 @@ impl JamApp {
             avatar_picture: None,
             avatar_dialog: None,
             own_avatar: None,
+            own_name: String::new(),
             own_avatar_bytes: None,
             applied_audio: AudioSettings::default(),
             enumerate: Arc::new(|| Ok(DeviceCatalog::demo())),
@@ -270,15 +276,19 @@ impl JamApp {
         app
     }
 
-    /// Puts the saved audio setup back on the pickers: each device by id and
+    /// Puts the saved setup back where it is used: each device by id and
     /// only when the catalog still holds it, so a selection whose interface
-    /// is unplugged today quietly stays on the system default, and the buffer
-    /// only when it is one of the picker's own choices.
+    /// is unplugged today quietly stays on the system default; the buffer
+    /// only when it is one of the picker's own choices; the display name
+    /// onto the join screen's field.
     pub fn restore_audio_prefs(&mut self) {
         let Some(path) = &self.settings_path else {
             return;
         };
         let prefs = crate::prefs::AppPrefs::load_from(path);
+        if let Some(name) = prefs.display_name {
+            self.own_name = name;
+        }
         if prefs.capture_id.is_some() {
             let (idx, found) = DeviceCatalog::find(&self.catalog.capture, &prefs.capture_id);
             if found {
@@ -308,11 +318,13 @@ impl JamApp {
             return;
         };
         let settings = self.audio_settings();
+        let name = self.own_name.trim();
         let prefs = crate::prefs::AppPrefs {
             capture_id: settings.capture_id,
             playback_id: settings.playback_id,
             buffer_frames: Some(settings.buffer_frames),
             allow_exclusive: Some(settings.allow_exclusive),
+            display_name: (!name.is_empty()).then(|| name.to_owned()),
         };
         if let Err(err) = prefs.save_to(path) {
             tracing::warn!(%err, "audio preferences not saved");
@@ -443,6 +455,7 @@ impl JamApp {
                 self.recent = RecentSession::load();
                 self.screen = Screen::Session;
                 self.announce_own_avatar();
+                self.announce_own_name();
             }
             Err(err) => {
                 self.wizard.launch_error = Some(format!(
@@ -601,7 +614,7 @@ impl JamApp {
 
         match self.screen {
             Screen::Home => {
-                if let Some(action) = self.home.ui(ui, &self.recent) {
+                if let Some(action) = self.home.ui(ui, &self.recent, &mut self.own_name) {
                     match action {
                         HomeAction::Join(invite) => {
                             let settings = self.audio_settings();
@@ -613,6 +626,10 @@ impl JamApp {
                                     self.session = SessionScreen::default();
                                     self.screen = Screen::Session;
                                     self.announce_own_avatar();
+                                    self.announce_own_name();
+                                    // The last-used name, remembered where
+                                    // the next launch pre-fills from.
+                                    self.persist_audio_prefs();
                                 }
                                 Err(err) => self.home.error = Some(err.to_string()),
                             }
@@ -1048,6 +1065,25 @@ impl JamApp {
     fn announce_own_avatar(&self) {
         if let (Some(bytes), Some(rt)) = (&self.own_avatar_bytes, self.runtime.as_deref()) {
             rt.send(Command::SetOwnAvatar(Some(bytes.clone())));
+        }
+    }
+
+    /// Stamps the join screen's name into presence, beside the avatar
+    /// announcement: the runtime keeps it and re-announces on reconnect.
+    /// Cut to the wire's byte cap on a character boundary, so a name the
+    /// field accepted is never silently refused further down.
+    fn announce_own_name(&self) {
+        let mut name = self.own_name.trim();
+        while name.len() > jamstream_protocol::control::MAX_NAME_LEN {
+            let mut chars = name.chars();
+            chars.next_back();
+            name = chars.as_str();
+        }
+        if name.is_empty() {
+            return;
+        }
+        if let Some(rt) = self.runtime.as_deref() {
+            rt.send(Command::SetOwnName(name.to_owned()));
         }
     }
 }

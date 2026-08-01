@@ -13,7 +13,7 @@ Each invite admits one person to one seat in one session, signed by the host's k
 
 ## Joining
 
-Paste the invite into the **Join a session** field on the home screen (hint text: "paste an invite, jamstream://join/...") and click Join, or press Enter. A malformed or expired invite shows the reason under the field instead of joining. If every seat for your role is taken, the screen reads "the session is full; waiting for a seat to free" and the app keeps trying, so you are in as soon as somebody leaves.
+Type your name into the **your name** field so the roster and any recorded stems say who you are instead of "musician 2"; it is remembered for next time, and it wins over whatever name the host put on your invite. Then paste the invite into the **Join a session** field (hint text: "paste an invite, jamstream://join/...") and click Join, or press Enter. A malformed or expired invite shows the reason under the field instead of joining. If every seat for your role is taken, the screen reads "the session is full; waiting for a seat to free" and the app keeps trying, so you are in as soon as somebody leaves.
 
 ## The session screen
 
