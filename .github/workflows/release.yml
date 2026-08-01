@@ -487,9 +487,10 @@ jobs:
         run: echo 'Placeholder; Authenticode signing lands once a Windows certificate exists.'
       # The app zip carries jamstreamd.exe beside jamstream-app.exe; the
       # local provider resolves the app-adjacent helper, so hosting on this
-      # computer works straight from the unzipped folder. The committed
-      # jamstream.ico rides along for shortcuts; embedding it in the exe
-      # itself needs a build-script resource compiler and is a follow-up.
+      # computer works straight from the unzipped folder. The exe itself
+      # embeds the icon and a VERSIONINFO block (crates/client/build.rs);
+      # the committed jamstream.ico rides along for anything that wants a
+      # loose .ico file, and uninstall.ps1 deletes exactly this list.
       - name: Package and upload archives
         shell: bash
         run: |

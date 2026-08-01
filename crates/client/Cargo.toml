@@ -57,3 +57,6 @@ zeroize.workspace = true
 egui_kittest.workspace = true
 jamstream-server.workspace = true
 hound.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
