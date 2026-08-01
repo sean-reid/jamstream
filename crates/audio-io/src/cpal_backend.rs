@@ -180,10 +180,18 @@ impl AudioBackend for CpalBackend {
         input.play().map_err(|e| map_err(&e))?;
         output.play().map_err(|e| map_err(&e))?;
 
-        // Negotiated callback sizes are the best latency estimate cpal
-        // exposes; sum both directions when both are known.
-        let latency_frames = match (input.buffer_size().ok(), output.buffer_size().ok()) {
+        // Negotiated callback sizes, per host: the WASAPI shared-mode device
+        // period, the ALSA period, CoreAudio's device frame size, PipeWire's
+        // last quantum (the request until the first callback lands). Their sum
+        // is the best latency estimate cpal exposes; the larger one is what a
+        // callback-sized consumer has to absorb.
+        let (in_frames, out_frames) = (input.buffer_size().ok(), output.buffer_size().ok());
+        let latency_frames = match (in_frames, out_frames) {
             (Some(i), Some(o)) => Some(i + o),
+            (one, other) => one.or(other),
+        };
+        let buffer_frames = match (in_frames, out_frames) {
+            (Some(i), Some(o)) => Some(i.max(o)),
             (one, other) => one.or(other),
         };
 
@@ -192,6 +200,7 @@ impl AudioBackend for CpalBackend {
             output,
             errored,
             latency_frames,
+            buffer_frames,
         }))
     }
 }
@@ -479,11 +488,16 @@ struct CpalStreamHandle {
     output: cpal::Stream,
     errored: Arc<AtomicBool>,
     latency_frames: Option<u32>,
+    buffer_frames: Option<u32>,
 }
 
 impl StreamHandle for CpalStreamHandle {
     fn latency_frames(&self) -> Option<u32> {
         self.latency_frames
+    }
+
+    fn buffer_frames(&self) -> Option<u32> {
+        self.buffer_frames
     }
 
     fn errored(&self) -> bool {

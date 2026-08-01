@@ -27,6 +27,7 @@ pub struct WavBackend {
     input_wav: Option<PathBuf>,
     capture_output: Option<PathBuf>,
     device_rate: u32,
+    device_period: Option<u32>,
     lose_device_after: Option<u64>,
     /// The rate every open after the first one runs at, when it differs.
     /// Shared, so the count survives the clone a caller keeps.
@@ -43,6 +44,7 @@ impl WavBackend {
             input_wav,
             capture_output,
             device_rate: 48_000,
+            device_period: None,
             lose_device_after: None,
             reopen_rate: None,
             opened: Arc::new(AtomicBool::new(false)),
@@ -54,6 +56,18 @@ impl WavBackend {
     #[must_use]
     pub fn with_device_rate(mut self, rate: u32) -> Self {
         self.device_rate = rate;
+        self
+    }
+
+    /// Models a device that ignores the requested buffer size and calls back
+    /// at its own period of `frames`, the way WASAPI shared mode does (~480
+    /// frames at 48 kHz against a 120-frame request). Pumped frames accumulate
+    /// and the handler runs once per full period, so the caller sees the same
+    /// burstiness a real device delivers; [`StreamHandle::buffer_frames`]
+    /// reports the period, exactly as cpal reports it on that host.
+    #[must_use]
+    pub fn with_device_period(mut self, frames: u32) -> Self {
+        self.device_period = Some(frames);
         self
     }
 
@@ -124,6 +138,9 @@ impl WavBackend {
             pumped_frames: 0,
             lose_device_after: self.lose_device_after,
             errored: false,
+            period: self.device_period.map(|p| p as usize),
+            pending: 0,
+            buffer_frames: self.device_period.unwrap_or(config.buffer_frames),
         })
     }
 }
@@ -175,6 +192,12 @@ pub struct WavStream {
     pumped_frames: u64,
     lose_device_after: Option<u64>,
     errored: bool,
+    /// Callback size the modelled device insists on; `None` delivers each
+    /// pump as one callback, which is a device that honoured the request.
+    period: Option<usize>,
+    /// Frames pumped but not yet delivered, while a period is in force.
+    pending: usize,
+    buffer_frames: u32,
 }
 
 impl WavStream {
@@ -182,7 +205,24 @@ impl WavStream {
     /// capture callback, then collect the same number of frames from its
     /// playback callback and append them to the capture output file.
     /// Input past end of file is silence; see [`exhausted`](Self::exhausted).
+    ///
+    /// Under [`WavBackend::with_device_period`] the frames accumulate instead,
+    /// and the handler runs once per full period the total covers.
     pub fn pump(&mut self, frames: usize) -> Result<()> {
+        let Some(period) = self.period else {
+            return self.deliver(frames);
+        };
+        self.pending += frames;
+        while self.pending >= period {
+            self.deliver(period)?;
+            self.pending -= period;
+        }
+        Ok(())
+    }
+
+    /// One device callback pair of `frames`: capture into the handler, then
+    /// its playout into the capture output file.
+    fn deliver(&mut self, frames: usize) -> Result<()> {
         let samples = frames * self.channels;
         self.capture_buf.clear();
         self.capture_buf.resize(samples, 0.0);
@@ -252,6 +292,10 @@ impl std::fmt::Debug for WavStream {
 impl StreamHandle for WavStream {
     fn latency_frames(&self) -> Option<u32> {
         Some(0)
+    }
+
+    fn buffer_frames(&self) -> Option<u32> {
+        Some(self.buffer_frames)
     }
 
     fn errored(&self) -> bool {
