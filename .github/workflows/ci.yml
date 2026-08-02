@@ -541,7 +541,8 @@ jobs:
       # newer ones so the gate is real without being brittle:
       # server measures 89.5 (floor 85), cli measures 84.3-84.5 (floor 80;
       # it moves by about 0.2 between runs), stream measures 85.96 from its
-      # unit tests (floor 80).
+      # unit tests (floor 80), audio-io measures 95.89 with its device layer
+      # masked (floor 90).
       #
       # jamstream-stream was missing from `all` as well as from the loop,
       # which cost twice: it had no floor of its own, and because it never
@@ -553,17 +554,23 @@ jobs:
       # pipewire and dbus and nothing else. The gap is almost all proc.rs
       # at 44.55; everything else in the crate is 90 to 100.
       #
+      # audio-io is one file short of measurable, not unmeasurable, so it
+      # gets a floor with that file masked instead of an exemption. A
+      # headless runner has no device to open and cpal_backend.rs sits at
+      # 52.46 because of it; the other nine files are pure logic and measure
+      # 95.89 together (resample 99.30, wasapi_policy and bridge 100, format
+      # 99.70). The whole crate reads 78.86, which is the number the old
+      # exemption pointed at: one file was excusing nine.
+      #
       # Still without a floor, deliberately: jamstream-client (kittest
-      # snapshot baselines are macOS renders, see the test job),
+      # snapshot baselines are macOS renders, see the test job) and
       # jamstream-harness (its gates assert wall-clock budgets that
-      # instrumentation invalidates), and jamstream-audio-io (a headless
-      # runner has no device to open, so the device paths cannot be
-      # measured here; its pure logic is unit-tested). The first two are
-      # also excluded from the workspace lcov above.
+      # instrumentation invalidates). Both are also excluded from the
+      # workspace lcov above.
       - name: Enforce per-crate line-coverage floors
         run: |
           all='protocol engine session audio-io cloud server cli client harness broadcast stream'
-          for pair in protocol:75 engine:75 session:75 cloud:75 broadcast:75 server:85 cli:80 stream:80; do
+          for pair in protocol:75 engine:75 session:75 audio-io:90 cloud:75 broadcast:75 server:85 cli:80 stream:80; do
             crate="${pair%:*}"
             floor="${pair#*:}"
             others=''
@@ -572,10 +579,16 @@ jobs:
                 others="${others:+$others|}$other"
               fi
             done
+            ignore="crates/($others)/|xtask/"
+            # The one file above that a runner with no sound card cannot
+            # reach.
+            if [ "$crate" = audio-io ]; then
+              ignore="$ignore|crates/audio-io/src/cpal_backend\.rs"
+            fi
             echo "::group::jamstream-$crate (floor ${floor} percent)"
             cargo llvm-cov nextest --locked -p "jamstream-$crate" --summary-only \
               --fail-under-lines "$floor" \
-              --ignore-filename-regex "crates/($others)/|xtask/"
+              --ignore-filename-regex "$ignore"
             echo '::endgroup::'
           done
 
