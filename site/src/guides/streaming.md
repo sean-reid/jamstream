@@ -64,7 +64,16 @@ Both are one count for the whole broadcast, so both rows show the same pair, and
 
 A stream that dies quietly is worse than one that never started, so a failure shows in three places: the row goes red with the reason under it, the tab counts the failures, and the status bar lights STREAM FAILED beside ON AIR even with Settings closed.
 
-A destination that stops is retried on its own, on a backoff that starts at 500 ms and doubles to 16 seconds: the row goes back to `connecting`, and to `live` once a push has held for three seconds. A key the platform rejects fails every time, and the reason says so: **Remove** that destination and add the key again. `connection refused` or `authentication failed` means the key is wrong, was reset, or belongs to another channel.
+A destination that stops is retried on its own, on a backoff that starts at 500 ms and doubles to 16 seconds: the row goes back to `connecting`, and to `live` once a push has held for three seconds. A key the platform rejects fails every time, and the reason says so: **Remove** that destination and add the key again.
+
+The reason is the line the encoder or the pusher printed, quoted, with the destination URL removed because a stream key is in it. Read the front of it first.
+
+| Reason starts with | Where it broke |
+|---|---|
+| `push failed:` | sending the encode to the platform |
+| `encoder down:` | making the encode in the first place, before any platform is involved |
+
+Then read what follows. `Failed to connect to rtmps://<redacted>` with `Connection refused` or `authentication failed` is the platform saying no, so the key is wrong, was reset, or belongs to another channel. `Failed to connect to <local relay>` is the session machine failing to talk to itself, which no key change will fix; restart the session.
 
 **Stop streaming** takes everything off air at once, with no confirmation step, because a host who needs the stream to stop needs it to stop now. Ending the session stops it too.
 
