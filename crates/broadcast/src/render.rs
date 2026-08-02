@@ -358,8 +358,14 @@ impl Renderer {
         let s = self.scale;
         let size = 13.0 * s;
         let count = listeners.to_string();
+        // The mono is cut down to [`text::MONO_CHARSET`]; a count formatted
+        // with a separator or a "k" suffix would draw those as blanks.
+        debug_assert!(
+            count.chars().all(|c| text::MONO_CHARSET.contains(c)),
+            "listener count {count:?} outside the mono charset"
+        );
         let label = " listening";
-        let wc = text::width(&self.fonts.mono, size, 0.0, &count);
+        let wc = text::width(&self.fonts.mono_digits, size, 0.0, &count);
         let wl = text::width(&self.fonts.sans, size, 0.0, label);
         let x = (self.cfg.width as f32 - wc - wl) / 2.0;
         let baseline = self.cfg.height as f32 - 17.0 * s;
@@ -368,7 +374,7 @@ impl Renderer {
             self.static_scene.data_mut(),
             w,
             h,
-            &self.fonts.mono,
+            &self.fonts.mono_digits,
             size,
             0.0,
             x,
