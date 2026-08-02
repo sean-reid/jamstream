@@ -1,6 +1,6 @@
 //! Native GCP service-account authentication. Parses the JSON key file
 //! that `GOOGLE_APPLICATION_CREDENTIALS` points at, signs an RS256 JWT
-//! with aws-lc-rs (already in the tree as rustls's crypto provider), and
+//! with ring (already in the tree as rustls's crypto provider), and
 //! exchanges it at the key's `token_uri`, which has to be https, for an
 //! OAuth2 access token. No gcloud subprocess is involved.
 //!
@@ -19,9 +19,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use data_encoding::{BASE64, BASE64URL_NOPAD};
+use ring::rand::SystemRandom;
+use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -122,7 +122,7 @@ impl ParsedKey {
         });
         let claims = BASE64URL_NOPAD.encode(claims.to_string().as_bytes());
         let signing_input = format!("{header}.{claims}");
-        let mut signature = vec![0u8; self.key_pair.public_modulus_len()];
+        let mut signature = vec![0u8; self.key_pair.public().modulus_len()];
         self.key_pair
             .sign(
                 &RSA_PKCS1_SHA256,
@@ -316,7 +316,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use aws_lc_rs::signature::{KeyPair, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+    use ring::signature::{KeyPair, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
     use serde_json::Value;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -354,7 +354,7 @@ mod tests {
     fn fixture_pem_parses_to_a_2048_bit_rsa_key() {
         let key = fixture_key();
         // 2048-bit modulus signs 256-byte signatures.
-        assert_eq!(key.key_pair.public_modulus_len(), 256);
+        assert_eq!(key.key_pair.public().modulus_len(), 256);
         assert_eq!(
             key.client_email,
             "jamstream-test@jamstream-test-project.iam.gserviceaccount.com"

@@ -4,7 +4,7 @@
 //! request must carry the bearer token from the shared GCP token source.
 
 // Every test here is about GCP, which sits behind the `gcp` feature so
-// jamstreamd can build without aws-lc. With the feature off this file is
+// jamstreamd can build without it. With the feature off this file is
 // empty rather than broken.
 #![cfg(feature = "gcp")]
 

@@ -80,7 +80,9 @@ snow = { version = "0.10", default-features = false, features = [
 ed25519-dalek = { version = "3", features = ["serde"] }
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 data-encoding = "2"
-aws-lc-rs = "1"
+# The RS256 signature on the GCP service account JWT. Already in the tree as
+# rustls's crypto provider, so naming it adds no compile unit.
+ring = "0.17"
 blake2 = "0.10"
 # The cookie challenge's AEAD. Already in the tree through snow's
 # default-resolver crypto, so naming it adds no compile unit.
