@@ -95,7 +95,7 @@ pub async fn run<W: Write>(
         return Err(CliError::Failed(format!(
             "{} instance(s) still listed for session {} after destroy; run jamstream sweep",
             remaining.len(),
-            &session.session_id_hex[..8]
+            &session.session_id_hex[..8.min(session.session_id_hex.len())]
         )));
     }
 
@@ -109,7 +109,7 @@ pub async fn run<W: Write>(
     writeln!(
         out,
         "Session {} ended. Instance {} is destroyed.",
-        &session.session_id_hex[..8],
+        &session.session_id_hex[..8.min(session.session_id_hex.len())],
         session.instance_id
     )?;
     Ok(())
