@@ -12,11 +12,11 @@
 //! reads every record under `JAMSTREAM_STATE_DIR`, so two tests sharing a
 //! process would each be reconciling the other's fixtures.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use jamstream_cli::state::{self, SessionState, SessionStatus};
 use jamstream_client::app::JamApp;
-use jamstream_client::sweep::Resolved;
+use jamstream_client::sweep::{Resolved, Resolver};
 use jamstream_cloud::{MockProvider, Provider, ProviderError, ProviderKind, session_tag};
 
 /// A record of a session that is, as far as this computer knows, still up.
@@ -53,6 +53,17 @@ fn seeded(kind: ProviderKind, sessions: &[&str]) -> (MockProvider, Vec<String>) 
         .map(|s| provider.seed_instance(&region, vec![session_tag(s)]).id)
         .collect();
     (provider, ids)
+}
+
+/// A resolver good for exactly one sweep. The sweeper takes the providers by
+/// value, so a second press would need a second set, and panicking on it says
+/// so rather than sweeping an empty list and calling that clean.
+fn once(providers: Vec<Box<dyn Provider>>, unconfigured: Vec<ProviderKind>) -> Resolver {
+    let held = Mutex::new(Some(providers));
+    Arc::new(move || Resolved {
+        providers: held.lock().expect("providers").take().expect("one sweep"),
+        unconfigured: unconfigured.clone(),
+    })
 }
 
 /// Runs the app's sweep to completion, the way the frame loop does: press,
@@ -105,17 +116,12 @@ fn the_home_sweep_stops_strays_and_says_what_it_could_not_account_for() {
     let (gcp, _) = seeded(ProviderKind::Gcp, &["c3c3"]);
 
     let mut app = JamApp::in_memory();
-    let first: Arc<std::sync::Mutex<Option<Vec<Box<dyn Provider>>>>> =
-        Arc::new(std::sync::Mutex::new(Some(vec![
-            Box::new(aws),
-            Box::new(gcp),
-        ])));
-    app.providers = Arc::new(move || Resolved {
-        providers: first.lock().expect("providers").take().expect("one sweep"),
-        // The keychain holds nothing for DigitalOcean on this computer, so
-        // nothing there was searched. Not the same as finding nothing.
-        unconfigured: vec![ProviderKind::DigitalOcean],
-    });
+    // The keychain holds nothing for DigitalOcean on this computer, so nothing
+    // there was searched. Not the same as finding nothing.
+    app.providers = once(
+        vec![Box::new(aws), Box::new(gcp)],
+        vec![ProviderKind::DigitalOcean],
+    );
 
     sweep_now(&mut app);
     let outcome = app.swept.as_ref().expect("an outcome");
@@ -159,15 +165,7 @@ fn the_home_sweep_stops_strays_and_says_what_it_could_not_account_for() {
     );
     let (stubborn, _) = seeded(ProviderKind::Gcp, &["e5e5"]);
     stubborn.fail_next_destroys(1, ProviderError::RateLimited { retry_after: None });
-    let second: Arc<std::sync::Mutex<Option<Vec<Box<dyn Provider>>>>> =
-        Arc::new(std::sync::Mutex::new(Some(vec![
-            Box::new(broken),
-            Box::new(stubborn),
-        ])));
-    app.providers = Arc::new(move || Resolved {
-        providers: second.lock().expect("providers").take().expect("one sweep"),
-        unconfigured: Vec::new(),
-    });
+    app.providers = once(vec![Box::new(broken), Box::new(stubborn)], Vec::new());
 
     sweep_now(&mut app);
     let outcome = app.swept.as_ref().expect("an outcome");
