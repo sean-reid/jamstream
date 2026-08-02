@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::resample::{converting_capture, converting_playback, session_frames};
 use crate::types::{
@@ -31,13 +31,17 @@ pub struct WavBackend {
     device_period: Option<u32>,
     form_factor: FormFactor,
     lose_device_after: Option<u64>,
+    /// Whether every stream loses the device, or only the first one to reach
+    /// the threshold.
+    loss_repeats: bool,
     /// Latched by the stream that hit the loss threshold. Shared, so the
     /// unplug happens once per backend however many streams reopen after it.
     loss_fired: Arc<AtomicBool>,
     /// The rate every open after the first one runs at, when it differs.
-    /// Shared, so the count survives the clone a caller keeps.
     reopen_rate: Option<u32>,
-    opened: Arc<AtomicBool>,
+    /// Streams opened so far. Shared, so the count survives the clone a
+    /// caller keeps to watch it and a caller that moved the backend away.
+    opens: Arc<AtomicU32>,
 }
 
 impl WavBackend {
@@ -52,10 +56,19 @@ impl WavBackend {
             device_period: None,
             form_factor: FormFactor::Unknown,
             lose_device_after: None,
+            loss_repeats: false,
             loss_fired: Arc::new(AtomicBool::new(false)),
             reopen_rate: None,
-            opened: Arc::new(AtomicBool::new(false)),
+            opens: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Streams this backend has opened, the reopens included. A caller that
+    /// moved the backend into a runtime keeps a clone to read it, which is
+    /// how a test tells a bounded retry loop from an unbounded one.
+    #[must_use]
+    pub fn opens(&self) -> u32 {
+        self.opens.load(Ordering::Relaxed)
     }
 
     /// Models an interface clocked at `rate`: a session at any other rate
@@ -96,10 +109,26 @@ impl WavBackend {
     /// pumped the stream reports [`StreamHandle::errored`], so the caller's
     /// device-gone path runs offline instead of only against real hardware.
     /// An unplug happens once: the stream that answers the reopen models the
-    /// replacement device and keeps running.
+    /// replacement device and keeps running. See
+    /// [`losing_device_every`](Self::losing_device_every) for the device that
+    /// never comes back.
     #[must_use]
     pub fn with_device_loss_after(mut self, frames: u64) -> Self {
         self.lose_device_after = Some(frames);
+        self.loss_repeats = false;
+        self
+    }
+
+    /// Models a device that will not stay open: every stream, the reopens
+    /// included, loses the device after this many pumped frames. Zero latches
+    /// the stream at open, before the caller can poll it once, which is the
+    /// shape a WASAPI exclusive endpoint another process holds and a PipeWire
+    /// graph refusing the rate both arrive in, and the shape the retry loop
+    /// has to be bounded against.
+    #[must_use]
+    pub fn losing_device_every(mut self, frames: u64) -> Self {
+        self.lose_device_after = Some(frames);
+        self.loss_repeats = true;
         self
     }
 
@@ -123,8 +152,9 @@ impl WavBackend {
     /// the stream, its files, and its pump run in device-rate frames while
     /// the handler keeps its session-rate view.
     pub fn open_offline(&self, config: StreamConfig, handler: DuplexHandler) -> Result<WavStream> {
+        let reopen = self.opens.fetch_add(1, Ordering::Relaxed) > 0;
         let rate = match self.reopen_rate {
-            Some(rate) if self.opened.swap(true, Ordering::Relaxed) => rate,
+            Some(rate) if reopen => rate,
             _ => self.device_rate,
         };
         if config.channels == 0 {
@@ -168,6 +198,15 @@ impl WavBackend {
         // boundary converter, never anything else.
         crate::rate::log_rate_outcomes(&rate_outcomes(rate, resample_added_ms));
 
+        // A repeating loss belongs to every stream; a one-shot unplug is
+        // spent once some stream has served it.
+        let loss = self
+            .lose_device_after
+            .filter(|_| self.loss_repeats || !self.loss_fired.load(Ordering::Relaxed));
+        if loss == Some(0) {
+            self.loss_fired.store(true, Ordering::Relaxed);
+        }
+
         let device_frames = self.device_period.unwrap_or(config.buffer_frames);
         Ok(WavStream {
             handler,
@@ -181,11 +220,12 @@ impl WavBackend {
             capture_buf: Vec::new(),
             playback_buf: Vec::new(),
             pumped_frames: 0,
-            lose_device_after: self
-                .lose_device_after
-                .filter(|_| !self.loss_fired.load(Ordering::Relaxed)),
+            lose_device_after: loss,
             loss_fired: Arc::clone(&self.loss_fired),
-            errored: false,
+            // A device that is already gone when the stream comes up: the
+            // handle answers errored on the caller's first poll, with no
+            // pump in between.
+            errored: loss == Some(0),
             period: self.device_period.map(|p| p as usize),
             pending: 0,
             buffer_frames: session_frames(device_frames, config.sample_rate, rate),

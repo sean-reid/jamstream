@@ -953,9 +953,8 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
         snap.chat
     );
 
-    // And it comes back. The reopen runs on a 500 ms cadence and the
-    // modelled unplug is spent, so the replacement stream keeps running and
-    // the session was never dropped.
+    // And it comes back. The modelled unplug is spent, so the replacement
+    // stream keeps running and the session was never dropped.
     let snap = wait_for(&rt, "the reopen", Duration::from_secs(10), |s| {
         s.chat
             .iter()
@@ -966,6 +965,18 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
         ConnState::Joined,
         "losing a device must not drop the session"
     );
+    // Promptly, which is the property the backoff must not cost: a device
+    // that was fine until it was pulled is retried on the next tick, not
+    // after the wait a flapping device earns.
+    let at = |text: &str| {
+        snap.chat
+            .iter()
+            .find(|l| l.text.contains(text))
+            .unwrap_or_else(|| panic!("{text} is in chat: {:?}", snap.chat))
+            .at_ms
+    };
+    let gap = at("audio device reopened") - at("the audio stream stopped; retrying");
+    assert!(gap < 100, "the reopen waited {gap} ms after the loss");
 
     rt.send(Command::Leave);
     wait_for(&rt, "idle", Duration::from_secs(5), |s| {
@@ -973,6 +984,106 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
     });
     drop(rt);
     let _ = std::fs::remove_file(&sine);
+}
+
+/// The device that will not stay open, which is where the reopen loop used
+/// to come apart. It opens every time and latches before the next 2.5 ms
+/// tick, so the loop got a fresh success on every attempt and never consulted
+/// its own interval: a close and an open every tick, two chat lines a tick
+/// (neither deduped, because they alternate), the 500-line scrollback emptied
+/// of the band's conversation in about a second, and `Worker::step` running
+/// far past the tick, so the rings were not serviced for the whole episode.
+/// A WASAPI exclusive endpoint another process takes, a half-present USB
+/// interface, and a PipeWire graph refusing the rate all arrive in this
+/// shape.
+///
+/// What must hold instead: a handful of attempts over a widening backoff, a
+/// bounded number of chat lines, a plain sentence when the loop gives up that
+/// agrees with how many times it really tried, and a session that is still
+/// joined at the end of it, which is the proof the worker kept servicing the
+/// loop rather than drowning in device opens.
+#[test]
+fn a_device_that_will_not_stay_open_is_retried_a_few_times_and_then_left_alone() {
+    let server = TestServer::start();
+    // Dead on arrival on every open, reopens included: the client polls
+    // errored before it ever pumps, so no frame count would model this.
+    let backend = WavBackend::new(None, None).losing_device_every(0);
+    let device = backend.clone();
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+
+    // Two and a half seconds in: single figures, against the ~1000 opens a
+    // 2.5 ms tick would have made by now.
+    std::thread::sleep(Duration::from_millis(2_500));
+    let early = device.opens();
+    assert!(
+        early <= 6,
+        "{early} device opens in 2.5 s; the backoff is not holding"
+    );
+    let snap = rt.snapshot();
+    assert!(
+        snap.chat.len() <= 3,
+        "the retry loop is flooding chat: {:?}",
+        snap.chat
+    );
+
+    // And it stops, saying so in a sentence a musician can act on.
+    let snap = wait_for(&rt, "the loop to give up", Duration::from_secs(30), |s| {
+        s.chat.iter().any(|l| l.text.contains("did not stay open"))
+    });
+    let given_up = snap
+        .chat
+        .iter()
+        .find(|l| l.text.contains("did not stay open"))
+        .expect("the predicate above matched");
+    assert!(
+        given_up.text.contains("pick a device"),
+        "the give-up line must say what to do: {:?}",
+        given_up.text
+    );
+    // The claim in that line and the number of opens the fake counted are the
+    // same story: one open for the join, then the tries it says it made.
+    let tries: u32 = given_up
+        .text
+        .split_whitespace()
+        .find_map(|w| w.parse().ok())
+        .expect("the line names how many tries it made");
+    assert_eq!(
+        device.opens(),
+        tries + 1,
+        "the line claims {tries} tries: {:?}",
+        given_up.text
+    );
+
+    // Three lines for the whole episode: stopped, reopened, gave up.
+    assert_eq!(snap.chat.len(), 3, "{:?}", snap.chat);
+    for text in [
+        "the audio stream stopped; retrying",
+        "audio device reopened",
+        "did not stay open",
+    ] {
+        assert_eq!(
+            snap.chat.iter().filter(|l| l.text.contains(text)).count(),
+            1,
+            "{text}: {:?}",
+            snap.chat
+        );
+    }
+
+    // Nothing more is tried, and the session is still up: the network side
+    // kept its tick the whole time the device was failing.
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(device.opens(), tries + 1, "the loop restarted itself");
+    let snap = rt.snapshot();
+    assert_eq!(snap.stats.state, ConnState::Joined);
+    assert!(snap.stats.rtt_ms.is_some(), "pings kept flowing");
+    assert_eq!(snap.chat.len(), 3, "{:?}", snap.chat);
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
 }
 
 /// User story: a musician swaps interfaces mid-song, the new one runs at

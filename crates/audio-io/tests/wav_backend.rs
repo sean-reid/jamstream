@@ -380,6 +380,53 @@ fn the_stream_after_the_unplug_keeps_running() {
     assert!(!second.errored(), "the replacement device stays plugged in");
 }
 
+/// The device that never comes back, which the one-shot latch made
+/// impossible to model: every stream loses it again, so a caller's retry loop
+/// is exercised against a failure that repeats rather than one that cannot.
+#[test]
+fn a_device_that_never_stays_open_loses_every_stream() {
+    let backend = WavBackend::new(None, None).losing_device_every(480);
+    for open in 1..=3 {
+        let mut stream = backend.open_offline(config(2), passthrough()).unwrap();
+        stream.pump(240).unwrap();
+        assert!(!stream.errored(), "open {open} is alive at 240 frames");
+        stream.pump(240).unwrap();
+        assert!(stream.errored(), "open {open} loses the device again");
+    }
+    assert_eq!(
+        backend.opens(),
+        3,
+        "every open is counted, reopens included"
+    );
+}
+
+/// The worst shape, and the one the client's reopen loop has to be bounded
+/// against: the open succeeds and the stream is already dead when the caller
+/// first polls it, with no pump in between. A WASAPI exclusive endpoint
+/// another process holds and a PipeWire graph refusing the rate both land
+/// here, because the refusal arrives on the error callback rather than out of
+/// the open.
+#[test]
+fn a_device_gone_before_the_first_poll_is_errored_at_open() {
+    let backend = WavBackend::new(None, None).losing_device_every(0);
+    for open in 1..=3 {
+        let stream = backend.open_offline(config(2), passthrough()).unwrap();
+        assert!(stream.errored(), "open {open} is dead on arrival");
+    }
+    assert_eq!(backend.opens(), 3);
+}
+
+/// The same shape as a one-shot: it is spent by the stream it latched, so the
+/// reopen answers with a working device.
+#[test]
+fn a_one_shot_loss_at_open_is_spent_by_the_first_stream() {
+    let backend = WavBackend::new(None, None).with_device_loss_after(0);
+    let first = backend.open_offline(config(2), passthrough()).unwrap();
+    assert!(first.errored());
+    let second = backend.open_offline(config(2), passthrough()).unwrap();
+    assert!(!second.errored(), "the replacement device is fine");
+}
+
 #[test]
 fn a_device_loss_can_be_triggered_on_demand() {
     let backend = WavBackend::new(None, None);
