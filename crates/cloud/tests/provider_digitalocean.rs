@@ -2,19 +2,20 @@
 //! provider can make is exercised against a faked v2 API.
 
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use wiremock::matchers::{
-    body_partial_json, header, method, path, query_param, query_param_is_missing,
+    any, body_partial_json, header, method, path, query_param, query_param_is_missing,
 };
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use jamstream_cloud::providers::digitalocean::{
     BARE_TAG, DigitalOceanProvider, from_do_tag, session_do_tag, to_do_tag,
 };
 use jamstream_cloud::{
     Instance, InstanceClass, LaunchSpec, Provider, ProviderError, ProviderKind, Region, RegionId,
-    session_id_from_tags, session_tag,
+    assert_provider_contract, session_id_from_tags, session_tag,
 };
 
 const TOKEN: &str = "dop_v1_test_token";
@@ -827,4 +828,254 @@ async fn a_launch_403_says_it_was_creating_the_firewall() {
         err.to_string().contains("creating the session firewall"),
         "the operation has to be named: {err}"
     );
+}
+
+// ---- Generic provider contract against a stateful fake v2 API ----
+
+struct FakeDroplet {
+    id: u64,
+    region: String,
+    tags: Vec<String>,
+}
+
+struct FakeFirewall {
+    id: String,
+    name: String,
+    /// The tag the firewall is attached to, which is what puts droplets
+    /// behind it: a create names a tag, never a droplet.
+    tag: String,
+    port: String,
+}
+
+#[derive(Default)]
+struct DoState {
+    droplets: Vec<FakeDroplet>,
+    firewalls: Vec<FakeFirewall>,
+    tags: Vec<String>,
+    next_id: u64,
+}
+
+/// A small stateful DigitalOcean v2 API: droplets, tags, and cloud
+/// firewalls held in memory, plus the sizes and image catalogs a launch
+/// reads. Enough of the surface for the behavioral contract and no more.
+#[derive(Clone, Default)]
+struct FakeDigitalOcean {
+    state: Arc<Mutex<DoState>>,
+}
+
+fn json_error(status: u16, id: &str, message: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status).set_body_json(json!({ "id": id, "message": message }))
+}
+
+impl FakeDigitalOcean {
+    /// A firewall as the API returns it. `droplet_ids` is derived rather
+    /// than stored: the real API attaches by tag, so a droplet created
+    /// after the firewall is behind it and a destroyed one is not, which is
+    /// exactly what orphan cleanup reads.
+    fn firewall_view(&self, state: &DoState, firewall: &FakeFirewall) -> Value {
+        let droplet_ids: Vec<u64> = state
+            .droplets
+            .iter()
+            .filter(|d| d.tags.contains(&firewall.tag))
+            .map(|d| d.id)
+            .collect();
+        json!({
+            "id": firewall.id,
+            "name": firewall.name,
+            "status": "succeeded",
+            "inbound_rules": [{
+                "protocol": "udp",
+                "ports": firewall.port,
+                "sources": { "addresses": ["0.0.0.0/0", "::/0"] },
+            }],
+            "outbound_rules": [{
+                "protocol": "tcp",
+                "ports": "0",
+                "destinations": { "addresses": ["0.0.0.0/0", "::/0"] },
+            }],
+            "droplet_ids": droplet_ids,
+            "tags": [firewall.tag],
+        })
+    }
+
+    fn create_firewall(&self, body: &Value) -> ResponseTemplate {
+        let mut state = self.state.lock().unwrap();
+        let name = body["name"].as_str().unwrap_or_default().to_owned();
+        if state.firewalls.iter().any(|f| f.name == name) {
+            return json_error(422, "unprocessable_entity", "duplicate name");
+        }
+        let tag = body["tags"][0].as_str().unwrap_or_default().to_owned();
+        // A firewall may only name a tag that already exists, which is the
+        // whole reason the provider creates the tag first.
+        if !state.tags.contains(&tag) {
+            return json_error(422, "unprocessable_entity", "tag does not exist");
+        }
+        let firewall = FakeFirewall {
+            id: format!("fw-{name}"),
+            name,
+            tag,
+            port: body["inbound_rules"][0]["ports"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        };
+        let view = self.firewall_view(&state, &firewall);
+        state.firewalls.push(firewall);
+        ResponseTemplate::new(202).set_body_json(json!({ "firewall": view }))
+    }
+
+    fn create_droplet(&self, body: &Value) -> ResponseTemplate {
+        let mut state = self.state.lock().unwrap();
+        let tags: Vec<String> = body["tags"]
+            .as_array()
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|t| t.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        state.next_id += 1;
+        let droplet = FakeDroplet {
+            id: 3_000_000 + state.next_id,
+            region: body["region"].as_str().unwrap_or_default().to_owned(),
+            tags,
+        };
+        let view = droplet_view(&droplet);
+        state.droplets.push(droplet);
+        ResponseTemplate::new(202).set_body_json(json!({ "droplet": view }))
+    }
+
+    fn list_droplets(&self, tag: Option<&str>) -> ResponseTemplate {
+        let state = self.state.lock().unwrap();
+        let droplets: Vec<Value> = state
+            .droplets
+            .iter()
+            .filter(|d| tag.is_none_or(|want| d.tags.iter().any(|t| t == want)))
+            .map(droplet_view)
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "droplets": droplets,
+            "links": {},
+            "meta": { "total": droplets.len() },
+        }))
+    }
+
+    fn delete_droplet(&self, id: &str) -> ResponseTemplate {
+        let mut state = self.state.lock().unwrap();
+        let before = state.droplets.len();
+        state.droplets.retain(|d| d.id.to_string() != id);
+        if state.droplets.len() == before {
+            return json_error(404, "not_found", "no such droplet");
+        }
+        ResponseTemplate::new(204)
+    }
+
+    fn delete_firewall(&self, id: &str) -> ResponseTemplate {
+        let mut state = self.state.lock().unwrap();
+        let before = state.firewalls.len();
+        state.firewalls.retain(|f| f.id != id);
+        if state.firewalls.len() == before {
+            return json_error(404, "not_found", "no such firewall");
+        }
+        ResponseTemplate::new(204)
+    }
+}
+
+fn droplet_view(droplet: &FakeDroplet) -> Value {
+    json!({
+        "id": droplet.id,
+        "name": format!("jamstream-{}", droplet.id),
+        "status": "active",
+        "networks": {
+            "v4": [{ "ip_address": "203.0.113.20", "type": "public" }],
+            "v6": [],
+        },
+        "region": { "name": "Fake", "slug": droplet.region, "available": true },
+        "tags": droplet.tags,
+    })
+}
+
+impl Respond for FakeDigitalOcean {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let path = request.url.path().to_owned();
+        let method = request.method.as_str().to_owned();
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let tag = request
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "tag_name")
+            .map(|(_, v)| v.into_owned());
+        match (method.as_str(), path.as_str()) {
+            ("GET", "/v2/sizes") => {
+                ResponseTemplate::new(200).set_body_json(every_region_sizes_body())
+            }
+            ("GET", "/v2/images") => ResponseTemplate::new(200).set_body_json(json!({
+                "images": [{ "id": 3, "slug": "debian-13-x64" }],
+                "links": {},
+                "meta": {},
+            })),
+            ("POST", "/v2/tags") => {
+                let name = body["name"].as_str().unwrap_or_default().to_owned();
+                let mut state = self.state.lock().unwrap();
+                if state.tags.contains(&name) {
+                    return json_error(422, "unprocessable_entity", "Tag already exists");
+                }
+                state.tags.push(name.clone());
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({ "tag": { "name": name, "resources": {} } }))
+            }
+            ("POST", "/v2/firewalls") => self.create_firewall(&body),
+            ("GET", "/v2/firewalls") => {
+                let state = self.state.lock().unwrap();
+                let firewalls: Vec<Value> = state
+                    .firewalls
+                    .iter()
+                    .map(|f| self.firewall_view(&state, f))
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "firewalls": firewalls, "links": {} }))
+            }
+            ("POST", "/v2/droplets") => self.create_droplet(&body),
+            ("GET", "/v2/droplets") => self.list_droplets(tag.as_deref()),
+            ("DELETE", _) => match path.rsplit_once('/') {
+                Some(("/v2/droplets", id)) => self.delete_droplet(id),
+                Some(("/v2/firewalls", id)) => self.delete_firewall(id),
+                _ => json_error(404, "not_found", "no such collection"),
+            },
+            _ => json_error(404, "not_found", &format!("{method} {path} is not faked")),
+        }
+    }
+}
+
+/// Both session sizes, in every catalog region, because the contract prices
+/// every region a provider advertises.
+fn every_region_sizes_body() -> Value {
+    let regions: Vec<String> = DigitalOceanProvider::new(TOKEN.to_owned())
+        .regions()
+        .iter()
+        .map(|r| r.id.to_string())
+        .collect();
+    json!({
+        "sizes": [
+            { "slug": "s-1vcpu-2gb", "price_hourly": 0.01786, "regions": regions },
+            { "slug": "s-2vcpu-2gb", "price_hourly": 0.02679, "regions": regions },
+        ],
+        "links": {},
+        "meta": { "total": 2 },
+    })
+}
+
+/// #390: the contract is what a new provider has to pass unchanged, and
+/// DigitalOcean was held to hand-written per-behaviour tests instead. Those
+/// stay, because they pin the wire format; this pins the behaviour every
+/// provider owes.
+#[tokio::test]
+async fn digitalocean_provider_passes_the_generic_contract() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(FakeDigitalOcean::default())
+        .mount(&server)
+        .await;
+    let p = provider(&server);
+    assert_provider_contract(&p).await;
 }

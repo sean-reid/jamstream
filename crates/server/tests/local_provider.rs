@@ -242,6 +242,174 @@ fn the_measured_tests_are_named_in_the_nextest_config() {
     );
 }
 
+/// The other half of the same pairing, for the two overrides that name test
+/// binaries rather than test names. Those filters enumerate binaries one by
+/// one, so a new suite that spawns jamstreamd joins no group and gets no
+/// isolation on a green run, which is how #354's half-copied binary and its
+/// Windows CreateProcess error 216 got in.
+///
+/// So the check runs the other way: every test binary in the workspace is
+/// classified from its own source, and the two filters must name exactly the
+/// binaries that come out.
+///
+/// This file quotes every marker below and reaches jamstreamd for real, so it
+/// classifies itself correctly rather than needing an exception.
+#[test]
+fn the_isolated_test_binaries_are_named_in_the_nextest_config() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+
+    let uplift = section(CONFIG, "test-group = \"jamstreamd-uplift\"");
+    let alone = section(CONFIG, "binary(live_runtime)");
+    let mut want_uplift = Vec::new();
+    let mut want_alone = Vec::new();
+    for (package, binary, source) in test_binaries() {
+        // Reaching target/<profile>/jamstreamd, by any of the three routes
+        // the workspace has: cargo's own variable, the server suite's
+        // helper, and the cli and client helper that builds it first.
+        if [
+            "CARGO_BIN_EXE_jamstreamd",
+            "server_binary(",
+            "jamstreamd_binary(",
+        ]
+        .iter()
+        .any(|marker| source.contains(marker))
+        {
+            want_uplift.push((package.clone(), binary.clone()));
+        }
+        // Driving a real client runtime and then letting a second or more of
+        // real time pass: everything measured after that sleep is measured on
+        // whatever machine the suite landed on, so it needs the machine.
+        if source.contains("LiveRuntime") && long_sleep(&source) {
+            want_alone.push(binary);
+        }
+    }
+    want_uplift.sort();
+    want_alone.sort();
+
+    assert_eq!(
+        named_binaries(uplift),
+        want_uplift,
+        "the jamstreamd-uplift filter and the suites that reach \
+         target/<profile>/jamstreamd have come apart; a suite outside the \
+         group can spawn the binary while cargo is rewriting it"
+    );
+    assert_eq!(
+        named_binaries(alone)
+            .into_iter()
+            .map(|(_, binary)| binary)
+            .collect::<Vec<_>>(),
+        want_alone,
+        "the exclusive filter and the suites that measure real time over a \
+         live runtime have come apart"
+    );
+}
+
+/// The `[[profile.default.overrides]]` block containing `marker`, panicking
+/// if no block does.
+fn section<'a>(config: &'a str, marker: &str) -> &'a str {
+    config
+        .split("[[profile.default.overrides]]")
+        .find(|block| block.contains(marker))
+        .unwrap_or_else(|| panic!("no override block in .config/nextest.toml holds {marker}"))
+}
+
+/// The `(package, binary)` pairs a filter names, reading each `package(...)`
+/// clause as owning every `binary(...)` up to the next one. A filter with no
+/// package clause reports an empty package.
+fn named_binaries(filter: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut package = String::new();
+    let mut rest = filter;
+    while let Some(at) = rest.find(['p', 'b']) {
+        let tail = &rest[at..];
+        if let Some(name) = tail
+            .strip_prefix("package(")
+            .and_then(|t| t.split(')').next())
+        {
+            package = name.to_owned();
+            rest = &tail[8..];
+        } else if let Some(name) = tail
+            .strip_prefix("binary(")
+            .and_then(|t| t.split(')').next())
+        {
+            pairs.push((package.clone(), name.trim_start_matches('=').to_owned()));
+            rest = &tail[7..];
+        } else {
+            rest = &tail[1..];
+        }
+    }
+    pairs.sort();
+    pairs
+}
+
+/// Every test binary in the workspace: `(package, binary, source)`, from the
+/// top-level files under each crate's `tests/` directory.
+fn test_binaries() -> Vec<(String, String, String)> {
+    let crates = workspace_root().join("crates");
+    let mut out = Vec::new();
+    for crate_dir in read_dir_sorted(&crates) {
+        let manifest = crate_dir.join("Cargo.toml");
+        let Ok(manifest) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let package = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("name = \""))
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("no package name in {}", crate_dir.display()))
+            .to_owned();
+        for file in read_dir_sorted(&crate_dir.join("tests")) {
+            if file.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let binary = file
+                .file_stem()
+                .expect("a .rs file has a stem")
+                .to_string_lossy()
+                .into_owned();
+            let source = std::fs::read_to_string(&file).expect("test source is readable");
+            out.push((package.clone(), binary, source));
+        }
+    }
+    assert!(
+        out.len() > 20,
+        "found only {} test binaries; the workspace scan is looking in the \
+         wrong place",
+        out.len()
+    );
+    out
+}
+
+fn read_dir_sorted(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    paths
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+}
+
+/// True when `source` sleeps a whole second or more of real time in one go.
+/// Underscores in the literal are cargo's, not a separator this has to keep.
+fn long_sleep(source: &str) -> bool {
+    let millis = source.split("thread::sleep(Duration::from_millis(").skip(1);
+    let secs = source.split("thread::sleep(Duration::from_secs(").skip(1);
+    let digits = |tail: &str| -> Option<u64> {
+        let literal: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '_')
+            .collect();
+        literal.replace('_', "").parse().ok()
+    };
+    millis.filter_map(digits).any(|ms| ms >= 1_000) || secs.filter_map(digits).any(|s| s >= 1)
+}
+
 #[tokio::test]
 async fn registry_survives_provider_restart() {
     let dir = scratch_dir("localmode-sweeper");

@@ -57,6 +57,9 @@ zeroize.workspace = true
 egui_kittest.workspace = true
 jamstream-server.workspace = true
 hound.workspace = true
+# A provider that holds the app's one executor thread, so a test can say what
+# the window does while a teardown has not answered yet.
+async-trait.workspace = true
 
 [build-dependencies]
 winresource.workspace = true
