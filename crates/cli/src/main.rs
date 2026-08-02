@@ -9,17 +9,14 @@ use clap::Parser;
 use jamstream_cli::cli::{Cli, Command, RecordingsCommand};
 use jamstream_cli::storage::EnvStores;
 use jamstream_cli::{CliError, end, host, join, providers, recordings, status, sweep};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 fn main() -> ExitCode {
-    // Warnings by default: with RUST_LOG unset, from_default_env dropped
-    // every warn!, including the security-relevant Windows degradations
-    // (icacls failed, directory ACL left inherited). RUST_LOG still wins.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
+    // Warnings by default, RUST_LOG wins: see the logging module for why.
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(jamstream_cli::logging::from_env())
         .init();
 
     let cli = Cli::parse();

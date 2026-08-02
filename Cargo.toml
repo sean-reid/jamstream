@@ -131,7 +131,11 @@ tokio ={ version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json = "1"
 wiremock = "0.6"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# No env-filter: it pulls a full regex engine (280 KiB of jamstreamd's
+# musl .text) for EnvFilter's span-field directive grammar, which nothing
+# here uses. All three binaries parse RUST_LOG with filter::Targets, which
+# the fmt feature's std already carries. See #298.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 mimalloc = "0.1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
