@@ -366,10 +366,13 @@ write_files:
       rtmpAddress: 127.0.0.1:1935
       rtmpEncryption: "no"
       rtsp: false
-      rtsps: false
       hls: false
       webrtc: false
       srt: false
+      # Off like the rest, and for one more reason: MoQ defaults on and writes
+      # auto.key and auto.crt into the working directory, which is / here and
+      # read-only under ProtectSystem=strict.
+      moq: false
       api: false
       metrics: false
       pprof: false
