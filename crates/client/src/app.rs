@@ -1319,15 +1319,21 @@ impl JamApp {
     /// Meters, the cost ticker, and connection quality move for as long as
     /// a session is up. A file dialog is a second window the frame loop
     /// cannot see, so a repaint is asked for until its thread answers.
+    ///
+    /// An open settings drawer used to be reason enough on any screen. Its
+    /// only moving part is the Audio tab's input meter, which reads its
+    /// levels off a snapshot, so on Home with no session behind it the
+    /// drawer held the whole app at display rate to redraw zeros (#383).
     pub fn repaint_while_animating(&self, ctx: &Context) {
+        let drawer_animating = self.settings_open && self.runtime.is_some();
         let animating = self.ending.is_some()
             || self.avatar_dialog.is_some()
             || self.recording.busy()
             || match self.screen {
                 Screen::Session => true,
-                Screen::HostWizard => self.wizard.busy() || self.settings_open,
-                Screen::Takes => self.takes.busy() || self.settings_open,
-                _ => self.settings_open,
+                Screen::HostWizard => self.wizard.busy() || drawer_animating,
+                Screen::Takes => self.takes.busy() || drawer_animating,
+                _ => drawer_animating,
             };
         if animating {
             ctx.request_repaint();

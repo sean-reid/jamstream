@@ -213,6 +213,51 @@ fn the_frame_pulls_one_snapshot() {
     }
 }
 
+/// The settings drawer is not by itself a reason to run at display rate.
+/// Its one moving part is the Audio tab's input meter, which draws off a
+/// snapshot, so an open drawer on Home used to pin the app at display rate
+/// redrawing permanent zeros (#383).
+///
+/// Observed where the frame loop observes it: the callback egui calls to
+/// wake a sleeping integration, on a context of this test's own.
+#[test]
+fn an_open_drawer_repaints_only_with_a_session_behind_it() {
+    fn wakes(app: &JamApp) -> usize {
+        let ctx = egui::Context::default();
+        let woken = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&woken);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        app.repaint_while_animating(&ctx);
+        woken.load(Ordering::Relaxed)
+    }
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.settings_open = true;
+    assert_eq!(wakes(&app), 0, "the drawer on Home animates nothing");
+
+    // The meter's source, and the drawer starts moving with it.
+    app.runtime = Some(Box::new(CountingRuntime::new(DemoRuntime::full(
+        0, true, false,
+    ))));
+    assert_eq!(
+        wakes(&app),
+        1,
+        "levels are arriving; the meter has to be redrawn"
+    );
+
+    // And the session screen, which animates whatever the drawer is doing.
+    app.screen = Screen::Session;
+    app.settings_open = false;
+    assert_eq!(
+        wakes(&app),
+        1,
+        "a session animates with or without the drawer"
+    );
+}
+
 /// What a frame of the busiest screen costs in allocations. The number is
 /// printed on every run, because a budget nobody can see the distance to
 /// cannot be calibrated.
