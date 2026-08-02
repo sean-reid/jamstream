@@ -14,6 +14,9 @@
 # - install-scripts-windows: the PowerShell pair must also survive a real
 #   install, smoke, and uninstall on a Windows runner, against the newest
 #   release that has finished uploading its assets.
+# - site-fonts: the theme's fonts are copies of fonts/ at the root of the
+#   tree. A change to those must run site/copy-fonts.sh in the same change
+#   or this job fails, and a build of the book proves the fonts reach it.
 # - channel-claims: site/src/download.md's package-managers section must
 #   agree with packaging/README.md about which channels are live, and the
 #   two strings a user types (the brew tap path, the scoop bucket URL)
@@ -73,6 +76,49 @@ jobs:
         run: cargo test --locked -p jamstream-client --test ui_snapshots
       - name: Check committed docs images against fresh previews
         run: site/copy-previews.sh --check
+
+  # The theme's fonts are copies of fonts/ at the root of the tree, which is
+  # the one set the app and the stream card also embed. They were symlinks
+  # until #425: a Windows clone writes those as text files holding the target
+  # path, mdBook copies them into the book as fonts, and the browser falls
+  # back with nothing reporting an error. The copies are what CI can see, so
+  # this job proves they still match their source and that a real build ships
+  # the bytes themselves rather than anything standing in for them.
+  site-fonts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Shellcheck the site scripts
+        run: shellcheck site/*.sh
+      - name: Check the theme fonts against the tree's fonts
+        run: site/copy-fonts.sh --check
+      # pages.yml pins the version that builds what people read, so it is the
+      # one place the pin lives.
+      - name: Install mdbook, the version pages.yml pins
+        run: |
+          set -eu
+          version=$(sed -n 's/^ *MDBOOK_VERSION: *//p' .github/workflows/pages.yml | head -1)
+          [ -n "$version" ] || { echo "::error::no MDBOOK_VERSION in pages.yml"; exit 1; }
+          echo "mdbook $version"
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${version}/mdbook-v${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build the book
+        run: mdbook build site
+      - name: The built book carries the fonts themselves
+        run: |
+          set -eu
+          for theme in site/theme/fonts/*.ttf; do
+            name=$(basename "$theme")
+            built="site/book/fonts/$name"
+            [ -f "$built" ] || { echo "::error::the built book has no $built"; exit 1; }
+            cmp "fonts/$name" "$built"
+            echo "$built matches fonts/$name"
+          done
 
   palette:
     runs-on: ubuntu-latest

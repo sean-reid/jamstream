@@ -734,7 +734,7 @@ jobs:
           # them here is what makes a job added there fail this one, and the
           # reverse direction catches a deleted job whose required context
           # would otherwise leave the branch permanently unmergeable.
-          DOCS_JOBS='cli-docs screenshots palette channel-claims install-scripts install-scripts-windows'
+          DOCS_JOBS='cli-docs screenshots site-fonts palette channel-claims install-scripts install-scripts-windows'
 
           # Top-level keys of the `jobs:` block. Deliberately dumb, and it
           # fails on an empty result rather than passing quietly, because a

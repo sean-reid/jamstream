@@ -1,5 +1,7 @@
-/* The files beside this one are symlinks into the tree's fonts directory,
- * so the site serves the same bytes the app and the stream card embed.
+/* The files beside this one are copies of the tree's fonts directory made by
+ * site/copy-fonts.sh, so the site serves the same bytes the app and the
+ * stream card embed. This stylesheet is the list that script reads: name a
+ * face here and it gets copied, stop naming one and it goes.
  * Public Sans (OFL, see PublicSans-OFL.txt) for text,
  * IBM Plex Mono (OFL, see IBMPlexMono-OFL.txt) for code and numerals. */
 
