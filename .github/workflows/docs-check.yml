@@ -14,6 +14,10 @@
 # - install-scripts-windows: the PowerShell pair must also survive a real
 #   install, smoke, and uninstall on a Windows runner against the latest
 #   published release.
+# - channel-claims: site/src/download.md's package-managers section must
+#   agree with packaging/README.md about which channels are live, and the
+#   two strings a user types (the brew tap path, the scoop bucket URL)
+#   must match their single sources.
 # - palette: crates/client/src/theme.rs is the single source of truth for
 #   JamStream's colors. The docs theme's custom properties, the docs
 #   theme-color meta, and the app icon's fills are generated from it by
@@ -86,6 +90,19 @@ jobs:
       # ubuntu rather than needing a macOS runner.
       - name: Check the derived icon assets against the icon
         run: scripts/render-icon.sh --check
+
+  # The download page's claims about package channels, against
+  # packaging/README.md (whose per-channel sections say what is live) and
+  # the two strings a user actually types: the brew tap path, defined in
+  # the README and echoed by the rendered manifests, and the scoop bucket
+  # URL, defined by release.yml's BUCKET_REPO. The page said no package
+  # manager was live while the tap had been shipping for weeks (#362).
+  channel-claims:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the download page against the channel claims
+        run: scripts/check-channel-claims.sh
 
   install-scripts:
     runs-on: ubuntu-latest
