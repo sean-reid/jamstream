@@ -28,5 +28,5 @@ b7e5c9b6   local/local          ended    2 h 13 min        $0.00              - 
 
 - ACCRUED is the machine's hourly rate times elapsed time; egress is not included, so the provider's bill can be cents higher.
 - PROJECTED extends the rate to the `--hours` horizon, for running sessions only.
-- A provider that cannot be checked (credentials not in this shell, network down) proves nothing, so the row keeps its recorded status and a line under the table says it could not be checked.
+- A provider that cannot be checked (credentials not in this shell, network down, one of its regions unreachable) proves nothing, so the row keeps its recorded status and a line under the table says it could not be checked.
 - In `--json`, rows recorded as running carry `"corroborated"`, and `"status"` is `"stale"` when the provider no longer lists the instance. Nothing is rewritten on disk; [`jamstream end`](end.md) and [`jamstream sweep`](sweep.md) do that.
