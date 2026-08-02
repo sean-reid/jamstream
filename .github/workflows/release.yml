@@ -119,7 +119,19 @@ jobs:
         with:
           toolchain: stable
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      # No build cache in any of the four jobs that produce release artifacts.
+      # A restored target directory is object files from an earlier run, which
+      # cargo links rather than rebuilds, and the cache is writable by anything
+      # that can run a workflow on the default branch. That lands before the
+      # fetch-then-offline argument below starts holding, in the job whose
+      # output every session VM downloads and in the macos job that holds the
+      # Developer ID certificate.
+      #
+      # It buys nothing measurable either. Releases are days or weeks apart and
+      # the entries do not survive the gap: on v0.2.0 and on v0.1.6 the restore
+      # in all four jobs logged "No cache found", each job then spent time
+      # saving a copy nothing ever read, and the two runs took the same wall
+      # clock to a few seconds.
       # musl-tools carries the native musl-gcc; gcc-aarch64-linux-gnu is the
       # cross linker and C compiler for the arm64 build, where rustc's
       # self-contained musl libc does the rest.
@@ -220,7 +232,8 @@ jobs:
         with:
           toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      # No build cache; see server-musl. It matters most here, where the
+      # linked result is signed and notarized.
       - name: Verify the pinned server artifacts reached this job
         run: |
           set -eu
@@ -449,7 +462,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      # No build cache; see server-musl.
       - name: Verify the pinned server artifacts reached this job
         shell: bash
         run: |
@@ -566,7 +579,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      # No build cache; see server-musl.
       - name: Verify the pinned server artifacts reached this job
         run: |
           set -eu
