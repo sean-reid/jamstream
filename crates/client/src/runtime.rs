@@ -437,4 +437,13 @@ pub struct Snapshot {
 pub trait Runtime: Send {
     fn snapshot(&self) -> Snapshot;
     fn send(&self, cmd: Command);
+
+    /// The connection state alone, for the frame loop's "has this session
+    /// ended" check. The default answer is the snapshot's, so an
+    /// implementation is free to ignore this; one whose snapshot copies a
+    /// roster and a chat buffer should not, because this is asked every
+    /// frame and the answer is one enum (#382).
+    fn conn_state(&self) -> ConnState {
+        self.snapshot().stats.state
+    }
 }
