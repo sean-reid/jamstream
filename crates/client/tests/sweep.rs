@@ -22,10 +22,10 @@ use jamstream_cloud::{MockProvider, Provider, ProviderError, ProviderKind, sessi
 /// A record of a session that is, as far as this computer knows, still up.
 /// `instance_id` is what ties it to a machine the sweep may destroy.
 ///
-/// `provider` is a real provider name rather than the mock's, which
-/// `reconcile` matches against instances of every kind: a record that matched
-/// whatever provider happened to be searched would make this test agree with
-/// itself about coverage, which is the whole thing it is here to check.
+/// `provider` is the name the record spells, and `reconcile` will only close
+/// it on the word of a search answering to that same name. The mock answers
+/// to "mock" alone, so a record naming a real cloud is one no mock can speak
+/// for, which is what the second half of this test leans on.
 fn running_record(provider: &str, session_id_hex: &str, instance_id: &str) -> SessionState {
     SessionState {
         session_id_hex: session_id_hex.to_owned(),
@@ -102,26 +102,24 @@ fn the_home_sweep_stops_strays_and_says_what_it_could_not_account_for() {
     // state or provider access, on the only thread that has started.
     unsafe { std::env::set_var(state::STATE_DIR_ENV, &dir) };
 
-    // Two strays on one cloud and a third on another, with a record for each
-    // of the first two saying they are still running.
-    let (aws, aws_ids) = seeded(ProviderKind::Aws, &["a1a1", "b2b2"]);
-    for (session, instance) in ["a1", "b2"].iter().zip(&aws_ids) {
-        let record = running_record("aws", &session.repeat(16), instance);
+    // Three strays, with a record for two of them saying they are still
+    // running. One provider, because every mock answers to "mock" and a
+    // second would leave which search speaks for these records up to the
+    // order they were resolved in.
+    let (cloud, ids) = seeded(ProviderKind::Aws, &["a1a1", "b2b2", "c3c3"]);
+    for (session, instance) in ["a1", "b2"].iter().zip(&ids) {
+        let record = running_record("mock", &session.repeat(16), instance);
         state::write_to(
             &dir.join(format!("{}.json", record.session_id_hex)),
             &record,
         )
         .expect("write the record");
     }
-    let (gcp, _) = seeded(ProviderKind::Gcp, &["c3c3"]);
 
     let mut app = JamApp::in_memory();
     // The keychain holds nothing for DigitalOcean on this computer, so nothing
     // there was searched. Not the same as finding nothing.
-    app.providers = once(
-        vec![Box::new(aws), Box::new(gcp)],
-        vec![ProviderKind::DigitalOcean],
-    );
+    app.providers = once(vec![Box::new(cloud)], vec![ProviderKind::DigitalOcean]);
 
     sweep_now(&mut app);
     let outcome = app.swept.as_ref().expect("an outcome");

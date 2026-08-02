@@ -63,28 +63,49 @@ pub struct SweepOutcome {
     pub still_running: Vec<String>,
     /// `provider: reason` for a provider whose listing failed.
     pub unswept: Vec<String>,
+    /// Providers that answered for some of themselves and not the rest, with
+    /// the regions that never answered. A stray in one of those regions was
+    /// not looked for, so this is a hole in the sweep and not a clean pass.
+    pub partly_searched: Vec<String>,
     /// Providers with no credential here.
     pub unconfigured: Vec<ProviderKind>,
     /// Session records this closed, by short id.
     pub closed: Vec<String>,
     pub firewalls: usize,
-    /// The records could not be rewritten. The machines are still gone; what
-    /// failed is the bookkeeping, and saying so beats a silent disagreement
-    /// between the app and `jamstream status`.
-    pub records_error: Option<String>,
+    /// Records the reconciliation could not rewrite, one line each. The
+    /// machines are still gone; what failed is the bookkeeping, and saying so
+    /// beats a silent disagreement between the app and `jamstream status`.
+    pub records_errors: Vec<String>,
 }
 
 impl SweepOutcome {
-    /// Reads a real report. `closed` is what [`jamstream_cli::sweep::reconcile`]
+    /// Reads a real report and what [`jamstream_cli::sweep::reconcile`]
     /// answered.
     pub fn new(
         report: &SweepReport,
-        closed: Result<Vec<String>, String>,
+        reconciled: Result<jamstream_cli::sweep::Reconciled, String>,
         unconfigured: Vec<ProviderKind>,
     ) -> SweepOutcome {
-        let (closed, records_error) = match closed {
-            Ok(ids) => (ids, None),
-            Err(err) => (Vec::new(), Some(err)),
+        // Two different failures, said differently. Reconciliation failing
+        // outright closed nothing and leaves every record suspect; one
+        // unwritable record leaves the rest correct, so it is named alone.
+        let (closed, records_errors) = match reconciled {
+            Ok(done) => (
+                done.closed,
+                done.unwritten
+                    .iter()
+                    .map(|(path, err)| {
+                        format!(
+                            "A session record could not be updated: {}: {err}",
+                            path.display()
+                        )
+                    })
+                    .collect(),
+            ),
+            Err(err) => (
+                Vec::new(),
+                vec![format!("The session records could not be updated: {err}")],
+            ),
         };
         SweepOutcome {
             found: report.found.len(),
@@ -97,7 +118,20 @@ impl SweepOutcome {
             unswept: report
                 .unswept
                 .iter()
-                .map(|(kind, err)| format!("{kind}: could not be searched: {err}"))
+                .map(|(name, err)| format!("{name}: could not be searched: {err}"))
+                .collect(),
+            partly_searched: report
+                .searches
+                .iter()
+                .filter(|s| !s.unsearched.is_empty())
+                .map(|s| {
+                    let regions: Vec<&str> = s.unsearched.iter().map(|r| r.as_str()).collect();
+                    format!(
+                        "{}: {} did not answer, so nothing there was looked for",
+                        s.provider,
+                        regions.join(", ")
+                    )
+                })
                 .collect(),
             unconfigured,
             closed: closed
@@ -105,14 +139,19 @@ impl SweepOutcome {
                 .map(|id| id.chars().take(8).collect())
                 .collect(),
             firewalls: report.firewalls_removed.len(),
-            records_error,
+            records_errors,
         }
     }
 
-    /// True when every provider was searched and everything found is gone.
-    /// Anything else means a machine may still be billing.
+    /// True when every provider was searched in full and everything found is
+    /// gone. Anything else means a machine may still be billing, including a
+    /// provider that answered for only some of its regions: the sweep cannot
+    /// speak for the ones that stayed silent.
     pub fn accounted_for(&self) -> bool {
-        self.still_running.is_empty() && self.unswept.is_empty() && self.unconfigured.is_empty()
+        self.still_running.is_empty()
+            && self.unswept.is_empty()
+            && self.partly_searched.is_empty()
+            && self.unconfigured.is_empty()
     }
 
     /// The headline: what was found and what is gone.
@@ -152,15 +191,14 @@ impl SweepOutcome {
             out.push(format!("Still running, could not stop it: {line}"));
         }
         out.extend(self.unswept.iter().cloned());
+        out.extend(self.partly_searched.iter().cloned());
         if !self.unconfigured.is_empty() {
             out.push(format!(
                 "Not searched, no credentials saved here: {}.",
                 ProviderKind::name_list(self.unconfigured.iter().copied())
             ));
         }
-        if let Some(err) = &self.records_error {
-            out.push(format!("The session records could not be updated: {err}"));
-        }
+        out.extend(self.records_errors.iter().cloned());
         out
     }
 }
@@ -171,15 +209,19 @@ impl SweepOutcome {
 /// the records saying one thing and the account another.
 pub async fn run(resolved: Resolved) -> SweepOutcome {
     let report = jamstream_cloud::sweep(&resolved.providers, SweepFilter::All, false).await;
-    let closed =
-        jamstream_cli::sweep::reconcile(&report, &resolved.providers).map_err(|e| e.to_string());
-    SweepOutcome::new(&report, closed, resolved.unconfigured)
+    // The report is the whole record of what was searched, so reconcile takes
+    // it alone: a provider list passed alongside could disagree with it, and
+    // that disagreement is what let a sweep close a session nobody looked for.
+    let reconciled = jamstream_cli::sweep::reconcile(&report).map_err(|e| e.to_string());
+    SweepOutcome::new(&report, reconciled, resolved.unconfigured)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::creds::MemStore;
+    use jamstream_cli::sweep::Reconciled;
+    use jamstream_cloud::{ProviderSearch, RegionId};
 
     /// The set the button sweeps is every provider this computer holds a key
     /// for, and the rest are reported rather than dropped: a sweep that
@@ -208,19 +250,63 @@ mod tests {
     /// with no key here. Both keep the outcome from reading as accounted for.
     #[test]
     fn coverage_gaps_are_never_reported_as_clean() {
-        let clean = SweepOutcome::new(&SweepReport::default(), Ok(Vec::new()), Vec::new());
+        let clean = SweepOutcome::new(
+            &SweepReport::default(),
+            Ok(Reconciled::default()),
+            Vec::new(),
+        );
         assert!(clean.accounted_for());
         assert!(clean.warnings().is_empty());
         assert_eq!(clean.summary(), "Nothing tagged jamstream was running.");
 
         let unconfigured = SweepOutcome::new(
             &SweepReport::default(),
-            Ok(Vec::new()),
+            Ok(Reconciled::default()),
             vec![ProviderKind::Aws],
         );
         assert!(!unconfigured.accounted_for());
         assert_eq!(unconfigured.warnings().len(), 1);
         assert!(unconfigured.warnings()[0].contains("aws"));
+    }
+
+    /// A provider that answered for some of its regions and not the rest
+    /// found nothing in the ones that stayed silent, because it never looked
+    /// there. That is a hole, and the sweeper reports it as one rather than
+    /// letting an empty result read as an all-clear.
+    #[test]
+    fn a_partial_search_is_a_hole_not_an_all_clear() {
+        let report = SweepReport {
+            searches: vec![ProviderSearch {
+                provider: "aws",
+                kind: ProviderKind::Aws,
+                unsearched: vec![RegionId::new("eu-west-1".to_owned())],
+            }],
+            ..SweepReport::default()
+        };
+        let outcome = SweepOutcome::new(&report, Ok(Reconciled::default()), Vec::new());
+
+        assert!(
+            !outcome.accounted_for(),
+            "a region nobody could list may still hold a billing machine"
+        );
+        let warnings = outcome.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("aws"), "{warnings:?}");
+        assert!(warnings[0].contains("eu-west-1"), "{warnings:?}");
+
+        // A search that reached all of itself says nothing, so a clean sweep
+        // stays quiet rather than listing every provider that worked.
+        let whole = SweepReport {
+            searches: vec![ProviderSearch {
+                provider: "aws",
+                kind: ProviderKind::Aws,
+                unsearched: Vec::new(),
+            }],
+            ..SweepReport::default()
+        };
+        let outcome = SweepOutcome::new(&whole, Ok(Reconciled::default()), Vec::new());
+        assert!(outcome.accounted_for());
+        assert!(outcome.warnings().is_empty());
     }
 
     /// Reconcile failing is a bookkeeping failure, not a sweep failure: the

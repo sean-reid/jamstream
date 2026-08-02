@@ -351,7 +351,10 @@ fn unaccounted_sweep() -> SweepOutcome {
         ));
     SweepOutcome::new(
         &report,
-        Ok(vec!["c3c3c3c3".repeat(4)]),
+        Ok(jamstream_cli::sweep::Reconciled {
+            closed: vec!["c3c3c3c3".repeat(4)],
+            unwritten: Vec::new(),
+        }),
         vec![ProviderKind::DigitalOcean],
     )
 }
