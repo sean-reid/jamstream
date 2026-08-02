@@ -324,6 +324,18 @@ jobs:
         run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
       - if: runner.os == 'Linux'
         run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
+      # And the relay, from the same pin file, for crates/stream's relay_chain
+      # test. The encoder publishes to a MediaMTX on loopback and every pusher
+      # reads from it, so the hop between them is half of what a live broadcast
+      # depends on and no file sink can stand in for it. It is also the only
+      # thing that runs the relay config cloud-init generates against the
+      # release a session boots: mediamtx refuses an unknown key and exits, and
+      # systemd reports a Type=simple unit as started either way.
+      - if: runner.os == 'Linux'
+        name: Install the mediamtx a session VM runs
+        run: scripts/install-pinned-mediamtx.sh "$RUNNER_TEMP/pinned-mediamtx"
+      - if: runner.os == 'Linux'
+        run: echo "$RUNNER_TEMP/pinned-mediamtx" >> "$GITHUB_PATH"
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-nextest
@@ -519,14 +531,17 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
-      # The pinned ffmpeg for the same reason as the test job: this runs
-      # crates/stream's tests too, and real_ffmpeg fails on Linux when the
-      # encoder is absent rather than reporting a pass. Instrumentation makes
-      # this the job most likely to catch a feed that only just keeps up, which
-      # is where the ffmpeg 8 wedge showed itself.
+      # The pinned ffmpeg and mediamtx for the same reason as the test job: this
+      # runs crates/stream's tests too, and real_ffmpeg and relay_chain fail on
+      # Linux when the tools are absent rather than reporting a pass.
+      # Instrumentation makes this the job most likely to catch a feed that only
+      # just keeps up, which is where the ffmpeg 8 wedge showed itself.
       - name: Install the ffmpeg a session VM runs
         run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
       - run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
+      - name: Install the mediamtx a session VM runs
+        run: scripts/install-pinned-mediamtx.sh "$RUNNER_TEMP/pinned-mediamtx"
+      - run: echo "$RUNNER_TEMP/pinned-mediamtx" >> "$GITHUB_PATH"
       # Through nextest, like every other job that runs these tests. Plain
       # `cargo llvm-cov` drives libtest, which reads none of
       # .config/nextest.toml, so on this one path the file's opening claim
