@@ -22,8 +22,11 @@ use jamstream_client::screens::invites::InvitesPanel;
 use jamstream_client::screens::recording::RecordingChoice;
 use jamstream_client::screens::session::SettingsTab;
 use jamstream_client::screens::takes::Half;
+use jamstream_client::sweep::SweepOutcome;
 use jamstream_client::theme::{self, Theme};
-use jamstream_cloud::{Price, ProbeMatrix, ProviderKind, Region, RegionId, rank};
+use jamstream_cloud::{
+    MockProvider, Price, ProbeMatrix, ProviderError, ProviderKind, Region, RegionId, rank,
+};
 
 const WIDE: egui::Vec2 = vec2(1280.0, 800.0);
 const NARROW: egui::Vec2 = vec2(800.0, 600.0);
@@ -267,6 +270,65 @@ fn home_light() {
     app.recent = sample_recent();
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_light");
+}
+
+#[test]
+fn home_sweep_confirm() {
+    // "Stop strays" asks first. It destroys every tagged machine in every
+    // account this computer holds a key for, and one of them can be a
+    // session a band is playing on, so the dialog says that before the
+    // button does it.
+    let mut app = test_app(Theme::Dark);
+    app.recent = sample_recent();
+    app.confirm_sweep = true;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "home_sweep_confirm");
+}
+
+#[test]
+fn home_sweep_report() {
+    // What a sweep that could not account for everything says, off a real
+    // report: two clouds swept, one of them refusing to list, one machine
+    // that would not die, and a provider with no key on this computer. Each
+    // of those is a bill, so each is in the danger colour, apart from what
+    // the sweep actually did.
+    let mut app = test_app(Theme::Dark);
+    app.recent = sample_recent();
+    app.swept = Some(unaccounted_sweep());
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "home_sweep_report");
+}
+
+/// A [`SweepOutcome`] off the real sweeper rather than a hand-built one: the
+/// mocks refuse a listing and a destroy, and what the card draws is whatever
+/// `jamstream_cloud::sweep` made of that.
+fn unaccounted_sweep() -> SweepOutcome {
+    let seed = |kind: ProviderKind, session: &str| {
+        use jamstream_cloud::Provider as _;
+        let p = MockProvider::with_default_regions(kind);
+        let region = p.regions()[0].clone();
+        p.seed_instance(&region, vec![jamstream_cloud::session_tag(session)]);
+        p
+    };
+    let throttled = seed(ProviderKind::Aws, "a1a1");
+    throttled.fail_next_lists(1, ProviderError::RateLimited { retry_after: None });
+    let stubborn = seed(ProviderKind::Gcp, "b2b2");
+    stubborn.fail_next_destroys(1, ProviderError::Other("instance is locked".to_owned()));
+    let providers: Vec<Box<dyn jamstream_cloud::Provider>> =
+        vec![Box::new(throttled), Box::new(stubborn)];
+    let report = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("fixture runtime")
+        .block_on(jamstream_cloud::sweep(
+            &providers,
+            jamstream_cloud::SweepFilter::All,
+            false,
+        ));
+    SweepOutcome::new(
+        &report,
+        Ok(vec!["c3c3c3c3".repeat(4)]),
+        vec![ProviderKind::DigitalOcean],
+    )
 }
 
 /// The Takes screen with everything it can say on it at once.

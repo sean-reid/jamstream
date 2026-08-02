@@ -1726,8 +1726,7 @@ mod tests {
         let err = CliError::Provider(ProviderError::Auth(format!(
             "http 403 Forbidden: {S3_DENIED}"
         )));
-        let (shown, logged) =
-            with_captured_log(|| error_sentence("listing a3f29c41", "aws", &err));
+        let (shown, logged) = with_captured_log(|| error_sentence("listing a3f29c41", "aws", &err));
         assert!(shown.contains("s3:ListBucket"), "the remedy: {shown}");
         assert!(shown.contains("storage key"), "what failed: {shown}");
         for identifier in [

@@ -53,8 +53,12 @@ Members need only outbound UDP, so home routers and NAT need no configuration an
 
 ## Something is still running that should not be
 
+In the app, **Stop strays** on the Recent sessions card destroys every JamStream-tagged machine in every account this computer holds a key for, and brings the session records back in line with what it found. It reports three things apart: what it stopped, what it could not stop, and which providers it could not search. A provider with no credentials saved here, or one whose listing failed, was never looked at, which is not the same as finding nothing.
+
+From a terminal:
+
 ```console
 $ jamstream sweep --dry-run
 ```
 
-lists every JamStream-tagged machine across your configured providers. Run it without `--dry-run` to destroy them. If sweep reports a failure, the named instance is still billing; destroy it from the provider's own console and report the bug.
+lists the same machines without destroying them. Run it without `--dry-run` to destroy them. Either way, a named instance that could not be stopped is still billing; destroy it from the provider's own console and report the bug.

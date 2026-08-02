@@ -46,9 +46,9 @@ Three, all on by default:
 
 - **The self-destruct timers.** Every server shuts itself down after `--idle-min` minutes with no musicians (default 10) and destroys itself at the `--max-hours` hard cap (default 12) no matter what. The cap is enforced on the machine itself, not by your laptop.
 
-  GCP is the exception, and it costs money if you walk away. There the idle window stops the server but cannot delete the machine, so an abandoned session keeps billing until the hard cap: roughly $0.39 on an e2-medium if everyone leaves at twenty minutes and nobody comes back. End the session when you are done, or run `jamstream sweep` afterwards, and you pay for the time you played. Shortening `--max-hours` bounds it too.
+  GCP is the exception, and it costs money if you walk away. There the idle window stops the server but cannot delete the machine, so an abandoned session keeps billing until the hard cap: roughly $0.39 on an e2-medium if everyone leaves at twenty minutes and nobody comes back. End the session when you are done, or press **Stop strays** afterwards, and you pay for the time you played. Shortening `--max-hours` bounds it too.
 - **The cost ticker.** While a session runs, cost so far and elapsed time sit at the right-hand end of the app's status bar, beside **Record** and **Leave**, and `jamstream status` prints accrued and projected cost per session. You always know the meter's reading; nothing accrues silently.
-- **The sweeper.** Every machine JamStream launches is tagged. `jamstream sweep` finds everything with the tag across all configured providers and destroys it; `--dry-run` lists without destroying. `jamstream host` also warns you at launch if tagged machines already exist. When in doubt, sweep.
+- **The sweeper.** Every machine JamStream launches is tagged. **Stop strays**, on the app's Recent sessions card, finds everything with the tag across every account this computer holds a key for and destroys it, then says what it could not account for. `jamstream sweep` does the same from a terminal, with `--dry-run` to list without destroying. `jamstream host` also warns you at launch if tagged machines already exist. When in doubt, sweep.
 
 The worst case, all guardrails ignored and a session forgotten mid-jam, is 12 hours of a small machine: about $0.32 on DigitalOcean, about $0.40 on AWS or GCP, plus cents of egress.
 
