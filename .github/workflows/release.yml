@@ -71,14 +71,21 @@ on:
         required: true
         type: string
 
-# Every job here uploads assets to the release, so contents: write is the
-# floor. Nothing needs actions, packages, or id-token.
+# Read by default; the jobs that upload assets raise themselves to
+# contents: write. Nothing here needs actions, packages, or id-token.
 permissions:
-  contents: write
+  contents: read
 
+# GH_TOKEN is bound per step, not here. On the workflow it sat in process.env
+# for every step of every job, including the cargo builds, whose dependency
+# graph runs dozens of third-party build scripts, and that token can overwrite
+# any asset on the release: the jamstreamd binaries every cloud session VM
+# downloads at boot, SHA256SUMS (which is what the installer verifies
+# downloads against), and the signed DMG. Only the steps that call gh get it,
+# and every checkout below drops the credential rather than persisting it into
+# .git/config where any later step could read it back.
 env:
   CARGO_TERM_COLOR: always
-  GH_TOKEN: ${{ github.token }}
   TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
@@ -88,6 +95,8 @@ jobs:
   server-musl:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
     outputs:
       server_url_x86_64: ${{ steps.pin.outputs.url_x86_64 }}
       server_sha256_x86_64: ${{ steps.pin.outputs.sha256_x86_64 }}
@@ -96,15 +105,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           # The live path into this workflow is workflow_dispatch, whose
           # default ref is the default branch, not the tag. Without this
           # the artifacts for a tag are built from whatever main happens
           # to be when the build starts, which with parallel PRs merging
           # is not the tagged commit.
           ref: ${{ github.event.release.tag_name || inputs.tag }}
-      # Commit pins, per the policy documented in ci.yml. Every job in this
-      # workflow holds a token that can write release assets, and the macos
-      # job below also holds the Developer ID certificate and the notary key.
+      # Commit pins, per the policy documented in ci.yml. These actions run in
+      # the jobs that build what a release publishes, and the macos job below
+      # also holds the Developer ID certificate and the notary key.
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
@@ -158,6 +168,8 @@ jobs:
       # not "latest", so a client always launches the server it shipped with.
       - name: Package, upload, and pin the server artifacts
         id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           for ARCH in x86_64 aarch64; do
@@ -187,6 +199,8 @@ jobs:
     needs: server-musl
     runs-on: macos-latest
     timeout-minutes: 60
+    permissions:
+      contents: write
     env:
       JAMSTREAM_SERVER_URL_X86_64: ${{ needs.server-musl.outputs.server_url_x86_64 }}
       JAMSTREAM_SERVER_SHA256_X86_64: ${{ needs.server-musl.outputs.server_sha256_x86_64 }}
@@ -195,6 +209,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           # The live path into this workflow is workflow_dispatch, whose
           # default ref is the default branch, not the tag. Without this
           # the artifacts for a tag are built from whatever main happens
@@ -389,6 +404,8 @@ jobs:
           xcrun stapler validate jamstream-app-macos.dmg
           spctl -a -t open --context context:primary-signature -v jamstream-app-macos.dmg
       - name: Package CLI tarball and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           tar -C target/universal -czf jamstream-cli-macos-universal.tar.gz jamstream
@@ -412,6 +429,8 @@ jobs:
     needs: server-musl
     runs-on: windows-latest
     timeout-minutes: 45
+    permissions:
+      contents: write
     env:
       JAMSTREAM_SERVER_URL_X86_64: ${{ needs.server-musl.outputs.server_url_x86_64 }}
       JAMSTREAM_SERVER_SHA256_X86_64: ${{ needs.server-musl.outputs.server_sha256_x86_64 }}
@@ -420,6 +439,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           # The live path into this workflow is workflow_dispatch, whose
           # default ref is the default branch, not the tag. Without this
           # the artifacts for a tag are built from whatever main happens
@@ -497,6 +517,8 @@ jobs:
       # loose .ico file, and uninstall.ps1 deletes exactly this list.
       - name: Package and upload archives
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           7z a jamstream-cli-windows-x86_64.zip ./target/release/jamstream.exe
           7z a jamstream-app-windows-x86_64.zip ./target/release/jamstream-app.exe ./target/release/jamstreamd.exe ./crates/client/assets/icon/jamstream.ico
@@ -524,6 +546,8 @@ jobs:
     needs: server-musl
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: write
     env:
       JAMSTREAM_SERVER_URL_X86_64: ${{ needs.server-musl.outputs.server_url_x86_64 }}
       JAMSTREAM_SERVER_SHA256_X86_64: ${{ needs.server-musl.outputs.server_sha256_x86_64 }}
@@ -532,6 +556,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           # The live path into this workflow is workflow_dispatch, whose
           # default ref is the default branch, not the tag. Without this
           # the artifacts for a tag are built from whatever main happens
@@ -564,6 +589,8 @@ jobs:
       # are installed under the XDG hicolor/applications dirs) and the
       # .desktop entry.
       - name: Package and upload tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tar -C target/release -czf jamstream-cli-linux-x86_64.tar.gz jamstream
           mkdir -p dist/linux
@@ -589,9 +616,12 @@ jobs:
     needs: [server-musl, macos, windows, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           # The live path into this workflow is workflow_dispatch, whose
           # default ref is the default branch, not the tag. Without this
           # the artifacts for a tag are built from whatever main happens
@@ -599,6 +629,8 @@ jobs:
           # is not the tagged commit.
           ref: ${{ github.event.release.tag_name || inputs.tag }}
       - name: Download all release assets, checksum, upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           mkdir assets
@@ -624,16 +656,24 @@ jobs:
     needs: checksums
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           # The live path into this workflow is workflow_dispatch, whose
           # default ref is the default branch, not the tag. Without this
           # the artifacts for a tag are built from whatever main happens
           # to be when the build starts, which with parallel PRs merging
           # is not the tagged commit.
           ref: ${{ github.event.release.tag_name || inputs.tag }}
+      # render-packaging.sh downloads this tag's SHA256SUMS, authenticated
+      # when GH_TOKEN is set and anonymous otherwise, so the token stays on
+      # this step to keep the fetch off the unauthenticated rate limit.
       - name: Render every manifest from this release's SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: ./scripts/render-packaging.sh --output-dir rendered "$TAG"
       - name: Show what was rendered
         run: |
@@ -641,6 +681,8 @@ jobs:
           find rendered -type f | sort
           grep -RE '^\s*(sha256|sha256sums|InstallerSha256)' rendered | sort
       - name: Attach the rendered manifests to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           tar -C rendered -czf jamstream-packaging.tar.gz .
