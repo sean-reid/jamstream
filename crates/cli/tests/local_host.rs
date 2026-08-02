@@ -250,7 +250,7 @@ async fn local_host_join_and_end_story() {
     // A fresh provider on the same state dir sees an empty registry, and a
     // sweep dry-run confirms nothing local is left.
     let fresh = providers::resolve("local").unwrap();
-    assert!(fresh.list_tagged(None).await.unwrap().is_empty());
+    assert!(fresh.list_tagged(None).await.unwrap().instances.is_empty());
     let mut out = Vec::new();
     sweep::run(&[fresh], true, &mut out).await.unwrap();
     assert!(

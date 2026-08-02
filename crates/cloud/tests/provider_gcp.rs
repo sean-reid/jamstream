@@ -351,7 +351,11 @@ async fn list_tagged_session_filter_is_sent_and_decoded() {
         .await;
 
     let p = provider(&server);
-    let found = p.list_tagged(Some("deadbeefcafef00d")).await.expect("list");
+    let found = p
+        .list_tagged(Some("deadbeefcafef00d"))
+        .await
+        .expect("list")
+        .instances;
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, "jamstream-one");
     assert_eq!(found[0].region.id.as_str(), "us-central1");
@@ -397,7 +401,15 @@ async fn list_tagged_aggregates_zones_and_skips_failing_zone() {
         .await;
 
     let p = provider(&server);
-    let mut found = p.list_tagged(None).await.expect("list all");
+    let listed = p.list_tagged(None).await.expect("list all");
+    // The zone that never answered is named rather than counted as empty:
+    // a session living there is not a session that ended.
+    assert!(
+        listed.unsearched.contains(&RegionId::new("us-east1")),
+        "the failing zone must be reported, got {:?}",
+        listed.unsearched
+    );
+    let mut found = listed.instances;
     found.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(found.len(), 2, "one instance per healthy zone");
     assert_eq!(found[0].id, "jamstream-a");
@@ -442,7 +454,11 @@ async fn list_tagged_follows_next_page_token_within_a_zone() {
         .await;
 
     let p = provider(&server);
-    let mut found = p.list_tagged(None).await.expect("list across pages");
+    let mut found = p
+        .list_tagged(None)
+        .await
+        .expect("list across pages")
+        .instances;
     found.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(found.len(), 2, "both pages must be fetched");
     assert_eq!(found[0].id, "jamstream-page1");
@@ -501,7 +517,8 @@ async fn list_tagged_authenticates_via_native_service_account_source() {
     let found = p
         .list_tagged(Some("deadbeefcafef00d"))
         .await
-        .expect("list via native auth");
+        .expect("list via native auth")
+        .instances;
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, "jamstream-native");
     server.verify().await;

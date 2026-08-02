@@ -283,6 +283,45 @@ impl Instance {
     }
 }
 
+/// What one listing saw, and how much of the provider it managed to look at.
+///
+/// The second half is the point. AWS and GCP fan a listing out over every
+/// region in their catalog and return whatever answered, so a throttled
+/// region reads as an empty account. An instance missing from `instances` is
+/// only an instance that is gone when `unsearched` is empty, and callers that
+/// end sessions on an absence have to be able to tell the two apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    pub instances: Vec<Instance>,
+    /// Regions or zones that could not be listed while others answered.
+    pub unsearched: Vec<RegionId>,
+}
+
+impl Listing {
+    /// A listing that covered the whole provider, for the implementations
+    /// that answer in one call and so have nothing to leave out.
+    pub fn complete(instances: Vec<Instance>) -> Self {
+        Listing {
+            instances,
+            unsearched: Vec::new(),
+        }
+    }
+
+    /// True when every region answered.
+    pub fn is_complete(&self) -> bool {
+        self.unsearched.is_empty()
+    }
+
+    /// The regions nobody looked at, for a message: "eu-west-1, ap-south-1".
+    pub fn unsearched_display(&self) -> String {
+        self.unsearched
+            .iter()
+            .map(RegionId::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Builds the canonical session tag pair for a launch.
 pub fn session_tag(session_id: &str) -> (String, String) {
     (SESSION_TAG_KEY.to_owned(), session_id.to_owned())

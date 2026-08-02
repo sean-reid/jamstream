@@ -162,7 +162,7 @@ async fn corroborate(
         Err(e) => return Corroboration::Unchecked(e.to_string()),
     };
     match provider.list_tagged(Some(&session.session_id_hex)).await {
-        Ok(instances) if instances.is_empty() => Corroboration::Gone,
+        Ok(listing) if listing.instances.is_empty() => Corroboration::Gone,
         Ok(_) => Corroboration::Confirmed,
         Err(e) => Corroboration::Unchecked(e.to_string()),
     }

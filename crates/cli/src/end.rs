@@ -90,7 +90,10 @@ pub async fn run<W: Write>(
         )?,
     }
 
-    let remaining = provider.list_tagged(Some(&session.session_id_hex)).await?;
+    let remaining = provider
+        .list_tagged(Some(&session.session_id_hex))
+        .await?
+        .instances;
     if !remaining.is_empty() {
         return Err(CliError::Failed(format!(
             "{} instance(s) still listed for session {} after destroy; run jamstream sweep",

@@ -75,9 +75,9 @@ pub use storage::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use storage::{MockStore, assert_object_store_contract};
-pub use sweeper::{SweepFilter, SweepReport, sweep};
+pub use sweeper::{ProviderSearch, SweepFilter, SweepReport, sweep};
 pub use types::{
     ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, HANDSHAKE_CAP, IP_POLL_PERIOD, IP_WAIT_CAP,
-    IngressRule, Instance, InstanceClass, LaunchSpec, Price, ProviderKind, Region, RegionId,
-    SESSION_TAG_KEY, format_microusd, session_id_from_tags, session_tag,
+    IngressRule, Instance, InstanceClass, LaunchSpec, Listing, Price, ProviderKind, Region,
+    RegionId, SESSION_TAG_KEY, format_microusd, session_id_from_tags, session_tag,
 };

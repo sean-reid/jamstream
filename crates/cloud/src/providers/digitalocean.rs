@@ -32,7 +32,7 @@ use crate::http::{client, error_body, send_retrying};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
     ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec,
-    Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
+    Listing, Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.digitalocean.com";
@@ -709,7 +709,7 @@ impl Provider for DigitalOceanProvider {
         Ok(())
     }
 
-    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>> {
+    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Listing> {
         let tag = match session_tag {
             Some(id) => session_do_tag(id),
             None => BARE_TAG.to_owned(),
@@ -727,7 +727,10 @@ impl Provider for DigitalOceanProvider {
                 Ok((page.droplets, next))
             })
             .await?;
-        Ok(droplets.iter().map(|d| self.instance_from(d)).collect())
+        // One account-wide query, so there is no region to leave out.
+        Ok(Listing::complete(
+            droplets.iter().map(|d| self.instance_from(d)).collect(),
+        ))
     }
 
     fn session_port(&self) -> u16 {

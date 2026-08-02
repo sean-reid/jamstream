@@ -74,8 +74,8 @@ pub async fn run<W: Write>(
     }
     // A provider that could not be listed was never searched, which is not
     // the same as finding nothing there, and the difference is a bill.
-    for (kind, err) in &report.unswept {
-        writeln!(out, "{}: could not be searched: {err}", kind.as_str())?;
+    for (provider, err) in &report.unswept {
+        writeln!(out, "{provider}: could not be searched: {err}")?;
     }
     if !report.is_clean() {
         return Err(CliError::Failed(
@@ -115,7 +115,7 @@ pub fn reconcile(
         let listed = report.found.iter().any(ours);
         let searched = providers.iter().any(|p| {
             record_names_kind(&session.provider, p.kind())
-                && !report.unswept.iter().any(|(kind, _)| *kind == p.kind())
+                && !report.unswept.iter().any(|(name, _)| *name == p.name())
         });
         if destroyed || (searched && !listed) {
             session.mark_ended(now_unix);

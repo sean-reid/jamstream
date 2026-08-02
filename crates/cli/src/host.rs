@@ -114,7 +114,7 @@ pub async fn run<W: Write>(
     // Pre-flight orphan guard: anything already tagged jamstream on this
     // provider is billing right now, most likely a stray from a session
     // that never got torn down. Warn before adding another instance.
-    let preexisting = provider.list_tagged(None).await?;
+    let preexisting = provider.list_tagged(None).await?.instances;
     if !preexisting.is_empty() && !args.json {
         writeln!(
             out,
@@ -792,7 +792,7 @@ async fn wait_for_ip(
         }
         tokio::time::sleep(IP_POLL_PERIOD).await;
         let listed = provider.list_tagged(Some(session_hex)).await?;
-        if let Some(found) = listed.into_iter().find(|i| i.id == instance.id) {
+        if let Some(found) = listed.instances.into_iter().find(|i| i.id == instance.id) {
             instance = found;
         }
     }
