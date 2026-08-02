@@ -1,5 +1,8 @@
-//! The repository's deterministic audio fixture generator, as a library so
-//! `cargo xtask fixtures` and the cli test suite call the same code.
+//! Repository tasks as a library, so `cargo xtask` and the test suites call
+//! the same code: the deterministic audio fixture generator, which the cli
+//! suite regenerates from, and the pre-release hand checks.
+
+pub mod prerelease;
 
 use std::path::Path;
 

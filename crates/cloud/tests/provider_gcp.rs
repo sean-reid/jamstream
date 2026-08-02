@@ -5,18 +5,19 @@
 // empty rather than broken.
 #![cfg(feature = "gcp")]
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use jamstream_cloud::providers::gcp::{GcpProvider, ServiceAccountTokenSource};
 use jamstream_cloud::{
     BootConfig, InstanceClass, LaunchSpec, Provider, ProviderError, ProviderKind, Region, RegionId,
-    SelfDestruct, session_tag,
+    SelfDestruct, assert_provider_contract, session_tag,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{
-    body_string_contains, header, method, path, query_param, query_param_is_missing,
+    any, body_string_contains, header, method, path, query_param, query_param_is_missing,
 };
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const PROJECT: &str = "test-project";
 
@@ -727,4 +728,176 @@ async fn orphan_cleanup_stands_down_when_a_zone_did_not_answer() {
             .is_empty()
     );
     server.verify().await;
+}
+
+// ---- Generic provider contract against a stateful fake Compute Engine ----
+
+struct FakeInstance {
+    name: String,
+    zone: String,
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct GcpState {
+    instances: Vec<FakeInstance>,
+    /// Firewall rules by name, kept as the bodies the provider inserted, so
+    /// a listing returns what the provider actually asked for.
+    firewalls: Vec<(String, Value)>,
+}
+
+/// A small stateful Compute Engine: zonal instance inserts, deletes, and
+/// label-filtered lists, plus the global firewall collection. Every zone in
+/// the catalog answers, because a listing that left one out is a partial
+/// listing and the contract refuses those from a healthy provider.
+#[derive(Clone, Default)]
+struct FakeCompute {
+    state: Arc<Mutex<GcpState>>,
+}
+
+fn operation(name: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({ "name": name, "status": "DONE" }))
+}
+
+fn gcp_error(status: u16, message: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status)
+        .set_body_json(json!({ "error": { "code": status, "message": message } }))
+}
+
+impl FakeCompute {
+    fn insert_instance(&self, zone: &str, body: &Value) -> ResponseTemplate {
+        let mut state = self.state.lock().unwrap();
+        let name = body["name"].as_str().unwrap_or_default().to_owned();
+        if state.instances.iter().any(|i| i.name == name) {
+            return gcp_error(409, "already exists");
+        }
+        let labels = body["labels"]
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        state.instances.push(FakeInstance {
+            name,
+            zone: zone.to_owned(),
+            labels,
+        });
+        operation("operation-insert")
+    }
+
+    /// One zone's listing, narrowed by the `labels.key=value` filter the
+    /// provider sends. An unfiltered request would be a bug in the caller,
+    /// so it returns nothing rather than everything.
+    fn list_instances(&self, zone: &str, filter: Option<&str>) -> ResponseTemplate {
+        let Some((key, value)) = filter
+            .and_then(|f| f.strip_prefix("labels."))
+            .and_then(|f| f.split_once('='))
+        else {
+            return gcp_error(400, "a label filter is required");
+        };
+        let state = self.state.lock().unwrap();
+        let items: Vec<Value> = state
+            .instances
+            .iter()
+            .filter(|i| i.zone == zone && i.labels.get(key).is_some_and(|v| v == value))
+            .map(|i| {
+                json!({
+                    "name": i.name,
+                    "status": "RUNNING",
+                    "labels": i.labels,
+                    "networkInterfaces": [{
+                        "accessConfigs": [{ "type": "ONE_TO_ONE_NAT", "natIP": "198.51.100.9" }],
+                    }],
+                })
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({ "items": items }))
+    }
+
+    fn delete_instance(&self, zone: &str, name: &str) -> ResponseTemplate {
+        let mut state = self.state.lock().unwrap();
+        let before = state.instances.len();
+        state
+            .instances
+            .retain(|i| !(i.zone == zone && i.name == name));
+        if state.instances.len() == before {
+            return gcp_error(404, "no such instance");
+        }
+        operation("operation-delete")
+    }
+
+    fn insert_firewall(&self, body: &Value) -> ResponseTemplate {
+        let mut state = self.state.lock().unwrap();
+        let name = body["name"].as_str().unwrap_or_default().to_owned();
+        if state
+            .firewalls
+            .iter()
+            .any(|(existing, _)| existing == &name)
+        {
+            return gcp_error(409, "already exists");
+        }
+        state.firewalls.push((name, body.clone()));
+        operation("operation-firewall")
+    }
+
+    fn delete_firewall(&self, name: &str) -> ResponseTemplate {
+        let mut state = self.state.lock().unwrap();
+        let before = state.firewalls.len();
+        state.firewalls.retain(|(existing, _)| existing != name);
+        if state.firewalls.len() == before {
+            return gcp_error(404, "no such firewall rule");
+        }
+        operation("operation-firewall-delete")
+    }
+}
+
+impl Respond for FakeCompute {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let path = request.url.path().to_owned();
+        let method = request.method.as_str().to_owned();
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let filter = request
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "filter")
+            .map(|(_, v)| v.into_owned());
+        let prefix = format!("/compute/v1/projects/{PROJECT}/");
+        let Some(rest) = path.strip_prefix(&prefix) else {
+            return gcp_error(404, "wrong project");
+        };
+        let parts: Vec<&str> = rest.split('/').collect();
+        match (method.as_str(), parts.as_slice()) {
+            ("POST", ["global", "firewalls"]) => self.insert_firewall(&body),
+            ("GET", ["global", "firewalls"]) => {
+                let state = self.state.lock().unwrap();
+                let items: Vec<Value> = state
+                    .firewalls
+                    .iter()
+                    .map(|(_, rule)| rule.clone())
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "items": items }))
+            }
+            ("DELETE", ["global", "firewalls", name]) => self.delete_firewall(name),
+            ("POST", ["zones", zone, "instances"]) => self.insert_instance(zone, &body),
+            ("GET", ["zones", zone, "instances"]) => self.list_instances(zone, filter.as_deref()),
+            ("DELETE", ["zones", zone, "instances", name]) => self.delete_instance(zone, name),
+            _ => gcp_error(404, &format!("{method} {rest} is not faked")),
+        }
+    }
+}
+
+/// #390: the contract is what a new provider has to pass unchanged, and GCP
+/// was held to hand-written per-behaviour tests instead. Those stay, because
+/// they pin the request bodies; this pins the behaviour every provider owes.
+#[tokio::test]
+async fn gcp_provider_passes_the_generic_contract() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(FakeCompute::default())
+        .mount(&server)
+        .await;
+    let p = provider(&server);
+    assert_provider_contract(&p).await;
 }

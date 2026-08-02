@@ -2947,6 +2947,7 @@ dependencies = [
 name = "jamstream-client"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "data-encoding",
  "dirs",
  "eframe",

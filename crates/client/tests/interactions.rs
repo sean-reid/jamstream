@@ -2518,9 +2518,9 @@ fn the_two_frame_counts_are_named_apart() {
 
 /// Closing the window while this app is the host raises one confirmation
 /// with three ways out (#322). "Keep it running and quit" leaves the session
-/// alive and lets the window go; Escape is Cancel; and the destructive
-/// answer is on screen but not pressed here, because it is the same
-/// `end_session` the Invites tab's covered button calls.
+/// alive and lets the window go, and Escape is Cancel. The destructive
+/// answer has a test of its own below, because what is new about it is the
+/// sequencing after the press rather than the `end_session` underneath.
 ///
 /// The dialog is raised by the close request itself in production; the
 /// fixture sets the flag directly because a kittest harness has no window
@@ -2588,6 +2588,202 @@ fn quitting_while_hosting_confirms_and_keep_running_lets_the_window_go() {
     let (confirming, running) = *state2.lock().unwrap();
     assert!(!confirming, "the dialog answered");
     assert!(running, "keep it running must not end the session");
+}
+
+/// A provider that holds the app's one executor thread until the test lets
+/// it go. Jobs run there one at a time in submission order, so a sweep
+/// started first keeps whatever the app submits next from even beginning,
+/// which is how the test below gets a teardown that is genuinely still
+/// running rather than one that happened to be slow.
+///
+/// The listing fails on the way out: a sweep that searched nothing closes no
+/// session record, so this never touches the records on the machine running
+/// it. The name is its own for the same reason.
+struct HeldOpen(Arc<std::sync::Barrier>);
+
+#[async_trait::async_trait]
+impl jamstream_cloud::Provider for HeldOpen {
+    fn kind(&self) -> jamstream_cloud::ProviderKind {
+        jamstream_cloud::ProviderKind::Local
+    }
+
+    fn name(&self) -> &'static str {
+        "held-open"
+    }
+
+    fn server_arch(&self) -> jamstream_cloud::ServerArch {
+        jamstream_cloud::ServerArch::X86_64
+    }
+
+    fn regions(&self) -> Vec<jamstream_cloud::Region> {
+        Vec::new()
+    }
+
+    async fn price(
+        &self,
+        region: &jamstream_cloud::RegionId,
+    ) -> jamstream_cloud::Result<jamstream_cloud::Price> {
+        Err(jamstream_cloud::ProviderError::NotFound(region.to_string()))
+    }
+
+    async fn launch(
+        &self,
+        _spec: jamstream_cloud::LaunchSpec,
+    ) -> jamstream_cloud::Result<jamstream_cloud::Instance> {
+        Err(jamstream_cloud::ProviderError::NotFound("held".to_owned()))
+    }
+
+    async fn destroy(
+        &self,
+        _region: &jamstream_cloud::RegionId,
+        id: &str,
+    ) -> jamstream_cloud::Result<()> {
+        Err(jamstream_cloud::ProviderError::NotFound(id.to_owned()))
+    }
+
+    async fn list_tagged(
+        &self,
+        _session: Option<&str>,
+    ) -> jamstream_cloud::Result<jamstream_cloud::Listing> {
+        self.0.wait();
+        Err(jamstream_cloud::ProviderError::Other(
+            "held by the test".to_owned(),
+        ))
+    }
+
+    async fn session_ingress(
+        &self,
+        _session: &str,
+    ) -> jamstream_cloud::Result<Vec<jamstream_cloud::IngressRule>> {
+        Ok(Vec::new())
+    }
+
+    async fn destroy_orphan_firewalls(&self) -> jamstream_cloud::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Close commands the app sent on the frame just drawn.
+fn close_commands<S>(harness: &Harness<'_, S>) -> usize {
+    harness
+        .output()
+        .viewport_output
+        .values()
+        .flat_map(|viewport| &viewport.commands)
+        .filter(|command| matches!(command, egui::ViewportCommand::Close))
+        .count()
+}
+
+/// #391: "End session and quit" pressed, and the sequencing only this answer
+/// has. `end_session` itself is covered where it lives; what is new here is
+/// that the window has to outlive the teardown. Close it early and the
+/// provider call dies with the process, mid-destroy; never close it and the
+/// host is left with a window that will not go.
+///
+/// The teardown is held open on purpose, so "the window is still here" is a
+/// fact about the app rather than about how fast the machine answered. This
+/// one takes the failing answer, an AWS record on a machine with no AWS
+/// credentials, because the branch that closes the window runs on success
+/// and failure alike and the failure is the half that can be built here.
+#[test]
+fn end_session_and_quit_waits_for_the_teardown_before_the_window_goes() {
+    use jamstream_client::app::{JamApp, Screen};
+    use jamstream_client::sweep::Resolved;
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, true)));
+    app.screen = Screen::Session;
+    let mut invites = empty_invites();
+    // No credential for this one is saved in an in-memory app, so the
+    // teardown resolves no provider and comes back with a reason.
+    invites.state.provider = "aws".to_owned();
+    app.session.invites = Some(invites);
+    assert!(app.hosting_live_session(), "the fixture is a host");
+    app.confirm_quit = true;
+
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    let held = Arc::clone(&gate);
+    app.providers = Arc::new(move || Resolved {
+        providers: vec![Box::new(HeldOpen(Arc::clone(&held)))],
+        unconfigured: Vec::new(),
+    });
+    app.begin_sweep();
+
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui_state(
+            |ui, app: &mut JamApp| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+            },
+            app,
+        );
+    harness.run_steps(2);
+    assert_eq!(close_commands(&harness), 0, "nothing has been answered yet");
+
+    harness
+        .get_by_role_and_label(AkRole::Button, "End session and quit")
+        .click_accesskit();
+    // Counted from the press itself, because the frame that answers the
+    // dialog is the first one that could close the window too early.
+    let mut closes = 0;
+    for _ in 0..2 {
+        harness.step();
+        closes += close_commands(&harness);
+    }
+
+    assert!(!harness.state().confirm_quit, "the dialog answered");
+    assert!(
+        harness.state().runtime.is_none(),
+        "the session was left before the teardown started"
+    );
+    assert!(
+        harness.state().ending(),
+        "pressing it has to start the teardown"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("the server is being destroyed")
+            .is_some(),
+        "the progress sheet has to say what the window is waiting for"
+    );
+
+    // Twenty more frames with the provider still holding: a window that
+    // closed anywhere in here would take the destroy call with it.
+    for _ in 0..20 {
+        harness.step();
+        closes += close_commands(&harness);
+        assert_eq!(
+            closes, 0,
+            "the window closed while the teardown was still running"
+        );
+        assert!(harness.state().ending());
+    }
+
+    // Let it answer. The window follows, once.
+    gate.wait();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while closes == 0 && std::time::Instant::now() < deadline {
+        harness.step();
+        closes += close_commands(&harness);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(closes, 1, "the teardown answered and the window did not go");
+    assert!(!harness.state().ending(), "the teardown is done");
+    let error = harness.state().home.error.clone().unwrap_or_default();
+    assert!(
+        error.contains("ending the session failed"),
+        "a failed teardown has to be readable when the app is reopened: {error:?}"
+    );
+
+    // And it stays gone: the close command is sent once, not on every frame
+    // after.
+    for _ in 0..5 {
+        harness.step();
+        assert_eq!(close_commands(&harness), 0, "the close repeated");
+    }
 }
 
 /// A musician who merely joined gets no dialog: their seat is kept and no
