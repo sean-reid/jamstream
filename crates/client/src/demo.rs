@@ -529,6 +529,17 @@ impl Runtime for DemoRuntime {
         }
     }
 
+    /// The state on its own, from the one flag that decides it. The demo's
+    /// snapshot copies a roster and a chat buffer like the live one does,
+    /// and the frame loop asks this every frame (#382).
+    fn conn_state(&self) -> ConnState {
+        if self.state.lock().expect("demo state").left {
+            ConnState::Idle
+        } else {
+            ConnState::Joined
+        }
+    }
+
     fn send(&self, cmd: Command) {
         let mut s = self.state.lock().expect("demo state");
         match cmd {
@@ -711,6 +722,17 @@ mod tests {
             b.cost.expect("host cost").accrued_microusd
                 >= a.cost.expect("host cost").accrued_microusd
         );
+    }
+
+    /// The cheap accessor and the snapshot must never disagree, in either
+    /// state: the frame loop leaves a session on what this says.
+    #[test]
+    fn the_state_accessor_agrees_with_the_snapshot() {
+        let rt = DemoRuntime::host();
+        assert_eq!(rt.conn_state(), rt.snapshot().stats.state);
+        rt.send(Command::Leave);
+        assert_eq!(rt.conn_state(), ConnState::Idle);
+        assert_eq!(rt.conn_state(), rt.snapshot().stats.state);
     }
 
     #[test]

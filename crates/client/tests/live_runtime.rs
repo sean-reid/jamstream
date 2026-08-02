@@ -312,6 +312,33 @@ fn join_reaches_joined_and_stats_populate() {
     assert!(snap.stats.mouth_to_ear_ms.is_some());
 }
 
+/// The frame loop asks for the connection state alone rather than pulling a
+/// snapshot to read one field off it (#382), and it leaves the session on
+/// what that answer says, so the two must never disagree: before the join
+/// lands, once it has, and after a leave.
+#[test]
+fn the_state_accessor_agrees_with_the_snapshot() {
+    let server = TestServer::start();
+    let rt = LiveRuntime::join_offline(
+        &server.invite(1, "solo"),
+        settings(),
+        WavBackend::new(None, None),
+    )
+    .expect("join offline");
+
+    assert_eq!(rt.conn_state(), rt.snapshot().stats.state);
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+    assert_eq!(rt.conn_state(), ConnState::Joined);
+    assert_eq!(rt.conn_state(), rt.snapshot().stats.state);
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(3), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    assert_eq!(rt.conn_state(), ConnState::Idle);
+    assert_eq!(rt.conn_state(), rt.snapshot().stats.state);
+}
+
 #[test]
 fn two_runtimes_hear_each_other() {
     let server = TestServer::start();

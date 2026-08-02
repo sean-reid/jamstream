@@ -620,6 +620,12 @@ impl JamApp {
     }
 
     pub fn root_ui(&mut self, ui: &mut Ui) {
+        // The frame's one snapshot. A pull copies the roster, the chat
+        // buffer, and the destinations out from under the network thread's
+        // own lock, so the session screen, the drawer's tab list, and the
+        // drawer's body share this one rather than taking three (#382).
+        let snap = self.runtime.as_deref().map(Runtime::snapshot);
+
         egui::Panel::top(egui::Id::new("app-top")).show(ui, |ui| {
             ui.add_space(theme::SPACE_SM);
             ui.horizontal(|ui| {
@@ -763,10 +769,8 @@ impl JamApp {
                 // leaving its message field showing under the drawer's bottom
                 // edge (#286).
                 self.session.chat_covered = self.settings_open;
-                if let Some(rt) = self.runtime.as_deref() {
-                    // One snapshot pull per frame; screens never call back in.
-                    let snap = rt.snapshot();
-                    match self.session.ui(ui, &snap, rt) {
+                if let (Some(rt), Some(snap)) = (self.runtime.as_deref(), snap.as_ref()) {
+                    match self.session.ui(ui, snap, rt) {
                         Some(SessionEvent::Left) => {
                             self.runtime = None;
                             self.live = None;
@@ -789,7 +793,7 @@ impl JamApp {
         // Last, so a session has already drawn its status bar and the drawer
         // knows where to stop. Ending the session is reached from in here now,
         // so the drawer answers with the same event the screen does.
-        if let Some(SessionEvent::EndSession) = self.settings_drawer(ui.ctx()) {
+        if let Some(SessionEvent::EndSession) = self.settings_drawer(ui.ctx(), snap.as_ref()) {
             self.end_session();
         }
 
@@ -942,7 +946,7 @@ impl JamApp {
     /// opens, the content is taller than the window. The body scrolls inside
     /// it, so what a short window puts out of sight is whatever the body puts
     /// last, and never the buffer picks or the input meter.
-    fn settings_drawer(&mut self, ctx: &Context) -> Option<SessionEvent> {
+    fn settings_drawer(&mut self, ctx: &Context, snap: Option<&Snapshot>) -> Option<SessionEvent> {
         if !self.settings_open {
             return None;
         }
@@ -964,7 +968,7 @@ impl JamApp {
                     });
                 });
                 ui.add_space(theme::SPACE_SM);
-                let tabs = self.settings_tabs();
+                let tabs = self.settings_tabs(snap);
                 self.tab_row(ui, &tabs);
                 ui.add_space(theme::SPACE_SM);
                 // The header and the tab row stay put and only the panel
@@ -974,7 +978,7 @@ impl JamApp {
                 egui::ScrollArea::vertical()
                     .id_salt(("settings-scroll", self.settings_tab.label()))
                     .auto_shrink([false, false])
-                    .show(ui, |ui| event = self.settings_body(ui));
+                    .show(ui, |ui| event = self.settings_body(ui, snap));
             });
         event
     }
@@ -982,9 +986,9 @@ impl JamApp {
     /// The tabs this app can show right now. Session-scoped ones exist only
     /// inside a session, and only for a host: from the home screen there is no
     /// broadcast to mix and no seat to invite anyone into.
-    fn settings_tabs(&self) -> Vec<SettingsTab> {
-        match (self.screen, self.runtime.as_deref()) {
-            (Screen::Session, Some(rt)) => self.session.settings_tabs(&rt.snapshot()),
+    fn settings_tabs(&self, snap: Option<&Snapshot>) -> Vec<SettingsTab> {
+        match (self.screen, snap) {
+            (Screen::Session, Some(snap)) => self.session.settings_tabs(snap),
             _ => vec![SettingsTab::Audio, SettingsTab::Recording, SettingsTab::You],
         }
     }
@@ -1016,19 +1020,17 @@ impl JamApp {
 
     /// The selected tab's panel, and nothing else: one thing at a time in a
     /// drawer this narrow beats five sections in one scroll.
-    fn settings_body(&mut self, ui: &mut Ui) -> Option<SessionEvent> {
-        let snap = self.runtime.as_deref().map(|rt| rt.snapshot());
+    fn settings_body(&mut self, ui: &mut Ui, snap: Option<&Snapshot>) -> Option<SessionEvent> {
         match self.settings_tab {
             SettingsTab::Audio => {
-                let levels = snap.as_ref().map(|s| s.levels).unwrap_or_default();
-                let m2e = snap.as_ref().and_then(|s| s.stats.mouth_to_ear_ms);
+                let levels = snap.map(|s| s.levels).unwrap_or_default();
+                let m2e = snap.and_then(|s| s.stats.mouth_to_ear_ms);
                 let rate_lines = snap
-                    .as_ref()
                     .and_then(|s| s.stats.rate)
                     .map(|r| r.lines())
                     .unwrap_or_default();
                 let notes = StreamNotes {
-                    refusal: snap.as_ref().and_then(|s| s.device_error.as_deref()),
+                    refusal: snap.and_then(|s| s.device_error.as_deref()),
                     rate_lines: &rate_lines,
                 };
                 let event =
@@ -1041,14 +1043,12 @@ impl JamApp {
             }
             SettingsTab::Broadcast => {
                 let rt = self.runtime.as_deref()?;
-                let snap = snap?;
-                self.session.broadcast_tab(ui, &snap, rt);
+                self.session.broadcast_tab(ui, snap?, rt);
                 None
             }
             SettingsTab::Invites => {
                 let rt = self.runtime.as_deref()?;
-                let snap = snap?;
-                self.session.invites_tab(ui, &snap, rt)
+                self.session.invites_tab(ui, snap?, rt)
             }
             SettingsTab::Recording => {
                 self.recording.ui(ui);
@@ -1057,7 +1057,7 @@ impl JamApp {
             SettingsTab::You => {
                 self.name_ui(ui);
                 ui.add_space(theme::SPACE_XL);
-                self.avatar_ui(ui, snap.as_ref());
+                self.avatar_ui(ui, snap);
                 ui.add_space(theme::SPACE_XL);
                 ui.label(theme::title(ui, "Theme"));
                 for (value, label) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
@@ -1310,19 +1310,16 @@ impl JamApp {
             self.announced_name = Some(name.to_owned());
         }
     }
-}
 
-// No Default impl on purpose: which credential store the app gets is a
-// choice, and `JamApp::default()` would be a silent way back to the real
-// keychain. Callers name `in_memory` or `with_system_devices`.
-
-impl eframe::App for JamApp {
-    fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        theme::apply(ctx, self.theme);
-        // Meters, the cost ticker, and connection quality move while a
-        // session or the input meter is on screen.
-        // A file dialog is a second window the frame loop cannot see, so
-        // repaint until its thread answers.
+    /// Keeps the frame loop running at display rate for as long as
+    /// something on screen is moving, and lets it go idle the moment
+    /// nothing is. Public so a test can ask an [`egui::Context`] what this
+    /// state of the app does to it; `logic` is the only caller in the app.
+    ///
+    /// Meters, the cost ticker, and connection quality move for as long as
+    /// a session is up. A file dialog is a second window the frame loop
+    /// cannot see, so a repaint is asked for until its thread answers.
+    pub fn repaint_while_animating(&self, ctx: &Context) {
         let animating = self.ending.is_some()
             || self.avatar_dialog.is_some()
             || self.recording.busy()
@@ -1335,15 +1332,33 @@ impl eframe::App for JamApp {
         if animating {
             ctx.request_repaint();
         }
-        // A session that ended from the far side falls back to home.
+    }
+
+    /// A session that ended from the far side falls back to home. Asks the
+    /// runtime for the connection state alone: a snapshot would copy the
+    /// roster and the chat buffer to answer one enum (#382). Public for the
+    /// same reason as [`Self::repaint_while_animating`].
+    pub fn fall_back_when_idle(&mut self) {
         if self.screen == Screen::Session
             && let Some(rt) = self.runtime.as_deref()
-            && matches!(rt.snapshot().stats.state, ConnState::Idle)
+            && matches!(rt.conn_state(), ConnState::Idle)
         {
             self.runtime = None;
             self.live = None;
             self.screen = Screen::Home;
         }
+    }
+}
+
+// No Default impl on purpose: which credential store the app gets is a
+// choice, and `JamApp::default()` would be a silent way back to the real
+// keychain. Callers name `in_memory` or `with_system_devices`.
+
+impl eframe::App for JamApp {
+    fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        theme::apply(ctx, self.theme);
+        self.repaint_while_animating(ctx);
+        self.fall_back_when_idle();
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {

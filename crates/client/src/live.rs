@@ -626,6 +626,14 @@ impl LiveRuntime {
             .is_none_or(JoinHandle::is_finished)
     }
 
+    /// The connection state without a snapshot behind it. The frame loop
+    /// asks every frame only to see whether the session has ended, and
+    /// [`Self::snapshot_now`] would copy the roster, the chat buffer, and
+    /// the destinations to answer it (#382).
+    fn conn_now(&self) -> ConnState {
+        self.shared.lock().expect("live state").conn.clone()
+    }
+
     fn snapshot_now(&self) -> Snapshot {
         let s = self.shared.lock().expect("live state");
         let members = s
@@ -797,6 +805,10 @@ impl Runtime for LiveRuntime {
     fn send(&self, cmd: Command) {
         self.send_cmd(cmd);
     }
+
+    fn conn_state(&self) -> ConnState {
+        self.conn_now()
+    }
 }
 
 impl Runtime for Arc<LiveRuntime> {
@@ -806,6 +818,10 @@ impl Runtime for Arc<LiveRuntime> {
 
     fn send(&self, cmd: Command) {
         self.send_cmd(cmd);
+    }
+
+    fn conn_state(&self) -> ConnState {
+        self.conn_now()
     }
 }
 
@@ -868,6 +884,12 @@ impl Runtime for CostedRuntime {
 
     fn send(&self, cmd: Command) {
         self.inner.send_cmd(cmd);
+    }
+
+    /// Neither the cost meter nor the token map can change the connection
+    /// state, so this is the inner runtime's answer unwrapped.
+    fn conn_state(&self) -> ConnState {
+        self.inner.conn_now()
     }
 }
 
