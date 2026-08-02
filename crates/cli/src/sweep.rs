@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use jamstream_cloud::{Provider, ProviderKind, SweepFilter, SweepReport};
+use jamstream_cloud::{Instance, Provider, SweepFilter, SweepReport};
 
 use crate::CliError;
 use crate::state::{self, SessionStatus};
@@ -55,7 +55,7 @@ pub async fn run<W: Write>(
     // A dry run destroyed nothing, so the records it would close are still
     // true; reconciling from one would mark live sessions ended.
     if !dry_run {
-        for session in reconcile(&report, providers)? {
+        for session in reconcile(&report)? {
             let prefix = &session[..8.min(session.len())];
             writeln!(
                 out,
@@ -77,6 +77,23 @@ pub async fn run<W: Write>(
     for (provider, err) in &report.unswept {
         writeln!(out, "{provider}: could not be searched: {err}")?;
     }
+    // Same for one region of a provider that answered for the rest: AWS and
+    // GCP return what they could reach, so a throttled region reads as empty.
+    for search in &report.searches {
+        if !search.is_complete() {
+            writeln!(
+                out,
+                "{}: could not search {}; anything there was not looked for.",
+                search.provider,
+                search
+                    .unsearched
+                    .iter()
+                    .map(|region| region.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+    }
     if !report.is_clean() {
         return Err(CliError::Failed(
             "sweep could not account for everything tagged jamstream; anything above is still \
@@ -87,18 +104,22 @@ pub async fn run<W: Write>(
     Ok(())
 }
 
-/// Closes the session records this sweep made false: every running record
-/// whose instance the sweep destroyed, or whose provider was searched and no
-/// longer lists the instance. Returns the ids of the sessions it closed.
+/// Closes the session records this sweep made false, and returns their ids.
 ///
-/// A record on a provider the sweep could not search stays untouched, the
-/// same absence-of-evidence rule the report's `unswept` list exists for:
-/// nobody looked, so nothing was learned. A destroy that failed leaves the
-/// record running too, because the instance is still billing.
-pub fn reconcile(
-    report: &SweepReport,
-    providers: &[Box<dyn Provider>],
-) -> Result<Vec<String>, CliError> {
+/// A record is only closed on positive evidence that its instance is gone:
+/// either the sweep destroyed it, or a provider answering to the record's own
+/// name searched all of itself and no longer lists it. Anything else leaves
+/// the record alone, because closing one blanks the issuer key and hides the
+/// session from `jamstream end`, and a machine nobody can end keeps billing.
+///
+/// Absence of evidence is not evidence of absence, and there are four ways to
+/// mistake one for the other here. A provider whose credentials are missing
+/// is not in the sweep at all, so no search names it. A provider whose
+/// listing failed outright is in `unswept`, again with no search. One that
+/// reached some of its regions reports the rest as unsearched, and that is
+/// not a complete search. And the mock answers to "mock" alone, however real
+/// the kind its instances borrow.
+pub fn reconcile(report: &SweepReport) -> Result<Vec<String>, CliError> {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -108,27 +129,21 @@ pub fn reconcile(
         if session.status != SessionStatus::Running {
             continue;
         }
-        let ours = |inst: &jamstream_cloud::Instance| {
-            inst.id == session.instance_id && record_names_kind(&session.provider, inst.provider)
+        let Some(search) = report.search_for(&session.provider) else {
+            continue;
         };
-        let destroyed = report.destroyed.iter().any(&ours);
-        let listed = report.found.iter().any(ours);
-        let searched = providers.iter().any(|p| {
-            record_names_kind(&session.provider, p.kind())
-                && !report.unswept.iter().any(|(name, _)| *name == p.name())
-        });
-        if destroyed || (searched && !listed) {
+        let ours = |inst: &Instance| inst.id == session.instance_id && inst.provider == search.kind;
+        if report.destroyed.iter().any(&ours) {
             session.mark_ended(now_unix);
-            state::write_to(&path, &session)?;
-            closed.push(session.session_id_hex);
+        } else if search.is_complete() && !report.found.iter().any(ours) {
+            // A full listing that does not have it. Weaker evidence than a
+            // destroy, so the record closes but keeps its issuer key.
+            session.mark_ended_unlisted(now_unix);
+        } else {
+            continue;
         }
+        state::write_to(&path, &session)?;
+        closed.push(session.session_id_hex);
     }
     Ok(closed)
-}
-
-/// Whether a state record written for provider `name` describes instances of
-/// `kind`. Every real provider records its kind's own name; the mock records
-/// "mock" while its instances borrow a real kind.
-fn record_names_kind(name: &str, kind: ProviderKind) -> bool {
-    name == kind.as_str() || name == crate::providers::MOCK_PROVIDER
 }

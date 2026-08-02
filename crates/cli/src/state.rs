@@ -149,13 +149,26 @@ impl SessionState {
         self.issuer_private_key_b64 = String::new();
     }
 
-    /// Closes the record for an instance that no longer exists, whichever
-    /// way it went: `jamstream end`, a sweep, the server's own timers, or a
-    /// crash. The key is forgotten for the same reason `end` forgets it.
+    /// Closes the record for an instance the provider destroyed or disowned
+    /// by name: `jamstream end`, a sweep that took the machine down, the
+    /// server's own timers. The key is forgotten for the same reason `end`
+    /// forgets it, and because that evidence does not come back wrong.
     pub fn mark_ended(&mut self, ended_unix: u64) {
+        self.mark_ended_unlisted(ended_unix);
+        self.forget_issuer_key();
+    }
+
+    /// Closes the record for an instance a full listing no longer mentions,
+    /// which is weaker evidence than a destroy: AWS's listing filters to
+    /// pending and running, so an instance that is stopping, stopped, or
+    /// rebooting is absent from it and alive.
+    ///
+    /// The issuer key stays for exactly that case. It is inert against a
+    /// machine that is really gone, and it is the only way to revoke every
+    /// invite to one that is not.
+    pub fn mark_ended_unlisted(&mut self, ended_unix: u64) {
         self.status = SessionStatus::Ended;
         self.ended_unix = Some(ended_unix);
-        self.forget_issuer_key();
     }
 }
 

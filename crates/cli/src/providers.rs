@@ -16,7 +16,7 @@ use crate::state;
 /// The name of the test-only provider, which launches nothing real and stays
 /// out of help text and error messages. Every other name is
 /// [`ProviderKind`]'s.
-pub const MOCK_PROVIDER: &str = "mock";
+pub const MOCK_PROVIDER: &str = MockProvider::NAME;
 
 /// Every provider name this build recognizes, the mock last.
 pub fn known_providers() -> impl Iterator<Item = &'static str> {
@@ -126,10 +126,16 @@ pub fn resolve_for_port(name: &str, session_port: u16) -> Result<Box<dyn Provide
 }
 
 /// Every provider whose credentials are present in the environment, plus
-/// local and the mock, which need none. Sweep runs across all of them, so
-/// stray local servers are found like any cloud stray.
+/// local, which needs none. Sweep runs across all of them, so stray local
+/// servers are found like any cloud stray.
+///
+/// The mock is deliberately absent. It resolves without credentials and
+/// launches nothing real, so the only thing it can report is an empty cloud,
+/// and a sweep that took that for a searched AWS account would close the
+/// records of live AWS sessions. Reach it by name with `--provider mock`.
 pub fn resolve_all() -> Vec<Box<dyn Provider>> {
     known_providers()
+        .filter(|name| *name != MOCK_PROVIDER)
         .filter_map(|name| resolve(name).ok())
         .collect()
 }
@@ -249,10 +255,30 @@ mod tests {
         }
     }
 
+    /// Local needs no credentials and belongs in every sweep. The mock
+    /// resolves without them too and must stay out: it lists an empty
+    /// account for whichever kind its instances borrow, and a sweep that
+    /// counted that as having searched AWS would end live AWS sessions.
     #[test]
-    fn resolve_all_always_includes_local_and_the_mock() {
+    fn resolve_all_takes_local_and_leaves_the_mock_out() {
         let all = resolve_all();
         assert!(all.iter().any(|p| p.kind() == ProviderKind::Local));
-        assert!(all.len() >= 2, "local and the mock resolve with no creds");
+        assert!(
+            !all.iter().any(|p| p.name() == MOCK_PROVIDER),
+            "the mock must never stand in for a real provider"
+        );
+    }
+
+    /// The double answers to its own name, not to the cloud whose kind it
+    /// borrows, which is what keeps a record written against it apart from
+    /// a record written against that cloud.
+    #[test]
+    fn the_mock_is_named_for_itself() {
+        let mock = resolve(MOCK_PROVIDER).unwrap();
+        assert_eq!(mock.name(), MOCK_PROVIDER);
+        assert_ne!(mock.name(), mock.kind().as_str());
+        for kind in ProviderKind::ALL {
+            assert_ne!(mock.name(), kind.as_str());
+        }
     }
 }
