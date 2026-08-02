@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.1](https://github.com/sean-reid/jamstream/compare/v0.2.0...v0.2.1) (2026-08-02)
+
+
+### Features
+
+* **site:** pin the POSIX installer to a release, and copy the theme fonts ([#429](https://github.com/sean-reid/jamstream/issues/429)) ([febc594](https://github.com/sean-reid/jamstream/commit/febc5948dcc06bfb9f6da55652e2febabe7a7c8f))
+
+
+### Bug Fixes
+
+* the secrets this keeps on disk ([#408](https://github.com/sean-reid/jamstream/issues/408)) ([2050997](https://github.com/sean-reid/jamstream/commit/2050997ca866481fbd42d91d7b6c2ced7a75ccca))
+
+
+### Performance Improvements
+
+* **broadcast:** cut the card's mono down to the digits it draws ([#432](https://github.com/sean-reid/jamstream/issues/432)) ([cfa8f41](https://github.com/sean-reid/jamstream/commit/cfa8f4165ccab7a430db9075295aca23f8ac5f5c))
+* **client:** one snapshot per frame ([#409](https://github.com/sean-reid/jamstream/issues/409)) ([10702c2](https://github.com/sean-reid/jamstream/commit/10702c207125f7f7a3cf357295255a94c8076ed6))
+
 ## [0.2.0](https://github.com/sean-reid/jamstream/compare/v0.1.6...v0.2.0) (2026-08-02)
 
 
