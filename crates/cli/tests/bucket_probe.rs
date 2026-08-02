@@ -62,8 +62,12 @@ async fn a_bucket_that_refuses_the_write_reports_the_reason_and_the_prefix() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path(probe_path()))
+        // The document a real S3 403 carries, identifiers and all.
         .respond_with(ResponseTemplate::new(403).set_body_string(
-            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+            "<Error><Code>AccessDenied</Code><Message>User: \
+             arn:aws:iam::887762372032:user/jamstream-recordings is not authorized to \
+             perform: s3:PutObject</Message><RequestId>Q0YMR4GFKCH1Y688</RequestId>\
+             <HostId>EE3WMENDEauoc0QS4v1XCZK1RcDA4A</HostId></Error>",
         ))
         .expect(1)
         .mount(&server)
@@ -80,8 +84,16 @@ async fn a_bucket_that_refuses_the_write_reports_the_reason_and_the_prefix() {
         err.contains(&prefix),
         "the prefix a key has to write must be named: {err}"
     );
-    // The provider's own words, not ours.
-    assert!(err.contains("403"), "the reason must be verbatim: {err}");
+    // What the bucket refused, in our words and with the permissions to add.
+    assert!(
+        err.contains("s3:PutObject"),
+        "the remedy must be named: {err}"
+    );
+    // And not in the bucket's, which name the account and the key's ARN
+    // (#374). Those go to the log.
+    for identifier in ["887762372032", "arn:", "Q0YMR4GFKCH1Y688", "EE3WMEND", "<"] {
+        assert!(!err.contains(identifier), "{identifier} leaked: {err}");
+    }
     // A refusal must not leak the key that was refused.
     assert!(!err.contains(SECRET), "the secret reached an error: {err}");
 
