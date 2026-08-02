@@ -107,6 +107,7 @@ impl Rig {
             stdin: Stdin::Pipe,
             fifos: vec![self.fifo()],
             label: "adversary".to_owned(),
+            relay_url: None,
         };
         self.host.spawn(&spec).expect("the adversary starts")
     }
@@ -379,6 +380,7 @@ fn a_child_that_dies_before_opening_the_fifo_is_a_spawn_error() {
         stdin: Stdin::Pipe,
         fifos: vec![rig.fifo()],
         label: "adversary".to_owned(),
+        relay_url: None,
     };
     let err = rig
         .host

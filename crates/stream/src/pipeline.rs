@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use jamstream_broadcast::{AvatarImage, MemberVisual, Renderer, Role as VisualRole, SceneConfig};
 use jamstream_protocol::control::{
-    DestinationState, DestinationStatus, StreamKey, StreamOp, StreamPlatform,
+    DestinationState, DestinationStatus, StreamKey, StreamOp, StreamPlatform, fit_stream_reason,
 };
 use jamstream_protocol::ids::{DestinationId, MemberId};
 
@@ -492,7 +492,17 @@ impl<H: ProcessHost> Pipeline<H> {
                         delay_ms = delay,
                         "pusher died"
                     );
-                    self.set_state(idx, DestinationState::Failed { reason });
+                    // Prefixed, because the encoder's failures reach this
+                    // same row as "encoder down: ...". They sit on opposite
+                    // sides of the local relay and take different fixes, so
+                    // a host must not have to guess which one they are
+                    // reading.
+                    self.set_state(
+                        idx,
+                        DestinationState::Failed {
+                            reason: format!("push failed: {reason}"),
+                        },
+                    );
                     return;
                 }
             }
@@ -578,7 +588,19 @@ impl<H: ProcessHost> Pipeline<H> {
         }
     }
 
+    /// Records a destination's state and, on a change, emits it.
+    ///
+    /// Every reason is cut to fit here rather than at each of the places one
+    /// is built, because the cost of missing one is not this destination's
+    /// line: the wire refuses the whole `StreamStatus`, so one over-long
+    /// explanation would leave every other destination with no status at all.
     fn set_state(&mut self, idx: usize, state: DestinationState) {
+        let state = match state {
+            DestinationState::Failed { reason } => DestinationState::Failed {
+                reason: fit_stream_reason(&reason).to_owned(),
+            },
+            other => other,
+        };
         if self.dests[idx].state == state {
             return;
         }
@@ -886,6 +908,7 @@ impl<H: ProcessHost> Pipeline<H> {
             stdin: Stdin::Pipe,
             fifos: vec![fifo],
             label: "encoder".to_owned(),
+            relay_url: self.relay_url(&self.cfg.encoder_output),
         }
     }
 
@@ -911,7 +934,17 @@ impl<H: ProcessHost> Pipeline<H> {
             stdin: Stdin::SecretFile(key_path),
             fifos: Vec::new(),
             label: format!("pusher:{}:{}", platform.as_str(), id.0),
+            // The pusher's *input*. Its output is the platform, key and all,
+            // and that one stays redacted.
+            relay_url: self.relay_url(&self.cfg.pusher_input),
         }
+    }
+
+    /// The relay as it will appear in a child's stderr, when it is a URL at
+    /// all: `encoder_output` is a plain file path in the real-ffmpeg test,
+    /// and a path is not something the redactor would ever match anyway.
+    fn relay_url(&self, target: &str) -> Option<String> {
+        target.contains("://").then(|| target.to_owned())
     }
 
     fn work_fifo(&self) -> PathBuf {
@@ -1046,7 +1079,7 @@ mod tests {
         assert_eq!(
             state(&p, 1),
             DestinationState::Failed {
-                reason: "exited with status 1".to_owned()
+                reason: "push failed: exited with status 1".to_owned()
             }
         );
         // 500 ms of backoff: nothing respawns before it elapses.
@@ -1433,6 +1466,121 @@ mod tests {
             Stdin::SecretFile(PathBuf::from("/run/jamstream/keys/dest-2"))
         );
         assert_eq!(spec.label, "pusher:youtube:2");
+    }
+
+    /// Which side of the local relay failed. The two faults reach the same
+    /// row and take different fixes: an encoder that cannot publish is a
+    /// relay problem on the session's own machine, a pusher that cannot
+    /// connect is usually the platform.
+    #[test]
+    fn the_encoder_and_the_push_are_told_apart_in_the_reason() {
+        let mut p = pipeline("sides");
+        p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
+        p.apply(0, StreamOp::Start).unwrap();
+
+        let pusher = p.host().find_live("pusher").unwrap();
+        p.host_mut().exit(
+            pusher,
+            "[flv @ 0x1] Failed to connect to rtmps://<redacted> refused",
+        );
+        p.poll(10);
+        match state(&p, 1) {
+            DestinationState::Failed { reason } => {
+                assert!(reason.starts_with("push failed: "), "{reason}");
+                assert!(reason.contains("Failed to connect"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        let encoder = p.host().find_live("encoder").unwrap();
+        p.host_mut().exit(
+            encoder,
+            "[flv @ 0x1] Failed to connect to <local relay> refused",
+        );
+        p.poll(1_000);
+        match state(&p, 1) {
+            DestinationState::Failed { reason } => {
+                assert!(reason.starts_with("encoder down: "), "{reason}");
+                assert!(reason.contains("<local relay>"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Both children are told which URL is the loopback relay, and only that
+    /// one: a pusher's *output* is the platform's, key and all, and naming it
+    /// would put the key in a reason that goes to the whole room.
+    #[test]
+    fn only_the_relay_url_is_handed_to_a_child_as_safe_to_name() {
+        let p = pipeline("relayurl");
+        let relay = "rtmp://127.0.0.1:1935/jamstream".to_owned();
+        assert_eq!(p.encoder_spec().relay_url, Some(relay.clone()));
+        let pusher = p.pusher_spec(
+            DestinationId(1),
+            StreamPlatform::Twitch,
+            PathBuf::from("/tmp/key"),
+        );
+        assert_eq!(pusher.relay_url, Some(relay));
+    }
+
+    /// The reason has to survive the trip, and the trip is what nothing used
+    /// to check. `ControlLink::send` refuses a status whose reason is over
+    /// the wire cap, and it refuses the whole message: one destination's long
+    /// explanation would cost every other destination its status line, and a
+    /// full status of failures at the wire cap fragments on the way out.
+    #[test]
+    fn every_reason_the_pipeline_builds_fits_the_wire_it_leaves_on() {
+        use jamstream_protocol::control::{ControlLink, ControlMsg, STREAM_REASON_BUDGET};
+
+        let mut p = pipeline("wire");
+        for i in 0..MAX_DESTINATIONS as u16 {
+            p.apply(0, add(i, StreamPlatform::Twitch, "tw")).unwrap();
+        }
+        p.apply(0, StreamOp::Start).unwrap();
+        // Every pusher dies with far more to say than the wire will carry.
+        let babble = format!(
+            "[flv @ 0x55d1c0a2f480] Failed to connect to rtmps://<redacted> Connection \
+             refused{}",
+            ". and then some".repeat(40)
+        );
+        for id in p.host().live() {
+            p.host_mut().exit(id, &babble);
+        }
+        p.poll(10);
+
+        let status = p.status();
+        assert_eq!(status.len(), MAX_DESTINATIONS);
+        for d in &status {
+            match &d.state {
+                DestinationState::Failed { reason } => {
+                    assert!(reason.len() <= STREAM_REASON_BUDGET, "{reason}");
+                    // Cut at the back, so the diagnosis is what survives.
+                    assert!(reason.starts_with("push failed: [flv"), "{reason}");
+                    assert!(reason.contains("Connection refused"), "{reason}");
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+
+        // And the message it travels in both sends and arrives, which is the
+        // half a status-shaped unit test cannot see.
+        let mut sender = ControlLink::new();
+        sender
+            .send(ControlMsg::StreamStatus {
+                destinations: status.clone(),
+            })
+            .expect("a full status of failures must be sendable");
+        let mut receiver = ControlLink::new();
+        let mut arrived = Vec::new();
+        for dg in sender.poll(0) {
+            arrived.extend(receiver.receive(&dg).expect("and it must decode"));
+        }
+        assert_eq!(
+            arrived,
+            vec![ControlMsg::StreamStatus {
+                destinations: status
+            }]
+        );
     }
 
     #[test]
