@@ -444,6 +444,15 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The test and harness jobs set this, and so does nightly's e2e; this job
+    # did not, so every deadline scaled by it in crates/server, crates/cli and
+    # crates/session ran at the 1x laptop budget while llvm instrumentation
+    # made this the slowest configuration in CI. Instrumented runs need the
+    # multiplier more than anything else here, not less. Same 120 as every
+    # other job, on the job rather than on one step because the floor loop
+    # below re-runs the tests too.
+    env:
+      JAMSTREAM_PERF_BUDGET_SECS: "120"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -451,9 +460,11 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      # cargo-nextest for the same reason the test and harness jobs install
+      # it: the runs below go through `cargo llvm-cov nextest`.
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov,cargo-nextest
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       # The pinned ffmpeg for the same reason as the test job: this runs
       # crates/stream's tests too, and real_ffmpeg fails on Linux when the
@@ -463,12 +474,32 @@ jobs:
       - name: Install the ffmpeg a session VM runs
         run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
       - run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
+      # Through nextest, like every other job that runs these tests. Plain
+      # `cargo llvm-cov` drives libtest, which reads none of
+      # .config/nextest.toml, so on this one path the file's opening claim
+      # was false and none of its overrides applied. Two of them matter in
+      # this job's scope: tick_cost_at_capacity, the session suite's
+      # wall-clock gate, was measured beside a thousand cpu-bound
+      # simulations rather than given the machine to itself, and the
+      # jamstreamd-uplift group serialized nothing, so the binary rewrite
+      # #354 traced to CreateProcess error 216 was free to overlap a spawn
+      # again in the server and cli suites. This job is push-gated to main,
+      # so what that buys lands on main rather than on the pull request that
+      # caused it. (The other two isolated gates live in the harness suite,
+      # which this job excludes.)
+      #
+      # Nothing measured changes. Run both ways over crates/audio-io, the
+      # lcov carries the same records for the same files and every one of
+      # its 2226 DA lines lands on the same side of hit or miss; only the
+      # execution counts move, because nextest gives each test its own
+      # process. The floors below read the summary, not the counts.
+      #
       # jamstream-harness is also excluded: its gates assert wall-clock
       # budgets, which instrumentation invalidates by design, and its
       # coverage contribution is redundant with the direct suites the
       # floors below measure.
       - name: Workspace coverage (lcov)
-        run: cargo llvm-cov --locked --workspace --exclude jamstream-client --exclude jamstream-harness --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --locked --workspace --exclude jamstream-client --exclude jamstream-harness --lcov --output-path lcov.info
       - name: Coverage summary
         run: |
           {
@@ -535,7 +566,7 @@ jobs:
               fi
             done
             echo "::group::jamstream-$crate (floor ${floor} percent)"
-            cargo llvm-cov --locked -p "jamstream-$crate" --summary-only \
+            cargo llvm-cov nextest --locked -p "jamstream-$crate" --summary-only \
               --fail-under-lines "$floor" \
               --ignore-filename-regex "crates/($others)/|xtask/"
             echo '::endgroup::'
