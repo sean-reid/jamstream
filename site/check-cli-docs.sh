@@ -45,9 +45,9 @@ fi
 
 # Long flags the docs mention that belong to another tool, so the CLI cannot be
 # asked about them: brew's --cask, shasum's --check and --ignore-missing,
-# cargo's --path, and the install and uninstall scripts' own --purge and
+# cargo's --path, and the install and uninstall scripts' own --purge, --tag and
 # --with-server.
-FOREIGN_FLAGS='--cask --check --ignore-missing --path --purge --with-server'
+FOREIGN_FLAGS='--cask --check --ignore-missing --path --purge --tag --with-server'
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
