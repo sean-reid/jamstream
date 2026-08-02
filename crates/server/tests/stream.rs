@@ -69,16 +69,16 @@ impl Peer {
         for pkt in self.core.poll(now_ms) {
             let _ = self.socket.send(&pkt).await;
         }
-        // Bounded: a musician's downlink is 400 packets a second, so an
-        // unbounded drain never returns and the caller never gets to look at
-        // its events.
+        // Everything the socket is holding right now, and not one packet
+        // more: `try_recv` ends the pass the moment the queue is empty
+        // instead of waiting for the next arrival, so the drain can never
+        // consume slower than the 400 packets a second a musician's
+        // downlink produces. A pass bounded by a packet count instead ran
+        // at 64 per loop and left this peer reading further behind real
+        // time on every iteration, which is what a status arriving seconds
+        // after the server sent it looks like (#389).
         let mut buf = [0u8; 2048];
-        for _ in 0..64 {
-            let Ok(Ok(len)) =
-                tokio::time::timeout(Duration::from_millis(5), self.socket.recv(&mut buf)).await
-            else {
-                break;
-            };
+        while let Ok(len) = self.socket.try_recv(&mut buf) {
             for pkt in self.core.handle_datagram(now_ms, &buf[..len]) {
                 let _ = self.socket.send(&pkt).await;
             }
