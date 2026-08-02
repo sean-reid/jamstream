@@ -436,7 +436,9 @@ fn takes_listing_refused() {
     // A bucket that said no, drawn as the shipped mapping renders it: the
     // row a real S3 AccessDenied produces is a sentence with the remedy,
     // never the XML document, which carries the AWS account number and is
-    // exactly what someone would screenshot.
+    // exactly what someone would screenshot. The session records to
+    // DigitalOcean, so the remedy has to be the Spaces one; this fixture
+    // published a Spaces host being told to edit an IAM policy.
     let denied = jamstream_cli::CliError::Provider(jamstream_cloud::ProviderError::Auth(
         "http 403 Forbidden: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <Error><Code>AccessDenied</Code><Message>User: \
@@ -447,8 +449,11 @@ fn takes_listing_refused() {
     ));
     let mut app = takes_app(Theme::Dark);
     app.takes.rows[0].takes.clear();
+    let provider = app.takes.rows[0].provider_name();
+    assert_eq!(provider, "digitalocean");
     app.takes.rows[0].error = Some(jamstream_client::screens::takes::error_sentence(
         "listing a3f29c41",
+        &provider,
         &denied,
     ));
     let mut harness = app_harness(app, WIDE);
