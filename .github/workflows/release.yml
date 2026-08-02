@@ -704,10 +704,15 @@ jobs:
             echo "::warning::HOMEBREW TAP PUSH SKIPPED: no HOMEBREW_TAP_TOKEN secret. The rendered cask and formula are attached to this release inside jamstream-packaging.tar.gz. Create $TAP_REPO and add the token to publish automatically."
             exit 0
           fi
-          STATUS=$(curl -sS -o tap-repo.json -w '%{http_code}' \
-            -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$TAP_REPO")
+          # The tap token never appears on a command line: curl reads the
+          # authorization header from a config on stdin, and git reads the
+          # token from this step's environment through the askpass helper
+          # below. On argv it was in every ps listing for the life of the
+          # process.
+          STATUS=$(printf 'header = "Authorization: Bearer %s"\n' "$HOMEBREW_TAP_TOKEN" \
+            | curl -sS --config - -o tap-repo.json -w '%{http_code}' \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$TAP_REPO")
           if [ "$STATUS" = 404 ]; then
             echo "::warning::HOMEBREW TAP PUSH SKIPPED: https://github.com/$TAP_REPO does not exist, or the token cannot see it. Create it as a public, empty repository; nothing else needs to change."
             exit 0
@@ -721,7 +726,18 @@ jobs:
           # branch is called.
           BRANCH=$(sed -n 's/.*"default_branch": *"\([^"]*\)".*/\1/p' tap-repo.json | head -1)
           [ -n "$BRANCH" ] || BRANCH=main
-          git clone "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/$TAP_REPO.git" tap
+          # Cloning with the token in the url wrote it into tap/.git/config,
+          # where every later step in the job could read it back. The askpass
+          # helper holds no secret itself; git runs it on the auth challenge
+          # and it prints the token out of the environment. The clone url
+          # carries only the username, so nothing is persisted.
+          cat > "$RUNNER_TEMP/askpass-tap.sh" <<'ASKPASS'
+          #!/bin/sh
+          printf %s "$HOMEBREW_TAP_TOKEN"
+          ASKPASS
+          chmod +x "$RUNNER_TEMP/askpass-tap.sh"
+          export GIT_ASKPASS="$RUNNER_TEMP/askpass-tap.sh"
+          git clone "https://x-access-token@github.com/$TAP_REPO.git" tap
           mkdir -p tap/Casks tap/Formula
           cp rendered/homebrew/Casks/jamstream.rb tap/Casks/jamstream.rb
           cp rendered/homebrew/Formula/jamstream-cli.rb tap/Formula/jamstream-cli.rb
@@ -751,10 +767,11 @@ jobs:
             echo "::warning::SCOOP BUCKET PUSH SKIPPED: no SCOOP_BUCKET_TOKEN or HOMEBREW_TAP_TOKEN secret. The rendered manifests are attached to this release inside jamstream-packaging.tar.gz."
             exit 0
           fi
-          STATUS=$(curl -sS -o bucket-repo.json -w '%{http_code}' \
-            -H "Authorization: Bearer $SCOOP_BUCKET_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$BUCKET_REPO")
+          # Off argv and out of .git/config, exactly as the tap step above.
+          STATUS=$(printf 'header = "Authorization: Bearer %s"\n' "$SCOOP_BUCKET_TOKEN" \
+            | curl -sS --config - -o bucket-repo.json -w '%{http_code}' \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$BUCKET_REPO")
           if [ "$STATUS" = 404 ]; then
             echo "::warning::SCOOP BUCKET PUSH SKIPPED: https://github.com/$BUCKET_REPO does not exist, or the token cannot see it."
             exit 0
@@ -765,7 +782,13 @@ jobs:
           fi
           BRANCH=$(sed -n 's/.*"default_branch": *"\([^"]*\)".*/\1/p' bucket-repo.json | head -1)
           [ -n "$BRANCH" ] || BRANCH=main
-          git clone "https://x-access-token:$SCOOP_BUCKET_TOKEN@github.com/$BUCKET_REPO.git" bucket
+          cat > "$RUNNER_TEMP/askpass-bucket.sh" <<'ASKPASS'
+          #!/bin/sh
+          printf %s "$SCOOP_BUCKET_TOKEN"
+          ASKPASS
+          chmod +x "$RUNNER_TEMP/askpass-bucket.sh"
+          export GIT_ASKPASS="$RUNNER_TEMP/askpass-bucket.sh"
+          git clone "https://x-access-token@github.com/$BUCKET_REPO.git" bucket
           mkdir -p bucket/bucket
           cp rendered/scoop/bucket/jamstream.json bucket/bucket/jamstream.json
           cp rendered/scoop/bucket/jamstream-app.json bucket/bucket/jamstream-app.json
