@@ -164,6 +164,11 @@ pub struct JamApp {
     pub log_path: Option<std::path::PathBuf>,
     /// Why the file manager would not open on the log; shown under the row.
     log_reveal_error: Option<String>,
+    /// What About calls this build. A field rather than the crate version
+    /// read at the point of use, because the snapshot baselines render it:
+    /// taking it from `CARGO_PKG_VERSION` there made every release bump
+    /// break four screenshots, which is how the 0.2.0 release found it.
+    pub build_version: String,
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
@@ -246,6 +251,7 @@ impl JamApp {
             settings_path: None,
             log_path: None,
             log_reveal_error: None,
+            build_version: env!("CARGO_PKG_VERSION").to_owned(),
             ending: None,
             confirm_quit: false,
             allow_close: false,
@@ -268,7 +274,11 @@ impl JamApp {
     /// must not read what the developer has stored.
     pub fn in_memory() -> Self {
         let env: EnvReader = Arc::new(|_: &str| None);
-        Self::new(Arc::new(creds::MemStore::default()), env, None)
+        let mut app = Self::new(Arc::new(creds::MemStore::default()), env, None);
+        // Pinned so a version bump is not a snapshot diff. The real string
+        // is main's business and About renders whatever it is given.
+        app.build_version = "0.0.0-test".to_owned();
+        app
     }
 
     /// The production entry point: the real keychain and the real
@@ -1070,7 +1080,7 @@ impl JamApp {
         ui.label(theme::title(ui, "About"));
         ui.label(theme::mono_muted(
             ui,
-            format!("jamstream-app {}", env!("CARGO_PKG_VERSION")),
+            format!("jamstream-app {}", self.build_version),
         ));
         let Some(path) = self.log_path.clone() else {
             // No data directory to keep one in; init said so by returning
