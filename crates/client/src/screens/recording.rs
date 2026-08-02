@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use data_encoding::HEXLOWER;
 use egui::{RichText, TextEdit, Ui};
+use jamstream_cli::reason::{self, Attempt};
 use jamstream_cloud::cloudinit::{RecordingStorage, StorageCredential};
 use jamstream_cloud::{ProviderKind, RegionId, Retention, RetentionEnforcement};
 use jamstream_protocol::ids::SessionId;
@@ -392,10 +393,11 @@ impl RecordingPanel {
                 // ever hold, so a check writes where a take would and touches
                 // no session's objects.
                 let probe_session = hex(&SessionId::generate().0);
+                let provider = self.provider;
                 self.check_job = Some(self.exec.run(async move {
                     jamstream_cli::host::probe_bucket(&storage, &probe_session)
                         .await
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| check_failure(provider, &e))
                 }));
                 true
             }
@@ -407,7 +409,7 @@ impl RecordingPanel {
     }
 
     /// A passing check saves the bucket and the key pair; a failing one saves
-    /// nothing and shows the provider's reason verbatim.
+    /// nothing and shows what the bucket refused.
     pub fn apply_check_result(&mut self, result: Result<(), String>) {
         if result.is_err() {
             self.check_result = Some(result);
@@ -712,6 +714,15 @@ fn hex(bytes: &[u8]) -> String {
     HEXLOWER.encode(bytes)
 }
 
+/// This tab's binding of the shared mapping: a failing Check is a bucket
+/// refusing a write, so the remedy is about writing the recordings prefix
+/// and setting the lifecycle rule, and the closing verb is this tab's own
+/// Check. The provider's response goes to the log; for S3 it is a document
+/// naming the account number and the IAM ARN (#374).
+fn check_failure(provider: ProviderKind, err: &jamstream_cli::CliError) -> String {
+    reason::error_sentence("checking the bucket", Attempt::Probe, Some(provider), err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +830,47 @@ mod tests {
         assert!(panel.setup(Some(ProviderKind::Aws)).refusal().is_some());
         assert!(panel.setup(Some(ProviderKind::Local)).refusal().is_some());
         assert!(panel.setup(None).refusal().is_some());
+    }
+
+    /// #374: a bucket that refused the Check put its whole answer on screen,
+    /// and for S3 that answer names the account number, the IAM ARN, a
+    /// RequestId and a HostId. What the pane draws is the sentence, with the
+    /// write permissions to add; the document is in the log.
+    #[test]
+    fn a_refused_check_draws_the_remedy_and_not_the_buckets_answer() {
+        let denied = jamstream_cli::CliError::Provider(jamstream_cloud::ProviderError::Auth(
+            "http 403 Forbidden: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>AccessDenied</Code><Message>User: \
+             arn:aws:iam::887762372032:user/jamstream-recordings is not \
+             authorized to perform: s3:PutObject</Message>\
+             <RequestId>Q0YMR4GFKCH1Y688</RequestId>\
+             <HostId>EE3WMENDEauoc0QS4v1XCZK1RcDA4A</HostId></Error>"
+                .to_owned(),
+        ));
+        let (_, mut panel) = panel();
+        panel.provider = ProviderKind::Aws;
+        panel.apply_check_result(Err(check_failure(ProviderKind::Aws, &denied)));
+        let shown = match &panel.check_result {
+            Some(Err(shown)) => shown.clone(),
+            other => panic!("a refused check must be on screen, got {other:?}"),
+        };
+        assert!(shown.contains("s3:PutObject"), "the remedy: {shown}");
+        assert!(shown.ends_with("then check again."), "{shown}");
+        for identifier in [
+            "887762372032",
+            "arn:",
+            "Q0YMR4GFKCH1Y688",
+            "EE3WMEND",
+            "<",
+            "http",
+        ] {
+            assert!(!shown.contains(identifier), "{identifier} leaked: {shown}");
+        }
+        // A DigitalOcean bucket gets the act DigitalOcean actually has,
+        // which is not an S3 policy.
+        let spaces = check_failure(ProviderKind::DigitalOcean, &denied);
+        assert!(spaces.contains("Spaces key"), "{spaces}");
+        assert!(!spaces.contains("s3:"), "{spaces}");
     }
 
     /// Neither half of the pair may reach a debug line, which is where a secret

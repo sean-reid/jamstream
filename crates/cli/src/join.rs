@@ -128,7 +128,7 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
     // session names loopback as well as the LAN address so a join from the
     // hosting machine never leaves it. A timeout below moves to the next.
     let mut candidates = ServerCandidates::new(&invite)?;
-    let mut socket = crate::host::connected_socket(candidates.current()).await?;
+    let mut socket = crate::launch::connected_socket(candidates.current()).await?;
 
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
@@ -219,7 +219,7 @@ pub async fn run<W: Write>(args: &JoinArgs, out: &mut W) -> Result<(), CliError>
             ClientState::TimedOut if joined_at.is_none() && candidates.has_alternatives() => {
                 let next = candidates.advance();
                 writeln!(out, "no answer, trying {next}")?;
-                socket = crate::host::connected_socket(next).await?;
+                socket = crate::launch::connected_socket(next).await?;
                 let init = core.reconnect(now())?;
                 socket.send(&init).await?;
             }

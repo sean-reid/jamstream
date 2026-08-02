@@ -35,11 +35,12 @@ use std::sync::{Arc, Mutex};
 
 use egui::{RichText, Ui};
 use jamstream_cli::CliError;
+use jamstream_cli::reason::{self, Attempt};
 use jamstream_cli::recordings::{self, Action, Take, TakeProgress};
 use jamstream_cli::state::{RecordingRecord, SessionState, SessionStatus};
 use jamstream_cli::storage::Stores;
 use jamstream_cloud::cloudinit::RecordingStorage;
-use jamstream_cloud::{ObjectStore, ProviderError, ProviderKind, Retention, http};
+use jamstream_cloud::{ObjectStore, Retention};
 
 use crate::creds::{self, CredStore, EnvReader};
 use crate::exec::{Executor, Job};
@@ -482,12 +483,11 @@ fn day_label(unix: u64) -> String {
 
 /// One sentence for the screen; the whole error for the log.
 ///
-/// A bucket refusal arrives as the provider's response verbatim, which for
-/// S3 is an XML document naming the AWS account number, the IAM user path,
-/// a RequestId and a HostId. None of that helps a musician, and this is the
-/// screen most likely to be screenshotted, since it is where something went
-/// wrong. So the raw error goes to the log, where diagnosis happens, and
-/// the row gets a sentence with the remedy in it.
+/// The Takes screen's binding of the shared builder: every refusal here is a
+/// bucket refusing to be read, so the remedy is about listing and reading,
+/// and the closing verb is this screen's Refresh. See
+/// [`jamstream_cli::reason`] for why the provider's own response never
+/// reaches a row.
 ///
 /// `provider` is the recording's own provider name, because the remedy for a
 /// refusal is a different act on each of them; an unparseable name gets the
@@ -496,88 +496,7 @@ fn day_label(unix: u64) -> String {
 /// Public because the snapshot fixture renders the row a refusal really
 /// produces, through this same mapping.
 pub fn error_sentence(doing: &str, provider: &str, err: &CliError) -> String {
-    tracing::warn!("{doing}: {err}");
-    match err {
-        CliError::Provider(p) => provider_sentence(provider.parse().ok(), p),
-        // Everything else is already in our own words: the keychain's
-        // pointer at the Recording tab, the traversal guard, the size check.
-        other => other.to_string(),
-    }
-}
-
-/// The sentence for each way a bucket says no. Only the error's class and
-/// its code are read, never the response body, so nothing in the body can
-/// leak: extraction is not a filter someone has to maintain.
-fn provider_sentence(provider: Option<ProviderKind>, err: &ProviderError) -> String {
-    match err {
-        ProviderError::Auth(_) => match http::error_code(err).as_deref() {
-            Some("ExpiredToken" | "TokenRefreshRequired" | "InvalidToken") => {
-                "The storage key has expired. Save a fresh key in the \
-                 Recording tab, then refresh."
-                    .to_owned()
-            }
-            Some("InvalidAccessKeyId" | "SignatureDoesNotMatch") => {
-                "The bucket did not accept the storage key. Check the key \
-                 and its secret in the Recording tab."
-                    .to_owned()
-            }
-            _ => listing_denied(provider),
-        },
-        ProviderError::NotFound(_) => match http::error_code(err).as_deref() {
-            Some("NoSuchKey") => {
-                "That take is no longer in the bucket. Refresh the list.".to_owned()
-            }
-            _ => "The bucket was not found. It may have been deleted, or it \
-                  may live in a different region than this session recorded."
-                .to_owned(),
-        },
-        ProviderError::RateLimited { .. } => {
-            "The provider is rate limiting requests. Refresh in a minute.".to_owned()
-        }
-        ProviderError::Transient(_) => {
-            "The bucket could not be reached. Check your connection and refresh.".to_owned()
-        }
-        // A quota refusal cannot come off the storage path, but the match
-        // has to hold if one ever does: same rule as any other unclassified
-        // failure.
-        ProviderError::QuotaExceeded(m) | ProviderError::Other(m) => match http::error_code(err) {
-            // A body is the provider's, not ours to draw.
-            Some(code) => format!("The bucket refused the request ({code})."),
-            None if http::error_body(err).is_some() => "The bucket refused the request.".to_owned(),
-            // Our own messages, the size check among them, are sentences
-            // already.
-            None => m.clone(),
-        },
-    }
-}
-
-/// A 403 on the listing call, with the remedy the provider that refused
-/// actually has.
-///
-/// This used to name `s3:ListBucket` to everyone, which is a policy only AWS
-/// has: a Spaces key carries no policy at all, and a GCS bucket grants a role
-/// to the service account behind the HMAC key. The published screenshot of
-/// this row is a DigitalOcean session being told to edit an S3 policy.
-/// Each remedy is the step the provider's own setup guide ends on.
-fn listing_denied(provider: Option<ProviderKind>) -> String {
-    let remedy = match provider {
-        Some(ProviderKind::Aws) => {
-            "Add s3:ListBucket and s3:GetObject for the bucket to the key's policy"
-        }
-        Some(ProviderKind::DigitalOcean) => {
-            "Give the Spaces key full access to this bucket, under Spaces \
-             Object Storage, Access Keys"
-        }
-        Some(ProviderKind::Gcp) => {
-            "Grant the key's service account the Storage Admin role on the bucket"
-        }
-        // Local records to a folder and cannot 403, and a name that does not
-        // parse has no console to send anyone to.
-        Some(ProviderKind::Local) | None => {
-            "Give the key permission to list the bucket and read what is in it"
-        }
-    };
-    format!("The storage key cannot list this bucket. {remedy}, then refresh.")
+    reason::error_sentence(doing, Attempt::Takes, provider.parse().ok(), err)
 }
 
 /// Opens a session's bucket with the key this computer's keychain holds.
@@ -1680,155 +1599,30 @@ mod tests {
         );
     }
 
-    /// The 403 a real bucket answered a listing with, as captured in issue
-    /// 311: the account number, the IAM user, a RequestId and a HostId,
-    /// none of which belongs on a screen.
-    const S3_DENIED: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-        <Error><Code>AccessDenied</Code><Message>User: \
-        arn:aws:iam::887762372032:user/jamstream-recordings is not \
-        authorized to perform: s3:ListBucket on resource: \
-        \"arn:aws:s3:::our-takes\"</Message>\
-        <RequestId>Q0YMR4GFKCH1Y688</RequestId>\
-        <HostId>EE3WMENDEauoc0QS4v1XCZK1RcDA4A/kbNvyiXfCbZDbAM3rq3zXBP\
-        bfLYNvpk2rAOFP8prkVw=</HostId></Error>";
-
-    /// Runs `f` with warnings captured, returning what it made and what it
-    /// logged, so a test can hold the screen and the log side by side.
-    fn with_captured_log(f: impl FnOnce() -> String) -> (String, String) {
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("log sink").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let sink = Sink::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer({
-                let sink = sink.clone();
-                move || sink.clone()
-            })
-            .finish();
-        let shown = tracing::subscriber::with_default(subscriber, f);
-        let logged = String::from_utf8(sink.0.lock().expect("log sink").clone()).expect("utf8");
-        (shown, logged)
-    }
-
-    /// The point of the mapping: the row gets the remedy, the log gets the
-    /// document, and the identifiers people crop out of screenshots appear
-    /// in exactly one of the two.
+    /// The screen's binding of the shared mapping: a real 403 reads as the
+    /// listing remedy, and none of the four identifiers the document carries
+    /// reaches the row. What the mapping does with every other class of
+    /// failure is pinned in `jamstream_cli::reason`, where it lives.
     #[test]
-    fn a_real_denial_reads_as_a_remedy_and_logs_whole() {
-        let err = CliError::Provider(ProviderError::Auth(format!(
-            "http 403 Forbidden: {S3_DENIED}"
-        )));
-        let (shown, logged) = with_captured_log(|| error_sentence("listing a3f29c41", "aws", &err));
-        assert!(shown.contains("s3:ListBucket"), "the remedy: {shown}");
-        assert!(shown.contains("storage key"), "what failed: {shown}");
-        for identifier in [
-            "887762372032",
-            "arn:",
-            "Q0YMR4GFKCH1Y688",
-            "EE3WMEND",
-            "<",
-            "http",
-        ] {
+    fn a_real_denial_reads_as_the_listing_remedy() {
+        let denied = CliError::Provider(jamstream_cloud::ProviderError::Auth(
+            "http 403 Forbidden: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Error><Code>AccessDenied</Code><Message>User: \
+             arn:aws:iam::887762372032:user/jamstream-recordings is not \
+             authorized to perform: s3:ListBucket</Message>\
+             <RequestId>Q0YMR4GFKCH1Y688</RequestId>\
+             <HostId>EE3WMENDEauoc0QS4v1XCZK1RcDA4A</HostId></Error>"
+                .to_owned(),
+        ));
+        let shown = error_sentence("listing a3f29c41", "aws", &denied);
+        assert_eq!(
+            shown,
+            "The storage key cannot list this bucket. Add s3:ListBucket and s3:GetObject \
+             for the bucket to the key's policy, then refresh."
+        );
+        for identifier in ["887762372032", "arn:", "Q0YMR4GFKCH1Y688", "EE3WMEND", "<"] {
             assert!(!shown.contains(identifier), "{identifier} leaked: {shown}");
         }
-        for kept in [
-            "AccessDenied",
-            "887762372032",
-            "Q0YMR4GFKCH1Y688",
-            "EE3WMEND",
-        ] {
-            assert!(logged.contains(kept), "{kept} lost from the log: {logged}");
-        }
-    }
-
-    /// Each failure the bucket path can produce reads as a sentence naming
-    /// what to do, and our own messages pass through as themselves.
-    #[test]
-    fn every_failure_class_reads_as_a_sentence() {
-        let auth = |code: &str| {
-            ProviderError::Auth(format!(
-                "http 403 Forbidden: <Error><Code>{code}</Code>\
-                 <Message>x</Message></Error>"
-            ))
-        };
-        let aws = Some(ProviderKind::Aws);
-        assert!(provider_sentence(aws, &auth("ExpiredToken")).contains("expired"));
-        assert!(provider_sentence(aws, &auth("SignatureDoesNotMatch")).contains("did not accept"));
-        assert!(provider_sentence(aws, &auth("AccessDenied")).contains("s3:ListBucket"));
-
-        let missing = ProviderError::NotFound(
-            "http 404 Not Found: <Error><Code>NoSuchBucket</Code></Error>".to_owned(),
-        );
-        assert!(provider_sentence(aws, &missing).contains("bucket was not found"));
-        let gone = ProviderError::NotFound(
-            "http 404 Not Found: <Error><Code>NoSuchKey</Code></Error>".to_owned(),
-        );
-        assert!(provider_sentence(aws, &gone).contains("no longer in the bucket"));
-
-        let offline = ProviderError::Transient("error sending request: connect error".to_owned());
-        assert!(provider_sentence(aws, &offline).contains("connection"));
-        assert!(
-            provider_sentence(aws, &ProviderError::RateLimited { retry_after: None })
-                .contains("rate limiting")
-        );
-
-        // Our own words survive: this is the size check's sentence, not a
-        // provider body.
-        let truncated = ProviderError::Other(
-            "download of mix.flac is truncated: content-length promised 9 bytes, 4 arrived"
-                .to_owned(),
-        );
-        assert_eq!(
-            provider_sentence(aws, &truncated),
-            "download of mix.flac is truncated: content-length promised 9 bytes, 4 arrived"
-        );
-        // A body on an unclassified status is a provider's, so only its
-        // code is shown.
-        let refused = ProviderError::Other(
-            "http 400 Bad Request: <Error><Code>InvalidRequest</Code>\
-             <Message>secret detail</Message></Error>"
-                .to_owned(),
-        );
-        let shown = provider_sentence(aws, &refused);
-        assert_eq!(shown, "The bucket refused the request (InvalidRequest).");
-    }
-
-    /// A 403 sends each provider to its own console, because the act that
-    /// fixes it is different on each: only AWS has a policy with
-    /// `s3:ListBucket` in it, and telling a Spaces or GCS host to edit one
-    /// sends them looking for a screen their provider does not have.
-    #[test]
-    fn the_denied_remedy_is_the_one_this_provider_actually_has() {
-        let denied = ProviderError::Auth(
-            "http 403 Forbidden: <Error><Code>AccessDenied</Code></Error>".to_owned(),
-        );
-        let sentence = |name: &str| {
-            error_sentence("listing", name, &CliError::Provider(denied.clone())).to_lowercase()
-        };
-        let aws = sentence("aws");
-        assert!(aws.contains("s3:listbucket"), "{aws}");
-
-        let spaces = sentence("digitalocean");
-        assert!(spaces.contains("spaces key"), "{spaces}");
-        assert!(!spaces.contains("s3:"), "{spaces}");
-        assert!(!spaces.contains("policy"), "{spaces}");
-
-        let gcs = sentence("gcp");
-        assert!(gcs.contains("service account"), "{gcs}");
-        assert!(!gcs.contains("s3:"), "{gcs}");
-
-        // A name from a record this build does not know still gets an act.
-        let unknown = sentence("azure");
-        assert!(unknown.contains("list the bucket"), "{unknown}");
-        assert!(!unknown.contains("s3:"), "{unknown}");
     }
 
     /// The folder is ours by name wherever it lands, and a machine that can

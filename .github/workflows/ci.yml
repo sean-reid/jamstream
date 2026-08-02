@@ -316,10 +316,10 @@ jobs:
       # clippy step below. A workspace-wide --all-targets check here
       # duplicated those builds in another profile and, with the exe
       # resource scripts and persistence deps added, pushed this leg past
-      # its 20 minute ceiling; scoping to the three bench crates keeps
+      # its 20 minute ceiling; scoping to the bench crates keeps
       # the coverage and drops the duplicate work.
       - if: runner.os == 'Windows'
-        run: cargo check --locked --benches -p jamstream-engine -p jamstream-protocol -p jamstream-server
+        run: cargo check --locked --benches -p jamstream-engine -p jamstream-protocol -p jamstream-server -p jamstream-audio-io
       # nextest does not run doctests, and nothing else did either, so a doctest
       # would have compiled on the author's machine and never once in CI (#295).
       # It costs a doc-mode build to find zero of them today, because every

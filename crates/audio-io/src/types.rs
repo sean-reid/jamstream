@@ -49,8 +49,14 @@ pub struct DeviceInfo {
     pub max_buffer_frames: Option<u32>,
 }
 
-/// Requested stream parameters. The whole system runs 48 kHz f32; backends
-/// reject other rates rather than resampling.
+/// Requested stream parameters. Everything above the device layer sees
+/// `sample_rate` in f32 whatever the hardware does, and a backend gets there
+/// however it can (#347): the device already runs there, the backend moves
+/// the device clock, the OS converts, or the backend resamples at the
+/// boundary and pays the latency. A device is refused only when no rung
+/// carries it, which since #347 means a hands-free microphone or a native
+/// open that itself failed. [`StreamHandle::rate_outcomes`] reports which
+/// rung each direction landed on and what it cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamConfig {
     pub sample_rate: u32,
