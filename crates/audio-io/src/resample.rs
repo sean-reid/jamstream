@@ -35,8 +35,8 @@ pub(crate) const MAX_CHUNK_FRAMES: usize = 4096;
 /// 48 kHz, the granularity everything downstream of the bridge moves in.
 const CHUNK: usize = 120;
 
-type CaptureFn = Box<dyn FnMut(&[f32]) + Send>;
-type PlaybackFn = Box<dyn FnMut(&mut [f32]) + Send>;
+pub type CaptureFn = Box<dyn FnMut(&[f32]) + Send>;
+pub type PlaybackFn = Box<dyn FnMut(&mut [f32]) + Send>;
 
 /// A device-rate callback size in session-rate frames, rounded up: what a
 /// converting stream can hand the handler per callback, and therefore what
@@ -81,7 +81,7 @@ fn fixed_ratio_resampler(ratio: f64, channels: usize, fixed: FixedAsync) -> Asyn
 /// Device callbacks of any size are accepted; `inner` is called with fixed
 /// `CHUNK`-frame session-rate chunks as whole ones become available. The
 /// wrapper never allocates after construction.
-pub(crate) fn converting_capture(
+pub fn converting_capture(
     mut inner: CaptureFn,
     session_rate: u32,
     device_rate: u32,
@@ -132,7 +132,7 @@ pub(crate) fn converting_capture(
 /// Device requests of any size are served; `inner` is pulled in fixed
 /// `CHUNK`-frame session-rate chunks until enough device-rate audio is
 /// staged. The wrapper never allocates after construction.
-pub(crate) fn converting_playback(
+pub fn converting_playback(
     mut inner: PlaybackFn,
     session_rate: u32,
     device_rate: u32,
