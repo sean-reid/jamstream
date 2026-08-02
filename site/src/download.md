@@ -95,7 +95,7 @@ irm https://sean-reid.github.io/jamstream/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -WithApp
 ```
 
-`-WithApp` installs the desktop app beside the CLI.
+`-WithApp` installs the desktop app beside the CLI. `-Tag v0.2.0` installs that release instead of the newest one.
 
 Uninstalling on Windows is the same shape:
 

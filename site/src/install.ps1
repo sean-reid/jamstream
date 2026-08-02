@@ -3,20 +3,26 @@
 #
 #   powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
 #
-# Downloads the jamstream CLI from the latest GitHub release, verifies its
-# sha256 against the release's SHA256SUMS file, and installs it. A winget
-# package is planned; until it exists, this script and the zips on the
-# download page are the install paths.
+# Downloads the jamstream CLI from a GitHub release, verifies its sha256
+# against that release's SHA256SUMS file, and installs it. A winget package is
+# planned; until it exists, this script and the zips on the download page are
+# the install paths.
 #
 # Parameters (when run as a saved script rather than piped to iex):
 #   -WithApp      also install the desktop app zip
 #   -WithServer   explain where the server binary comes from on Windows
+#   -Tag          install this release, for example v0.2.0, instead of the
+#                 latest one
 #   -InstallDir   install here; defaults to JAMSTREAM_INSTALL_DIR if set,
 #                 otherwise $env:LOCALAPPDATA\Programs\jamstream
 
 param(
     [switch]$WithApp,
     [switch]$WithServer,
+    # A release tag is a path segment in every URL below, so it is held to
+    # what a tag can contain.
+    [ValidatePattern('^[A-Za-z0-9._-]+$')]
+    [string]$Tag,
     [string]$InstallDir = $(if ($env:JAMSTREAM_INSTALL_DIR) { $env:JAMSTREAM_INSTALL_DIR }
                            else { Join-Path $env:LOCALAPPDATA 'Programs\jamstream' })
 )
@@ -28,7 +34,16 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $repo = 'sean-reid/jamstream'
-$base = "https://github.com/$repo/releases/latest/download"
+# latest/download resolves to whatever is newest at the moment each asset is
+# requested, which is the right default for a person and the wrong one for
+# anything that has to name a version.
+if ($Tag) {
+    $base = "https://github.com/$repo/releases/download/$Tag"
+    $release = "release $Tag"
+} else {
+    $base = "https://github.com/$repo/releases/latest/download"
+    $release = 'the latest release'
+}
 
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
     Write-Host 'This is the Windows installer; on macOS and Linux run:'
@@ -76,7 +91,7 @@ function Get-Asset([string]$Name, [string]$Dest) {
 function Install-Archive([string]$Asset, [string]$Binary, [string]$SumsPath, [string]$Dir, [string]$Tmp) {
     $zip = Join-Path $Tmp $Asset
     if (-not (Get-Asset $Asset $zip)) {
-        throw "The latest release has no asset named $Asset; if a release was just published, its uploads may still be running, so retry in a few minutes."
+        throw "No asset named $Asset on $release; if it was just published, its uploads may still be running, so retry in a few minutes."
     }
     $line = Select-String -Path $SumsPath -Pattern ([regex]::Escape($Asset)) | Select-Object -First 1
     if (-not $line) { throw "SHA256SUMS has no entry for $Asset" }
@@ -117,6 +132,7 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) ("jamstream-install-" + [IO.Path]::G
 New-Item -ItemType Directory -Path $tmp | Out-Null
 
 Write-Host 'JamStream installer'
+Write-Host "installing from: $release"
 Write-Host "install directory: $InstallDir"
 
 $createdInstallDir = -not (Test-Path $InstallDir)
@@ -125,10 +141,10 @@ try {
     $sums = Join-Path $tmp 'SHA256SUMS'
     if (-not (Get-Asset 'SHA256SUMS' $sums)) {
         Write-Host ''
-        Write-Host 'The latest release has no SHA256SUMS; if a release was just published,'
-        Write-Host 'its uploads may still be running, so retry in a few minutes.'
-        Write-Host 'If no release has been published yet, the repository builds from source'
-        Write-Host '(Rust toolchain required):'
+        Write-Host "No SHA256SUMS on $release; if it was just published, its uploads"
+        Write-Host 'may still be running, so retry in a few minutes.'
+        Write-Host 'If the tag is wrong, or nothing has been published yet, the'
+        Write-Host 'repository builds from source (Rust toolchain required):'
         Write-Host "  git clone https://github.com/$repo; cd jamstream"
         Write-Host '  cargo install --path crates/cli'
         exit 1
