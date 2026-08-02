@@ -213,7 +213,12 @@ async fn launch_join_destroy_end_to_end() {
         "destroy took longer than the 5 s budget"
     );
     assert!(
-        provider.list_tagged(None).await.unwrap().is_empty(),
+        provider
+            .list_tagged(None)
+            .await
+            .unwrap()
+            .instances
+            .is_empty(),
         "destroyed session still listed"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -256,7 +261,11 @@ async fn registry_survives_provider_restart() {
     // A fresh provider on the same state dir sees the session: the
     // registry is on disk, which is exactly what the sweeper relies on.
     let fresh = LocalProvider::new(dir.clone());
-    let found = fresh.list_tagged(Some("sweep-session")).await.unwrap();
+    let found = fresh
+        .list_tagged(Some("sweep-session"))
+        .await
+        .unwrap()
+        .instances;
     assert_eq!(found.len(), 1, "restarted provider lost the session");
     assert_eq!(found[0].id, instance.id);
 
@@ -264,7 +273,7 @@ async fn registry_survives_provider_restart() {
         .destroy(&instance.region.id, &instance.id)
         .await
         .expect("destroy from fresh provider");
-    assert!(fresh.list_tagged(None).await.unwrap().is_empty());
+    assert!(fresh.list_tagged(None).await.unwrap().instances.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -33,7 +33,7 @@ use crate::http;
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
     ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec,
-    Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
+    Listing, Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
 };
 
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -718,7 +718,7 @@ impl Provider for AwsProvider {
         Ok(())
     }
 
-    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>> {
+    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Listing> {
         let mut base = vec![
             ("Filter.1.Name".to_owned(), "instance-state-name".to_owned()),
             ("Filter.1.Value.1".to_owned(), "pending".to_owned()),
@@ -735,8 +735,9 @@ impl Provider for AwsProvider {
             }
         }
 
+        let regions = self.regions();
         let mut set = tokio::task::JoinSet::new();
-        for region in self.regions() {
+        for region in regions.iter().cloned() {
             let provider = self.clone();
             let params = base.clone();
             set.spawn(async move {
@@ -747,11 +748,14 @@ impl Provider for AwsProvider {
 
         let mut out = Vec::new();
         let mut first_err = None;
-        let mut ok_regions = 0usize;
+        // Every region starts unsearched and is struck off when it answers,
+        // so a task that panicked instead of returning an error still leaves
+        // its region named rather than silently counted as empty.
+        let mut unsearched: Vec<RegionId> = regions.iter().map(|r| r.id.clone()).collect();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((_, Ok(parsed))) => {
-                    ok_regions += 1;
+                Ok((region, Ok(parsed))) => {
+                    unsearched.retain(|id| id != &region.id);
                     out.extend(parsed.into_iter().map(|p| p.instance));
                 }
                 // One broken region must not hide orphans elsewhere: warn
@@ -768,7 +772,7 @@ impl Provider for AwsProvider {
         }
         // If every region failed there is nothing trustworthy to report;
         // an empty Ok here would look like "no orphans" to the sweeper.
-        if ok_regions == 0
+        if unsearched.len() == regions.len()
             && let Some(err) = first_err
         {
             return Err(err);
@@ -776,7 +780,11 @@ impl Provider for AwsProvider {
         out.sort_by(|a, b| {
             (a.region.id.as_str(), a.id.as_str()).cmp(&(b.region.id.as_str(), b.id.as_str()))
         });
-        Ok(out)
+        unsearched.sort();
+        Ok(Listing {
+            instances: out,
+            unsearched,
+        })
     }
 
     fn session_port(&self) -> u16 {

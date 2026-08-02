@@ -162,8 +162,14 @@ async fn corroborate(
         Err(e) => return Corroboration::Unchecked(e.to_string()),
     };
     match provider.list_tagged(Some(&session.session_id_hex)).await {
-        Ok(instances) if instances.is_empty() => Corroboration::Gone,
-        Ok(_) => Corroboration::Confirmed,
+        Ok(listing) if !listing.instances.is_empty() => Corroboration::Confirmed,
+        // Nothing here, but not everywhere was looked at: AWS and GCP list
+        // what they could reach, so a throttled region reads as an empty
+        // account and would print a live session as stale.
+        Ok(listing) if !listing.is_complete() => {
+            Corroboration::Unchecked(format!("{} did not answer", listing.unsearched_display()))
+        }
+        Ok(_) => Corroboration::Gone,
         Err(e) => Corroboration::Unchecked(e.to_string()),
     }
 }

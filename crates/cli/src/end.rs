@@ -90,12 +90,15 @@ pub async fn run<W: Write>(
         )?,
     }
 
-    let remaining = provider.list_tagged(Some(&session.session_id_hex)).await?;
+    let remaining = provider
+        .list_tagged(Some(&session.session_id_hex))
+        .await?
+        .instances;
     if !remaining.is_empty() {
         return Err(CliError::Failed(format!(
             "{} instance(s) still listed for session {} after destroy; run jamstream sweep",
             remaining.len(),
-            &session.session_id_hex[..8]
+            &session.session_id_hex[..8.min(session.session_id_hex.len())]
         )));
     }
 
@@ -109,7 +112,7 @@ pub async fn run<W: Write>(
     writeln!(
         out,
         "Session {} ended. Instance {} is destroyed.",
-        &session.session_id_hex[..8],
+        &session.session_id_hex[..8.min(session.session_id_hex.len())],
         session.instance_id
     )?;
     Ok(())

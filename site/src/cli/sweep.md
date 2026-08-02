@@ -40,5 +40,5 @@ No jamstream-tagged instances found.
 
 - `sweep --dry-run --provider <name>` doubles as the credential check for a newly configured provider; see [Provider setup](../guides/providers.md#verifying-any-provider).
 - Sweep destroys by tag, so it also catches machines from other computers and old versions, and nothing untagged is ever touched.
-- Sweep also closes this machine's record of any session whose instance it destroyed or found already gone, so [`jamstream status`](status.md) stops reporting it as running. Records on a provider that could not be searched are left alone.
-- If any destroy fails, sweep exits nonzero and says so plainly, because the failed instance is still billing. Destroy it from the provider's console and report the bug.
+- Sweep also closes this machine's record of any session whose instance it destroyed or found already gone, so [`jamstream status`](status.md) stops reporting it as running. Closing a record is only done on evidence: a provider that could not be searched, or one region of it that could not be listed, leaves its records alone.
+- If a destroy fails, or a provider or any of its regions could not be searched, sweep exits nonzero and says which, because anything it could not account for may still be billing.

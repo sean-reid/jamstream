@@ -54,11 +54,22 @@ pub async fn assert_provider_contract(p: &dyn Provider) {
     assert_session_firewall(p, "contract-b").await;
 
     let only_a = p.list_tagged(Some("contract-a")).await.expect("list a");
-    assert_eq!(only_a.len(), 1, "session filter must return exactly a");
-    assert_eq!(only_a[0].id, a.id);
+    assert_eq!(
+        only_a.instances.len(),
+        1,
+        "session filter must return exactly a"
+    );
+    assert_eq!(only_a.instances[0].id, a.id);
 
     let all = p.list_tagged(None).await.expect("list all");
-    let ids: Vec<&str> = all.iter().map(|i| i.id.as_str()).collect();
+    // Nothing is wrong with this provider, so a listing that left a region
+    // out would be a listing that quietly reported someone else's account.
+    assert!(
+        all.is_complete(),
+        "a healthy provider's listing must cover all of it, missed {}",
+        all.unsearched_display()
+    );
+    let ids: Vec<&str> = all.instances.iter().map(|i| i.id.as_str()).collect();
     assert!(
         ids.contains(&a.id.as_str()) && ids.contains(&b.id.as_str()),
         "list with None must return all jamstream-tagged instances"
@@ -88,7 +99,10 @@ pub async fn assert_provider_contract(p: &dyn Provider) {
 
     p.destroy(&a.region.id, &a.id).await.expect("destroy a");
     let after = p.list_tagged(Some("contract-a")).await.expect("list a");
-    assert!(after.is_empty(), "destroyed instance must disappear");
+    assert!(
+        after.instances.is_empty(),
+        "destroyed instance must disappear"
+    );
     match p.destroy(&a.region.id, &a.id).await {
         Err(ProviderError::NotFound(_)) => {}
         other => panic!("double destroy must be NotFound, got {other:?}"),
@@ -118,7 +132,11 @@ pub async fn assert_provider_contract(p: &dyn Provider) {
 
     p.destroy(&b.region.id, &b.id).await.expect("destroy b");
     assert!(
-        p.list_tagged(None).await.expect("final list").is_empty(),
+        p.list_tagged(None)
+            .await
+            .expect("final list")
+            .instances
+            .is_empty(),
         "contract suite must leave nothing behind"
     );
     p.destroy_orphan_firewalls()

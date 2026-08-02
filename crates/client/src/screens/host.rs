@@ -1190,7 +1190,7 @@ async fn wait_for_ip(
             .list_tagged(Some(session_hex))
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(found) = listed.into_iter().find(|i| i.id == instance.id) {
+        if let Some(found) = listed.instances.into_iter().find(|i| i.id == instance.id) {
             instance = found;
         }
     }
