@@ -749,22 +749,27 @@ jobs:
             echo "the tap already carries $TAG; nothing to push"
             exit 0
           fi
-          git commit -m "jamstream $TAG"
+          git commit -m "chore: jamstream $TAG"
           git push origin "HEAD:refs/heads/$BRANCH"
           echo "pushed $TAG to https://github.com/$TAP_REPO ($BRANCH)"
       # Scoop is the same shape as the tap: a bucket is just a git
       # repository, so the release publishes it the same way, gated on a
-      # token so a release never fails for the channel. SCOOP_BUCKET_TOKEN
-      # is preferred; the tap token works as a fallback when one classic
-      # PAT covers both repositories.
+      # token so a release never fails for the channel.
+      #
+      # Its own token, with no fallback to the tap's. That fallback shipped
+      # in v0.2.0 and cost the release: a fine-grained tap token can read a
+      # public bucket and clone it, so every check here passed and the push
+      # 403'd at the end, after every artifact had already been published.
+      # A token that cannot write is worse than no token, because the
+      # missing-token path says so and skips.
       - name: Push the Scoop bucket
         env:
-          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN || secrets.HOMEBREW_TAP_TOKEN }}
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           BUCKET_REPO: sean-reid/scoop-jamstream
         run: |
           set -eu
           if [ -z "${SCOOP_BUCKET_TOKEN:-}" ]; then
-            echo "::warning::SCOOP BUCKET PUSH SKIPPED: no SCOOP_BUCKET_TOKEN or HOMEBREW_TAP_TOKEN secret. The rendered manifests are attached to this release inside jamstream-packaging.tar.gz."
+            echo "::warning::SCOOP BUCKET PUSH SKIPPED: no SCOOP_BUCKET_TOKEN secret with contents write on $BUCKET_REPO. The rendered manifests are attached to this release inside jamstream-packaging.tar.gz."
             exit 0
           fi
           # Off argv and out of .git/config, exactly as the tap step above.
@@ -800,6 +805,6 @@ jobs:
             echo "the bucket already carries $TAG; nothing to push"
             exit 0
           fi
-          git commit -m "jamstream $TAG"
+          git commit -m "chore: jamstream $TAG"
           git push origin "HEAD:refs/heads/$BRANCH"
           echo "pushed $TAG to https://github.com/$BUCKET_REPO ($BRANCH)"
