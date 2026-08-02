@@ -86,6 +86,25 @@ pub fn cookie_key(server_private: &[u8], epoch: u64) -> wire::CookieKey {
     wire::CookieKey::from_bytes(h.finalize().into())
 }
 
+/// KDF label for the cookie reply key, WireGuard's `LABEL-COOKIE` role. Part
+/// of the wire contract in [`wire::build_cookie_challenge`]: change it and no
+/// shipped client opens another build's challenges.
+const COOKIE_REPLY_KEY_DOMAIN: &[u8] = b"jamstream-cookie-reply-key-v1";
+
+/// The key a cookie challenge is encrypted under:
+/// Blake2s-256([`COOKIE_REPLY_KEY_DOMAIN`] || server static public key).
+///
+/// A pure function of the public key, so the client derives it from the
+/// `server_pk` its invite already carries and the server from its own key,
+/// and nothing new rides any invite. See [`wire::CookieReplyKey`] for what
+/// that does and does not keep secret.
+pub fn cookie_reply_key(server_public: &[u8; 32]) -> wire::CookieReplyKey {
+    let mut h = Blake2s256::new();
+    h.update(COOKIE_REPLY_KEY_DOMAIN);
+    h.update(server_public);
+    wire::CookieReplyKey::from_bytes(h.finalize().into())
+}
+
 /// The key that authenticates a version reject for an init this server will
 /// not otherwise process, recovered from the init itself.
 ///
@@ -742,13 +761,62 @@ mod tests {
         assert_ne!(cookie(&server.private, 7), cookie(&server.public, 7));
     }
 
+    /// Both ends of the challenge derive the reply key from the public key
+    /// alone: the client from the `server_pk` in its invite, the server from
+    /// its own keypair. A challenge the server seals must open on the client
+    /// with no key material moving, or the cookie round trip would deadlock
+    /// exactly when the server is under load.
+    #[test]
+    fn the_reply_key_is_shared_through_the_invite_alone() {
+        let (_, server, invite) = setup();
+        let (_, init_packet) = Initiator::new(&invite).unwrap();
+        let src: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let epoch_key = cookie_key(&server.private, 7);
+
+        // Server side: seal under a key from its own public half.
+        let challenge = wire::build_cookie_challenge(
+            &cookie_reply_key(&server.public),
+            &epoch_key,
+            src,
+            &init_packet,
+        );
+        let wire::Packet::CookieChallenge { nonce, sealed } = wire::parse(&challenge).unwrap()
+        else {
+            panic!("expected a challenge");
+        };
+        // Client side: open under a key from the invite, against the init it
+        // sent. Out comes the very cookie the server will accept back.
+        let cookie = wire::open_cookie_challenge(
+            &cookie_reply_key(&invite.server_pk),
+            &nonce,
+            &sealed,
+            &init_packet,
+        )
+        .expect("the invite's server_pk derives the reply key");
+        assert!(wire::cookie_matches(&epoch_key, src, &cookie));
+
+        // A different server public key derives a different reply key, so a
+        // challenge from a stranger opens as garbage, not as a cookie.
+        let stranger = generate_keypair();
+        assert_eq!(
+            wire::open_cookie_challenge(
+                &cookie_reply_key(&stranger.public),
+                &nonce,
+                &sealed,
+                &init_packet
+            ),
+            None
+        );
+    }
+
     #[test]
     fn version_mismatch_is_explicit() {
         let (_, server, invite) = setup();
-        let err = Responder::read_init(&server.private, &invite.session_id, 2, b"junk");
+        let theirs = PROTOCOL_VERSION + 1;
+        let err = Responder::read_init(&server.private, &invite.session_id, theirs, b"junk");
         assert!(matches!(
             err,
-            Err(Error::VersionMismatch { ours: 1, theirs: 2 })
+            Err(Error::VersionMismatch { ours, theirs: t }) if ours == PROTOCOL_VERSION && t == theirs
         ));
     }
 }

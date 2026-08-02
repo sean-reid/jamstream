@@ -6,7 +6,12 @@
 use std::net::IpAddr;
 
 use blake2::Blake2sMac;
-use blake2::digest::{KeyInit, Mac, consts::U16};
+use blake2::digest::{
+    KeyInit, Mac,
+    consts::{U16, U24},
+};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
 use crate::Error;
@@ -24,6 +29,14 @@ pub const TYPE_COOKIED_INIT: u8 = 7;
 /// width as the reject MACs and enough that guessing one is hopeless.
 pub const COOKIE_BYTES: usize = 16;
 
+/// XChaCha20Poly1305 nonce carried in a cookie challenge. Chosen by the
+/// server and opaque to the receiver, which decrypts with whatever arrived.
+pub const COOKIE_NONCE_BYTES: usize = 24;
+
+/// The encrypted cookie in a challenge: the 16-byte cookie plus the 16-byte
+/// Poly1305 tag.
+pub const COOKIE_SEALED_BYTES: usize = COOKIE_BYTES + 16;
+
 /// Channel byte inside decrypted transport plaintext.
 pub const CHANNEL_MEDIA: u8 = 0;
 pub const CHANNEL_CONTROL: u8 = 1;
@@ -33,6 +46,9 @@ const REJECT_DOMAIN: &[u8] = b"jamstream-version-reject";
 /// one must never be replayable as the other.
 const CAPACITY_DOMAIN: &[u8] = b"jamstream-capacity-reject";
 const COOKIE_DOMAIN: &[u8] = b"jamstream-cookie";
+/// Domain for the challenge nonce derivation; server-side only, see
+/// [`challenge_nonce`].
+const COOKIE_NONCE_DOMAIN: &[u8] = b"jamstream-cookie-nonce";
 
 /// The key a version reject is authenticated with: a hash of the X25519
 /// shared secret between the server's static key and the per-connection
@@ -79,6 +95,31 @@ impl std::fmt::Debug for CookieKey {
     }
 }
 
+/// The AEAD key a cookie challenge is encrypted under:
+/// Blake2s-256(`"jamstream-cookie-reply-key-v1"` || server static public key),
+/// WireGuard's cookie-reply construction. Both ends can derive it, the server
+/// from its own key and the client from the `server_pk` its invite carries,
+/// so no new material is distributed. [`crate::transport::cookie_reply_key`]
+/// derives it.
+///
+/// Not a secret against invite holders: anyone holding an invite knows
+/// `server_pk`. What the AEAD adds is the binding, through its additional
+/// authenticated data, of one challenge to the one init that drew it.
+#[derive(Clone)]
+pub struct CookieReplyKey(Zeroizing<[u8; 32]>);
+
+impl CookieReplyKey {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> CookieReplyKey {
+        CookieReplyKey(Zeroizing::new(bytes))
+    }
+}
+
+impl std::fmt::Debug for CookieReplyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CookieReplyKey(..)")
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Packet<'a> {
     HandshakeInit {
@@ -104,12 +145,15 @@ pub enum Packet<'a> {
     CapacityReject {
         mac: [u8; 16],
     },
-    /// Come back with this cookie. Sent instead of reading an init while the
-    /// server is under handshake load, and carries no proof of who sent it:
-    /// authenticating it would cost the Diffie-Hellman the cookie exists to
-    /// avoid. See [`cookie_for`].
+    /// Come back with the cookie sealed inside. Sent instead of reading an
+    /// init while the server is under handshake load. The cookie is encrypted
+    /// and bound, through the AEAD's additional data, to the exact init it
+    /// answers, so only a peer that knows `server_pk` and saw that init can
+    /// produce one this client will accept. See [`build_cookie_challenge`]
+    /// for the complete construction.
     CookieChallenge {
-        cookie: [u8; COOKIE_BYTES],
+        nonce: [u8; COOKIE_NONCE_BYTES],
+        sealed: [u8; COOKIE_SEALED_BYTES],
     },
     /// A handshake init carrying a cookie from an earlier challenge. A
     /// separate type rather than a field on [`Packet::HandshakeInit`], so the
@@ -167,11 +211,13 @@ pub fn parse(buf: &[u8]) -> Result<Packet<'_>, Error> {
             })
         }
         TYPE_COOKIE_CHALLENGE => {
-            if rest.len() != COOKIE_BYTES {
+            if rest.len() != COOKIE_NONCE_BYTES + COOKIE_SEALED_BYTES {
                 return Err(Error::Malformed);
             }
+            let (nonce, sealed) = rest.split_at(COOKIE_NONCE_BYTES);
             Ok(Packet::CookieChallenge {
-                cookie: rest.try_into().unwrap(),
+                nonce: nonce.try_into().unwrap(),
+                sealed: sealed.try_into().unwrap(),
             })
         }
         TYPE_COOKIED_INIT => {
@@ -296,11 +342,104 @@ pub fn cookie_matches(key: &CookieKey, source: IpAddr, cookie: &[u8; COOKIE_BYTE
     equal(&cookie_for(key, source), cookie)
 }
 
-pub fn build_cookie_challenge(cookie: &[u8; COOKIE_BYTES]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + COOKIE_BYTES);
+/// Builds a cookie challenge answering one handshake init. This is the wire
+/// contract, exactly; a second implementation that follows it interoperates:
+///
+/// - AEAD: XChaCha20Poly1305 (RFC 8439 ChaCha20-Poly1305 with the HChaCha20
+///   extension for a 24-byte nonce).
+/// - Key: Blake2s-256 over `"jamstream-cookie-reply-key-v1"` followed by the
+///   server's 32-byte X25519 static public key; see [`CookieReplyKey`].
+/// - Plaintext: the 16-byte cookie of [`cookie_for`].
+/// - Additional authenticated data: the complete
+///   [`TYPE_HANDSHAKE_INIT`] datagram being answered, unabridged, from the
+///   type byte through the two little-endian version bytes to the end of the
+///   Noise message. This is what binds the reply to one init: an AEAD open
+///   against any other init fails.
+/// - Layout: the [`TYPE_COOKIE_CHALLENGE`] byte, the 24-byte nonce, then the
+///   32-byte ciphertext (cookie plus Poly1305 tag). 57 bytes, always smaller
+///   than any init the server answers.
+///
+/// The nonce is the sender's to choose and opaque to the receiver. This
+/// server derives it deterministically (see [`challenge_nonce`]) so the core
+/// stays clock-and-input driven under the harness; a random 24-byte nonce,
+/// which is what WireGuard uses, would interoperate identically.
+pub fn build_cookie_challenge(
+    reply_key: &CookieReplyKey,
+    cookie_key: &CookieKey,
+    source: IpAddr,
+    init_packet: &[u8],
+) -> Vec<u8> {
+    let cookie = cookie_for(cookie_key, source);
+    let nonce = challenge_nonce(cookie_key, source, init_packet);
+    let sealed = XChaCha20Poly1305::new(Key::from_slice(reply_key.0.as_slice()))
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &cookie,
+                aad: init_packet,
+            },
+        )
+        .expect("cookie seal is infallible at this size");
+    let mut out = Vec::with_capacity(1 + COOKIE_NONCE_BYTES + COOKIE_SEALED_BYTES);
     out.push(TYPE_COOKIE_CHALLENGE);
-    out.extend_from_slice(cookie);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&sealed);
     out
+}
+
+/// Opens a cookie challenge against the init this client actually sent.
+/// `None` is a forgery, a tamper, or an answer to some other init, and the
+/// caller drops the packet; the cookie inside a `Some` is bound to
+/// `init_packet_sent` by the AEAD and safe to echo in a cookied init.
+pub fn open_cookie_challenge(
+    reply_key: &CookieReplyKey,
+    nonce: &[u8; COOKIE_NONCE_BYTES],
+    sealed: &[u8; COOKIE_SEALED_BYTES],
+    init_packet_sent: &[u8],
+) -> Option<[u8; COOKIE_BYTES]> {
+    let plain = XChaCha20Poly1305::new(Key::from_slice(reply_key.0.as_slice()))
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: sealed,
+                aad: init_packet_sent,
+            },
+        )
+        .ok()?;
+    plain.as_slice().try_into().ok()
+}
+
+/// The challenge nonce for one (epoch, source, init) triple.
+///
+/// A MAC under the epoch's cookie secret rather than a random draw, so the
+/// server core stays deterministic under the harness with no RNG in it.
+/// Every input the plaintext depends on is under the MAC: the epoch through
+/// the key, the source address, and the init that is also the AEAD's
+/// additional data. A repeated nonce therefore means the identical
+/// (key, plaintext, AAD) triple, which re-produces the identical ciphertext
+/// and leaks nothing, and two different plaintexts can share a nonce only by
+/// a 192-bit collision. Keyed so the nonce is no oracle for confirming a
+/// cookie guess offline.
+fn challenge_nonce(
+    key: &CookieKey,
+    source: IpAddr,
+    init_packet: &[u8],
+) -> [u8; COOKIE_NONCE_BYTES] {
+    let mut mac =
+        <Blake2sMac<U24> as KeyInit>::new_from_slice(key.0.as_slice()).expect("32-byte key");
+    mac.update(COOKIE_NONCE_DOMAIN);
+    match source {
+        IpAddr::V4(v4) => {
+            mac.update(&[4]);
+            mac.update(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            mac.update(&[6]);
+            mac.update(&v6.octets());
+        }
+    }
+    mac.update(init_packet);
+    mac.finalize().into_bytes().into()
 }
 
 /// The same first flight as [`build_handshake_init`] with a cookie in front of
@@ -454,11 +593,24 @@ mod tests {
         );
 
         let cookie_key = CookieKey::from_bytes([6u8; 32]);
-        let cookie = cookie_for(&cookie_key, "203.0.113.7".parse().unwrap());
+        let reply_key = CookieReplyKey::from_bytes([7u8; 32]);
+        let src: IpAddr = "203.0.113.7".parse().unwrap();
+        let cookie = cookie_for(&cookie_key, src);
+        let challenge = build_cookie_challenge(&reply_key, &cookie_key, src, &init);
         assert_eq!(
-            data_encoding::HEXLOWER.encode(&build_cookie_challenge(&cookie)),
-            "062bc7213d87f96d944f831f5d6209ef93",
+            data_encoding::HEXLOWER.encode(&challenge),
+            "06d0377c257164b14d157ec21be2a5a1960ebd6d4392001991419e4f0212d68a\
+             9df1ca5282e01ac38fcb02b2f81101651cfafffdddd889eb3f",
             "cookie challenge encoding drifted"
+        );
+        // And the pinned bytes open back to the very cookie that was sealed,
+        // so the vector pins the whole construction, not just its length.
+        let Packet::CookieChallenge { nonce, sealed } = parse(&challenge).unwrap() else {
+            panic!("wrong packet type");
+        };
+        assert_eq!(
+            open_cookie_challenge(&reply_key, &nonce, &sealed, &init),
+            Some(cookie)
         );
         let cookied = build_cookied_init(&cookie, 9, b"a-fixed-init-for-the-vector");
         assert_eq!(
@@ -534,17 +686,86 @@ mod tests {
         assert_ne!(cookie_for(&key, a), cookie_for(&key, b));
     }
 
-    /// A challenge is a tag and a cookie; a cookied init needs at least a
-    /// cookie and a version before any Noise bytes. Anything else is refused
-    /// rather than read past the end or tolerated as a second encoding.
+    /// A challenge answers exactly one init. Opened against any other init,
+    /// under any other server key, or after a flipped bit anywhere in the
+    /// packet, the AEAD refuses: this is what an off-path forger runs into,
+    /// because a challenge the victim will accept requires both the reply key
+    /// and the exact bytes of the init being answered.
+    #[test]
+    fn a_challenge_opens_only_against_the_init_it_answers() {
+        let reply_key = CookieReplyKey::from_bytes([7u8; 32]);
+        let other_key = CookieReplyKey::from_bytes([8u8; 32]);
+        let cookie_key = CookieKey::from_bytes([6u8; 32]);
+        let src: IpAddr = "203.0.113.7".parse().unwrap();
+        let init = build_handshake_init(2, b"the-init-being-answered");
+        let challenge = build_cookie_challenge(&reply_key, &cookie_key, src, &init);
+        let Packet::CookieChallenge { nonce, sealed } = parse(&challenge).unwrap() else {
+            panic!("wrong packet type");
+        };
+
+        assert_eq!(
+            open_cookie_challenge(&reply_key, &nonce, &sealed, &init),
+            Some(cookie_for(&cookie_key, src))
+        );
+        // A different init, which is what a challenge sprayed at some other
+        // client's handshake is; a different key, which is what a forger
+        // without the server public key holds.
+        let other_init = build_handshake_init(2, b"somebody-elses-init");
+        assert_eq!(
+            open_cookie_challenge(&reply_key, &nonce, &sealed, &other_init),
+            None
+        );
+        assert_eq!(
+            open_cookie_challenge(&other_key, &nonce, &sealed, &init),
+            None
+        );
+        // Any flipped bit, nonce included, is a refusal.
+        for i in 0..(COOKIE_NONCE_BYTES + COOKIE_SEALED_BYTES) {
+            let mut bad = challenge.clone();
+            bad[1 + i] ^= 0x01;
+            let Packet::CookieChallenge { nonce, sealed } = parse(&bad).unwrap() else {
+                panic!("wrong packet type");
+            };
+            assert_eq!(
+                open_cookie_challenge(&reply_key, &nonce, &sealed, &init),
+                None,
+                "a challenge with byte {i} flipped still opened"
+            );
+        }
+
+        // Deterministic on purpose: the same (key, epoch, source, init) is
+        // the same packet, so the server core needs no RNG. Any other input
+        // moves the nonce.
+        assert_eq!(
+            challenge,
+            build_cookie_challenge(&reply_key, &cookie_key, src, &init)
+        );
+        let elsewhere = build_cookie_challenge(
+            &reply_key,
+            &cookie_key,
+            "203.0.113.8".parse().unwrap(),
+            &init,
+        );
+        assert_ne!(challenge[1..25], elsewhere[1..25], "nonce ignored the ip");
+        let another = build_cookie_challenge(&reply_key, &cookie_key, src, &other_init);
+        assert_ne!(challenge[1..25], another[1..25], "nonce ignored the init");
+        let rotated =
+            build_cookie_challenge(&reply_key, &CookieKey::from_bytes([9u8; 32]), src, &init);
+        assert_ne!(challenge[1..25], rotated[1..25], "nonce ignored the epoch");
+    }
+
+    /// A challenge is a tag, a nonce, and a sealed cookie; a cookied init
+    /// needs at least a cookie and a version before any Noise bytes. Anything
+    /// else is refused rather than read past the end or tolerated as a second
+    /// encoding.
     #[test]
     fn cookie_packets_refuse_wrong_lengths() {
-        for len in [0usize, 1, 15, 17, 64] {
+        for len in [0usize, 1, 16, 24, 55, 57, 64] {
             let mut wrong = vec![TYPE_COOKIE_CHALLENGE];
             wrong.extend(std::iter::repeat_n(0u8, len));
             assert_eq!(
                 parse(&wrong).is_ok(),
-                len == COOKIE_BYTES,
+                len == COOKIE_NONCE_BYTES + COOKIE_SEALED_BYTES,
                 "{len}-byte challenge payload parsed wrongly"
             );
         }
