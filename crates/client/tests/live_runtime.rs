@@ -205,16 +205,47 @@ fn tail_rms(path: &Path, secs: f64) -> f64 {
     rms(&tail(path, secs).1)
 }
 
-/// Zero-crossing pitch of channel 0 over the final `secs` seconds of a
-/// stereo capture file, measured on the file's own clock.
+/// Energy at one frequency, by Goertzel. Cheaper than a transform when the
+/// question is about a handful of candidates rather than a whole spectrum.
+fn tone_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
+    let k = 2.0 * std::f64::consts::PI * hz / f64::from(rate);
+    let coeff = 2.0 * k.cos();
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    for &x in samples {
+        let s0 = f64::from(x) + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt()
+}
+
+/// Pitch of channel 0 over the final `secs` seconds of a stereo capture
+/// file, measured on the file's own clock, as the strongest tone between
+/// 300 and 700 Hz.
+///
+/// Not zero crossings. That counted every crossing the signal made, so a
+/// dropout or a bit of ringing added cycles that were never in the tone,
+/// and the estimate rose with load rather than with pitch: the nightly of
+/// 2026-08-02 read a 440 Hz sine as 484 on a loaded runner while the same
+/// commit passed unloaded. Energy at a frequency does not care how ragged
+/// the waveform is around it, so a glitchy 440 still reads as 440, and the
+/// dropouts it used to disguise are left to `longest_zero_run` and `rms`,
+/// which is where a test can say what it actually found.
 fn tail_pitch_hz(path: &Path, secs: f64) -> f64 {
     let (rate, samples) = tail(path, secs);
     let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
-    let cycles = left
-        .windows(2)
-        .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
-        .count();
-    cycles as f64 / (left.len() as f64 / f64::from(rate))
+    // 2 Hz steps: an order finer than the +-20 Hz the callers allow, and
+    // far finer than the 8.8% a rate mismatch would move the tone.
+    let mut best = (0.0f64, 0.0f64);
+    let mut hz = 300.0;
+    while hz <= 700.0 {
+        let energy = tone_energy(&left, rate, hz);
+        if energy > best.1 {
+            best = (hz, energy);
+        }
+        hz += 2.0;
+    }
+    best.0
 }
 
 /// Polls snapshots until `pred` holds; panics with the last state on timeout.
