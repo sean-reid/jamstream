@@ -9,11 +9,22 @@
 //!
 //! Diagnostics must never cost the feature they describe, so a log directory
 //! that cannot be made falls back to stderr alone, silently.
+//!
+//! The file goes through [`jamstream_cloud::private`] like everything else
+//! under the data directory. It collects whole provider error documents and
+//! panic backtraces, and its own point is that a stuck user can hand it to
+//! someone, which is a decision for them to make rather than for the mode
+//! bits. Routing it there also settles who creates the shared data root:
+//! this runs first in `main`, so before it did, the root was whatever
+//! `create_dir_all` left behind on a machine where the app opened before
+//! the CLI ever ran.
 
 use std::fs::File;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use jamstream_cloud::private::{create_private_dir, create_private_file};
 
 use tracing_subscriber::fmt::writer::MakeWriterExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -68,8 +79,8 @@ fn open_log_file() -> Option<(PathBuf, File)> {
 }
 
 fn open_log_file_at(path: PathBuf) -> Option<(PathBuf, File)> {
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    let mut file = File::create(&path).ok()?;
+    create_private_dir(path.parent()?).ok()?;
+    let mut file = create_private_file(&path).ok()?;
     // Written directly, past the filter: only warnings and panics log, so
     // a healthy run's file would otherwise be empty, and an empty file is
     // indistinguishable from a sink that never worked. The Windows console
@@ -103,6 +114,29 @@ fn install_panic_hook(file: Arc<File>) {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A directory of this test's own, gone before it starts, so a mode
+    /// assertion is about what this code did and not about what a previous
+    /// run left.
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jamstream-log-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
 
     /// The app takes the CLI's filter wholesale: warnings by default so
     /// degradations show, and a `RUST_LOG` target directive still wins.
@@ -145,7 +179,7 @@ mod tests {
     /// empty file means a healthy run rather than a broken sink.
     #[test]
     fn the_log_opens_with_a_banner_and_truncates_on_reopen() {
-        let dir = std::env::temp_dir().join(format!("jamstream-log-banner-{}", std::process::id()));
+        let dir = scratch("banner");
         let path = dir.join("app.log");
         for _ in 0..2 {
             let (p, file) = open_log_file_at(path.clone()).expect("open log");
@@ -158,5 +192,36 @@ mod tests {
             assert_eq!(text.lines().count(), 1, "{text:?}");
             assert!(text.contains("empty after this line is a healthy run"));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The log is not the one file under the data directory that opts out
+    /// of the private machinery: 0600 on the file, 0700 on every directory
+    /// made on the way to it, including the shared root, which this
+    /// creates before any other jamstream code runs.
+    #[cfg(unix)]
+    #[test]
+    fn the_log_and_the_directories_above_it_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("modes");
+        let data = root.join("jamstream");
+        let path = data.join("logs").join("app.log");
+
+        let (_, file) = open_log_file_at(path.clone()).expect("open log");
+        drop(file);
+
+        assert_eq!(mode_of(&path), 0o600, "the log is world readable");
+        assert_eq!(mode_of(path.parent().expect("logs dir")), 0o700);
+        assert_eq!(mode_of(&data), 0o700, "the shared data root");
+
+        // What an existing install has: a 0644 file from an older build.
+        // The mode only applies to a fresh inode, so opening this one has
+        // to replace it rather than truncate it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let (_, file) = open_log_file_at(path.clone()).expect("reopen log");
+        drop(file);
+        assert_eq!(mode_of(&path), 0o600, "a permissive log survived a reopen");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
