@@ -91,8 +91,8 @@ use crate::artifact::ServerArch;
 use crate::http::{client, send_retrying};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
-    ANY_IPV4, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec, Price,
-    ProviderKind, Region, RegionId, SESSION_TAG_KEY,
+    ANY_IPV4, DEFAULT_SESSION_PORT, IngressRule, Instance, InstanceClass, LaunchSpec, Listing,
+    Price, ProviderKind, Region, RegionId, SESSION_TAG_KEY,
 };
 
 pub use super::gcp_auth::ServiceAccountTokenSource;
@@ -579,7 +579,7 @@ impl Provider for GcpProvider {
         Ok(())
     }
 
-    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>> {
+    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Listing> {
         let filter = match session_tag {
             Some(session) => format!(
                 "labels.{}={}",
@@ -589,40 +589,50 @@ impl Provider for GcpProvider {
             None => format!("labels.{MARKER_LABEL_KEY}=true"),
         };
         let token = self.token.access_token().await?;
+        let zones = self.regions();
         let mut tasks = JoinSet::new();
-        for region in self.regions() {
+        for region in zones.iter().cloned() {
             let http = self.http.clone();
             let url = self.zone_url(&region.id);
             let token = token.clone();
             let filter = filter.clone();
-            tasks.spawn(async move { list_zone(http, url, token, filter, region).await });
+            let id = region.id.clone();
+            tasks.spawn(async move { (id, list_zone(http, url, token, filter, region).await) });
         }
         let mut instances = Vec::new();
-        let mut any_zone_succeeded = false;
+        // Struck off as each zone answers, so a zone whose task panicked is
+        // still named rather than counted as empty.
+        let mut unsearched: Vec<RegionId> = zones.iter().map(|r| r.id.clone()).collect();
         let mut first_err: Option<ProviderError> = None;
         while let Some(joined) = tasks.join_next().await {
-            let outcome = joined
-                .unwrap_or_else(|e| Err(ProviderError::Other(format!("zone list task: {e}"))));
+            let (id, outcome) = match joined {
+                Ok(pair) => pair,
+                Err(e) => {
+                    first_err.get_or_insert(ProviderError::Other(format!("zone list task: {e}")));
+                    continue;
+                }
+            };
             match outcome {
                 Ok(items) => {
-                    any_zone_succeeded = true;
+                    unsearched.retain(|zone| zone != &id);
                     instances.extend(items);
                 }
                 // Per-zone failures are tolerated as long as at least one
                 // zone answers; a jam session lives in exactly one zone.
                 Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+                    first_err.get_or_insert(e);
                 }
             }
         }
-        if any_zone_succeeded {
-            Ok(instances)
-        } else {
-            Err(first_err
-                .unwrap_or_else(|| ProviderError::Other("gcp catalog has no zones".to_owned())))
+        if unsearched.len() == zones.len() {
+            return Err(first_err
+                .unwrap_or_else(|| ProviderError::Other("gcp catalog has no zones".to_owned())));
         }
+        unsearched.sort();
+        Ok(Listing {
+            instances,
+            unsearched,
+        })
     }
 
     fn session_port(&self) -> u16 {
@@ -665,9 +675,19 @@ impl Provider for GcpProvider {
     async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>> {
         // A rule targets one session's network tag, and the instances still
         // carrying that session label are what makes it live.
-        let live: Vec<String> = self
-            .list_tagged(None)
-            .await?
+        let listing = self.list_tagged(None).await?;
+        // A session in a zone that did not answer would read as dead here,
+        // and deleting its rule shuts the musicians out of a jam that is
+        // still playing. Firewalls cost nothing, so the next sweep gets them.
+        if !listing.is_complete() {
+            tracing::warn!(
+                zones = listing.unsearched_display(),
+                "skipping firewall cleanup: some zones could not be listed"
+            );
+            return Ok(Vec::new());
+        }
+        let live: Vec<String> = listing
+            .instances
             .iter()
             .filter_map(|i| i.session_id().and_then(|s| network_tag(s).ok()))
             .collect();

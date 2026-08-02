@@ -1,7 +1,12 @@
 //! Session records stop lying after any death: sweep closes the record of
 //! every instance it destroyed or found gone, and status corroborates a
-//! running record against its provider before repeating it. A provider that
-//! cannot be asked proves nothing, so its records are left alone.
+//! running record against its provider before repeating it.
+//!
+//! The other half matters more, because getting it wrong costs a session
+//! rather than a line of output. Closing a record blanks the issuer key,
+//! hides the session from `jamstream end`, and reports a live machine as
+//! ended, so a record is only closed on positive evidence that its instance
+//! is gone. Nobody looked is not the same answer as nothing is there.
 //!
 //! One test function: the state directory override is process-global env,
 //! so the phases run in sequence against one directory.
@@ -10,8 +15,19 @@ use std::path::Path;
 
 use jamstream_cli::cli::StatusArgs;
 use jamstream_cli::state::{self, SessionState, SessionStatus};
-use jamstream_cli::{CliError, status, sweep};
+use jamstream_cli::{CliError, providers, status, sweep};
 use jamstream_cloud::{MockProvider, Provider, ProviderError, ProviderKind, session_tag};
+
+/// Credentials that would put a real cloud provider in `resolve_all`, so the
+/// phase that runs a real sweep runs the one a host without them gets.
+const CLOUD_CREDENTIALS: [&str; 6] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "DIGITALOCEAN_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCP_ACCESS_TOKEN",
+];
 
 fn record(session_hex: &str, provider: &str, instance_id: &str) -> SessionState {
     SessionState {
@@ -61,22 +77,27 @@ async fn records_are_reconciled_after_any_death() {
         std::env::set_var(state::STATE_DIR_ENV, &state_dir);
     }
 
-    // Phase 1: sweep closes what it destroyed and what it found gone.
-    let aws = MockProvider::with_default_regions(ProviderKind::Aws);
-    let region = aws.regions()[0].clone();
-    let swept = aws.seed_instance(&region, vec![session_tag("aaaa1111aaaa1111")]);
-    let path_swept = state::save(&record("aaaa1111aaaa1111", "aws", &swept.id)).unwrap();
+    // Phase 1: sweep closes what it destroyed and what it found gone. The
+    // records name the provider they were launched against, and the mock is
+    // its own provider, not a stand-in for the cloud its instances borrow.
+    let mock = MockProvider::with_default_regions(ProviderKind::Aws);
+    let region = mock.regions()[0].clone();
+    let swept = mock.seed_instance(&region, vec![session_tag("aaaa1111aaaa1111")]);
+    let path_swept = state::save(&record("aaaa1111aaaa1111", "mock", &swept.id)).unwrap();
     // Crashed or self-destructed earlier: a record with no instance behind it.
-    let path_gone = state::save(&record("bbbb2222bbbb2222", "aws", "i-long-gone")).unwrap();
+    let path_gone = state::save(&record("bbbb2222bbbb2222", "mock", "i-long-gone")).unwrap();
     // A provider this sweep was not given: nobody looked, nothing learned.
     let path_elsewhere = state::save(&record("cccc3333cccc3333", "gcp", "gcp-instance")).unwrap();
+    // A real cloud whose kind the mock happens to borrow. The double proves
+    // nothing about the account it is imitating.
+    let path_real_cloud = state::save(&record("eeee5555eeee5555", "aws", "i-live")).unwrap();
 
-    let providers: Vec<Box<dyn Provider>> = vec![Box::new(aws)];
+    let providers: Vec<Box<dyn Provider>> = vec![Box::new(mock)];
 
     // A dry run destroys nothing, so it must also close nothing.
     let mut out = Vec::new();
     sweep::run(&providers, true, &mut out).await.unwrap();
-    for path in [&path_swept, &path_gone, &path_elsewhere] {
+    for path in [&path_swept, &path_gone, &path_elsewhere, &path_real_cloud] {
         assert_eq!(state::load(path).unwrap().status, SessionStatus::Running);
     }
 
@@ -89,26 +110,51 @@ async fn records_are_reconciled_after_any_death() {
     );
     assert!(text.contains("Session bbbb2222:"), "sweep output: {text}");
     assert!(!text.contains("cccc3333"), "sweep output: {text}");
+    assert!(!text.contains("eeee5555"), "sweep output: {text}");
 
-    for path in [&path_swept, &path_gone] {
-        let closed = state::load(path).unwrap();
-        assert_eq!(closed.status, SessionStatus::Ended);
-        assert!(closed.ended_unix.is_some());
-        assert!(
-            closed.issuer_private_key_b64.is_empty(),
-            "the issuer key outlived the session"
+    // Destroyed by this sweep, so the instance is certainly gone and the
+    // issuer key goes with it: nothing to mint or revoke against a machine
+    // this process took down.
+    let destroyed = state::load(&path_swept).unwrap();
+    assert_eq!(destroyed.status, SessionStatus::Ended);
+    assert!(destroyed.ended_unix.is_some());
+    assert!(
+        destroyed.issuer_private_key_b64.is_empty(),
+        "the issuer key outlived an instance we destroyed ourselves"
+    );
+
+    // Closed on a listing instead. Weaker evidence, so the key survives: a
+    // listing filters by instance state, and a host whose machine turns out
+    // to be alive needs the key to revoke every invite to it.
+    let unlisted = state::load(&path_gone).unwrap();
+    assert_eq!(unlisted.status, SessionStatus::Ended);
+    assert!(unlisted.ended_unix.is_some());
+    assert_eq!(
+        unlisted.issuer_private_key_b64, "aXNzdWVy",
+        "a record closed on a listing must keep the key that revokes its invites"
+    );
+
+    for (path, why) in [
+        (
+            &path_elsewhere,
+            "a record on a provider the sweep never searched must not be closed",
+        ),
+        (
+            &path_real_cloud,
+            "the mock must not answer for the cloud whose kind its instances borrow",
+        ),
+    ] {
+        assert_eq!(
+            state::load(path).unwrap().status,
+            SessionStatus::Running,
+            "{why}"
         );
     }
-    assert_eq!(
-        state::load(&path_elsewhere).unwrap().status,
-        SessionStatus::Running,
-        "a record on a provider the sweep never searched must not be closed"
-    );
 
     // Phase 2: a provider whose listing fails was never searched, so its
     // records stand even though the sweep saw no instances at all.
     reset(&state_dir);
-    let path_unlisted = state::save(&record("dddd4444dddd4444", "aws", "i-unknown")).unwrap();
+    let path_unlisted = state::save(&record("dddd4444dddd4444", "mock", "i-unknown")).unwrap();
     let broken = MockProvider::with_default_regions(ProviderKind::Aws);
     broken.fail_next_lists(1, ProviderError::Other("network unreachable".to_owned()));
     let providers: Vec<Box<dyn Provider>> = vec![Box::new(broken)];
@@ -121,6 +167,113 @@ async fn records_are_reconciled_after_any_death() {
         SessionStatus::Running,
         "absence of evidence must not close a record"
     );
+
+    // Phase 2a: a provider that reached only some of its regions searched
+    // none of them as far as a record is concerned. The instance below is
+    // alive in the region that did not answer.
+    reset(&state_dir);
+    let path_partial = state::save(&record("ffff6666ffff6666", "mock", "mock-000001")).unwrap();
+    let partial = MockProvider::with_default_regions(ProviderKind::Aws);
+    let west = partial.regions()[1].clone();
+    partial.seed_instance(&west, vec![session_tag("ffff6666ffff6666")]);
+    partial.unsearchable_region(&west.id);
+    let providers: Vec<Box<dyn Provider>> = vec![Box::new(partial)];
+    let mut out = Vec::new();
+    let err = sweep::run(&providers, false, &mut out)
+        .await
+        .expect_err("a region nobody could list is not a clean sweep");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("mock: could not search mock-west"),
+        "sweep output: {text}"
+    );
+    assert!(err.to_string().contains("still billing"), "error: {err}");
+    let survived = state::load(&path_partial).unwrap();
+    assert_eq!(
+        survived.status,
+        SessionStatus::Running,
+        "a session in the region nobody listed must not be closed"
+    );
+    assert_eq!(survived.issuer_private_key_b64, "aXNzdWVy");
+
+    // Phase 2b: the whole thing end to end through the provider set the
+    // binary actually sweeps with. A shell with no cloud credentials
+    // resolves no cloud provider at all, so a running AWS record has nobody
+    // to speak for it and must come through untouched. This is the shape of
+    // the bug that closed live sessions: the test double resolved without
+    // credentials, reported an empty account, and passed for AWS.
+    reset(&state_dir);
+    // Safety: single-test binary, as above.
+    unsafe {
+        for key in CLOUD_CREDENTIALS {
+            std::env::remove_var(key);
+        }
+    }
+    let path_live = state::save(&record("9999cccc9999cccc", "aws", "i-still-running")).unwrap();
+    let resolved = providers::resolve_all();
+    assert!(
+        !resolved.iter().any(|p| p.name() == "aws"),
+        "no credentials in this shell, so no aws provider"
+    );
+    let mut out = Vec::new();
+    sweep::run(&resolved, false, &mut out).await.unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("9999cccc"), "sweep output: {text}");
+    let live = state::load(&path_live).unwrap();
+    assert_eq!(
+        live.status,
+        SessionStatus::Running,
+        "a sweep from a shell without credentials must not end an aws session"
+    );
+    assert_eq!(
+        live.issuer_private_key_b64, "aXNzdWVy",
+        "and it must not blank the key that revokes the session's invites"
+    );
+
+    // Phase 2c: a record that cannot be rewritten must not abandon the rest.
+    // The instances are already destroyed by the time reconciliation runs, so
+    // every record it skips is one that will go on claiming a live session.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        reset(&state_dir);
+        let stuck = MockProvider::with_default_regions(ProviderKind::Aws);
+        let region = stuck.regions()[0].clone();
+        let mut paths = Vec::new();
+        for session in ["1a1a1a1a1a1a1a1a", "2b2b2b2b2b2b2b2b"] {
+            let inst = stuck.seed_instance(&region, vec![session_tag(session)]);
+            paths.push(state::save(&record(session, "mock", &inst.id)).unwrap());
+        }
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root writes wherever it likes, so the phase only means something
+        // where the directory is genuinely unwritable.
+        let probe = state_dir.join("probe");
+        let unwritable = std::fs::write(&probe, b"x").is_err();
+        let _ = std::fs::remove_file(&probe);
+
+        if unwritable {
+            let providers: Vec<Box<dyn Provider>> = vec![Box::new(stuck)];
+            let mut out = Vec::new();
+            let err = sweep::run(&providers, false, &mut out)
+                .await
+                .expect_err("a record left claiming a destroyed instance is a failed sweep");
+            let text = String::from_utf8(out).unwrap();
+            assert!(err.to_string().contains("2 session record(s)"), "{err}");
+            for path in &paths {
+                assert!(
+                    text.contains(&path.display().to_string()),
+                    "every record that could not be rewritten is named: {text}"
+                );
+                assert_eq!(
+                    state::load(path).unwrap().status,
+                    SessionStatus::Running,
+                    "nothing was written, so nothing changed on disk"
+                );
+            }
+        }
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     // Phase 3: status corroborates running records against the provider,
     // read-only. Live stays running, gone prints stale with the way out,
@@ -237,6 +390,35 @@ async fn records_are_reconciled_after_any_death() {
         text.contains("\"status\": \"running\""),
         "an unverifiable session must keep blocking an uninstall: {text}"
     );
+
+    // Phase 5: a listing that reached only some of a provider proves
+    // nothing either. The session below is alive in the region that did not
+    // answer, and calling it stale would invite the host to close a jam
+    // that is still playing.
+    reset(&state_dir);
+    let session = "7777aaaa7777aaaa";
+    state::save(&record(session, "aws", "mock-000001")).unwrap();
+    let partial = |name: &str| -> Result<Box<dyn Provider>, CliError> {
+        assert_eq!(name, "aws");
+        let p = MockProvider::with_default_regions(ProviderKind::Aws);
+        let west = p.regions()[1].clone();
+        p.seed_instance(&west, vec![session_tag(session)]);
+        p.unsearchable_region(&west.id);
+        Ok(Box::new(p))
+    };
+    let text = status_text(false, partial).await;
+    assert!(!text.contains("stale"), "table: {text}");
+    assert!(
+        text.contains(
+            "Session 7777aaaa: recorded running; aws could not be checked \
+             (mock-west did not answer)."
+        ),
+        "table: {text}"
+    );
+    let json: Vec<serde_json::Value> =
+        serde_json::from_str(&status_text(true, partial).await).unwrap();
+    assert_eq!(json[0]["status"], "running");
+    assert_eq!(json[0]["corroborated"], false);
 
     reset(&state_dir);
 }

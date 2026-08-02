@@ -1138,7 +1138,7 @@ async fn the_ec2_provider_still_signs_ec2_requests_after_the_s3_extension() {
     let provider = AwsProvider::new(ACCESS_KEY_ID.to_owned(), "test-secret-key".to_owned())
         .with_base_url(server.uri());
     let instances = provider.list_tagged(Some("s1")).await.unwrap();
-    assert!(instances.is_empty());
+    assert!(instances.instances.is_empty());
     assert_eq!(provider.kind(), ProviderKind::Aws);
 }
 

@@ -375,7 +375,9 @@ async fn list_tagged_by_session_filters_and_parses_instances() {
         .await;
 
     let p = provider(&server);
-    let instances = p.list_tagged(Some("sess1")).await.unwrap();
+    let listed = p.list_tagged(Some("sess1")).await.unwrap();
+    assert!(listed.is_complete(), "every region answered");
+    let instances = listed.instances;
     assert_eq!(instances.len(), 2);
 
     assert_eq!(instances[0].id, "i-aaa11122233344455");
@@ -414,7 +416,9 @@ async fn list_tagged_all_sessions_uses_tag_key_filter() {
         .await;
 
     let p = provider(&server);
-    let instances = p.list_tagged(None).await.unwrap();
+    let listed = p.list_tagged(None).await.unwrap();
+    assert!(listed.is_complete(), "every region answered");
+    let instances = listed.instances;
     assert_eq!(instances.len(), 1);
     assert_eq!(instances[0].id, "i-orphan1");
     assert_eq!(instances[0].region.id.as_str(), "eu-central-1");
@@ -449,7 +453,18 @@ async fn list_tagged_tolerates_a_broken_region() {
         .await;
 
     let p = provider(&server);
-    let instances = p.list_tagged(None).await.unwrap();
+    let listed = p.list_tagged(None).await.unwrap();
+    // The orphan in the region that answered is reported, and the region
+    // that did not is named: an empty us-east-1 and an unreachable one are
+    // the difference between a session record closed and a session record
+    // left alone.
+    assert_eq!(
+        listed.unsearched,
+        vec![RegionId::new("us-east-1")],
+        "a region on fire must not read as a region with nothing in it"
+    );
+    assert!(!listed.is_complete());
+    let instances = listed.instances;
     assert_eq!(instances.len(), 1);
     assert_eq!(instances[0].id, "i-eu1");
     assert_eq!(instances[0].region.id.as_str(), "eu-west-1");

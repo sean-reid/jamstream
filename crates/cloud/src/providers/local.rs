@@ -137,7 +137,7 @@ use crate::cloudinit::flat_config_value;
 use crate::private::{create_private_dir, write_private};
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
-    IngressRule, Instance, LaunchSpec, Price, ProviderKind, Region, RegionId, session_tag,
+    IngressRule, Instance, LaunchSpec, Listing, Price, ProviderKind, Region, RegionId, session_tag,
 };
 
 const REGION_ID: &str = "local";
@@ -746,7 +746,7 @@ impl Provider for LocalProvider {
         Ok(())
     }
 
-    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>> {
+    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Listing> {
         // Prune dead pids while listing; the registry only ever holds
         // sessions that were actually running at last look.
         let live = self.with_registry(|entries| {
@@ -754,11 +754,14 @@ impl Provider for LocalProvider {
             entries.clone()
         })?;
         let ip = self.reachable_ip();
-        Ok(live
-            .iter()
-            .filter(|e| session_tag.is_none_or(|want| e.session == want))
-            .map(|e| Self::instance_for(e, ip))
-            .collect())
+        // One registry, one region: either it was read or this returned an
+        // error, so there is never a partial answer here.
+        Ok(Listing::complete(
+            live.iter()
+                .filter(|e| session_tag.is_none_or(|want| e.session == want))
+                .map(|e| Self::instance_for(e, ip))
+                .collect(),
+        ))
     }
 
     /// There is no cloud network here. The host's own firewall and router are
@@ -1909,7 +1912,12 @@ mod tests {
         assert!(matches!(err, ProviderError::Other(_)));
         assert!(err.to_string().contains("does-not-exist"));
         assert!(
-            provider.list_tagged(None).await.unwrap().is_empty(),
+            provider
+                .list_tagged(None)
+                .await
+                .unwrap()
+                .instances
+                .is_empty(),
             "failed launch must not leave a registry entry"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1943,8 +1951,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(instance.public_ip, Some(loopback));
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].public_ip, Some(loopback));
+        assert_eq!(listed.instances.len(), 1);
+        assert_eq!(listed.instances[0].public_ip, Some(loopback));
     }
 
     /// The default is the whole point of the flag being a flag: an
@@ -2010,7 +2018,12 @@ mod tests {
 
         let provider = LocalProvider::new(state.clone());
         assert!(
-            provider.list_tagged(None).await.unwrap().is_empty(),
+            provider
+                .list_tagged(None)
+                .await
+                .unwrap()
+                .instances
+                .is_empty(),
             "a corrupt registry reads as no sessions, not as an error forever"
         );
         // The unparseable bytes are kept, in case a human wants them, and
@@ -2522,7 +2535,7 @@ mod tests {
 
         let sweeper = LocalProvider::new(state.clone());
         assert_eq!(
-            sweeper.list_tagged(None).await.unwrap().len(),
+            sweeper.list_tagged(None).await.unwrap().instances.len(),
             1,
             "the probe must still recognize a server that really is ours"
         );
@@ -2551,7 +2564,12 @@ mod tests {
         // which is what runs on every CLI launch.
         std::fs::write(&registry, &tampered).unwrap();
         assert!(
-            sweeper.list_tagged(None).await.unwrap().is_empty(),
+            sweeper
+                .list_tagged(None)
+                .await
+                .unwrap()
+                .instances
+                .is_empty(),
             "a stale entry must be pruned, not reported as a running session"
         );
 

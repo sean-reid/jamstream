@@ -2,7 +2,7 @@
 //! every configured provider on every app and CLI launch.
 
 use crate::provider::{Provider, ProviderError};
-use crate::types::{Instance, ProviderKind};
+use crate::types::{Instance, ProviderKind, RegionId};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum SweepFilter {
@@ -39,11 +39,16 @@ pub struct SweepReport {
     pub found: Vec<Instance>,
     pub destroyed: Vec<Instance>,
     pub failed: Vec<(Instance, ProviderError)>,
-    /// Providers that could not be listed at all. Nothing can be attached
-    /// to an instance here, and that is exactly why it is reported: a
-    /// provider whose listing fails is a provider whose strays were never
-    /// looked for, and a sweep that says nothing about it reads as clean.
-    pub unswept: Vec<(ProviderKind, ProviderError)>,
+    /// Providers that could not be listed at all, by the name a session
+    /// record spells. Nothing can be attached to an instance here, and that
+    /// is exactly why it is reported: a provider whose listing fails is a
+    /// provider whose strays were never looked for, and a sweep that says
+    /// nothing about it reads as clean.
+    pub unswept: Vec<(&'static str, ProviderError)>,
+    /// One entry per provider that answered, saying how much of it the
+    /// search reached. Nothing else in this report can tell an instance
+    /// that is gone from one nobody looked for.
+    pub searches: Vec<ProviderSearch>,
     /// Per-session firewalls with no instance left behind them, deleted on
     /// the way past. AWS will not delete a security group until the
     /// terminating instance's network interface is gone, so a group that was
@@ -51,9 +56,42 @@ pub struct SweepReport {
     pub firewalls_removed: Vec<String>,
 }
 
+/// How much of one provider a sweep managed to search. A provider whose
+/// listing failed outright is in [`SweepReport::unswept`] instead and has no
+/// entry here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderSearch {
+    /// The name a session record spells for this provider, which is what
+    /// ties a record to the search that can speak for it. Names rather than
+    /// kinds, because the mock's instances borrow a real kind.
+    pub provider: &'static str,
+    pub kind: ProviderKind,
+    /// Regions that could not be listed while others answered. Empty when
+    /// the search covered the whole provider, which is the only case where
+    /// an instance missing from [`SweepReport::found`] is one that is gone.
+    pub unsearched: Vec<RegionId>,
+}
+
+impl ProviderSearch {
+    pub fn is_complete(&self) -> bool {
+        self.unsearched.is_empty()
+    }
+}
+
 impl SweepReport {
+    /// Whether this sweep can promise nothing tagged jamstream is still
+    /// billing. A skipped region is as much a hole in that promise as a
+    /// destroy that failed, so it is not clean either.
     pub fn is_clean(&self) -> bool {
-        self.failed.is_empty() && self.unswept.is_empty()
+        self.failed.is_empty()
+            && self.unswept.is_empty()
+            && self.searches.iter().all(ProviderSearch::is_complete)
+    }
+
+    /// The search that can speak for a session record naming `provider`, if
+    /// this sweep held such a provider at all.
+    pub fn search_for(&self, provider: &str) -> Option<&ProviderSearch> {
+        self.searches.iter().find(|s| s.provider == provider)
     }
 }
 
@@ -64,19 +102,31 @@ pub async fn sweep(
 ) -> SweepReport {
     let mut report = SweepReport::default();
     for p in providers {
-        let instances = match p.list_tagged(None).await {
+        let listing = match p.list_tagged(None).await {
             Ok(v) => v,
             Err(e) => {
                 // Carry on with the others, but say so: the promise at the
                 // top of this file is that nothing tagged jamstream keeps
                 // billing, and a provider that could not be listed is one
                 // this sweep cannot make that promise about.
-                tracing::warn!(provider = p.kind().as_str(), error = %e, "sweep list failed");
-                report.unswept.push((p.kind(), e));
+                tracing::warn!(provider = p.name(), error = %e, "sweep list failed");
+                report.unswept.push((p.name(), e));
                 continue;
             }
         };
-        for inst in instances.into_iter().filter(|i| filter.matches(i)) {
+        if !listing.is_complete() {
+            tracing::warn!(
+                provider = p.name(),
+                regions = listing.unsearched_display(),
+                "sweep searched only part of a provider"
+            );
+        }
+        report.searches.push(ProviderSearch {
+            provider: p.name(),
+            kind: p.kind(),
+            unsearched: listing.unsearched,
+        });
+        for inst in listing.instances.into_iter().filter(|i| filter.matches(i)) {
             report.found.push(inst.clone());
             if dry_run {
                 continue;
@@ -85,7 +135,7 @@ pub async fn sweep(
                 Ok(()) => report.destroyed.push(inst),
                 Err(e) => {
                     tracing::warn!(
-                        provider = p.kind().as_str(),
+                        provider = p.name(),
                         instance = inst.id,
                         error = %e,
                         "sweep destroy failed"
@@ -104,7 +154,7 @@ pub async fn sweep(
         match p.destroy_orphan_firewalls().await {
             Ok(names) => report.firewalls_removed.extend(names),
             Err(e) => {
-                tracing::warn!(provider = p.kind().as_str(), error = %e, "firewall cleanup failed");
+                tracing::warn!(provider = p.name(), error = %e, "firewall cleanup failed");
             }
         }
     }
@@ -136,7 +186,7 @@ mod tests {
         assert_eq!(report.destroyed.len(), 3);
         assert!(report.is_clean());
         for p in &providers {
-            assert!(p.list_tagged(None).await.unwrap().is_empty());
+            assert!(p.list_tagged(None).await.unwrap().instances.is_empty());
         }
     }
 
@@ -148,7 +198,15 @@ mod tests {
         assert_eq!(report.found.len(), 1);
         assert!(report.destroyed.is_empty());
         assert!(report.firewalls_removed.is_empty());
-        assert_eq!(providers[0].list_tagged(None).await.unwrap().len(), 1);
+        assert_eq!(
+            providers[0]
+                .list_tagged(None)
+                .await
+                .unwrap()
+                .instances
+                .len(),
+            1
+        );
     }
 
     /// A stray instance leaves a stray firewall, and a sweep that took down
@@ -197,8 +255,8 @@ mod tests {
         assert_eq!(report.destroyed.len(), 1);
         assert_eq!(report.destroyed[0].session_id(), Some("leaked"));
         let left = providers[0].list_tagged(None).await.unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].session_id(), Some("live"));
+        assert_eq!(left.instances.len(), 1);
+        assert_eq!(left.instances[0].session_id(), Some("live"));
     }
 
     /// A provider whose listing fails was never searched, so a report that
@@ -215,11 +273,52 @@ mod tests {
         assert_eq!(report.destroyed.len(), 1, "the working provider is swept");
         assert_eq!(report.destroyed[0].session_id(), Some("s2"));
         assert_eq!(report.unswept.len(), 1);
-        assert_eq!(report.unswept[0].0, ProviderKind::Local);
+        assert_eq!(report.unswept[0].0, MockProvider::NAME);
         assert!(
             !report.is_clean(),
             "a sweep that missed a provider is not clean"
         );
+        // A provider that answered nothing has no search to its name, so
+        // nothing downstream can mistake it for one that came back empty.
+        assert_eq!(report.searches.len(), 1);
+    }
+
+    /// A provider that reached some of its regions is not a provider that
+    /// searched itself. AWS and GCP return the regions that answered, so a
+    /// throttled one otherwise reads as an account with nothing in it.
+    #[tokio::test]
+    async fn a_partly_searched_provider_says_which_regions_it_missed() {
+        let p = MockProvider::with_default_regions(ProviderKind::Aws);
+        let east = p.regions()[0].clone();
+        let west = p.regions()[1].clone();
+        p.seed_instance(&east, vec![session_tag("reachable")]);
+        p.seed_instance(&west, vec![session_tag("hidden")]);
+        p.unsearchable_region(&west.id);
+        let providers: Vec<Box<dyn Provider>> = vec![Box::new(p)];
+
+        let report = sweep(&providers, SweepFilter::All, false).await;
+        assert_eq!(report.destroyed.len(), 1, "only the reachable one is found");
+        assert_eq!(report.destroyed[0].session_id(), Some("reachable"));
+        let search = report.search_for(MockProvider::NAME).expect("searched");
+        assert_eq!(search.unsearched, vec![west.id]);
+        assert!(!search.is_complete());
+        assert!(
+            !report.is_clean(),
+            "a region nobody could list is a hole in the promise that nothing is billing"
+        );
+    }
+
+    /// The double answers to its own name. Reporting the kind its instances
+    /// borrow would let a sweep holding only the mock claim it searched AWS.
+    #[tokio::test]
+    async fn the_mock_is_searched_under_its_own_name() {
+        let p = seeded(ProviderKind::Aws, &["s1"]);
+        let providers: Vec<Box<dyn Provider>> = vec![Box::new(p)];
+        let report = sweep(&providers, SweepFilter::All, false).await;
+        assert_eq!(report.searches.len(), 1);
+        assert_eq!(report.searches[0].provider, MockProvider::NAME);
+        assert_eq!(report.searches[0].kind, ProviderKind::Aws);
+        assert!(report.search_for("aws").is_none());
     }
 
     #[tokio::test]

@@ -429,7 +429,8 @@ pub async fn end_session(
     let remaining = provider
         .list_tagged(Some(&state.session_id_hex))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .instances;
     if !remaining.is_empty() {
         return Err(format!(
             "{} instance(s) still listed after destroy; press Stop strays on \

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use crate::artifact::ServerArch;
 use crate::provider::{Provider, ProviderError, Result};
 use crate::types::{
-    ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Price,
+    ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Listing, Price,
     ProviderKind, Region, RegionId, session_id_from_tags,
 };
 
@@ -46,6 +46,9 @@ struct State {
     launch_failures: VecDeque<ProviderError>,
     destroy_failures: VecDeque<ProviderError>,
     list_failures: VecDeque<ProviderError>,
+    /// Regions whose listing never answers: see
+    /// [`MockProvider::unsearchable_region`].
+    unsearchable: Vec<RegionId>,
     calls: Vec<Call>,
 }
 
@@ -59,6 +62,11 @@ pub struct MockProvider {
 }
 
 impl MockProvider {
+    /// The name a session record spells for the mock. Not any real
+    /// provider's, so a record written against the double is never matched
+    /// against the cloud whose kind its instances borrow.
+    pub const NAME: &'static str = "mock";
+
     pub fn new(kind: ProviderKind) -> Self {
         MockProvider {
             kind,
@@ -156,6 +164,21 @@ impl MockProvider {
         }
     }
 
+    /// Makes one region unlistable for good, the way a throttled AWS region
+    /// is: its instances are absent from every later `list_tagged` and the
+    /// region comes back in [`Listing::unsearched`], so a caller can tell
+    /// "not there" from "nobody looked".
+    ///
+    /// Distinct from [`MockProvider::fail_next_lists`], which is the whole
+    /// provider going dark. This one still answers, with less than all of it.
+    pub fn unsearchable_region(&self, region: &RegionId) {
+        assert!(
+            self.regions.iter().any(|r| &r.id == region),
+            "{region} is not one of this mock's regions"
+        );
+        self.state.lock().unwrap().unsearchable.push(region.clone());
+    }
+
     /// Seeds an already-running instance, e.g. a leaked orphan for sweeper
     /// tests. Returns the instance as stored.
     pub fn seed_instance(&self, region: &Region, tags: Vec<(String, String)>) -> Instance {
@@ -208,6 +231,11 @@ impl MockProvider {
 impl Provider for MockProvider {
     fn kind(&self) -> ProviderKind {
         self.kind
+    }
+
+    /// Never the borrowed kind's name: the double answers for itself alone.
+    fn name(&self) -> &'static str {
+        Self::NAME
     }
 
     /// Mirrors the real provider of this kind, so artifact selection under
@@ -292,22 +320,31 @@ impl Provider for MockProvider {
         Ok(())
     }
 
-    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>> {
+    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Listing> {
         let mut s = self.state.lock().unwrap();
         s.calls
             .push(Call::ListTagged(session_tag.map(str::to_owned)));
         if let Some(err) = s.list_failures.pop_front() {
             return Err(err);
         }
-        Ok(s.instances
+        let mut unsearched = s.unsearchable.clone();
+        unsearched.sort();
+        unsearched.dedup();
+        let instances = s
+            .instances
             .iter()
+            .filter(|i| !unsearched.contains(&i.region.id))
             .filter(|i| match (session_id_from_tags(&i.tags), session_tag) {
                 (Some(sid), Some(want)) => sid == want,
                 (Some(_), None) => true,
                 (None, _) => false,
             })
             .cloned()
-            .collect())
+            .collect();
+        Ok(Listing {
+            instances,
+            unsearched,
+        })
     }
 
     fn session_port(&self) -> u16 {
@@ -374,10 +411,10 @@ mod tests {
         assert_eq!(inst.session_id(), Some("s1"));
 
         let listed = p.list_tagged(Some("s1")).await.unwrap();
-        assert_eq!(listed, vec![inst.clone()]);
+        assert_eq!(listed, Listing::complete(vec![inst.clone()]));
 
         p.destroy(&inst.region.id, &inst.id).await.unwrap();
-        assert!(p.list_tagged(None).await.unwrap().is_empty());
+        assert!(p.list_tagged(None).await.unwrap().instances.is_empty());
     }
 
     #[tokio::test]
@@ -401,7 +438,36 @@ mod tests {
         let p = MockProvider::with_default_regions(ProviderKind::Gcp);
         let region = p.regions[0].clone();
         p.seed_instance(&region, vec![("unrelated".into(), "tag".into())]);
-        assert!(p.list_tagged(None).await.unwrap().is_empty());
+        assert!(p.list_tagged(None).await.unwrap().instances.is_empty());
+    }
+
+    /// The double can be as partial as a real multi-region provider: an
+    /// instance in a region that never answers is absent from the listing,
+    /// and the listing says so instead of passing for a complete one.
+    #[tokio::test]
+    async fn an_unsearchable_region_hides_its_instances_and_says_so() {
+        let p = MockProvider::with_default_regions(ProviderKind::Aws);
+        let east = p.regions[0].clone();
+        let west = p.regions[1].clone();
+        let reachable = p.seed_instance(&east, vec![session_tag("s1")]);
+        let hidden = p.seed_instance(&west, vec![session_tag("s2")]);
+
+        let listed = p.list_tagged(None).await.unwrap();
+        assert_eq!(listed.instances, vec![reachable.clone(), hidden]);
+        assert!(listed.is_complete());
+
+        p.unsearchable_region(&west.id);
+        let listed = p.list_tagged(None).await.unwrap();
+        assert_eq!(listed.instances, vec![reachable]);
+        assert_eq!(listed.unsearched, vec![west.id.clone()]);
+        assert!(!listed.is_complete());
+        assert_eq!(listed.unsearched_display(), west.id.as_str());
+
+        // Narrowing to the hidden session finds nothing, and still admits
+        // that the region it would have been in was never read.
+        let listed = p.list_tagged(Some("s2")).await.unwrap();
+        assert!(listed.instances.is_empty());
+        assert!(!listed.is_complete());
     }
 
     #[tokio::test]

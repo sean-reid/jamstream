@@ -374,7 +374,10 @@ async fn list_by_tag_follows_pagination_links() {
         .await;
 
     let p = provider(&server);
-    let all = p.list_tagged(None).await.expect("list");
+    let listed = p.list_tagged(None).await.expect("list");
+    // One account-wide query, so a DigitalOcean listing is never partial.
+    assert!(listed.is_complete());
+    let all = listed.instances;
     assert_eq!(all.len(), 2, "both pages must be fetched");
     assert_eq!(all[0].id, "101");
     assert_eq!(all[0].session_id(), Some("aa"));
@@ -398,7 +401,7 @@ async fn list_for_one_session_queries_the_session_tag() {
         .await;
 
     let p = provider(&server);
-    let got = p.list_tagged(Some("sess1")).await.expect("list");
+    let got = p.list_tagged(Some("sess1")).await.expect("list").instances;
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].session_id(), Some("sess1"));
 }

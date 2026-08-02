@@ -187,10 +187,21 @@ mod tests {
 
     const DEVICE: u32 = 44_100;
     const SESSION: u32 = 48_000;
+    /// Device rates the ladder really meets, on both sides of unity. Above
+    /// the session rate the capture ratio drops below one and the playback
+    /// ratio rises above it, which inverts every buffering argument in this
+    /// module, and 96 kHz is what most pro interfaces ship set to. The
+    /// telephony pair is a playback endpoint: [`crate::cpal_backend`] refuses
+    /// a hands-free microphone, but nothing refuses a hands-free earpiece, so
+    /// that direction runs at ratio 6.
+    const DEVICE_RATES: [u32; 7] = [8_000, 16_000, 44_100, 88_200, 96_000, 176_400, 192_000];
     /// Callback sizes a mix of hosts really deliver: single frames, odd
     /// remainders, one 44.1 period (441), one 48 k period (480), and cpal's
     /// slicing bound.
     const SIZES: [usize; 7] = [1, 7, 110, 111, 441, 480, 4096];
+    /// Where a step of a converted ramp stops being the filter and starts
+    /// being a dropped sample, in input samples.
+    const SEAM: f64 = 0.5;
 
     /// Counts heap operations on this thread so the RT-path test can assert
     /// the wrappers are allocation-free after construction. Counting is
@@ -227,20 +238,20 @@ mod tests {
 
     /// A mono capture wrapper whose inner half collects everything it is
     /// handed, the way the bridge push would.
-    fn capture_rig() -> (CaptureFn, Arc<Mutex<Vec<f32>>>, f32) {
+    fn capture_rig(device: u32) -> (CaptureFn, Arc<Mutex<Vec<f32>>>, f32) {
         let sink = Arc::new(Mutex::new(Vec::new()));
         let inner_sink = Arc::clone(&sink);
         let inner: CaptureFn = Box::new(move |samples: &[f32]| {
             inner_sink.lock().unwrap().extend_from_slice(samples);
         });
-        let (capture, added) = converting_capture(inner, SESSION, DEVICE, 1);
+        let (capture, added) = converting_capture(inner, SESSION, device, 1);
         (capture, sink, added)
     }
 
     /// Feeds `input` through a capture wrapper in callbacks cycling over
     /// `sizes` and returns everything the inner half saw.
-    fn convert_capture(input: &[f32], sizes: &[usize]) -> Vec<f32> {
-        let (mut capture, sink, _) = capture_rig();
+    fn convert_capture(device: u32, input: &[f32], sizes: &[usize]) -> Vec<f32> {
+        let (mut capture, sink, _) = capture_rig(device);
         let mut pos = 0;
         for size in sizes.iter().cycle() {
             let end = (pos + size).min(input.len());
@@ -257,8 +268,8 @@ mod tests {
             .unwrap()
     }
 
-    fn sine_44_1(idx: usize) -> f32 {
-        (440.0 * std::f64::consts::TAU * idx as f64 / f64::from(DEVICE)).sin() as f32 * 0.5
+    fn sine(hz: f64, rate: u32, idx: usize) -> f32 {
+        (hz * std::f64::consts::TAU * idx as f64 / f64::from(rate)).sin() as f32 * 0.5
     }
 
     fn rms(samples: &[f32]) -> f64 {
@@ -278,27 +289,100 @@ mod tests {
             .count()
     }
 
-    /// Count conservation at the 147/160 boundary: over ten seconds the
-    /// output count tracks input * 160/147 to within the buffering slack,
-    /// which is what "no dropped or padded runs at steady state" means in
-    /// numbers. Any systematic ratio error diverges linearly and lands far
-    /// outside the window.
-    #[test]
-    fn the_output_count_holds_the_147_160_ratio() {
-        let input = vec![0.25f32; 10 * DEVICE as usize];
-        let produced = convert_capture(&input, &[441]).len();
-        let expected = (input.len() as f64 * 160.0 / 147.0) as usize;
+    /// Samples of a converted ramp past the filter warmup, where the sinc
+    /// still sees zero history.
+    const SKIP: usize = 480;
+
+    /// The probe the buffering tests run on: sample values are their own
+    /// index, so any seam is a step in a straight line.
+    fn ramp() -> Vec<f32> {
+        (0..30_000).map(|i| i as f32).collect()
+    }
+
+    /// The widest a converted ramp departs from the straight line of gradient
+    /// `slope` through its first steady sample, and where.
+    ///
+    /// The ramp carries input-sample indices, so a dropped or doubled sample
+    /// moves every later value by exactly 1.0 whatever the ratio, which makes
+    /// this one number the seam detector at every rate.
+    fn worst_deviation(out: &[f32], slope: f64) -> (usize, f64) {
+        let delay = SKIP as f64 * slope - f64::from(out[SKIP]);
+        out.iter()
+            .enumerate()
+            .skip(SKIP)
+            .map(|(k, &s)| (k, (f64::from(s) - (k as f64 * slope - delay)).abs()))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("a converted run reaches past the warmup")
+    }
+
+    /// Holds a converted ramp to one unbroken line of gradient `slope` and
+    /// returns the group delay it measured, in samples of the line's own
+    /// clock.
+    ///
+    /// The bound is half the sample a seam would move the line by;
+    /// `one_dropped_sample_is_what_a_seam_looks_like` measures both sides of
+    /// it at every rate. What sets the floor is arithmetic, not the ratio: 64
+    /// f32 taps summed over values this size drift by a fraction of a sample
+    /// over a long run, so the ramp is kept short enough that the drift stays
+    /// well inside the bound at the steepest ratio in the table.
+    fn assert_line(device: u32, out: &[f32], slope: f64) -> f64 {
+        let (at, worst) = worst_deviation(out, slope);
         assert!(
-            produced <= expected && expected - produced <= 3 * CHUNK,
-            "fed {} expected ~{expected} produced {produced}",
-            input.len()
+            worst < SEAM,
+            "{device} Hz: sample {at} is off the line by {worst:.3}: \
+             the ramp has a seam"
         );
+        SKIP as f64 * slope - f64::from(out[SKIP])
+    }
+
+    /// The seam detector's own teeth, at every ratio: one input sample
+    /// dropped from the ramp has to land on the far side of [`SEAM`] from a
+    /// clean run. A tolerance loose enough to pass a real seam would be worse
+    /// than no test at all, and nothing else in the module would say so.
+    #[test]
+    fn one_dropped_sample_is_what_a_seam_looks_like() {
+        let whole = ramp();
+        let mut seamed = whole.clone();
+        seamed.remove(whole.len() / 2);
+        for device in DEVICE_RATES {
+            let slope = f64::from(device) / f64::from(SESSION);
+            let (_, clean) = worst_deviation(&convert_capture(device, &whole, &SIZES), slope);
+            let (_, seam) = worst_deviation(&convert_capture(device, &seamed, &SIZES), slope);
+            assert!(clean < SEAM, "{device} Hz: a clean run measures {clean:.3}");
+            assert!(
+                seam > SEAM,
+                "{device} Hz: a dropped sample measures {seam:.3}, against \
+                 {clean:.3} clean: the detector cannot tell a seam from the filter"
+            );
+        }
+    }
+
+    /// Count conservation at every ratio the ladder meets: over five seconds
+    /// the output count tracks input * session / device to within the
+    /// buffering slack, which is what "no dropped or padded runs at steady
+    /// state" means in numbers. Any systematic ratio error diverges linearly
+    /// and lands far outside the window.
+    #[test]
+    fn the_output_count_holds_the_ratio_at_every_device_rate() {
+        for device in DEVICE_RATES {
+            let input = vec![0.25f32; 5 * device as usize];
+            let produced = convert_capture(device, &input, &[device as usize / 100]).len();
+            let expected =
+                (input.len() as f64 * f64::from(SESSION) / f64::from(device)).round() as usize;
+            assert!(
+                produced <= expected && expected - produced <= 3 * CHUNK,
+                "{device} Hz: fed {} expected ~{expected} produced {produced}",
+                input.len()
+            );
+        }
     }
 
     /// The boundary-buffering defect class: a ramp in must be one unbroken
     /// line out, whatever callback sizes deliver it. A single dropped or
-    /// doubled sample anywhere shifts every later sample by ~0.92 against
-    /// the closed-form line and breaks the tolerance.
+    /// doubled sample anywhere moves every later sample a whole sample off
+    /// the line, which `assert_line` catches. Run at every device rate,
+    /// because the backlog and staging arguments this depends on invert when
+    /// the ratio crosses one.
     ///
     /// The measured line offset is the converter's real group delay, so this
     /// is also the honesty check on the advertised latency: the figure the
@@ -306,36 +390,31 @@ mod tests {
     /// within a fraction of a millisecond.
     #[test]
     fn odd_callback_sizes_preserve_the_ramp() {
-        let input: Vec<f32> = (0..130_000).map(|i| i as f32).collect();
-        let (mut capture, sink, added) = capture_rig();
-        let mut pos = 0;
-        for size in SIZES.iter().cycle() {
-            let end = (pos + size).min(input.len());
-            capture(&input[pos..end]);
-            pos = end;
-            if pos == input.len() {
-                break;
+        let input = ramp();
+        for device in DEVICE_RATES {
+            let (mut capture, sink, added) = capture_rig(device);
+            let mut pos = 0;
+            for size in SIZES.iter().cycle() {
+                let end = (pos + size).min(input.len());
+                capture(&input[pos..end]);
+                pos = end;
+                if pos == input.len() {
+                    break;
+                }
             }
-        }
-        let out = sink.lock().unwrap();
-        let slope = f64::from(DEVICE) / f64::from(SESSION);
-        // Skip the filter warmup, where the sinc still sees zero history.
-        let skip = 480;
-        let delay = skip as f64 * slope - f64::from(out[skip]);
-        for (k, &s) in out.iter().enumerate().skip(skip) {
-            let expected = k as f64 * slope - delay;
+            let out = sink.lock().unwrap();
+            let slope = f64::from(device) / f64::from(SESSION);
+            let delay = assert_line(device, &out, slope);
+            // The measured group delay against the reported added latency:
+            // one staged chunk on top of the delay the line actually shows.
+            let measured_ms =
+                (delay / f64::from(device) + CHUNK as f64 / f64::from(SESSION)) * 1000.0;
             assert!(
-                (f64::from(s) - expected).abs() < 0.5,
-                "sample {k} is {s}, expected {expected:.2}: the ramp has a seam"
+                (measured_ms - f64::from(added)).abs() < 0.1,
+                "{device} Hz: constructor reports {added} ms, \
+                 the audio measured {measured_ms:.3} ms"
             );
         }
-        // The measured group delay against the reported added latency: one
-        // staged chunk on top of the delay the line actually shows.
-        let measured_ms = (delay / f64::from(DEVICE) + CHUNK as f64 / f64::from(SESSION)) * 1000.0;
-        assert!(
-            (measured_ms - f64::from(added)).abs() < 0.1,
-            "constructor reports {added} ms, the audio measured {measured_ms:.3} ms"
-        );
     }
 
     /// The playback direction, same defect class: session-rate pulls of a
@@ -343,57 +422,58 @@ mod tests {
     /// sizes the device makes.
     #[test]
     fn odd_playback_requests_preserve_the_ramp() {
-        let next = Arc::new(AtomicUsize::new(0));
-        let inner_next = Arc::clone(&next);
-        let inner: PlaybackFn = Box::new(move |out: &mut [f32]| {
-            for s in out.iter_mut() {
-                *s = inner_next.fetch_add(1, Ordering::Relaxed) as f32;
+        for device in DEVICE_RATES {
+            let next = Arc::new(AtomicUsize::new(0));
+            let inner_next = Arc::clone(&next);
+            let inner: PlaybackFn = Box::new(move |out: &mut [f32]| {
+                for s in out.iter_mut() {
+                    *s = inner_next.fetch_add(1, Ordering::Relaxed) as f32;
+                }
+            });
+            let (mut playback, added) = converting_playback(inner, SESSION, device, 1);
+            let mut out = Vec::new();
+            let mut buf = [0.0f32; 4096];
+            for &size in SIZES.iter().cycle().take(70) {
+                playback(&mut buf[..size]);
+                out.extend_from_slice(&buf[..size]);
             }
-        });
-        let (mut playback, added) = converting_playback(inner, SESSION, DEVICE, 1);
-        let mut out = Vec::new();
-        let mut buf = [0.0f32; 4096];
-        for &size in SIZES.iter().cycle().take(70) {
-            playback(&mut buf[..size]);
-            out.extend_from_slice(&buf[..size]);
-        }
-        let slope = f64::from(SESSION) / f64::from(DEVICE);
-        let skip = 480;
-        let delay = skip as f64 * slope - f64::from(out[skip]);
-        for (k, &s) in out.iter().enumerate().skip(skip) {
-            let expected = k as f64 * slope - delay;
+            let slope = f64::from(SESSION) / f64::from(device);
+            let delay = assert_line(device, &out, slope);
+            let measured_ms =
+                (delay / f64::from(SESSION) + CHUNK as f64 / f64::from(SESSION)) * 1000.0;
             assert!(
-                (f64::from(s) - expected).abs() < 0.5,
-                "sample {k} is {s}, expected {expected:.2}: the ramp has a seam"
+                (measured_ms - f64::from(added)).abs() < 0.1,
+                "{device} Hz: constructor reports {added} ms, \
+                 the audio measured {measured_ms:.3} ms"
             );
         }
-        let measured_ms = (delay / f64::from(SESSION) + CHUNK as f64 / f64::from(SESSION)) * 1000.0;
-        assert!(
-            (measured_ms - f64::from(added)).abs() < 0.1,
-            "constructor reports {added} ms, the audio measured {measured_ms:.3} ms"
-        );
     }
 
-    /// The defect the ladder exists to prevent: a 440 Hz sine captured from
-    /// a 44.1 kHz device must still be 440 Hz on the 48 kHz side, at the
-    /// same level. An unconverted path would read 479 Hz here.
+    /// The defect the ladder exists to prevent: a 440 Hz sine captured from a
+    /// device on its own clock must still be 440 Hz on the 48 kHz side, at
+    /// the same level. An unconverted 44.1 path would read 479 Hz here, and
+    /// an unconverted 96 kHz one 220.
     #[test]
     fn a_440_hz_sine_survives_conversion_at_pitch_and_level() {
-        let input: Vec<f32> = (0..5 * DEVICE as usize).map(sine_44_1).collect();
-        let out = convert_capture(&input, &[441]);
-        let steady = &out[480..];
-        let secs = steady.len() as f64 / f64::from(SESSION);
-        let hz = cycles(steady) as f64 / secs;
-        assert!(
-            (hz - 440.0).abs() < 1.5,
-            "pitch moved: {hz:.2} Hz out of 440 in"
-        );
-        let level = rms(steady);
-        let expected = 0.5 / std::f64::consts::SQRT_2;
-        assert!(
-            (level - expected).abs() / expected < 0.03,
-            "level moved: rms {level:.4}, fed {expected:.4}"
-        );
+        for device in DEVICE_RATES {
+            let input: Vec<f32> = (0..3 * device as usize)
+                .map(|i| sine(440.0, device, i))
+                .collect();
+            let out = convert_capture(device, &input, &[device as usize / 100]);
+            let steady = &out[480..];
+            let secs = steady.len() as f64 / f64::from(SESSION);
+            let hz = cycles(steady) as f64 / secs;
+            assert!(
+                (hz - 440.0).abs() < 1.5,
+                "{device} Hz: pitch moved to {hz:.2} Hz out of 440 in"
+            );
+            let level = rms(steady);
+            let expected = 0.5 / std::f64::consts::SQRT_2;
+            assert!(
+                (level - expected).abs() / expected < 0.03,
+                "{device} Hz: level moved, rms {level:.4}, fed {expected:.4}"
+            );
+        }
     }
 
     /// The composition contract with the session's drift compensators: a
@@ -402,29 +482,39 @@ mod tests {
     /// never absorb it; the compensators are the one steered stage.
     #[test]
     fn a_200_ppm_fast_device_is_still_200_ppm_fast_at_48_k() {
-        let secs = 120usize;
-        let fed = (secs as f64 * f64::from(DEVICE) * (1.0 + 200e-6)) as usize;
-        let input = vec![0.25f32; fed];
-        let produced = convert_capture(&input, &[4410]).len();
-        let expected = (fed as f64 * 160.0 / 147.0) as usize;
-        assert!(
-            produced <= expected && expected - produced <= 3 * CHUNK,
-            "fed {fed} expected ~{expected} produced {produced}"
-        );
-        // The nominal-rate count would be 200 ppm lower; the excess must
-        // still be there for the compensators to measure.
-        let nominal = secs * SESSION as usize;
-        assert!(
-            produced > nominal + 800,
-            "the 200 ppm excess was absorbed: produced {produced} vs nominal {nominal}"
-        );
+        // Both sides of unity: a crystal error is a fraction, so a converter
+        // that absorbed it would do so whichever way the ratio points.
+        for device in [DEVICE, 96_000] {
+            let secs = 60usize;
+            let fed = (secs as f64 * f64::from(device) * (1.0 + 200e-6)) as usize;
+            let input = vec![0.25f32; fed];
+            let produced = convert_capture(device, &input, &[device as usize / 10]).len();
+            let expected = (fed as f64 * f64::from(SESSION) / f64::from(device)) as usize;
+            assert!(
+                produced <= expected && expected - produced <= 3 * CHUNK,
+                "{device} Hz: fed {fed} expected ~{expected} produced {produced}"
+            );
+            // The nominal-rate count would be 200 ppm lower; the excess must
+            // still be there for the compensators to measure.
+            let nominal = secs * SESSION as usize;
+            assert!(
+                produced > nominal + 400,
+                "{device} Hz: the 200 ppm excess was absorbed, \
+                 produced {produced} against nominal {nominal}"
+            );
+        }
     }
 
     /// Pins the figures the module doc states, from the constructor's own
-    /// report; the empirical cross-check lives in the ramp tests.
+    /// report; the empirical cross-check lives in the ramp tests. The bound
+    /// across the rest of the table is the product claim: no device the
+    /// ladder carries costs more than a few milliseconds here. The widest
+    /// figure is capture from 8 kHz, where the filter's delay is six output
+    /// frames per input frame, and that is a direction the ladder refuses
+    /// before this code sees it (#330).
     #[test]
     fn the_reported_added_latency_matches_the_documented_figures() {
-        let (_, _, capture_added) = capture_rig();
+        let (_, _, capture_added) = capture_rig(DEVICE);
         let inner: PlaybackFn = Box::new(|_out: &mut [f32]| {});
         let (_, playback_added) = converting_playback(inner, SESSION, DEVICE, 1);
         assert!(
@@ -435,6 +525,18 @@ mod tests {
             (playback_added - 3.158).abs() < 0.01,
             "playback adds {playback_added} ms"
         );
+
+        for device in DEVICE_RATES {
+            let (_, _, capture_added) = capture_rig(device);
+            let inner: PlaybackFn = Box::new(|_out: &mut [f32]| {});
+            let (_, playback_added) = converting_playback(inner, SESSION, device, 1);
+            for (side, added) in [("capture", capture_added), ("playback", playback_added)] {
+                assert!(
+                    (2.6..7.0).contains(&added),
+                    "{device} Hz {side} adds {added} ms"
+                );
+            }
+        }
     }
 
     /// The scaling behind [`crate::StreamHandle::buffer_frames`]'s one-unit
@@ -452,39 +554,50 @@ mod tests {
             240,
             "unity is untouched"
         );
+        // A faster device delivers more device frames per callback than the
+        // handler sees, so the scale runs the other way: the ring must not be
+        // sized from the raw figure in either direction.
+        assert_eq!(session_frames(1_024, SESSION, 192_000), 256);
+        assert_eq!(session_frames(960, SESSION, 96_000), 480);
+        assert_eq!(session_frames(128, SESSION, 8_000), 768);
     }
 
     /// Both wrappers run inside device callbacks, so after construction they
     /// must never touch the heap, across every callback size up to and past
-    /// the slicing bound.
+    /// the slicing bound and at every device rate. The backlog and staging
+    /// capacities that make this true are reasoned from the ratio, and the
+    /// reasoning inverts when the ratio crosses one, so a rate table is the
+    /// only way this property is actually asserted.
     #[test]
     fn the_wrappers_do_not_allocate_after_construction() {
-        let seen = Arc::new(AtomicUsize::new(0));
-        let inner_seen = Arc::clone(&seen);
-        let capture_inner: CaptureFn = Box::new(move |samples: &[f32]| {
-            inner_seen.fetch_add(samples.len(), Ordering::Relaxed);
-        });
-        let (mut capture, _) = converting_capture(capture_inner, SESSION, DEVICE, 2);
-        let playback_inner: PlaybackFn = Box::new(|out: &mut [f32]| out.fill(0.25));
-        let (mut playback, _) = converting_playback(playback_inner, SESSION, DEVICE, 2);
-
         let pcm = [0.1f32; 2 * 5000];
         let mut out = [0.0f32; 2 * 5000];
-        // Warmup exercises every internal path once, including a callback
-        // past MAX_CHUNK_FRAMES that takes the slicing branch.
-        capture(&pcm);
-        playback(&mut out);
+        for device in DEVICE_RATES {
+            let seen = Arc::new(AtomicUsize::new(0));
+            let inner_seen = Arc::clone(&seen);
+            let capture_inner: CaptureFn = Box::new(move |samples: &[f32]| {
+                inner_seen.fetch_add(samples.len(), Ordering::Relaxed);
+            });
+            let (mut capture, _) = converting_capture(capture_inner, SESSION, device, 2);
+            let playback_inner: PlaybackFn = Box::new(|out: &mut [f32]| out.fill(0.25));
+            let (mut playback, _) = converting_playback(playback_inner, SESSION, device, 2);
 
-        let before = heap_ops();
-        for (i, &size) in SIZES.iter().cycle().take(500).enumerate() {
-            capture(&pcm[..2 * size.min(4999) + 2 * (i % 2)]);
-            playback(&mut out[..2 * size.min(4999)]);
+            // Warmup exercises every internal path once, including a callback
+            // past MAX_CHUNK_FRAMES that takes the slicing branch.
+            capture(&pcm);
+            playback(&mut out);
+
+            let before = heap_ops();
+            for (i, &size) in SIZES.iter().cycle().take(500).enumerate() {
+                capture(&pcm[..2 * size.min(4999) + 2 * (i % 2)]);
+                playback(&mut out[..2 * size.min(4999)]);
+            }
+            assert_eq!(
+                heap_ops() - before,
+                0,
+                "a wrapper allocated after construction at {device} Hz"
+            );
+            assert!(seen.load(Ordering::Relaxed) > 0, "{device} Hz");
         }
-        assert_eq!(
-            heap_ops() - before,
-            0,
-            "a wrapper allocated after construction"
-        );
-        assert!(seen.load(Ordering::Relaxed) > 0);
     }
 }

@@ -6,7 +6,8 @@ use async_trait::async_trait;
 
 use crate::artifact::ServerArch;
 use crate::types::{
-    DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Price, ProviderKind, Region, RegionId,
+    DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Listing, Price, ProviderKind, Region,
+    RegionId,
 };
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -88,6 +89,18 @@ impl Default for WaitOpts {
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
+    /// The name a session record spells for this provider, which is
+    /// [`ProviderKind::as_str`] for every real one.
+    ///
+    /// The mock overrides it. Its instances borrow a real kind so tests
+    /// exercise the code paths a real launch takes, and without a name of
+    /// its own it answers for that cloud: a sweep holding only the mock
+    /// would report AWS searched and close the records of live AWS
+    /// sessions.
+    fn name(&self) -> &'static str {
+        self.kind().as_str()
+    }
+
     /// CPU architecture of the machines this provider launches, which
     /// decides the `jamstreamd` build the launch path hands the VM.
     fn server_arch(&self) -> ServerArch;
@@ -103,7 +116,12 @@ pub trait Provider: Send + Sync {
 
     /// Lists jamstream-tagged instances only. `session_tag` narrows to one
     /// session; `None` returns every jamstream-tagged instance.
-    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Vec<Instance>>;
+    ///
+    /// An implementation that could not reach part of the provider names
+    /// those regions in [`Listing::unsearched`] rather than returning the
+    /// instances it did find as if they were all of them. An error is for
+    /// a listing that learned nothing at all.
+    async fn list_tagged(&self, session_tag: Option<&str>) -> Result<Listing>;
 
     /// Cheapest authenticated read exercising a permission that only a
     /// launch otherwise touches. The wizard's credential check calls this,

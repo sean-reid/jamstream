@@ -466,7 +466,14 @@ async fn wizard_hosts_a_real_local_session() {
 
     // Nothing tagged remains for a fresh provider on the same state dir.
     let fresh = jamstream_cli::providers::resolve("local").expect("local provider");
-    assert!(fresh.list_tagged(None).await.expect("list").is_empty());
+    assert!(
+        fresh
+            .list_tagged(None)
+            .await
+            .expect("list")
+            .instances
+            .is_empty()
+    );
 
     std::fs::remove_dir_all(&state_dir).ok();
     unsafe {

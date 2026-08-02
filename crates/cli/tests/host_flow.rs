@@ -163,12 +163,27 @@ async fn host_end_and_sweep_flow() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("would destroy"), "sweep output: {text}");
     assert!(text.contains("1 found, 0 destroyed, 0 failed"));
-    assert_eq!(providers[0].list_tagged(None).await.unwrap().len(), 1);
+    assert_eq!(
+        providers[0]
+            .list_tagged(None)
+            .await
+            .unwrap()
+            .instances
+            .len(),
+        1
+    );
 
     // A wet sweep then removes it.
     let mut out = Vec::new();
     sweep::run(&providers, false, &mut out).await.unwrap();
-    assert!(providers[0].list_tagged(None).await.unwrap().is_empty());
+    assert!(
+        providers[0]
+            .list_tagged(None)
+            .await
+            .unwrap()
+            .instances
+            .is_empty()
+    );
 
     std::fs::remove_dir_all(&state_dir).unwrap();
 }
