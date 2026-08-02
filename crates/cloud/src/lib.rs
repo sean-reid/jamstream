@@ -29,6 +29,7 @@ pub mod cloudinit;
 #[cfg(any(test, feature = "testing"))]
 pub mod contract;
 pub mod cost;
+pub mod date;
 pub mod http;
 /// The scriptable provider double. Test-only: see the `testing` feature.
 #[cfg(any(test, feature = "testing"))]
@@ -55,6 +56,7 @@ pub use cloudinit::{
 #[cfg(any(test, feature = "testing"))]
 pub use contract::assert_provider_contract;
 pub use cost::{CostPreview, LineItem};
+pub use date::civil_from_days;
 #[cfg(any(test, feature = "testing"))]
 pub use mock::MockProvider;
 pub use probe::{ProbeTarget, probe_all, probe_catalog};
