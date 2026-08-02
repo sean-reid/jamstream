@@ -15,8 +15,9 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 /// Where the app writes its log: `logs/app.log` under the same per-user
 /// jamstream data directory the CLI keeps session state in, so one folder
@@ -31,28 +32,31 @@ pub fn log_path() -> Option<PathBuf> {
 /// Installs the subscriber and the panic hook. Returns the log file's path
 /// when one is in use.
 ///
-/// Warnings show by default and `RUST_LOG` still overrides, matching the
-/// CLI. Called once, first thing in main: everything after it can fail
-/// visibly.
+/// Warnings show by default and `RUST_LOG` still overrides, through the
+/// same filter the CLI uses. Called once, first thing in main: everything
+/// after it can fail visibly.
 pub fn init() -> Option<PathBuf> {
-    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = jamstream_cli::logging::from_env();
     match open_log_file() {
         Some((path, file)) => {
             let file = Arc::new(file);
             // ANSI off because one format layer feeds both writers, and a
             // log file full of color codes is unreadable where it matters.
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter())
-                .with_ansi(false)
-                .with_writer(std::io::stderr.and(Arc::clone(&file)))
+            let _ = tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::io::stderr.and(Arc::clone(&file))),
+                )
+                .with(filter)
                 .try_init();
             install_panic_hook(file);
             Some(path)
         }
         None => {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter())
-                .with_writer(std::io::stderr)
+            let _ = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .with(filter)
                 .try_init();
             None
         }
@@ -99,6 +103,21 @@ fn install_panic_hook(file: Arc<File>) {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The app takes the CLI's filter wholesale: warnings by default so
+    /// degradations show, and a `RUST_LOG` target directive still wins.
+    /// Pinned from this binary's side so the shared module cannot drift
+    /// out from under it (#298 moved it from EnvFilter to Targets).
+    #[test]
+    fn the_filter_defaults_to_warn_and_honors_rust_log() {
+        use tracing::Level;
+        let unset = jamstream_cli::logging::filter(None);
+        assert!(unset.would_enable("jamstream_client", &Level::WARN));
+        assert!(!unset.would_enable("jamstream_client", &Level::INFO));
+
+        let set = jamstream_cli::logging::filter(Some("jamstream_client=trace"));
+        assert!(set.would_enable("jamstream_client", &Level::TRACE));
+    }
 
     /// The log sits under the same jamstream data directory as the CLI's
     /// session state. None is only for a machine with no platform data

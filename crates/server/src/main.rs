@@ -9,6 +9,9 @@ use jamstream_cloud::cloudinit::{
 use jamstream_server::config::Config;
 use jamstream_server::revocations::Revocations;
 use jamstream_server::runtime::{Options, RecordingOptions, Server};
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -37,10 +40,9 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
     install_panic_hook();
 
@@ -143,6 +145,16 @@ fn main() -> ExitCode {
             }
         }
     })
+}
+
+/// `RUST_LOG` target and level directives, or info when the variable is
+/// unset or does not parse. `Targets` rather than `EnvFilter`: same syntax
+/// for everything an operator writes here, without the regex engine that
+/// only EnvFilter's unused span-field grammar needs (#298).
+fn log_filter(rust_log: Option<&str>) -> Targets {
+    rust_log
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| Targets::new().with_default(LevelFilter::INFO))
 }
 
 /// Routes panics through tracing so they land in the journal with the same
@@ -303,8 +315,30 @@ fn recording_options() -> Result<Option<RecordingOptions>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bind, version_requested};
+    use super::{log_filter, parse_bind, version_requested};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use tracing::Level;
+
+    /// #298 moved the filter from `EnvFilter` to `Targets` to drop the
+    /// regex engine. `RUST_LOG` target directives and the unset info
+    /// default are the contract that must survive the swap.
+    #[test]
+    fn log_filter_honors_rust_log_and_defaults_to_info() {
+        let unset = log_filter(None);
+        assert!(unset.would_enable("jamstream_session", &Level::INFO));
+        assert!(!unset.would_enable("jamstream_session", &Level::DEBUG));
+
+        let directives = log_filter(Some("jamstream_session=debug,hyper=error"));
+        assert!(directives.would_enable("jamstream_session", &Level::DEBUG));
+        assert!(!directives.would_enable("hyper", &Level::WARN));
+
+        // A value Targets cannot parse falls back to the default instead
+        // of taking the process down before the subscriber exists, which
+        // is what EnvFilter::try_from_default_env's error arm did.
+        let garbage = log_filter(Some("jamstream_session=notalevel"));
+        assert!(garbage.would_enable("jamstream_session", &Level::INFO));
+        assert!(!garbage.would_enable("jamstream_session", &Level::DEBUG));
+    }
 
     /// #139: the bootstrap execs `jamstreamd --version` before enabling the
     /// unit, so the flag must be recognized wherever it lands in argv and

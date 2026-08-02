@@ -7,6 +7,7 @@ pub mod cli;
 pub mod end;
 pub mod host;
 pub mod join;
+pub mod logging;
 pub mod providers;
 pub mod recordings;
 pub mod state;
