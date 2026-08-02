@@ -132,9 +132,8 @@ impl S3Store {
     ///
     /// This is what lets the session server record to GCS without RSA. The
     /// only thing that needed asymmetric crypto was signing a service
-    /// account JWT, and that pulled aws-lc-sys into jamstreamd, whose C does
-    /// not link against musl for aarch64; an HMAC key needs nothing the
-    /// SigV4 path does not already have.
+    /// account JWT, which would put the whole GCP provider into jamstreamd;
+    /// an HMAC key needs nothing the SigV4 path does not already have.
     ///
     /// The signing region is `auto`, which is what Cloud Storage expects
     /// from interop clients: the bucket's real location is not part of the

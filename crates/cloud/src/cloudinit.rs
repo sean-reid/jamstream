@@ -163,9 +163,9 @@ pub enum StorageCredential {
     /// the same config decides which endpoint it signs against.
     ///
     /// One shape for all three is deliberate. GCS could also take a service
-    /// account key, but its RSA signing pulled aws-lc-sys into jamstreamd,
-    /// whose C does not link against musl for aarch64, and an HMAC key needs
-    /// nothing the SigV4 path does not already have.
+    /// account key, but that would put the GCP provider and its RSA signing
+    /// into jamstreamd, and an HMAC key needs nothing the SigV4 path does
+    /// not already have.
     KeyPair {
         access_key_id: String,
         secret_access_key: String,

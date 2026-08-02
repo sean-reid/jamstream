@@ -16,15 +16,16 @@ tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 data-encoding.workspace = true
-aws-lc-rs = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 flate2.workspace = true
 
 [features]
 # GCP launching, which is the only asymmetric crypto in the crate. Default
-# on for the CLI and the app; jamstreamd builds without it so aws-lc-sys
-# stays out of the musl binaries, where its C does not link for aarch64.
+# on for the CLI and the app; jamstreamd builds without it because a session
+# VM never launches another VM, so the provider and its token source are
+# dead weight in a binary that is downloaded at every boot.
 default = ["gcp"]
-gcp = ["dep:aws-lc-rs"]
+gcp = ["dep:ring"]
 # The mock provider, the in-memory store, and the two contract suites. Off
 # here and on in the dev-dependency below, so `cargo build` leaves all four
 # modules out and every test target still has them. jamstreamd is the reason:

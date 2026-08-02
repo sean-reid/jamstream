@@ -18,7 +18,7 @@
 //! # Authentication
 //!
 //! GCP service-account keys require an RS256-signed JWT to mint an OAuth2
-//! access token. This crate signs that JWT natively with aws-lc-rs (see
+//! access token. This crate signs that JWT natively with ring (see
 //! [`ServiceAccountTokenSource`]); no gcloud subprocess is needed. Three
 //! modes are supported:
 //!
