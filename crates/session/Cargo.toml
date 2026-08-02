@@ -14,11 +14,19 @@ blake2.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# `testing` only, and optional so the sans-io crate stays sans-runtime for
+# everything that ships: the shared socket pump is the one item here that
+# awaits.
+tokio = { workspace = true, optional = true }
 
 [features]
 # Re-exports the avatar reassembly internals so the fuzz workspace can drive
 # them without a handshake. No shipped build enables it.
 fuzzing = []
+# The socket pump the server and cli integration suites drive a real
+# `ClientCore` with. Consumers ask for it in their dev-dependencies
+# (jamstream-server, jamstream-cli); no shipped build enables it.
+testing = ["dep:tokio"]
 
 [dev-dependencies]
 # A version reject can only be drawn by a readable init this build refuses.

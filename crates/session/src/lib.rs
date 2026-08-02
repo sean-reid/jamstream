@@ -9,6 +9,12 @@ pub mod client;
 pub mod limits;
 pub mod server;
 
+/// The socket pump the integration suites share. Behind a feature because it
+/// is the only thing here that wants an async runtime; no shipped build takes
+/// it.
+#[cfg(feature = "testing")]
+pub mod testing;
+
 /// Reassembly internals for the fuzz workspace only; production traffic
 /// reaches them through the cores' control-message handling.
 #[cfg(feature = "fuzzing")]

@@ -14,6 +14,7 @@ use jamstream_protocol::ids::HOST_MEMBER_ID;
 use jamstream_protocol::invite::Invite;
 use jamstream_server::runtime::{Options, RecordingOptions, Server};
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
+use jamstream_session::testing::pump;
 use tokio::net::UdpSocket;
 
 struct Client {
@@ -38,21 +39,8 @@ impl Client {
     /// One pump pass, keeping the events: this test is about what the
     /// members were told.
     async fn pump(&mut self, now_ms: u64) {
-        for pkt in self.core.poll(now_ms) {
-            self.socket.send(&pkt).await.unwrap();
-        }
-        let mut buf = [0u8; 2048];
-        for _ in 0..64 {
-            let Ok(Ok(len)) =
-                tokio::time::timeout(Duration::from_millis(2), self.socket.recv(&mut buf)).await
-            else {
-                break;
-            };
-            for pkt in self.core.handle_datagram(now_ms, &buf[..len]) {
-                self.socket.send(&pkt).await.unwrap();
-            }
-        }
-        self.events.extend(self.core.events());
+        self.events
+            .extend(pump(&self.socket, &mut self.core, now_ms).await);
     }
 
     fn last_record_state(&self) -> Option<&RecordingState> {
