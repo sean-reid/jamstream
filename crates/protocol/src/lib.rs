@@ -13,9 +13,14 @@ pub mod wire;
 
 pub use error::Error;
 
-/// Protocol version spoken by this build. A server accepts its own version
-/// and, once versions beyond 1 exist, the one before it.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Protocol version spoken by this build. A server accepts exactly this
+/// version; any other draws the authenticated version reject, which is how a
+/// client on the wrong build learns what to update.
+///
+/// Version 2 encrypted the cookie challenge and bound it to the init it
+/// answers; a version 1 challenge is a bare cookie no version 2 peer emits
+/// or accepts. See [`wire::build_cookie_challenge`].
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Session audio runs at 48 kHz everywhere; other rates are resampled at the
 /// edges, never on the wire.

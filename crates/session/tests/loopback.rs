@@ -2361,7 +2361,7 @@ fn version_reject_rate_limited_and_verified() {
     let Ok(Packet::VersionReject { ours, theirs, mac }) = wire::parse(&out[0].1) else {
         panic!("expected a version reject");
     };
-    assert_eq!((ours, theirs), (1, 3));
+    assert_eq!((ours, theirs), (jamstream_protocol::PROTOCOL_VERSION, 3));
     assert!(wire::verify_version_reject(
         future.reject_key().unwrap(),
         ours,
@@ -2410,8 +2410,14 @@ fn a_rejected_client_joins_when_the_server_starts_answering() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv = h.mint(0, Role::Musician);
     let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
-    core.handle_datagram(1, &reject_for(&h, &init, 2));
-    assert_eq!(*core.state(), ClientState::Rejected { ours: 1, theirs: 2 });
+    core.handle_datagram(1, &reject_for(&h, &init, 9));
+    assert_eq!(
+        *core.state(),
+        ClientState::Rejected {
+            ours: jamstream_protocol::PROTOCOL_VERSION,
+            theirs: 9
+        }
+    );
 
     let retry = core.poll(6_000);
     assert_eq!(retry, vec![init]);

@@ -16,8 +16,10 @@ use jamstream_protocol::control::{
 use jamstream_protocol::ids::{MemberId, Role, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
-use jamstream_protocol::transport::{Initiator, Session, Welcome};
-use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, Packet, RejectKey};
+use jamstream_protocol::transport::{Initiator, Session, Welcome, cookie_reply_key};
+use jamstream_protocol::wire::{
+    self, CHANNEL_CONTROL, CHANNEL_MEDIA, CookieReplyKey, Packet, RejectKey,
+};
 
 use crate::SessionError;
 use crate::avatar::{
@@ -44,11 +46,12 @@ const REJECT_RETRY_MAX_MS: u64 = 60_000;
 /// and how fast that allowance comes back.
 ///
 /// Answering at once saves up to a whole resend interval, so it is worth
-/// doing, but a cookie challenge is unauthenticated by construction: anyone
-/// who can see this client's address can forge one. Without a budget that
-/// would be a lever for making this client emit a packet per forged
-/// challenge, at whatever rate the attacker chose. Four covers a rotation and
-/// a retry; past that the resend timer carries it.
+/// doing. A challenge only opens against the exact init this client sent,
+/// under a key derived from `server_pk`, so a forger needs both; an invite
+/// holder watching the path has both, and without a budget that would be a
+/// lever for making this client emit a packet per forged challenge, at
+/// whatever rate the attacker chose. Four covers a rotation and a retry;
+/// past that the resend timer carries it.
 const COOKIE_ANSWER_BURST: u32 = 4;
 const COOKIE_ANSWER_PER_SEC: u32 = 1;
 /// Reports of clean link required before redundancy turns back off.
@@ -205,6 +208,9 @@ pub struct ClientCore {
     /// sent alongside the plain init and never instead of it.
     cookied_init: Option<Vec<u8>>,
     cookie_answers: TokenBucket,
+    /// Opens cookie challenges; a pure function of the invite's `server_pk`,
+    /// derived once. See [`jamstream_protocol::transport::cookie_reply_key`].
+    cookie_reply_key: CookieReplyKey,
     session: Option<Session>,
     welcome: Option<Welcome>,
     link: ControlLink,
@@ -338,6 +344,7 @@ impl ClientCore {
             session_full: false,
             cookied_init: None,
             cookie_answers: TokenBucket::new(COOKIE_ANSWER_BURST, COOKIE_ANSWER_PER_SEC),
+            cookie_reply_key: cookie_reply_key(&invite.server_pk),
             session: None,
             welcome: None,
             link: ControlLink::new(),
@@ -553,34 +560,39 @@ impl ClientCore {
                     _ => {}
                 }
             }
-            Packet::CookieChallenge { cookie } => {
+            Packet::CookieChallenge { nonce, sealed } => {
                 // The server is under handshake load and wants the address
-                // proved before it spends a Diffie-Hellman. Nothing
-                // authenticates this packet, and nothing can: authenticating
-                // it would cost the server exactly what the cookie saves. So
-                // the cookied init is an addition, never a replacement, and
-                // answering a forged challenge costs no more than dropping the
-                // packet would have.
-                //
-                // The cookie we store is a different matter. A cookie we hold
-                // but cannot offer is a cookie the server will refuse, so a
-                // forged challenge must not evict a good one: adopt the new
-                // cookie only when the budget actually lets us answer with it.
-                // That leaves the off-path forgery, which needs the cookie
-                // encrypted the WireGuard way, under Hash(label || server_pk)
-                // with the init as AAD. That is a wire change and belongs at
-                // the next protocol version bump (issue #203).
+                // proved before it spends a Diffie-Hellman. The cookie
+                // arrives sealed to the exact init this client sent (the
+                // AEAD's additional data), under a key only `server_pk`
+                // derives, so an off-path forger cannot mint one this open
+                // accepts: what pinned a client to a cookie the server would
+                // refuse (issue #203) now dies here. The open costs one hash
+                // and one ChaCha pass, the going rate for parsing.
                 if self.state != ClientState::Connecting {
                     return out;
                 }
+                let Some(cookie) = wire::open_cookie_challenge(
+                    &self.cookie_reply_key,
+                    &nonce,
+                    &sealed,
+                    &self.init_packet,
+                ) else {
+                    return out;
+                };
                 let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(&self.init_packet)
                 else {
                     return out;
                 };
                 let cookied = wire::build_cookied_init(&cookie, version, noise);
                 // A repeated challenge carrying the cookie already held costs
-                // nothing at all, which is most replays. The budget covers the
-                // rest.
+                // nothing at all, which is most replays. The budget bounds
+                // what remains: an invite holder on the path holds both the
+                // key and the init and can still forge, and even a valid
+                // challenge must neither pump this client for packets nor,
+                // when it cannot be answered, evict the cookie the next
+                // resend offers. The cookied init stays an addition to the
+                // plain one, never a replacement.
                 if self.cookied_init.as_deref() == Some(cookied.as_slice())
                     || !self.cookie_answers.take(now_ms)
                 {
@@ -1252,12 +1264,17 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jamstream_protocol::PROTOCOL_VERSION;
     use jamstream_protocol::ids::SessionId;
     use jamstream_protocol::invite::{Issuer, Token};
     use jamstream_protocol::transport::{
-        Keypair, Responder, generate_keypair, reject_key_for_init,
+        Keypair, Responder, cookie_key, generate_keypair, reject_key_for_init,
     };
     use jamstream_protocol::wire::TYPE_HANDSHAKE_INIT;
+
+    /// The address the test server believes the client connects from; the
+    /// client never checks it, it just echoes the cookie it decrypts.
+    const CHALLENGE_SRC: &str = "203.0.113.7";
 
     fn invite(role: Role) -> Invite {
         invite_and_server(role).0
@@ -1297,6 +1314,29 @@ mod tests {
             })
             .expect("respond");
         packet
+    }
+
+    /// The challenge a real server under load sends in answer to `init`,
+    /// sealed the way the server seals it: under the reply key from its
+    /// public half, bound to the exact init bytes, carrying the cookie of
+    /// `epoch`. Distinct epochs give distinct cookies, which is what a test
+    /// that needs many valid challenges for one init varies.
+    fn genuine_challenge(server: &Keypair, init: &[u8], epoch: u64) -> Vec<u8> {
+        wire::build_cookie_challenge(
+            &jamstream_protocol::transport::cookie_reply_key(&server.public),
+            &cookie_key(&server.private, epoch),
+            CHALLENGE_SRC.parse().unwrap(),
+            init,
+        )
+    }
+
+    /// The cookie inside [`genuine_challenge`] for the same epoch: what the
+    /// client is expected to echo in its cookied init.
+    fn challenge_cookie(server: &Keypair, epoch: u64) -> [u8; wire::COOKIE_BYTES] {
+        wire::cookie_for(
+            &cookie_key(&server.private, epoch),
+            CHALLENGE_SRC.parse().unwrap(),
+        )
     }
 
     /// The reject a real server would send in answer to `init`, keyed the way
@@ -1358,11 +1398,20 @@ mod tests {
 
         // The server's own, over the same init, is honored and mapped to the
         // client's perspective.
-        core.handle_datagram(2, &genuine_reject(&server, &inv, &init, 2));
-        assert_eq!(*core.state(), ClientState::Rejected { ours: 1, theirs: 2 });
+        core.handle_datagram(2, &genuine_reject(&server, &inv, &init, 9));
+        assert_eq!(
+            *core.state(),
+            ClientState::Rejected {
+                ours: PROTOCOL_VERSION,
+                theirs: 9
+            }
+        );
         assert_eq!(
             core.events(),
-            vec![ClientEvent::Rejected { ours: 1, theirs: 2 }]
+            vec![ClientEvent::Rejected {
+                ours: PROTOCOL_VERSION,
+                theirs: 9
+            }]
         );
     }
 
@@ -1390,7 +1439,7 @@ mod tests {
     fn a_rejected_client_keeps_trying_and_can_still_join() {
         let (inv, server) = invite_and_server(Role::Musician);
         let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
-        core.handle_datagram(1, &genuine_reject(&server, &inv, &init, 2));
+        core.handle_datagram(1, &genuine_reject(&server, &inv, &init, 9));
         assert!(matches!(core.state(), ClientState::Rejected { .. }));
 
         // Backoff from 5 s, doubling, and the same bytes every time.
@@ -1479,7 +1528,7 @@ mod tests {
         // A version reject's MAC is not a capacity reject's, even though the
         // two share a key.
         let Ok(Packet::VersionReject { mac, .. }) =
-            wire::parse(&genuine_reject(&server, &inv, &init, 2))
+            wire::parse(&genuine_reject(&server, &inv, &init, 9))
         else {
             panic!("expected a version reject");
         };
@@ -1515,22 +1564,24 @@ mod tests {
         assert_eq!(core.poll(5_001), vec![init]);
     }
 
-    /// A challenge carries no proof of who sent it, so a client that swapped
+    /// A challenge does not prove the server sent it (any invite holder on
+    /// the path holds the reply key and this init), so a client that swapped
     /// its plain init for a cookied one would have lost its join to exactly
     /// the trick a forged handshake response used to play. Both forms go out,
     /// always, and the server takes whichever it can use.
     #[test]
     fn a_cookie_is_offered_alongside_the_plain_init_never_instead_of_it() {
-        let (mut core, init) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
-        let cookie = [0x5Au8; wire::COOKIE_BYTES];
-        let answer = core.handle_datagram(10, &wire::build_cookie_challenge(&cookie));
+        let (inv, server) = invite_and_server(Role::Musician);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+        let answer = core.handle_datagram(10, &genuine_challenge(&server, &init, 7));
 
         // Answered at once, because waiting for the resend timer would cost up
-        // to two seconds, and the plain init goes with it.
+        // to two seconds, and the plain init goes with it. The cookie echoed
+        // is the one the server sealed, decrypted for real.
         let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(&init) else {
             panic!("expected an init");
         };
-        let cookied = wire::build_cookied_init(&cookie, version, noise);
+        let cookied = wire::build_cookied_init(&challenge_cookie(&server, 7), version, noise);
         assert_eq!(answer, vec![init.clone(), cookied.clone()]);
         // The Noise message is byte-identical in both forms, so the server's
         // cached response still pairs with whichever one it read.
@@ -1545,32 +1596,42 @@ mod tests {
         assert_eq!(*core.state(), ClientState::Connecting);
     }
 
-    /// A forged challenge is free to send for anyone who can see this client's
-    /// address, so answering one must not be a lever for making the client
-    /// emit packets at whatever rate the attacker picks.
+    /// Answering a challenge must not be a lever for making the client emit
+    /// packets at whatever rate a sender picks. A forger without the server
+    /// key now gets nothing at all; a sender who can seal valid challenges
+    /// (an invite holder watching the path) still gets no more than the
+    /// budget.
     #[test]
     fn forged_challenges_cannot_pump_a_client_for_packets() {
-        let (mut core, _init) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
+        let (inv, server) = invite_and_server(Role::Musician);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+
+        // Forged under the wrong key: sealed for real, just not by anyone
+        // holding this server's public key. Every one is dropped unopened.
+        let stranger = generate_keypair();
+        for i in 0..2_000u64 {
+            assert!(
+                core.handle_datagram(1, &genuine_challenge(&stranger, &init, i))
+                    .is_empty()
+            );
+        }
+
+        // Validly sealed, a different cookie every time, which is the
+        // expensive case: an unchanged one costs nothing at all. Two
+        // datagrams per answer, and the burst is all a sender gets in an
+        // instant.
         let mut sent = 0;
-        for i in 0..2_000u32 {
-            // A different cookie every time, which is the expensive case: an
-            // unchanged one costs nothing at all.
-            let mut cookie = [0u8; wire::COOKIE_BYTES];
-            cookie[..4].copy_from_slice(&i.to_le_bytes());
+        for i in 0..2_000u64 {
             sent += core
-                .handle_datagram(1, &wire::build_cookie_challenge(&cookie))
+                .handle_datagram(1, &genuine_challenge(&server, &init, i))
                 .len();
         }
-        // Two datagrams per answer, and the burst is all an attacker gets in
-        // an instant.
         assert_eq!(sent, 2 * COOKIE_ANSWER_BURST as usize);
         // And no faster than the refill from there.
         let mut later = 0;
-        for i in 0..2_000u32 {
-            let mut cookie = [0xFFu8; wire::COOKIE_BYTES];
-            cookie[..4].copy_from_slice(&i.to_le_bytes());
+        for i in 2_000..4_000u64 {
             later += core
-                .handle_datagram(1_500, &wire::build_cookie_challenge(&cookie))
+                .handle_datagram(1_500, &genuine_challenge(&server, &init, i))
                 .len();
         }
         assert_eq!(later, 2 * COOKIE_ANSWER_PER_SEC as usize);
@@ -1582,39 +1643,34 @@ mod tests {
     /// Every cookie this client holds is one it answered with. The stored
     /// cookie is what the next resend offers, so a challenge that arrives with
     /// the answer budget already spent must not replace it: that turned an
-    /// injected challenge into a way to point the client at a cookie the server
-    /// will refuse, for free and at whatever rate the attacker liked, while the
-    /// plain init only drew another challenge (issue #203).
-    ///
-    /// This narrows the primitive rather than removing it: an eviction now
-    /// costs one of the same tokens that bound the answers. Binding a challenge
-    /// to the init it answers needs the cookie encrypted, which is a wire
-    /// change for the next protocol version.
+    /// injected challenge into a way to point the client at a cookie the
+    /// server will refuse, while the plain init only drew another challenge
+    /// (issue #203). The AEAD binding stops a forger who lacks the key or the
+    /// init; this guard prices out the sender who has both, so an eviction
+    /// costs one of the same tokens that bound the answers.
     #[test]
     fn a_challenge_we_cannot_answer_does_not_replace_the_cookie_we_hold() {
-        let inv = invite(Role::Musician);
+        let (inv, server) = invite_and_server(Role::Musician);
         let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
         let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(&init) else {
             panic!("expected an init");
         };
-        let cookie_n = |i: u32| {
-            let mut c = [0u8; wire::COOKIE_BYTES];
-            c[..4].copy_from_slice(&i.to_le_bytes());
-            c
-        };
 
-        // A thousand distinct challenges in one instant. Only the burst is
-        // answered, so only the burst is adopted.
+        // A thousand distinct validly sealed challenges in one instant. Only
+        // the burst is answered, so only the burst is adopted.
         let mut answered = Vec::new();
-        for i in 0..1_000u32 {
+        for i in 0..1_000u64 {
             if !core
-                .handle_datagram(1, &wire::build_cookie_challenge(&cookie_n(i)))
+                .handle_datagram(1, &genuine_challenge(&server, &init, i))
                 .is_empty()
             {
                 answered.push(i);
             }
         }
-        assert_eq!(answered, (0..COOKIE_ANSWER_BURST).collect::<Vec<u32>>());
+        assert_eq!(
+            answered,
+            (0..u64::from(COOKIE_ANSWER_BURST)).collect::<Vec<u64>>()
+        );
 
         // The resend carries the last cookie this client put on the wire, not
         // the last one somebody sent it.
@@ -1623,16 +1679,16 @@ mod tests {
             core.poll(3_000),
             vec![
                 init.clone(),
-                wire::build_cookied_init(&cookie_n(last_answered), version, noise)
+                wire::build_cookied_init(&challenge_cookie(&server, last_answered), version, noise)
             ],
             "an unanswerable challenge replaced the cookie on the wire"
         );
 
         // Once the bucket refills the next challenge is adopted, so a client
         // whose cookie really did go stale is not stuck with it.
-        let fresh = cookie_n(9_999);
+        let fresh = challenge_cookie(&server, 9_999);
         assert_eq!(
-            core.handle_datagram(4_000, &wire::build_cookie_challenge(&fresh)),
+            core.handle_datagram(4_000, &genuine_challenge(&server, &init, 9_999)),
             vec![
                 init.clone(),
                 wire::build_cookied_init(&fresh, version, noise)
@@ -1647,6 +1703,56 @@ mod tests {
         );
     }
 
+    /// A challenge is bound, through the AEAD's additional data, to the one
+    /// init it answers. Sealed over anybody else's init, under the right key
+    /// and by the right server, it is still not an answer to ours: it draws
+    /// no packet, spends no budget, and cannot displace the cookie this
+    /// client already holds. This is the off-path forgery of issue #203,
+    /// which used to displace the held cookie for free.
+    #[test]
+    fn a_challenge_for_a_different_init_is_rejected() {
+        let (inv, server) = invite_and_server(Role::Musician);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+        let Ok(Packet::HandshakeInit { version, noise }) = wire::parse(&init) else {
+            panic!("expected an init");
+        };
+
+        // A genuine challenge first, so there is a held cookie to defend.
+        assert_eq!(
+            core.handle_datagram(1, &genuine_challenge(&server, &init, 0))
+                .len(),
+            2
+        );
+
+        // The same server's challenges for a different connection attempt,
+        // which is what a replayed or misdirected challenge is. Distinct
+        // cookies every time; not one opens, so not one is answered.
+        let (_, other_init) = Initiator::new(&inv).unwrap();
+        for i in 0..1_000u64 {
+            assert!(
+                core.handle_datagram(2, &genuine_challenge(&server, &other_init, i))
+                    .is_empty()
+            );
+        }
+
+        // The resend still offers the cookie sealed for this init, and the
+        // budget those rejects never touched still answers a genuine rotation
+        // at once.
+        assert_eq!(
+            core.poll(3_000),
+            vec![
+                init.clone(),
+                wire::build_cookied_init(&challenge_cookie(&server, 0), version, noise)
+            ],
+            "a challenge for somebody else's init displaced the held cookie"
+        );
+        assert_eq!(
+            core.handle_datagram(3_001, &genuine_challenge(&server, &init, 1))
+                .len(),
+            2
+        );
+    }
+
     /// A challenge is only meaningful while a handshake is in flight. Joined,
     /// it is either stale or somebody probing, and either way it must not put
     /// a second init on the wire.
@@ -1656,9 +1762,8 @@ mod tests {
         let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
         core.handle_datagram(1, &handshake_response(&server, &inv, &init));
         assert_eq!(*core.state(), ClientState::Joined);
-        let cookie = [7u8; wire::COOKIE_BYTES];
         assert!(
-            core.handle_datagram(2, &wire::build_cookie_challenge(&cookie))
+            core.handle_datagram(2, &genuine_challenge(&server, &init, 7))
                 .is_empty()
         );
     }

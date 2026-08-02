@@ -82,6 +82,9 @@ x25519-dalek = { version = "3", features = ["static_secrets"] }
 data-encoding = "2"
 aws-lc-rs = "1"
 blake2 = "0.10"
+# The cookie challenge's AEAD. Already in the tree through snow's
+# default-resolver crypto, so naming it adds no compile unit.
+chacha20poly1305 = "0.10"
 getrandom = "0.3"
 zeroize = "1"
 # opus 0.3 (audiopus_sys) fails to build with CMake >= 4; opusic-c bundles a

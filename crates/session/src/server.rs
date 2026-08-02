@@ -92,15 +92,22 @@ const COOKIE_TRIGGER_BURST: u32 = 48;
 /// honest init from a spoofed one, so a cap low enough to matter to a flood
 /// would starve exactly the client the cookie exists to let through. What it
 /// bounds is an unbounded send loop on the task that owns the mix tick: at
-/// 17 bytes a challenge this is under 280 KB/s, inside what the session
-/// already sends to a full gallery, and always less than the flood that drew
-/// it. Past the ceiling an init draws silence, which is what it drew before
-/// any of this existed.
+/// 57 bytes a challenge this is under 1 MB/s, and per packet a challenge is
+/// always smaller than the init that drew it (see
+/// [`CHALLENGE_MIN_INIT_BYTES`]), so the reflected flood is always less than
+/// the inbound one. Past the ceiling an init draws silence, which is what it
+/// drew before any of this existed.
 const CHALLENGE_RATE_PER_SEC: u32 = 16_384;
 /// Shortest handshake init that earns a reject. A reject is 21 bytes and a
 /// real Noise IK first message is over 90, so answering anything shorter
 /// would make the server an amplifier by size: `[1, 9, 0]` in, 21 bytes out.
 const REJECT_MIN_INIT_BYTES: usize = 48;
+/// Shortest handshake init that earns a cookie challenge. Higher than the
+/// reject floor because the encrypted challenge is 57 bytes against the
+/// reject's 21; above this floor the challenge is still always the smaller
+/// packet. A real Noise IK first flight is over 180 bytes, so no honest init
+/// is anywhere near either floor.
+const CHALLENGE_MIN_INIT_BYTES: usize = 64;
 /// Queue depth at which the avatar pacer stops feeding a link. Well clear of
 /// [`MAX_PENDING`], so the link's hard cap only ever refuses bulk, never a
 /// roster or a chat. A round trip's worth of chunks on a 45 ms path is about
@@ -402,6 +409,9 @@ pub struct ServerCore {
     /// A detector, not a limiter: nothing is dropped for failing to take one.
     cookie_trigger: TokenBucket,
     challenge_budget: TokenBucket,
+    /// Seals every cookie challenge; a pure function of the static public
+    /// key, derived once. See [`transport::cookie_reply_key`].
+    cookie_reply_key: wire::CookieReplyKey,
     /// Cookie challenges emitted, so a test can assert the round trip
     /// engaged rather than infer it from an absence.
     challenges: u64,
@@ -424,6 +434,7 @@ pub struct ServerCore {
 impl ServerCore {
     pub fn new(cfg: ServerConfig) -> Self {
         let slot_hasher = slot_hasher(&cfg.server_private);
+        let cookie_reply_key = transport::cookie_reply_key(&cfg.server_public);
         Self {
             cfg,
             members: BTreeMap::new(),
@@ -461,6 +472,7 @@ impl ServerCore {
             init_reads: 0,
             cookie_trigger: TokenBucket::new(COOKIE_TRIGGER_BURST, COOKIE_TRIGGER_RATE_PER_SEC),
             challenge_budget: TokenBucket::new(CHALLENGE_RATE_PER_SEC, CHALLENGE_RATE_PER_SEC),
+            cookie_reply_key,
             challenges: 0,
             events: Vec::new(),
             last_musician_count: 0,
@@ -1144,14 +1156,17 @@ impl ServerCore {
         !self.cookie_trigger.take(now_ms)
     }
 
-    /// Answers an init with a cookie instead of reading it.
+    /// Answers an init with a sealed cookie instead of reading it.
     ///
-    /// The challenge carries no proof of who sent it, and cannot: proving it
-    /// would cost the Diffie-Hellman the cookie exists to avoid. WireGuard has
-    /// the same hole and the same answer, which is that a client keeps
-    /// offering its plain init alongside the cookied one, so a forged
-    /// challenge buys an attacker nothing they could not get by dropping the
-    /// packet instead.
+    /// The cookie is encrypted under a key derived from the static public
+    /// key, with the init's exact bytes as the AEAD's additional data, so the
+    /// reply is bound to the one init it answers: nobody who did not see this
+    /// init, and nobody who does not know `server_pk`, can produce a
+    /// challenge the client will accept. Cheaper than proof of who sent it,
+    /// which would cost the Diffie-Hellman the cookie exists to avoid; an
+    /// invite holder on the path still knows both, which is WireGuard's
+    /// residue too, and against that the client keeps offering its plain init
+    /// alongside the cookied one.
     fn cookie_challenge(
         &mut self,
         now_ms: u64,
@@ -1159,10 +1174,9 @@ impl ServerCore {
         init_packet: &[u8],
         out: &mut Outgoing,
     ) {
-        // Same floor as the version reject, for the same reason: answering a
-        // 3-byte `[1, 1, 0]` with 17 bytes would make the server an amplifier
-        // by size. Above the floor the challenge is always the smaller packet.
-        if init_packet.len() < REJECT_MIN_INIT_BYTES {
+        // Same rule as the version reject's floor: never answer a stub with a
+        // bigger packet. Above the floor the challenge is always the smaller.
+        if init_packet.len() < CHALLENGE_MIN_INIT_BYTES {
             return;
         }
         if !self.challenge_budget.take(now_ms) {
@@ -1170,8 +1184,10 @@ impl ServerCore {
         }
         self.challenges += 1;
         let key = transport::cookie_key(&self.cfg.server_private, cookie_epoch(now_ms));
-        let cookie = wire::cookie_for(&key, src.ip());
-        out.push((src, wire::build_cookie_challenge(&cookie)));
+        out.push((
+            src,
+            wire::build_cookie_challenge(&self.cookie_reply_key, &key, src.ip(), init_packet),
+        ));
     }
 
     /// Whether a cookie is one this server handed to this address.
@@ -2335,19 +2351,27 @@ mod tests {
     /// spreads over every slot, a cookie holder cannot.
     #[test]
     fn a_cookie_holder_is_still_capped_at_its_networks_share() {
-        let (mut core, _issuer, _public) = server_with_issuer();
+        let (mut core, _issuer, public) = server_with_issuer();
         let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
         let src: SocketAddr = "203.0.113.7:5000".parse().unwrap();
 
         // Drain the trigger so the round trip is engaged, then take the
-        // cookie the server offers this address.
+        // cookie the server offers this address, opening it the way a client
+        // does: against the init that drew it.
         for _ in 0..COOKIE_TRIGGER_BURST {
             core.handle_datagram(0, 0, src, &init);
         }
         let out = core.handle_datagram(0, 0, src, &init);
-        let Ok(Packet::CookieChallenge { cookie }) = wire::parse(&out[0].1) else {
+        let Ok(Packet::CookieChallenge { nonce, sealed }) = wire::parse(&out[0].1) else {
             panic!("expected a challenge, got {:?}", wire::parse(&out[0].1));
         };
+        let cookie = wire::open_cookie_challenge(
+            &transport::cookie_reply_key(&public),
+            &nonce,
+            &sealed,
+            &init,
+        )
+        .expect("the challenge opens against the init that drew it");
         let cookied = wire::build_cookied_init(&cookie, PROTOCOL_VERSION, &[0xAA; 96]);
         let before = core.handshake_reads();
 
@@ -2405,12 +2429,20 @@ mod tests {
         let (_, init) = Initiator::new(&invite).unwrap();
         let honest = addr(9);
 
-        // The plain init: a challenge, no read, no member.
+        // The plain init: a challenge, no read, no member. The cookie comes
+        // out the way a client gets it, through the AEAD bound to this init.
         let reads = core.handshake_reads();
         let out = core.handle_datagram(0, 0, honest, &init);
-        let Ok(Packet::CookieChallenge { cookie }) = wire::parse(&out[0].1) else {
+        let Ok(Packet::CookieChallenge { nonce, sealed }) = wire::parse(&out[0].1) else {
             panic!("expected a challenge, got {:?}", wire::parse(&out[0].1));
         };
+        let cookie = wire::open_cookie_challenge(
+            &transport::cookie_reply_key(&public),
+            &nonce,
+            &sealed,
+            &init,
+        )
+        .expect("the challenge opens against the init that drew it");
         assert_eq!(core.handshake_reads(), reads, "the init was read anyway");
         assert_eq!(core.musicians_connected(), 0);
 
@@ -2519,9 +2551,16 @@ mod tests {
             core.handle_datagram(0, 0, addr(2), &filler);
         }
         let out = core.handle_datagram(0, 0, src, &init);
-        let Ok(Packet::CookieChallenge { cookie }) = wire::parse(&out[0].1) else {
+        let Ok(Packet::CookieChallenge { nonce, sealed }) = wire::parse(&out[0].1) else {
             panic!("expected a challenge");
         };
+        let cookie = wire::open_cookie_challenge(
+            &transport::cookie_reply_key(&public),
+            &nonce,
+            &sealed,
+            &init,
+        )
+        .expect("the challenge opens against the init that drew it");
         let Ok(Packet::HandshakeInit { noise, .. }) = wire::parse(&init) else {
             panic!("expected an init");
         };
@@ -2545,16 +2584,23 @@ mod tests {
     /// from two epochs back does not.
     #[test]
     fn a_cookie_expires_one_rotation_after_the_secret_that_made_it() {
-        let (mut core, _issuer, _public) = server_with_issuer();
+        let (mut core, _issuer, public) = server_with_issuer();
         let init = wire::build_handshake_init(PROTOCOL_VERSION, &[0xAA; 96]);
         let src: SocketAddr = "203.0.113.7:5000".parse().unwrap();
         for _ in 0..COOKIE_TRIGGER_BURST {
             core.handle_datagram(0, 0, src, &init);
         }
         let out = core.handle_datagram(0, 0, src, &init);
-        let Ok(Packet::CookieChallenge { cookie }) = wire::parse(&out[0].1) else {
+        let Ok(Packet::CookieChallenge { nonce, sealed }) = wire::parse(&out[0].1) else {
             panic!("expected a challenge");
         };
+        let cookie = wire::open_cookie_challenge(
+            &transport::cookie_reply_key(&public),
+            &nonce,
+            &sealed,
+            &init,
+        )
+        .expect("the challenge opens against the init that drew it");
         let cookied = wire::build_cookied_init(&cookie, PROTOCOL_VERSION, &[0xAA; 96]);
 
         // Still the current epoch, and then the previous one: a rotation must
@@ -2572,7 +2618,7 @@ mod tests {
         assert!(!read(&mut core, 9 * COOKIE_ROTATION_MS));
     }
 
-    /// A cookie challenge is 17 bytes. Answering a 3-byte `[1, 1, 0]` with one
+    /// A cookie challenge is 57 bytes. Answering a 3-byte `[1, 1, 0]` with one
     /// would make the server an amplifier by size, and a challenge is the one
     /// thing here that is not otherwise rate limited per source.
     #[test]
@@ -2582,7 +2628,7 @@ mod tests {
         for _ in 0..COOKIE_TRIGGER_BURST {
             core.handle_datagram(0, 0, addr(2), &long);
         }
-        for noise_len in [0usize, 1, 8, 44] {
+        for noise_len in [0usize, 1, 8, 44, CHALLENGE_MIN_INIT_BYTES - 4] {
             let short = wire::build_handshake_init(PROTOCOL_VERSION, &vec![0xAA; noise_len]);
             assert!(
                 core.handle_datagram(0, 0, addr(3), &short).is_empty(),
