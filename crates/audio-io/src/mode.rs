@@ -14,10 +14,11 @@
 //!
 //! The encoding is split from the cell it lives in so a test can exercise it
 //! on a cell of its own. A process-wide value serialized by a comment saying
-//! only one test touches it is one added test away from a race, and the
-//! coverage job runs these suites under libtest, with no process per test to
-//! hide it (#395). The one test that has to use the real cell claims it, so
-//! a second toucher fails rather than races.
+//! only one test touches it is one added test away from a race, so the rule
+//! is held two ways instead (#395). A new test in this file fails the build
+//! until its author has said which kind it is, and a test anywhere in the
+//! crate that reaches the cell claims it, so a second toucher fails under
+//! libtest, which is where the two of them share a process.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -43,12 +44,38 @@ static ACTIVE: AtomicU8 = AtomicU8::new(UNSET);
 /// and PipeWire have no shared/exclusive split to report.
 #[must_use]
 pub fn active_device_mode() -> Option<DeviceMode> {
-    read(&ACTIVE)
+    read(process_cell())
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn set_active_device_mode(mode: DeviceMode) {
-    write(&ACTIVE, mode);
+    write(process_cell(), mode);
+}
+
+/// The one cell the process has, reached only from here so that the claim
+/// below cannot be walked past by a test that does not know about it.
+fn process_cell() -> &'static AtomicU8 {
+    #[cfg(test)]
+    claim_the_process_value();
+    &ACTIVE
+}
+
+/// Fails the second test to reach the process-wide cell. Under libtest the
+/// whole binary is one process and each test gets a thread, so two touchers
+/// would race; this makes the second one a failure carrying its own fix.
+/// Nextest gives each test a process, where there is nothing to race.
+#[cfg(test)]
+fn claim_the_process_value() {
+    use std::sync::{Mutex, PoisonError};
+
+    static OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+    let mut owner = OWNER.lock().unwrap_or_else(PoisonError::into_inner);
+    let me = std::thread::current().id();
+    assert!(
+        *owner.get_or_insert(me) == me,
+        "a second test reached the process-wide device mode; test the \
+         encoding through read() and write() on a cell the test owns"
+    );
 }
 
 fn read(cell: &AtomicU8) -> Option<DeviceMode> {
@@ -67,23 +94,21 @@ fn write(cell: &AtomicU8, mode: DeviceMode) {
     cell.store(value, Ordering::Relaxed);
 }
 
+/// One of the tests below reaches the process-wide cell and the other must
+/// not, which a diff of a third one does not show. Counting this file's own
+/// tests holds the build until whoever adds one has answered that, in every
+/// runner, including the ones the claim above cannot speak for.
+#[cfg(test)]
+const _: () = assert!(
+    xtask::source::lines_equal(include_str!("mode.rs"), "#[test]") == 2,
+    "a new test in mode.rs exercises the encoding through read() and write() \
+     on a cell it owns, and then raises the count above. The process-wide \
+     cell has one toucher; a second one races it under libtest."
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-
-    /// Fails the second test to reach the process-wide cell, which is the
-    /// half the split cannot enforce on its own. Under libtest the whole
-    /// binary is one process, so two touchers would race; this turns that
-    /// into a failure with the fix in the message instead of a flake.
-    fn claim_the_process_value() {
-        static CLAIMED: AtomicBool = AtomicBool::new(false);
-        assert!(
-            !CLAIMED.swap(true, Ordering::Relaxed),
-            "a second test reached the process-wide mode; test the encoding \
-             through read() and write() on a cell the test owns"
-        );
-    }
 
     #[test]
     fn reported_mode_follows_the_last_open() {
@@ -98,10 +123,10 @@ mod tests {
     /// The public pair really is a pair, over the one cell the process has.
     /// That the setter and the getter reach the same cell is the only thing
     /// the split cannot check, and it is what the Windows backend and the
-    /// client's status line depend on.
+    /// client's status line depend on. The claim this makes on the cell is
+    /// taken by the accessors themselves, so nothing here has to remember.
     #[test]
     fn the_public_accessors_share_the_process_wide_value() {
-        claim_the_process_value();
         set_active_device_mode(DeviceMode::Exclusive);
         assert_eq!(active_device_mode(), Some(DeviceMode::Exclusive));
         set_active_device_mode(DeviceMode::Shared);

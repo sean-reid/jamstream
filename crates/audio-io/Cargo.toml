@@ -24,6 +24,11 @@ rubato.workspace = true
 jamstream-engine.workspace = true
 jamstream-protocol.workspace = true
 criterion.workspace = true
+# The build-time source count in src/mode.rs, shared with the same check in
+# the cli suite rather than copied into a second file. A path dependency and
+# not a workspace one, as in crates/cli: nothing ships xtask, and it has no
+# business in the workspace dependency table.
+xtask = { path = "../../xtask" }
 
 # test = false keeps `cargo test`/`cargo nextest` from building or running
 # this; harness = false hands main() to criterion.
