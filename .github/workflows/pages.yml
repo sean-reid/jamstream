@@ -32,6 +32,8 @@ jobs:
       MDBOOK_VERSION: 0.5.4
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install mdbook (pinned)
         run: |

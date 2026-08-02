@@ -12,8 +12,8 @@
 #   and /install.ps1 (they live in site/src/, which mdBook copies into the
 #   built site verbatim) must stay shellcheck-clean and parseable.
 # - install-scripts-windows: the PowerShell pair must also survive a real
-#   install, smoke, and uninstall on a Windows runner against the latest
-#   published release.
+#   install, smoke, and uninstall on a Windows runner, against the newest
+#   release that has finished uploading its assets.
 # - channel-claims: site/src/download.md's package-managers section must
 #   agree with packaging/README.md about which channels are live, and the
 #   two strings a user types (the brew tap path, the scoop bucket URL)
@@ -45,6 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
         with:
           shared-key: docs-check-cli
@@ -55,6 +57,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
         with:
           shared-key: docs-check-previews
@@ -74,6 +78,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Shellcheck the palette and icon generators
         run: shellcheck scripts/render-palette.sh scripts/render-icon.sh
       - name: Check the generated palette consumers against theme.rs
@@ -96,6 +102,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Check the download page against the channel claims
         run: scripts/check-channel-claims.sh
 
@@ -103,6 +111,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Shellcheck the POSIX installer and uninstaller
         run: shellcheck site/src/install.sh site/src/uninstall.sh
       - name: Parse the PowerShell installer and uninstaller
@@ -121,16 +131,24 @@ jobs:
 
   # The parse above runs on ubuntu, where the only branch these scripts can
   # reach is the "this is not Windows" early exit; nothing ever executed
-  # their happy path on any OS. This job runs them for real against the
-  # latest published release: lint, install, run the installed CLI,
-  # uninstall, and assert the directory is gone. It is also the gate that
-  # pins the asset names install.ps1 downloads to what release.yml actually
-  # uploaded.
+  # their happy path on any OS. This job runs them for real against a real
+  # release: lint, install, run the installed CLI, uninstall, and assert the
+  # directory is gone. It is also the gate that pins the asset names
+  # install.ps1 downloads to what release.yml actually uploaded.
+  #
+  # Which release matters. SHA256SUMS is the last asset release.yml uploads,
+  # because it hashes all the others, so for the several minutes a release
+  # takes there is a published release with nothing in it and the installer
+  # correctly refuses it. Asking install.ps1 for the newest release turned
+  # that into a red docs-check on main during v0.2.0, which is the question
+  # this job never meant to ask: it is here to prove the scripts work.
   install-scripts-windows:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Error severity only: the scripts talk to the user through
       # Write-Host, which the Warning set flags by design.
       - name: PSScriptAnalyzer
@@ -146,12 +164,32 @@ jobs:
             else { Write-Output "$script analyzes cleanly" }
           }
           if ($failed) { exit 1 }
-      - name: Install, run, and uninstall against the latest release
+      # The newest release that finished uploading, which is what -Tag exists
+      # for. sean-reid/jamstream by name rather than this repository, because
+      # that is the repository install.ps1 downloads from wherever it runs.
+      - name: Find the newest complete release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$(gh api 'repos/sean-reid/jamstream/releases?per_page=30' --jq \
+            'map(select(.draft == false and ([.assets[].name] | index("SHA256SUMS")))) | .[0].tag_name // empty')
+          if [ -z "$tag" ]; then
+            echo "::error::no published release carries a SHA256SUMS asset, so there is nothing for the installer to verify against"
+            exit 1
+          fi
+          echo "checking the scripts against $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Install, run, and uninstall against that release
         shell: powershell
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
           $dir = Join-Path $env:RUNNER_TEMP 'jamstream-install-check'
-          powershell -ExecutionPolicy Bypass -File site/src/install.ps1 -InstallDir $dir
+          powershell -ExecutionPolicy Bypass -File site/src/install.ps1 -Tag $env:TAG -InstallDir $dir
           if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
           & (Join-Path $dir 'jamstream.exe') --version
           if ($LASTEXITCODE -ne 0) { throw "installed jamstream.exe exited $LASTEXITCODE" }

@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # A deleted, rotated-away, or renamed APPLE_CERT_P12 is the exact case
       # this workflow exists for, and it used to be the one case it could not
       # see: an empty secret published configured=false, every later step
