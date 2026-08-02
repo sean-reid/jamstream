@@ -238,5 +238,34 @@ async fn records_are_reconciled_after_any_death() {
         "an unverifiable session must keep blocking an uninstall: {text}"
     );
 
+    // Phase 5: a listing that reached only some of a provider proves
+    // nothing either. The session below is alive in the region that did not
+    // answer, and calling it stale would invite the host to close a jam
+    // that is still playing.
+    reset(&state_dir);
+    let session = "7777aaaa7777aaaa";
+    state::save(&record(session, "aws", "mock-000001")).unwrap();
+    let partial = |name: &str| -> Result<Box<dyn Provider>, CliError> {
+        assert_eq!(name, "aws");
+        let p = MockProvider::with_default_regions(ProviderKind::Aws);
+        let west = p.regions()[1].clone();
+        p.seed_instance(&west, vec![session_tag(session)]);
+        p.unsearchable_region(&west.id);
+        Ok(Box::new(p))
+    };
+    let text = status_text(false, partial).await;
+    assert!(!text.contains("stale"), "table: {text}");
+    assert!(
+        text.contains(
+            "Session 7777aaaa: recorded running; aws could not be checked \
+             (mock-west did not answer)."
+        ),
+        "table: {text}"
+    );
+    let json: Vec<serde_json::Value> =
+        serde_json::from_str(&status_text(true, partial).await).unwrap();
+    assert_eq!(json[0]["status"], "running");
+    assert_eq!(json[0]["corroborated"], false);
+
     reset(&state_dir);
 }
