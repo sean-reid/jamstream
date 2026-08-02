@@ -1,8 +1,8 @@
 //! Native GCP service-account authentication. Parses the JSON key file
 //! that `GOOGLE_APPLICATION_CREDENTIALS` points at, signs an RS256 JWT
 //! with aws-lc-rs (already in the tree as rustls's crypto provider), and
-//! exchanges it at the key's `token_uri` for an OAuth2 access token. No
-//! gcloud subprocess is involved.
+//! exchanges it at the key's `token_uri`, which has to be https, for an
+//! OAuth2 access token. No gcloud subprocess is involved.
 //!
 //! [`ServiceAccountTokenSource`] implements
 //! [`TokenSource`](super::gcp::TokenSource) and caches the minted token,
@@ -94,6 +94,7 @@ impl ParsedKey {
                 key.key_type
             )));
         }
+        let token_uri = https_endpoint(key.token_uri)?;
         let der = pem_to_der(&key.private_key)?;
         let key_pair = RsaKeyPair::from_pkcs8(&der).map_err(|e| {
             auth_err(format!(
@@ -104,7 +105,7 @@ impl ParsedKey {
         Ok(ParsedKey {
             key_pair,
             client_email: key.client_email,
-            token_uri: key.token_uri,
+            token_uri,
             project_id: key.project_id,
         })
     }
@@ -135,6 +136,29 @@ impl ParsedKey {
             BASE64URL_NOPAD.encode(&signature)
         ))
     }
+}
+
+/// The key's `token_uri`, accepted only when it is https.
+///
+/// The assertion POSTed there is signed bearer material for the service
+/// account until it expires, so a key carrying `http://` would put it on
+/// the wire in the clear for anyone on the path to replay. Key files
+/// arrive from a path or a paste box, which is why this sits here rather
+/// than with whoever produced the document.
+fn https_endpoint(token_uri: String) -> Result<String> {
+    let scheme = token_uri
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(auth_err(format!(
+            "service account key token_uri is {token_uri:?}, which is not https: the assertion \
+             posted there is signed bearer material for this service account and cannot cross \
+             a cleartext connection (a key downloaded from GCP names \
+             https://oauth2.googleapis.com/token)"
+        )));
+    }
+    Ok(token_uri)
 }
 
 /// PKCS#8 PEM ("BEGIN PRIVATE KEY") to DER: strip the markers and
@@ -218,6 +242,8 @@ impl ServiceAccountTokenSource {
 
     /// Overrides where the signed assertion is POSTed (tests point this at
     /// a mock server). The JWT `aud` claim stays the key's `token_uri`.
+    /// The seam is this call and nothing else: a key file cannot reach it,
+    /// and the `token_uri` it would come from is https or it is refused.
     pub fn with_token_endpoint(mut self, url: impl Into<String>) -> Self {
         self.token_endpoint = url.into();
         self
@@ -555,6 +581,59 @@ mod tests {
             ProviderError::Auth(msg) => assert!(msg.contains("RSA"), "{msg}"),
             other => panic!("expected Auth, got {other:?}"),
         }
+    }
+
+    /// A key that names a cleartext endpoint is refused at parse, because
+    /// the assertion it would sign is bearer material for the account and
+    /// the document it comes from is a paste box away from a stranger.
+    #[test]
+    fn a_token_uri_that_is_not_https_is_rejected() {
+        for uri in [
+            "http://oauth2.googleapis.com/token",
+            "HTTP://oauth2.googleapis.com/token",
+            "oauth2.googleapis.com/token",
+            "ftp://oauth2.googleapis.com/token",
+            "",
+        ] {
+            let mut key: Value = serde_json::from_str(TEST_KEY_JSON).unwrap();
+            key["token_uri"] = Value::String(uri.to_owned());
+            let err = ServiceAccountTokenSource::from_json(&key.to_string()).unwrap_err();
+            match err {
+                ProviderError::Auth(msg) => {
+                    assert!(msg.contains("https"), "no remedy for {uri:?}: {msg}");
+                    assert!(msg.contains(uri), "{uri:?} is not named in: {msg}");
+                }
+                other => panic!("expected Auth for {uri:?}, got {other:?}"),
+            }
+        }
+        // A scheme is a scheme rather than a spelling, so the shouted one
+        // is the same endpoint and stays acceptable.
+        let mut key: Value = serde_json::from_str(TEST_KEY_JSON).unwrap();
+        key["token_uri"] = Value::String("HTTPS://oauth2.googleapis.com/token".to_owned());
+        ServiceAccountTokenSource::from_json(&key.to_string()).expect("https in any case");
+    }
+
+    /// And the refusal is what keeps the assertion off the wire: pointed
+    /// at a real cleartext server, the source never gets far enough to
+    /// post anything to it.
+    #[tokio::test]
+    async fn a_cleartext_endpoint_receives_no_assertion() {
+        let server = MockServer::start().await;
+        assert!(
+            server.uri().starts_with("http://"),
+            "the mock stopped being cleartext, so this proves nothing"
+        );
+        Mock::given(method("POST"))
+            .respond_with(token_response("never-minted", 3600))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut key: Value = serde_json::from_str(TEST_KEY_JSON).unwrap();
+        key["token_uri"] = Value::String(format!("{}/token", server.uri()));
+        ServiceAccountTokenSource::from_json(&key.to_string())
+            .expect_err("a cleartext token_uri must not build a source");
+        server.verify().await;
     }
 
     #[test]
