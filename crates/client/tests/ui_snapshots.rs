@@ -790,13 +790,42 @@ fn home_settings_narrow() {
 #[test]
 fn session_settings_you() {
     // The You tab: the avatar row above the theme picker, which is where the
-    // two things you set once ended up.
+    // two things you set once ended up, and under them the build and this
+    // run's log. The path is the one main hands over, so a fixture that left
+    // it None would render the tab a real launch never shows.
+    let mut app = drawer_app(
+        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
+        SettingsTab::You,
+    );
+    app.log_path = Some(PathBuf::from(
+        "/Users/you/Library/Application Support/jamstream/logs/app.log",
+    ));
+    let mut harness = app_harness(app, WIDE);
+    // The whole point of drawing it: a Windows release build has no console,
+    // so this label is the only place the path appears.
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("jamstream/logs/app.log")
+            .is_some(),
+        "the log path has to be readable in the drawer"
+    );
+    snapshot(&mut harness, "session_settings_you");
+}
+
+#[test]
+fn session_settings_no_log() {
+    // A machine with no platform data directory: logging::init returned None
+    // and there is no file. Saying so beats printing a path nothing wrote.
     let app = drawer_app(
         session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
         SettingsTab::You,
     );
+    assert!(app.log_path.is_none());
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_settings_you");
+    harness.run_steps(4);
+    assert!(harness.query_by_label("Copy path").is_none());
+    snapshot(&mut harness, "session_settings_no_log");
 }
 
 #[test]

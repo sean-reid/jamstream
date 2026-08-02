@@ -16,8 +16,10 @@ const ICON_PNG: &[u8] = include_bytes!("../assets/icon/jamstream-512.png");
 
 fn main() -> eframe::Result {
     // First, before anything can fail: the subscriber and the panic hook are
-    // what make a failure before the window opens visible at all.
-    jamstream_client::logging::init();
+    // what make a failure before the window opens visible at all. The path it
+    // returns is carried into the app because on Windows there is no console
+    // to print it to, so Settings is the only place a stuck user can read it.
+    let log_path = jamstream_client::logging::init();
     let demo = std::env::args().any(|a| a == "--demo");
     let icon = eframe::icon_data::from_png_bytes(ICON_PNG)
         .expect("assets/icon/jamstream-512.png is a valid PNG");
@@ -33,11 +35,12 @@ fn main() -> eframe::Result {
         "jamstream",
         options,
         Box::new(move |_cc| {
-            let app = if demo {
+            let mut app = if demo {
                 JamApp::demo()
             } else {
                 JamApp::with_system_devices()
             };
+            app.log_path = log_path;
             Ok(Box::new(app))
         }),
     )

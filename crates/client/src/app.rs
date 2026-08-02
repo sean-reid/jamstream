@@ -12,6 +12,7 @@ use crate::demo::DemoRuntime;
 use crate::exec::{Executor, Job};
 use crate::live::{AudioSettings, CostedRuntime, LiveError, LiveRuntime};
 use crate::picker::{Pick, Picked};
+use crate::reveal;
 use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
 use crate::screens::devices::{
@@ -154,6 +155,14 @@ pub struct JamApp {
     /// and in-memory apps so no fixture reads or rewrites the developer's
     /// own (#328).
     pub settings_path: Option<std::path::PathBuf>,
+    /// The log this run is writing, as [`crate::logging::init`] opened it.
+    /// Set by main and nowhere else: a release build on Windows has no
+    /// console, so Settings is the only place a stuck user can read the path
+    /// off, and only main knows whether the file really opened. `None` shows
+    /// nothing rather than a path that might not exist.
+    pub log_path: Option<std::path::PathBuf>,
+    /// Why the file manager would not open on the log; shown under the row.
+    log_reveal_error: Option<String>,
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
@@ -224,6 +233,8 @@ impl JamApp {
             applied_audio: AudioSettings::default(),
             enumerate: Arc::new(|| Ok(DeviceCatalog::demo())),
             settings_path: None,
+            log_path: None,
+            log_reveal_error: None,
             ending: None,
             confirm_quit: false,
             allow_close: false,
@@ -940,8 +951,55 @@ impl JamApp {
                         self.theme = value;
                     }
                 }
+                ui.add_space(theme::SPACE_XL);
+                self.about_ui(ui);
                 None
             }
+        }
+    }
+
+    /// The build, and where this run's log is.
+    ///
+    /// The path is here because it is nowhere else: a release build on
+    /// Windows detaches from the console, so `jamstream-app.exe` from
+    /// PowerShell prints nothing, and the file is the only account of a
+    /// failure anyone can attach to a bug report. Terse on purpose, at the
+    /// bottom of the tab that is already about this installation.
+    fn about_ui(&mut self, ui: &mut Ui) {
+        ui.label(theme::title(ui, "About"));
+        ui.label(theme::mono_muted(
+            ui,
+            format!("jamstream-app {}", env!("CARGO_PKG_VERSION")),
+        ));
+        let Some(path) = self.log_path.clone() else {
+            // No data directory to keep one in; init said so by returning
+            // None, and promising a file that does not exist is worse than
+            // saying there is none.
+            ui.label(theme::muted(
+                ui,
+                "No log file on this machine; diagnostics go to stderr.",
+            ));
+            return;
+        };
+        ui.add_space(theme::SPACE_XS);
+        ui.label(theme::muted(ui, "This run's log, for a bug report:"));
+        let text = path.display().to_string();
+        // Wrapped, not truncated: someone reading this is about to type it
+        // into a file manager, and an ellipsis in the middle of a path is
+        // exactly as useless as no path at all.
+        ui.add(egui::Label::new(theme::mono_muted(ui, text.clone())).wrap());
+        ui.horizontal(|ui| {
+            if ui.button("Copy path").clicked() {
+                ui.ctx().copy_text(text);
+            }
+            if ui.button(reveal::LABEL).clicked() {
+                // Never a dead button: a machine with no file manager says so
+                // where the path is already readable above.
+                self.log_reveal_error = reveal::show(&path).err();
+            }
+        });
+        if let Some(err) = self.log_reveal_error.clone() {
+            theme::reason(ui, err);
         }
     }
 
