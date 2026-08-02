@@ -39,6 +39,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
@@ -123,6 +125,8 @@ jobs:
           - opus_decode
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Pinned like everything else, but to master with `toolchain: nightly`:
       # the @nightly branch is master plus that as a default, and it gets
       # force-pushed. The toolchain itself is still whatever nightly is today.
@@ -176,6 +180,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
@@ -262,6 +268,8 @@ jobs:
           fi
       - if: steps.creds.outputs.available == 'true'
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Commit pins, per the policy documented in ci.yml. This job holds a
       # credential that can create and destroy droplets.
       - if: steps.creds.outputs.available == 'true'
