@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.2.0](https://github.com/sean-reid/jamstream/compare/v0.1.6...v0.2.0) (2026-08-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **protocol:** the cookie challenge wire format changed and PROTOCOL_VERSION is now 2. A 0.1.x peer draws the authenticated version reject instead of a session, which is deliberate pre-1.0.
+
+### Features
+
+* any device rate carries a 48 kHz session ([#367](https://github.com/sean-reid/jamstream/issues/367)) ([f299d4e](https://github.com/sean-reid/jamstream/commit/f299d4efed92612f773320a9997c29f6c6d2efbb))
+* **audio-io:** a 48 kHz boundary for devices that cannot clock there ([#365](https://github.com/sean-reid/jamstream/issues/365)) ([2afe783](https://github.com/sean-reid/jamstream/commit/2afe7838b2128a63484b543f1d65e2332cf5a421))
+* **client:** a host can say who they are ([#403](https://github.com/sean-reid/jamstream/issues/403)) ([6a652a0](https://github.com/sean-reid/jamstream/commit/6a652a0274ab3689e34e4dc18aaa972b801dd0b7))
+* **client:** a session screen that tells the truth ([#366](https://github.com/sean-reid/jamstream/issues/366)) ([852c594](https://github.com/sean-reid/jamstream/commit/852c59407a1a50b679fedde95e54f889fd5dd749)), closes [#357](https://github.com/sean-reid/jamstream/issues/357)
+* **client:** a Windows exe that says what it is ([#352](https://github.com/sean-reid/jamstream/issues/352)) ([2573bec](https://github.com/sean-reid/jamstream/commit/2573bec6cf15e329b81a99b95b5d701eeb067520)), closes [#341](https://github.com/sean-reid/jamstream/issues/341)
+* **packaging:** render Scoop manifests beside winget ([#358](https://github.com/sean-reid/jamstream/issues/358)) ([b5d9af3](https://github.com/sean-reid/jamstream/commit/b5d9af3a7282cc4e695c1ec337416a2c3511e3b8))
+
+
+### Bug Fixes
+
+* an install that fails leaves nothing behind ([#349](https://github.com/sean-reid/jamstream/issues/349)) ([77df618](https://github.com/sean-reid/jamstream/commit/77df61828b910fb78f60d30c6cc87dfbaabbd1a3))
+* **audio-io:** the backend tells the truth about devices ([#359](https://github.com/sean-reid/jamstream/issues/359)) ([c4b6c32](https://github.com/sean-reid/jamstream/commit/c4b6c32c26055d3cf09069afaf5a3056b6bc0172))
+* **client:** a GUI subsystem on Windows, with quiet child processes ([#344](https://github.com/sean-reid/jamstream/issues/344)) ([7682045](https://github.com/sean-reid/jamstream/commit/76820459a0d9aba985bbd587eeb4154494eca072))
+* **client:** a provider error a musician can read ([#368](https://github.com/sean-reid/jamstream/issues/368)) ([e1b1186](https://github.com/sean-reid/jamstream/commit/e1b1186c314d692707a20da4f56735db79966fc3))
+* **client:** bound the audio reopen loop ([#400](https://github.com/sean-reid/jamstream/issues/400)) ([c0c1ea7](https://github.com/sean-reid/jamstream/commit/c0c1ea7316a79cadbee6c68c1422954003ba624c))
+* **client:** keep the build version out of the snapshot baselines ([#402](https://github.com/sean-reid/jamstream/issues/402)) ([f608a86](https://github.com/sean-reid/jamstream/commit/f608a86774ac01091cb5a72b0a19658b50340e1a))
+* **client:** open the log with a banner so an empty file means healthy ([#348](https://github.com/sean-reid/jamstream/issues/348)) ([3fdad80](https://github.com/sean-reid/jamstream/commit/3fdad80c58bfef1bbfe4116b5f208df67303b6e6))
+* **client:** size the audio ring from what the device delivers ([#355](https://github.com/sean-reid/jamstream/issues/355)) ([7756649](https://github.com/sean-reid/jamstream/commit/7756649c1e4efecfc4240f769156446fdde32be5)), closes [#323](https://github.com/sean-reid/jamstream/issues/323)
+* **client:** store a credential the keychain refuses as a private file ([#346](https://github.com/sean-reid/jamstream/issues/346)) ([a4113ef](https://github.com/sean-reid/jamstream/commit/a4113efdbdc1fb2dae3cb6cd17a392c33743ef6a))
+* **cli:** session records stop lying after any death ([#353](https://github.com/sean-reid/jamstream/issues/353)) ([7712d6e](https://github.com/sean-reid/jamstream/commit/7712d6e53edbada2708e757f9d372ccdf0776b28))
+* **cli:** sweep must not close a session it never really looked for ([#401](https://github.com/sean-reid/jamstream/issues/401)) ([544cb1b](https://github.com/sean-reid/jamstream/commit/544cb1b86281c721958c79ae32189c694e2b966f))
+* **cloud:** refuse or repair an exposed Windows state dir ([#351](https://github.com/sean-reid/jamstream/issues/351)) ([17f8ada](https://github.com/sean-reid/jamstream/commit/17f8ada41a80f8f42e792e4ef85e824a64c678a1))
+* filenames that survive every filesystem and keep the musician's name ([#350](https://github.com/sean-reid/jamstream/issues/350)) ([cf0f561](https://github.com/sean-reid/jamstream/commit/cf0f561a21a45bad8e9abbf3aa36e7a3ca09088a))
+* make the Windows install scripts survive first contact ([#319](https://github.com/sean-reid/jamstream/issues/319)) ([5b899bf](https://github.com/sean-reid/jamstream/commit/5b899bfb76254b42c47cf45b93992e630bbd145f))
+* **protocol:** bind the handshake cookie to its init ([#372](https://github.com/sean-reid/jamstream/issues/372)) ([235708f](https://github.com/sean-reid/jamstream/commit/235708fdada4bad908cd8bb1ba05395cc062ea1d))
+* say what actually shipped ([#399](https://github.com/sean-reid/jamstream/issues/399)) ([7944077](https://github.com/sean-reid/jamstream/commit/7944077b1cb9161e8c427f90fd14dfffb437a278))
+* **session:** drain the avatar cache overshoot on duplicate inserts ([#316](https://github.com/sean-reid/jamstream/issues/316)) ([8a6fedd](https://github.com/sean-reid/jamstream/commit/8a6feddf2cfba2525a77a789bdc90421b81a9f67))
+* the Windows papercuts the audit could fix from here ([#345](https://github.com/sean-reid/jamstream/issues/345)) ([9528f98](https://github.com/sean-reid/jamstream/commit/9528f984830245ba50e1b8aa837a090e7df51025))
+
+
+### Performance Improvements
+
+* **server:** drop the regex engine jamstreamd's log filter never needed ([#369](https://github.com/sean-reid/jamstream/issues/369)) ([bac60a1](https://github.com/sean-reid/jamstream/commit/bac60a1cb52348a060a697becd07b7eb971dfd18))
+
 ## [0.1.6](https://github.com/sean-reid/jamstream/compare/v0.1.5...v0.1.6) (2026-07-29)
 
 
