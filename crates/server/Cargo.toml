@@ -38,6 +38,10 @@ mimalloc.workspace = true
 [dev-dependencies]
 # The version reject story sends an init claiming a version we do not speak.
 jamstream-protocol = { workspace = true, features = ["testing"] }
+# testing: the socket pump every suite here that joins a real member runs on.
+# Not in the dependency above, so jamstreamd links neither it nor tokio's
+# presence in that crate.
+jamstream-session = { workspace = true, features = ["testing"] }
 # testing: the recording tests upload into the in-memory object store. Not in
 # the dependency above, so jamstreamd links neither it nor the contract suites.
 jamstream-cloud = { workspace = true, features = ["testing"] }

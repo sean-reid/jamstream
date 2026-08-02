@@ -22,6 +22,7 @@ use jamstream_protocol::ids::{DestinationId, Role, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_server::runtime::{Options, Server};
 use jamstream_session::client::{ClientCore, ClientEvent};
+use jamstream_session::testing::pump;
 use jamstream_stream::pipeline::StreamConfig;
 use tokio::net::UdpSocket;
 
@@ -66,24 +67,7 @@ impl Peer {
     }
 
     async fn pump(&mut self, now_ms: u64) {
-        for pkt in self.core.poll(now_ms) {
-            let _ = self.socket.send(&pkt).await;
-        }
-        // Everything the socket is holding right now, and not one packet
-        // more: `try_recv` ends the pass the moment the queue is empty
-        // instead of waiting for the next arrival, so the drain can never
-        // consume slower than the 400 packets a second a musician's
-        // downlink produces. A pass bounded by a packet count instead ran
-        // at 64 per loop and left this peer reading further behind real
-        // time on every iteration, which is what a status arriving seconds
-        // after the server sent it looks like (#389).
-        let mut buf = [0u8; 2048];
-        while let Ok(len) = self.socket.try_recv(&mut buf) {
-            for pkt in self.core.handle_datagram(now_ms, &buf[..len]) {
-                let _ = self.socket.send(&pkt).await;
-            }
-        }
-        for event in self.core.events() {
+        for event in pump(&self.socket, &mut self.core, now_ms).await {
             if let ClientEvent::StreamStatus(d) = event {
                 self.statuses.push(d);
             }

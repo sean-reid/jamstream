@@ -36,6 +36,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 jamstream-server.workspace = true
+# testing: the local recording story joins a real member, on the same socket
+# pump the server suites use.
+jamstream-session = { workspace = true, features = ["testing"] }
 wiremock.workspace = true
 # The audio fixture generator, so `cargo xtask fixtures` and these tests
 # cannot drift apart. A path dependency and not a workspace one: nothing

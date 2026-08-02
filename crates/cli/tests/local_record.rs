@@ -19,6 +19,7 @@ use jamstream_cli::{end, host, providers, state};
 use jamstream_protocol::control::{RecordOp, RecordingState};
 use jamstream_protocol::invite::Invite;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
+use jamstream_session::testing::pump;
 use tokio::net::UdpSocket;
 
 /// A real client on a real socket, kept only as far as this story needs:
@@ -43,24 +44,10 @@ impl Wire {
         }
     }
 
-    /// One pump pass: flush what the core wants sent, take what arrived,
-    /// and remember the latest recording state the server reported.
+    /// One pump pass, remembering the latest recording state the server
+    /// reported.
     async fn pump(&mut self, now_ms: u64) {
-        for pkt in self.core.poll(now_ms) {
-            self.socket.send(&pkt).await.unwrap();
-        }
-        let mut buf = [0u8; 2048];
-        for _ in 0..64 {
-            let Ok(Ok(len)) =
-                tokio::time::timeout(Duration::from_millis(2), self.socket.recv(&mut buf)).await
-            else {
-                break;
-            };
-            for pkt in self.core.handle_datagram(now_ms, &buf[..len]) {
-                self.socket.send(&pkt).await.unwrap();
-            }
-        }
-        for event in self.core.events() {
+        for event in pump(&self.socket, &mut self.core, now_ms).await {
             if let ClientEvent::RecordStatus { state, .. } = event {
                 self.last_record_state = Some(state);
             }

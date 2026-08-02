@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use common::{Running, Session, budget, loopback, scratch_dir};
 use jamstream_server::runtime::{Options, Server};
 use jamstream_session::client::{ClientCore, ClientState};
+use jamstream_session::testing::pump;
 use tokio::net::UdpSocket;
 
 struct Client {
@@ -20,26 +21,10 @@ struct Client {
 }
 
 impl Client {
-    /// One pump pass: flush queued traffic, then drain a bounded batch of
-    /// datagrams. Bounded because a joined musician receives a mix frame
-    /// every 2.5 ms; draining until quiet would never return.
+    /// One pump pass. Events are not asserted here; the pass drains them so
+    /// the queue stays bounded.
     async fn pump(&mut self, now_ms: u64) {
-        for pkt in self.core.poll(now_ms) {
-            self.socket.send(&pkt).await.unwrap();
-        }
-        let mut buf = [0u8; 2048];
-        for _ in 0..64 {
-            let Ok(Ok(len)) =
-                tokio::time::timeout(Duration::from_millis(2), self.socket.recv(&mut buf)).await
-            else {
-                break;
-            };
-            for pkt in self.core.handle_datagram(now_ms, &buf[..len]) {
-                self.socket.send(&pkt).await.unwrap();
-            }
-        }
-        // Events are not asserted here; drain so the queue stays bounded.
-        let _ = self.core.events();
+        let _ = pump(&self.socket, &mut self.core, now_ms).await;
     }
 }
 

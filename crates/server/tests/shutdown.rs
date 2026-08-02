@@ -23,6 +23,7 @@ use jamstream_protocol::invite::Invite;
 use jamstream_server::revocations::Revocations;
 use jamstream_server::runtime::Server;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState};
+use jamstream_session::testing::pump;
 #[cfg(unix)]
 use std::net::{IpAddr, Ipv4Addr};
 use tokio::net::UdpSocket;
@@ -48,24 +49,10 @@ impl Client {
         }
     }
 
-    /// One pump pass, bounded: a joined musician gets a mix frame every
-    /// 2.5 ms, so draining until quiet would never return.
+    /// One pump pass, keeping the events this test watches for.
     async fn pump(&mut self, now_ms: u64) {
-        for pkt in self.core.poll(now_ms) {
-            let _ = self.socket.send(&pkt).await;
-        }
-        let mut buf = [0u8; 2048];
-        for _ in 0..64 {
-            let Ok(Ok(len)) =
-                tokio::time::timeout(Duration::from_millis(2), self.socket.recv(&mut buf)).await
-            else {
-                break;
-            };
-            for pkt in self.core.handle_datagram(now_ms, &buf[..len]) {
-                let _ = self.socket.send(&pkt).await;
-            }
-        }
-        self.events.extend(self.core.events());
+        self.events
+            .extend(pump(&self.socket, &mut self.core, now_ms).await);
     }
 
     async fn pump_until_joined(&mut self, start: Instant) -> bool {
