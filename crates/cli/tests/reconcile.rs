@@ -18,6 +18,51 @@ use jamstream_cli::state::{self, SessionState, SessionStatus};
 use jamstream_cli::{CliError, providers, status, sweep};
 use jamstream_cloud::{MockProvider, Provider, ProviderError, ProviderKind, session_tag};
 
+/// Lines of `src` that are exactly `needle` once indentation is stripped.
+/// A const fn so the count below is a build error rather than a test.
+const fn attribute_lines(src: &str, needle: &str) -> usize {
+    let (src, needle) = (src.as_bytes(), needle.as_bytes());
+    let (mut found, mut at) = (0, 0);
+    while at <= src.len() {
+        let mut end = at;
+        while end < src.len() && src[end] != b'\n' {
+            end += 1;
+        }
+        let mut from = at;
+        while from < end && (src[from] == b' ' || src[from] == b'\t') {
+            from += 1;
+        }
+        let mut to = end;
+        while to > from && (src[to - 1] == b' ' || src[to - 1] == b'\t' || src[to - 1] == b'\r') {
+            to -= 1;
+        }
+        if to - from == needle.len() {
+            let mut i = 0;
+            while i < needle.len() && src[from + i] == needle[i] {
+                i += 1;
+            }
+            if i == needle.len() {
+                found += 1;
+            }
+        }
+        at = end + 1;
+    }
+    found
+}
+
+/// The single-test rule this file's `set_var` rests on, enforced at compile
+/// time. Two tests in one binary run on two threads under libtest, which the
+/// coverage job uses, and the second one's state directory would land on the
+/// first one mid-sweep.
+const _: () = assert!(
+    attribute_lines(include_str!("reconcile.rs"), "#[test]")
+        + attribute_lines(include_str!("reconcile.rs"), "#[tokio::test]")
+        == 1,
+    "reconcile.rs sets JAMSTREAM_STATE_DIR for the whole process, so it holds \
+     exactly one test. Add a phase to the one below, or a new file with its \
+     own directory."
+);
+
 /// Credentials that would put a real cloud provider in `resolve_all`, so the
 /// phase that runs a real sweep runs the one a host without them gets.
 const CLOUD_CREDENTIALS: [&str; 6] = [
@@ -71,8 +116,8 @@ async fn records_are_reconciled_after_any_death() {
             .unwrap()
             .as_nanos()
     ));
-    // Safety: this test binary is single-test and sets the variable before
-    // any state access.
+    // Safety: the const assertion above holds this binary to one test, and
+    // the variable is set before the first state access below.
     unsafe {
         std::env::set_var(state::STATE_DIR_ENV, &state_dir);
     }
