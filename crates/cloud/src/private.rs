@@ -27,6 +27,7 @@
 //! hand back, so the exposure is repaired in place instead, and a repair
 //! that fails is the same hard refusal.
 
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,15 +49,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
     let tmp = temp_path(path);
-    let mut opts = std::fs::OpenOptions::new();
-    // create_new is O_CREAT|O_EXCL, which fails rather than following a
-    // symlink or opening a file another account got there first.
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
+    let opts = private_file_options();
     let write = || -> io::Result<()> {
         let mut file = opts.open(&tmp)?;
         file.write_all(bytes)?;
@@ -71,6 +64,53 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Reads a file that holds key material, refusing it when the directory
+/// it sits in is not one only this account can write.
+///
+/// The write side vets the directory on the way in
+/// ([`create_private_dir`]) and the read side has to do the same, because
+/// the vetting is what says who could have put the bytes there. A path
+/// that was private when it was written and is not now hands back
+/// whatever the account that loosened it left behind, and the caller has
+/// no way to tell.
+pub fn read_private(path: &Path) -> io::Result<Vec<u8>> {
+    check_exposure(parent_of(path))?;
+    std::fs::read(path)
+}
+
+/// Creates `path` as a file only this account can read and hands back the
+/// open handle, for the writer that keeps producing lines rather than
+/// having its bytes ready in one buffer. [`write_private`] is the one for
+/// anything that can be handed over whole; the app log cannot, and a log
+/// of provider errors and panic backtraces is no more readable by the
+/// machine than a key is.
+///
+/// Replaces rather than reopens, for the reason `write_private` does: a
+/// file another account pre-created, or a symlink of theirs aimed at one
+/// of their targets, must not be written through or truncated.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+        _ => {}
+    }
+    private_file_options().open(path)
+}
+
+/// How every file this module creates is opened. `create_new` is
+/// `O_CREAT|O_EXCL`, which fails rather than following a symlink or
+/// opening a file another account got there first, and the mode applies
+/// at creation, which is the only moment it can.
+fn private_file_options() -> std::fs::OpenOptions {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts
 }
 
 /// Renames `from` over `to`, retrying a few times before giving up.
@@ -101,10 +141,7 @@ pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
 /// same path must not collide on the temporary.
 fn temp_path(path: &Path) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let parent = parent_of(path);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -114,6 +151,14 @@ fn temp_path(path: &Path) -> PathBuf {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// The directory a path sits in, where a bare file name means the working
+/// directory rather than nothing.
+fn parent_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn create_all(dir: &Path) -> io::Result<()> {
@@ -212,7 +257,7 @@ fn harden_new_dir(_dir: &Path) {}
 
 /// Directories created on the way to the key directory. A failure here is
 /// a warning, not an error: the directory the key files actually land in
-/// is the one [`check_exposure`] re-vets on every [`create_private_dir`],
+/// is the one [`check_exposure`] vets again on the way to every write,
 /// and that one refuses.
 #[cfg(windows)]
 fn harden_new_dir(dir: &Path) {
@@ -228,9 +273,17 @@ fn harden_new_dir(dir: &Path) {
 /// keep for a `JAMSTREAM_STATE_DIR` under `C:\` or another shared root,
 /// which inherits `Authenticated Users: Modify` from the volume root.
 ///
-/// Idempotent, and cheap to repeat: a directory this process already
-/// tightened is remembered and skipped, so the per-write
-/// [`create_private_dir`] calls do not spawn `icacls` every time.
+/// Idempotent, and cheap to repeat: a pass this process ran within
+/// [`HARDENING_STANDS_FOR`] stands in for the next one, so the two
+/// [`create_private_dir`] calls a single registry write makes cost one
+/// pair of `icacls` runs rather than two, and a poll loop writing through
+/// them does not spawn processes every turn.
+///
+/// The window is short on purpose. This process outlives the ACL it read:
+/// the desktop app runs for hours, and a memo that lasted the process
+/// turned the module's promise to vet a directory it finds into a promise
+/// to vet it once, which is what an ACL loosened mid-session walked
+/// straight through (#380).
 ///
 /// Two `icacls` passes, because `/remove:g` cannot touch an inherited ACE:
 ///
@@ -265,18 +318,39 @@ fn harden_new_dir(dir: &Path) {
 ///   dependency we are not taking on for this.
 #[cfg(windows)]
 fn harden_dir(dir: &Path) -> io::Result<()> {
-    use std::collections::HashSet;
-    use std::sync::{LazyLock, Mutex};
-    static HARDENED: LazyLock<Mutex<HashSet<PathBuf>>> =
-        LazyLock::new(|| Mutex::new(HashSet::new()));
+    use std::sync::LazyLock;
+    use std::time::Instant;
+    static HARDENED: LazyLock<Hardened> = LazyLock::new(Hardened::default);
 
     let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    if HARDENED.lock().unwrap().contains(&key) {
+    if hardening_still_stands(&HARDENED, &key, Instant::now()) {
         return Ok(());
     }
     harden_dir_with(&system32("icacls.exe"), dir)?;
-    HARDENED.lock().unwrap().insert(key);
+    HARDENED.lock().unwrap().insert(key, Instant::now());
     Ok(())
+}
+
+/// When [`harden_dir`] last ran a pass over each directory, by canonical
+/// path. Compiled off Windows as well so the window it implements is
+/// checkable in every platform's suite; only Windows has a pass to skip.
+#[cfg(any(windows, test))]
+type Hardened = std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>;
+
+/// How long one `icacls` pass answers for a directory. Long enough to
+/// collapse the calls a single write makes, short enough that an ACL
+/// changed while the app is open is caught by the next write rather than
+/// by the next launch.
+#[cfg(any(windows, test))]
+const HARDENING_STANDS_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether the pass recorded for `dir` still answers for it at `now`.
+#[cfg(any(windows, test))]
+fn hardening_still_stands(memo: &Hardened, dir: &Path, now: std::time::Instant) -> bool {
+    memo.lock()
+        .unwrap()
+        .get(dir)
+        .is_some_and(|last| now.duration_since(*last) < HARDENING_STANDS_FOR)
 }
 
 /// [`harden_dir`] with the tool path injectable, which is the only way a
@@ -507,6 +581,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The handle the app log is written through gets what a key file
+    /// gets: a fresh 0600 inode, and a symlink left at the path replaced
+    /// rather than followed.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_private_file_replaces_what_it_finds() {
+        use std::io::Write as _;
+        let root = temp_dir("openfile");
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        let path = root.join("app.log");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let mut file = create_private_file(&path).unwrap();
+        file.write_all(b"warning\n").unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        assert_eq!(std::fs::read(&path).unwrap(), b"warning\n");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(mode_of(&path), 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// mode() only applies at create, so a rewrite of a file that was left
     /// world-writable has to replace the inode, not open it.
     #[cfg(unix)]
@@ -620,6 +718,38 @@ mod tests {
         assert_eq!(parse_whoami_sid(""), None);
     }
 
+    /// The memo the Windows hardening keeps is a dedupe for one write's
+    /// worth of calls, not a verdict for the life of the process: past its
+    /// window a directory is checked again, which is the whole of what the
+    /// module doc promises about a directory that already exists.
+    #[test]
+    fn a_recorded_hardening_stops_answering_after_its_window() {
+        use std::time::{Duration, Instant};
+        let memo = Hardened::default();
+        let dir = PathBuf::from("state");
+        let at = Instant::now();
+
+        assert!(
+            !hardening_still_stands(&memo, &dir, at),
+            "nothing has been hardened yet"
+        );
+        memo.lock().unwrap().insert(dir.clone(), at);
+        assert!(hardening_still_stands(&memo, &dir, at));
+        assert!(hardening_still_stands(
+            &memo,
+            &dir,
+            at + HARDENING_STANDS_FOR - Duration::from_millis(1)
+        ));
+        assert!(
+            !hardening_still_stands(&memo, &dir, at + HARDENING_STANDS_FOR),
+            "the window has passed and the ACL has not been looked at since"
+        );
+        assert!(
+            !hardening_still_stands(&memo, Path::new("elsewhere"), at),
+            "one directory's pass answered for another"
+        );
+    }
+
     #[cfg(windows)]
     fn acl_of(dir: &Path) -> String {
         let out = std::process::Command::new("icacls")
@@ -628,6 +758,36 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "icacls query failed");
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Puts the multi-account ACE on `dir` that a shared root would hand
+    /// down, by SID and read-only, so nothing real is exposed while a test
+    /// runs.
+    #[cfg(windows)]
+    fn grant_everyone(dir: &Path) {
+        let out = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(RX)"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cannot stage the Everyone ACE: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Whether Everyone is on `dir`'s ACL. `/findsid` names the directory
+    /// only on a match, which holds in any locale.
+    #[cfg(windows)]
+    fn grants_everyone(dir: &Path) -> bool {
+        let out = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(["/findsid", "*S-1-1-0"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls /findsid failed");
+        String::from_utf8_lossy(&out.stdout).contains(&dir.display().to_string())
     }
 
     /// The ACL tightening must leave the directory usable by us: the worst
@@ -669,16 +829,7 @@ mod tests {
         // by SID, read-only so nothing real is exposed while the test runs).
         let parent = root.join("shared");
         std::fs::create_dir(&parent).unwrap();
-        let granted = std::process::Command::new("icacls")
-            .arg(&parent)
-            .args(["/grant", "*S-1-1-0:(OI)(CI)(RX)"])
-            .output()
-            .unwrap();
-        assert!(
-            granted.status.success(),
-            "cannot stage the inheritable ACE: {}",
-            String::from_utf8_lossy(&granted.stderr)
-        );
+        grant_everyone(&parent);
 
         // A plain create, as a user making the dir themselves would: it
         // inherits the parent's ACEs, which is what makes the assertion
@@ -702,18 +853,39 @@ mod tests {
             "inherited ACEs survived on a pre-existing directory: {after}"
         );
         // And the staged ACE is gone outright, not merely re-marked as
-        // explicit: /findsid names the directory only on a match, which
-        // holds in any locale.
-        let found = std::process::Command::new("icacls")
-            .arg(&dir)
-            .args(["/findsid", "*S-1-1-0"])
-            .output()
-            .unwrap();
-        assert!(found.status.success(), "icacls /findsid failed");
-        let report = String::from_utf8_lossy(&found.stdout).into_owned();
+        // explicit.
         assert!(
-            !report.contains(&dir.display().to_string()),
-            "the Everyone ACE survived the hardening: {report}"
+            !grants_everyone(&dir),
+            "the Everyone ACE survived the hardening: {}",
+            acl_of(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The case issue #380 is about. The app is a long-running process, so
+    /// a directory it hardened at launch has hours in which its ACL can be
+    /// loosened; the next write has to look again rather than answer from
+    /// the memo.
+    #[cfg(windows)]
+    #[test]
+    fn windows_an_acl_loosened_mid_session_is_tightened_again() {
+        let root = temp_dir("reacl");
+        let dir = root.join("state");
+        create_private_dir(&dir).unwrap();
+
+        grant_everyone(&dir);
+        assert!(
+            grants_everyone(&dir),
+            "the loosened ACE did not stick, nothing to test"
+        );
+
+        std::thread::sleep(HARDENING_STANDS_FOR);
+        create_private_dir(&dir).unwrap();
+
+        assert!(
+            !grants_everyone(&dir),
+            "a directory hardened once was never looked at again: {}",
+            acl_of(&dir)
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -26,11 +26,11 @@
 //! same class of secret was safe to put on a screen (#184). It is not.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use jamstream_cloud::cloudinit::StorageCredential;
-use jamstream_cloud::private::{create_private_dir, write_private};
+use jamstream_cloud::private::{create_private_dir, read_private, write_private};
 use jamstream_cloud::providers::aws::AwsProvider;
 use jamstream_cloud::providers::digitalocean::DigitalOceanProvider;
 use jamstream_cloud::providers::gcp::GcpProvider;
@@ -195,7 +195,9 @@ impl Keychain for SystemKeychain {
 /// [`jamstream_cloud::private`] so the file is 0600 on unix and on Windows
 /// inherits from a directory whose ACL was tightened at creation. Reads
 /// ask the keychain first and fall through to the file, so which place
-/// holds a secret is never recorded anywhere.
+/// holds a secret is never recorded anywhere, and the fallback read vets
+/// the directory the write vetted: a key kept somewhere that has stopped
+/// being private is not handed back.
 pub struct KeyringStore {
     keychain: Box<dyn Keychain>,
     /// Where an oversized secret lands; the CLI's own data directory
@@ -242,6 +244,29 @@ impl KeyringStore {
                 )
             })
     }
+
+    /// The read half of [`KeyringStore::set_fallback`], vetted the way the
+    /// write was. The secret that lands here in practice is a GCP service
+    /// account key, and a directory that has stopped being private since
+    /// the key was written is one somebody else can hand a key back from.
+    ///
+    /// A refusal reads as nothing saved, which is a state the wizard
+    /// already explains; the reason goes to the log, naming the path and
+    /// never the value.
+    fn read_fallback(path: &Path) -> Option<String> {
+        match read_private(path) {
+            Ok(bytes) => String::from_utf8(bytes).ok().filter(|v| !v.is_empty()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "refusing to read a saved credential"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl CredStore for KeyringStore {
@@ -251,7 +276,7 @@ impl CredStore for KeyringStore {
             .filter(|v| !v.is_empty())
             .or_else(|| {
                 let path = self.fallback_path(provider, field).ok()?;
-                std::fs::read_to_string(path).ok().filter(|v| !v.is_empty())
+                Self::read_fallback(&path)
             })
     }
 
@@ -766,6 +791,37 @@ mod tests {
         store.delete(provider, field);
         assert!(!path.exists(), "delete left the file behind");
         assert_eq!(store.get(provider, field), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The directory is vetted on the way out too. The file it guards is
+    /// the GCP service account key on the machines that reach the fallback
+    /// at all, and once the directory is writable by everyone the key that
+    /// reads back is whoever's key was put there last.
+    #[cfg(unix)]
+    #[test]
+    fn a_fallback_directory_that_stopped_being_private_is_not_read_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (store, dir) = capped_store("loosened");
+        let (provider, field) = GCP_SERVICE_ACCOUNT_JSON;
+        let secret = "x".repeat(2500);
+        store.set(provider, field, &secret).expect("set");
+        assert_eq!(store.get(provider, field).as_deref(), Some(secret.as_str()));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(
+            dir.join("gcp.service_account_json").is_file(),
+            "the file has to still be there for the refusal to mean anything"
+        );
+        assert_eq!(
+            store.get(provider, field),
+            None,
+            "a key read back out of a world writable directory"
+        );
+
+        // Tightened again, it is the same key it always was.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert_eq!(store.get(provider, field).as_deref(), Some(secret.as_str()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
