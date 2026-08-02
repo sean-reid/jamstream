@@ -685,3 +685,46 @@ async fn orphan_cleanup_spares_the_rules_of_a_live_session() {
     );
     server.verify().await;
 }
+
+/// A session in a zone that could not be listed reads as dead to the
+/// liveness check, and deleting its rule locks the musicians out of a jam
+/// that is still playing. Cleanup stands down instead; firewalls cost
+/// nothing and the next sweep collects them.
+#[tokio::test]
+async fn orphan_cleanup_stands_down_when_a_zone_did_not_answer() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(zone_path("us-central1-b")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(firewalls_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                { "name": "jamstream-maybe-live-allow", "targetTags": ["jamstream-maybe-live"] },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .mount(&server)
+        .await;
+    // Any DELETE at all is the bug: the one rule on offer might belong to a
+    // session living in the zone that never answered.
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    assert!(
+        p.destroy_orphan_firewalls()
+            .await
+            .expect("cleanup")
+            .is_empty()
+    );
+    server.verify().await;
+}

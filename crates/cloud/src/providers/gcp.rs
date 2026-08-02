@@ -675,9 +675,18 @@ impl Provider for GcpProvider {
     async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>> {
         // A rule targets one session's network tag, and the instances still
         // carrying that session label are what makes it live.
-        let live: Vec<String> = self
-            .list_tagged(None)
-            .await?
+        let listing = self.list_tagged(None).await?;
+        // A session in a zone that did not answer would read as dead here,
+        // and deleting its rule shuts the musicians out of a jam that is
+        // still playing. Firewalls cost nothing, so the next sweep gets them.
+        if !listing.is_complete() {
+            tracing::warn!(
+                zones = listing.unsearched_display(),
+                "skipping firewall cleanup: some zones could not be listed"
+            );
+            return Ok(Vec::new());
+        }
+        let live: Vec<String> = listing
             .instances
             .iter()
             .filter_map(|i| i.session_id().and_then(|s| network_tag(s).ok()))
