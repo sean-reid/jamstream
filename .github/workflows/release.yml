@@ -489,9 +489,12 @@ jobs:
       # Machine type and subsystem are hard gates: the app must be a GUI
       # binary (no console window on a double-click, which is the one place
       # a regression here shows) while the CLI and server stay console. The
-      # import table is printed as a measurement; tightening it to an
-      # allowlist wants the distribution from a few real releases first.
-      - name: The exes are x64 with the right subsystems, imports on the record
+      # import table is printed in full, because that is how #416 was found,
+      # and the redistributable CRT is a hard gate on top: vcruntime and
+      # msvcp ship with Visual C++, not with Windows, so an exe that imports
+      # one fails in the loader on a clean machine. The static CRT link that
+      # keeps them out lives in .cargo/config.toml.
+      - name: The exes are x64 with the right subsystems and no redistributable CRT
         shell: powershell
         run: |
           $want = @{ 'jamstream.exe' = 3; 'jamstream-app.exe' = 2; 'jamstreamd.exe' = 3 }
@@ -508,12 +511,12 @@ jobs:
           $vs = & $vswhere -latest -property installationPath
           $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe "$vs\VC\Tools\MSVC" |
             Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
-          if ($dumpbin) {
-            foreach ($exe in 'jamstream.exe', 'jamstream-app.exe', 'jamstreamd.exe') {
-              & $dumpbin.FullName /nologo /dependents "target/release/$exe"
-            }
-          } else {
-            Write-Output 'dumpbin not found; import tables not recorded this release'
+          if (-not $dumpbin) { throw 'dumpbin not found, so no exe had its imports checked' }
+          foreach ($exe in 'jamstream.exe', 'jamstream-app.exe', 'jamstreamd.exe') {
+            $imports = & $dumpbin.FullName /nologo /dependents "target/release/$exe"
+            $imports
+            $redist = $imports | Select-String -Pattern '(vcruntime|msvcp|msvcr)\d+.*\.dll'
+            if ($redist) { throw "$exe imports a Visual C++ redistributable DLL, which does not ship with Windows: $(($redist -join '; ').Trim())" }
           }
       # Placeholder: Authenticode signing of both .exe files lands once a
       # Windows code-signing certificate exists. The step name starts with

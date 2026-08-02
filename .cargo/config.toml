@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --package xtask --"
+
+# VCRUNTIME140.dll comes from the Visual C++ redistributable, not from
+# Windows, so a dynamically linked exe dies in the loader on a clean machine
+# before main and before any logging. Linking the CRT in drops that import.
+# A RUSTFLAGS environment variable replaces these flags instead of adding to
+# them, so a Windows build that sets one has to carry this flag itself.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
