@@ -12,7 +12,7 @@
 //! nothing in a body can leak: extraction is not a filter someone has to
 //! maintain.
 
-use jamstream_cloud::{ProviderError, ProviderKind, http};
+use jamstream_cloud::{AWS_QUOTE, ProviderError, ProviderKind, http};
 
 use crate::CliError;
 
@@ -49,13 +49,6 @@ impl Attempt {
         }
     }
 }
-
-/// The aside `jamstream_cloud`'s AWS provider appends when it quotes EC2
-/// inside a sentence of its own: everything before it names the IAM action
-/// the policy is missing and where to add it, and everything after it is
-/// EC2's message, which is the part naming the account number and the ARN.
-/// The screen keeps the head; the log already has both.
-const AWS_QUOTE: &str = " (AWS said:";
 
 /// One sentence for the surface; the whole error for the log.
 ///

@@ -61,6 +61,7 @@ pub use date::civil_from_days;
 pub use mock::MockProvider;
 pub use probe::{ProbeTarget, probe_all, probe_catalog};
 pub use provider::{Provider, ProviderError, Result, Sleeper, TokioSleeper, WaitOpts};
+pub use providers::aws::AWS_QUOTE;
 pub use recording::{
     BitDepth, EgressQuote, RecordingEstimate, RecordingPlan, StoragePrice, storage_price,
 };

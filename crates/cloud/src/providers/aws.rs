@@ -935,6 +935,15 @@ const AWS_SETUP_URL: &str = "https://sean-reid.github.io/jamstream/guides/provid
 /// fix.
 const ENCODED_AUTHORIZATION_MESSAGE: &str = "Encoded authorization failure message:";
 
+/// Marks where our half of a denial stops and EC2's begins. Ahead of it is
+/// the missing action and the page with the policy to paste; after it, up to
+/// the closing `)`, is EC2's own message, which names the account number and
+/// the IAM ARN. A user-facing surface keeps the head and drops the tail, so
+/// the marker is one constant both the sentence that composes it and the cut
+/// that reads it name: two copies of this text can drift apart with nothing
+/// failing, and the drift is a leak.
+pub const AWS_QUOTE: &str = " (AWS said:";
+
 /// The action an UnauthorizedOperation message names, if it names one. AWS
 /// phrases it "is not authorized to perform: ec2:CreateSecurityGroup on
 /// resource: ...".
@@ -973,8 +982,8 @@ fn map_error_body(body: &str) -> ProviderError {
             .unwrap_or(&message)
             .trim();
         return ProviderError::Auth(format!(
-            "{code}: {missing}. Update the jamstream-host policy at {AWS_SETUP_URL} \
-             (AWS said: {said})"
+            "{code}: {missing}. Update the jamstream-host policy at \
+             {AWS_SETUP_URL}{AWS_QUOTE} {said})"
         ));
     }
     if code == "RequestLimitExceeded" || code == "Throttling" {
@@ -1826,6 +1835,35 @@ mod tests {
             map_error_body("not xml at all"),
             ProviderError::Other(_)
         ));
+    }
+
+    /// A denial is two halves and the seam between them is [`AWS_QUOTE`]:
+    /// ours ahead of it, EC2's after it, with the account number and the IAM
+    /// ARN in EC2's half. The CLI cuts a user-facing sentence on that
+    /// constant, so composing the seam from anything else here is a leak,
+    /// and this fails rather than lets one happen.
+    #[test]
+    fn a_denial_marks_where_our_words_end_and_ec2s_begin() {
+        let body = "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>\
+                    You are not authorized to perform this operation. User: \
+                    arn:aws:iam::887762372032:user/jamstream is not authorized to perform: \
+                    ec2:RunInstances on resource: \
+                    arn:aws:ec2:us-west-2:887762372032:instance/*</Message></Error></Errors>\
+                    </Response>";
+        let ProviderError::Auth(message) = map_error_body(body) else {
+            panic!("a denial is an auth failure");
+        };
+        let (ours, ec2s) = message
+            .split_once(AWS_QUOTE)
+            .unwrap_or_else(|| panic!("the quote is unmarked: {message}"));
+        assert!(
+            ours.contains("the IAM policy is missing ec2:RunInstances"),
+            "{ours}"
+        );
+        assert!(ours.contains(AWS_SETUP_URL), "{ours}");
+        assert!(!ours.contains("arn:aws:"), "our half stays ours: {ours}");
+        assert!(ec2s.contains("arn:aws:iam::887762372032"), "{ec2s}");
+        assert!(ec2s.ends_with(')'), "{ec2s}");
     }
 
     // ---- Catalog, data file, constructors ----
