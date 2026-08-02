@@ -39,7 +39,6 @@ jamstream-broadcast.workspace = true
 data-encoding.workspace = true
 eframe.workspace = true
 egui.workspace = true
-egui_extras.workspace = true
 image.workspace = true
 rfd.workspace = true
 serde.workspace = true

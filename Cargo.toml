@@ -103,7 +103,12 @@ zeroize = "1"
 # crates/protocol/fuzz/fuzz_targets/opus_decode.rs records the rest of the
 # posture and fuzzes the decoder nightly.
 opus = { package = "opusic-c", version = "~1.6" }
-rubato = "4"
+# default-features off drops `fft_resampler`, and with it realfft and
+# rustfft. Both resamplers here are sinc: the device boundary's fixed-ratio
+# `Async` and the drift compensator's `Slip`. The FFT path is generic and
+# never instantiated, so it reached no binary; what it cost was compile time
+# and two more crates to audit.
+rubato = { version = "4", default-features = false }
 # Pure-Rust FLAC encoder for session recording; nothing to cross-compile for
 # the musl and Windows builds. default-features off drops `par` (a
 # crossbeam-channel worker pool: the recorder already encodes on its own
@@ -174,7 +179,6 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # App::save implementation on our side.
 eframe = { version = "0.35", features = ["persistence"] }
 egui = "0.35"
-egui_extras = "0.35"
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 # Build-time only: compiles the icon and VERSIONINFO resources into the
 # Windows exes. A plain build-dependency, not target-gated, because the

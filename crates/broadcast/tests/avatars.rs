@@ -8,12 +8,12 @@ use common::solid_png;
 use jamstream_broadcast::{AvatarError, AvatarImage, MAX_BYTES, MAX_DIM};
 
 /// The byte cap belongs to the control plane: it is how big an avatar the
-/// roster will carry, and this crate retypes the literal because it links
-/// nothing of ours and cannot import it. Drift either way is a live defect. If
-/// the transfer cap rose, the renderer would refuse pictures the session had
-/// already delivered; if it fell, this crate would decode bytes no member can
-/// send. A dev-dependency and this test are the only thing that can hold them
-/// together (#232).
+/// roster will carry. Drift either way is a live defect. If the transfer cap
+/// rose, the renderer would refuse pictures the session had already
+/// delivered; if it fell, this crate would decode bytes no member can send.
+/// `MAX_BYTES` derives from the protocol constant so the two cannot come
+/// apart; this pins that it still does, and fails the day someone retypes
+/// the literal (#232, #387).
 #[test]
 fn the_byte_cap_is_the_control_planes_own_number() {
     assert_eq!(

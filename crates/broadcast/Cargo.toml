@@ -12,11 +12,9 @@ tiny-skia.workspace = true
 ab_glyph.workspace = true
 image.workspace = true
 thiserror.workspace = true
-
-# Tests only, and on purpose: this crate draws frames and links nothing of
-# ours, which is what keeps it a pure function of its inputs. The avatar byte
-# cap is the transfer layer's number, though, and a renderer that accepted a
-# larger file than the control plane will carry is a renderer with a cap for
-# nothing, so `tests/avatars.rs` holds the two together (#232).
-[dev-dependencies]
+# The avatar byte cap only: this crate decodes untrusted pictures on the
+# public VM and the size it refuses at has to be the one the control plane
+# will carry, so `avatar::MAX_BYTES` reads the constant rather than retyping
+# it (#232, #387). Every consumer of this crate already links protocol, so
+# the edge costs no bytes in any shipped binary.
 jamstream-protocol.workspace = true

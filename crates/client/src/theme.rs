@@ -169,25 +169,27 @@ pub fn palette_of(ui: &Ui) -> &'static Palette {
     }
 }
 
-/// Bundled fonts only; egui's defaults are explicitly not used.
+/// Bundled fonts only; egui's defaults are explicitly not used. The files
+/// are the tree's one set, shared with the stream card and the docs site so
+/// a name is drawn in the same shapes wherever it appears.
 fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::empty();
     fonts.font_data.insert(
         "public-sans".to_owned(),
         Arc::new(FontData::from_static(include_bytes!(
-            "../assets/fonts/PublicSans-Regular.ttf"
+            "../../../fonts/PublicSans-Regular.ttf"
         ))),
     );
     fonts.font_data.insert(
         "public-sans-semibold".to_owned(),
         Arc::new(FontData::from_static(include_bytes!(
-            "../assets/fonts/PublicSans-SemiBold.ttf"
+            "../../../fonts/PublicSans-SemiBold.ttf"
         ))),
     );
     fonts.font_data.insert(
         "plex-mono".to_owned(),
         Arc::new(FontData::from_static(include_bytes!(
-            "../assets/fonts/IBMPlexMono-Regular.ttf"
+            "../../../fonts/IBMPlexMono-Regular.ttf"
         ))),
     );
     fonts

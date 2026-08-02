@@ -4,8 +4,10 @@
 
 use thiserror::Error;
 
-/// Encoded size cap, checked before any decoding.
-pub const MAX_BYTES: usize = 256 * 1024;
+/// Encoded size cap, checked before any decoding. The control plane's own
+/// number: a picture the roster will not carry is not one to decode here,
+/// and a picture it will carry must not be refused after delivery.
+pub const MAX_BYTES: usize = jamstream_protocol::control::MAX_AVATAR_BYTES;
 /// Decoded dimension cap per axis.
 pub const MAX_DIM: u32 = 1024;
 
