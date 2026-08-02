@@ -23,6 +23,12 @@ mod format;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod cpal_backend;
 
+/// The sample-rate ladder the cpal backend opens each direction on. Split out
+/// of `cpal_backend` because it decides rather than does: no device, no host
+/// call, so its tests run anywhere the crate builds.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod cpal_policy;
+
 /// Failure classification and the shared-mode fallback table for the Windows
 /// exclusive path. Built everywhere so its unit tests run on every host.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
