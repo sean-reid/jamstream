@@ -3,6 +3,9 @@
 # wall time per job on a warm Swatinem cache (cold caches pay a one-off
 # compile that no job split can avoid):
 #
+#   changes   seconds   classifies the diff; when it is docs-only (site and
+#                       root markdown, site images) the compile jobs skip
+#   hygiene   seconds   action pins + shellcheck + the LF gate, on every diff
 #   lint      ~4 min    fmt + clippy + cargo-deny
 #   test      ~6-8 min  unit + property + integration + E2E stories, per OS
 #   harness   ~4 min    simulation gate suite (~3 min of test runtime)
@@ -45,6 +48,60 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # A change that only touches prose proves nothing the compile jobs check,
+  # so they skip when the whole diff is docs: markdown under site/, markdown
+  # at the repository root, and the site's committed images.
+  # site/src/install.sh and its siblings are code (the site serves them as
+  # real installers and docs-check executes them), and so is any path the
+  # patterns have never seen. scripts/classify-diff.sh holds the rules and
+  # proves them against known paths on every run.
+  #
+  # A job skipped by its if: still satisfies branch protection (GitHub
+  # counts a skipped required check as passing), so no twin no-op workflow
+  # and no protection change is needed. The required aggregator below then
+  # checks that skipped-for-docs is the result each gated job reported.
+  # docs-check.yml has no gate on purpose: docs are exactly what it checks.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs-only: ${{ steps.classify.outputs.docs-only }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The merge base against the PR's base branch needs history from
+          # both sides.
+          fetch-depth: 0
+      - name: Classify the diff as docs-only or code
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -eu
+          if [ "$EVENT" = pull_request ]; then
+            base=$(git merge-base "origin/$BASE_REF" HEAD)
+          else
+            # A push compares against the tip it replaced. The first push
+            # of a ref and a force push have no reachable before-sha, so
+            # they run everything rather than guess.
+            base=$BEFORE
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+              || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              echo "no usable previous sha (before: '${BEFORE:-none}'); classifying as code"
+              echo "docs-only=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          verdict=$(scripts/classify-diff.sh "$base" HEAD)
+          echo "verdict: $verdict"
+          if [ "$verdict" = docs ]; then
+            echo "docs-only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs-only=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # We squash-merge, so the PR title becomes the commit message on main, and
   # release-please builds the changelog from those. A title that is not a
   # conventional commit is not an error anywhere: the PR merges, CI is green,
@@ -94,7 +151,37 @@ jobs:
           MSG
           exit 1
 
+  # The text-level gates, split out of lint so they stay on when lint's
+  # cargo steps skip for a docs-only diff: a docs PR can commit a CRLF
+  # markdown file as easily as a code PR can, and the other two cost
+  # seconds. Nothing here needs a toolchain or a cache.
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every third-party action is pinned to a commit
+        run: scripts/check-action-pins.sh
+      # release.yml's shell helpers live in scripts/; keep them
+      # shellcheck-clean (shellcheck is preinstalled on ubuntu runners).
+      - name: Shellcheck the repository scripts
+        run: shellcheck scripts/*.sh
+      # .gitattributes normalizes everything to LF so the bash steps Windows
+      # runners execute and the byte-compare gates keep working; this proves
+      # the index stayed normalized after checkouts from misconfigured
+      # machines. i/none and i/-text are fine (no line endings, binary).
+      - name: Every text file is stored with LF
+        run: |
+          bad=$(git ls-files --eol | grep -E '^i/(crlf|mixed)' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            echo "CRLF or mixed line endings in the index; run git add --renormalize ." >&2
+            exit 1
+          fi
+
   lint:
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -111,7 +198,8 @@ jobs:
       # This comment claimed the pinning was total while two actions,
       # cargo-deny below and taiki-e/install-action, sat on @v2. The claim is
       # what made that hard to see, so the policy is now enforced by
-      # scripts/check-action-pins.sh in this job rather than asserted here.
+      # scripts/check-action-pins.sh in the hygiene job rather than asserted
+      # here.
       #
       # dtolnay/rust-toolchain is pinned to master, which is append-only, with
       # an explicit `toolchain: stable`; the @stable branch is only master
@@ -125,8 +213,6 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - name: Every third-party action is pinned to a commit
-        run: scripts/check-action-pins.sh
       # Staleness gate. cargo-deny audits Cargo.lock and every cargo
       # invocation in this repo passes --locked, so a lockfile that does not
       # match Cargo.toml turns into a build failure minutes into some other
@@ -140,22 +226,6 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-      # release.yml's shell helpers live in scripts/; keep them
-      # shellcheck-clean (shellcheck is preinstalled on ubuntu runners).
-      - name: Shellcheck release scripts
-        run: shellcheck scripts/*.sh
-      # .gitattributes normalizes everything to LF so the bash steps Windows
-      # runners execute and the byte-compare gates keep working; this proves
-      # the index stayed normalized after checkouts from misconfigured
-      # machines. i/none and i/-text are fine (no line endings, binary).
-      - name: Every text file is stored with LF
-        run: |
-          bad=$(git ls-files --eol | grep -E '^i/(crlf|mixed)' || true)
-          if [ -n "$bad" ]; then
-            echo "$bad"
-            echo "CRLF or mixed line endings in the index; run git add --renormalize ." >&2
-            exit 1
-          fi
 
   # Unit, property, integration, and E2E story tests, plus a production
   # build of every binary. The harness gate suite runs in its own job below
@@ -172,6 +242,8 @@ jobs:
   # merge green and surface on main at the push-gated release build. So:
   # full workspace on macOS, everything but the snapshot binary elsewhere.
   test:
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -309,7 +381,8 @@ jobs:
   # Thin-lto release compilation is minutes per os; proving it belongs on
   # main, not on every pr iteration. Breakage here is rare and self-locates.
   release-build:
-    if: github.event_name == 'push'
+    needs: [changes]
+    if: github.event_name == 'push' && needs.changes.outputs.docs-only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -330,6 +403,8 @@ jobs:
   # ~3 minutes of pure test runtime, and no audio/UI system deps (the harness
   # wires engine + protocol to virtual clocks), so no apt step.
   harness:
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -478,6 +553,8 @@ jobs:
   # did not compile for weeks while every default-features job stayed green.
   # A configuration nobody builds is a configuration nobody has tested.
   features:
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -492,6 +569,8 @@ jobs:
         run: cargo test --locked -p jamstream-cloud --all-features --all-targets
 
   musl:
+    needs: [changes]
+    if: needs.changes.outputs.docs-only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -560,7 +639,7 @@ jobs:
   # wave a run through exactly when a dependency did not finish.
   required:
     if: always()
-    needs: [pr-title, lint, test, release-build, harness, coverage, features, musl]
+    needs: [pr-title, changes, hygiene, lint, test, release-build, harness, coverage, features, musl]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -599,7 +678,7 @@ jobs:
           FOUND_DOCS=$(job_names .github/workflows/docs-check.yml | tr '\n' ' ')
           # A reformat the awk cannot read would yield nothing and then wave
           # every job through, so the count is the check on the check.
-          test "$(printf '%s' "$CI_JOBS" | wc -w)" -ge 9
+          test "$(printf '%s' "$CI_JOBS" | wc -w)" -ge 10
           test "$(printf '%s' "$FOUND_DOCS" | wc -w)" -ge 5
 
           GATED=$(printf '%s' "$NEEDS" | jq -r 'keys[]' | tr '\n' ' ')
@@ -637,6 +716,7 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           EVENT: ${{ github.event_name }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs-only }}
         run: |
           set -eu
           # Jobs that run on one event only, so `skipped` is their correct
@@ -646,6 +726,12 @@ jobs:
           # a gate that accepts any skip would accept that too.
           PUSH_ONLY='coverage release-build'
           PR_ONLY='pr-title'
+          # The jobs the changes job turns off when the whole diff is docs.
+          # Skipped is their correct result then and a failure any other
+          # time; keep this list equal to the jobs whose if: reads
+          # docs-only above, in both directions, or the next docs-only run
+          # fails here and says which side drifted.
+          DOCS_SKIP='lint test release-build harness features musl'
           status=0
           for job in $(printf '%s' "$NEEDS" | jq -r 'keys[]'); do
             result=$(printf '%s' "$NEEDS" | jq -r --arg j "$job" '.[$j].result')
@@ -655,6 +741,9 @@ jobs:
             esac
             case " $PR_ONLY " in
               *" $job "*) [ "$EVENT" = pull_request ] || want=skipped ;;
+            esac
+            case " $DOCS_SKIP " in
+              *" $job "*) [ "$DOCS_ONLY" != true ] || want=skipped ;;
             esac
             if [ "$result" = "$want" ]; then
               printf 'ok      %-14s %s\n' "$job" "$result"
