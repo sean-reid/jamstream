@@ -574,11 +574,11 @@ jobs:
           # wants a reason written above it.
           EXEMPT=''
           # docs-check.yml's jobs. A job cannot depend on another workflow's
-          # jobs, so those four report their own required contexts. Listing
+          # jobs, so each of those reports its own required context. Listing
           # them here is what makes a job added there fail this one, and the
           # reverse direction catches a deleted job whose required context
           # would otherwise leave the branch permanently unmergeable.
-          DOCS_JOBS='cli-docs screenshots palette install-scripts install-scripts-windows'
+          DOCS_JOBS='cli-docs screenshots palette channel-claims install-scripts install-scripts-windows'
 
           # Top-level keys of the `jobs:` block. Deliberately dumb, and it
           # fails on an empty result rather than passing quietly, because a
@@ -600,7 +600,7 @@ jobs:
           # A reformat the awk cannot read would yield nothing and then wave
           # every job through, so the count is the check on the check.
           test "$(printf '%s' "$CI_JOBS" | wc -w)" -ge 9
-          test "$(printf '%s' "$FOUND_DOCS" | wc -w)" -ge 4
+          test "$(printf '%s' "$FOUND_DOCS" | wc -w)" -ge 5
 
           GATED=$(printf '%s' "$NEEDS" | jq -r 'keys[]' | tr '\n' ' ')
           echo "gated by this job: $GATED"
