@@ -1,6 +1,7 @@
 # Nightly work with no wall-time budget: the hot-path benchmarks, fuzzing the
 # unauthenticated attack surface, the full test suite (including E2E stories
-# and UI work) on all three OSes, and the gated live cloud smoke.
+# and UI work) on all three OSes, the advisory audit against a database that
+# only changes with the calendar, and the gated live cloud smoke.
 name: nightly
 
 on:
@@ -19,6 +20,49 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # cargo-deny runs on every pull request and reports two advisory classes,
+  # vulnerability and unmaintained. With [advisories] version 2 the other two,
+  # unsound and notice, are not surfaced at all: on this lockfile
+  # `cargo deny check advisories` said ok while cargo audit named
+  # RUSTSEC-2026-0221, an unsound Send hole in event-listener that the desktop
+  # client reaches on Linux (#376). cargo audit reports every class, so it is
+  # what closes the gap.
+  #
+  # Here rather than on the pull-request path because this is the one gate
+  # whose input changes with nobody pushing. An advisory published this morning
+  # would turn every open pull request red for something no pull request did,
+  # and the answer to one is a dependency bump or an argued ignore, which is a
+  # change of its own. The price is that a new dependency carrying an unsound
+  # advisory merges green and fails that night instead, which is a night, not a
+  # release.
+  #
+  # The accepted advisories are deny.toml's, read out of the file rather than
+  # copied into a second list, because only one of two lists would keep the
+  # arguments for why each is accepted. A parse that read nothing would leave
+  # the quick-xml entries unignored and fail this job loudly, not widen it.
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: cargo-audit
+      # Nothing is compiled here; cargo audit reads Cargo.lock, so the runner's
+      # own stable toolchain is only there to dispatch the subcommand.
+      - name: Audit the lockfile against today's advisory database
+        run: |
+          set -eu
+          ignores=()
+          while read -r id; do
+            [ -n "$id" ] || continue
+            ignores+=(--ignore "$id")
+          done < <(grep -oE '^ *"RUSTSEC-[0-9]{4}-[0-9]{4}",' deny.toml | grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}')
+          echo "deny.toml accepts: ${ignores[*]:-nothing}"
+          cargo audit --deny warnings "${ignores[@]}"
+
   # The engine, protocol and audio-io hot-path benchmarks. Deliberately not on
   # the PR path: the suite runs for minutes, and criterion's numbers on a
   # shared two-core runner are too noisy to gate on. The same benchmark was

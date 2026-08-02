@@ -5,6 +5,24 @@
 # the Linux-and-Wayland-only sctk-adwaita path reported below.
 [advisories]
 version = 2
+# What this section does not cover, written down so the gap is not read as
+# silence.
+#
+# version 2 reports two advisory classes, vulnerability and unmaintained. It
+# does not surface unsound or notice at all: RUSTSEC-2026-0221, an unsound
+# Send hole in event-listener, sat in this graph while `cargo deny check
+# advisories` printed ok. The advisories job in nightly.yml runs cargo audit,
+# which reports every class, and it reads the ignore array below rather than
+# keeping a second list, so an advisory is still argued about in exactly one
+# place.
+#
+# Neither tool covers anything that is not a crate, and two of those ship. The
+# ffmpeg and mediamtx binaries pinned by sha256 in
+# crates/cloud/data/media_artifacts.json are downloaded and run by every
+# session VM, and the libopus C that opusic-sys compiles is in every binary we
+# publish and is the parser facing the network on a publicly reachable VM.
+# Neither has an advisory feed, so what covers them is the per-release version
+# review that file's notes describe, and the pin bump that follows it.
 yanked = "deny"
 ignore = [
     # ttf-parser is unmaintained (informational, patched = [], so there is no
