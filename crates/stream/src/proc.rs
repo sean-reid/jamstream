@@ -1411,6 +1411,10 @@ mod tests {
     /// translation is the OS's rather than a table here: the same refusal is
     /// 145 on Linux and 195 on macOS, and neither number means anything to
     /// the musician who is shown it.
+    // libc is a unix-only dependency here, and the 256-minus-errno exit
+    // convention this pins is a unix one. Windows never reaches it: that
+    // target compiles the crate but StdProcessHost refuses to spawn.
+    #[cfg(unix)]
     #[test]
     fn a_truncated_errno_exit_code_is_translated_by_the_os() {
         let refused = 256 - libc::ECONNREFUSED;
