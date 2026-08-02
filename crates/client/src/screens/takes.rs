@@ -39,7 +39,7 @@ use jamstream_cli::recordings::{self, Action, Take, TakeProgress};
 use jamstream_cli::state::{RecordingRecord, SessionState, SessionStatus};
 use jamstream_cli::storage::Stores;
 use jamstream_cloud::cloudinit::RecordingStorage;
-use jamstream_cloud::{ObjectStore, ProviderError, Retention, http};
+use jamstream_cloud::{ObjectStore, ProviderError, ProviderKind, Retention, http};
 
 use crate::creds::{self, CredStore, EnvReader};
 use crate::exec::{Executor, Job};
@@ -197,6 +197,14 @@ impl SessionTakes {
             Place::Bucket(record) => Some(record),
             Place::Disk(_) => None,
         }
+    }
+
+    /// Whose bucket refused, which is who a refusal has to be explained in
+    /// terms of. The recording's own provider rather than the session's,
+    /// because that is the account the key belongs to.
+    pub fn provider_name(&self) -> String {
+        self.record()
+            .map_or_else(|| self.provider.clone(), |r| r.provider.clone())
     }
 
     /// `Tue 28 Jul, 47 min, digitalocean sfo3`.
@@ -481,12 +489,16 @@ fn day_label(unix: u64) -> String {
 /// wrong. So the raw error goes to the log, where diagnosis happens, and
 /// the row gets a sentence with the remedy in it.
 ///
+/// `provider` is the recording's own provider name, because the remedy for a
+/// refusal is a different act on each of them; an unparseable name gets the
+/// remedy that holds everywhere.
+///
 /// Public because the snapshot fixture renders the row a refusal really
 /// produces, through this same mapping.
-pub fn error_sentence(doing: &str, err: &CliError) -> String {
+pub fn error_sentence(doing: &str, provider: &str, err: &CliError) -> String {
     tracing::warn!("{doing}: {err}");
     match err {
-        CliError::Provider(p) => provider_sentence(p),
+        CliError::Provider(p) => provider_sentence(provider.parse().ok(), p),
         // Everything else is already in our own words: the keychain's
         // pointer at the Recording tab, the traversal guard, the size check.
         other => other.to_string(),
@@ -496,7 +508,7 @@ pub fn error_sentence(doing: &str, err: &CliError) -> String {
 /// The sentence for each way a bucket says no. Only the error's class and
 /// its code are read, never the response body, so nothing in the body can
 /// leak: extraction is not a filter someone has to maintain.
-fn provider_sentence(err: &ProviderError) -> String {
+fn provider_sentence(provider: Option<ProviderKind>, err: &ProviderError) -> String {
     match err {
         ProviderError::Auth(_) => match http::error_code(err).as_deref() {
             Some("ExpiredToken" | "TokenRefreshRequired" | "InvalidToken") => {
@@ -509,10 +521,7 @@ fn provider_sentence(err: &ProviderError) -> String {
                  and its secret in the Recording tab."
                     .to_owned()
             }
-            _ => "The storage key cannot list this bucket. Add s3:ListBucket \
-                  and s3:GetObject for the bucket to the key's policy, then \
-                  refresh."
-                .to_owned(),
+            _ => listing_denied(provider),
         },
         ProviderError::NotFound(_) => match http::error_code(err).as_deref() {
             Some("NoSuchKey") => {
@@ -540,6 +549,35 @@ fn provider_sentence(err: &ProviderError) -> String {
             None => m.clone(),
         },
     }
+}
+
+/// A 403 on the listing call, with the remedy the provider that refused
+/// actually has.
+///
+/// This used to name `s3:ListBucket` to everyone, which is a policy only AWS
+/// has: a Spaces key carries no policy at all, and a GCS bucket grants a role
+/// to the service account behind the HMAC key. The published screenshot of
+/// this row is a DigitalOcean session being told to edit an S3 policy.
+/// Each remedy is the step the provider's own setup guide ends on.
+fn listing_denied(provider: Option<ProviderKind>) -> String {
+    let remedy = match provider {
+        Some(ProviderKind::Aws) => {
+            "Add s3:ListBucket and s3:GetObject for the bucket to the key's policy"
+        }
+        Some(ProviderKind::DigitalOcean) => {
+            "Give the Spaces key full access to this bucket, under Spaces \
+             Object Storage, Access Keys"
+        }
+        Some(ProviderKind::Gcp) => {
+            "Grant the key's service account the Storage Admin role on the bucket"
+        }
+        // Local records to a folder and cannot 403, and a name that does not
+        // parse has no console to send anyone to.
+        Some(ProviderKind::Local) | None => {
+            "Give the key permission to list the bucket and read what is in it"
+        }
+    };
+    format!("The storage key cannot list this bucket. {remedy}, then refresh.")
 }
 
 /// Opens a session's bucket with the key this computer's keychain holds.
@@ -758,7 +796,11 @@ impl TakesScreen {
                 let listed = recordings::takes_for(session, record, stores.as_ref())
                     .await
                     .map_err(|e| {
-                        error_sentence(&format!("listing {}", session.session_id_hex), &e)
+                        error_sentence(
+                            &format!("listing {}", session.session_id_hex),
+                            &record.provider,
+                            &e,
+                        )
                     });
                 out.push((session.session_id_hex.clone(), listed));
             }
@@ -782,11 +824,13 @@ impl TakesScreen {
                     continue;
                 };
                 row.listing = false;
+                let provider = row.provider_name();
                 match listed {
                     Ok(objects) => match takes_from_objects(&objects, &row.dir) {
                         Ok(takes) => row.takes = takes,
                         Err(err) => {
-                            row.error = Some(error_sentence("planning the downloads", &err));
+                            row.error =
+                                Some(error_sentence("planning the downloads", &provider, &err));
                         }
                     },
                     Err(err) => row.error = Some(err),
@@ -816,6 +860,7 @@ impl TakesScreen {
             if row.record().is_none() {
                 continue;
             }
+            let provider = row.provider_name();
             let objects: Vec<Take> = row
                 .takes
                 .iter()
@@ -827,7 +872,9 @@ impl TakesScreen {
             }
             match takes_from_objects(&objects, &row.dir) {
                 Ok(takes) => row.takes = takes,
-                Err(err) => row.error = Some(error_sentence("re-planning the downloads", &err)),
+                Err(err) => {
+                    row.error = Some(error_sentence("re-planning the downloads", &provider, &err));
+                }
             }
         }
     }
@@ -872,9 +919,10 @@ impl TakesScreen {
             dir,
             meter,
             job: self.exec.run(async move {
+                let provider = record.provider.clone();
                 let store = stores
                     .open(&record)
-                    .map_err(|e| error_sentence("opening the bucket", &e))?;
+                    .map_err(|e| error_sentence("opening the bucket", &provider, &e))?;
                 let mut progress = MeterProgress {
                     meter: job_meter,
                     base: 0,
@@ -888,7 +936,7 @@ impl TakesScreen {
                     &mut progress,
                 )
                 .await
-                .map_err(|e| error_sentence("downloading takes", &e))
+                .map_err(|e| error_sentence("downloading takes", &provider, &e))
             }),
         });
         true
@@ -1678,7 +1726,7 @@ mod tests {
         let err = CliError::Provider(ProviderError::Auth(format!(
             "http 403 Forbidden: {S3_DENIED}"
         )));
-        let (shown, logged) = with_captured_log(|| error_sentence("listing a3f29c41", &err));
+        let (shown, logged) = with_captured_log(|| error_sentence("listing a3f29c41", "aws", &err));
         assert!(shown.contains("s3:ListBucket"), "the remedy: {shown}");
         assert!(shown.contains("storage key"), "what failed: {shown}");
         for identifier in [
@@ -1711,23 +1759,24 @@ mod tests {
                  <Message>x</Message></Error>"
             ))
         };
-        assert!(provider_sentence(&auth("ExpiredToken")).contains("expired"));
-        assert!(provider_sentence(&auth("SignatureDoesNotMatch")).contains("did not accept"));
-        assert!(provider_sentence(&auth("AccessDenied")).contains("s3:ListBucket"));
+        let aws = Some(ProviderKind::Aws);
+        assert!(provider_sentence(aws, &auth("ExpiredToken")).contains("expired"));
+        assert!(provider_sentence(aws, &auth("SignatureDoesNotMatch")).contains("did not accept"));
+        assert!(provider_sentence(aws, &auth("AccessDenied")).contains("s3:ListBucket"));
 
         let missing = ProviderError::NotFound(
             "http 404 Not Found: <Error><Code>NoSuchBucket</Code></Error>".to_owned(),
         );
-        assert!(provider_sentence(&missing).contains("bucket was not found"));
+        assert!(provider_sentence(aws, &missing).contains("bucket was not found"));
         let gone = ProviderError::NotFound(
             "http 404 Not Found: <Error><Code>NoSuchKey</Code></Error>".to_owned(),
         );
-        assert!(provider_sentence(&gone).contains("no longer in the bucket"));
+        assert!(provider_sentence(aws, &gone).contains("no longer in the bucket"));
 
         let offline = ProviderError::Transient("error sending request: connect error".to_owned());
-        assert!(provider_sentence(&offline).contains("connection"));
+        assert!(provider_sentence(aws, &offline).contains("connection"));
         assert!(
-            provider_sentence(&ProviderError::RateLimited { retry_after: None })
+            provider_sentence(aws, &ProviderError::RateLimited { retry_after: None })
                 .contains("rate limiting")
         );
 
@@ -1738,7 +1787,7 @@ mod tests {
                 .to_owned(),
         );
         assert_eq!(
-            provider_sentence(&truncated),
+            provider_sentence(aws, &truncated),
             "download of mix.flac is truncated: content-length promised 9 bytes, 4 arrived"
         );
         // A body on an unclassified status is a provider's, so only its
@@ -1748,8 +1797,38 @@ mod tests {
              <Message>secret detail</Message></Error>"
                 .to_owned(),
         );
-        let shown = provider_sentence(&refused);
+        let shown = provider_sentence(aws, &refused);
         assert_eq!(shown, "The bucket refused the request (InvalidRequest).");
+    }
+
+    /// A 403 sends each provider to its own console, because the act that
+    /// fixes it is different on each: only AWS has a policy with
+    /// `s3:ListBucket` in it, and telling a Spaces or GCS host to edit one
+    /// sends them looking for a screen their provider does not have.
+    #[test]
+    fn the_denied_remedy_is_the_one_this_provider_actually_has() {
+        let denied = ProviderError::Auth(
+            "http 403 Forbidden: <Error><Code>AccessDenied</Code></Error>".to_owned(),
+        );
+        let sentence = |name: &str| {
+            error_sentence("listing", name, &CliError::Provider(denied.clone())).to_lowercase()
+        };
+        let aws = sentence("aws");
+        assert!(aws.contains("s3:listbucket"), "{aws}");
+
+        let spaces = sentence("digitalocean");
+        assert!(spaces.contains("spaces key"), "{spaces}");
+        assert!(!spaces.contains("s3:"), "{spaces}");
+        assert!(!spaces.contains("policy"), "{spaces}");
+
+        let gcs = sentence("gcp");
+        assert!(gcs.contains("service account"), "{gcs}");
+        assert!(!gcs.contains("s3:"), "{gcs}");
+
+        // A name from a record this build does not know still gets an act.
+        let unknown = sentence("azure");
+        assert!(unknown.contains("list the bucket"), "{unknown}");
+        assert!(!unknown.contains("s3:"), "{unknown}");
     }
 
     /// The folder is ours by name wherever it lands, and a machine that can

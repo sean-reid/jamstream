@@ -4,6 +4,7 @@
 use egui::{Key, TextEdit, Ui};
 use jamstream_protocol::invite::Invite;
 
+use crate::sweep::SweepOutcome;
 use crate::theme;
 
 /// One row from the jamstream-cli state directory.
@@ -41,6 +42,17 @@ pub enum HomeAction {
     Host,
     /// The takes those sessions left, which outlive them.
     Takes,
+    /// Stop everything tagged jamstream, in every account this computer can
+    /// reach. Confirmed first: it takes down a session a band may be on.
+    Sweep,
+}
+
+/// What the Recent sessions card knows about the sweep, handed over as plain
+/// data every frame like the rest of this screen's inputs.
+#[derive(Default, Clone, Copy)]
+pub struct SweepView<'a> {
+    pub busy: bool,
+    pub outcome: Option<&'a SweepOutcome>,
 }
 
 #[derive(Default)]
@@ -58,6 +70,7 @@ impl HomeScreen {
         ui: &mut Ui,
         recent: &[RecentSession],
         name: &mut String,
+        sweep: SweepView<'_>,
     ) -> Option<HomeAction> {
         let mut action = None;
         let room = ui.available_height();
@@ -126,47 +139,85 @@ impl HomeScreen {
 
             theme::panel(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                if recent.is_empty() {
+                // Takes is the way to what those sessions recorded, and Stop
+                // strays is the way to correct them: the rows are a record of
+                // what happened, and both acts belong to the record rather
+                // than to a fourth card or a fourth thing in the top bar.
+                // Stop strays is here even with no rows, because a machine
+                // this computer never recorded is exactly the one that
+                // strands.
+                ui.horizontal(|ui| {
                     ui.label(theme::title(ui, "Recent sessions"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!sweep.busy, egui::Button::new("Stop strays"))
+                            .on_hover_text(
+                                "Find and stop every jamstream machine in the accounts \
+                                 this computer can reach",
+                            )
+                            .clicked()
+                        {
+                            action = Some(HomeAction::Sweep);
+                        }
+                        if !recent.is_empty() && ui.button("Takes").clicked() {
+                            action = Some(HomeAction::Takes);
+                        }
+                    });
+                });
+                if recent.is_empty() {
                     ui.label(theme::muted(
                         ui,
                         "No sessions yet; host one or paste an invite above.",
                     ));
-                } else {
-                    // Takes is the way to what those sessions recorded, and the
-                    // only thing to press on this card: the rows are a record of
-                    // what happened, and a take belongs to a session, so this is
-                    // where it hangs off rather than becoming a fourth card or a
-                    // fourth thing in the top bar. With no sessions there are no
-                    // takes either, so above there is nothing to press at.
-                    ui.horizontal(|ui| {
-                        ui.label(theme::title(ui, "Recent sessions"));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Takes").clicked() {
-                                action = Some(HomeAction::Takes);
-                            }
-                        });
-                    });
-                    // A record of what happened, not a list of things to press.
-                    // These rows had no rejoin, no end, and no click, and they
-                    // read as a list you could act on because each one carried
-                    // three type treatments in one line: a mono id, the
-                    // provider and region proportional and muted, then the
-                    // status back in mono (#187). The id is the one thing here
-                    // that is a number, so it keeps the monospace; everything
-                    // else is a sentence about a session that is over.
-                    for row in recent {
-                        ui.horizontal(|ui| {
-                            ui.label(theme::mono_muted(ui, row.short_id.clone()));
-                            ui.label(theme::muted(
-                                ui,
-                                format!("{} {}, {}", row.provider, row.region, row.status),
-                            ));
-                        });
-                    }
                 }
+                // A record of what happened, not a list of things to press.
+                // These rows had no rejoin, no end, and no click, and they
+                // read as a list you could act on because each one carried
+                // three type treatments in one line: a mono id, the
+                // provider and region proportional and muted, then the
+                // status back in mono (#187). The id is the one thing here
+                // that is a number, so it keeps the monospace; everything
+                // else is a sentence about a session that is over.
+                for row in recent {
+                    ui.horizontal(|ui| {
+                        ui.label(theme::mono_muted(ui, row.short_id.clone()));
+                        ui.label(theme::muted(
+                            ui,
+                            format!("{} {}, {}", row.provider, row.region, row.status),
+                        ));
+                    });
+                }
+                sweep_report(ui, sweep);
             });
         });
         action
+    }
+}
+
+/// What the last sweep did, under the rows it corrected.
+///
+/// Three registers, and the difference between them is the point. The
+/// headline is what happened, the notes are what it tidied, and the warnings
+/// are drawn in the danger colour because every one of them is a machine or
+/// an account this sweep could not account for, which is a bill.
+fn sweep_report(ui: &mut Ui, sweep: SweepView<'_>) {
+    if sweep.busy {
+        ui.add_space(theme::SPACE_SM);
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().color(theme::palette_of(ui).text_muted));
+            ui.label(theme::muted(ui, "Searching every account for machines."));
+        });
+        return;
+    }
+    let Some(outcome) = sweep.outcome else {
+        return;
+    };
+    ui.add_space(theme::SPACE_SM);
+    ui.add(egui::Label::new(theme::muted(ui, outcome.summary())).wrap());
+    for note in outcome.notes() {
+        ui.add(egui::Label::new(theme::muted(ui, note)).wrap());
+    }
+    for warning in outcome.warnings() {
+        theme::reason(ui, warning);
     }
 }

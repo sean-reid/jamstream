@@ -60,10 +60,9 @@ $ brew install sean-reid/jamstream/jamstream-cli      # CLI, with completions
 
 ```console
 scoop bucket add jamstream https://github.com/sean-reid/scoop-jamstream
-scoop install jamstream
+scoop install jamstream-app   # desktop app, with a Start Menu shortcut
+scoop install jamstream       # CLI
 ```
-
-`scoop install jamstream-app` installs the desktop app with a Start Menu shortcut; `jamstream` alone is the CLI.
 
 ## Install the CLI in one line
 

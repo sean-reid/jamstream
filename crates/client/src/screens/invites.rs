@@ -433,7 +433,8 @@ pub async fn end_session(
         .instances;
     if !remaining.is_empty() {
         return Err(format!(
-            "{} instance(s) still listed after destroy; run jamstream sweep",
+            "{} instance(s) still listed after destroy; press Stop strays on \
+             the home screen, or run jamstream sweep",
             remaining.len()
         ));
     }

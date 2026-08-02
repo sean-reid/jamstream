@@ -1116,12 +1116,26 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
         // The persistent converting tag (#347): while a direction rides the
         // boundary converter, the device's own rate sits beside the number
         // its cost is inside of. Muted, because it is a fact, not a fault.
+        //
+        // Both rates and the verb, because a bare "44.1 kHz" beside the
+        // latency number reads as the rate the session is running at, which
+        // is the one thing it is not: sessions are 48 kHz always, and 44.1 is
+        // what this machine's device is clocked at. Stacked like the ms
+        // label above, so saying it costs almost no width in the bar.
         if let Some(device) = s.rate.and_then(|r| r.resampled_rate()) {
-            ui.label(
-                RichText::new(format!("{} kHz", crate::runtime::khz(device)))
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.label(RichText::new("converting").size(9.5).color(p.text_muted));
+                ui.label(
+                    RichText::new(format!(
+                        "{} to {} kHz",
+                        crate::runtime::khz(device),
+                        crate::runtime::khz(jamstream_protocol::SAMPLE_RATE)
+                    ))
                     .size(9.5)
                     .color(p.text_muted),
-            );
+                );
+            });
         }
     });
     ui.interact(

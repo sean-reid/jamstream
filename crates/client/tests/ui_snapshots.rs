@@ -22,8 +22,11 @@ use jamstream_client::screens::invites::InvitesPanel;
 use jamstream_client::screens::recording::RecordingChoice;
 use jamstream_client::screens::session::SettingsTab;
 use jamstream_client::screens::takes::Half;
+use jamstream_client::sweep::SweepOutcome;
 use jamstream_client::theme::{self, Theme};
-use jamstream_cloud::{Price, ProbeMatrix, ProviderKind, Region, RegionId, rank};
+use jamstream_cloud::{
+    MockProvider, Price, ProbeMatrix, ProviderError, ProviderKind, Region, RegionId, rank,
+};
 
 const WIDE: egui::Vec2 = vec2(1280.0, 800.0);
 const NARROW: egui::Vec2 = vec2(800.0, 600.0);
@@ -44,13 +47,12 @@ fn snapshot(harness: &mut Harness<'_>, name: &str) {
 
 /// Drops `name` from the manifest if an earlier run put it there.
 ///
-/// The manifest is appended to rather than rewritten, because nextest runs each
-/// test in its own process and no one of them owns the whole list, so it was
-/// never truncated: demoting a fixture out of [`snapshot_for_docs`], which is
-/// the act of declaring that an image no longer shows the product honestly,
-/// kept `site/copy-previews.sh --check` passing locally against the line the
-/// previous run left behind (#217). The demotion has to be the thing that
-/// removes the line, so this is that.
+/// Demoting a fixture out of [`snapshot_for_docs`], which is the act of
+/// declaring that an image no longer shows the product honestly, used to keep
+/// `site/copy-previews.sh --check` passing against the line the previous run
+/// left behind (#217). The demotion has to be the thing that removes the line,
+/// so this is that. [`fresh_manifest`] covers the fixture that is deleted
+/// outright, which leaves no test behind to demote it.
 ///
 /// Read, filter, rename. The replacement is atomic, so no reader ever sees a
 /// partial list. Two processes doing it at once could lose an append that
@@ -103,16 +105,42 @@ fn unpublish(name: &str) {
 fn snapshot_for_docs(harness: &mut Harness<'_>, name: &str) {
     let dir = preview_dir();
     std::fs::create_dir_all(&dir).expect("create preview dir");
-    // Append rather than rewrite: nextest runs each test in its own process,
-    // so there is no single point that could own the whole list.
+    let path = dir.join("publishable.txt");
+    if fresh_manifest() {
+        let _ = std::fs::remove_file(&path);
+    }
     let mut manifest = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("publishable.txt"))
+        .open(&path)
         .expect("open publishable manifest");
     use std::io::Write as _;
     writeln!(manifest, "{name}.png").expect("record publishable name");
     render_and_compare(harness, name);
+}
+
+/// Whether this write is the first of the run, and so the one that empties
+/// the manifest.
+///
+/// The file used to be append-only and never truncated, so a fixture DELETED
+/// rather than demoted left its line behind forever and
+/// `site/copy-previews.sh --check` kept passing against it. docs-check.yml
+/// worked around that by deleting the whole preview directory first, which
+/// only fixed CI: locally the stale line survived. Truncating on the first
+/// write is the fix, and it belongs here because this is the only thing that
+/// writes the file.
+///
+/// Under nextest every test is its own process, so no one of them owns the
+/// list and each would truncate away the others. There the manifest stays
+/// append-only, which can only leave it holding too many names, never too
+/// few. Nothing reads it on that path: the docs check renders with libtest,
+/// single process, and this returns true exactly once there.
+fn fresh_manifest() -> bool {
+    static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    if std::env::var_os("NEXTEST").is_some() {
+        return false;
+    }
+    FIRST.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
 fn render_and_compare(harness: &mut Harness<'_>, name: &str) {
@@ -267,6 +295,68 @@ fn home_light() {
     app.recent = sample_recent();
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_light");
+}
+
+#[test]
+fn home_sweep_confirm() {
+    // "Stop strays" asks first. It destroys every tagged machine in every
+    // account this computer holds a key for, and one of them can be a
+    // session a band is playing on, so the dialog says that before the
+    // button does it.
+    let mut app = test_app(Theme::Dark);
+    app.recent = sample_recent();
+    app.confirm_sweep = true;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "home_sweep_confirm");
+}
+
+#[test]
+fn home_sweep_report() {
+    // What a sweep that could not account for everything says, off a real
+    // report: two clouds swept, one of them refusing to list, one machine
+    // that would not die, and a provider with no key on this computer. Each
+    // of those is a bill, so each is in the danger colour, apart from what
+    // the sweep actually did.
+    let mut app = test_app(Theme::Dark);
+    app.recent = sample_recent();
+    app.swept = Some(unaccounted_sweep());
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "home_sweep_report");
+}
+
+/// A [`SweepOutcome`] off the real sweeper rather than a hand-built one: the
+/// mocks refuse a listing and a destroy, and what the card draws is whatever
+/// `jamstream_cloud::sweep` made of that.
+fn unaccounted_sweep() -> SweepOutcome {
+    let seed = |kind: ProviderKind, session: &str| {
+        use jamstream_cloud::Provider as _;
+        let p = MockProvider::with_default_regions(kind);
+        let region = p.regions()[0].clone();
+        p.seed_instance(&region, vec![jamstream_cloud::session_tag(session)]);
+        p
+    };
+    let throttled = seed(ProviderKind::Aws, "a1a1");
+    throttled.fail_next_lists(1, ProviderError::RateLimited { retry_after: None });
+    let stubborn = seed(ProviderKind::Gcp, "b2b2");
+    stubborn.fail_next_destroys(1, ProviderError::Other("instance is locked".to_owned()));
+    let providers: Vec<Box<dyn jamstream_cloud::Provider>> =
+        vec![Box::new(throttled), Box::new(stubborn)];
+    let report = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("fixture runtime")
+        .block_on(jamstream_cloud::sweep(
+            &providers,
+            jamstream_cloud::SweepFilter::All,
+            false,
+        ));
+    SweepOutcome::new(
+        &report,
+        Ok(jamstream_cli::sweep::Reconciled {
+            closed: vec!["c3c3c3c3".repeat(4)],
+            unwritten: Vec::new(),
+        }),
+        vec![ProviderKind::DigitalOcean],
+    )
 }
 
 /// The Takes screen with everything it can say on it at once.
@@ -436,7 +526,9 @@ fn takes_listing_refused() {
     // A bucket that said no, drawn as the shipped mapping renders it: the
     // row a real S3 AccessDenied produces is a sentence with the remedy,
     // never the XML document, which carries the AWS account number and is
-    // exactly what someone would screenshot.
+    // exactly what someone would screenshot. The session records to
+    // DigitalOcean, so the remedy has to be the Spaces one; this fixture
+    // published a Spaces host being told to edit an IAM policy.
     let denied = jamstream_cli::CliError::Provider(jamstream_cloud::ProviderError::Auth(
         "http 403 Forbidden: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <Error><Code>AccessDenied</Code><Message>User: \
@@ -447,8 +539,11 @@ fn takes_listing_refused() {
     ));
     let mut app = takes_app(Theme::Dark);
     app.takes.rows[0].takes.clear();
+    let provider = app.takes.rows[0].provider_name();
+    assert_eq!(provider, "digitalocean");
     app.takes.rows[0].error = Some(jamstream_client::screens::takes::error_sentence(
         "listing a3f29c41",
+        &provider,
         &denied,
     ));
     let mut harness = app_harness(app, WIDE);
@@ -785,13 +880,42 @@ fn home_settings_narrow() {
 #[test]
 fn session_settings_you() {
     // The You tab: the avatar row above the theme picker, which is where the
-    // two things you set once ended up.
+    // two things you set once ended up, and under them the build and this
+    // run's log. The path is the one main hands over, so a fixture that left
+    // it None would render the tab a real launch never shows.
+    let mut app = drawer_app(
+        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
+        SettingsTab::You,
+    );
+    app.log_path = Some(PathBuf::from(
+        "/Users/you/Library/Application Support/jamstream/logs/app.log",
+    ));
+    let mut harness = app_harness(app, WIDE);
+    // The whole point of drawing it: a Windows release build has no console,
+    // so this label is the only place the path appears.
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("jamstream/logs/app.log")
+            .is_some(),
+        "the log path has to be readable in the drawer"
+    );
+    snapshot(&mut harness, "session_settings_you");
+}
+
+#[test]
+fn session_settings_no_log() {
+    // A machine with no platform data directory: logging::init returned None
+    // and there is no file. Saying so beats printing a path nothing wrote.
     let app = drawer_app(
         session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
         SettingsTab::You,
     );
+    assert!(app.log_path.is_none());
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_settings_you");
+    harness.run_steps(4);
+    assert!(harness.query_by_label("Copy path").is_none());
+    snapshot(&mut harness, "session_settings_no_log");
 }
 
 #[test]
@@ -852,11 +976,24 @@ fn avatar_fixture(name: &str) -> PathBuf {
 /// Writes a fixture under a name of our choosing, because the row shows the
 /// file's name and the snapshot has to be the same every run.
 fn fixture_file(name: &str, bytes: &[u8]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("jamstream-snapshot-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let dir = private_temp_dir(&format!("jamstream-snapshot-{}", std::process::id()));
     let path = dir.join(name);
     std::fs::write(&path, bytes).expect("write the fixture");
     path
+}
+
+/// A fixture directory only this user can read. Not `temp_dir()` itself: the
+/// state writer refuses a world-writable parent, and Linux's /tmp is one.
+fn private_temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(name);
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    dir
 }
 
 // The Recording tab: where takes go, and the key that writes them. Always
@@ -1796,13 +1933,19 @@ fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {
         status: jamstream_cli::state::SessionStatus::Running,
         ended_unix: None,
     };
-    // Per process: revoking rewrites the record, and nextest runs each test
-    // in one of its own, so two of these must not write the same file.
-    let path = std::env::temp_dir().join(format!(
-        "jamstream-snapshot-invites-{}.json",
+    // Per call, not per process. Revoking rewrites this file, and under
+    // libtest, which is what docs-check.yml runs, the three session_invites
+    // fixtures are threads in one process: sharing a pid-scoped path meant
+    // three tests revoking into the same record, so a committed docs
+    // screenshot could render from a record another test had just rewritten,
+    // with the job green. The counter makes every panel its own file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = private_temp_dir(&format!(
+        "jamstream-snapshot-invites-{}",
         std::process::id()
     ));
-    (state, path)
+    (state, dir.join(format!("{n}.json")))
 }
 
 /// The host who has just revoked one musician, so every row state is on

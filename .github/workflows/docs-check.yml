@@ -58,17 +58,12 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
         with:
           shared-key: docs-check-previews
-      # target/ui-previews/publishable.txt is opened with append(true) and never
-      # truncated (crates/client/tests/ui_snapshots.rs), so a fixture demoted
-      # out of snapshot_for_docs, which is the act of saying an image no longer
-      # shows the product honestly, keeps passing against the stale entry left
-      # by an earlier run. Whether the cache ever carries that directory across
-      # runs is not something this job should have to be sure of, so delete it
-      # and let the render below be the only thing that writes the manifest.
-      #
-      # This closes the CI half only. The real fix is truncating on the first
-      # write, which is in the client crate.
-      - name: Clear last run's previews and manifest
+      # The manifest is now truncated by the run's first snapshot_for_docs
+      # (crates/client/tests/ui_snapshots.rs), so a stale entry cannot survive
+      # into the check below. The PNGs themselves are still whatever the last
+      # run left, and a preview file for a fixture that no longer exists would
+      # let a deleted image stay published, so the directory still goes.
+      - name: Clear last run's previews
         run: rm -rf target/ui-previews
       - name: Render UI previews
         run: cargo test --locked -p jamstream-client --test ui_snapshots

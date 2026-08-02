@@ -1950,10 +1950,10 @@ impl HostWizard {
                 ui,
                 if self.is_local() {
                     "You stopped waiting for the last start. If the server process came up, \
-                     jamstream sweep finds and removes it."
+                     Stop strays on the home screen finds and removes it."
                 } else {
                     "You stopped waiting for the last launch. If a machine came up, \
-                     jamstream sweep finds and removes it."
+                     Stop strays on the home screen finds and removes it."
                 },
             )));
         }
@@ -2040,8 +2040,8 @@ impl HostWizard {
                 ui.add_space(theme::SPACE_XS);
                 ui.label(theme::muted(
                     ui,
-                    "If a machine was launched before the failure, jamstream sweep finds \
-                     and removes it.",
+                    "If a machine was launched before the failure, Stop strays on the \
+                     home screen finds and removes it.",
                 ));
             }
             ui.add_space(theme::SPACE_LG);

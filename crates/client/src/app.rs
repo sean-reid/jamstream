@@ -12,17 +12,19 @@ use crate::demo::DemoRuntime;
 use crate::exec::{Executor, Job};
 use crate::live::{AudioSettings, CostedRuntime, LiveError, LiveRuntime};
 use crate::picker::{Pick, Picked};
+use crate::reveal;
 use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
 use crate::screens::devices::{
     Block, DeviceCatalog, DeviceInfo, DevicesEvent, DevicesScreen, StreamNotes,
 };
-use crate::screens::home::{HomeAction, HomeScreen, RecentSession};
+use crate::screens::home::{HomeAction, HomeScreen, RecentSession, SweepView};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
 use crate::screens::invites::{self, InvitesPanel};
 use crate::screens::recording::RecordingPanel;
 use crate::screens::session::{SessionEvent, SessionScreen, SettingsTab};
 use crate::screens::takes::TakesScreen;
+use crate::sweep::{self, Resolver, SweepOutcome};
 use crate::theme::{self, Theme};
 use crate::widgets::{AVATAR_D_STRIP, avatar_disc, sweep_avatar_textures};
 
@@ -154,6 +156,14 @@ pub struct JamApp {
     /// and in-memory apps so no fixture reads or rewrites the developer's
     /// own (#328).
     pub settings_path: Option<std::path::PathBuf>,
+    /// The log this run is writing, as [`crate::logging::init`] opened it.
+    /// Set by main and nowhere else: a release build on Windows has no
+    /// console, so Settings is the only place a stuck user can read the path
+    /// off, and only main knows whether the file really opened. `None` shows
+    /// nothing rather than a path that might not exist.
+    pub log_path: Option<std::path::PathBuf>,
+    /// Why the file manager would not open on the log; shown under the row.
+    log_reveal_error: Option<String>,
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
@@ -169,6 +179,16 @@ pub struct JamApp {
     quit_after_ending: bool,
     /// How a join is performed; see [`Joiner`].
     pub join: Joiner,
+    /// What "Stop strays" sweeps; see [`Resolver`].
+    pub providers: Resolver,
+    /// The sweep in flight, and what the last one found. Kept until the next
+    /// one, because a host who pressed the button walks away and comes back
+    /// to read what it said.
+    sweeping: Option<Job<SweepOutcome>>,
+    pub swept: Option<SweepOutcome>,
+    /// The sweep confirmation is up. It destroys every tagged machine in
+    /// reach, including one a band may still be playing on, so it asks.
+    pub confirm_sweep: bool,
     creds: Arc<dyn CredStore>,
     env: EnvReader,
     exec: Arc<Executor>,
@@ -224,11 +244,17 @@ impl JamApp {
             applied_audio: AudioSettings::default(),
             enumerate: Arc::new(|| Ok(DeviceCatalog::demo())),
             settings_path: None,
+            log_path: None,
+            log_reveal_error: None,
             ending: None,
             confirm_quit: false,
             allow_close: false,
             quit_after_ending: false,
             join: system_joiner(),
+            providers: sweep::system_resolver(Arc::clone(&creds), Arc::clone(&env)),
+            sweeping: None,
+            swept: None,
+            confirm_sweep: false,
             creds,
             env,
             exec,
@@ -462,7 +488,9 @@ impl JamApp {
             Err(err) => {
                 self.wizard.launch_error = Some(format!(
                     "the server is running but joining it failed: {err}. \
-                     End it with: jamstream end --last"
+                     Go Back and press Stop strays on the home screen to \
+                     stop it; jamstream end --last does the same from a \
+                     terminal."
                 ));
             }
         }
@@ -495,6 +523,40 @@ impl JamApp {
         self.screen = Screen::Home;
     }
 
+    /// Starts the sweep: destroy every jamstream-tagged machine in reach and
+    /// bring the session records back in line, off the UI thread.
+    ///
+    /// Public because it is the whole of what the Home button does, and a
+    /// test that reimplemented the body would agree with itself about which
+    /// providers were searched and which records were closed.
+    pub fn begin_sweep(&mut self) {
+        if self.sweeping.is_some() {
+            return;
+        }
+        let resolved = (self.providers)();
+        self.swept = None;
+        self.sweeping = Some(self.exec.run(sweep::run(resolved)));
+    }
+
+    /// The sweep's result, once it has one. Called once per frame; also how a
+    /// test waits for one to finish.
+    pub fn poll_sweep(&mut self) -> Option<&SweepOutcome> {
+        if let Some(job) = &mut self.sweeping
+            && let Some(outcome) = job.poll()
+        {
+            self.sweeping = None;
+            self.swept = Some(outcome);
+            // Records the sweep closed change what the rows say.
+            self.recent = RecentSession::load();
+        }
+        self.swept.as_ref()
+    }
+
+    /// True while a sweep is in flight.
+    pub fn sweeping(&self) -> bool {
+        self.sweeping.is_some()
+    }
+
     /// The teardown's result, once it has one, and `None` while it is still
     /// running or was never started. Called once per frame by
     /// [`JamApp::ending_progress`]; also how a test waits for an end to finish.
@@ -519,7 +581,8 @@ impl JamApp {
             }
             // "End session and quit": the window goes once the provider has
             // answered, success or failure alike; a failure is in the state
-            // file and `jamstream sweep` collects what is left.
+            // file and the next sweep, from Home or the CLI, collects what
+            // is left.
             if self.quit_after_ending {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -593,6 +656,11 @@ impl JamApp {
         {
             self.confirm_quit = false;
         }
+        if self.confirm_sweep
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.confirm_sweep = false;
+        }
 
         // Before the sheet draws, so a picture that landed while the dialog
         // was open shows in the same frame it arrived.
@@ -616,8 +684,14 @@ impl JamApp {
 
         match self.screen {
             Screen::Home => {
-                if let Some(action) = self.home.ui(ui, &self.recent, &mut self.own_name) {
+                self.poll_sweep();
+                let view = SweepView {
+                    busy: self.sweeping(),
+                    outcome: self.swept.as_ref(),
+                };
+                if let Some(action) = self.home.ui(ui, &self.recent, &mut self.own_name, view) {
                     match action {
+                        HomeAction::Sweep => self.confirm_sweep = true,
                         HomeAction::Join(invite) => {
                             let settings = self.audio_settings();
                             match (self.join)(&invite, settings) {
@@ -695,6 +769,7 @@ impl JamApp {
 
         self.ending_progress(ui.ctx());
         self.quit_confirm_window(ui.ctx());
+        self.sweep_confirm_window(ui.ctx());
         self.close_the_other_sheet();
         // Last, so a session has already drawn its status bar and the drawer
         // knows where to stop. Ending the session is reached from in here now,
@@ -748,8 +823,10 @@ impl JamApp {
                 ui.label(theme::muted(
                     ui,
                     "Kept running, the band can play on without you: the server \
-                     stops itself 10 minutes after the last musician leaves, at \
-                     its hard cap, or when you run jamstream end.",
+                     stops itself 10 minutes after the last musician leaves, and \
+                     at its hard cap. To stop it sooner, reopen this app and \
+                     press Stop strays on the home screen; jamstream end does \
+                     the same from a terminal.",
                 ));
                 ui.add_space(theme::SPACE_SM);
                 ui.horizontal(|ui| {
@@ -769,6 +846,41 @@ impl JamApp {
                         self.confirm_quit = false;
                         self.quit_after_ending = true;
                         self.end_session();
+                    }
+                });
+            });
+    }
+
+    /// "Stop strays": what it will do before it does it. Centre screen like
+    /// the other confirmations, because this destroys machines in an account
+    /// and one of them may be a session a band is playing on right now.
+    fn sweep_confirm_window(&mut self, ctx: &Context) {
+        if !self.confirm_sweep {
+            return;
+        }
+        egui::Window::new("Stop every jamstream machine")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.label("Every machine tagged jamstream, in every account this computer holds a key for, is destroyed.");
+                ui.add_space(theme::SPACE_SM);
+                ui.label(theme::muted(
+                    ui,
+                    "That includes a session someone is still playing on. Use it \
+                     when a launch failed or a session is running that should not \
+                     be.",
+                ));
+                ui.add_space(theme::SPACE_SM);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_sweep = false;
+                    }
+                    let p = theme::palette_of(ui);
+                    if ui.add(theme::danger_button(p, "Stop them all")).clicked() {
+                        self.confirm_sweep = false;
+                        self.begin_sweep();
                     }
                 });
             });
@@ -940,8 +1052,55 @@ impl JamApp {
                         self.theme = value;
                     }
                 }
+                ui.add_space(theme::SPACE_XL);
+                self.about_ui(ui);
                 None
             }
+        }
+    }
+
+    /// The build, and where this run's log is.
+    ///
+    /// The path is here because it is nowhere else: a release build on
+    /// Windows detaches from the console, so `jamstream-app.exe` from
+    /// PowerShell prints nothing, and the file is the only account of a
+    /// failure anyone can attach to a bug report. Terse on purpose, at the
+    /// bottom of the tab that is already about this installation.
+    fn about_ui(&mut self, ui: &mut Ui) {
+        ui.label(theme::title(ui, "About"));
+        ui.label(theme::mono_muted(
+            ui,
+            format!("jamstream-app {}", env!("CARGO_PKG_VERSION")),
+        ));
+        let Some(path) = self.log_path.clone() else {
+            // No data directory to keep one in; init said so by returning
+            // None, and promising a file that does not exist is worse than
+            // saying there is none.
+            ui.label(theme::muted(
+                ui,
+                "No log file on this machine; diagnostics go to stderr.",
+            ));
+            return;
+        };
+        ui.add_space(theme::SPACE_XS);
+        ui.label(theme::muted(ui, "This run's log, for a bug report:"));
+        let text = path.display().to_string();
+        // Wrapped, not truncated: someone reading this is about to type it
+        // into a file manager, and an ellipsis in the middle of a path is
+        // exactly as useless as no path at all.
+        ui.add(egui::Label::new(theme::mono_muted(ui, text.clone())).wrap());
+        ui.horizontal(|ui| {
+            if ui.button("Copy path").clicked() {
+                ui.ctx().copy_text(text);
+            }
+            if ui.button(reveal::LABEL).clicked() {
+                // Never a dead button: a machine with no file manager says so
+                // where the path is already readable above.
+                self.log_reveal_error = reveal::show(&path).err();
+            }
+        });
+        if let Some(err) = self.log_reveal_error.clone() {
+            theme::reason(ui, err);
         }
     }
 
