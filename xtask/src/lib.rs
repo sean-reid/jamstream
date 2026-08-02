@@ -1,8 +1,10 @@
 //! Repository tasks as a library, so `cargo xtask` and the test suites call
 //! the same code: the deterministic audio fixture generator, which the cli
-//! suite regenerates from, and the pre-release hand checks.
+//! suite regenerates from, the pre-release hand checks, and the source
+//! counting that holds a file to a rule its comments used to state alone.
 
 pub mod prerelease;
+pub mod source;
 
 use std::path::Path;
 
