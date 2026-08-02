@@ -3,75 +3,23 @@
 
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use data_encoding::{BASE64, HEXLOWER};
 use jamstream_cloud::{
-    BootConfig, CostPreview, HANDSHAKE_CAP, IP_POLL_PERIOD, IP_WAIT_CAP, InstanceClass, LaunchSpec,
-    Price, ProbeMatrix, ProbeTarget, Provider, ProviderKind, RecordingEstimate, RecordingPlan,
-    RecordingStorage, Region, RegionId, RegionScore, RetentionEnforcement, SelfDestruct, rank,
-    session_tag,
+    BootConfig, CostPreview, HANDSHAKE_CAP, InstanceClass, LaunchSpec, Price, ProbeMatrix,
+    ProbeTarget, Provider, ProviderKind, RecordingEstimate, RecordingPlan, RecordingStorage,
+    Region, RegionId, RegionScore, RetentionEnforcement, rank, session_tag,
 };
-use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
-use jamstream_session::client::{ClientCore, ClientState, ServerCandidates};
 
 use crate::CliError;
 use crate::cli::HostArgs;
+use crate::launch::{self, ArtifactOverride};
+use crate::reason::{self, Attempt};
 use crate::state::{self, InviteRecord, SessionState, SessionStatus};
-
-/// Placeholders the mock and local providers accept: the mock launches
-/// nothing, and the flat config the local provider consumes carries no
-/// artifact fields. A cloud provider needs a real url and hash because the
-/// VM downloads and verifies this at boot; see [`resolve_artifact`].
-const PLACEHOLDER_ARTIFACT_URL: &str = "https://artifacts.invalid/jamstreamd";
-const PLACEHOLDER_ARTIFACT_SHA256: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// The artifact the boot config carries, by precedence: the explicit
-/// --artifact-url/--artifact-sha256 overrides first (they apply to
-/// whatever architecture this launch runs on), then the download pinned
-/// into this build for `arch`, the architecture of the machines the
-/// provider launches. A launch whose architecture has no pin is refused
-/// here, because the VM would download a binary that cannot execute
-/// (#139). Local and mock launches download nothing, so without
-/// overrides they get the inert placeholders.
-fn resolve_artifact(
-    needs_download: bool,
-    arch: jamstream_cloud::ServerArch,
-    url_flag: Option<&str>,
-    sha_flag: Option<&str>,
-    pinned: jamstream_cloud::PinnedServerArtifacts,
-) -> Result<(String, String), CliError> {
-    if let (Some(url), Some(sha)) = (url_flag, sha_flag) {
-        // Checked here rather than on the VM, where a bad pair costs a
-        // launch, a boot, and a self-destruct before anyone hears about it.
-        jamstream_cloud::validate_pair(url, sha).map_err(CliError::Usage)?;
-        return Ok((url.to_owned(), sha.to_owned()));
-    }
-    if !needs_download {
-        return Ok((
-            PLACEHOLDER_ARTIFACT_URL.to_owned(),
-            PLACEHOLDER_ARTIFACT_SHA256.to_owned(),
-        ));
-    }
-    match pinned.for_arch(arch) {
-        Some(p) => Ok((p.url.to_owned(), p.sha256.to_owned())),
-        None if pinned.any() => Err(CliError::Failed(format!(
-            "this build pins no {arch} server artifact and this provider launches {arch} \
-             machines, which could only download a binary they cannot run; pass \
-             --artifact-url and --artifact-sha256 naming an {arch} jamstreamd build"
-        ))),
-        None => Err(CliError::Usage(
-            "this build has no pinned server artifact because it is not a release build; \
-             pass --artifact-url and --artifact-sha256 naming a jamstreamd build the VM \
-             can download and verify, or host with a release build, which pins its own"
-                .to_owned(),
-        )),
-    }
-}
 
 pub async fn run<W: Write>(
     args: &HostArgs,
@@ -207,12 +155,13 @@ pub async fn run<W: Write>(
 
     // Local mode runs a binary already on this machine and the mock
     // launches nothing; only a cloud VM downloads the artifact for real.
-    let (artifact_url, artifact_sha256) = resolve_artifact(
+    let (artifact_url, artifact_sha256) = launch::resolve_artifact(
         !is_mock && !is_local,
         provider.server_arch(),
         args.artifact_url.as_deref(),
         args.artifact_sha256.as_deref(),
         jamstream_cloud::pinned(),
+        ArtifactOverride::Flags,
     )?;
     let boot = BootConfig {
         artifact_url,
@@ -223,7 +172,7 @@ pub async fn run<W: Write>(
         port: args.port,
         idle_shutdown_min: args.idle_min,
         max_duration_min: args.max_hours * 60,
-        self_destruct: self_destruct_for(provider.kind())?,
+        self_destruct: launch::self_destruct_for(provider.kind(), digitalocean_token())?,
         // A local session records through the provider's own spawn flags
         // (see LocalProvider::with_record) rather than the boot config, so
         // this is set for a bucket and nothing else.
@@ -266,7 +215,7 @@ pub async fn run<W: Write>(
         }
     }
     let instance = provider.launch(spec).await?;
-    let instance = wait_for_ip(provider, &session_hex, instance).await?;
+    let instance = launch::wait_for_ip(provider, &session_hex, instance).await?;
     let ip = instance.public_ip.expect("wait_for_ip returned without ip");
     let address = SocketAddr::new(ip, args.port);
 
@@ -289,7 +238,7 @@ pub async fn run<W: Write>(
         }
         "skipped"
     } else {
-        verify_reachable(&invites[0].1, HANDSHAKE_CAP).await?;
+        launch::verify_reachable(&invites[0].1, HANDSHAKE_CAP).await?;
         "ok"
     };
 
@@ -504,8 +453,10 @@ pub async fn probe_bucket(storage: &RecordingStorage, session_hex: &str) -> Resu
 /// Writes one probe object under `prefix` and deletes it.
 ///
 /// A bucket that refuses the key fails here, in a configuring frame of mind,
-/// rather than at the first take. The failure carries the provider's reason
-/// verbatim and names the prefix a key has to be able to write.
+/// rather than at the first take. The failure says what the bucket refused
+/// and names the prefix a key has to be able to write; the provider's own
+/// response goes to the log, because for S3 it is a document naming the
+/// account number and the IAM ARN (#374).
 pub async fn probe_prefix(
     store: &dyn jamstream_cloud::ObjectStore,
     bucket: &str,
@@ -522,8 +473,10 @@ pub async fn probe_prefix(
         )
         .await
         .map_err(|err| {
+            let refusal = reason::provider_sentence(Attempt::Probe, Some(store.kind()), &err);
+            tracing::warn!("writing the probe object to {bucket} in {region}: {err}");
             CliError::Failed(format!(
-                "cannot write to {bucket} in {region}: {err}. Recording needs a key that \
+                "cannot write to {bucket} in {region}. {refusal} Recording needs a key that \
                  may write {prefix} and set the bucket's lifecycle rule."
             ))
         })?;
@@ -740,149 +693,11 @@ pub fn mint_invites(
     invites
 }
 
-fn self_destruct_for(kind: ProviderKind) -> Result<SelfDestruct, CliError> {
-    match kind {
-        // The mock resolves with an Aws kind, so it lands here too; the
-        // shutdown script is a harmless placeholder for it.
-        ProviderKind::Aws => Ok(SelfDestruct::AwsShutdown),
-        ProviderKind::Gcp => Ok(SelfDestruct::GcpMaxRunDuration),
-        // Powered-off droplets still bill, so the VM must hold a token able
-        // to delete itself. DigitalOcean cannot mint narrower per-droplet
-        // tokens, which is why the docs tell DO users to scope theirs to
-        // droplet and tag operations only.
-        ProviderKind::DigitalOcean => {
-            let token = std::env::var("DIGITALOCEAN_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .ok_or_else(|| {
-                    CliError::Usage(
-                        "DIGITALOCEAN_TOKEN is required to arm the droplet's self-destruct; \
-                         refusing to launch a machine that cannot delete itself"
-                            .to_owned(),
-                    )
-                })?;
-            Ok(SelfDestruct::ApiToken {
-                endpoint: "https://api.digitalocean.com/v2/droplets".to_owned(),
-                token,
-            })
-        }
-        // Local sessions never render cloud-init: the flat config carries
-        // no self-destruct and the spawned server self-limits through its
-        // own --idle-exit-min. Any variant satisfies the struct; this one
-        // is inert here.
-        ProviderKind::Local => Ok(SelfDestruct::AwsShutdown),
-    }
-}
-
-/// Polls list_tagged until the instance reports a public IP. The mock
-/// returns one at launch, so this is a single pass there.
-async fn wait_for_ip(
-    provider: &dyn Provider,
-    session_hex: &str,
-    mut instance: jamstream_cloud::Instance,
-) -> Result<jamstream_cloud::Instance, CliError> {
-    let deadline = Instant::now() + IP_WAIT_CAP;
-    while instance.public_ip.is_none() {
-        if Instant::now() >= deadline {
-            return Err(CliError::Failed(format!(
-                "instance {} did not report an ip within {} s",
-                instance.id,
-                IP_WAIT_CAP.as_secs()
-            )));
-        }
-        tokio::time::sleep(IP_POLL_PERIOD).await;
-        let listed = provider.list_tagged(Some(session_hex)).await?;
-        if let Some(found) = listed.instances.into_iter().find(|i| i.id == instance.id) {
-            instance = found;
-        }
-    }
-    Ok(instance)
-}
-
-/// Proves the VM is actually serving: a genuine ClientCore handshake with
-/// the host invite over UDP, driven until Joined. Skipped for the mock,
-/// which launches no server.
-///
-/// Every address in the invite gets a turn, so this reports what a joining
-/// musician will actually experience rather than what the first entry
-/// alone would.
-async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), CliError> {
-    let mut candidates = ServerCandidates::new(invite)?;
-    let mut socket = connected_socket(candidates.current()).await?;
-
-    let start = Instant::now();
-    let now = || start.elapsed().as_millis() as u64;
-    let (mut core, init) = ClientCore::connect(invite, now())?;
-    socket.send(&init).await?;
-    let mut buf = [0u8; MAX_DATAGRAM_BYTES];
-    while start.elapsed() < cap {
-        for pkt in core.poll(now()) {
-            socket.send(&pkt).await?;
-        }
-        if let Ok(Ok(len)) =
-            tokio::time::timeout(Duration::from_millis(50), socket.recv(&mut buf)).await
-        {
-            for pkt in core.handle_datagram(now(), &buf[..len]) {
-                socket.send(&pkt).await?;
-            }
-        }
-        match core.state().clone() {
-            ClientState::Joined => {
-                let _ = core.leave("host reachability check");
-                for pkt in core.poll(now()) {
-                    socket.send(&pkt).await?;
-                }
-                return Ok(());
-            }
-            ClientState::Rejected { ours, theirs } => {
-                return Err(CliError::Failed(format!(
-                    "server rejected the handshake: this client speaks protocol {ours}, \
-                     the server speaks {theirs}"
-                )));
-            }
-            ClientState::Ejected { reason } => {
-                return Err(CliError::Failed(format!(
-                    "server ejected the reachability check: {reason}"
-                )));
-            }
-            // The core gives up after its own 10 s window; keep trying
-            // fresh handshakes until our cap, the VM may still be booting.
-            // Each retry moves to the next address the invite offers and
-            // comes back round, so a slow boot and a filtered interface
-            // both get answered by the time the cap runs out.
-            ClientState::TimedOut => {
-                if candidates.has_alternatives() {
-                    let next = candidates.advance();
-                    socket = connected_socket(next).await?;
-                }
-                let init = core.reconnect(now())?;
-                socket.send(&init).await?;
-            }
-            ClientState::Connecting => {}
-        }
-    }
-    Err(CliError::Failed(format!(
-        "server did not complete a handshake within {} s on {}",
-        cap.as_secs(),
-        invite
-            .addresses
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )))
-}
-
-/// A UDP socket bound to the right family and connected to one candidate.
-pub async fn connected_socket(server: SocketAddr) -> Result<tokio::net::UdpSocket, CliError> {
-    let bind: SocketAddr = if server.is_ipv4() {
-        "0.0.0.0:0".parse().expect("static addr")
-    } else {
-        "[::]:0".parse().expect("static addr")
-    };
-    let socket = tokio::net::UdpSocket::bind(bind).await?;
-    socket.connect(server).await?;
-    Ok(socket)
+/// The token a droplet needs to delete itself, from this machine's
+/// environment. The app reads its own from the credential store; see
+/// [`crate::launch::self_destruct_for`].
+fn digitalocean_token() -> Option<String> {
+    std::env::var("DIGITALOCEAN_TOKEN").ok()
 }
 
 fn unix_now() -> u64 {
@@ -1161,178 +976,6 @@ mod tests {
         for row in &rows[1..] {
             assert!(row.contains('$'));
         }
-    }
-
-    /// A release-shaped pin set with two distinct downloads, so a test that
-    /// selects the wrong one cannot pass by coincidence.
-    fn both_pins() -> jamstream_cloud::PinnedServerArtifacts {
-        jamstream_cloud::PinnedServerArtifacts {
-            x86_64: Some(jamstream_cloud::PinnedServerArtifact {
-                url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-x86_64-musl",
-                sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-            }),
-            aarch64: Some(jamstream_cloud::PinnedServerArtifact {
-                url: "https://github.com/sean-reid/jamstream/releases/download/v1/jamstreamd-linux-aarch64-musl",
-                sha256: "4444444444444444444444444444444444444444444444444444444444444444",
-            }),
-        }
-    }
-
-    #[test]
-    fn artifact_precedence_is_flags_then_pinned_then_error() {
-        let pinned = both_pins();
-        // Explicit flags outrank the pin, on either architecture.
-        for arch in [
-            jamstream_cloud::ServerArch::X86_64,
-            jamstream_cloud::ServerArch::Aarch64,
-        ] {
-            let (url, sha) = resolve_artifact(
-                true,
-                arch,
-                Some("https://own.example/jamstreamd"),
-                Some("1111111111111111111111111111111111111111111111111111111111111111"),
-                pinned,
-            )
-            .unwrap();
-            assert_eq!(url, "https://own.example/jamstreamd");
-            assert_eq!(sha, "1".repeat(64));
-        }
-        // No flags: the pin for the launch's architecture fills in.
-        let (url, sha) = resolve_artifact(
-            true,
-            jamstream_cloud::ServerArch::X86_64,
-            None,
-            None,
-            pinned,
-        )
-        .unwrap();
-        assert_eq!(url, pinned.x86_64.unwrap().url);
-        assert_eq!(sha, pinned.x86_64.unwrap().sha256);
-        // No flags, no pins, cloud launch: the error explains why and both
-        // ways out.
-        let err = resolve_artifact(
-            true,
-            jamstream_cloud::ServerArch::X86_64,
-            None,
-            None,
-            jamstream_cloud::PinnedServerArtifacts::default(),
-        )
-        .unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("not a release build"), "error was: {text}");
-        assert!(text.contains("--artifact-url"), "error was: {text}");
-    }
-
-    /// #139 root cause: the pin followed the build, not the machine. The
-    /// architecture must come from the provider doing the launching, and
-    /// the two real cloud providers with fixed instance families must pull
-    /// opposite pins from the same build.
-    #[test]
-    fn aws_selects_the_arm64_pin_and_digitalocean_the_x86_64_one() {
-        use jamstream_cloud::providers::{aws::AwsProvider, digitalocean::DigitalOceanProvider};
-        let pinned = both_pins();
-        let aws = AwsProvider::new("AKIATEST".to_owned(), "secret".to_owned());
-        let (url, _) = resolve_artifact(true, aws.server_arch(), None, None, pinned).unwrap();
-        assert!(url.ends_with("jamstreamd-linux-aarch64-musl"), "{url}");
-        let digitalocean = DigitalOceanProvider::new("t".to_owned());
-        let (url, _) =
-            resolve_artifact(true, digitalocean.server_arch(), None, None, pinned).unwrap();
-        assert!(url.ends_with("jamstreamd-linux-x86_64-musl"), "{url}");
-    }
-
-    /// A launch whose architecture has no pin must refuse before a machine
-    /// is paid for, and the error must name the architecture, because
-    /// launching would produce exactly the dead VM of #139.
-    #[test]
-    fn a_missing_arch_pin_refuses_to_launch_naming_the_architecture() {
-        let x86_only = jamstream_cloud::PinnedServerArtifacts {
-            aarch64: None,
-            ..both_pins()
-        };
-        let err = resolve_artifact(
-            true,
-            jamstream_cloud::ServerArch::Aarch64,
-            None,
-            None,
-            x86_only,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("aarch64"), "error was: {err}");
-        assert!(err.contains("--artifact-url"), "error was: {err}");
-        // The override remains the escape hatch and applies to the
-        // architecture being launched.
-        let (url, _) = resolve_artifact(
-            true,
-            jamstream_cloud::ServerArch::Aarch64,
-            Some("https://own.example/jamstreamd-arm64"),
-            Some("3333333333333333333333333333333333333333333333333333333333333333"),
-            x86_only,
-        )
-        .unwrap();
-        assert_eq!(url, "https://own.example/jamstreamd-arm64");
-    }
-
-    /// The overrides are the one part of the VM's root bootstrap a user
-    /// types, so they are checked before a machine is paid for.
-    #[test]
-    fn artifact_overrides_are_validated_before_anything_launches() {
-        let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-        for (url, sha, what) in [
-            ("http://own.example/jamstreamd", sha, "https"),
-            ("https://own.example/a\";id;\"", sha, "url"),
-            ("https://own.example/jamstreamd", "abcd", "64 hex digits"),
-        ] {
-            let err = resolve_artifact(
-                true,
-                jamstream_cloud::ServerArch::X86_64,
-                Some(url),
-                Some(sha),
-                jamstream_cloud::PinnedServerArtifacts::default(),
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(err.contains(what), "{url} {sha} was rejected as {err:?}");
-        }
-        // A valid pair still passes through untouched, on a local launch
-        // as well as a cloud one.
-        for needs_download in [true, false] {
-            let (url, out_sha) = resolve_artifact(
-                needs_download,
-                jamstream_cloud::ServerArch::X86_64,
-                Some("https://own.example/d"),
-                Some(sha),
-                jamstream_cloud::PinnedServerArtifacts::default(),
-            )
-            .unwrap();
-            assert_eq!(url, "https://own.example/d");
-            assert_eq!(out_sha, sha);
-        }
-    }
-
-    #[test]
-    fn local_and_mock_launches_use_placeholders_unless_overridden() {
-        // No download happens, so no flags and no pin is fine.
-        let (url, sha) = resolve_artifact(
-            false,
-            jamstream_cloud::ServerArch::X86_64,
-            None,
-            None,
-            jamstream_cloud::PinnedServerArtifacts::default(),
-        )
-        .unwrap();
-        assert_eq!(url, PLACEHOLDER_ARTIFACT_URL);
-        assert_eq!(sha, PLACEHOLDER_ARTIFACT_SHA256);
-        // Explicit flags still win everywhere.
-        let (url, _) = resolve_artifact(
-            false,
-            jamstream_cloud::ServerArch::X86_64,
-            Some("https://own.example/jamstreamd"),
-            Some("2222222222222222222222222222222222222222222222222222222222222222"),
-            jamstream_cloud::PinnedServerArtifacts::default(),
-        )
-        .unwrap();
-        assert_eq!(url, "https://own.example/jamstreamd");
     }
 
     /// The point of #121: a session on this machine is offered on loopback
