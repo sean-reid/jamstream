@@ -47,13 +47,12 @@ fn snapshot(harness: &mut Harness<'_>, name: &str) {
 
 /// Drops `name` from the manifest if an earlier run put it there.
 ///
-/// The manifest is appended to rather than rewritten, because nextest runs each
-/// test in its own process and no one of them owns the whole list, so it was
-/// never truncated: demoting a fixture out of [`snapshot_for_docs`], which is
-/// the act of declaring that an image no longer shows the product honestly,
-/// kept `site/copy-previews.sh --check` passing locally against the line the
-/// previous run left behind (#217). The demotion has to be the thing that
-/// removes the line, so this is that.
+/// Demoting a fixture out of [`snapshot_for_docs`], which is the act of
+/// declaring that an image no longer shows the product honestly, used to keep
+/// `site/copy-previews.sh --check` passing against the line the previous run
+/// left behind (#217). The demotion has to be the thing that removes the line,
+/// so this is that. [`fresh_manifest`] covers the fixture that is deleted
+/// outright, which leaves no test behind to demote it.
 ///
 /// Read, filter, rename. The replacement is atomic, so no reader ever sees a
 /// partial list. Two processes doing it at once could lose an append that
@@ -106,16 +105,42 @@ fn unpublish(name: &str) {
 fn snapshot_for_docs(harness: &mut Harness<'_>, name: &str) {
     let dir = preview_dir();
     std::fs::create_dir_all(&dir).expect("create preview dir");
-    // Append rather than rewrite: nextest runs each test in its own process,
-    // so there is no single point that could own the whole list.
+    let path = dir.join("publishable.txt");
+    if fresh_manifest() {
+        let _ = std::fs::remove_file(&path);
+    }
     let mut manifest = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("publishable.txt"))
+        .open(&path)
         .expect("open publishable manifest");
     use std::io::Write as _;
     writeln!(manifest, "{name}.png").expect("record publishable name");
     render_and_compare(harness, name);
+}
+
+/// Whether this write is the first of the run, and so the one that empties
+/// the manifest.
+///
+/// The file used to be append-only and never truncated, so a fixture DELETED
+/// rather than demoted left its line behind forever and
+/// `site/copy-previews.sh --check` kept passing against it. docs-check.yml
+/// worked around that by deleting the whole preview directory first, which
+/// only fixed CI: locally the stale line survived. Truncating on the first
+/// write is the fix, and it belongs here because this is the only thing that
+/// writes the file.
+///
+/// Under nextest every test is its own process, so no one of them owns the
+/// list and each would truncate away the others. There the manifest stays
+/// append-only, which can only leave it holding too many names, never too
+/// few. Nothing reads it on that path: the docs check renders with libtest,
+/// single process, and this returns true exactly once there.
+fn fresh_manifest() -> bool {
+    static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    if std::env::var_os("NEXTEST").is_some() {
+        return false;
+    }
+    FIRST.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
 fn render_and_compare(harness: &mut Harness<'_>, name: &str) {
@@ -948,11 +973,24 @@ fn avatar_fixture(name: &str) -> PathBuf {
 /// Writes a fixture under a name of our choosing, because the row shows the
 /// file's name and the snapshot has to be the same every run.
 fn fixture_file(name: &str, bytes: &[u8]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("jamstream-snapshot-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let dir = private_temp_dir(&format!("jamstream-snapshot-{}", std::process::id()));
     let path = dir.join(name);
     std::fs::write(&path, bytes).expect("write the fixture");
     path
+}
+
+/// A fixture directory only this user can read. Not `temp_dir()` itself: the
+/// state writer refuses a world-writable parent, and Linux's /tmp is one.
+fn private_temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(name);
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    dir
 }
 
 // The Recording tab: where takes go, and the key that writes them. Always
@@ -1892,13 +1930,19 @@ fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {
         status: jamstream_cli::state::SessionStatus::Running,
         ended_unix: None,
     };
-    // Per process: revoking rewrites the record, and nextest runs each test
-    // in one of its own, so two of these must not write the same file.
-    let path = std::env::temp_dir().join(format!(
-        "jamstream-snapshot-invites-{}.json",
+    // Per call, not per process. Revoking rewrites this file, and under
+    // libtest, which is what docs-check.yml runs, the three session_invites
+    // fixtures are threads in one process: sharing a pid-scoped path meant
+    // three tests revoking into the same record, so a committed docs
+    // screenshot could render from a record another test had just rewritten,
+    // with the job green. The counter makes every panel its own file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = private_temp_dir(&format!(
+        "jamstream-snapshot-invites-{}",
         std::process::id()
     ));
-    (state, path)
+    (state, dir.join(format!("{n}.json")))
 }
 
 /// The host who has just revoked one musician, so every row state is on

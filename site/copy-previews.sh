@@ -1,13 +1,14 @@
 #!/bin/sh
 # Refreshes the screenshots the book shows from the previews the snapshot
-# suite renders. Regenerate those first, from a clean directory:
-#   rm -rf target/ui-previews
+# suite renders. Regenerate those first:
 #   cargo test -p jamstream-client --test ui_snapshots
 #
-# The rm matters. publishable.txt is appended to and never truncated, so a
-# fixture demoted out of snapshot_for_docs leaves its old line behind and the
-# manifest check below keeps passing against it. docs-check.yml clears the
-# directory for the same reason.
+# That run owns publishable.txt: the first snapshot_for_docs of the run
+# truncates it, so a fixture that stopped being publishable, or that was
+# deleted outright, leaves no line behind for the manifest check below to
+# keep passing against. Under nextest, where each test is its own process,
+# the file stays append-only and can only list too many names; render with
+# cargo test, as docs-check.yml does.
 # Default: copy. --check: compare byte for byte and fail naming what differs,
 # so a UI change that moves a baseline must refresh the committed copy in the
 # same change.
