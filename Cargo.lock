@@ -2905,6 +2905,7 @@ dependencies = [
  "tracing",
  "wasapi",
  "windows",
+ "xtask",
 ]
 
 [[package]]
