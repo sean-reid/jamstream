@@ -449,7 +449,10 @@ fn open_playback_side(
 /// the same closure back. After a successful build the shim claims the inner
 /// closure from the slot on the first callback; the lock is uncontended by
 /// construction, because the only other locker is the failure path, which
-/// runs strictly before any callback can.
+/// runs strictly before any callback can (a failed build leaves no stream,
+/// and a built stream is paused until both directions have opened). If it
+/// ever were contended the shim gives up that one buffer and claims on the
+/// next callback, because a device thread must never block on a lock.
 fn recoverable_capture(inner: CaptureFn) -> (CaptureFn, Arc<Mutex<Option<CaptureFn>>>) {
     let slot = Arc::new(Mutex::new(Some(inner)));
     let shared = Arc::clone(&slot);
@@ -1376,6 +1379,142 @@ mod tests {
         // contest is with the other app, not with the cable.
         demote_dead_stream(&demoted, &["clocked".to_owned()], &[], false);
         assert!(demoted.lock().unwrap().contains("clocked"));
+    }
+
+    /// The #367 handoff, in the sequence cpal imposes: the build takes the
+    /// callback by value and drops it on failure, so the native-rate retry
+    /// can only run the handler the slot gives back. If that handoff broke,
+    /// the fallback stream would run a dead closure and the session would go
+    /// silent on exactly the devices rung 3 exists for, with every rate test
+    /// still passing, because they all stop at the plan.
+    ///
+    /// The counter tells one closure from another: a rebuilt handler would
+    /// start its count over.
+    #[test]
+    fn a_failed_attempt_hands_the_capture_handler_back_whole() {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        let mut calls = 0usize;
+        let inner: CaptureFn = Box::new(move |samples: &[f32]| {
+            calls += 1;
+            sink.lock().unwrap().push((calls, samples.to_vec()));
+        });
+        let (shim, slot) = recoverable_capture(inner);
+        // The attempt failed, so cpal dropped what it was handed.
+        drop(shim);
+        let mut recovered = slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the handler outlives the build that failed");
+        recovered(&[0.25, -0.25]);
+        recovered(&[0.5]);
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.len(), 2);
+        assert_eq!(heard[0], (1, vec![0.25, -0.25]));
+        assert_eq!(heard[1], (2, vec![0.5]), "the same closure, still counting");
+    }
+
+    #[test]
+    fn a_failed_attempt_hands_the_playback_handler_back_whole() {
+        let mut n = 0.0f32;
+        let inner: PlaybackFn = Box::new(move |out: &mut [f32]| {
+            for s in out.iter_mut() {
+                n += 1.0;
+                *s = n;
+            }
+        });
+        let (shim, slot) = recoverable_playback(inner);
+        drop(shim);
+        let mut recovered = slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the handler outlives the build that failed");
+        let mut buf = [0.0f32; 3];
+        recovered(&mut buf);
+        assert_eq!(buf, [1.0, 2.0, 3.0]);
+        recovered(&mut buf);
+        assert_eq!(buf, [4.0, 5.0, 6.0], "the same closure, continuing");
+    }
+
+    /// The other outcome: the attempt came up, so the shim is what cpal
+    /// calls. Every callback reaches the handler, the first one included, and
+    /// the claim happens once rather than per callback.
+    #[test]
+    fn a_successful_attempt_loses_no_callback_to_the_shim() {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        let inner: CaptureFn = Box::new(move |samples: &[f32]| {
+            sink.lock().unwrap().push(samples.to_vec());
+        });
+        let (mut shim, slot) = recoverable_capture(inner);
+        shim(&[1.0]);
+        shim(&[2.0, 3.0]);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![vec![1.0], vec![2.0, 3.0]],
+            "the first callback must not be the price of the shim"
+        );
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the handler is claimed out of the slot, once"
+        );
+
+        let mut n = 0.0f32;
+        let inner: PlaybackFn = Box::new(move |out: &mut [f32]| {
+            for s in out.iter_mut() {
+                n += 1.0;
+                *s = n;
+            }
+        });
+        let (mut shim, _slot) = recoverable_playback(inner);
+        let mut buf = [0.0f32; 2];
+        shim(&mut buf);
+        assert_eq!(buf, [1.0, 2.0]);
+        shim(&mut buf);
+        assert_eq!(buf, [3.0, 4.0]);
+    }
+
+    /// The one branch that swallows a callback. It is unreachable in the open
+    /// path (a failed build leaves no stream to call back, and a built stream
+    /// stays paused until both directions are open), but a device thread must
+    /// never block on a lock, so the answer if it ever were contended is one
+    /// buffer given up and a claim on the next callback. Silence for one
+    /// buffer, not a stalled device thread and not a permanent loss.
+    #[test]
+    fn a_contended_claim_costs_one_buffer_and_never_blocks() {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        let inner: CaptureFn = Box::new(move |samples: &[f32]| {
+            sink.lock().unwrap().push(samples.to_vec());
+        });
+        let (mut shim, slot) = recoverable_capture(inner);
+        let held = slot.lock().expect("the recovery path holds it");
+        shim(&[1.0]);
+        assert!(
+            heard.lock().unwrap().is_empty(),
+            "a contended claim delivers nothing rather than waiting"
+        );
+        drop(held);
+        shim(&[2.0]);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![vec![2.0]],
+            "the next callback claims the handler"
+        );
+
+        let inner: PlaybackFn = Box::new(|out: &mut [f32]| out.fill(0.75));
+        let (mut shim, slot) = recoverable_playback(inner);
+        let held = slot.lock().expect("the recovery path holds it");
+        // The buffer arrives zeroed and untouched means silence, which is
+        // what an unclaimed playback callback has to leave behind.
+        let mut buf = [0.0f32; 2];
+        shim(&mut buf);
+        assert_eq!(buf, [0.0, 0.0]);
+        drop(held);
+        shim(&mut buf);
+        assert_eq!(buf, [0.75, 0.75]);
     }
 
     #[test]
