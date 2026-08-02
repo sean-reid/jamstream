@@ -440,8 +440,15 @@ jobs:
   # pushes to main only; PRs get their signal from the jobs above. The
   # client crate is excluded because its kittest snapshot tests are
   # platform-tied to macOS (see the test job comment).
+  #
+  # It also skips a docs-only push, which every other compile job already
+  # did. Alone in this file it had no `needs: [changes]`, so a typo fixed in
+  # the README spent 16 instrumented minutes proving nothing; `coverage` is
+  # in the aggregator's DOCS_SKIP below so the skip is checked rather than
+  # merely allowed.
   coverage:
-    if: github.event_name == 'push'
+    needs: [changes]
+    if: github.event_name == 'push' && needs.changes.outputs.docs-only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # The test and harness jobs set this, and so does nightly's e2e; this job
@@ -762,7 +769,7 @@ jobs:
           # time; keep this list equal to the jobs whose if: reads
           # docs-only above, in both directions, or the next docs-only run
           # fails here and says which side drifted.
-          DOCS_SKIP='lint test release-build harness features musl'
+          DOCS_SKIP='lint test release-build harness features musl coverage'
           status=0
           for job in $(printf '%s' "$NEEDS" | jq -r 'keys[]'); do
             result=$(printf '%s' "$NEEDS" | jq -r --arg j "$job" '.[$j].result')
