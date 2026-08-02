@@ -2751,3 +2751,93 @@ fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A host never passes the join screen, so Settings, You is where they name
+/// themselves. Typing there has to reach the link and survive the next
+/// launch, which is the pair the join screen's own field already gets.
+#[test]
+fn the_you_tab_names_a_host_and_remembers_it() {
+    let dir = std::env::temp_dir().join(format!(
+        "jamstream-you-name-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    // The state writer refuses a world-writable parent, and Linux's /tmp is
+    // one, so the fixture gets a directory of its own.
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    let path = dir.join("settings.json");
+
+    let rt = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        false,
+    )));
+    let mut app = jamstream_client::app::JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(Arc::clone(&rt)));
+    app.screen = jamstream_client::app::Screen::Session;
+    app.settings_open = true;
+    app.settings_tab = SettingsTab::You;
+    app.settings_path = Some(path.clone());
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(2);
+
+    harness.get_by_role(AkRole::TextInput).focus();
+    harness.run_steps(1);
+    harness
+        .input_mut()
+        .events
+        .push(Event::Text("Sam".to_owned()));
+    harness.run_steps(1);
+    // Committed rather than sent per keystroke, so nothing reaches the
+    // roster until the field is done.
+    assert!(
+        !rt.commands()
+            .iter()
+            .any(|c| matches!(c, Command::SetOwnName(_))),
+        "typing alone must not announce: {:?}",
+        rt.commands()
+    );
+
+    harness.input_mut().events.push(Event::Key {
+        key: Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run_steps(3);
+
+    let named: Vec<String> = rt
+        .commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::SetOwnName(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(named, vec!["Sam".to_owned()], "the link hears it once");
+
+    // And the next launch starts already named, which is the half a host
+    // notices: they set it once, not once per session.
+    let mut next = jamstream_client::app::JamApp::in_memory();
+    next.settings_path = Some(path);
+    next.restore_audio_prefs();
+    assert_eq!(next.own_name, "Sam");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
