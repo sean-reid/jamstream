@@ -109,12 +109,9 @@ jobs:
           fi
 
   # We squash-merge, so the PR title becomes the commit message on main, and
-  # release-please builds the changelog from those. A title that is not a
-  # conventional commit is not an error anywhere: the PR merges, CI is green,
-  # and the change is silently absent from the next release notes. That is
-  # exactly what happened before v0.1.2, where nine PRs including the session
-  # firewall and the broadcast pipeline were dropped from the changelog and
-  # had to be restored by hand. Hence a gate rather than a convention.
+  # release-please builds the changelog from those. The gate and the reason
+  # for it live in scripts/check-pr-title.sh, which reads the accepted types
+  # out of release-please-config.json so the two can never disagree.
   #
   # Seconds to run, so it is not worth its own workflow, and it fails fast
   # while the compile jobs are still warming up.
@@ -123,39 +120,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # Passed through env, never interpolated into the script body: a PR
-      # title is attacker-controlled text and `${{ }}` inside run: is a shell
-      # injection.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Passed through env and quoted as an argument, never interpolated into
+      # the script body: a PR title is attacker-controlled text and `${{ }}`
+      # inside run: is a shell injection.
       - name: Check the title is a conventional commit
         env:
           TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          set -eu
-          # Types accepted by release-please's default config, plus the ones
-          # this repo already uses in its history (deps).
-          TYPES='feat|fix|perf|refactor|docs|chore|test|ci|build|style|revert|deps'
-          if printf '%s' "$TITLE" | grep -qE "^($TYPES)(\([a-z0-9,./ -]+\))?!?: .+"; then
-            echo "ok: $TITLE"
-            exit 0
-          fi
-          cat >&2 <<MSG
-          PR title is not a conventional commit:
-
-            $TITLE
-
-          Because this repo squash-merges, the title becomes the commit
-          message on main, and release-please builds the changelog from it.
-          A non-conforming title merges fine and then vanishes from the
-          release notes, which is why this is enforced rather than asked for.
-
-          Use:  <type>[optional scope][!]: <description>
-          Types: $TYPES
-          Example: feat: a firewall per session
-                   fix(cloud): make the VM bootstrap fail closed
-
-          feat and fix appear in the changelog. Use ! for a breaking change.
-          MSG
-          exit 1
+        run: scripts/check-pr-title.sh "$TITLE"
 
   # The text-level gates, split out of lint so they stay on when lint's
   # cargo steps skip for a docs-only diff: a docs PR can commit a CRLF
@@ -176,6 +150,41 @@ jobs:
       # shellcheck-clean (shellcheck is preinstalled on ubuntu runners).
       - name: Shellcheck the repository scripts
         run: shellcheck scripts/*.sh
+      # The title gate reads its accepted types out of release-please-config
+      # .json, so exercise it against the real file: a parse that stopped
+      # finding the changelog sections, or a section deleted from the config,
+      # shows up here rather than on the pull request that renames a type.
+      # Every accepted title below is a type this repository has released.
+      - name: The PR title gate accepts and rejects
+        run: |
+          set -eu
+          while IFS= read -r title; do
+            scripts/check-pr-title.sh "$title" >/dev/null
+          done <<'GOOD'
+          security(protocol)!: key the version reject on a shared secret
+          feat: a firewall per session
+          fix(cloud): make the VM bootstrap fail closed
+          perf(audio): fewer copies per tick
+          deps: rand 0.10 and dalek 3
+          revert: the broadcast pipeline
+          docs: reword the install page
+          chore(main): release 0.1.6
+          ci: pin every third-party action
+          GOOD
+          status=0
+          while IFS= read -r title; do
+            if scripts/check-pr-title.sh "$title" >/dev/null 2>&1; then
+              echo "the gate accepted \"$title\"" >&2
+              status=1
+            fi
+          done <<'BAD'
+          Fix the thing
+          wip hold
+          feat no colon here
+          security
+          nope(scope): a type with no changelog section
+          BAD
+          exit $status
       # .gitattributes normalizes everything to LF so the bash steps Windows
       # runners execute and the byte-compare gates keep working; this proves
       # the index stayed normalized after checkouts from misconfigured
