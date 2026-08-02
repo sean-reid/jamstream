@@ -164,6 +164,10 @@ pub struct JamApp {
     pub log_path: Option<std::path::PathBuf>,
     /// Why the file manager would not open on the log; shown under the row.
     log_reveal_error: Option<String>,
+    /// The name the link was last told, so an edit that changes nothing
+    /// does not put the roster through another relay. `None` until the
+    /// first announcement, which is why a first name always goes out.
+    announced_name: Option<String>,
     /// What About calls this build. A field rather than the crate version
     /// read at the point of use, because the snapshot baselines render it:
     /// taking it from `CARGO_PKG_VERSION` there made every release bump
@@ -251,6 +255,7 @@ impl JamApp {
             settings_path: None,
             log_path: None,
             log_reveal_error: None,
+            announced_name: None,
             build_version: env!("CARGO_PKG_VERSION").to_owned(),
             ending: None,
             confirm_quit: false,
@@ -1050,6 +1055,8 @@ impl JamApp {
                 None
             }
             SettingsTab::You => {
+                self.name_ui(ui);
+                ui.add_space(theme::SPACE_XL);
                 self.avatar_ui(ui, snap.as_ref());
                 ui.add_space(theme::SPACE_XL);
                 ui.label(theme::title(ui, "Theme"));
@@ -1111,6 +1118,37 @@ impl JamApp {
         });
         if let Some(err) = self.log_reveal_error.clone() {
             theme::reason(ui, err);
+        }
+    }
+
+    /// "Your name", the same field the join screen carries and the same
+    /// stored value.
+    ///
+    /// It is here as well because the join screen's copy lives inside the
+    /// Join a session panel, and a host never goes through that panel: they
+    /// press Host a session and land in a session named whatever the roster
+    /// falls back to. This is the tab that already answers who you are, so
+    /// it answers it for a host too, and mid-session as well, since the name
+    /// reaches the roster over the link rather than through the invite.
+    fn name_ui(&mut self, ui: &mut Ui) {
+        ui.label(theme::title(ui, "Your name"));
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.own_name)
+                .desired_width(220.0)
+                .char_limit(64)
+                .hint_text("how the roster shows you"),
+        );
+        ui.label(theme::muted(
+            ui,
+            "The roster and any takes you record use this.",
+        ));
+        // On commit rather than per keystroke: a SetName per character would
+        // put the roster through every prefix of the name. A singleline
+        // TextEdit reports lost_focus for Enter as well as for clicking
+        // away, so checking the key too would announce twice for one edit.
+        if response.lost_focus() {
+            self.announce_own_name();
+            self.persist_audio_prefs();
         }
     }
 
@@ -1251,7 +1289,7 @@ impl JamApp {
     /// announcement: the runtime keeps it and re-announces on reconnect.
     /// Cut to the wire's byte cap on a character boundary, so a name the
     /// field accepted is never silently refused further down.
-    fn announce_own_name(&self) {
+    fn announce_own_name(&mut self) {
         let mut name = self.own_name.trim();
         while name.len() > jamstream_protocol::control::MAX_NAME_LEN {
             let mut chars = name.chars();
@@ -1261,8 +1299,15 @@ impl JamApp {
         if name.is_empty() {
             return;
         }
+        // Only a change is news. A commit that renamed nothing, and the
+        // announcements the join and host paths both make on the way in,
+        // would otherwise relay the same name to every roster twice.
+        if self.announced_name.as_deref() == Some(name) {
+            return;
+        }
         if let Some(rt) = self.runtime.as_deref() {
             rt.send(Command::SetOwnName(name.to_owned()));
+            self.announced_name = Some(name.to_owned());
         }
     }
 }
