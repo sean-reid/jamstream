@@ -10,6 +10,7 @@ pub mod join;
 pub mod launch;
 pub mod logging;
 pub mod providers;
+pub mod reason;
 pub mod recordings;
 pub mod state;
 pub mod status;

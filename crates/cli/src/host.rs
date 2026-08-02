@@ -18,6 +18,7 @@ use jamstream_protocol::transport::generate_keypair;
 use crate::CliError;
 use crate::cli::HostArgs;
 use crate::launch::{self, ArtifactOverride};
+use crate::reason::{self, Attempt};
 use crate::state::{self, InviteRecord, SessionState, SessionStatus};
 
 pub async fn run<W: Write>(
@@ -452,8 +453,10 @@ pub async fn probe_bucket(storage: &RecordingStorage, session_hex: &str) -> Resu
 /// Writes one probe object under `prefix` and deletes it.
 ///
 /// A bucket that refuses the key fails here, in a configuring frame of mind,
-/// rather than at the first take. The failure carries the provider's reason
-/// verbatim and names the prefix a key has to be able to write.
+/// rather than at the first take. The failure says what the bucket refused
+/// and names the prefix a key has to be able to write; the provider's own
+/// response goes to the log, because for S3 it is a document naming the
+/// account number and the IAM ARN (#374).
 pub async fn probe_prefix(
     store: &dyn jamstream_cloud::ObjectStore,
     bucket: &str,
@@ -470,8 +473,10 @@ pub async fn probe_prefix(
         )
         .await
         .map_err(|err| {
+            let refusal = reason::provider_sentence(Attempt::Probe, Some(store.kind()), &err);
+            tracing::warn!("writing the probe object to {bucket} in {region}: {err}");
             CliError::Failed(format!(
-                "cannot write to {bucket} in {region}: {err}. Recording needs a key that \
+                "cannot write to {bucket} in {region}. {refusal} Recording needs a key that \
                  may write {prefix} and set the bucket's lifecycle rule."
             ))
         })?;

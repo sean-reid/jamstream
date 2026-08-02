@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use data_encoding::{BASE64, HEXLOWER};
 use egui::{RichText, Ui, vec2};
 use jamstream_cli::launch::{self, ArtifactOverride};
+use jamstream_cli::reason::{self, Attempt};
 use jamstream_cloud::{
     BootConfig, CostPreview, HANDSHAKE_CAP, InstanceClass, LaunchSpec, PinnedServerArtifacts,
     Price, ProbeMatrix, Provider, ProviderKind, Region, RegionId, RetentionEnforcement, ServerArch,
@@ -900,22 +901,48 @@ fn local_region_row() -> RegionRow {
 /// docs' `jamstream sweep --dry-run` verification makes; price alone would
 /// not exercise authentication on providers with bundled price data), and
 /// the provider's launch preflight, so a token that can price sessions but
-/// cannot launch them fails here rather than at step 4 of 4. Errors are
-/// returned verbatim for the pane to show.
+/// cannot launch them fails here rather than at step 4 of 4. A refusal comes
+/// back as a sentence naming the scope or the policy to fix; see
+/// [`machine_failure`].
 pub async fn check_provider(provider: Box<dyn Provider>) -> Result<(), String> {
+    let kind = provider.kind();
     let regions = provider.regions();
     let first = regions
         .first()
         .ok_or("provider offers no regions")?
         .id
         .clone();
-    provider.price(&first).await.map_err(|e| e.to_string())?;
+    provider
+        .price(&first)
+        .await
+        .map_err(|e| machine_failure("pricing a region", kind, e))?;
     provider
         .list_tagged(None)
         .await
-        .map_err(|e| e.to_string())?;
-    provider.preflight().await.map_err(|e| e.to_string())?;
+        .map_err(|e| machine_failure("listing tagged instances", kind, e))?;
+    provider
+        .preflight()
+        .await
+        .map_err(|e| machine_failure("the launch preflight", kind, e))?;
     Ok(())
+}
+
+/// The wizard's binding of the shared mapping: every refusal it draws is the
+/// provider's machine API saying no, so the remedy is about the scopes and
+/// the policy that launch machines, never a bucket. The provider's own
+/// response goes to the log, because an EC2 403 names the account number and
+/// the IAM ARN of the key that was refused (#374).
+fn machine_failure(
+    doing: &str,
+    provider: ProviderKind,
+    err: jamstream_cloud::ProviderError,
+) -> String {
+    reason::error_sentence(
+        doing,
+        Attempt::Machines,
+        Some(provider),
+        &jamstream_cli::CliError::Provider(err),
+    )
 }
 
 /// The real region step: live price per region, TCP connect timing from
@@ -930,7 +957,7 @@ pub async fn check_provider(provider: Box<dyn Provider>) -> Result<(), String> {
 async fn survey_regions(provider: Box<dyn Provider>) -> Result<RegionSurvey, String> {
     let table = jamstream_cloud::priced_regions(provider.as_ref())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| machine_failure("pricing the regions", provider.kind(), e))?;
     let regions: Vec<Region> = table.candidates.iter().map(|(r, _)| r.clone()).collect();
     let targets = jamstream_cli::host::catalog_targets(provider.kind(), &regions);
     let rtts = jamstream_cloud::probe_all(&targets).await;
@@ -1036,7 +1063,14 @@ async fn launch_session(
         Some(storage) => Some(
             jamstream_cli::host::verify_bucket(storage, &session_hex)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| {
+                    reason::error_sentence(
+                        "arming the bucket",
+                        Attempt::Probe,
+                        Some(storage.provider),
+                        &e,
+                    )
+                })?,
         ),
         None => None,
     };
@@ -1053,11 +1087,22 @@ async fn launch_session(
     };
 
     set_phase(LaunchPhase::Launching);
-    let instance = provider.launch(spec).await.map_err(|e| e.to_string())?;
+    let kind = provider.kind();
+    let instance = provider
+        .launch(spec)
+        .await
+        .map_err(|e| machine_failure("launching the machine", kind, e))?;
     set_phase(LaunchPhase::WaitingForAddress);
     let instance = launch::wait_for_ip(provider.as_ref(), &session_hex, instance)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            reason::error_sentence(
+                "waiting for the machine's address",
+                Attempt::Machines,
+                Some(kind),
+                &e,
+            )
+        })?;
     let ip = instance.public_ip.ok_or("instance reported no public ip")?;
     let address = SocketAddr::new(ip, port);
 
