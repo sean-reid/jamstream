@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use jamstream_audio_io::WavBackend;
+use jamstream_audio_io::{AudioError, DeviceRung, WavBackend};
 use jamstream_client::live::{AudioSettings, LiveRuntime};
 use jamstream_client::runtime::{
     Command, ConnState, MemberId, RateOutcomeView, RecordState, Runtime, Snapshot,
@@ -1194,19 +1194,26 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
     }
 }
 
-/// The refusal that outlives rung 3, and the surface that carries it: a
-/// device the reopen cannot open at the device's own rate (the #242 final
-/// fallback). The swapped-in interface's 44.1 kHz clock no longer refuses,
-/// so the failure modelled here is its input source: a 48 kHz fixture the
-/// 44.1 stream cannot read. The reason must land in the snapshot for the
-/// UI, not only in a log, and the session must survive.
+/// The refusal that outlives rung 3, and the surface that carries it: the
+/// interface a musician swaps to will not open at all (the #242 final
+/// fallback). The reason must land in the snapshot for the UI, not only in a
+/// log, and it must arrive in the device's own words, because those words are
+/// the only thing that tells them what to do about it.
+///
+/// The refusal is modelled as a refusal. This test used to reach one by
+/// handing the fake a 48 kHz fixture and reopening at 44.1, so what it
+/// actually asserted was WavBackend's input-file check, a string no real
+/// backend can produce, and after #367 a 44.1 kHz interface is exactly the
+/// case that succeeds now.
 #[test]
 fn a_device_the_reopen_cannot_open_says_so_in_the_snapshot() {
+    const REFUSAL: &str = "capture device runs at 16000 Hz and will not open at 48000 Hz; \
+                           that is a Bluetooth or headset microphone with no 48000 Hz mode, \
+                           so use another capture device";
     let server = TestServer::start();
-    let sine = sine_fixture("device-refused", 440.0, RATE);
-    let backend = WavBackend::new(Some(sine.clone()), None)
+    let backend = WavBackend::new(None, None)
         .with_device_loss_after(200)
-        .reopening_at(44_100);
+        .refusing_reopen(AudioError::Unsupported(REFUSAL.to_owned()));
     let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
         .expect("join offline");
     wait_for(&rt, "joined", Duration::from_secs(10), joined);
@@ -1215,9 +1222,10 @@ fn a_device_the_reopen_cannot_open_says_so_in_the_snapshot() {
         s.device_error.is_some()
     });
     let reason = snap.device_error.expect("the predicate above matched");
-    assert!(
-        reason.contains("44100") && reason.contains("48000"),
-        "the reason must name both rates a musician has to reconcile: {reason:?}"
+    assert_eq!(
+        reason,
+        format!("unsupported audio configuration: {REFUSAL}"),
+        "the device's own sentence must reach the UI whole"
     );
     assert_eq!(
         snap.stats.state,
@@ -1234,13 +1242,193 @@ fn a_device_the_reopen_cannot_open_says_so_in_the_snapshot() {
         "a refusal must not read as an unplug or a fallback: {:?}",
         snap.chat
     );
+    let snap = wait_for(&rt, "the chat notice", Duration::from_secs(10), |s| {
+        s.chat
+            .iter()
+            .any(|l| l.text.contains("audio device refused"))
+    });
+    assert_eq!(
+        snap.chat
+            .iter()
+            .filter(|l| l.text == format!("audio device refused: {REFUSAL}"))
+            .count(),
+        1,
+        "said once, in the device's words: {:?}",
+        snap.chat
+    );
 
     rt.send(Command::Leave);
     wait_for(&rt, "idle", Duration::from_secs(5), |s| {
         s.stats.state == ConnState::Idle
     });
-    drop(rt);
-    let _ = std::fs::remove_file(&sine);
+}
+
+/// The other class, and the only one this client may call a disconnection: a
+/// reopen that finds no device at all. Every other latched error goes out as
+/// a refusal in the device's words, because the exclusive Windows path
+/// latches on any read or write hiccup and an unplug is not knowable from
+/// that (#327). Nothing covered this arm before, so the two could have been
+/// swapped and only the negative half of the refusal tests would have
+/// noticed.
+#[test]
+fn a_reopen_that_finds_nothing_is_the_one_case_called_a_disconnection() {
+    let server = TestServer::start();
+    let backend = WavBackend::new(None, None)
+        .with_device_loss_after(200)
+        .refusing_reopen(AudioError::DeviceGone);
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+
+    let snap = wait_for(&rt, "the disconnection", Duration::from_secs(10), |s| {
+        s.chat
+            .iter()
+            .any(|l| l.text == "audio device disconnected; retrying")
+    });
+    assert_eq!(
+        snap.device_error.as_deref(),
+        Some("audio device is gone or was never present")
+    );
+    assert!(
+        !snap.chat.iter().any(|l| l.text.contains("refused")),
+        "a device that is gone is not a device that refused: {:?}",
+        snap.chat
+    );
+    // Said once however many times the cadence retries it.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let snap = rt.snapshot();
+    assert_eq!(
+        snap.chat
+            .iter()
+            .filter(|l| l.text.contains("disconnected"))
+            .count(),
+        1,
+        "{:?}",
+        snap.chat
+    );
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+}
+
+/// The asymmetric pair, end to end: a 44.1 kHz microphone beside 48 kHz
+/// monitors, which is the ordinary case the moment the two endpoints are
+/// different hardware. Capture converts and playback does not, so exactly one
+/// direction is disclosed and exactly that direction's milliseconds reach
+/// mouth to ear. The fake had one rate for the whole stream until now, so
+/// every disclosure test ran on a pair that matched and this shape was
+/// unreachable from any surface.
+#[test]
+fn a_stream_that_converts_one_direction_discloses_only_that_direction() {
+    let server = TestServer::start();
+    let backend = WavBackend::new(None, None)
+        .with_direction_rungs(DeviceRung::Converted { device: 44_100 }, DeviceRung::Native);
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    let snap = wait_for(&rt, "joined with stats", Duration::from_secs(10), |s| {
+        joined(s) && s.stats.mouth_to_ear_ms.is_some()
+    });
+
+    let rate = snap.stats.rate.expect("a running stream reports its rungs");
+    let capture_ms = match rate.capture {
+        RateOutcomeView::Resampled {
+            device: 44_100,
+            added_ms,
+        } => added_ms,
+        other => panic!("capture converts at 44.1: {other:?}"),
+    };
+    assert_eq!(
+        rate.playback,
+        RateOutcomeView::Native,
+        "the monitors are already at the session rate"
+    );
+
+    // One line, for the direction that earned it.
+    let notices: Vec<&str> = snap
+        .chat
+        .iter()
+        .filter(|l| l.text.contains("converting"))
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].starts_with("converting capture 44.1 kHz to 48 kHz"));
+
+    // And one direction's milliseconds. The buffer term is the negotiated
+    // callback in session-rate frames: the 120-frame request against a
+    // 44.1 kHz capture endpoint is ceil(120 * 160/147) = 131.
+    let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
+    let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
+    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + 131.0 / 48.0;
+    assert!(
+        (m2e - link_ms - capture_ms).abs() < 0.01,
+        "mouth to ear {m2e} ms must carry the converted direction's \
+         {capture_ms} ms over {link_ms} ms of link"
+    );
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+}
+
+/// The two rungs no test could reach, because the fake could only be native
+/// or converting: a host that moved the capture device's clock to the session
+/// rate, beside one that is carrying playback over its own. Neither costs the
+/// converter's latency, and the copy is not interchangeable, so what a
+/// musician reads about their machine depends on this pair surviving the whole
+/// way from the backend to chat.
+#[test]
+fn a_moved_clock_and_an_os_converter_read_as_themselves() {
+    let server = TestServer::start();
+    let backend = WavBackend::new(None, None).with_direction_rungs(
+        DeviceRung::ClockSet { from: 44_100 },
+        DeviceRung::OsConverted { device: 44_100 },
+    );
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    let snap = wait_for(&rt, "joined with stats", Duration::from_secs(10), |s| {
+        joined(s) && s.stats.mouth_to_ear_ms.is_some()
+    });
+
+    let rate = snap.stats.rate.expect("a running stream reports its rungs");
+    assert_eq!(rate.capture, RateOutcomeView::ClockSet { from: 44_100 });
+    assert_eq!(
+        rate.playback,
+        RateOutcomeView::OsConverted { device: 44_100 }
+    );
+    assert_eq!(rate.added_ms(), 0.0, "neither rung runs a converter");
+
+    // The moved clock is announced, once: it is the one rung with a
+    // consequence outside this app, since every other program on that device
+    // is now hearing 48 kHz. The OS converter is hover-only.
+    assert_eq!(
+        snap.chat
+            .iter()
+            .filter(|l| l.text == "moved the capture device to 48 kHz (was 44.1)")
+            .count(),
+        1,
+        "{:?}",
+        snap.chat
+    );
+    assert!(
+        !snap.chat.iter().any(|l| l.text.contains("the OS is")),
+        "the OS converter belongs on the hover, not in the room: {:?}",
+        snap.chat
+    );
+
+    // No converter, so mouth to ear carries no converter term, and the
+    // buffer term is the plain 120-frame request.
+    let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
+    let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
+    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + 120.0 / 48.0;
+    assert!((m2e - link_ms).abs() < 0.01, "mouth to ear {m2e} ms");
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
 }
 
 /// The client half of #357 against the real server: a member whose invite
@@ -1289,21 +1477,22 @@ fn a_name_set_after_join_reaches_every_roster() {
     drop(witness);
 }
 
-/// The repro on #327, made honest: a mid-session device pick is refused (a
-/// 44.1 kHz interface whose input source the stream cannot read at its own
-/// rate, the refusal that outlives rung 3). The runtime keeps the selection
-/// it was handed and retries exactly it, the refusal lands in chat once in
-/// the device's own words, and nothing claims the fallback the old code
-/// silently made. Before this, `applied_audio` and the pickers said the new
-/// device while the system default ran, for the rest of the session.
+/// The repro on #327, made honest: a mid-session device pick is refused. The
+/// runtime keeps the selection it was handed and retries exactly it, the
+/// refusal lands in chat once in the device's own words, and nothing claims
+/// the fallback the old code silently made. Before this, `applied_audio` and
+/// the pickers said the new device while the system default ran, for the rest
+/// of the session.
 #[test]
 fn a_refused_reconfigure_keeps_the_selection_and_says_why() {
+    const REFUSAL: &str = "playback device runs at 44100 Hz and will not open at 48000 Hz \
+                           (ASBD not supported); check Audio MIDI Setup, Format, for a \
+                           48000 Hz entry on that device";
     let server = TestServer::start();
-    // The first open (the join) succeeds at the session rate; every open
-    // after it answers at 44.1 kHz, and the 48 kHz input fixture is what
-    // the reopened stream cannot read.
-    let sine = sine_fixture("reconf-refused", 440.0, RATE);
-    let backend = WavBackend::new(Some(sine.clone()), None).reopening_at(44_100);
+    // The join succeeds on the device they started on; the pick they make
+    // mid-session is what refuses.
+    let backend =
+        WavBackend::new(None, None).refusing_reopen(AudioError::Unsupported(REFUSAL.to_owned()));
     let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
         .expect("join offline");
     wait_for(&rt, "joined", Duration::from_secs(10), joined);
@@ -1319,14 +1508,15 @@ fn a_refused_reconfigure_keeps_the_selection_and_says_why() {
         s.device_error.is_some()
     });
     let reason = snap.device_error.expect("the predicate above matched");
-    assert!(
-        reason.contains("44100") && reason.contains("48000"),
-        "the refusal must carry the device's own words: {reason:?}"
+    assert_eq!(
+        reason,
+        format!("unsupported audio configuration: {REFUSAL}"),
+        "the refusal must carry the device's own words"
     );
     let snap = wait_for(&rt, "the chat notice", Duration::from_secs(10), |s| {
         s.chat
             .iter()
-            .any(|l| l.text.contains("audio device refused") && l.text.contains("44100"))
+            .any(|l| l.text == format!("audio device refused: {REFUSAL}"))
     });
     assert!(
         !snap
@@ -1337,8 +1527,8 @@ fn a_refused_reconfigure_keeps_the_selection_and_says_why() {
         snap.chat
     );
 
-    // The 500 ms cadence keeps retrying the same refused device; each
-    // distinct reason is said once, not once per attempt.
+    // The cadence keeps retrying the same refused device; each distinct
+    // reason is said once, not once per attempt.
     std::thread::sleep(Duration::from_millis(1_500));
     let snap = rt.snapshot();
     assert_eq!(
@@ -1360,8 +1550,6 @@ fn a_refused_reconfigure_keeps_the_selection_and_says_why() {
     wait_for(&rt, "idle", Duration::from_secs(5), |s| {
         s.stats.state == ConnState::Idle
     });
-    drop(rt);
-    let _ = std::fs::remove_file(&sine);
 }
 
 /// The other half of the same contract: a session nobody armed to record

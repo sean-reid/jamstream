@@ -81,7 +81,9 @@ impl Default for StreamConfig {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+/// Clone so a modelled backend can answer every open with the same refusal;
+/// the variants carry nothing but their own words.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AudioError {
     #[error("audio device is gone or was never present")]
     DeviceGone,

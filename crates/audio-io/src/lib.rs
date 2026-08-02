@@ -38,7 +38,7 @@ pub use types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
     StreamConfig, StreamHandle,
 };
-pub use wav::{WavBackend, WavStream};
+pub use wav::{DeviceRung, WavBackend, WavStream};
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub use cpal_backend::CpalBackend;
