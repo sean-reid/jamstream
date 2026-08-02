@@ -4,23 +4,27 @@
 #
 #   curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
 #
-# Downloads the jamstream CLI from the latest GitHub release, verifies its
-# sha256 against the release's SHA256SUMS file, and installs it.
+# Downloads the jamstream CLI from a GitHub release, verifies its sha256
+# against that release's SHA256SUMS file, and installs it.
+#
+# Piped to sh, options need -s: curl ... | sh -s -- --tag v0.2.0
 #
 # Options and environment:
 #   --with-server           also install the jamstreamd session server
 #                           (published for Linux, musl, x86_64 and aarch64)
+#   --tag TAG               install this release, for example v0.2.0, instead
+#                           of the latest one
 #   JAMSTREAM_INSTALL_DIR   install into this directory instead of the
 #                           default (/usr/local/bin when writable,
 #                           otherwise ~/.local/bin)
 #
 # POSIX sh. No colors beyond bold on a terminal. Checked by shellcheck in
-# CI (.github/workflows/docs-check.yml).
+# CI, and installed, run and uninstalled for real against a published
+# release on Linux and macOS (.github/workflows/docs-check.yml).
 
 set -eu
 
 REPO="sean-reid/jamstream"
-BASE_URL="https://github.com/${REPO}/releases/latest/download"
 SITE_URL="https://sean-reid.github.io/jamstream"
 
 if [ -t 1 ]; then
@@ -38,26 +42,54 @@ fail() {
 }
 
 usage() {
-  say "usage: install.sh [--with-server]"
+  say "usage: install.sh [--with-server] [--tag TAG]"
   say ""
   say "Installs the jamstream CLI from the latest release."
   say "  --with-server   also install the jamstreamd session server"
   say "                  (published for Linux, musl, x86_64 and aarch64)"
+  say "  --tag TAG       install this release, for example v0.2.0"
   say ""
   say "Set JAMSTREAM_INSTALL_DIR to choose the install directory."
+  say "Piped to sh, options need -s: curl ... | sh -s -- --tag v0.2.0"
 }
 
 with_server=0
-for arg in "$@"; do
-  case "$arg" in
+tag=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --with-server) with_server=1 ;;
+    --tag)
+      shift
+      [ "$#" -gt 0 ] || fail "--tag needs a release tag, for example --tag v0.2.0"
+      tag="$1"
+      ;;
+    --tag=*) tag="${1#--tag=}" ;;
     -h|--help)
       usage
       exit 0
       ;;
-    *) fail "unknown option: $arg (this script takes --with-server only)" ;;
+    *) fail "unknown option: $1 (this script takes --with-server and --tag)" ;;
   esac
+  shift
 done
+
+# The tag is a path segment in every URL below, so it is held to what a tag
+# can contain, the same set install.ps1 validates against.
+case "$tag" in
+  "") ;;
+  *[!A-Za-z0-9._-]*) fail "not a usable release tag: $tag" ;;
+esac
+
+# latest/download resolves to whatever is newest at the moment each asset is
+# requested, which is the right default for a person and the wrong one for
+# anything that has to name a version.
+if [ -n "$tag" ]; then
+  BASE_URL="https://github.com/${REPO}/releases/download/${tag}"
+  release="release $tag"
+else
+  BASE_URL="https://github.com/${REPO}/releases/latest/download"
+  release="the latest release"
+fi
 
 # Platform detection. The macOS CLI archive is a universal binary, so both
 # Mac architectures map to the same asset.
@@ -133,7 +165,7 @@ fetch() {
 # install_binary <asset> <binary> <destdir>: download, verify, extract, place.
 install_binary() {
   if ! fetch "$1" "$tmp/$1"; then
-    fail "the latest release has no asset named $1; if a release was just published, its uploads may still be running, so retry in a few minutes"
+    fail "no asset named $1 on $release; if that release was just published, its uploads may still be running, so retry in a few minutes"
   fi
   expected=$(awk -v name="$1" '{ f = $2; sub(/^\*/, "", f); if (f == name) print $1 }' "$tmp/SHA256SUMS")
   [ -n "$expected" ] || fail "SHA256SUMS has no entry for $1"
@@ -163,15 +195,17 @@ fi
 
 say "${bold}JamStream installer${normal}"
 say "platform: $os $arch, asset: $cli_asset"
+say "installing from: $release"
 say "install directory: $dest"
 
 if ! fetch SHA256SUMS "$tmp/SHA256SUMS"; then
   say ""
-  say "No JamStream release has been published yet, so there is nothing to download."
-  say "The repository builds from source (Rust toolchain required):"
+  say "No SHA256SUMS on $release; if it was just published, its uploads may"
+  say "still be running, so retry in a few minutes."
+  say "If the tag is wrong, or nothing has been published yet, the repository"
+  say "builds from source (Rust toolchain required):"
   say "  git clone https://github.com/${REPO} && cd jamstream"
   say "  cargo install --path crates/cli"
-  say "This script starts working with the first release."
   exit 1
 fi
 

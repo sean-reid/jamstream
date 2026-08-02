@@ -11,9 +11,10 @@
 # - install-scripts: the installer scripts the site serves at /install.sh
 #   and /install.ps1 (they live in site/src/, which mdBook copies into the
 #   built site verbatim) must stay shellcheck-clean and parseable.
-# - install-scripts-windows: the PowerShell pair must also survive a real
-#   install, smoke, and uninstall on a Windows runner, against the newest
-#   release that has finished uploading its assets.
+# - install-scripts-windows and install-scripts-posix: each pair must also
+#   survive a real install, smoke, and uninstall on a runner of its own
+#   platform, against the newest release that has finished uploading its
+#   assets.
 # - site-fonts: the theme's fonts are copies of fonts/ at the root of the
 #   tree. A change to those must run site/copy-fonts.sh in the same change
 #   or this job fails, and a build of the book proves the fonts reach it.
@@ -182,12 +183,8 @@ jobs:
   # directory is gone. It is also the gate that pins the asset names
   # install.ps1 downloads to what release.yml actually uploaded.
   #
-  # Which release matters. SHA256SUMS is the last asset release.yml uploads,
-  # because it hashes all the others, so for the several minutes a release
-  # takes there is a published release with nothing in it and the installer
-  # correctly refuses it. Asking install.ps1 for the newest release turned
-  # that into a red docs-check on main during v0.2.0, which is the question
-  # this job never meant to ask: it is here to prove the scripts work.
+  # Which release it installs, and why that is not simply the newest one,
+  # is scripts/newest-release-tag.sh.
   install-scripts-windows:
     runs-on: windows-latest
     timeout-minutes: 15
@@ -211,8 +208,7 @@ jobs:
           }
           if ($failed) { exit 1 }
       # The newest release that finished uploading, which is what -Tag exists
-      # for. sean-reid/jamstream by name rather than this repository, because
-      # that is the repository install.ps1 downloads from wherever it runs.
+      # for. The POSIX job below resolves it with the same script.
       - name: Find the newest complete release
         id: release
         shell: bash
@@ -220,12 +216,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          tag=$(gh api 'repos/sean-reid/jamstream/releases?per_page=30' --jq \
-            'map(select(.draft == false and ([.assets[].name] | index("SHA256SUMS")))) | .[0].tag_name // empty')
-          if [ -z "$tag" ]; then
-            echo "::error::no published release carries a SHA256SUMS asset, so there is nothing for the installer to verify against"
-            exit 1
-          fi
+          tag=$(scripts/newest-release-tag.sh)
           echo "checking the scripts against $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Install, run, and uninstall against that release
@@ -242,3 +233,46 @@ jobs:
           powershell -ExecutionPolicy Bypass -File site/src/uninstall.ps1 -InstallDir $dir -Yes
           if ($LASTEXITCODE -ne 0) { throw "uninstall.ps1 exited $LASTEXITCODE" }
           if (Test-Path (Join-Path $dir 'jamstream.exe')) { throw 'uninstall left jamstream.exe behind' }
+
+  # The same treatment for the pair most people run. Until this existed, the
+  # POSIX scripts were shellchecked and nothing more, so a change that left
+  # install.sh parseable but broken merged green on both platforms it serves
+  # while Windows got a real install (#422). Both runners are here because
+  # the two differ in the asset they fetch, the checksum tool they find, and
+  # the data directory the uninstaller reports.
+  install-scripts-posix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Find the newest complete release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$(scripts/newest-release-tag.sh)
+          echo "checking the scripts against $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      # A directory of its own rather than a default one, so the run cannot
+      # depend on what else the image has in /usr/local/bin and so the
+      # uninstaller has exactly one binary to find.
+      - name: Install, run, and uninstall against that release
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          JAMSTREAM_INSTALL_DIR: ${{ runner.temp }}/jamstream-install-check
+        run: |
+          set -eu
+          sh site/src/install.sh --tag "$TAG"
+          "$JAMSTREAM_INSTALL_DIR/jamstream" --version
+          sh site/src/uninstall.sh --yes
+          if [ -e "$JAMSTREAM_INSTALL_DIR/jamstream" ]; then
+            echo "::error::uninstall.sh left the binary behind"
+            exit 1
+          fi
