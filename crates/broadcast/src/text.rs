@@ -17,9 +17,9 @@ impl Fonts {
         let load =
             |bytes: &'static [u8]| FontRef::try_from_slice(bytes).expect("embedded font parses");
         Fonts {
-            sans: load(include_bytes!("../assets/fonts/PublicSans-Regular.ttf")),
-            semibold: load(include_bytes!("../assets/fonts/PublicSans-SemiBold.ttf")),
-            mono: load(include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf")),
+            sans: load(include_bytes!("../../../fonts/PublicSans-Regular.ttf")),
+            semibold: load(include_bytes!("../../../fonts/PublicSans-SemiBold.ttf")),
+            mono: load(include_bytes!("../../../fonts/IBMPlexMono-Regular.ttf")),
         }
     }
 }

@@ -1,4 +1,5 @@
-/* Bundled fonts, same files the desktop app ships.
+/* The files beside this one are symlinks into the tree's fonts directory,
+ * so the site serves the same bytes the app and the stream card embed.
  * Public Sans (OFL, see PublicSans-OFL.txt) for text,
  * IBM Plex Mono (OFL, see IBMPlexMono-OFL.txt) for code and numerals. */
 
