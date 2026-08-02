@@ -2,6 +2,7 @@
 //! across resolvable providers. Nothing tagged jamstream may keep billing.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jamstream_cloud::{Instance, Provider, SweepFilter, SweepReport};
@@ -54,14 +55,25 @@ pub async fn run<W: Write>(
     }
     // A dry run destroyed nothing, so the records it would close are still
     // true; reconciling from one would mark live sessions ended.
-    if !dry_run {
-        for session in reconcile(&report)? {
-            let prefix = &session[..8.min(session.len())];
-            writeln!(
-                out,
-                "Session {prefix}: recorded running, instance gone; marked it ended."
-            )?;
-        }
+    let reconciled = if dry_run {
+        Reconciled::default()
+    } else {
+        reconcile(&report)?
+    };
+    for session in &reconciled.closed {
+        let prefix = &session[..8.min(session.len())];
+        writeln!(
+            out,
+            "Session {prefix}: recorded running, instance gone; marked it ended."
+        )?;
+    }
+    for (path, err) in &reconciled.unwritten {
+        writeln!(
+            out,
+            "{}: instance gone but the record could not be rewritten ({err}); it still says \
+             running.",
+            path.display()
+        )?;
     }
     // Only worth a line when there was something to close: firewalls cost
     // nothing, so their absence is not news.
@@ -101,10 +113,27 @@ pub async fn run<W: Write>(
                 .to_owned(),
         ));
     }
+    if !reconciled.unwritten.is_empty() {
+        return Err(CliError::Failed(format!(
+            "{} session record(s) still claim an instance this sweep destroyed",
+            reconciled.unwritten.len()
+        )));
+    }
     Ok(())
 }
 
-/// Closes the session records this sweep made false, and returns their ids.
+/// What reconciliation did to the session records, and what it could not do.
+#[derive(Debug, Default)]
+pub struct Reconciled {
+    /// Ids of the sessions whose records this sweep closed.
+    pub closed: Vec<String>,
+    /// Records that could not be rewritten, with why. One failure must not
+    /// abandon the rest: the machines are already destroyed, so every record
+    /// left unwritten is a record that will keep claiming a live session.
+    pub unwritten: Vec<(PathBuf, String)>,
+}
+
+/// Closes the session records this sweep made false.
 ///
 /// A record is only closed on positive evidence that its instance is gone:
 /// either the sweep destroyed it, or a provider answering to the record's own
@@ -119,12 +148,12 @@ pub async fn run<W: Write>(
 /// reached some of its regions reports the rest as unsearched, and that is
 /// not a complete search. And the mock answers to "mock" alone, however real
 /// the kind its instances borrow.
-pub fn reconcile(report: &SweepReport) -> Result<Vec<String>, CliError> {
+pub fn reconcile(report: &SweepReport) -> Result<Reconciled, CliError> {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut closed = Vec::new();
+    let mut out = Reconciled::default();
     for (path, mut session) in state::list()? {
         if session.status != SessionStatus::Running {
             continue;
@@ -142,8 +171,10 @@ pub fn reconcile(report: &SweepReport) -> Result<Vec<String>, CliError> {
         } else {
             continue;
         }
-        state::write_to(&path, &session)?;
-        closed.push(session.session_id_hex);
+        match state::write_to(&path, &session) {
+            Ok(()) => out.closed.push(session.session_id_hex),
+            Err(err) => out.unwritten.push((path, err.to_string())),
+        }
     }
-    Ok(closed)
+    Ok(out)
 }

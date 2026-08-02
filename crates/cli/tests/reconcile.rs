@@ -230,6 +230,51 @@ async fn records_are_reconciled_after_any_death() {
         "and it must not blank the key that revokes the session's invites"
     );
 
+    // Phase 2c: a record that cannot be rewritten must not abandon the rest.
+    // The instances are already destroyed by the time reconciliation runs, so
+    // every record it skips is one that will go on claiming a live session.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        reset(&state_dir);
+        let stuck = MockProvider::with_default_regions(ProviderKind::Aws);
+        let region = stuck.regions()[0].clone();
+        let mut paths = Vec::new();
+        for session in ["1a1a1a1a1a1a1a1a", "2b2b2b2b2b2b2b2b"] {
+            let inst = stuck.seed_instance(&region, vec![session_tag(session)]);
+            paths.push(state::save(&record(session, "mock", &inst.id)).unwrap());
+        }
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root writes wherever it likes, so the phase only means something
+        // where the directory is genuinely unwritable.
+        let probe = state_dir.join("probe");
+        let unwritable = std::fs::write(&probe, b"x").is_err();
+        let _ = std::fs::remove_file(&probe);
+
+        if unwritable {
+            let providers: Vec<Box<dyn Provider>> = vec![Box::new(stuck)];
+            let mut out = Vec::new();
+            let err = sweep::run(&providers, false, &mut out)
+                .await
+                .expect_err("a record left claiming a destroyed instance is a failed sweep");
+            let text = String::from_utf8(out).unwrap();
+            assert!(err.to_string().contains("2 session record(s)"), "{err}");
+            for path in &paths {
+                assert!(
+                    text.contains(&path.display().to_string()),
+                    "every record that could not be rewritten is named: {text}"
+                );
+                assert_eq!(
+                    state::load(path).unwrap().status,
+                    SessionStatus::Running,
+                    "nothing was written, so nothing changed on disk"
+                );
+            }
+        }
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     // Phase 3: status corroborates running records against the provider,
     // read-only. Live stays running, gone prints stale with the way out,
     // and a provider that cannot be asked degrades to the record plus a note.
