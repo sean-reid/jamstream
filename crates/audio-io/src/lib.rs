@@ -10,9 +10,15 @@
 mod bridge;
 mod mode;
 mod rate;
-mod resample;
 mod types;
 mod wav;
+
+/// The device-boundary sample-rate converter (#347 rung 3). Public and hidden
+/// rather than crate-private because it runs inside device callbacks and
+/// `benches/resample.rs` is what keeps a number on that; a bench is its own
+/// crate and can reach nothing less.
+#[doc(hidden)]
+pub mod resample;
 
 /// Device-edge format negotiation and sample conversion. Only the Windows
 /// exclusive path negotiates formats, but the conversion tables are pure

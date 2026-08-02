@@ -19,10 +19,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The engine and protocol hot-path benchmarks. Deliberately not on the PR
-  # path: the suite runs for minutes, and criterion's numbers on a shared
-  # two-core runner are too noisy to gate on. The same benchmark was watched
-  # swinging 5x on a 14 core laptop while other work ran.
+  # The engine, protocol and audio-io hot-path benchmarks. Deliberately not on
+  # the PR path: the suite runs for minutes, and criterion's numbers on a
+  # shared two-core runner are too noisy to gate on. The same benchmark was
+  # watched swinging 5x on a 14 core laptop while other work ran.
   #
   # So this does not fail on a regression and takes no --save-baseline, both
   # deliberate. Runner-to-runner variance would produce false failures and
@@ -30,9 +30,10 @@ jobs:
   # lands in a job summary every night, where a 10x change is visible to
   # anyone who looks.
   #
-  # No apt step: engine and protocol pull in neither the audio nor the UI
-  # stack, unlike every other job in this file, and criterion adds nothing
-  # with default features off.
+  # The apt step is audio-io's alone: the boundary converter it benches is
+  # pure arithmetic, but the crate carries cpal on Linux, so the build wants
+  # ALSA, PipeWire and dbus headers. No UI stack here, unlike every other job
+  # in this file, and criterion adds nothing with default features off.
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -42,6 +43,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libdbus-1-dev
       # tee, so a failure is readable in the log and not only in the summary.
       # The grep drops criterion's per-benchmark progress chatter and its
       # outlier counts; the tick table and every `time:` line survive it.
@@ -50,23 +52,28 @@ jobs:
       # GITHUB_STEP_SUMMARY instead: that path is unique per step, so the
       # check would grep its own empty file and fail on 0 forever, which is
       # how this job spent its first five nights.
-      - name: Benchmark the engine and protocol hot paths
+      - name: Benchmark the engine, protocol and audio-io hot paths
         run: |
           {
             echo '## Benchmarks'
             echo '```'
-            cargo bench --locked -p jamstream-engine -p jamstream-protocol 2>&1 \
+            cargo bench --locked -p jamstream-engine -p jamstream-protocol -p jamstream-audio-io 2>&1 \
               | grep -vE '^(Benchmarking|Found [0-9]+ outliers)'
             echo '```'
           } | tee bench.out | tee -a "$GITHUB_STEP_SUMMARY"
       # A run with no `time:` lines in it means cargo bench found no bench
       # targets and exited happy, which is exactly the silent no-op this job
       # exists to prevent. Fail loudly instead.
+      #
+      # A passing run measures 53: 45 across engine and protocol, 8 in
+      # audio-io. The floor sits just under that rather than at the old 20,
+      # because 20 would have passed happily with audio-io's whole bench
+      # target missing, which is the same silent no-op one crate down.
       - name: Check the summary holds real measurements
         run: |
           count=$(grep -c 'time:' bench.out || true)
           echo "criterion reported $count measurements"
-          test "$count" -ge 20
+          test "$count" -ge 50
       - if: always()
         uses: actions/upload-artifact@v7
         with:
