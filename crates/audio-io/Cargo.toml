@@ -23,6 +23,14 @@ rubato.workspace = true
 [dev-dependencies]
 jamstream-engine.workspace = true
 jamstream-protocol.workspace = true
+criterion.workspace = true
+
+# test = false keeps `cargo test`/`cargo nextest` from building or running
+# this; harness = false hands main() to criterion.
+[[bench]]
+name = "resample"
+harness = false
+test = false
 
 # Target-gated so server/wasm builds never pull platform audio stacks.
 # macOS: CoreAudio. Windows: WASAPI exclusive mode driven directly through
