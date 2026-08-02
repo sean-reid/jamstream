@@ -13,7 +13,7 @@ The source lives at [github.com/sean-reid/jamstream](https://github.com/sean-rei
 File issues at [github.com/sean-reid/jamstream/issues](https://github.com/sean-reid/jamstream/issues). The reports that get fixed fastest include:
 
 - what you ran or clicked, and what happened instead of what you expected;
-- if the app never opens, the output of running it from a terminal, which is the only place the error appears;
+- if the app never opens, the contents of `logs/app.log` in the [app's data directory](guides/troubleshooting.md#the-app-does-not-start), which is where a crash before the window lands;
 - your operating system and, for audio problems, your interface and buffer size;
 - for session problems, the status bar numbers (mouth to ear, rtt, buffer, loss) and the first 8 characters of the session id;
 - for provider problems, the provider name and the exact CLI output, which never contains your credentials.

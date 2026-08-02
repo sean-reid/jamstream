@@ -2,7 +2,15 @@
 
 ## The app does not start
 
-Startup errors print to a console window that closes with the app, and there are no log files today, so a double-click that fails shows nothing to read. Open PowerShell in the folder holding `jamstream-app.exe`, run `.\jamstream-app.exe`, and the message stays on screen; paste it into the [bug report](../about.md#reporting-problems). The same trick works on macOS and Linux: run the binary from a terminal. A local session server that dies at startup is a different case with its own log; see [Playing on the same network](local.md#from-the-terminal).
+Every launch writes a log, and a failure before the window opens lands in it. Read that file:
+
+- macOS: `~/Library/Application Support/jamstream/logs/app.log`
+- Windows: `%LOCALAPPDATA%\jamstream\logs\app.log`
+- Linux: `~/.local/share/jamstream/logs/app.log`, or under `$XDG_DATA_HOME` if you set it
+
+The file is truncated at every start, so it holds one run and no history. It opens with a version banner; everything after that line is a warning or a crash, and that is what to paste into the [bug report](../about.md#reporting-problems). A file with the banner alone means the run was healthy. The app prints the path itself under Settings, then You, so you do not have to type any of the above.
+
+Running `.\jamstream-app.exe` from PowerShell shows nothing: a release build on Windows has no console attached, by design, so the log is the only place the error appears. On macOS and Linux a terminal run also prints to stderr. A local session server that dies at startup is a different case with its own log; see [Playing on the same network](local.md#from-the-terminal).
 
 ## Latency feels high
 
