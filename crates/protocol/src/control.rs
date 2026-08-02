@@ -17,8 +17,22 @@ pub const MAX_NAME_LEN: usize = 64;
 /// Longest accepted stream key. Twitch and YouTube keys are well under 100
 /// characters; the cap only stops a host from stuffing the control plane.
 pub const MAX_STREAM_KEY_LEN: usize = 256;
-/// Longest accepted failure reason in a [`DestinationStatus`].
+/// Longest accepted failure reason in a [`DestinationStatus`]. What a
+/// receiver tolerates; [`STREAM_REASON_BUDGET`] is what a sender may build.
 pub const MAX_STREAM_REASON_LEN: usize = 200;
+/// Longest failure reason a sender puts in a [`DestinationStatus`].
+///
+/// Smaller than [`MAX_STREAM_REASON_LEN`] because the cap that matters is the
+/// datagram, not the field: a session may have [`MAX_DESTINATIONS`] of these
+/// and they travel in one `StreamStatus`. Eight reasons at the wire cap seal
+/// to 1850 bytes, which fragments on a 1500-byte path and so is routinely
+/// dropped across the internet; eight at this budget seal to 1274, which does
+/// not. `a_full_stream_status_never_fragments` pins it.
+///
+/// Failing that way would be silent and total. `ControlLink::send` refuses an
+/// over-long reason for the whole message, so one destination's long
+/// explanation costs every other destination its status line.
+pub const STREAM_REASON_BUDGET: usize = 128;
 /// Destinations one session may point at, and so the longest `StreamStatus`
 /// that decodes. The pipeline in jamstream-stream refuses to add a ninth and
 /// re-exports this rather than keeping its own number, so the cap a host hits
@@ -153,7 +167,8 @@ pub enum StreamOp {
 }
 
 /// Per-destination lifecycle. `Failed` carries a reason a musician can act
-/// on ("pusher exited: connection refused"), never a stream key.
+/// on ("push failed: Failed to connect to rtmps://<redacted> Connection
+/// refused"), never a stream key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DestinationState {
     /// Configured, encoder not running.
@@ -164,6 +179,23 @@ pub enum DestinationState {
     Failed {
         reason: String,
     },
+}
+
+/// Cuts a failure reason down to [`STREAM_REASON_BUDGET`], on a char
+/// boundary so the result is still a `str`.
+///
+/// The cut keeps the head. ffmpeg reports the fault it hit first and then the
+/// consequences of it, so the front of a reason is the diagnosis and the back
+/// is the fallout.
+pub fn fit_stream_reason(reason: &str) -> &str {
+    if reason.len() <= STREAM_REASON_BUDGET {
+        return reason;
+    }
+    let mut end = STREAM_REASON_BUDGET;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
 }
 
 /// One destination as the server sees it. Deliberately key-free: this goes
@@ -648,6 +680,74 @@ mod tests {
     }
 
     use super::*;
+
+    /// The reason `STREAM_REASON_BUDGET` is what it is. A session may fail on
+    /// every destination at once, and all eight reasons travel in one
+    /// `StreamStatus`; at the wire cap that datagram fragments, and a
+    /// fragmented datagram is routinely dropped on the paths this has to
+    /// work across. The property is pinned rather than the constant, so a
+    /// wider `DestinationStatus` fails here instead of in the field.
+    #[test]
+    fn a_full_stream_status_never_fragments() {
+        let destinations: Vec<_> = (0..MAX_DESTINATIONS as u16)
+            .map(|i| DestinationStatus {
+                id: DestinationId(i),
+                platform: StreamPlatform::Twitch,
+                state: DestinationState::Failed {
+                    reason: "x".repeat(STREAM_REASON_BUDGET),
+                },
+                bitrate_kbps: 2_628,
+                // The widest these counters ever encode to, so a long
+                // session cannot be the thing that tips it over.
+                dropped_frames: u64::MAX,
+                repeated_frames: u64::MAX,
+            })
+            .collect();
+        let mut link = ControlLink::new();
+        link.send(ControlMsg::StreamStatus { destinations })
+            .expect("a status full of failures must be sendable");
+        for plain in link.poll(0) {
+            // The transport adds an 11-byte header and a 16-byte aead tag.
+            let sealed = plain.len() + 11 + 16;
+            assert!(
+                sealed <= 1_472,
+                "sealed stream status is {sealed} bytes, which fragments on a 1500 byte mtu"
+            );
+        }
+    }
+
+    /// The budget is a byte count and a reason is text, so the cut has to
+    /// land on a char boundary or the result is not a string at all.
+    #[test]
+    fn fitting_a_reason_cuts_on_a_char_boundary() {
+        let short = "connection refused";
+        assert_eq!(fit_stream_reason(short), short);
+
+        // Three bytes per char, so the budget falls mid-character.
+        let wide = "☃".repeat(STREAM_REASON_BUDGET);
+        let cut = fit_stream_reason(&wide);
+        assert!(cut.len() <= STREAM_REASON_BUDGET);
+        assert!(cut.len() > STREAM_REASON_BUDGET - 3);
+        assert!(wide.starts_with(cut));
+
+        // And what comes out is always sendable, which is the whole point.
+        let mut link = ControlLink::new();
+        assert!(
+            link.send(ControlMsg::StreamStatus {
+                destinations: vec![DestinationStatus {
+                    id: DestinationId(1),
+                    platform: StreamPlatform::Twitch,
+                    state: DestinationState::Failed {
+                        reason: cut.to_owned()
+                    },
+                    bitrate_kbps: 2_628,
+                    dropped_frames: 0,
+                    repeated_frames: 0,
+                }],
+            })
+            .is_ok()
+        );
+    }
 
     fn chat(n: u64) -> ControlMsg {
         ControlMsg::Chat {
