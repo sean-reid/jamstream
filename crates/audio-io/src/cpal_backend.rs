@@ -11,9 +11,12 @@
 //! WASAPI render and PipeWire convert in the OS. When the host refuses, or
 //! cannot be trusted to try (ALSA), the stream opens at the device's own
 //! rate with the boundary converter from [`crate::resample`] wrapped around
-//! that direction's handler half. The refusal that used to be the whole
-//! policy survives only for a device whose native-rate open itself fails,
-//! and for a Bluetooth hands-free microphone, which has no rate worth
+//! that direction's handler half. A host that only refuses once the stream is
+//! up, which is how PipeWire negotiates, kills it from the error callback
+//! instead; the device is demoted there so the reopen lands on the converter
+//! rather than repeating the same attempt. The refusal that used to be the
+//! whole policy survives only for a device whose native-rate open itself
+//! fails, and for a Bluetooth hands-free microphone, which has no rate worth
 //! carrying (#330).
 
 use std::collections::HashSet;
@@ -193,12 +196,12 @@ impl AudioBackend for CpalBackend {
         )?;
 
         let (on_capture, on_playback) = handler.into_parts();
-        let errored = Arc::new(AtomicBool::new(false));
+        let flags = Arc::new(StreamFlags::default());
 
         let (input, in_rate, in_added) =
-            open_capture_side(&in_side, in_plan, &config, rates, on_capture, &errored)?;
+            open_capture_side(&in_side, in_plan, &config, rates, on_capture, &flags)?;
         let (output, out_rate, out_added) =
-            open_playback_side(&out_side, out_plan, &config, rates, on_playback, &errored)?;
+            open_playback_side(&out_side, out_plan, &config, rates, on_playback, &flags)?;
 
         // cpal 0.18 streams start paused.
         input.play().map_err(|e| map_err(&e))?;
@@ -225,6 +228,24 @@ impl AudioBackend for CpalBackend {
             && let Ok(id) = out_device.id()
         {
             clock_set.push(id.id().to_string());
+        }
+
+        // The devices running at a rate they never advertised, because the
+        // host was trusted to refuse what it could not carry. Only a
+        // direction that is still on its attempt counts: one that already
+        // fell through to the converter has nothing left to demote.
+        let mut attempted = Vec::new();
+        if in_plan.attempted
+            && in_added.is_none()
+            && let Ok(id) = in_device.id()
+        {
+            attempted.push(id.id().to_string());
+        }
+        if out_plan.attempted
+            && out_added.is_none()
+            && let Ok(id) = out_device.id()
+        {
+            attempted.push(id.id().to_string());
         }
 
         // Negotiated callback sizes, per host: the WASAPI shared-mode device
@@ -254,11 +275,12 @@ impl AudioBackend for CpalBackend {
         Ok(Box::new(CpalStreamHandle {
             input,
             output,
-            errored,
+            flags,
             latency_frames,
             buffer_frames,
             rate,
             clock_set,
+            attempted,
             demoted: Arc::clone(&self.demoted),
             demotion_noted: AtomicBool::new(false),
         }))
@@ -272,18 +294,43 @@ fn device_demoted(demoted: &Mutex<HashSet<String>>, device: &cpal::Device) -> bo
         .is_ok_and(|id| demoted.lock().is_ok_and(|set| set.contains(id.id())))
 }
 
-/// Records a dead clock-set stream's devices as demoted, once each, so every
-/// later open in this backend converts for them instead of re-setting the
-/// clock (#347's contested-clock decision: no retry, no fight).
-fn demote(demoted: &Mutex<HashSet<String>>, clock_set: &[String]) {
+/// Everything a dead stream demotes, so every later open in this backend
+/// takes those devices at their own rate through the boundary converter.
+///
+/// The clock this app set is demoted whatever killed the stream (#347's
+/// contested-clock decision: no retry, no fight). A device running at a rate
+/// it never advertised is demoted only when the host is what refused it,
+/// because an unplug says nothing about the rate and putting a working device
+/// on the converter for good would cost latency for nothing.
+fn demote_dead_stream(
+    demoted: &Mutex<HashSet<String>>,
+    clock_set: &[String],
+    attempted: &[String],
+    config_refused: bool,
+) {
+    demote(
+        demoted,
+        clock_set,
+        "a stream that had moved this device's clock died",
+    );
+    if config_refused {
+        demote(
+            demoted,
+            attempted,
+            "the host refused the rate this stream was opened at, after it came up",
+        );
+    }
+}
+
+/// Records devices as demoted, once each, logging `why` the first time.
+fn demote(demoted: &Mutex<HashSet<String>>, devices: &[String], why: &str) {
     let Ok(mut set) = demoted.lock() else { return };
-    for id in clock_set {
+    for id in devices {
         if set.insert(id.clone()) {
             tracing::warn!(
                 device = %id,
-                "a stream that had moved this device's clock died; opening it \
-                 through the boundary converter from now on instead of \
-                 re-setting the clock"
+                why,
+                "opening this device through the boundary converter from now on"
             );
         }
     }
@@ -309,26 +356,26 @@ fn open_capture_side(
     config: &StreamConfig,
     rates: RateContext,
     on_capture: CaptureFn,
-    errored: &Arc<AtomicBool>,
+    flags: &Arc<StreamFlags>,
 ) -> Result<(cpal::Stream, u32, Option<f32>)> {
     let refused = |e: &AudioError| rates.refused(side.direction, &side.native, side.form, Some(e));
     if plan.convert {
         let device_rate = plan.open.sample_rate();
         let (wrapped, added) =
             converting_capture(on_capture, config.sample_rate, device_rate, config.channels);
-        let stream = build_input(side.device, &plan.open, config, wrapped, errored)
+        let stream = build_input(side.device, &plan.open, config, wrapped, flags)
             .map_err(|e| refused(&e))?;
         return Ok((stream, device_rate, Some(added)));
     }
     if !plan.attempted {
-        let stream = build_input(side.device, &plan.open, config, on_capture, errored)?;
+        let stream = build_input(side.device, &plan.open, config, on_capture, flags)?;
         return Ok((stream, plan.open.sample_rate(), None));
     }
     // The attempt: a session-rate config the device never advertised, put to
     // a host that reports honestly. cpal consumes the callback even when the
     // build fails, so it rides in a slot the fallback can take back.
     let (shim, slot) = recoverable_capture(on_capture);
-    let failure = match build_input(side.device, &plan.open, config, shim, errored) {
+    let failure = match build_input(side.device, &plan.open, config, shim, flags) {
         Ok(stream) => return Ok((stream, plan.open.sample_rate(), None)),
         Err(e) => e,
     };
@@ -344,8 +391,8 @@ fn open_capture_side(
     let device_rate = side.native.sample_rate();
     let (wrapped, added) =
         converting_capture(inner, config.sample_rate, device_rate, config.channels);
-    let stream = build_input(side.device, &side.native, config, wrapped, errored)
-        .map_err(|e| refused(&e))?;
+    let stream =
+        build_input(side.device, &side.native, config, wrapped, flags).map_err(|e| refused(&e))?;
     Ok((stream, device_rate, Some(added)))
 }
 
@@ -356,7 +403,7 @@ fn open_playback_side(
     config: &StreamConfig,
     rates: RateContext,
     on_playback: PlaybackFn,
-    errored: &Arc<AtomicBool>,
+    flags: &Arc<StreamFlags>,
 ) -> Result<(cpal::Stream, u32, Option<f32>)> {
     let refused = |e: &AudioError| rates.refused(side.direction, &side.native, side.form, Some(e));
     if plan.convert {
@@ -367,16 +414,16 @@ fn open_playback_side(
             device_rate,
             config.channels,
         );
-        let stream = build_output(side.device, &plan.open, config, wrapped, errored)
+        let stream = build_output(side.device, &plan.open, config, wrapped, flags)
             .map_err(|e| refused(&e))?;
         return Ok((stream, device_rate, Some(added)));
     }
     if !plan.attempted {
-        let stream = build_output(side.device, &plan.open, config, on_playback, errored)?;
+        let stream = build_output(side.device, &plan.open, config, on_playback, flags)?;
         return Ok((stream, plan.open.sample_rate(), None));
     }
     let (shim, slot) = recoverable_playback(on_playback);
-    let failure = match build_output(side.device, &plan.open, config, shim, errored) {
+    let failure = match build_output(side.device, &plan.open, config, shim, flags) {
         Ok(stream) => return Ok((stream, plan.open.sample_rate(), None)),
         Err(e) => e,
     };
@@ -392,8 +439,8 @@ fn open_playback_side(
     let device_rate = side.native.sample_rate();
     let (wrapped, added) =
         converting_playback(inner, config.sample_rate, device_rate, config.channels);
-    let stream = build_output(side.device, &side.native, config, wrapped, errored)
-        .map_err(|e| refused(&e))?;
+    let stream =
+        build_output(side.device, &side.native, config, wrapped, flags).map_err(|e| refused(&e))?;
     Ok((stream, device_rate, Some(added)))
 }
 
@@ -801,24 +848,50 @@ fn choose_buffer_size(native: &cpal::SupportedStreamConfig, requested: u32) -> c
     }
 }
 
-fn make_error_callback(errored: &Arc<AtomicBool>) -> impl FnMut(cpal::Error) + Send + 'static {
-    let flag = Arc::clone(errored);
+/// What one stream's error callback has to tell the poller: that the stream
+/// is dead, and whether the host killed it by refusing the config the open
+/// asked for.
+///
+/// The second flag is the asynchronous half of the rate ladder. PipeWire
+/// negotiates after the build returns, so its refusal of an attempted
+/// session-rate open arrives at the error callback as `UnsupportedConfig`
+/// rather than out of `build_*_stream`. A synchronous refusal falls through
+/// to the converter inside the open; this is what lets the asynchronous one
+/// do the same on the next open instead of producing the identical plan
+/// forever, which left rung 3 unreachable on that host.
+#[derive(Debug, Default)]
+struct StreamFlags {
+    errored: AtomicBool,
+    rate_refused: AtomicBool,
+}
+
+/// A refusal of the config the stream was opened at, as opposed to any other
+/// way a stream can die. cpal reports a negotiated-format mismatch this way
+/// on every host that verifies one.
+fn is_config_refusal(kind: cpal::ErrorKind) -> bool {
+    matches!(kind, cpal::ErrorKind::UnsupportedConfig)
+}
+
+fn make_error_callback(flags: &Arc<StreamFlags>) -> impl FnMut(cpal::Error) + Send + 'static {
+    let flags = Arc::clone(flags);
     move |e: cpal::Error| {
         // Informational kinds do not invalidate the stream; everything else
         // (device gone, stream invalidated, backend failure) means the app
-        // must surface a device-gone state and reopen.
-        //
-        // This is also the second half of the rate guarantee. PipeWire
-        // negotiates asynchronously, so a stream that comes back at some rate
-        // other than the one asked for is reported here as UnsupportedConfig
-        // rather than by `build_*_stream`, and latching on it is what stops
-        // that stream from playing on at the wrong pitch.
-        if !matches!(
-            e.kind(),
+        // must surface a device-gone state and reopen. Latching on the
+        // refusal is also what stops a stream that came back at the wrong
+        // rate from playing on at the wrong pitch.
+        let kind = e.kind();
+        if matches!(
+            kind,
             cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied
         ) {
-            flag.store(true, Ordering::Release);
+            return;
         }
+        // Ordered so a poller that sees the death also sees the reason.
+        if is_config_refusal(kind) {
+            flags.rate_refused.store(true, Ordering::Relaxed);
+        }
+        flags.errored.store(true, Ordering::Release);
     }
 }
 
@@ -827,7 +900,7 @@ fn build_input(
     open: &cpal::SupportedStreamConfig,
     config: &StreamConfig,
     mut on_capture: CaptureFn,
-    errored: &Arc<AtomicBool>,
+    flags: &Arc<StreamFlags>,
 ) -> Result<cpal::Stream> {
     let device_ch = usize::from(open.channels().max(1));
     let handler_ch = usize::from(config.channels);
@@ -849,7 +922,7 @@ fn build_input(
                     on_capture(dst);
                 }
             },
-            make_error_callback(errored),
+            make_error_callback(flags),
             None,
         )
         .map_err(|e| map_err(&e))
@@ -860,7 +933,7 @@ fn build_output(
     open: &cpal::SupportedStreamConfig,
     config: &StreamConfig,
     mut on_playback: PlaybackFn,
-    errored: &Arc<AtomicBool>,
+    flags: &Arc<StreamFlags>,
 ) -> Result<cpal::Stream> {
     let device_ch = usize::from(open.channels().max(1));
     let handler_ch = usize::from(config.channels);
@@ -883,7 +956,7 @@ fn build_output(
                     map_frames(src, handler_ch, chunk, device_ch);
                 }
             },
-            make_error_callback(errored),
+            make_error_callback(flags),
             None,
         )
         .map_err(|e| map_err(&e))
@@ -892,13 +965,16 @@ fn build_output(
 struct CpalStreamHandle {
     input: cpal::Stream,
     output: cpal::Stream,
-    errored: Arc<AtomicBool>,
+    flags: Arc<StreamFlags>,
     latency_frames: Option<u32>,
     buffer_frames: Option<u32>,
     rate: RateOutcomes,
     /// Devices whose clock this stream's open moved, joined to the backend's
     /// `demoted` set the first time [`StreamHandle::errored`] reads true.
     clock_set: Vec<String>,
+    /// Devices this stream asked for a rate they never advertised; demoted
+    /// with the clock-set ones when the host is what refused it.
+    attempted: Vec<String>,
     demoted: Arc<Mutex<HashSet<String>>>,
     demotion_noted: AtomicBool,
 }
@@ -913,15 +989,20 @@ impl StreamHandle for CpalStreamHandle {
     }
 
     fn errored(&self) -> bool {
-        let errored = self.errored.load(Ordering::Acquire);
-        // A dead stream that had set a device clock demotes that device
-        // before the caller's reopen can ask for the session rate again.
-        // Polled off the RT path, so the lock inside is fine.
+        let errored = self.flags.errored.load(Ordering::Acquire);
+        // A dead stream demotes what it has to before the caller's reopen can
+        // ask for the same thing again. Polled off the RT path, so the lock
+        // inside is fine.
         if errored
-            && !self.clock_set.is_empty()
+            && !(self.clock_set.is_empty() && self.attempted.is_empty())
             && !self.demotion_noted.swap(true, Ordering::Relaxed)
         {
-            demote(&self.demoted, &self.clock_set);
+            demote_dead_stream(
+                &self.demoted,
+                &self.clock_set,
+                &self.attempted,
+                self.flags.rate_refused.load(Ordering::Relaxed),
+            );
         }
         errored
     }
@@ -1173,11 +1254,128 @@ mod tests {
     #[test]
     fn a_dead_clock_set_stream_demotes_its_devices_once() {
         let demoted = Mutex::new(HashSet::new());
-        demote(&demoted, &["dev-a".to_owned(), "dev-b".to_owned()]);
-        demote(&demoted, &["dev-a".to_owned()]);
+        demote(&demoted, &["dev-a".to_owned(), "dev-b".to_owned()], "why");
+        demote(&demoted, &["dev-a".to_owned()], "why");
         let set = demoted.lock().unwrap();
         assert_eq!(set.len(), 2);
         assert!(set.contains("dev-a") && set.contains("dev-b"));
+    }
+
+    /// The production error callback, fed the errors the hosts really send.
+    /// A rerouted device and a refused realtime promotion leave the stream
+    /// alive; everything else kills it, and a refusal of the config the
+    /// stream was opened at is recorded as such, because it is the only kind
+    /// the next open can do anything about.
+    #[test]
+    fn the_error_callback_latches_the_death_and_the_reason() {
+        let cases = [
+            (cpal::ErrorKind::DeviceChanged, false, false),
+            (cpal::ErrorKind::RealtimeDenied, false, false),
+            (cpal::ErrorKind::DeviceNotAvailable, true, false),
+            (cpal::ErrorKind::StreamInvalidated, true, false),
+            (cpal::ErrorKind::BackendError, true, false),
+            // PipeWire's asynchronous answer, verbatim in shape.
+            (cpal::ErrorKind::UnsupportedConfig, true, true),
+        ];
+        for (kind, dead, refused) in cases {
+            let flags = Arc::new(StreamFlags::default());
+            let mut callback = make_error_callback(&flags);
+            callback(cpal::Error::with_message(
+                kind,
+                "Negotiated format mismatch: expected 2 channels at 48000 Hz, \
+                 got 2 channels at 44100 Hz"
+                    .to_owned(),
+            ));
+            assert_eq!(flags.errored.load(Ordering::Acquire), dead, "{kind:?}");
+            assert_eq!(
+                flags.rate_refused.load(Ordering::Relaxed),
+                refused,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The asynchronous half of rung 3, end to end within this module: a
+    /// PipeWire graph that advertises only 44.1 kHz is attempted at 48, comes
+    /// up, and refuses from its param-changed handler. The refusal has to
+    /// demote the device, or the next `plan_direction` produces the identical
+    /// attempted plan and the converter is unreachable on that host forever.
+    #[test]
+    fn a_refusal_after_the_stream_came_up_reaches_the_converter_on_the_next_open() {
+        let native = native(44_100, 2);
+        let ranges = [range(44_100, 44_100, 2, SampleFormat::F32)];
+        let plan = plan_direction(
+            ctx("PipeWire"),
+            Direction::Capture,
+            &native,
+            ranges.into_iter(),
+            true,
+            FormFactor::Unknown,
+            false,
+        )
+        .expect("a converting host is asked");
+        assert!(plan.attempted && !plan.convert);
+
+        // The graph answers after the build returned, on the real callback.
+        let flags = Arc::new(StreamFlags::default());
+        let mut callback = make_error_callback(&flags);
+        callback(cpal::Error::with_message(
+            cpal::ErrorKind::UnsupportedConfig,
+            "Negotiated format mismatch: expected 2 channels at 48000 Hz, \
+             got 2 channels at 44100 Hz"
+                .to_owned(),
+        ));
+        assert!(flags.errored.load(Ordering::Acquire), "the stream is dead");
+
+        let demoted = Mutex::new(HashSet::new());
+        demote_dead_stream(
+            &demoted,
+            &[],
+            &["pipewire-in".to_owned()],
+            flags.rate_refused.load(Ordering::Relaxed),
+        );
+        assert!(demoted.lock().unwrap().contains("pipewire-in"));
+
+        let plan = plan_direction(
+            ctx("PipeWire"),
+            Direction::Capture,
+            &native,
+            ranges.into_iter(),
+            true,
+            FormFactor::Unknown,
+            true,
+        )
+        .expect("the reopen takes the converter");
+        assert!(plan.convert, "rung 3 must be reachable on PipeWire");
+        assert!(!plan.attempted, "the same attempt must not be repeated");
+        assert_eq!(plan.open.sample_rate(), 44_100);
+    }
+
+    /// And the other half: an unplug says nothing about the rate, so the
+    /// device keeps its rung. Demoting on every death would put a device that
+    /// was carrying the session fine on the converter, and its latency, for
+    /// the rest of the session.
+    #[test]
+    fn an_unplug_does_not_demote_the_rate_a_device_was_carrying() {
+        let flags = Arc::new(StreamFlags::default());
+        let mut callback = make_error_callback(&flags);
+        callback(cpal::Error::with_message(
+            cpal::ErrorKind::DeviceNotAvailable,
+            "device disappeared".to_owned(),
+        ));
+        let demoted = Mutex::new(HashSet::new());
+        demote_dead_stream(
+            &demoted,
+            &[],
+            &["usb-in".to_owned()],
+            flags.rate_refused.load(Ordering::Relaxed),
+        );
+        assert!(demoted.lock().unwrap().is_empty());
+
+        // A clock this app set is demoted whatever killed the stream: the
+        // contest is with the other app, not with the cable.
+        demote_dead_stream(&demoted, &["clocked".to_owned()], &[], false);
+        assert!(demoted.lock().unwrap().contains("clocked"));
     }
 
     #[test]
