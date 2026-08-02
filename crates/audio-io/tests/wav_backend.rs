@@ -244,9 +244,9 @@ fn a_44_1_device_opens_a_48_khz_session_through_the_converter() {
     let stream = backend.open_offline(config(2), passthrough()).unwrap();
     assert_eq!(stream.device_rate(), 44_100);
     assert_eq!(stream.buffer_frames(), Some(262));
-    let (capture_ms, playback_ms) = stream
-        .resample_added_ms()
-        .expect("a converting stream reports its added latency");
+    let (Some(capture_ms), Some(playback_ms)) = stream.resample_added_ms() else {
+        panic!("a converting stream reports its added latency on both directions");
+    };
     assert!(capture_ms > 0.0 && playback_ms > 0.0);
     // The handle's rung report carries the converter's own figures, never a
     // copy that could drift from them.
@@ -274,7 +274,7 @@ fn a_48_k_device_reports_no_conversion_and_no_added_latency() {
     let backend = WavBackend::new(None, None);
     let stream = backend.open_offline(config(2), passthrough()).unwrap();
     assert_eq!(stream.device_rate(), 48_000);
-    assert_eq!(stream.resample_added_ms(), None);
+    assert_eq!(stream.resample_added_ms(), (None, None));
     assert_eq!(stream.buffer_frames(), Some(240), "no scaling at unity");
     assert_eq!(
         stream.rate_outcomes(),
@@ -317,6 +317,143 @@ fn an_input_wav_must_match_the_device_rate_not_the_session_rate() {
     };
     assert!(msg.contains("44100") && msg.contains("48000"), "{msg}");
     let _ = std::fs::remove_file(&input_path);
+}
+
+/// Every rung a real backend can land on is expressible, and none of them
+/// claims more than the stream is doing. Only the boundary converter leaves
+/// the device on its own clock: a clock the backend moved and an OS converter
+/// both hand us a session-rate stream, which is what CoreAudio and WASAPI
+/// render really do, so the fake runs at the session rate on both.
+#[test]
+fn every_rung_is_reportable_and_none_of_them_lies_about_the_clock() {
+    use jamstream_audio_io::{DeviceRung, RateOutcome};
+
+    let cases = [
+        (DeviceRung::Native, RateOutcome::Native),
+        (
+            DeviceRung::ClockSet { from: 44_100 },
+            RateOutcome::ClockSet { from: 44_100 },
+        ),
+        (
+            DeviceRung::OsConverted { device: 44_100 },
+            RateOutcome::OsConverted { device: 44_100 },
+        ),
+    ];
+    for (rung, want) in cases {
+        let backend = WavBackend::new(None, None).with_direction_rungs(rung, rung);
+        let stream = backend.open_offline(config(2), passthrough()).unwrap();
+        let outcomes = stream.rate_outcomes().expect("the fake always reports");
+        assert_eq!(outcomes.capture, want, "{rung:?}");
+        assert_eq!(outcomes.playback, want, "{rung:?}");
+        assert_eq!(
+            stream.device_rate(),
+            48_000,
+            "{rung:?} leaves the stream at the session rate"
+        );
+        assert_eq!(
+            stream.resample_added_ms(),
+            (None, None),
+            "{rung:?} costs no converter"
+        );
+    }
+
+    // A rung that names the session rate bridges nothing, whatever it claims.
+    let backend = WavBackend::new(None, None).with_direction_rungs(
+        DeviceRung::ClockSet { from: 48_000 },
+        DeviceRung::Converted { device: 48_000 },
+    );
+    let stream = backend.open_offline(config(2), passthrough()).unwrap();
+    let outcomes = stream.rate_outcomes().unwrap();
+    assert_eq!(outcomes.capture, RateOutcome::Native);
+    assert_eq!(outcomes.playback, RateOutcome::Native);
+}
+
+/// The asymmetric pair the outcome type exists for: a 44.1 kHz microphone
+/// beside 48 kHz monitors. Capture converts and keeps the interface's clock,
+/// playback is native on the session's, and each file is written at the clock
+/// of the endpoint that produced it. The fake had one rate for the whole
+/// stream before this, so nothing anywhere could reach two different
+/// outcomes at once.
+#[test]
+fn two_endpoints_on_two_clocks_convert_one_direction_only() {
+    use jamstream_audio_io::{DeviceRung, RateOutcome};
+
+    let input_path = temp_path("split-clock-in.wav");
+    let output_path = temp_path("split-clock-out.wav");
+    write_sine(&input_path, 2, 44_100, 44_100);
+
+    let backend = WavBackend::new(Some(input_path.clone()), Some(output_path.clone()))
+        .with_direction_rungs(DeviceRung::Converted { device: 44_100 }, DeviceRung::Native);
+    let mut stream = backend.open_offline(config(2), passthrough()).unwrap();
+
+    assert_eq!(
+        stream.device_rate(),
+        44_100,
+        "the pump runs on the capture clock"
+    );
+    let outcomes = stream.rate_outcomes().unwrap();
+    assert!(
+        matches!(
+            outcomes.capture,
+            RateOutcome::Resampled { device: 44_100, .. }
+        ),
+        "{outcomes:?}"
+    );
+    assert_eq!(outcomes.playback, RateOutcome::Native);
+    let (capture_ms, playback_ms) = stream.resample_added_ms();
+    assert!(capture_ms.is_some_and(|ms| ms > 0.0));
+    assert_eq!(playback_ms, None, "a native direction converts nothing");
+    assert_eq!(
+        stream.buffer_frames(),
+        Some(262),
+        "the callback size is the wider direction's, in session-rate frames"
+    );
+
+    // One second on the capture clock is one second on the playback clock.
+    for _ in 0..100 {
+        stream.pump(441).unwrap();
+    }
+    stream.finish().unwrap();
+    let (spec, written) = read_all(&output_path);
+    assert_eq!(
+        spec.sample_rate, 48_000,
+        "the monitors write on their own clock"
+    );
+    assert_eq!(written.len() / 2, 48_000, "and at their own frame count");
+
+    let _ = std::fs::remove_file(&input_path);
+    let _ = std::fs::remove_file(&output_path);
+}
+
+/// A device the backend will not open, which is a different failure from the
+/// input file not matching the device clock: the first is what every real
+/// backend answers a bad open with, the second is this backend's own
+/// bookkeeping and no real one can produce it. The client's refusal surface
+/// was tested against the second for want of the first.
+#[test]
+fn a_refused_reopen_answers_in_the_devices_own_words() {
+    let words = "the interface is already open in exclusive mode";
+    let backend =
+        WavBackend::new(None, None).refusing_reopen(AudioError::Unsupported(words.into()));
+    backend
+        .open_offline(config(2), passthrough())
+        .expect("the first open is the device they started on");
+    for attempt in 1..=2 {
+        let err = backend.open_offline(config(2), passthrough()).unwrap_err();
+        let AudioError::Unsupported(msg) = err else {
+            panic!("attempt {attempt}: expected Unsupported, got {err:?}");
+        };
+        assert_eq!(msg, words, "the refusal is verbatim, every time");
+    }
+
+    // The gone class travels the same way, and it is a different class: the
+    // caller is allowed to say "disconnected" only for this one.
+    let backend = WavBackend::new(None, None).refusing_reopen(AudioError::DeviceGone);
+    backend.open_offline(config(1), passthrough()).unwrap();
+    assert!(matches!(
+        backend.open_offline(config(1), passthrough()),
+        Err(AudioError::DeviceGone)
+    ));
 }
 
 /// The offline backend reports a form factor like the real hosts do: Unknown
@@ -378,6 +515,53 @@ fn the_stream_after_the_unplug_keeps_running() {
     let mut second = backend.open_offline(config(2), passthrough()).unwrap();
     second.pump(960).unwrap();
     assert!(!second.errored(), "the replacement device stays plugged in");
+}
+
+/// The device that never comes back, which the one-shot latch made
+/// impossible to model: every stream loses it again, so a caller's retry loop
+/// is exercised against a failure that repeats rather than one that cannot.
+#[test]
+fn a_device_that_never_stays_open_loses_every_stream() {
+    let backend = WavBackend::new(None, None).losing_device_every(480);
+    for open in 1..=3 {
+        let mut stream = backend.open_offline(config(2), passthrough()).unwrap();
+        stream.pump(240).unwrap();
+        assert!(!stream.errored(), "open {open} is alive at 240 frames");
+        stream.pump(240).unwrap();
+        assert!(stream.errored(), "open {open} loses the device again");
+    }
+    assert_eq!(
+        backend.opens(),
+        3,
+        "every open is counted, reopens included"
+    );
+}
+
+/// The worst shape, and the one the client's reopen loop has to be bounded
+/// against: the open succeeds and the stream is already dead when the caller
+/// first polls it, with no pump in between. A WASAPI exclusive endpoint
+/// another process holds and a PipeWire graph refusing the rate both land
+/// here, because the refusal arrives on the error callback rather than out of
+/// the open.
+#[test]
+fn a_device_gone_before_the_first_poll_is_errored_at_open() {
+    let backend = WavBackend::new(None, None).losing_device_every(0);
+    for open in 1..=3 {
+        let stream = backend.open_offline(config(2), passthrough()).unwrap();
+        assert!(stream.errored(), "open {open} is dead on arrival");
+    }
+    assert_eq!(backend.opens(), 3);
+}
+
+/// The same shape as a one-shot: it is spent by the stream it latched, so the
+/// reopen answers with a working device.
+#[test]
+fn a_one_shot_loss_at_open_is_spent_by_the_first_stream() {
+    let backend = WavBackend::new(None, None).with_device_loss_after(0);
+    let first = backend.open_offline(config(2), passthrough()).unwrap();
+    assert!(first.errored());
+    let second = backend.open_offline(config(2), passthrough()).unwrap();
+    assert!(!second.errored(), "the replacement device is fine");
 }
 
 #[test]

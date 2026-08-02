@@ -57,8 +57,19 @@ const CHAT_LIMIT: usize = 500;
 /// Meter fall per 2.5 ms tick; roughly a 170 ms half-life so levels look
 /// alive at snapshot rate without flickering per packet.
 const LEVEL_DECAY: f32 = 0.99;
-/// Backoff between attempts to reopen a lost or misconfigured stream.
+/// Base backoff between attempts to reopen a lost or misconfigured stream.
+/// The first attempt of an episode is immediate; each one after it waits
+/// twice as long as the last, to [`REOPEN_BACKOFF_MAX`].
 const REOPEN_INTERVAL: Duration = Duration::from_millis(500);
+/// Longest the reopen loop waits between attempts.
+const REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(4);
+/// Attempts one episode gets before the loop stops and says so. Six of them
+/// span about twelve seconds, which is long enough for a driver to come back
+/// and short enough that a musician is not left watching dead meters.
+const REOPEN_ATTEMPTS_MAX: u32 = 6;
+/// A stream that has run this long has recovered: the episode ends, so the
+/// next loss is retried at once and announced again.
+const STREAM_SETTLED_AFTER: Duration = Duration::from_secs(5);
 /// Longest offline-pump stall replayed sample-for-sample, in seconds of
 /// device time; two seconds is comfortably past the server jitter buffer's
 /// 512-frame (1.28 s) stream-restart threshold, so an abandoned backlog
@@ -439,6 +450,44 @@ impl Driver {
     }
 }
 
+/// One run of the reopen loop, from the first loss to the stream that stays
+/// up for [`STREAM_SETTLED_AFTER`].
+///
+/// The first attempt of an episode is immediate, so a genuine unplug is
+/// reopened on the next tick. Each attempt after it waits twice as long, and
+/// the budget stops the loop entirely. Without both, a device that opens and
+/// then latches before the next tick was closed and reopened every 2.5 ms:
+/// two chat lines a tick emptied the 500-line scrollback in about a second,
+/// and a real open costs 10-100 ms, so the rings went unserviced for the
+/// whole episode.
+#[derive(Debug, Default)]
+struct ReopenEpisode {
+    attempts: u32,
+    /// Said once each per episode. A device that dies on every open would
+    /// otherwise alternate two distinct lines forever, which no per-line
+    /// dedupe can catch.
+    said_stopped: bool,
+    said_reopened: bool,
+    said_given_up: bool,
+}
+
+impl ReopenEpisode {
+    /// The wait owed before the next attempt.
+    fn backoff(&self) -> Duration {
+        match self.attempts.checked_sub(1) {
+            None => Duration::ZERO,
+            Some(n) => REOPEN_INTERVAL
+                .saturating_mul(1u32 << n.min(16))
+                .min(REOPEN_BACKOFF_MAX),
+        }
+    }
+
+    /// Whether the budget is spent and the loop should stop trying.
+    fn spent(&self) -> bool {
+        self.attempts >= REOPEN_ATTEMPTS_MAX
+    }
+}
+
 /// The production runtime. Construct with [`LiveRuntime::join`]; the UI
 /// consumes it as a `Box<dyn Runtime>` (an `Arc<LiveRuntime>` implements
 /// the trait too, so the app can keep a concrete handle for
@@ -544,6 +593,8 @@ impl LiveRuntime {
             avatar_failed: HashSet::new(),
             reopen_attempts: 0,
             last_reopen: None,
+            opened_at: Some(Instant::now()),
+            episode: ReopenEpisode::default(),
             announced_failure: None,
             announced_rate: rate,
         };
@@ -881,8 +932,13 @@ struct Worker {
     avatar_failed: HashSet<String>,
     reopen_attempts: u64,
     last_reopen: Option<Instant>,
-    /// The failure line last put in chat, so the 500 ms retry cadence
-    /// announces each distinct reason once instead of every half second.
+    /// When the running stream opened, until it has been up long enough to
+    /// count as recovered; None while there is no stream, and once the
+    /// running one has already ended its episode.
+    opened_at: Option<Instant>,
+    episode: ReopenEpisode,
+    /// The failure line last put in chat, so the retry cadence announces each
+    /// distinct reason once instead of once per attempt.
     announced_failure: Option<String>,
     /// The rate outcomes last announced in chat, so a reopen on the same
     /// rung says nothing and a rung change is said exactly once.
@@ -1046,7 +1102,7 @@ impl Worker {
 
     /// Closes and reopens the audio stream with new settings; the network
     /// side never pauses. On failure the user's selection is kept and the
-    /// 500 ms reopen cadence keeps trying exactly it: rewriting the settings
+    /// reopen cadence keeps trying exactly it: rewriting the settings
     /// to the system default here left the Audio tab claiming a device the
     /// stream did not run, from then on, with only a chat line to say so
     /// (#327). The refusal itself stays on screen through `device_error`.
@@ -1058,45 +1114,85 @@ impl Worker {
         self.move_capture(now_ms);
         self.driver.close();
         self.engine = None;
+        self.opened_at = None;
         self.settings = settings;
-        if let Err(err) = self.try_open() {
-            self.announce_open_failure(&err);
-            self.last_reopen = Some(Instant::now());
-        }
+        // A device the user just picked is a fresh start: the budget the last
+        // one spent, and anything already said about it, do not carry over.
+        self.episode = ReopenEpisode::default();
+        self.announced_failure = None;
+        self.attempt_open();
     }
 
     /// A dead stream is closed, announced for what is known about it, and
-    /// retried with the same settings on a 500 ms cadence. The old line
-    /// claimed "audio device disconnected" for every latched error, but the
-    /// exclusive path latches on any read or write hiccup, so a driver
-    /// stutter was reported as an unplug; the class is only knowable from
-    /// the reopen attempt, and the announcement waits for it.
+    /// retried with the same settings on the episode's widening cadence. The
+    /// old line claimed "audio device disconnected" for every latched error,
+    /// but the exclusive path latches on any read or write hiccup, so a
+    /// driver stutter was reported as an unplug; the class is only knowable
+    /// from the reopen attempt, and the announcement waits for it.
     fn check_stream(&mut self) {
         if self.driver.errored() {
             self.driver.close();
             self.engine = None;
-            self.last_reopen = None;
+            self.opened_at = None;
             // A dead stream has no rate outcome to show.
             self.shared.lock().expect("live state").rate = None;
-            self.system_line("the audio stream stopped; retrying");
-        }
-        if self.engine.is_none()
-            && self
-                .last_reopen
-                .is_none_or(|t| t.elapsed() >= REOPEN_INTERVAL)
-        {
-            self.last_reopen = Some(Instant::now());
-            self.reopen_attempts += 1;
-            tracing::warn!(attempt = self.reopen_attempts, "reopening audio stream");
-            match self.try_open() {
-                Ok(()) => self.system_line("audio device reopened"),
-                Err(err) => self.announce_open_failure(&err),
+            if !self.episode.said_stopped {
+                self.episode.said_stopped = true;
+                self.system_line("the audio stream stopped; retrying");
             }
+        }
+        if self
+            .opened_at
+            .is_some_and(|t| t.elapsed() >= STREAM_SETTLED_AFTER)
+        {
+            self.opened_at = None;
+            self.episode = ReopenEpisode::default();
+        }
+        if self.engine.is_some() {
+            return;
+        }
+        if self.episode.spent() {
+            if !self.episode.said_given_up {
+                self.episode.said_given_up = true;
+                self.system_line(&format!(
+                    "the audio device did not stay open after {REOPEN_ATTEMPTS_MAX} tries; \
+                     pick a device on the Audio tab to try again"
+                ));
+            }
+            return;
+        }
+        let backoff = self.episode.backoff();
+        if self.last_reopen.is_none_or(|t| t.elapsed() >= backoff) {
+            self.attempt_open();
+        }
+    }
+
+    /// One open attempt against the episode's budget. It sets the cadence
+    /// clock whether it succeeds or not, so a device that opens and then dies
+    /// before the next tick escalates exactly like one that refuses outright:
+    /// an open that does not last is not progress.
+    fn attempt_open(&mut self) {
+        self.last_reopen = Some(Instant::now());
+        self.reopen_attempts += 1;
+        self.episode.attempts += 1;
+        tracing::warn!(
+            attempt = self.reopen_attempts,
+            in_episode = self.episode.attempts,
+            "reopening audio stream"
+        );
+        match self.try_open() {
+            Ok(()) => {
+                if self.episode.said_stopped && !self.episode.said_reopened {
+                    self.episode.said_reopened = true;
+                    self.system_line("audio device reopened");
+                }
+            }
+            Err(err) => self.announce_open_failure(&err),
         }
     }
 
     /// One chat line per distinct failure, in the device's own words, so the
-    /// 500 ms retry cadence does not flood the conversation. Disconnection is
+    /// retry cadence does not flood the conversation. Disconnection is
     /// claimed only when the error class says the device is gone.
     fn announce_open_failure(&mut self, err: &AudioError) {
         let line = match err {
@@ -1122,6 +1218,7 @@ impl Worker {
                 // would stay silent for the rest of the session.
                 engine.push_playout(&vec![0.0; capacity]);
                 self.engine = Some(engine);
+                self.opened_at = Some(Instant::now());
                 self.device_frames = device_frames;
                 self.ring_underrun_warned = false;
                 self.ring_overrun_warned = false;
@@ -1522,7 +1619,7 @@ fn rate_view(outcomes: jamstream_audio_io::RateOutcomes) -> RateOutcomesView {
 
 /// The chat notice one direction's rung earns at an open, given the rung it
 /// was on before. Rung 1 is not news, the OS converter is hover-only, and an
-/// unchanged rung is silence, so the 500 ms reopen cadence can never flood
+/// unchanged rung is silence, so the reopen cadence can never flood
 /// the room. A converter that replaces a clock this app had set names the
 /// contest: that is the one demotion a musician might otherwise chase into
 /// their other software's settings.
@@ -1679,6 +1776,38 @@ mod tests {
         assert_eq!(
             rate_change_line(Some(clock_set), clock_set, "capture"),
             None
+        );
+    }
+
+    /// The cadence a device that keeps dying is retried on: the first loss at
+    /// once, so a genuine unplug comes back on the next tick, then a doubling
+    /// wait to the ceiling, then a stop. Before this the wait was cleared on
+    /// every loss, so a device that latched between ticks was closed and
+    /// reopened ~400 times a second for the rest of the session.
+    #[test]
+    fn the_reopen_cadence_widens_and_then_gives_up() {
+        let mut episode = ReopenEpisode::default();
+        let mut waits = Vec::new();
+        while !episode.spent() {
+            waits.push(episode.backoff());
+            episode.attempts += 1;
+        }
+        assert_eq!(waits.len(), REOPEN_ATTEMPTS_MAX as usize, "{waits:?}");
+        assert_eq!(waits[0], Duration::ZERO, "a one-shot loss reopens at once");
+        assert_eq!(waits[1], REOPEN_INTERVAL);
+        for pair in waits[1..].windows(2) {
+            assert_eq!(
+                pair[1],
+                (pair[0] * 2).min(REOPEN_BACKOFF_MAX),
+                "the wait must double to the ceiling and stay there: {waits:?}"
+            );
+        }
+        // Long enough that a driver settling has a chance, short enough that
+        // nobody watches dead meters for a minute.
+        let span: Duration = waits.iter().sum();
+        assert!(
+            span > Duration::from_secs(5) && span < Duration::from_secs(30),
+            "the whole budget spans {span:?}"
         );
     }
 
