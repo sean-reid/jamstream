@@ -27,6 +27,7 @@
 //! hand back, so the exposure is repaired in place instead, and a repair
 //! that fails is the same hard refusal.
 
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,15 +49,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
     let tmp = temp_path(path);
-    let mut opts = std::fs::OpenOptions::new();
-    // create_new is O_CREAT|O_EXCL, which fails rather than following a
-    // symlink or opening a file another account got there first.
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
+    let opts = private_file_options();
     let write = || -> io::Result<()> {
         let mut file = opts.open(&tmp)?;
         file.write_all(bytes)?;
@@ -71,6 +64,39 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Creates `path` as a file only this account can read and hands back the
+/// open handle, for the writer that keeps producing lines rather than
+/// having its bytes ready in one buffer. [`write_private`] is the one for
+/// anything that can be handed over whole; the app log cannot, and a log
+/// of provider errors and panic backtraces is no more readable by the
+/// machine than a key is.
+///
+/// Replaces rather than reopens, for the reason `write_private` does: a
+/// file another account pre-created, or a symlink of theirs aimed at one
+/// of their targets, must not be written through or truncated.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+        _ => {}
+    }
+    private_file_options().open(path)
+}
+
+/// How every file this module creates is opened. `create_new` is
+/// `O_CREAT|O_EXCL`, which fails rather than following a symlink or
+/// opening a file another account got there first, and the mode applies
+/// at creation, which is the only moment it can.
+fn private_file_options() -> std::fs::OpenOptions {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts
 }
 
 /// Renames `from` over `to`, retrying a few times before giving up.
@@ -504,6 +530,30 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"[]");
         assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
         assert_eq!(mode_of(&target), 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The handle the app log is written through gets what a key file
+    /// gets: a fresh 0600 inode, and a symlink left at the path replaced
+    /// rather than followed.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_private_file_replaces_what_it_finds() {
+        use std::io::Write as _;
+        let root = temp_dir("openfile");
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        let path = root.join("app.log");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let mut file = create_private_file(&path).unwrap();
+        file.write_all(b"warning\n").unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        assert_eq!(std::fs::read(&path).unwrap(), b"warning\n");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(mode_of(&path), 0o600);
         let _ = std::fs::remove_dir_all(&root);
     }
 
