@@ -66,6 +66,20 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Reads a file that holds key material, refusing it when the directory
+/// it sits in is not one only this account can write.
+///
+/// The write side vets the directory on the way in
+/// ([`create_private_dir`]) and the read side has to do the same, because
+/// the vetting is what says who could have put the bytes there. A path
+/// that was private when it was written and is not now hands back
+/// whatever the account that loosened it left behind, and the caller has
+/// no way to tell.
+pub fn read_private(path: &Path) -> io::Result<Vec<u8>> {
+    check_exposure(parent_of(path))?;
+    std::fs::read(path)
+}
+
 /// Creates `path` as a file only this account can read and hands back the
 /// open handle, for the writer that keeps producing lines rather than
 /// having its bytes ready in one buffer. [`write_private`] is the one for
@@ -127,10 +141,7 @@ pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
 /// same path must not collide on the temporary.
 fn temp_path(path: &Path) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let parent = parent_of(path);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -140,6 +151,14 @@ fn temp_path(path: &Path) -> PathBuf {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// The directory a path sits in, where a bare file name means the working
+/// directory rather than nothing.
+fn parent_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn create_all(dir: &Path) -> io::Result<()> {
