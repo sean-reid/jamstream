@@ -324,7 +324,7 @@ jobs:
         run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
       - if: runner.os == 'Linux'
         run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
-      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
         with:
           tool: cargo-nextest
       # JAMSTREAM_PERF_BUDGET_SECS was set only on the harness job, so a
@@ -461,7 +461,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
-      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
         with:
           tool: cargo-nextest
       # One run again. #282 split this into two so the two wall-clock gates
@@ -515,7 +515,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
       # cargo-nextest for the same reason the test and harness jobs install
       # it: the runs below go through `cargo llvm-cov nextest`.
-      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
