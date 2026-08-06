@@ -907,6 +907,111 @@ fn a_44_1_interface_carries_the_session_both_ways() {
     }
 }
 
+/// Two members on two different device clocks, which is what a real session
+/// looks like the moment the two machines are not the same: the host runs a
+/// 44.1 kHz interface and converts both directions, the joiner runs at the
+/// session rate and converts nothing. Audio has to cross in both directions.
+///
+/// Every other rate test puts both members on the same clock, so a fault that
+/// needed one converting peer beside one native peer had nowhere to show. This
+/// is the shape #447 was reported in.
+#[test]
+fn a_44_1_host_and_a_native_joiner_hear_each_other() {
+    const HOST_HZ: f64 = 440.0;
+    const JOINER_HZ: f64 = 660.0;
+    let server = TestServer::start();
+    let host_sine = sine_fixture("mixed", HOST_HZ as f32, 44_100);
+    let joiner_sine = sine_fixture("mixed", JOINER_HZ as f32, RATE);
+    let out_host = temp_path("mixed", "out-host.wav");
+    let out_joiner = temp_path("mixed", "out-joiner.wav");
+
+    let host = LiveRuntime::join_offline(
+        &server.invite(HOST_MEMBER_ID.0, "host"),
+        settings(),
+        WavBackend::new(Some(host_sine.clone()), Some(out_host.clone())).with_device_rate(44_100),
+    )
+    .expect("join host");
+    let joiner = LiveRuntime::join_offline(
+        &server.invite(1, "joiner"),
+        settings(),
+        WavBackend::new(Some(joiner_sine.clone()), Some(out_joiner.clone())),
+    )
+    .expect("join joiner");
+
+    for (rt, who) in [(&host, "host"), (&joiner, "joiner")] {
+        wait_for(rt, who, Duration::from_secs(10), |s| {
+            joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+        });
+    }
+
+    // The output meter is the mixed playout as it leaves the session core,
+    // before the device ever sees it, so this separates "the mix is silent"
+    // from "the device path lost it". Both members must see theirs move.
+    for (rt, who) in [(&host, "host"), (&joiner, "joiner")] {
+        wait_for(
+            rt,
+            &format!("{who}'s mixed playout to carry audio"),
+            Duration::from_secs(5),
+            |s| s.levels.output_peak > 0.01,
+        );
+    }
+
+    std::thread::sleep(Duration::from_millis(2_500));
+    // Neither side may be reported quiet: a quiet member is the server saying
+    // it has heard nothing from them, which is a different fault from a mix
+    // that drops what did arrive.
+    for (rt, who) in [(&host, "host"), (&joiner, "joiner")] {
+        let snap = rt.snapshot();
+        assert!(
+            snap.members.iter().all(|m| !m.quiet),
+            "{who} sees a quiet member: {:?}",
+            snap.members
+        );
+    }
+
+    for (rt, who) in [(&joiner, "joiner"), (&host, "host")] {
+        rt.send(Command::Leave);
+        wait_for(rt, who, Duration::from_secs(3), |s| {
+            s.stats.state == ConnState::Idle
+        });
+    }
+    drop(joiner);
+    drop(host);
+
+    // Each side's playout must carry the other's tone and not its own: the
+    // personal mix excludes self, so the wrong tone would mean a mix fault
+    // rather than a transport one.
+    for (path, who, mine, theirs, device_rate) in [
+        (&out_host, "host", HOST_HZ, JOINER_HZ, 44_100),
+        (&out_joiner, "joiner", JOINER_HZ, HOST_HZ, RATE),
+    ] {
+        let (rate, samples) = tail(path, 1.0);
+        assert_eq!(rate, device_rate, "{who} writes on its own device clock");
+        let energy = rms(&samples);
+        assert!(
+            energy > 0.02,
+            "{who} heard near-silence (rms {energy}); the other member's audio never arrived"
+        );
+        let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
+        let wanted = tone_energy(&left, rate, theirs);
+        let leaked = tone_energy(&left, rate, mine);
+        assert!(
+            wanted > leaked * 4.0,
+            "{who} played {mine} Hz at {leaked:.1} against {theirs} Hz at {wanted:.1}: \
+             that is its own signal, not the other member's"
+        );
+        let run = longest_zero_run(&samples);
+        assert!(
+            run < 240,
+            "{who}'s steady-state playout contains a {run}-sample silence run"
+        );
+    }
+
+    for p in [&host_sine, &joiner_sine, &out_host, &out_joiner] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// The disclosure that rides with rung 3 (#347): a member on a 44.1 kHz
 /// interface sees the Resampled outcome in the snapshot with the converter's
 /// own added milliseconds, one chat line per converted direction at join,
