@@ -185,6 +185,88 @@ jobs:
           nope(scope): a type with no changelog section
           BAD
           exit $status
+      # The gate release.yml and release-build both call, exercised on a runner
+      # that has no Windows exe and no Visual Studio: pwsh ships on ubuntu and
+      # dumpbin is stubbed with two real dumps. Four cases, and the last three
+      # are shapes of one failure, a gate that checks nothing and passes.
+      - name: The redistributable CRT gate accepts and rejects
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'crt-gate'
+          Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          # Both dumps are real dumpbin output for jamstream.exe: v0.2.1, which
+          # links the CRT statically, and v0.2.0, whose VCRUNTIME140.dll is #416.
+          @'
+
+          Dump of file target\release\jamstream.exe
+
+          File Type: EXECUTABLE IMAGE
+
+            Image has the following dependencies:
+
+              bcryptprimitives.dll
+              kernel32.dll
+              api-ms-win-core-synch-l1-2-0.dll
+              ws2_32.dll
+              ADVAPI32.dll
+              KERNEL32.dll
+
+            Summary
+
+                  3000 .data
+          '@ | Set-Content (Join-Path $dir 'clean.txt')
+          @'
+
+          Dump of file target\release\jamstream.exe
+
+          File Type: EXECUTABLE IMAGE
+
+            Image has the following dependencies:
+
+              bcryptprimitives.dll
+              kernel32.dll
+              ws2_32.dll
+              ADVAPI32.dll
+              KERNEL32.dll
+              VCRUNTIME140.dll
+              api-ms-win-crt-heap-l1-1-0.dll
+              api-ms-win-crt-runtime-l1-1-0.dll
+
+            Summary
+
+                  5000 .data
+          '@ | Set-Content (Join-Path $dir 'dirty.txt')
+          'LINK : fatal error LNK1181: cannot open input file' | Set-Content (Join-Path $dir 'nolist.txt')
+          $stub = Join-Path $dir 'dumpbin'
+          "#!/bin/sh`nexec cat `"`$DUMPBIN_FIXTURE`"`n" | Set-Content $stub
+          chmod +x $stub
+          Set-Content (Join-Path $dir 'jamstream.exe') 'stands in for a linked exe'
+
+          function Gate($fixture, $exe) {
+              $env:DUMPBIN_FIXTURE = Join-Path $dir $fixture
+              & ./scripts/check-windows-crt.ps1 $dir $exe -Dumpbin $stub
+          }
+          # A throw inside a try lands in its own catch, so the verdict is a
+          # flag and never the absence of an exception.
+          function Rejects($label, $block) {
+              $threw = $false
+              try { & $block | Out-Null } catch { $threw = $true; "rejected $label`: $($_.Exception.Message)" }
+              if (-not $threw) { throw "the gate passed $label" }
+          }
+
+          $out = Gate 'clean.txt' 'jamstream.exe'
+          # The whole list has to reach the log; reading it is how #416 was found.
+          if (-not ($out | Select-String -SimpleMatch 'bcryptprimitives.dll')) {
+              throw 'the gate passed a clean exe without printing its dependencies'
+          }
+          Rejects 'a vcruntime import' { Gate 'dirty.txt' 'jamstream.exe' }
+          Rejects 'a dump with no dependency list' { Gate 'nolist.txt' 'jamstream.exe' }
+          Rejects 'an exe that is not there' { Gate 'clean.txt' 'absent.exe' }
+          # No -Dumpbin and no Visual Studio on this runner: the path that would
+          # otherwise check nothing and pass.
+          Rejects 'a missing dumpbin' { & ./scripts/check-windows-crt.ps1 $dir jamstream.exe }
       # .gitattributes normalizes everything to LF so the bash steps Windows
       # runners execute and the byte-compare gates keep working; this proves
       # the index stayed normalized after checkouts from misconfigured
@@ -448,6 +530,38 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       - run: cargo build --locked --workspace --release
+      # This job builds what release.yml builds, so it is where the import
+      # table gets read. release.yml asserts the same thing on the same script
+      # at tag time, which was the only place it ran until #433: a shipped exe
+      # that pulled in the redistributable CRT failed the release after the tag
+      # existed. The gate's own accept and reject cases run in hygiene.
+      - if: runner.os == 'Windows'
+        name: No exe imports the redistributable CRT
+        shell: pwsh
+        run: ./scripts/check-windows-crt.ps1 target/release jamstream.exe jamstream-app.exe jamstreamd.exe
+      # scripts/windows-static-crt.cmake reaches opus through four hands: the
+      # variable name in .cargo/config.toml, cmake-rs reading it, the cache
+      # entry the file forces, and the option opus declares. Any of them can
+      # drift, and the only symptom would be the linker warnings coming back,
+      # which no lint can fail on. The configured cache is where all four meet.
+      - if: runner.os == 'Windows'
+        name: opus configured against the static CRT
+        shell: bash
+        run: |
+          set -eu
+          caches=$(find target/release/build -path '*opusic-sys*/out/build/CMakeCache.txt')
+          if [ -z "$caches" ]; then
+            echo 'no opus cmake cache under target/release/build; the path moved' >&2
+            exit 1
+          fi
+          for cache in $caches; do
+            if ! grep -qx 'OPUS_STATIC_RUNTIME:BOOL=ON' "$cache"; then
+              echo "$cache configured opus against the dynamic CRT:" >&2
+              grep -n 'OPUS_STATIC_RUNTIME\|CMAKE_TOOLCHAIN_FILE:' "$cache" >&2 || true
+              exit 1
+            fi
+            echo "$cache: OPUS_STATIC_RUNTIME=ON"
+          done
 
   # Simulation harness gates: latency budgets, loss resilience, drift, chaos.
   # ~3 minutes of pure test runtime, and no audio/UI system deps (the harness
