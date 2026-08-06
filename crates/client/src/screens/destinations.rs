@@ -454,7 +454,12 @@ impl DestinationsPanel {
         if let Some(reason) = reason {
             // The reason the pipeline gave, verbatim and full width. It never
             // contains a key; the server strips that by construction.
-            theme::reason(ui, reason);
+            //
+            // Capped, because it is usually ffmpeg's own sentence rather than
+            // one of ours, and a quoted diagnosis is that program's length.
+            // Left uncapped it sizes the drawer to whatever the encoder felt
+            // like saying.
+            theme::reason_capped(ui, ("destination-reason", index), reason);
         }
         if self.rows[index].entering {
             self.entry_ui(ui, index, rt);

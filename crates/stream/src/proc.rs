@@ -47,6 +47,12 @@ pub struct ProcSpec {
     /// Short name for logs and the fake's call log: "encoder",
     /// "pusher:twitch:1".
     pub label: String,
+    /// The one URL in this child's stderr that is ours and holds no secret:
+    /// the loopback relay it publishes to or reads from. Named in the reason
+    /// instead of redacted, so "could not reach the local relay" and "the
+    /// platform refused us" stop being the same sentence. Matched whole;
+    /// anything that is not exactly this is redacted as before.
+    pub relay_url: Option<String>,
 }
 
 impl ProcSpec {
@@ -175,6 +181,12 @@ pub trait ProcessHost {
 ///
 /// Each child's stderr is a pipe now, read by a thread that redacts every URL
 /// and logs what is left against the child's label. See [`redact`].
+///
+/// The log is also the wrong place for it to stop. A session VM's journal is
+/// somewhere no host can reach, so the last redacted lines are kept per child
+/// and become the reason [`ProcessHost::poll`] reports when it dies: the one
+/// place the failure was visible used to be the one place the explanation was
+/// not (#437).
 #[derive(Debug, Default)]
 pub struct StdProcessHost {
     next_id: ProcId,
@@ -191,6 +203,9 @@ struct Live {
     /// which is when the child's write end closes, so it is joined after the
     /// child is reaped and never before.
     stderr: Option<std::thread::JoinHandle<()>>,
+    /// The last redacted lines that thread saw, which is what a host is told
+    /// when this child dies.
+    tail: Arc<StderrTail>,
     /// We feed this process, so closing our write ends is an end-of-stream it
     /// can act on: give it a moment to flush before the signal. A pusher has
     /// nothing to flush and no reason to wait.
@@ -412,10 +427,53 @@ fn drain(queue: &Queue, mut sink: Box<dyn io::Write + Send>) {
 /// What replaces the tail of a URL in a child's stderr.
 const REDACTED: &str = "<redacted>";
 
+/// What replaces a URL that is [`ProcSpec::relay_url`]: our own loopback
+/// relay, which holds no secret and is the difference between a fault on our
+/// side of the machine and a platform saying no.
+const RELAY: &str = "<local relay>";
+
 /// Longest stderr line kept, in bytes. ffmpeg at `-loglevel error` writes
 /// short lines; anything longer is a child misbehaving, and the tail of it is
 /// dropped rather than buffered without a bound.
 const STDERR_LINE_CAP: usize = 2_048;
+
+/// Redacted stderr lines kept per child, to quote when it dies.
+///
+/// Two, oldest first. ffmpeg reports the fault it hit and then what that
+/// broke, so a refused connect is followed by "Could not write header:
+/// Broken pipe": the first line is the diagnosis and the second is only
+/// evidence the first one mattered.
+const STDERR_TAIL_LINES: usize = 2;
+
+/// The last few redacted lines a child wrote, shared with the thread reading
+/// its stderr.
+#[derive(Debug, Default)]
+struct StderrTail {
+    lines: Mutex<VecDeque<String>>,
+}
+
+impl StderrTail {
+    fn push(&self, line: &str) {
+        let mut lines = self.lock();
+        if lines.len() == STDERR_TAIL_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line.to_owned());
+    }
+
+    /// What the child said, oldest first, or None if it said nothing.
+    fn quote(&self) -> Option<String> {
+        let lines = self.lock();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(lines.iter().cloned().collect::<Vec<_>>().join("; "))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+        self.lines.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// Strips everything after `scheme://` in one line of a child's stderr.
 ///
@@ -428,26 +486,54 @@ const STDERR_LINE_CAP: usize = 2_048;
 /// which part of an authority is safe is a redactor with a bug waiting in it.
 /// Nothing is lost either way: which destination this is comes from the label
 /// the line is logged against, not from the URL.
-fn redact(line: &str) -> Cow<'_, str> {
+///
+/// One exception, and it is not a decision this function makes: a URL that
+/// matches `relay` exactly is replaced by [`RELAY`]. That string is our own
+/// loopback relay out of the pipeline's configuration, it never held a key,
+/// and telling the two refusals apart is the whole point (#437). A URL that
+/// is not character-for-character that string is redacted, so the exception
+/// can never print anything the caller did not already know.
+fn redact<'a>(line: &'a str, relay: Option<&str>) -> Cow<'a, str> {
     if !line.contains("://") {
         return Cow::Borrowed(line);
     }
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(at) = rest.find("://") {
-        // Up to and including the separator, so the scheme stays readable.
-        let (head, tail) = rest.split_at(at + 3);
-        out.push_str(head);
-        out.push_str(REDACTED);
+        let scheme_end = at + 3;
         // The URL runs to the next whitespace. Punctuation ffmpeg puts after
         // it goes too, since a port makes `:` no delimiter at all.
-        match tail.find(char::is_whitespace) {
-            Some(end) => rest = &tail[end..],
-            None => return Cow::Owned(out),
+        let url_end = rest[scheme_end..]
+            .find(char::is_whitespace)
+            .map_or(rest.len(), |end| scheme_end + end);
+        let scheme_start = scheme_start(&rest[..at]);
+        let url =
+            rest[scheme_start..url_end].trim_end_matches([':', ',', '.', ';', ')', '"', '\'']);
+        if relay.is_some_and(|r| r == url) {
+            out.push_str(&rest[..scheme_start]);
+            out.push_str(RELAY);
+        } else {
+            // Up to and including the separator, so the scheme stays readable.
+            out.push_str(&rest[..scheme_end]);
+            out.push_str(REDACTED);
         }
+        if url_end == rest.len() {
+            return Cow::Owned(out);
+        }
+        rest = &rest[url_end..];
     }
     out.push_str(rest);
     Cow::Owned(out)
+}
+
+/// Where the scheme of the URL ending at `head` begins, so the whole URL can
+/// be compared against the relay's. A scheme is letters, digits, `+`, `-`
+/// and `.`, so the first character outside that set ends the search.
+fn scheme_start(head: &str) -> usize {
+    head.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.')
+        .map_or(0, |at| {
+            at + head[at..].chars().next().map_or(1, char::len_utf8)
+        })
 }
 
 /// Reads one line of at most [`STDERR_LINE_CAP`] bytes into `line`, without
@@ -482,8 +568,8 @@ fn read_capped_line(reader: &mut impl io::BufRead, line: &mut Vec<u8>) -> io::Re
 /// Drains a child's stderr, one redacted line at a time, until end of stream.
 ///
 /// `emit` is where a line goes; the caller supplies it so a test can prove
-/// what does and does not arrive there.
-fn relay_stderr(mut reader: impl io::BufRead, mut emit: impl FnMut(&str)) {
+/// what does and does not arrive there. `relay` is [`ProcSpec::relay_url`].
+fn relay_stderr(mut reader: impl io::BufRead, relay: Option<&str>, mut emit: impl FnMut(&str)) {
     let mut line = Vec::with_capacity(256);
     loop {
         match read_capped_line(&mut reader, &mut line) {
@@ -499,7 +585,7 @@ fn relay_stderr(mut reader: impl io::BufRead, mut emit: impl FnMut(&str)) {
         if text.trim().is_empty() {
             continue;
         }
-        emit(redact(text).as_ref());
+        emit(redact(text, relay).as_ref());
     }
 }
 
@@ -576,14 +662,18 @@ impl ProcessHost for StdProcessHost {
 
         // Before any feeder, because a child with nobody reading its stderr
         // blocks in `write` once the pipe fills and stops encoding.
+        let tail = Arc::new(StderrTail::default());
         let stderr = match child.stderr.take() {
             Some(pipe) => {
                 let label = spec.label.clone();
+                let relay = spec.relay_url.clone();
+                let mine = Arc::clone(&tail);
                 let started = std::thread::Builder::new()
                     .name(format!("jamstream-stderr-{}", spec.label))
                     .spawn(move || {
-                        relay_stderr(io::BufReader::new(pipe), |line| {
+                        relay_stderr(io::BufReader::new(pipe), relay.as_deref(), |line| {
                             tracing::warn!(child = %label, "{line}");
+                            mine.push(line);
                         });
                     });
                 match started {
@@ -644,6 +734,7 @@ impl ProcessHost for StdProcessHost {
                 fifos,
                 fifo_paths: spec.fifos.clone(),
                 stderr,
+                tail,
                 drains_on_eof,
             },
         );
@@ -683,9 +774,24 @@ impl ProcessHost for StdProcessHost {
         };
         match live.child.try_wait() {
             Ok(None) => Exit::Running,
-            Ok(Some(status)) => Exit::Exited {
-                reason: describe(&status),
-            },
+            Ok(Some(status)) => {
+                // The child is gone, so it held the last write end of its
+                // stderr and the reader is at end of stream: this join is
+                // bounded, and it is what makes the last line the child
+                // wrote available here rather than a moment later. Without
+                // it the reason is a race with a thread that has already
+                // been handed the answer.
+                if let Some(join) = live.stderr.take() {
+                    let _ = join.join();
+                }
+                Exit::Exited {
+                    // What the child said, if it said anything. An exit code
+                    // is what is left when it did not: on its own it is a
+                    // number whose meaning changes with the host OS, which
+                    // is no use to the musician reading it (#437).
+                    reason: live.tail.quote().unwrap_or_else(|| describe(&status)),
+                }
+            }
             Err(err) => Exit::Exited {
                 reason: format!("wait failed: {err}"),
             },
@@ -745,9 +851,50 @@ impl ProcessHost for StdProcessHost {
 fn describe(status: &std::process::ExitStatus) -> String {
     match status.code() {
         Some(0) => "exited cleanly".to_owned(),
-        Some(code) => format!("exited with status {code}"),
+        Some(code) => match errno_behind(code) {
+            Some(err) => format!("exited with status {code}: {err}"),
+            None => format!("exited with status {code}"),
+        },
         None => "killed by signal".to_owned(),
     }
+}
+
+/// The errno an ffmpeg exit code is hiding, when it is hiding one.
+///
+/// ffmpeg exits with an AVERROR, which for a system failure is a negative
+/// errno, and an exit status keeps only the low eight bits: a connection
+/// refused on Linux is -111 and arrives as 145. The number does not travel,
+/// because the same refusal on macOS is 195, ECONNREFUSED being 61 there. So
+/// the code is put back through the OS rather than printed as an integer that
+/// means a different thing on the machine the reader is sitting at.
+///
+/// Two guards against dressing a plain exit code up as an error the OS never
+/// meant. 255 is excluded: it is both -1 and the conventional "it went
+/// wrong", and calling it EPERM would be a confident wrong answer. And the
+/// candidate has to land on an [`io::ErrorKind`] worth naming, which is the
+/// portable form of "the OS recognised it".
+fn errno_behind(code: i32) -> Option<io::Error> {
+    if !(129..=254).contains(&code) {
+        return None;
+    }
+    let err = io::Error::from_raw_os_error(256 - code);
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::AddrInUse
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::NotFound
+    )
+    .then_some(err)
 }
 
 #[cfg(unix)]
@@ -1091,6 +1238,7 @@ mod tests {
             stdin: Stdin::SecretFile(PathBuf::from("/run/jamstream/keys/1")),
             fifos: Vec::new(),
             label: "pusher:twitch:1".into(),
+            relay_url: None,
         };
         assert!(!spec.mentions("live_123_secret"));
         assert!(spec.mentions("JS_INGEST"));
@@ -1110,7 +1258,9 @@ mod tests {
         );
 
         let mut got: Vec<String> = Vec::new();
-        relay_stderr(io::Cursor::new(stderr), |line| got.push(line.to_owned()));
+        relay_stderr(io::Cursor::new(stderr), None, |line| {
+            got.push(line.to_owned())
+        });
 
         let all = got.join("\n");
         assert!(!all.contains(KEY), "the key reached the sink: {all}");
@@ -1135,7 +1285,9 @@ mod tests {
         let stderr = "[libx264 @ 0x1] VBV buffer size 0 too small, using 2500\n\
                       Conversion failed!\n";
         let mut got: Vec<String> = Vec::new();
-        relay_stderr(io::Cursor::new(stderr), |line| got.push(line.to_owned()));
+        relay_stderr(io::Cursor::new(stderr), None, |line| {
+            got.push(line.to_owned())
+        });
         assert_eq!(
             got,
             vec![
@@ -1150,12 +1302,65 @@ mod tests {
     #[test]
     fn redaction_stops_at_the_end_of_each_url() {
         assert_eq!(
-            redact("rtmp://relay/in to rtmps://out/app/k failed"),
+            redact("rtmp://relay/in to rtmps://out/app/k failed", None),
             "rtmp://<redacted> to rtmps://<redacted> failed"
         );
-        assert_eq!(redact("rtmps://host/app/secret"), "rtmps://<redacted>");
-        assert_eq!(redact("no url here"), "no url here");
-        assert_eq!(redact(""), "");
+        assert_eq!(
+            redact("rtmps://host/app/secret", None),
+            "rtmps://<redacted>"
+        );
+        assert_eq!(redact("no url here", None), "no url here");
+        assert_eq!(redact("", None), "");
+    }
+
+    /// The distinction #437 turned on: a refusal from the loopback relay and
+    /// a refusal from the platform are the same errno and completely
+    /// different problems. Only the relay's own URL is named, and only when
+    /// it matches character for character.
+    #[test]
+    fn only_the_configured_relay_is_named_and_everything_else_is_redacted() {
+        const RELAY_URL: &str = "rtmp://127.0.0.1:1935/jamstream";
+        let relay = Some(RELAY_URL);
+
+        // Ours, with the colon ffmpeg puts after it.
+        assert_eq!(
+            redact(
+                "[flv @ 0x1] Failed to connect to rtmp://127.0.0.1:1935/jamstream: \
+                 Connection refused",
+                relay
+            ),
+            "[flv @ 0x1] Failed to connect to <local relay> Connection refused"
+        );
+
+        // The platform's, in the same line and with the same wording. This is
+        // the one that carries a key, and it is redacted whole.
+        const KEY: &str = "live_918273645_TZq0cVnB4kLsX";
+        let platform = format!(
+            "[flv @ 0x1] Failed to connect to rtmps://a.rtmps.youtube.com:443/live2/{KEY}: \
+             Connection refused"
+        );
+        let got = redact(&platform, relay);
+        assert!(!got.contains(KEY), "{got}");
+        assert!(!got.contains("youtube.com"), "{got}");
+        assert_eq!(
+            got,
+            "[flv @ 0x1] Failed to connect to rtmps://<redacted> Connection refused"
+        );
+
+        // A near miss is not a match: a different port, a different path, or
+        // a different host all stay redacted, so the exception can never
+        // print something the pipeline did not hand it.
+        for near in [
+            "rtmp://127.0.0.1:1936/jamstream",
+            "rtmp://127.0.0.1:1935/jamstream/evil",
+            "rtmp://127.0.0.2:1935/jamstream",
+            "rtmps://127.0.0.1:1935/jamstream",
+        ] {
+            let line = format!("connect to {near}: refused");
+            let got = redact(&line, relay);
+            assert!(!got.contains(RELAY), "{near} was treated as the relay");
+            assert!(got.contains(REDACTED), "{near} -> {got}");
+        }
     }
 
     /// A line longer than the cap loses its tail rather than arriving as a
@@ -1168,7 +1373,9 @@ mod tests {
         let stderr = format!("{padding} rtmps://ingest.example/app/{KEY}\nshort line\n");
 
         let mut got: Vec<String> = Vec::new();
-        relay_stderr(io::Cursor::new(stderr), |line| got.push(line.to_owned()));
+        relay_stderr(io::Cursor::new(stderr), None, |line| {
+            got.push(line.to_owned())
+        });
 
         assert_eq!(got.len(), 2, "{got:?}");
         assert_eq!(got[0].len(), STDERR_LINE_CAP);
@@ -1183,7 +1390,153 @@ mod tests {
     fn a_partial_line_of_invalid_utf8_still_arrives() {
         let stderr: Vec<u8> = b"caf\xff done".to_vec();
         let mut got: Vec<String> = Vec::new();
-        relay_stderr(io::Cursor::new(stderr), |line| got.push(line.to_owned()));
+        relay_stderr(io::Cursor::new(stderr), None, |line| {
+            got.push(line.to_owned())
+        });
         assert_eq!(got, vec!["caf\u{fffd} done".to_owned()]);
+    }
+
+    /// The tail keeps the last lines, oldest first, and nothing before them.
+    #[test]
+    fn the_tail_keeps_the_last_lines_oldest_first() {
+        let tail = StderrTail::default();
+        assert_eq!(tail.quote(), None);
+        for n in 1..=STDERR_TAIL_LINES + 2 {
+            tail.push(&format!("line {n}"));
+        }
+        assert_eq!(tail.quote().as_deref(), Some("line 3; line 4"));
+    }
+
+    /// An exit code that is a truncated negative errno says so, and the
+    /// translation is the OS's rather than a table here: the same refusal is
+    /// 145 on Linux and 195 on macOS, and neither number means anything to
+    /// the musician who is shown it.
+    // libc is a unix-only dependency here, and the 256-minus-errno exit
+    // convention this pins is a unix one. Windows never reaches it: that
+    // target compiles the crate but StdProcessHost refuses to spawn.
+    #[cfg(unix)]
+    #[test]
+    fn a_truncated_errno_exit_code_is_translated_by_the_os() {
+        let refused = 256 - libc::ECONNREFUSED;
+        // The numbers from the issue, pinned so the claim stays checkable.
+        #[cfg(target_os = "linux")]
+        assert_eq!(refused, 145);
+        #[cfg(target_os = "macos")]
+        assert_eq!(refused, 195);
+
+        let err = errno_behind(refused).expect("a refused connect must decode");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+
+        // 255 is both -1 and the conventional "it went wrong", so it is left
+        // as a number rather than reported as EPERM.
+        assert!(errno_behind(255).is_none());
+        // And an ordinary small exit code is not an errno at all.
+        assert!(errno_behind(1).is_none());
+        assert!(errno_behind(0).is_none());
+    }
+
+    #[cfg(unix)]
+    mod real {
+        use super::*;
+        use std::process::ExitStatus;
+
+        /// Runs a shell script to completion under the real host and returns
+        /// the reason the supervisor would report.
+        fn reason_after_death(script: &str, relay: Option<&str>) -> String {
+            let mut host = StdProcessHost::new();
+            let spec = ProcSpec {
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".to_owned(), script.to_owned()],
+                stdin: Stdin::Null,
+                fifos: Vec::new(),
+                label: "pusher:youtube:1".to_owned(),
+                relay_url: relay.map(str::to_owned),
+            };
+            let id = host.spawn(&spec).expect("sh must spawn");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match host.poll(id) {
+                    Exit::Exited { reason } => return reason,
+                    Exit::Running => {
+                        assert!(Instant::now() < deadline, "the child never exited");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+
+        /// The whole of #437, against a real process: a host who pasted a
+        /// good key into a session that cannot reach the platform used to be
+        /// shown an integer. Now the row carries the sentence ffmpeg wrote,
+        /// and the key that sentence contained is still not in it.
+        #[test]
+        fn a_dead_pusher_reports_what_it_printed_and_not_the_key_in_it() {
+            const KEY: &str = "live_918273645_TZq0cVnB4kLsX";
+            let script = format!(
+                "printf '%s\\n' \
+                 '[flv @ 0x55d1c0a2f480] Failed to connect to \
+                 rtmps://a.rtmps.youtube.com:443/live2/{KEY}: Connection refused' \
+                 '[out#0/flv @ 0x55d1c0a31200] Could not write header: Broken pipe' >&2\n\
+                 exit 145\n"
+            );
+            let reason = reason_after_death(&script, Some("rtmp://127.0.0.1:1935/jamstream"));
+
+            assert!(
+                !reason.contains(KEY),
+                "the key reached the reason: {reason}"
+            );
+            assert!(!reason.contains("youtube.com"), "{reason}");
+            assert!(
+                reason.contains("Failed to connect to rtmps://<redacted> Connection refused"),
+                "{reason}"
+            );
+            // The diagnosis replaces the exit code rather than joining it.
+            assert!(!reason.contains("exited with status"), "{reason}");
+        }
+
+        /// The distinction that cost an evening. Same errno, same wording
+        /// from ffmpeg, different problem: this one is a relay that is not
+        /// listening on the session's own loopback, not a platform saying no.
+        #[test]
+        fn a_refusal_from_the_loopback_relay_names_the_relay() {
+            const RELAY_URL: &str = "rtmp://127.0.0.1:1935/jamstream";
+            let script = format!(
+                "printf '%s\\n' \
+                 '[flv @ 0x1] Failed to connect to {RELAY_URL}: Connection refused' >&2\n\
+                 exit 145\n"
+            );
+            let reason = reason_after_death(&script, Some(RELAY_URL));
+            assert!(reason.contains("<local relay>"), "{reason}");
+            assert!(!reason.contains("127.0.0.1"), "{reason}");
+        }
+
+        /// Nothing on stderr is the only case left to the exit code, and even
+        /// then it is translated rather than shown as a bare integer.
+        #[test]
+        fn a_silent_child_falls_back_to_a_translated_exit_code() {
+            let refused = 256 - libc::ECONNREFUSED;
+            let reason = reason_after_death(&format!("exit {refused}\n"), None);
+            assert!(reason.starts_with(&format!("exited with status {refused}")));
+            assert!(reason.contains("Connection refused"), "{reason}");
+        }
+
+        /// A child with nothing to say and nothing to decode still reports
+        /// the plain thing it always did.
+        #[test]
+        fn an_ordinary_failure_still_reports_its_code() {
+            assert_eq!(reason_after_death("exit 1\n", None), "exited with status 1");
+        }
+
+        /// `describe` is what the fallback runs, so it is worth checking on
+        /// its own where an exit status can be built rather than caused.
+        #[test]
+        fn describe_translates_only_what_the_os_recognises() {
+            use std::os::unix::process::ExitStatusExt;
+            let status = |code: i32| ExitStatus::from_raw(code << 8);
+            assert_eq!(describe(&status(0)), "exited cleanly");
+            assert_eq!(describe(&status(1)), "exited with status 1");
+            let refused = 256 - libc::ECONNREFUSED;
+            assert!(describe(&status(refused)).contains("Connection refused"));
+        }
     }
 }

@@ -1338,7 +1338,9 @@ fn session_destinations_failed() {
             (
                 StreamPlatform::YouTube,
                 DestinationState::Failed {
-                    reason: "pusher exited: rtmp connection refused".to_owned(),
+                    reason: "push failed: [flv @ 0x55d1c0a2f480] Failed to connect to \
+                     rtmps://<redacted> Connection refused"
+                        .to_owned(),
                 },
             ),
         ],
@@ -1423,7 +1425,9 @@ fn session_bar_stream_failed() {
         (
             StreamPlatform::YouTube,
             DestinationState::Failed {
-                reason: "pusher exited: rtmp connection refused".to_owned(),
+                reason: "push failed: [flv @ 0x55d1c0a2f480] Failed to connect to \
+                     rtmps://<redacted> Connection refused"
+                    .to_owned(),
             },
         ),
     ]);
