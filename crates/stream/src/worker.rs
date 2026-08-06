@@ -263,7 +263,9 @@ mod tests {
 
     #[test]
     fn the_worker_runs_the_pipeline_off_the_mix_tick() {
-        let worker = StreamWorker::spawn_with(cfg("basic"), FakeProcessHost::new()).unwrap();
+        let cfg = cfg("basic");
+        let work_dir = cfg.work_dir.clone();
+        let worker = StreamWorker::spawn_with(cfg, FakeProcessHost::new()).unwrap();
         assert!(!worker.wants_audio());
         worker.apply(
             0,
@@ -283,6 +285,9 @@ mod tests {
         for tick in 0..400u64 {
             worker.submit_tick(tick * 2, TickPayload::default());
         }
+        // The fake host runs no ffmpeg, so the report a pusher would have
+        // written is written here: nothing else makes a destination Live.
+        crate::pipeline::report_push(&work_dir, DestinationId(1));
         worker.beat(4_000);
         wait_for(&worker, "live", |s| s[0].state == DestinationState::Live);
 

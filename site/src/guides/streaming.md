@@ -45,7 +45,7 @@ Each row says what that platform is actually doing:
 | `key saved` | a key is on this computer, one click from being used |
 | `asking` | the server has not answered yet |
 | `ready` | configured, and goes live when you press Go live |
-| `connecting` | starting up |
+| `connecting` | starting up; nothing is reaching the platform yet |
 | `live` | the platform is receiving the broadcast |
 | `failed` | it stopped, with the reason on the next line |
 
@@ -64,7 +64,7 @@ Both are one count for the whole broadcast, so both rows show the same pair, and
 
 A stream that dies quietly is worse than one that never started, so a failure shows in three places: the row goes red with the reason under it, the tab counts the failures, and the status bar lights STREAM FAILED beside ON AIR even with Settings closed.
 
-A destination that stops is retried on its own, on a backoff that starts at 500 ms and doubles to 16 seconds: the row goes back to `connecting`, and to `live` once a push has held for three seconds. A key the platform rejects fails every time, and the reason says so: **Remove** that destination and add the key again.
+A destination that stops is retried on its own, on a backoff that starts at 500 ms and doubles to 16 seconds: the row goes back to `connecting`, and to `live` once the platform is taking the broadcast again. Expect a few seconds of `connecting` either way, most of it before the first byte leaves: a row that says `connecting` for five seconds is normal, and a row that says `live` is a platform receiving something. A key the platform rejects fails every time, and the reason says so: **Remove** that destination and add the key again.
 
 The reason is the line the encoder or the pusher printed, quoted, with the destination URL removed because a stream key is in it. Read the front of it first.
 

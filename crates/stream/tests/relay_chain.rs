@@ -77,9 +77,19 @@ const MIN_RELAYED_SECS: f64 = 4.0;
 /// does not need to spend. It is also the order a host works in.
 const GO_LIVE_SEC: u64 = 2;
 
-/// A destination is Live once its pusher has run this long; see HEALTHY_MS in
+/// How long a pusher takes to get its first byte to the platform, in seconds.
+///
+/// ffmpeg analyses an input it knows nothing else about for up to five seconds
+/// of content before it opens its output. The encoder opts out of that, because
+/// both of its inputs are fully described in argv; a pusher's input is a
+/// container off the relay and has to be read. Nothing is being broadcast for
+/// that whole window, which is what the destination now says.
+const PUSH_START_SEC: u64 = 5;
+
+/// A destination is Live once its pusher's ffmpeg has reported a push, which it
+/// does about a second after its output is open; see PROGRESS_PERIOD_SECS in
 /// the pipeline. Kept here as the number this test's arithmetic depends on.
-const HEALTHY_SEC: u64 = 3;
+const REPORT_SEC: u64 = 1;
 
 /// How long the relay gets to bind its port before the test gives up on it.
 const RELAY_READY: Duration = Duration::from_secs(15);
@@ -400,8 +410,14 @@ fn the_encoder_reaches_a_pusher_through_the_relay_we_ship() {
     // Both ends have to be seen refused: the encoder could not publish and the
     // pusher could not read. Usually inside half a second, but the cap is
     // generous because how long a spawned ffmpeg takes to reach its connect is
-    // a fact about the runner, and a pusher that has not died yet is reported
-    // Connecting or, past three seconds, Live.
+    // a fact about the runner, and until it gets there the destination is
+    // Connecting.
+    //
+    // Never Live, at any point, which is the assertion this loop is really for.
+    // How long that pusher takes to reach its failure is exactly the window
+    // #445 lived in: it is two execs and an ffmpeg startup ahead of the
+    // connect, and on a loaded runner it used to outlast the three seconds of
+    // survival that promoted a destination.
     feed_programme(&mut pipeline, 12 * TICKS_PER_SEC, |tick, p| {
         for event in p.events() {
             println!("  {} ms {event:?}", tick_ms(tick));
@@ -409,8 +425,15 @@ fn the_encoder_reaches_a_pusher_through_the_relay_we_ship() {
                 down = Some(reason);
             }
         }
-        let failed = matches!(destination_state(p), DestinationState::Failed { .. });
-        !(down.is_some() && failed)
+        let state = destination_state(p);
+        assert_ne!(
+            state,
+            DestinationState::Live,
+            "the destination went live at {} ms against a relay that is not running, so a \
+             broadcast nobody is receiving reads exactly like a working one",
+            tick_ms(tick)
+        );
+        !(down.is_some() && matches!(state, DestinationState::Failed { .. }))
     });
     let reason = down.expect(
         "the encoder published to a relay that is not running and the pipeline \
@@ -473,19 +496,24 @@ fn the_encoder_reaches_a_pusher_through_the_relay_we_ship() {
     });
     let went_live = went_live.unwrap_or_else(|| {
         panic!(
-            "the pusher never reached Live reading from the relay. It is at \
-             {:?}, and the relay said:\n{}",
+            "the pusher never reached Live reading from the relay, which is what \
+             a real ffmpeg reporting a push looks like from the pipeline. It is \
+             at {:?}, and the relay said:\n{}",
             destination_state(&pipeline),
             relay.log()
         )
     });
-    println!("the destination went live at {went_live} ms");
-    // First attempt, no backoff: a pusher that had to retry would land a
-    // multiple of 500 ms later, and that is worth noticing rather than
-    // absorbing, because it means the relay refused a reader it should have
-    // served.
+    println!(
+        "the destination went live at {went_live} ms, {} ms after the host clicked Go Live",
+        went_live - GO_LIVE_SEC * 1_000
+    );
+    // First attempt, no backoff: a pusher that had to retry would spend its
+    // backoff and then the whole input analysis again, so it would land more
+    // than five seconds later than this allows. That is worth noticing rather
+    // than absorbing, because it means the relay refused a reader it should
+    // have served.
     assert!(
-        went_live <= (GO_LIVE_SEC + HEALTHY_SEC) * 1_000 + 500,
+        went_live <= (GO_LIVE_SEC + PUSH_START_SEC + REPORT_SEC) * 1_000 + 1_000,
         "the pusher took until {went_live} ms to go live, so the relay refused \
          it at least once"
     );
