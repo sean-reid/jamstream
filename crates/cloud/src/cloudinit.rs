@@ -765,6 +765,12 @@ WantedBy=multi-user.target
 /// what keeps it off the internet: the packet filter is a second gate that
 /// is not up during early boot, and it is not there to make a listener on
 /// 0.0.0.0 safe.
+///
+/// Every key here is one the pinned mediamtx accepts: it rejects an unknown
+/// key outright and exits, and `Type=simple` means systemd still reports the
+/// unit started. `crates/stream/tests/relay_chain.rs` runs this exact text
+/// through that release, which is the only thing that can tell a stripped
+/// relay from a dead one.
 const MEDIAMTX_CONFIG: &str = "logLevel: warn
 logDestinations: [stdout]
 readTimeout: 10s
@@ -774,10 +780,13 @@ rtmp: true
 rtmpAddress: 127.0.0.1:1935
 rtmpEncryption: \"no\"
 rtsp: false
-rtsps: false
 hls: false
 webrtc: false
 srt: false
+# Off like the rest, and for one more reason: MoQ defaults on and writes
+# auto.key and auto.crt into the working directory, which is / here and
+# read-only under ProtectSystem=strict.
+moq: false
 api: false
 metrics: false
 pprof: false

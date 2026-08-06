@@ -27,6 +27,14 @@ nextest-version = { required = "0.9.91" }
 # binary rather than by test name so a renamed test cannot silently leave.
 jamstreamd-uplift = { max-threads = 1 }
 
+# The two suites that run a real ffmpeg, one at a time. Each of them encodes
+# 720p30 at real time and asserts that not one frame was dropped or repeated,
+# which is a claim about a machine with a core to spare; two of them at once on
+# a shared runner is not that machine. relay_chain also binds 127.0.0.1:1935,
+# the address the product uses, and it refuses to judge a relay it did not
+# start, so it cannot overlap anything else holding that port.
+real-encoder = { max-threads = 1 }
+
 [[profile.default.overrides]]
 # The tests that read a wall clock go last and get the machine to themselves.
 #
@@ -115,6 +123,21 @@ filter = """
     or (package(jamstream-client) and binary(=wizard_local))
 """
 test-group = "jamstreamd-uplift"
+
+[[profile.default.overrides]]
+# The real-encoder group, defined at the top of the file. Grouped by binary
+# rather than by test name so a renamed test cannot silently leave.
+#
+# Published on success for the same reason as the measurements above: both
+# print measured kbps and A/V drift, and relay_chain prints how much of the
+# window survived the relay. Two binaries, so the preamble cost is two tests'
+# worth.
+filter = """
+    package(jamstream-stream)
+    and (binary(=real_ffmpeg) or binary(=relay_chain))
+"""
+test-group = "real-encoder"
+success-output = "immediate"
 
 [[profile.default.overrides]]
 # The live_runtime suite drives two real client runtimes over loopback UDP

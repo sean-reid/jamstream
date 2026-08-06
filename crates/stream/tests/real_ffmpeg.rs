@@ -1,10 +1,12 @@
-//! End to end through a real ffmpeg, with ffprobe as the judge.
+//! The encoder through a real ffmpeg, with ffprobe as the judge.
 //!
 //! The relay is skipped: the encoder writes an FLV file instead of publishing
 //! to MediaMTX, which is the same muxer and the same encode ladder, just a
 //! local sink. What this proves is the part that no fake can: that the argv we
 //! build produces a stream the platforms would accept, and that the
-//! audio-mastered cadence keeps A/V drift far under a frame.
+//! audio-mastered cadence keeps A/V drift far under a frame. The hop it skips
+//! is `relay_chain.rs`, which stands a real mediamtx up on the shipped config
+//! and runs the encoder and a pusher through it.
 //!
 //! Every claim is read back out of the file by a second implementation. The
 //! 36 fake-host unit tests assert on the argv we passed, which says nothing
@@ -17,175 +19,47 @@
 //! where CI installs ffmpeg. This used to return early instead, with no
 //! `#[ignore]` and no runner carrying ffmpeg, so the whole RTMP path reported
 //! PASS on every OS in the matrix and nothing ever checked H.264, AAC-LC,
-//! `nal-hrd=cbr`, the keyframe cadence or A/V drift. On other unixes a missing
-//! ffmpeg is still a skip, so a laptop without one can run the rest of the
-//! suite; set `JAMSTREAM_REQUIRE_FFMPEG` there to demand it.
+//! `nal-hrd=cbr`, the keyframe cadence or A/V drift. See `common::require`,
+//! which is where that rule now lives for both suites.
 //!
 //! The whole file is unix-only: the pipeline hands video to ffmpeg through a
 //! named pipe. On Windows this target compiles to nothing rather than to a test
 //! that passes without testing.
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+mod common;
 
 use jamstream_protocol::control::StreamOp;
 use jamstream_protocol::ids::MemberId;
-use jamstream_stream::pipeline::{Levels, Pipeline, Roster, StreamConfig, StreamMember};
+use jamstream_stream::pipeline::{Pipeline, Roster, StreamConfig, StreamMember};
 use jamstream_stream::proc::StdProcessHost;
+
+use common::{
+    TICKS_PER_SEC, arm_deadline, feed_programme, h264_headers, header_field, last_pts, mean_volume,
+    probe, probe_entries, require, tick_ms,
+};
 
 /// Seconds of program material to encode.
 const SECONDS: u64 = 5;
-/// Session ticks per second.
-const TICKS_PER_SEC: u64 = 400;
-const TICK_STEREO: usize = 240;
 
-/// Wall-clock ceiling for the whole test.
-///
-/// The work is five seconds of programme fed at real time plus a handful of
-/// probes, so this is not a budget for slow hardware. It guards the way this
-/// test fails badly, which is that it does not fail, it stops. Before #248 the
-/// pipeline fed two blocking pipes from one thread and wedged against ffmpeg
-/// with no timer on either side; it sat there for 926 seconds before a human
-/// killed it, longer than the CI job is allowed to live, so the job died with
-/// no idea which test hung it. ffmpeg 8 is not immunity either: the same
-/// signature turned up there under coverage instrumentation, which only widens
-/// the window.
-///
-/// Raise it with `JAMSTREAM_FFMPEG_DEADLINE_SECS` if a runner ever needs more.
-const DEADLINE_SECS: u64 = 240;
-
-/// Aborts the test binary if the deadline passes.
-///
-/// A thread rather than an elapsed-time check, because the failure it exists
-/// for is a blocking syscall on the main thread, which never comes back to look
-/// at a clock. `abort` rather than `exit` for the same reason: `exit` runs
-/// atexit handlers on a process whose main thread is parked holding whatever it
-/// holds.
-fn arm_deadline() {
-    let secs = std::env::var("JAMSTREAM_FFMPEG_DEADLINE_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(DEADLINE_SECS);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(secs));
-        eprintln!(
-            "real_ffmpeg exceeded its {secs}s deadline and is being aborted. \
-             This is a deadlock, not slow encoding: something is feeding both \
-             of the encoder's pipes in a way that lets ffmpeg block one \
-             producer by refusing the other (issue #248). Confirm with \
-             `sample` or `gdb` on both processes; a `write` on the video fifo \
-             under push_tick, against an ffmpeg in `read`, is that bug. \
-             Anything ffmpeg printed follows."
-        );
-        std::process::abort();
-    });
-}
-
-fn tool(name: &str) -> Option<PathBuf> {
-    let out = Command::new("which").arg(name).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(out.stdout).ok()?.trim().to_owned();
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-fn probe(ffprobe: &Path, args: &[&str]) -> String {
-    let out = Command::new(ffprobe)
-        .args(["-v", "error"])
-        .args(args)
-        .output()
-        .expect("ffprobe runs");
-    assert!(
-        out.status.success(),
-        "ffprobe failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-/// Every H.264 header field the encoder actually wrote, as `trace_headers`
-/// dumps them. This is the only honest way to check `nal-hrd=cbr`: it lives in
-/// the SPS VUI, ffprobe does not surface it, and file size only ever hints at
-/// it. Trace goes to stderr, so the log is the return value.
-fn h264_headers(ffmpeg: &Path, file: &Path) -> String {
-    let out = Command::new(ffmpeg)
-        .args(["-hide_banner", "-nostdin", "-loglevel", "trace", "-i"])
-        .arg(file)
-        .args([
-            "-c",
-            "copy",
-            "-bsf:v",
-            "trace_headers",
-            "-t",
-            "0.2",
-            "-f",
-            "null",
-            "-",
-        ])
-        .output()
-        .expect("trace_headers runs");
-    let log = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(
-        log.contains("seq_parameter_set"),
-        "trace_headers produced no SPS, so this build cannot answer the \
-         question. Its output was:\n{log}"
-    );
-    log
-}
-
-/// One `trace_headers` field's decoded value.
-fn header_field(log: &str, name: &str) -> String {
-    log.lines()
-        .find(|l| l.contains(name))
-        .and_then(|l| l.rsplit('=').next())
-        .map(|v| v.trim().to_owned())
-        .unwrap_or_else(|| panic!("no {name} in the H.264 headers"))
-}
-
-/// Highest packet timestamp in one stream, in seconds.
-fn last_pts(ffprobe: &Path, file: &Path, stream: &str) -> f64 {
-    let raw = probe(
-        ffprobe,
-        &[
-            "-select_streams",
-            stream,
-            "-show_entries",
-            "packet=pts_time",
-            "-of",
-            "csv=p=0",
-            &file.to_string_lossy(),
-        ],
-    );
-    raw.lines()
-        .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
-        .fold(f64::MIN, f64::max)
-}
+const WEDGE_NOTE: &str = "This is a deadlock, not slow encoding: something is \
+                          feeding both of the encoder's pipes in a way that lets ffmpeg block one \
+                          producer by refusing the other (issue #248). Confirm with `sample` or \
+                          `gdb` on both processes; a `write` on the video fifo under push_tick, \
+                          against an ffmpeg in `read`, is that bug. Anything ffmpeg printed \
+                          follows.";
 
 #[test]
 fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
-    arm_deadline();
-    let (Some(ffmpeg), Some(ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
-        // Linux is where jamstreamd encodes and where CI installs the pinned
-        // ffmpeg, so an absent encoder there means the job that exists to run
-        // this test is not running it. Say so instead of reporting a pass.
-        assert!(
-            !cfg!(target_os = "linux") && std::env::var_os("JAMSTREAM_REQUIRE_FFMPEG").is_none(),
-            "ffmpeg and ffprobe are not on PATH, so nothing here checked the \
-             encode ladder the platforms accept. Install the pinned build with \
-             scripts/install-pinned-ffmpeg.sh, or, on a machine that will never \
-             have it, unset JAMSTREAM_REQUIRE_FFMPEG and run off Linux."
-        );
-        eprintln!(
-            "SKIP real_ffmpeg_produces_a_stream_the_platforms_would_accept: \
-             ffmpeg and ffprobe are not on PATH. The pipeline's supervision, \
-             cadence, and key handling are covered by the fake-host unit \
-             tests; this test needs the real encoder."
-        );
+    arm_deadline("real_ffmpeg", WEDGE_NOTE);
+    let Some(tools) = require(
+        "real_ffmpeg_produces_a_stream_the_platforms_would_accept",
+        &["ffmpeg", "ffprobe"],
+        "the encode ladder the platforms accept",
+    ) else {
         return;
     };
+    let (ffmpeg, ffprobe) = (tools[0].clone(), tools[1].clone());
 
     let root = std::env::temp_dir().join(format!("jamstream-realffmpeg-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -224,40 +98,8 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
         listeners: 7,
     });
 
-    // A 440 Hz sine at -10 dBFS, so the output is provably not silence, plus
-    // moving meters so the renderer does real per-frame work.
-    //
-    // Fed at the rate a session feeds it. The pipeline is a real-time
-    // component: it sheds video frames and declares a broken feed when the
-    // encoder falls behind the audio clock, so a test that pushes five
-    // seconds of programme as fast as the CPU allows measures the encoder's
-    // throughput and nothing else. The pacing only ever waits, never hurries,
-    // so a slow runner just gets a shorter wait and the same assertions.
     let total_ticks = SECONDS * TICKS_PER_SEC;
-    let started = Instant::now();
-    let mut sample = 0u64;
-    for tick in 0..total_ticks {
-        let mut audio = [0.0f32; TICK_STEREO];
-        for pair in audio.chunks_exact_mut(2) {
-            let t = sample as f64 / 48_000.0;
-            let v = (t * 440.0 * std::f64::consts::TAU).sin() as f32 * 0.316;
-            pair[0] = v;
-            pair[1] = v;
-            sample += 1;
-        }
-        let mut levels = Levels::default();
-        let phase = (tick % 200) as f32 / 200.0;
-        levels.push(0.2 + 0.5 * phase, 0.1 + 0.3 * phase);
-        levels.push(0.6 - 0.4 * phase, 0.3 - 0.2 * phase);
-        let due = Duration::from_micros(tick * 2_500);
-        if let Some(wait) = due.checked_sub(started.elapsed()) {
-            std::thread::sleep(wait);
-        }
-        let now_ms = tick * 5 / 2;
-        pipeline.push_tick(now_ms, &audio, &levels);
-        pipeline.poll(now_ms);
-    }
-    println!("fed {SECONDS}s of programme in {:?}", started.elapsed());
+    feed_programme(&mut pipeline, total_ticks, |_, _| true);
     // Nothing may be dropped or repeated at real time on any machine that can
     // encode at all: either count here is the renderer or the encoder failing
     // to keep up with 30 fps of 720p, which is the thing a session VM is sized
@@ -274,7 +116,7 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
     );
     // Stop closes our write ends, so ffmpeg drains and finishes the file.
     pipeline
-        .apply(total_ticks * 5 / 2, StreamOp::Stop)
+        .apply(tick_ms(total_ticks), StreamOp::Stop)
         .expect("stop");
     drop(pipeline);
 
@@ -291,17 +133,11 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
     );
 
     // Codecs and geometry.
-    let v = probe(
+    let v = probe_entries(
         &ffprobe,
-        &[
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,width,height,pix_fmt,r_frame_rate",
-            "-of",
-            "csv=p=0",
-            &out_file.to_string_lossy(),
-        ],
+        &out_file,
+        "v:0",
+        "stream=codec_name,width,height,pix_fmt,r_frame_rate",
     );
     assert!(v.contains("h264"), "video is not H.264: {v}");
     assert!(v.contains("1280,720"), "not 720p landscape: {v}");
@@ -332,17 +168,11 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
     let want_frames = u64::from(fps) * SECONDS + 1;
     assert_eq!(frames, want_frames, "video is missing frames");
 
-    let a = probe(
+    let a = probe_entries(
         &ffprobe,
-        &[
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=codec_name,sample_rate,channels,profile",
-            "-of",
-            "csv=p=0",
-            &out_file.to_string_lossy(),
-        ],
+        &out_file,
+        "a:0",
+        "stream=codec_name,sample_rate,channels,profile",
     );
     assert!(a.contains("aac"), "audio is not AAC: {a}");
     assert!(a.contains("48000"), "audio is not 48 kHz: {a}");
@@ -442,18 +272,7 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
     // is what the file size measures: a stream that starves for two seconds and
     // overshoots for two averages out fine and still trips a platform's
     // bitrate guard. So walk one-second windows over the video packets.
-    let packets = probe(
-        &ffprobe,
-        &[
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "packet=pts_time,size",
-            "-of",
-            "csv=p=0",
-            &out_file.to_string_lossy(),
-        ],
-    );
+    let packets = probe_entries(&ffprobe, &out_file, "v:0", "packet=pts_time,size");
     let mut window_kbits = vec![0u64; SECONDS as usize];
     for line in packets.lines() {
         let mut parts = line.split(',');
@@ -491,19 +310,7 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
     );
 
     // The audio really carried our sine, rather than a stream of silence.
-    let vol = Command::new(&ffmpeg)
-        .args(["-hide_banner", "-nostdin", "-i"])
-        .arg(&out_file)
-        .args(["-af", "volumedetect", "-f", "null", "-"])
-        .output()
-        .expect("volumedetect runs");
-    let log = String::from_utf8_lossy(&vol.stderr);
-    let mean = log
-        .lines()
-        .find_map(|l| l.split("mean_volume:").nth(1))
-        .and_then(|s| s.trim().split(' ').next())
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or_else(|| panic!("volumedetect gave no mean_volume:\n{log}"));
+    let mean = mean_volume(&ffmpeg, &out_file);
     assert!(
         (-20.0..-3.0).contains(&mean),
         "mean volume {mean} dBFS is not the -10 dBFS sine we fed"
