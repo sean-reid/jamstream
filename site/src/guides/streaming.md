@@ -44,7 +44,7 @@ The **Broadcast** tab says so when it is missing, with the reason, and both **Ad
 ![The Broadcast tab reading that this session cannot stream because the broadcast tooling could not be downloaded, with Add key and Go live both disabled](../images/session_destinations_unavailable.png)
 *Nothing on this computer can fix this one: the relay is on the session machine.*
 
-The session server checks the relay every few seconds for as long as the session lasts, so this appears if the relay dies mid-session too, and clears if it comes back. Nothing on your computer affects it. To broadcast, start a new session.
+The session server checks the relay every few seconds for as long as the session lasts, so this appears if the relay dies mid-session too, and clears if it comes back. Nothing on your computer affects it: to broadcast, start another session. A session hosted on your own machine needs `ffmpeg` and `mediamtx` in `/usr/local/bin` instead.
 
 ## While you are on air
 

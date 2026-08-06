@@ -352,12 +352,15 @@ impl DestinationsPanel {
         if let Some(reason) = snap.stream.unavailable_reason() {
             ui.add_space(theme::SPACE_XS);
             theme::reason(ui, cannot_stream_line(reason));
+            // No advice here on purpose. A cloud session is fixed by starting
+            // another one and a local session by installing the tooling, and
+            // this side cannot tell which it is looking at; the streaming
+            // guide can say both.
             ui.label(
                 theme::muted(
                     ui,
-                    "The broadcast relay runs on the session machine, so nothing \
-                     on this computer can fix it. Start a new session to \
-                     broadcast.",
+                    "The relay runs on the session's own machine, so nothing on \
+                     this computer changes it.",
                 )
                 .small(),
             );
