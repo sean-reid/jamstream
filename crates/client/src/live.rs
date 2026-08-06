@@ -22,6 +22,7 @@ use jamstream_audio_io::{
     AudioBackend, AudioError, CallbackBridge, DuplexHandler, EngineSide, StreamConfig,
     StreamHandle, WavBackend, WavStream,
 };
+use jamstream_engine::JitterStats;
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
 use jamstream_protocol::control::{RecordOp, RecordingState};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
@@ -78,6 +79,18 @@ const PUMP_REPLAY_MAX_SECS: u64 = 2;
 /// Synthetic sender id for system chat lines (device notices). Real member
 /// ids are assigned from zero, far below this.
 const SYSTEM_MEMBER: MemberId = MemberId(u16::MAX);
+/// How long playout may hand out nothing but zeros on a joined session before
+/// the log says so. The deepest legitimate refill is the buffer's own
+/// `MAX_TARGET` of 24 frames, 60 ms, so a second of it is not the buffer
+/// filling: it is a member hearing silence.
+const SILENT_PLAYOUT_AFTER: Duration = Duration::from_secs(1);
+/// Window the refused-frame rate is measured over, and the count inside it
+/// that means the arriving stream disagrees with playout rather than the
+/// network dropping the odd packet. Media arrives one frame per tick, 400 a
+/// second, and reordering strands a few percent of them; half of a second's
+/// frames refused cannot be that.
+const REFUSED_WINDOW: Duration = Duration::from_secs(1);
+const REFUSED_WINDOW_LIMIT: u64 = 200;
 
 /// Ring capacity in samples. It doubles as the playout depth target: the
 /// top-up loop keeps the ring full, so the device-side cushion sits at
@@ -488,6 +501,105 @@ impl ReopenEpisode {
     }
 }
 
+/// Watches the local jitter buffer for the two faults that leave a connected
+/// session sounding broken and show up nowhere else: playout handing out zeros
+/// because the buffer never filled, and frames arriving only to be refused.
+///
+/// Both are warnings because the log file promises that an empty file is a
+/// healthy run, and a member who heard nobody for a whole session found nothing
+/// in it (#451). Both are one line per episode, like the ring counters: at
+/// 2.5 ms a tick, warning per tick would put hundreds of lines a second in a
+/// file people mail us.
+///
+/// It reads counters rather than pull outcomes, so it needs no seam through the
+/// core: `waiting` moving while `pulled` stands still is exactly a run of
+/// `Pull::Waiting`, the one branch that writes literal zeros, and `late` is the
+/// frames the buffer refused, which no other surface carries at all.
+#[derive(Default)]
+struct PlayoutWatch {
+    /// Last tick's counters; the deltas are what they mean here.
+    prev: Option<JitterStats>,
+    /// When the current run of silence began, and whether it has been said.
+    silent_since: Option<Instant>,
+    silent_said: bool,
+    /// The open refusal window: when it started and `late` as it stood then.
+    refused_window: Option<(Instant, u64)>,
+    refused_said: bool,
+}
+
+impl PlayoutWatch {
+    /// One tick's worth of observation. `joined_as` is the member this client
+    /// is joined as, and None whenever it is not joined: before the session is
+    /// up nothing is arriving yet, and silence then is the connection's story
+    /// to tell.
+    fn observe(&mut self, now: Instant, joined_as: Option<MemberId>, stats: JitterStats) {
+        let prev = self.prev.replace(stats);
+        let Some(member) = joined_as else {
+            self.forget();
+            return;
+        };
+        let Some(prev) = prev else { return };
+        // A reconnect builds a fresh buffer, so a counter that went backwards
+        // is a new stream and not an event.
+        if stats.pulled < prev.pulled || stats.late < prev.late || stats.waiting < prev.waiting {
+            self.forget();
+            return;
+        }
+
+        // Zeros went out and nothing playable did: the buffer has not filled.
+        if stats.waiting > prev.waiting && stats.pulled == prev.pulled {
+            let since = *self.silent_since.get_or_insert(now);
+            if !self.silent_said && now.duration_since(since) >= SILENT_PLAYOUT_AFTER {
+                self.silent_said = true;
+                tracing::warn!(
+                    member = member.0,
+                    depth_frames = stats.depth_frames,
+                    target_frames = stats.target_frames,
+                    late = stats.late,
+                    reanchors = stats.reanchors,
+                    silent_ms = now.duration_since(since).as_millis(),
+                    "playout is silence: the jitter buffer has not filled"
+                );
+            }
+        } else {
+            self.silent_since = None;
+            self.silent_said = false;
+        }
+
+        match self.refused_window {
+            None => self.refused_window = Some((now, stats.late)),
+            Some((from, late_then)) if now.duration_since(from) >= REFUSED_WINDOW => {
+                let refused = stats.late - late_then;
+                if refused < REFUSED_WINDOW_LIMIT {
+                    self.refused_said = false;
+                } else if !self.refused_said {
+                    self.refused_said = true;
+                    tracing::warn!(
+                        member = member.0,
+                        refused,
+                        late = stats.late,
+                        depth_frames = stats.depth_frames,
+                        target_frames = stats.target_frames,
+                        reanchors = stats.reanchors,
+                        "media is arriving and being refused: its timing and playout disagree"
+                    );
+                }
+                self.refused_window = Some((now, stats.late));
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Drops both episodes without saying anything: the stream this was
+    /// watching is gone, and the next one starts its own.
+    fn forget(&mut self) {
+        self.silent_since = None;
+        self.silent_said = false;
+        self.refused_window = None;
+        self.refused_said = false;
+    }
+}
+
 /// The production runtime. Construct with [`LiveRuntime::join`]; the UI
 /// consumes it as a `Box<dyn Runtime>` (an `Arc<LiveRuntime>` implements
 /// the trait too, so the app can keep a concrete handle for
@@ -579,6 +691,7 @@ impl LiveRuntime {
             device_frames,
             ring_underrun_warned: false,
             ring_overrun_warned: false,
+            playout: PlayoutWatch::default(),
             settings,
             shared: Arc::clone(&shared),
             rx,
@@ -934,6 +1047,9 @@ struct Worker {
     /// audible but invisible (#323).
     ring_underrun_warned: bool,
     ring_overrun_warned: bool,
+    /// One warn per episode when playout goes silent or media is refused; the
+    /// jitter buffer's counters had no consumer that could say either (#451).
+    playout: PlayoutWatch,
     settings: AudioSettings,
     shared: Arc<Mutex<SharedState>>,
     rx: mpsc::Receiver<ThreadMsg>,
@@ -1032,7 +1148,9 @@ impl Worker {
             let _ = self.socket.send(&pkt);
         }
         self.drain_events(now_ms);
-        self.publish_stats();
+        let stats = self.core.stats();
+        self.watch_playout(&stats);
+        self.publish_stats(&stats);
         self.maybe_fail_over(now_ms);
         true
     }
@@ -1540,8 +1658,18 @@ impl Worker {
         }
     }
 
-    fn publish_stats(&mut self) {
-        let stats = self.core.stats();
+    /// Hands this tick's jitter counters to [`PlayoutWatch`], with the member
+    /// they belong to. Only a joined client is owed media, so the member is
+    /// also the gate.
+    fn watch_playout(&mut self, stats: &ClientStats) {
+        let joined_as = matches!(stats.state, ClientState::Joined)
+            .then(|| self.core.member_id())
+            .flatten();
+        self.playout
+            .observe(Instant::now(), joined_as, stats.jitter);
+    }
+
+    fn publish_stats(&mut self, stats: &ClientStats) {
         let mut s = self.shared.lock().expect("live state");
         if matches!(stats.state, ClientState::Joined) {
             self.ever_joined = true;
@@ -1554,7 +1682,7 @@ impl Worker {
         s.rtt_ms = stats.rtt_ms_last;
         s.jitter_depth = stats.jitter.depth_frames;
         s.jitter_target = stats.jitter.target_frames;
-        s.loss_pct = loss_pct(&stats);
+        s.loss_pct = loss_pct(stats);
         // Mouth to ear, capture to playout:
         //   rtt / 2                      the downlink network leg
         // + jitter depth * 2.5 ms        playout buffering ahead of decode
@@ -1705,6 +1833,7 @@ fn loss_pct(stats: &ClientStats) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jamstream_engine::{JitterBuffer, MediaPacket};
 
     /// The loop's pace against the audio it moves. Both constants come off
     /// [`FrameDuration::Ms2_5`] now, so asserting each against its own source
@@ -1852,5 +1981,212 @@ mod tests {
         assert_eq!(config.buffer_frames, 120);
         settings.buffer_frames = 0;
         assert_eq!(stream_config(&settings).buffer_frames, 32, "the floor");
+    }
+
+    /// The member the watched buffer plays for.
+    const ME: MemberId = MemberId(7);
+
+    /// Formatted log lines, behind the app's own default filter, so a test
+    /// says both what the log file would hold and that these events are
+    /// warnings rather than something the file never sees.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().expect("captured log").clone())
+                .expect("log is utf8")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// Runs `body` against a capturing subscriber carrying the CLI's default
+    /// filter, which is the one the log file is written through.
+    fn captured(body: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let cap = Captured::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(cap.clone()),
+            )
+            .with(jamstream_cli::logging::filter(None));
+        tracing::subscriber::with_default(subscriber, body);
+        cap.lines()
+    }
+
+    /// A real jitter buffer, the watch over it, and a synthetic mix clock: one
+    /// tick is one 2.5 ms pull, so the watch sees exactly what it sees in the
+    /// worker, produced by the buffer itself rather than by a stand-in.
+    struct Ticker {
+        jitter: JitterBuffer,
+        watch: PlayoutWatch,
+        start: Instant,
+        tick: u32,
+    }
+
+    impl Ticker {
+        fn new() -> Ticker {
+            Ticker {
+                jitter: JitterBuffer::new(),
+                watch: PlayoutWatch::default(),
+                start: Instant::now(),
+                tick: 0,
+            }
+        }
+
+        /// `ticks` mix ticks, with `feed` handed the buffer and the tick number
+        /// before each pull.
+        fn run(
+            &mut self,
+            ticks: u32,
+            joined_as: Option<MemberId>,
+            mut feed: impl FnMut(&mut JitterBuffer, u32),
+        ) {
+            for _ in 0..ticks {
+                feed(&mut self.jitter, self.tick);
+                self.jitter.pull();
+                let at = self.start + TICK * self.tick;
+                self.watch.observe(at, joined_as, self.jitter.stats());
+                self.tick += 1;
+            }
+        }
+    }
+
+    fn media(seq: u32) -> MediaPacket {
+        MediaPacket {
+            seq,
+            timestamp: u64::from(seq) * FRAME_FRAMES as u64,
+            payload: vec![0u8; 8],
+            redundant: None,
+        }
+    }
+
+    /// This tick's frame, in time, every tick.
+    fn healthy(jitter: &mut JitterBuffer, tick: u32) {
+        jitter.push(media(tick));
+    }
+
+    /// This tick's frame plus a copy of the one from 100 ms back, which is
+    /// behind playout by more than the buffer is deep and is refused for it.
+    fn stale_copies(jitter: &mut JitterBuffer, tick: u32) {
+        jitter.push(media(tick));
+        if let Some(old) = tick.checked_sub(40) {
+            jitter.push(media(old));
+        }
+    }
+
+    /// #451: a joined client handed no media at all hears silence for the whole
+    /// session, and the log used to carry nothing about it. One line, naming
+    /// the numbers that separate "nothing is arriving" from "arriving and being
+    /// refused", and one line only: three seconds of it at 2.5 ms a tick would
+    /// otherwise be 1200 of them.
+    #[test]
+    fn a_client_handed_no_media_says_so_once() {
+        let lines = captured(|| Ticker::new().run(1_200, Some(ME), |_, _| {}));
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        let line = &lines[0];
+        assert!(
+            line.contains("WARN"),
+            "not a warning, so the file never sees it: {line}"
+        );
+        assert!(line.contains("playout is silence"), "{line}");
+        for field in [
+            "member=7",
+            "depth_frames=0",
+            "target_frames=1",
+            "late=0",
+            "reanchors=0",
+        ] {
+            assert!(line.contains(field), "no {field} in {line}");
+        }
+    }
+
+    /// The other half of #451: media that arrives and is refused. Every tick
+    /// carries this tick's frame and a copy of one from 100 ms back, which is
+    /// behind playout and dropped, so `late` climbs while depth stays at
+    /// target and audio keeps playing. The reader has to be able to tell this
+    /// from hearing nothing, because the causes are nothing alike.
+    #[test]
+    fn a_client_whose_media_is_refused_says_something_else() {
+        let lines = captured(|| Ticker::new().run(1_200, Some(ME), stale_copies));
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        let line = &lines[0];
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("being refused"), "{line}");
+        assert!(
+            !line.contains("playout is silence"),
+            "a refused stream must not read as a silent one: {line}"
+        );
+        for field in [
+            "member=7",
+            "late=",
+            "refused=",
+            "depth_frames=",
+            "reanchors=0",
+        ] {
+            assert!(line.contains(field), "no {field} in {line}");
+        }
+    }
+
+    /// The direction that matters more: an ordinary session says nothing at
+    /// all. The banner promises an empty file means a healthy run, so a watch
+    /// that fires on the couple of ticks every start spends filling would cost
+    /// the file its only claim.
+    #[test]
+    fn an_ordinary_stream_says_nothing() {
+        let lines = captured(|| Ticker::new().run(1_200, Some(ME), healthy));
+        assert!(lines.is_empty(), "{lines:#?}");
+    }
+
+    /// Silence before the session is up belongs to the connection, which
+    /// reports itself. Warning here would put a line in every run that starts
+    /// with a server slow to answer.
+    #[test]
+    fn silence_before_joining_says_nothing() {
+        let lines = captured(|| Ticker::new().run(1_200, None, |_, _| {}));
+        assert!(lines.is_empty(), "{lines:#?}");
+    }
+
+    /// A reconnect hands the watch a fresh buffer whose counters restart at
+    /// zero. That is a new stream and not an event: counters that ran up and
+    /// then dropped must read as a restart, or the refusal window subtracts a
+    /// spent count from an empty one.
+    #[test]
+    fn a_reconnected_stream_starts_its_own_episode() {
+        let lines = captured(|| {
+            let mut t = Ticker::new();
+            t.run(1_200, Some(ME), stale_copies);
+            t.jitter = JitterBuffer::new();
+            t.run(1_200, Some(ME), healthy);
+        });
+        assert_eq!(
+            lines.len(),
+            1,
+            "the healthy stream after it said nothing new"
+        );
+        assert!(lines[0].contains("being refused"), "{:?}", lines[0]);
     }
 }
