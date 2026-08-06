@@ -282,16 +282,21 @@ mod tests {
     /// The relay is downloaded and started after this process, so its absence
     /// at the first probe is not news. Reporting it would be wrong in the
     /// direction that costs a host a broadcast they actually have.
+    ///
+    /// Short grace, not the shipped one: every probe is a real connect that
+    /// Windows spends `CONNECT_TIMEOUT` refusing, so 180 s costs 36 of them.
     #[tokio::test]
     async fn a_relay_that_has_not_arrived_yet_is_not_reported_missing() {
+        const GRACE: Duration = Duration::from_secs(15);
         let addr = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
-        let mut watch =
-            RelayWatch::new(&format!("rtmp://{addr}/jamstream"), None).expect("a relay url");
+        let mut watch = RelayWatch::new(&format!("rtmp://{addr}/jamstream"), None)
+            .expect("a relay url")
+            .with_grace(GRACE);
         let mut now = 0;
-        while now < FIRST_SIGHTING_GRACE.as_millis() as u64 {
+        while now < GRACE.as_millis() as u64 {
             assert_eq!(
                 watch.observe(now).await,
                 None,
@@ -304,6 +309,14 @@ mod tests {
             watch.observe(now).await,
             Some(BroadcastReadiness::Unavailable { .. })
         ));
+    }
+
+    /// Holds the shipped grace, which the test above overrides.
+    #[test]
+    fn the_shipped_grace_is_three_minutes() {
+        assert_eq!(FIRST_SIGHTING_GRACE, Duration::from_secs(180));
+        let watch = RelayWatch::new("rtmp://127.0.0.1:1935/jamstream", None).expect("a relay url");
+        assert_eq!(watch.grace, FIRST_SIGHTING_GRACE);
     }
 
     /// A reason from a note file is a line someone else wrote, so it takes the
