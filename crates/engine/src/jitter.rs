@@ -64,6 +64,12 @@ pub struct JitterStats {
     /// Pulls that consumed a slot (Frame, Recovered, or Missing; Waiting and
     /// growth holds excluded). Denominator for loss deltas over a window.
     pub pulled: u64,
+    /// Pulls answered with [`Pull::Waiting`], each one a frame of literal
+    /// zeros handed to playout because the buffer has not reached target depth
+    /// since it was last anchored. The only branch that plays silence rather
+    /// than concealment, so a caller can tell "hearing nothing" from
+    /// "hearing a concealed stream" and say so (#451).
+    pub waiting: u64,
     /// Times the buffer gave up on a playout position it could not reconcile
     /// with the arriving stream (see `REANCHOR_PATIENCE`) and re-anchored on
     /// the newest arrivals, exactly as it does for a stream restart. Each one
@@ -89,6 +95,7 @@ pub struct JitterBuffer {
     late: u64,
     resurrected: u64,
     pulled: u64,
+    waiting: u64,
     reanchors: u64,
     /// Seq the most recent pull concealed (Missing with nothing usable).
     /// While set, `next_seq == concealed + 1`; delivering any frame clears it.
@@ -171,6 +178,7 @@ impl JitterBuffer {
                 self.next_seq = self.frames.keys().next().copied();
                 self.running = true;
             } else {
+                self.waiting += 1;
                 return Pull::Waiting;
             }
         }
@@ -268,6 +276,7 @@ impl JitterBuffer {
             late: self.late,
             resurrected: self.resurrected,
             pulled: self.pulled,
+            waiting: self.waiting,
             reanchors: self.reanchors,
         }
     }
@@ -361,6 +370,10 @@ mod tests {
         assert_eq!(stats.recovered, 0);
         assert_eq!(stats.late, 0);
         assert_eq!(stats.target_frames, 1);
+        // Nothing was ever played as silence: the first packet was already in
+        // hand when the first pull came, so a caller watching `waiting` sees a
+        // healthy stream as zero (#451).
+        assert_eq!(stats.waiting, 0);
         assert_eq!(jb.loss_ratio_recent(), 0.0);
     }
 
@@ -546,8 +559,33 @@ mod tests {
         let mut jb = JitterBuffer::new();
         assert_eq!(jb.pull(), Pull::Waiting);
         assert_eq!(jb.pull(), Pull::Waiting);
+        // Each of those pulls handed playout a frame of zeros, and the counter
+        // is what lets a caller notice that it is happening.
+        assert_eq!(jb.stats().waiting, 2);
+        assert_eq!(jb.stats().pulled, 0);
         jb.push(packet(5, None));
         assert_eq!(jb.pull(), Pull::Frame(payload_for(5)));
+        // It stops the moment audio plays, so a run of silence is `waiting`
+        // moving while `pulled` stands still.
+        assert_eq!(jb.stats().waiting, 2);
+        assert_eq!(jb.stats().pulled, 1);
+    }
+
+    /// A buffer handed nothing at all counts every silent frame it plays: this
+    /// is the state a client is in when its user hears nothing for a whole
+    /// session, and before #451 no counter named it.
+    #[test]
+    fn silence_is_counted_for_as_long_as_the_buffer_stays_unfilled() {
+        let mut jb = JitterBuffer::new();
+        for _ in 0..400 {
+            assert_eq!(jb.pull(), Pull::Waiting);
+        }
+        let stats = jb.stats();
+        assert_eq!(stats.waiting, 400);
+        assert_eq!(stats.pulled, 0);
+        assert_eq!(stats.depth_frames, 0);
+        assert_eq!(stats.late, 0);
+        assert_eq!(stats.reanchors, 0);
     }
 
     #[test]
