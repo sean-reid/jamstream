@@ -19,7 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::VerifyingKey;
 use jamstream_cloud::cloudinit::RecordingStorage;
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
-use jamstream_protocol::control::{RecordOp, RecordingState as ProtoRecordingState, StreamOp};
+use jamstream_protocol::control::{
+    BroadcastReadiness, RecordOp, RecordingState as ProtoRecordingState, StreamOp,
+};
 use jamstream_protocol::transport::derive_public;
 use jamstream_session::server::{ServerConfig, ServerCore, ServerEvent};
 use jamstream_stream::pipeline::{Roster, StreamConfig, StreamMember};
@@ -30,6 +32,7 @@ use tokio::time::MissedTickBehavior;
 use crate::cloud_sink::CloudSink;
 use crate::config::Config;
 use crate::record::{DiskSink, RecordPayload, RecordWorker, RecordingState};
+use crate::relay::RelayWatch;
 use crate::revocations::Revocations;
 
 const TICK: Duration = Duration::from_micros(2_500);
@@ -167,6 +170,14 @@ pub struct Server {
     /// worth paying for until one does.
     stream: Option<StreamWorker>,
     stream_cfg: StreamConfig,
+    /// Probes the relay the encoder publishes to, so the host is told whether
+    /// this session can broadcast at all rather than being offered a key field
+    /// that leads nowhere. None when the configured target is not a relay on
+    /// this machine, which is what the encode tests point at.
+    relay: Option<RelayWatch>,
+    /// Where cloud-init leaves the reason the broadcast tooling never arrived,
+    /// which is the one thing the probe cannot work out for itself.
+    broadcast_note: Option<PathBuf>,
     /// Roster generation last handed to the pipeline.
     stream_roster_epoch: u64,
     /// Recorder, started on the host's first record request, like the
@@ -207,6 +218,7 @@ impl Server {
         // Encode settings and VM paths; tests override them through
         // with_stream_config.
         let stream_cfg = StreamConfig::default();
+        let relay = RelayWatch::new(&stream_cfg.encoder_output, None);
         Ok(Server {
             core,
             socket,
@@ -214,6 +226,8 @@ impl Server {
             idle_exit: Duration::ZERO,
             max_duration: Duration::ZERO,
             stream: None,
+            relay,
+            broadcast_note: None,
             stream_cfg,
             stream_roster_epoch: 0,
             recorder: None,
@@ -287,7 +301,26 @@ impl Server {
     /// cloud-init creates on the session VM.
     pub fn with_stream_config(mut self, cfg: StreamConfig) -> Self {
         self.stream_cfg = cfg;
+        self.rearm_relay_watch();
         self
+    }
+
+    /// Points the relay probe at the note cloud-init leaves when the broadcast
+    /// tooling never downloaded, so the host is told that rather than a
+    /// generic absence. Harmless where nothing writes one: a local session
+    /// simply has no such file, and the probe answers on its own.
+    pub fn with_broadcast_note(mut self, path: PathBuf) -> Self {
+        self.broadcast_note = Some(path);
+        self.rearm_relay_watch();
+        self
+    }
+
+    /// Rebuilds the probe against the current target and note. Both arrive
+    /// through builders after `bind`, and a probe of the wrong port is worse
+    /// than none: it would tell a host with a working relay that they have no
+    /// broadcast.
+    fn rearm_relay_watch(&mut self) {
+        self.relay = RelayWatch::new(&self.stream_cfg.encoder_output, self.broadcast_note.clone());
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -482,6 +515,34 @@ impl Server {
         self.core.set_stream_status(now_ms, status);
     }
 
+    /// Once a second: ask the relay whether it is there, and tell the room when
+    /// the answer changes. Every five seconds in practice, which is what the
+    /// watch's own cadence comes to.
+    ///
+    /// This runs whether or not the pipeline exists, unlike `beat_stream`: the
+    /// host who most needs the answer has configured no destination yet, so a
+    /// probe that waited for one would arrive after the mistake it prevents.
+    async fn beat_relay(&mut self, now_ms: u64) {
+        let Some(watch) = self.relay.as_mut() else {
+            return;
+        };
+        let Some(state) = watch.observe(now_ms).await else {
+            return;
+        };
+        let addr = watch.addr();
+        if self.core.broadcast_readiness() != Some(&state) {
+            match &state {
+                BroadcastReadiness::Ready => {
+                    tracing::info!(relay = %addr, "the broadcast relay is listening");
+                }
+                BroadcastReadiness::Unavailable { reason } => {
+                    tracing::warn!(relay = %addr, reason, "this session cannot broadcast");
+                }
+            }
+        }
+        self.core.set_broadcast_readiness(state);
+    }
+
     /// Logs the core's events and routes the two kinds that need an actuator.
     fn drain_events(&mut self, now_ms: u64) {
         for event in self.core.events() {
@@ -562,6 +623,7 @@ impl Server {
                     let now_ms = start.elapsed().as_millis() as u64;
                     self.beat_stream(now_ms);
                     self.beat_record();
+                    self.beat_relay(now_ms).await;
                     let musicians = self.core.musicians_connected();
                     if musicians > 0 {
                         touch(self.activity_path.as_deref());

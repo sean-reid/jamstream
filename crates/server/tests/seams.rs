@@ -10,7 +10,8 @@
 //! model came to quote mono WAV for a stereo FLAC take.
 
 use jamstream_cloud::cloudinit::{
-    ACTIVITY_FILE, BootConfig, RECORDING_CONFIG_PATH, STREAM_KEY_DIR, SelfDestruct,
+    ACTIVITY_FILE, BROADCAST_NOTE_FILE, BootConfig, RECORDING_CONFIG_PATH, STREAM_KEY_DIR,
+    SelfDestruct,
 };
 use jamstream_cloud::recording::{BitDepth, MIX_CHANNELS, RecordingPlan, SAMPLE_RATE_HZ};
 use jamstream_server::flac::{BITS_PER_SAMPLE, CHANNELS, FlacEncoder, SAMPLE_RATE};
@@ -110,6 +111,35 @@ fn the_boot_script_creates_the_paths_the_processes_use() {
             "install -d -o jamstream -g jamstream -m 0700 {STREAM_KEY_DIR}"
         )),
         "bootstrap must create the key directory 0700"
+    );
+}
+
+/// Why a session cannot broadcast: cloud-init writes the sentence, jamstreamd
+/// reads it and reports it to the host. Both halves spell the path from the
+/// same constant, and this is the only test that sees both, so a note written
+/// where nothing reads it would otherwise pass everything.
+#[test]
+fn the_reason_a_session_cannot_broadcast_reaches_the_process_that_reports_it() {
+    let script = jamstream_cloud::cloudinit::render(&boot_config());
+    assert!(
+        script.contains(&format!("> {BROADCAST_NOTE_FILE}")),
+        "the bring-up records no reason anywhere jamstreamd looks"
+    );
+    // The service account has to be able to read it: root writes the file into
+    // a 0750 directory that account owns.
+    assert!(
+        BROADCAST_NOTE_FILE.starts_with("/run/jamstream/"),
+        "the note is outside the directory the units grant access to"
+    );
+
+    // And the relay it is a reason about is the one the probe watches, which
+    // is the address the pipeline publishes to.
+    let cfg = jamstream_stream::pipeline::StreamConfig::default();
+    let addr = jamstream_server::relay::relay_addr(&cfg.encoder_output)
+        .expect("the encoder publishes to a relay on this machine");
+    assert!(
+        script.contains(&format!("rtmpAddress: {addr}")),
+        "the probe watches {addr}, which the relay config does not serve"
     );
 }
 
