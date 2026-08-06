@@ -42,6 +42,20 @@ pub const ACTIVITY_FILE: &str = "/run/jamstream/last-active";
 /// run against a scratch dir, and the local provider).
 pub const ACTIVITY_FILE_NAME: &str = "last-active";
 
+/// Where the bootstrap records that this session cannot broadcast, and why.
+///
+/// The broadcast tooling is deliberately allowed to fail: a musician must not
+/// lose a session to a failed download. But the warning it printed went to the
+/// console log, which no host can read, and nothing else recorded it, so the
+/// app kept offering a key field that led nowhere (#440). One line here is the
+/// whole mechanism: jamstreamd reads it when its relay probe finds nothing
+/// listening, and the host is told that sentence instead of nothing.
+///
+/// Public because jamstreamd is in another crate and the unit does not pass a
+/// path for it: both ends spell it from here, and the seam test in the server
+/// crate holds them together. Root writes it; the service account only reads.
+pub const BROADCAST_NOTE_FILE: &str = "/run/jamstream/broadcast-unavailable";
+
 /// Root-owned tmpfs directory the stream pipeline stages one-shot key files
 /// in. The bootstrap creates it 0700; `jamstream_stream`'s `StreamConfig`
 /// names the same path from the other side of a crate boundary it cannot
@@ -568,12 +582,12 @@ fn fetch_media_tool(name: &str, tool: &MediaTool) -> String {
         "# {name} {version}, {license}. Pinned in data/media_artifacts.json.{license_note}
 # Source: {source}
 case \"$(uname -m)\" in
-{cases}  *) echo \"jamstream: no pinned {name} for $(uname -m)\" >&2; exit 1 ;;
+{cases}  *) echo \"jamstream: no pinned {name} for $(uname -m)\" >&2; exit {fatal} ;;
 esac
 curl -fsSL --retry 5 -o \"$tmp/{name}.archive\" \"$url\"
 if ! echo \"$sha  $tmp/{name}.archive\" | sha256sum -c -; then
   echo \"jamstream: {name} sha256 mismatch, refusing to start\" >&2
-  exit 1
+  exit {fatal}
 fi
 tar -{extract} \"$tmp/{name}.archive\" -C \"$tmp\" --wildcards{strip} '{member}'
 install -m 0755 \"$tmp/{name}\" /usr/local/bin/{name}
@@ -583,8 +597,20 @@ rm -f \"$tmp/{name}.archive\" \"$tmp/{name}\"
         license = tool.license,
         source = tool.source,
         member = tool.member,
+        fatal = MEDIA_FETCH_FATAL,
     )
 }
+
+/// The media script's exit status for a refusal that asking again cannot
+/// change: no pinned build for this machine, or a hash that does not match.
+/// Every other failure is a network one, which is what the bootstrap retries.
+const MEDIA_FETCH_FATAL: u8 = 2;
+
+/// Attempts the bootstrap gives the media fetch, and the pause before each
+/// retry in seconds. One 503 from a mirror at boot used to cost the session
+/// its broadcast for the rest of its life.
+const MEDIA_FETCH_TRIES: u8 = 3;
+const MEDIA_FETCH_BACKOFF_SECS: u8 = 10;
 
 fn bootstrap_script(_cfg: &BootConfig) -> String {
     format!(
@@ -664,14 +690,12 @@ chmod 0755 /usr/local/bin/jamstreamd
 # tooling is only needed once the host goes live.
 systemctl enable --now jamstreamd.service
 
-# A session runs fine with no broadcast tooling, so a failed fetch warns
-# instead of taking a working VM down with it.
-if /usr/local/sbin/jamstream-media; then
-  systemctl enable --now mediamtx.service
-else
-  echo \"jamstream: broadcast tooling unavailable, session continues without it\" >&2
-fi
+# The broadcast tooling last, in its own script: it is the one part a session
+# can live without, and it always exits 0, so nothing in it can trip the trap
+# above and destroy a VM full of musicians over a download.
+{broadcast_up}
 ",
+        broadcast_up = BROADCAST_UP_SCRIPT,
         artifact_url_file = ARTIFACT_URL_FILE,
         artifact_sha_file = ARTIFACT_SHA_FILE,
         download = ARTIFACT_DOWNLOAD,
@@ -699,6 +723,65 @@ trap 'rm -rf \"$tmp\"' EXIT
 {ffmpeg}{mediamtx}",
         ffmpeg = fetch_media_tool("ffmpeg", &media.ffmpeg),
         mediamtx = fetch_media_tool("mediamtx", &media.mediamtx),
+    )
+}
+
+/// Where the bootstrap calls the broadcast bring-up from.
+const BROADCAST_UP_SCRIPT: &str = "/usr/local/sbin/jamstream-broadcast-up";
+
+/// Fetches the broadcast tooling and starts the relay, and records why not
+/// when either fails.
+///
+/// Its own script for two reasons. It always exits 0, so nothing in it can
+/// trip the bootstrap's fail-closed trap: losing a broadcast is survivable and
+/// destroying a VM full of musicians over a download is not. And with its paths
+/// as parameters a test can run the real thing against a scratch directory,
+/// which is what the retry ladder needed: a shell loop nobody has run is where
+/// an off-by-one lives.
+fn broadcast_up_script(media: &str, note: &str, backoff_secs: u8) -> String {
+    format!(
+        "#!/bin/sh
+# Fetch the pinned broadcast tooling and start the relay. A session runs fine
+# without either, so nothing here is fatal. What it must not be is silent: a
+# warning into the console log is not somewhere a host can look. So every way
+# out of here that ends without a relay leaves the reason in the note file
+# below, which jamstreamd reads and reports to the host (#440).
+set -u
+media_ok=no
+attempt=1
+while :; do
+  if {media}; then
+    media_ok=yes
+    break
+  else
+    rc=$?
+  fi
+  # {fatal} is the fetch's own refusal: no pinned build for this machine, or a
+  # hash that does not match. Neither becomes true by asking again.
+  if [ \"$rc\" -eq {fatal} ] || [ \"$attempt\" -ge {tries} ]; then
+    break
+  fi
+  pause=$((attempt * {backoff_secs}))
+  echo \"jamstream: broadcast tooling fetch failed with status $rc, retrying in ${{pause}}s\" >&2
+  sleep \"$pause\"
+  attempt=$((attempt + 1))
+done
+if [ \"$media_ok\" = no ]; then
+  echo \"jamstream: broadcast tooling unavailable, session continues without it\" >&2
+  printf '%s\\n' 'the broadcast tooling could not be downloaded' > {note}
+  exit 0
+fi
+# systemd calls a Type=simple unit started the moment it forks, so a start that
+# succeeds here says nothing about a relay that dies a second later. What
+# answers that is jamstreamd's probe of the relay, for the whole session.
+if ! systemctl enable --now mediamtx.service; then
+  echo \"jamstream: the broadcast relay would not start, session continues without it\" >&2
+  printf '%s\\n' 'the broadcast relay would not start on this session machine' > {note}
+fi
+exit 0
+",
+        fatal = MEDIA_FETCH_FATAL,
+        tries = MEDIA_FETCH_TRIES,
     )
 }
 
@@ -803,13 +886,25 @@ Description=JamStream broadcast relay (MediaMTX)
 After=network-online.target jamstream-firewall.service
 Wants=network-online.target
 Requires=jamstream-firewall.service
+# No start rate limit. The default is five attempts in ten seconds, and this
+# unit is one that can fail fast: restarting two seconds apart, a relay that
+# dies on its own configuration burned the whole budget inside the first minute
+# of boot and then stayed dead for a session that runs for hours (#441). A
+# relay that keeps retrying costs one process spawn every five seconds; one
+# that has given up costs the band their broadcast.
+StartLimitIntervalSec=0
 
 [Service]
 User={user}
 Group={user}
 ExecStart=/usr/local/bin/mediamtx /etc/jamstream/mediamtx.yml
-Restart=on-failure
-RestartSec=2
+# always, not on-failure: mediamtx has no reason to exit 0 while a session is
+# running, so a clean exit is as much a fault as a crash. Type= stays simple
+# because mediamtx does not notify readiness, and a notify unit that never
+# notifies would fail its start job on a timeout. What answers the readiness
+# question is jamstreamd's probe of 127.0.0.1:1935, not systemd's opinion.
+Restart=always
+RestartSec=5
 MemoryMax=256M
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 {hardening}
@@ -893,6 +988,15 @@ pub fn render(cfg: &BootConfig) -> String {
             firewall_script(cfg),
         ),
         ("/usr/local/sbin/jamstream-media", "0700", media_script()),
+        (
+            BROADCAST_UP_SCRIPT,
+            "0700",
+            broadcast_up_script(
+                "/usr/local/sbin/jamstream-media",
+                BROADCAST_NOTE_FILE,
+                MEDIA_FETCH_BACKOFF_SECS,
+            ),
+        ),
         (
             "/usr/local/sbin/jamstream-bootstrap",
             "0700",
@@ -1090,7 +1194,16 @@ mod tests {
         assert_eq!(UPLOAD_MARKER_DIR, format!("{RUN_DIR}/uploads"));
         // The unit grants write access to RUN_DIR alone, so anything outside
         // it is a path the hardened service cannot create.
-        for path in [ACTIVITY_FILE, STREAM_KEY_DIR, UPLOAD_MARKER_DIR] {
+        assert_eq!(
+            BROADCAST_NOTE_FILE,
+            format!("{RUN_DIR}/broadcast-unavailable")
+        );
+        for path in [
+            ACTIVITY_FILE,
+            STREAM_KEY_DIR,
+            UPLOAD_MARKER_DIR,
+            BROADCAST_NOTE_FILE,
+        ] {
             assert!(path.starts_with(RUN_DIR), "{path} escapes {RUN_DIR}");
         }
         assert!(RECORDING_CONFIG_PATH.starts_with("/etc/jamstream/"));
@@ -1185,13 +1298,7 @@ mod tests {
         assert_eq!(out.matches("AKIDRECORD").count(), 1);
         // No script interpolates it: every script body is checked, not just
         // the ones that exist today.
-        for script in [
-            self_destruct_script(&cfg),
-            guard_script(&cfg),
-            firewall_script(&cfg),
-            media_script(),
-            bootstrap_script(&cfg),
-        ] {
+        for (_, script) in rendered_scripts(&cfg) {
             assert!(!script.contains("AKIDRECORD") && !script.contains(&secret_b64));
         }
         // The bootstrap locks the file down exactly like the server config.
@@ -1316,6 +1423,26 @@ mod tests {
         ]
     }
 
+    /// Every shell script cloud-init writes, named. One list, so a test that
+    /// has to hold for all of them cannot silently stop covering a new one.
+    fn rendered_scripts(cfg: &BootConfig) -> Vec<(&'static str, String)> {
+        vec![
+            ("self-destruct", self_destruct_script(cfg)),
+            ("guard", guard_script(cfg)),
+            ("firewall", firewall_script(cfg)),
+            ("media", media_script()),
+            (
+                "broadcast-up",
+                broadcast_up_script(
+                    "/usr/local/sbin/jamstream-media",
+                    BROADCAST_NOTE_FILE,
+                    MEDIA_FETCH_BACKOFF_SECS,
+                ),
+            ),
+            ("bootstrap", bootstrap_script(cfg)),
+        ]
+    }
+
     /// Byte offset of `needle`, or a panic naming what was missing.
     fn at(out: &str, needle: &str) -> usize {
         out.find(needle)
@@ -1372,7 +1499,7 @@ mod tests {
             let firewall = at(&script, "systemctl enable --now jamstream-firewall.service");
             let guard = at(&script, "systemctl enable --now jamstream-guard.timer");
             let download = at(&script, "-o /usr/local/bin/jamstreamd.download");
-            let media = at(&script, "/usr/local/sbin/jamstream-media");
+            let media = at(&script, BROADCAST_UP_SCRIPT);
 
             assert!(trap < firewall, "the trap must cover the firewall step too");
             assert!(
@@ -1716,14 +1843,7 @@ mod tests {
 
         for sd in all_variants() {
             let cfg = base_config(sd);
-            let scripts = [
-                ("self-destruct", self_destruct_script(&cfg)),
-                ("guard", guard_script(&cfg)),
-                ("firewall", firewall_script(&cfg)),
-                ("media", media_script()),
-                ("bootstrap", bootstrap_script(&cfg)),
-            ];
-            for (name, script) in scripts {
+            for (name, script) in rendered_scripts(&cfg) {
                 let mut child = Command::new("sh")
                     .arg("-n")
                     .stdin(Stdio::piped())
@@ -1784,14 +1904,6 @@ mod tests {
         assert!(out.contains("    source: publisher"));
         assert!(out.contains("api: false"));
         assert!(out.contains("systemctl enable --now mediamtx.service"));
-        // The session server is up before the broadcast tooling downloads.
-        let script = bootstrap_script(&base_config(SelfDestruct::AwsShutdown));
-        let jamstreamd = at(&script, "enable --now jamstreamd.service");
-        let ffmpeg = at(&script, "/usr/local/sbin/jamstream-media");
-        assert!(
-            jamstreamd < ffmpeg,
-            "the session waits on a 100 MB download"
-        );
 
         // Key staging is tmpfs readable only by the service account, and
         // other processes' argv is hidden.
@@ -1806,6 +1918,220 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// #440: the fetch is allowed to fail, and every way it can end without a
+    /// relay has to leave the reason where jamstreamd can read it, because the
+    /// console log it used to warn into is not somewhere a host can look.
+    #[test]
+    fn a_session_that_cannot_broadcast_leaves_the_reason_for_the_server() {
+        let script = broadcast_up_script(
+            "/usr/local/sbin/jamstream-media",
+            BROADCAST_NOTE_FILE,
+            MEDIA_FETCH_BACKOFF_SECS,
+        );
+        // One retry ladder, three attempts, widening pause.
+        assert!(script.contains("[ \"$attempt\" -ge 3 ]"));
+        assert!(script.contains("pause=$((attempt * 10))"));
+        assert!(script.contains("sleep \"$pause\""));
+        // A refusal that cannot change is not retried.
+        assert!(script.contains("[ \"$rc\" -eq 2 ]"));
+        assert_eq!(
+            media_script().matches("exit 2").count(),
+            4,
+            "each tool refuses an unknown machine and a bad hash with the \
+             status the bring-up does not retry"
+        );
+        // Both failing paths write the note, and only those two.
+        assert_eq!(
+            script.matches(&format!("> {BROADCAST_NOTE_FILE}")).count(),
+            2
+        );
+        assert!(script.contains("the broadcast tooling could not be downloaded"));
+        assert!(script.contains("the broadcast relay would not start on this session machine"));
+        // The relay's start sits in a condition and the script ends in exit 0,
+        // so nothing in it can reach the bootstrap's fail-closed trap, which
+        // destroys the machine: a broadcast that cannot start must never end a
+        // session that can play.
+        assert!(script.contains("if ! systemctl enable --now mediamtx.service; then"));
+        assert!(script.trim_end().ends_with("exit 0"));
+
+        for sd in all_variants() {
+            let out = render(&base_config(sd.clone()));
+            assert!(out.contains(&format!("path: {BROADCAST_UP_SCRIPT}")));
+            // The bootstrap calls it, and only after the session server is up:
+            // musicians are waiting and a broadcast is not.
+            let bootstrap = bootstrap_script(&base_config(sd));
+            assert!(
+                at(&bootstrap, "enable --now jamstreamd.service")
+                    < at(&bootstrap, BROADCAST_UP_SCRIPT)
+            );
+        }
+    }
+
+    /// Runs the real bring-up against a scratch directory with a stub fetch and
+    /// a stub systemctl. Without this the retry ladder is text: a shell loop
+    /// nobody has run is where an off-by-one lives, and the failure that cost a
+    /// session its broadcast was a single transient one at boot.
+    #[cfg(unix)]
+    mod broadcast_up_behavior {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use std::process::Command;
+
+        /// What one run did: the note it left, how many times the fetch ran,
+        /// and what systemctl was asked to do.
+        struct Outcome {
+            note: Option<String>,
+            fetch_attempts: usize,
+            systemctl: Vec<String>,
+        }
+
+        fn write_exec(path: &Path, body: &str) {
+            fs::write(path, body).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// One bring-up whose fetch exits with each status in `statuses` in
+        /// turn, repeating the last, and whose systemctl exits `systemctl_rc`.
+        fn run(name: &str, statuses: &[i32], systemctl_rc: i32) -> Outcome {
+            let dir = std::env::temp_dir()
+                .join(format!("jamstream-bringup-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let bin = dir.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            let d = dir.display();
+
+            let media = dir.join("jamstream-media");
+            let statuses: Vec<String> = statuses.iter().map(i32::to_string).collect();
+            write_exec(
+                &media,
+                &format!(
+                    "#!/bin/sh\n\
+                     printf 'x\\n' >> {d}/attempts\n\
+                     n=$(wc -l < {d}/attempts)\n\
+                     set -- {list}\n\
+                     while [ $# -gt 1 ] && [ \"$n\" -gt 1 ]; do shift; n=$((n - 1)); done\n\
+                     exit \"$1\"\n",
+                    list = statuses.join(" "),
+                ),
+            );
+            write_exec(
+                &bin.join("systemctl"),
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {d}/systemctl\nexit {systemctl_rc}\n"
+                ),
+            );
+
+            let note = dir.join("broadcast-unavailable");
+            let script = dir.join("broadcast-up");
+            // Zero backoff: the ladder's arithmetic is asserted against the
+            // rendered script, and no test may spend half a minute asleep.
+            fs::write(
+                &script,
+                broadcast_up_script(&media.display().to_string(), &note.display().to_string(), 0),
+            )
+            .unwrap();
+
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let status = Command::new("sh")
+                .arg(&script)
+                .env("PATH", path)
+                .status()
+                .expect("run the bring-up under sh");
+            // Always zero: a failure in here must never reach the bootstrap's
+            // trap, because that trap destroys the machine.
+            assert!(status.success(), "the bring-up exited {status}");
+            Outcome {
+                note: fs::read_to_string(&note).ok().map(|s| s.trim().to_owned()),
+                fetch_attempts: fs::read_to_string(dir.join("attempts"))
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0),
+                systemctl: fs::read_to_string(dir.join("systemctl"))
+                    .map(|s| s.lines().map(str::to_owned).collect())
+                    .unwrap_or_default(),
+            }
+        }
+
+        #[test]
+        fn a_healthy_fetch_starts_the_relay_and_leaves_no_note() {
+            let out = run("ok", &[0], 0);
+            assert_eq!(out.fetch_attempts, 1);
+            assert_eq!(out.systemctl, vec!["enable --now mediamtx.service"]);
+            assert_eq!(out.note, None, "a working relay must not claim otherwise");
+        }
+
+        /// The case from #440: one transient failure at boot cost the session
+        /// its broadcast permanently.
+        #[test]
+        fn a_transient_failure_is_retried_and_costs_the_session_nothing() {
+            let out = run("transient", &[1, 0], 0);
+            assert_eq!(out.fetch_attempts, 2);
+            assert_eq!(out.systemctl, vec!["enable --now mediamtx.service"]);
+            assert_eq!(out.note, None);
+        }
+
+        #[test]
+        fn a_fetch_that_keeps_failing_gives_up_and_says_why() {
+            let out = run("gaveup", &[1], 0);
+            assert_eq!(out.fetch_attempts, 3, "three attempts, then the note");
+            assert!(out.systemctl.is_empty(), "nothing to start");
+            assert_eq!(
+                out.note.as_deref(),
+                Some("the broadcast tooling could not be downloaded")
+            );
+        }
+
+        /// A hash that does not match, or no pinned build for this machine.
+        /// Asking again spends two more downloads on the same answer.
+        #[test]
+        fn a_refusal_that_cannot_change_is_not_retried() {
+            let out = run("fatal", &[i32::from(MEDIA_FETCH_FATAL)], 0);
+            assert_eq!(out.fetch_attempts, 1);
+            assert_eq!(
+                out.note.as_deref(),
+                Some("the broadcast tooling could not be downloaded")
+            );
+        }
+
+        /// The other way this ends without a relay, and the one whose status
+        /// the bootstrap's `set -e` used to turn into a destroyed VM.
+        #[test]
+        fn a_relay_that_will_not_start_is_recorded_rather_than_fatal() {
+            let out = run("nostart", &[0], 1);
+            assert_eq!(out.systemctl, vec!["enable --now mediamtx.service"]);
+            assert_eq!(
+                out.note.as_deref(),
+                Some("the broadcast relay would not start on this session machine")
+            );
+        }
+    }
+
+    /// The relay is the one unit that may not end the session by giving up on
+    /// itself: sessions run for hours and the default start limit is five
+    /// attempts in ten seconds.
+    #[test]
+    fn the_relay_keeps_retrying_for_the_whole_session() {
+        let out = render(&base_config(SelfDestruct::AwsShutdown));
+        let unit = mediamtx_unit();
+        assert!(unit.contains("StartLimitIntervalSec=0"));
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("RestartSec=5"));
+        assert!(!unit.contains("Restart=on-failure"));
+        // The start limit is a [Unit] setting; in [Service] systemd ignores it.
+        let (unit_section, service) = unit.split_once("[Service]").expect("two sections");
+        assert!(unit_section.contains("StartLimitIntervalSec=0"));
+        assert!(!service.contains("StartLimitIntervalSec"));
+        assert!(out.contains("StartLimitIntervalSec=0"));
+        // The session server's own restart policy is untouched: it is not the
+        // unit that was dying, and it exits on purpose when a session ends.
+        assert!(jamstreamd_unit(&base_config(SelfDestruct::AwsShutdown)).contains("on-failure"));
     }
 
     #[test]

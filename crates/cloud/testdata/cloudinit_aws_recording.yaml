@@ -139,12 +139,12 @@ write_files:
       case "$(uname -m)" in
         aarch64|arm64) url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-26-13-28/ffmpeg-n7.1.5-10-g2aefd64d48-linuxarm64-gpl-7.1.tar.xz"; sha="b803fab318029e530ecd4859013ffbd743a549d0ee4e1bced5e5c3be59bf11e3" ;;
         x86_64) url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-26-13-28/ffmpeg-n7.1.5-10-g2aefd64d48-linux64-gpl-7.1.tar.xz"; sha="92f7ca590bb4cc17e596c4a9747e3c85d7456fde7bf6e297c48640b471be8f74" ;;
-        *) echo "jamstream: no pinned ffmpeg for $(uname -m)" >&2; exit 1 ;;
+        *) echo "jamstream: no pinned ffmpeg for $(uname -m)" >&2; exit 2 ;;
       esac
       curl -fsSL --retry 5 -o "$tmp/ffmpeg.archive" "$url"
       if ! echo "$sha  $tmp/ffmpeg.archive" | sha256sum -c -; then
         echo "jamstream: ffmpeg sha256 mismatch, refusing to start" >&2
-        exit 1
+        exit 2
       fi
       tar -xJf "$tmp/ffmpeg.archive" -C "$tmp" --wildcards --strip-components=2 '*/bin/ffmpeg'
       install -m 0755 "$tmp/ffmpeg" /usr/local/bin/ffmpeg
@@ -154,16 +154,59 @@ write_files:
       case "$(uname -m)" in
         aarch64|arm64) url="https://github.com/bluenviron/mediamtx/releases/download/v1.19.3/mediamtx_v1.19.3_linux_arm64.tar.gz"; sha="9e5b38a5b5fcab1916341b024031b2fc5dc6a2059baed9ba3f3b0d3768d231a8" ;;
         x86_64) url="https://github.com/bluenviron/mediamtx/releases/download/v1.19.3/mediamtx_v1.19.3_linux_amd64.tar.gz"; sha="a7ba21268fccda3ebc43fdad76b87fddb85ce77e725b5cb637bca724b5394fbe" ;;
-        *) echo "jamstream: no pinned mediamtx for $(uname -m)" >&2; exit 1 ;;
+        *) echo "jamstream: no pinned mediamtx for $(uname -m)" >&2; exit 2 ;;
       esac
       curl -fsSL --retry 5 -o "$tmp/mediamtx.archive" "$url"
       if ! echo "$sha  $tmp/mediamtx.archive" | sha256sum -c -; then
         echo "jamstream: mediamtx sha256 mismatch, refusing to start" >&2
-        exit 1
+        exit 2
       fi
       tar -xzf "$tmp/mediamtx.archive" -C "$tmp" --wildcards 'mediamtx'
       install -m 0755 "$tmp/mediamtx" /usr/local/bin/mediamtx
       rm -f "$tmp/mediamtx.archive" "$tmp/mediamtx"
+  - path: /usr/local/sbin/jamstream-broadcast-up
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/sh
+      # Fetch the pinned broadcast tooling and start the relay. A session runs fine
+      # without either, so nothing here is fatal. What it must not be is silent: a
+      # warning into the console log is not somewhere a host can look. So every way
+      # out of here that ends without a relay leaves the reason in the note file
+      # below, which jamstreamd reads and reports to the host (#440).
+      set -u
+      media_ok=no
+      attempt=1
+      while :; do
+        if /usr/local/sbin/jamstream-media; then
+          media_ok=yes
+          break
+        else
+          rc=$?
+        fi
+        # 2 is the fetch's own refusal: no pinned build for this machine, or a
+        # hash that does not match. Neither becomes true by asking again.
+        if [ "$rc" -eq 2 ] || [ "$attempt" -ge 3 ]; then
+          break
+        fi
+        pause=$((attempt * 10))
+        echo "jamstream: broadcast tooling fetch failed with status $rc, retrying in ${pause}s" >&2
+        sleep "$pause"
+        attempt=$((attempt + 1))
+      done
+      if [ "$media_ok" = no ]; then
+        echo "jamstream: broadcast tooling unavailable, session continues without it" >&2
+        printf '%s\n' 'the broadcast tooling could not be downloaded' > /run/jamstream/broadcast-unavailable
+        exit 0
+      fi
+      # systemd calls a Type=simple unit started the moment it forks, so a start that
+      # succeeds here says nothing about a relay that dies a second later. What
+      # answers that is jamstreamd's probe of the relay, for the whole session.
+      if ! systemctl enable --now mediamtx.service; then
+        echo "jamstream: the broadcast relay would not start, session continues without it" >&2
+        printf '%s\n' 'the broadcast relay would not start on this session machine' > /run/jamstream/broadcast-unavailable
+      fi
+      exit 0
   - path: /usr/local/sbin/jamstream-bootstrap
     owner: root:root
     permissions: "0700"
@@ -244,13 +287,10 @@ write_files:
       # tooling is only needed once the host goes live.
       systemctl enable --now jamstreamd.service
 
-      # A session runs fine with no broadcast tooling, so a failed fetch warns
-      # instead of taking a working VM down with it.
-      if /usr/local/sbin/jamstream-media; then
-        systemctl enable --now mediamtx.service
-      else
-        echo "jamstream: broadcast tooling unavailable, session continues without it" >&2
-      fi
+      # The broadcast tooling last, in its own script: it is the one part a session
+      # can live without, and it always exits 0, so nothing in it can trip the trap
+      # above and destroy a VM full of musicians over a download.
+      /usr/local/sbin/jamstream-broadcast-up
   - path: /etc/systemd/system/jamstreamd.service
     owner: root:root
     permissions: "0644"
@@ -387,13 +427,25 @@ write_files:
       After=network-online.target jamstream-firewall.service
       Wants=network-online.target
       Requires=jamstream-firewall.service
+      # No start rate limit. The default is five attempts in ten seconds, and this
+      # unit is one that can fail fast: restarting two seconds apart, a relay that
+      # dies on its own configuration burned the whole budget inside the first minute
+      # of boot and then stayed dead for a session that runs for hours (#441). A
+      # relay that keeps retrying costs one process spawn every five seconds; one
+      # that has given up costs the band their broadcast.
+      StartLimitIntervalSec=0
 
       [Service]
       User=jamstream
       Group=jamstream
       ExecStart=/usr/local/bin/mediamtx /etc/jamstream/mediamtx.yml
-      Restart=on-failure
-      RestartSec=2
+      # always, not on-failure: mediamtx has no reason to exit 0 while a session is
+      # running, so a clean exit is as much a fault as a crash. Type= stays simple
+      # because mediamtx does not notify readiness, and a notify unit that never
+      # notifies would fail its start job on a timeout. What answers the readiness
+      # question is jamstreamd's probe of 127.0.0.1:1935, not systemd's opinion.
+      Restart=always
+      RestartSec=5
       MemoryMax=256M
       RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
       NoNewPrivileges=yes
