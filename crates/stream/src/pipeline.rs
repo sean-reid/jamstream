@@ -6,9 +6,14 @@
 //! exercised deterministically against [`crate::proc::fake::FakeProcessHost`];
 //! [`crate::worker::StreamWorker`] is the thing that owns a thread and a
 //! clock.
+//!
+//! A pusher's progress file is the third input. What a destination reports is
+//! read out of what its ffmpeg says about itself rather than inferred from the
+//! process still being there, so a test writes the block a real one writes.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use jamstream_broadcast::{AvatarImage, MemberVisual, Renderer, Role as VisualRole, SceneConfig};
 use jamstream_protocol::control::{
@@ -31,12 +36,42 @@ pub use jamstream_broadcast::MAX_CARDS;
 /// would let the pipeline build a status no peer would accept.
 pub use jamstream_protocol::control::MAX_DESTINATIONS;
 
-/// A process alive this long has proven itself: state goes Live and the
-/// backoff resets, so a stream that fails after two hours restarts promptly
-/// instead of inheriting an old penalty.
+/// An encode alive this long has proven itself and its backoff resets, so one
+/// that fails after two hours restarts promptly instead of inheriting an old
+/// penalty. Survival is the whole of what there is to go on here: the encoder
+/// is fed by us, and a broken feed is reported by the write that failed.
+///
+/// Deliberately not what promotes a destination. See [`Pipeline::read_report`].
 const HEALTHY_MS: u64 = 3_000;
 const BACKOFF_BASE_MS: u64 = 500;
 const BACKOFF_MAX_MS: u64 = 16_000;
+
+/// How often a pusher's ffmpeg reports on itself, in the seconds
+/// `-stats_period` takes.
+///
+/// The first report is what makes a destination Live, and ffmpeg waits out one
+/// period before writing it, so this is what a working push spends waiting to
+/// be called one. Every report after that one is read by nothing and costs the
+/// session VM's tmpfs, which is what [`PROGRESS_TRIM_MS`] is for.
+const PROGRESS_PERIOD_SECS: &str = "1";
+
+/// The line that closes one of ffmpeg's progress blocks while it is still
+/// running. `progress=end` closes the report it writes on the way out, which is
+/// no evidence of anything.
+const PROGRESS_RUNNING: &str = "progress=continue";
+
+/// How often a connecting pusher's progress file is looked at. Off the mix
+/// tick, so it is a throttle rather than a syscall every 2.5 ms.
+const PROGRESS_PROBE_MS: u64 = 200;
+
+/// How often a live pusher's progress file is emptied. ffmpeg keeps its own
+/// offset and writes on past the hole, which bounds what a twelve-hour session
+/// of reports nobody reads costs the VM.
+const PROGRESS_TRIM_MS: u64 = 60_000;
+
+/// Most of a progress file that is ever read. A block is a couple of hundred
+/// bytes and the first one settles the question.
+const PROGRESS_HEAD_BYTES: u64 = 4_096;
 
 /// ffmpeg's floor for `-probesize`, and all either raw input needs: both are
 /// fully described in argv, so there is nothing to detect. See
@@ -219,7 +254,9 @@ struct Destination {
     backoff: Backoff,
     /// When a restart may be attempted; None means "as soon as possible".
     retry_at_ms: Option<u64>,
-    spawned_ms: u64,
+    /// When to read this pusher's progress file next: a throttle while it is
+    /// connecting, a trim once it is live.
+    progress_at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -343,7 +380,7 @@ impl<H: ProcessHost> Pipeline<H> {
                             state: DestinationState::Idle,
                             backoff: Backoff::default(),
                             retry_at_ms: None,
-                            spawned_ms: 0,
+                            progress_at_ms: 0,
                         });
                         self.events.push(PipelineEvent::DestinationChanged {
                             id,
@@ -470,13 +507,7 @@ impl<H: ProcessHost> Pipeline<H> {
         if let Some(proc) = self.dests[idx].proc {
             match self.host.poll(proc) {
                 Exit::Running => {
-                    let d = &self.dests[idx];
-                    if d.state == DestinationState::Connecting
-                        && now_ms.saturating_sub(d.spawned_ms) >= HEALTHY_MS
-                    {
-                        self.dests[idx].backoff.reset();
-                        self.set_state(idx, DestinationState::Live);
-                    }
+                    self.read_report(idx, now_ms);
                     return;
                 }
                 Exit::Exited { reason } => {
@@ -526,6 +557,43 @@ impl<H: ProcessHost> Pipeline<H> {
         self.spawn_pusher(idx, now_ms);
     }
 
+    /// Reads what a running pusher has said about itself.
+    ///
+    /// A destination stays Connecting until its ffmpeg has written a whole
+    /// progress block, because that block is the first thing ffmpeg writes once
+    /// its output is open, and a pusher's output is the platform: the handshake
+    /// went through and the broadcast has bytes in it.
+    ///
+    /// Surviving a timer cannot stand in for that, and the length of the timer
+    /// is not the reason. A pusher is two execs and an ffmpeg startup ahead of
+    /// its connect, so on a machine busy with an encode it can outlive any
+    /// window worth waiting and still be short of the refusal it is heading
+    /// for. What that bought was Live with nothing behind it, for as long as it
+    /// took to die, and Live is the one word a host reads as "it is working"
+    /// (#445).
+    fn read_report(&mut self, idx: usize, now_ms: u64) {
+        if now_ms < self.dests[idx].progress_at_ms {
+            return;
+        }
+        let path = progress_path(&self.cfg.work_dir, self.dests[idx].id);
+        match self.dests[idx].state {
+            DestinationState::Connecting => {
+                if pushed(&path) {
+                    self.dests[idx].backoff.reset();
+                    self.set_state(idx, DestinationState::Live);
+                    self.dests[idx].progress_at_ms = now_ms + PROGRESS_TRIM_MS;
+                } else {
+                    self.dests[idx].progress_at_ms = now_ms + PROGRESS_PROBE_MS;
+                }
+            }
+            DestinationState::Live => {
+                trim_progress(&path);
+                self.dests[idx].progress_at_ms = now_ms + PROGRESS_TRIM_MS;
+            }
+            _ => {}
+        }
+    }
+
     fn spawn_pusher(&mut self, idx: usize, now_ms: u64) {
         let (id, platform) = (self.dests[idx].id, self.dests[idx].platform);
         let Some(spec) = self.catalog.get(platform) else {
@@ -537,6 +605,20 @@ impl<H: ProcessHost> Pipeline<H> {
             );
             return;
         };
+        // Before the key is staged, so a failure here cannot leave one behind.
+        // ffmpeg will not start at all if it cannot open its progress file, and
+        // a block the last attempt left would be read as this one's report.
+        if let Err(err) = clear_progress(&self.cfg.work_dir, id) {
+            let delay = self.dests[idx].backoff.fail();
+            self.dests[idx].retry_at_ms = Some(now_ms + delay);
+            self.set_state(
+                idx,
+                DestinationState::Failed {
+                    reason: format!("cannot clear progress file: {err}"),
+                },
+            );
+            return;
+        }
         // The URL with the key in it exists as a String here, is written to a
         // 0600 file, and is dropped. The host opens and unlinks that file
         // before the child runs.
@@ -563,7 +645,7 @@ impl<H: ProcessHost> Pipeline<H> {
         match self.host.spawn(&proc_spec) {
             Ok(proc) => {
                 self.dests[idx].proc = Some(proc);
-                self.dests[idx].spawned_ms = now_ms;
+                self.dests[idx].progress_at_ms = now_ms;
                 self.dests[idx].retry_at_ms = None;
                 self.set_state(idx, DestinationState::Connecting);
             }
@@ -586,6 +668,7 @@ impl<H: ProcessHost> Pipeline<H> {
         if let Some(proc) = self.dests[idx].proc.take() {
             self.host.kill(proc);
         }
+        let _ = clear_progress(&self.cfg.work_dir, self.dests[idx].id);
     }
 
     /// Records a destination's state and, on a change, emits it.
@@ -915,6 +998,11 @@ impl<H: ProcessHost> Pipeline<H> {
     /// Argv for one pusher. The ingest URL, key included, arrives on stdin
     /// from the staged 0600 file and is never one of our arguments; the
     /// launcher reads one line and execs ffmpeg with it.
+    ///
+    /// `-progress` is the destination's state. ffmpeg writes counters there and
+    /// nothing else, so it is safe to leave in a directory the session can
+    /// read, and it says the one thing no other channel does: the output is
+    /// open. See [`Pipeline::read_report`].
     fn pusher_spec(
         &self,
         id: DestinationId,
@@ -924,8 +1012,11 @@ impl<H: ProcessHost> Pipeline<H> {
         let script = format!(
             "IFS= read -r JS_INGEST || exit 64\n\
              exec {ffmpeg} -nostdin -hide_banner -loglevel error -nostats \
+             -stats_period {period} -progress {progress} \
              -i {input} -c copy -f flv \"$JS_INGEST\"\n",
             ffmpeg = shell_quote(&self.cfg.ffmpeg.to_string_lossy()),
+            period = PROGRESS_PERIOD_SECS,
+            progress = shell_quote(&progress_path(&self.cfg.work_dir, id).to_string_lossy()),
             input = shell_quote(&self.cfg.pusher_input),
         );
         ProcSpec {
@@ -959,11 +1050,67 @@ impl<H: ProcessHost> Drop for Pipeline<H> {
                 self.host.kill(proc);
             }
             self.keys.discard(d.id);
+            let _ = clear_progress(&self.cfg.work_dir, d.id);
         }
         if let Some(enc) = self.encoder.take() {
             self.host.kill(enc.proc);
         }
     }
+}
+
+/// Where one pusher's ffmpeg reports on itself. Nothing secret is in it: a
+/// progress block is counters, and the name is a destination id.
+fn progress_path(work_dir: &Path, id: DestinationId) -> PathBuf {
+    work_dir.join(format!("pusher-{}.progress", id.0))
+}
+
+/// Makes the directory a pusher's report goes in and removes what any earlier
+/// attempt left there.
+///
+/// ffmpeg truncates the file when it opens it, but only if it gets that far: a
+/// launcher that never execs, or an exec that fails, leaves the last attempt's
+/// block behind, and the next attempt would read it as its own.
+fn clear_progress(work_dir: &Path, id: DestinationId) -> std::io::Result<()> {
+    std::fs::create_dir_all(work_dir)?;
+    match std::fs::remove_file(progress_path(work_dir, id)) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// True once a pusher's ffmpeg has written a whole progress block.
+///
+/// A pusher that never reached its output writes nothing at all: the file is
+/// created when ffmpeg parses its arguments and stays empty, whether the
+/// refusal came from the relay it reads or the platform it writes to.
+fn pushed(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::new();
+    if file
+        .take(PROGRESS_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    String::from_utf8_lossy(&head)
+        .lines()
+        .any(|line| line.trim_end() == PROGRESS_RUNNING)
+}
+
+/// Empties a live pusher's progress file.
+///
+/// The first block was the whole signal and nothing reads the rest, but ffmpeg
+/// writes one a second for as long as it runs, which over a long session is
+/// megabytes of the VM's tmpfs. It keeps its own offset, so what this leaves
+/// behind is a hole rather than an interrupted child.
+fn trim_progress(path: &Path) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_len(0));
 }
 
 /// FLV for RTMP (what MediaMTX and every platform ingest speaks); anything
@@ -983,6 +1130,23 @@ fn output_format(target: &str) -> &'static str {
 /// involved at all, so it quotes anyway.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// One of ffmpeg's progress blocks, byte for byte as a pusher writes it.
+///
+/// Captured from a real `ffmpeg -progress` run rather than written from the
+/// parser, which would only prove the parser agrees with itself.
+/// `tests/going_live.rs` hands the same fixture to a real child through the
+/// pipeline's own argv, and `tests/relay_chain.rs` promotes a destination on
+/// the block a real ffmpeg writes to a real platform stand-in.
+#[cfg(test)]
+pub(crate) const PROGRESS_BLOCK: &str = include_str!("../testdata/pusher.progress");
+
+/// Writes what a pusher's ffmpeg writes once its output is open.
+#[cfg(test)]
+pub(crate) fn report_push(work_dir: &Path, id: DestinationId) {
+    std::fs::create_dir_all(work_dir).expect("work dir");
+    std::fs::write(progress_path(work_dir, id), PROGRESS_BLOCK).expect("a progress block");
 }
 
 #[cfg(test)]
@@ -1024,6 +1188,16 @@ mod tests {
             .state
     }
 
+    /// The fake host runs no ffmpeg, so a test that wants a destination live
+    /// writes the report a real pusher would have written.
+    fn reports_push(p: &Pipeline<FakeProcessHost>, id: u16) {
+        report_push(&p.cfg.work_dir, DestinationId(id));
+    }
+
+    fn progress_of(p: &Pipeline<FakeProcessHost>, id: u16) -> PathBuf {
+        progress_path(&p.cfg.work_dir, DestinationId(id))
+    }
+
     #[test]
     fn backoff_schedule_is_capped_exponential() {
         let mut b = Backoff::default();
@@ -1058,12 +1232,117 @@ mod tests {
             .collect();
         assert_eq!(labels, vec!["encoder", "pusher:twitch:1"]);
         assert_eq!(state(&p, 1), DestinationState::Connecting);
-        // Healthy after the settle window, and only then.
-        p.poll(HEALTHY_MS - 1);
-        assert_eq!(state(&p, 1), DestinationState::Connecting);
+        // Connecting for as long as it takes, however long the process lives:
+        // nothing has been pushed yet, so there is nothing to report.
         p.poll(HEALTHY_MS);
+        p.poll(HEALTHY_MS * 10);
+        assert_eq!(state(&p, 1), DestinationState::Connecting);
+        assert!(!p.on_air());
+        // Live on the pusher's own report, and on nothing else.
+        reports_push(&p, 1);
+        p.poll(HEALTHY_MS * 10 + PROGRESS_PROBE_MS);
         assert_eq!(state(&p, 1), DestinationState::Live);
         assert!(p.on_air());
+    }
+
+    /// Issue #445, deterministically: a pusher that outlives every window a
+    /// supervisor might have waited and only then reaches its refused connect
+    /// must never have been called Live. It is a race on a loaded machine, so
+    /// the process here never dies until the test says so, which is the same
+    /// case held still.
+    #[test]
+    fn a_pusher_that_pushed_nothing_is_never_live_however_long_it_survives() {
+        let mut p = pipeline("nothingpushed");
+        p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
+        p.apply(0, StreamOp::Start).unwrap();
+        let pusher = p.host().find_live("pusher").unwrap();
+
+        let mut seen = Vec::new();
+        for now in (0..30_000).step_by(250) {
+            p.poll(now);
+            seen.extend(p.events());
+            assert_eq!(
+                state(&p, 1),
+                DestinationState::Connecting,
+                "at {now} ms, with nothing pushed"
+            );
+            assert!(!p.on_air(), "on air at {now} ms with nothing pushed");
+        }
+        // What it was doing all along, arriving late.
+        p.host_mut().exit(
+            pusher,
+            "[flv @ 0x1] Failed to connect to rtmps://<redacted> Connection refused",
+        );
+        p.poll(30_000);
+        seen.extend(p.events());
+        match state(&p, 1) {
+            DestinationState::Failed { reason } => {
+                assert!(reason.contains("Failed to connect"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(
+            !seen.iter().any(|e| matches!(
+                e,
+                PipelineEvent::DestinationChanged {
+                    state: DestinationState::Live,
+                    ..
+                }
+            )),
+            "a destination that never pushed anything was reported Live: {seen:?}"
+        );
+    }
+
+    /// A report belongs to the pusher that wrote it. The one a dead pusher left
+    /// behind must not make its replacement live before it has connected.
+    #[test]
+    fn a_dead_pushers_report_does_not_carry_over_to_its_replacement() {
+        let mut p = pipeline("stalereport");
+        p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
+        p.apply(0, StreamOp::Start).unwrap();
+        let first = p.host().find_live("pusher").unwrap();
+        reports_push(&p, 1);
+        p.poll(1_000);
+        assert_eq!(state(&p, 1), DestinationState::Live);
+
+        p.host_mut().exit(first, "connection reset");
+        p.poll(1_100);
+        p.poll(1_600);
+        let second = p.host().find_live("pusher").unwrap();
+        assert_ne!(second, first);
+        assert!(
+            !progress_of(&p, 1).exists(),
+            "the last attempt's report outlived it"
+        );
+        for now in (1_600..12_000).step_by(250) {
+            p.poll(now);
+            assert_eq!(state(&p, 1), DestinationState::Connecting, "at {now} ms");
+        }
+        reports_push(&p, 1);
+        p.poll(12_000 + PROGRESS_PROBE_MS);
+        assert_eq!(state(&p, 1), DestinationState::Live);
+    }
+
+    /// Reports pile up for as long as a push runs and nothing reads one after
+    /// the first, so the file is emptied rather than left to grow through a
+    /// session. The destination is unaffected: it is already live, and ffmpeg
+    /// writes on from its own offset.
+    #[test]
+    fn a_live_destination_stops_collecting_reports_nobody_reads() {
+        let mut p = pipeline("trimreports");
+        p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
+        p.apply(0, StreamOp::Start).unwrap();
+        reports_push(&p, 1);
+        p.poll(1_000);
+        assert_eq!(state(&p, 1), DestinationState::Live);
+
+        let path = progress_of(&p, 1);
+        std::fs::write(&path, PROGRESS_BLOCK.repeat(500)).expect("an hour of reports");
+        p.poll(1_000 + PROGRESS_TRIM_MS - 1);
+        assert!(std::fs::metadata(&path).expect("still there").len() > 0);
+        p.poll(1_000 + PROGRESS_TRIM_MS);
+        assert_eq!(std::fs::metadata(&path).expect("still there").len(), 0);
+        assert_eq!(state(&p, 1), DestinationState::Live);
     }
 
     #[test]
@@ -1098,12 +1377,17 @@ mod tests {
         p.poll(3_000);
         assert!(p.host().find_live("pusher").is_some());
 
-        // Once it survives the settle window the penalty is forgotten.
-        p.poll(3_000 + HEALTHY_MS);
+        // Once it reports a push the penalty is forgotten. Survival does not
+        // reset the backoff either: a pusher that keeps dying before it
+        // connects keeps its place in the schedule.
+        p.poll(60_000);
+        assert_eq!(state(&p, 1), DestinationState::Connecting);
+        reports_push(&p, 1);
+        let t = 60_000 + PROGRESS_PROBE_MS;
+        p.poll(t);
         assert_eq!(state(&p, 1), DestinationState::Live);
         let third = p.host().find_live("pusher").unwrap();
         p.host_mut().exit(third, "gone again");
-        let t = 3_000 + HEALTHY_MS;
         p.poll(t);
         p.poll(t + 500);
         assert!(p.host().find_live("pusher").is_some(), "backoff reset");
@@ -1115,6 +1399,8 @@ mod tests {
         p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
         p.apply(0, add(2, StreamPlatform::YouTube, "yt")).unwrap();
         p.apply(0, StreamOp::Start).unwrap();
+        reports_push(&p, 1);
+        reports_push(&p, 2);
         p.poll(HEALTHY_MS);
         let twitch = p.host().find_live("twitch").unwrap();
         let youtube = p.host().find_live("youtube").unwrap();
@@ -1144,6 +1430,7 @@ mod tests {
         let mut p = pipeline("addremove");
         p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
         p.apply(0, StreamOp::Start).unwrap();
+        reports_push(&p, 1);
         p.poll(HEALTHY_MS);
         let twitch = p.host().find_live("twitch").unwrap();
         let encoder = p.host().find_live("encoder").unwrap();
@@ -1247,6 +1534,7 @@ mod tests {
         let mut p = pipeline("stop");
         p.apply(0, add(1, StreamPlatform::Twitch, "tw")).unwrap();
         p.apply(0, StreamOp::Start).unwrap();
+        reports_push(&p, 1);
         p.poll(HEALTHY_MS);
         assert!(p.on_air());
         p.apply(HEALTHY_MS, StreamOp::Stop).unwrap();
@@ -1461,6 +1749,14 @@ mod tests {
         assert!(script.contains("-c copy"));
         assert!(script.contains("-f flv \"$JS_INGEST\""));
         assert!(script.contains("rtmp://127.0.0.1:1935/jamstream"));
+        // It reports on itself, which is the whole of what makes it Live, and
+        // it reports to the file the pipeline reads.
+        let progress = progress_path(&p.cfg.work_dir, DestinationId(2));
+        assert!(script.contains("-stats_period 1"), "{script}");
+        assert!(
+            script.contains(&format!("-progress '{}'", progress.display())),
+            "{script}"
+        );
         assert_eq!(
             spec.stdin,
             Stdin::SecretFile(PathBuf::from("/run/jamstream/keys/dest-2"))
