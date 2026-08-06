@@ -35,6 +35,17 @@ ON AIR lights for everyone in the session. You can add or drop a platform while 
 
 Your key is treated as a credential. Leave **keep this key in this computer's keychain** on and the next session starts with **Use saved key** instead of a paste; **Forget key** deletes it again.
 
+## When a session cannot stream
+
+A broadcast goes out through a relay that runs on the session machine, alongside the server. It is downloaded when the session boots, and a session runs perfectly well without it: the band plays, listeners listen, takes record. Only the broadcast needs it.
+
+The **Broadcast** tab says so when it is missing, with the reason, and both **Add key** and **Go live** are off, because a key would have nowhere to go.
+
+![The Broadcast tab reading that this session cannot stream because the broadcast tooling could not be downloaded, with Add key and Go live both disabled](../images/session_destinations_unavailable.png)
+*Nothing on this computer can fix this one: the relay is on the session machine.*
+
+The session server checks the relay every few seconds for as long as the session lasts, so this appears if the relay dies mid-session too, and clears if it comes back. Nothing on your computer affects it. To broadcast, start a new session.
+
 ## While you are on air
 
 Each row says what that platform is actually doing:

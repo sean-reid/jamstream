@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-pub use jamstream_protocol::control::{DestinationState, StreamKey, StreamPlatform};
+pub use jamstream_protocol::control::{
+    BroadcastReadiness, DestinationState, StreamKey, StreamPlatform,
+};
 pub use jamstream_protocol::ids::{DestinationId, MemberId, Role, TokenId};
 
 /// One member's avatar, decoded. The UI needs pixels, not a file: the
@@ -362,9 +364,23 @@ pub enum RecordState {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StreamView {
     pub destinations: Vec<DestinationView>,
+    /// Whether this session can broadcast at all, as the server's relay probe
+    /// answers it. None means it has not answered, which reads as "assume it
+    /// works": before the first probe, and on a session that predates the
+    /// probe, dimming Go Live would refuse a broadcast the session can serve.
+    pub readiness: Option<BroadcastReadiness>,
 }
 
 impl StreamView {
+    /// Why this session cannot stream, when it cannot. `None` covers both a
+    /// working relay and no answer yet, because the tab treats them the same.
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        match &self.readiness {
+            Some(BroadcastReadiness::Unavailable { reason }) => Some(reason),
+            _ => None,
+        }
+    }
+
     /// On air: at least one destination is actually being watched. Idle and
     /// connecting destinations are not on air, and a failed one is the
     /// opposite of on air.

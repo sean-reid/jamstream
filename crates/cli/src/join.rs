@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
-use jamstream_protocol::control::{DestinationState, RecordingState};
+use jamstream_protocol::control::{BroadcastReadiness, DestinationState, RecordingState};
 use jamstream_protocol::ids::{HOST_MEMBER_ID, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_session::client::{ClientCore, ClientEvent, ClientState, ServerCandidates};
@@ -404,6 +404,12 @@ fn print_event<W: Write>(out: &mut W, event: &ClientEvent) -> std::io::Result<()
                 .count();
             writeln!(out, "stream: {live} of {} live", destinations.len())
         }
+        ClientEvent::BroadcastReadiness(state) => match state {
+            BroadcastReadiness::Ready => writeln!(out, "broadcast: ready"),
+            BroadcastReadiness::Unavailable { reason } => {
+                writeln!(out, "broadcast: unavailable, {reason}")
+            }
+        },
         ClientEvent::RecordStatus { state, stems } => {
             let what = match state {
                 RecordingState::Idle => "idle".to_owned(),

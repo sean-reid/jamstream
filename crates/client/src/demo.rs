@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::avatar::disc_color;
 use crate::runtime::{
-    AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationId,
-    DestinationState, DestinationView, DeviceModeView, FaderView, LevelsView, MemberId, MemberView,
-    MetronomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView,
-    StreamPlatform, StreamView, TokenId,
+    AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState, CostView,
+    DestinationId, DestinationState, DestinationView, DeviceModeView, FaderView, LevelsView,
+    MemberId, MemberView, MetronomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime,
+    Snapshot, StatsView, StreamPlatform, StreamView, TokenId,
 };
 use crate::theme;
 
@@ -123,6 +123,9 @@ struct DemoState {
     left: bool,
     audition: bool,
     destinations: Vec<Destination>,
+    /// Whether the session can broadcast at all. None is a session that has
+    /// not been asked, which is every demo one; a fixture pins the answer.
+    readiness: Option<BroadcastReadiness>,
     record: RecordView,
     /// Why this computer has no audio stream, when it has none. The real
     /// runtime fills this from the device that refused; a fixture pins it so
@@ -290,6 +293,7 @@ impl DemoRuntime {
                 left: false,
                 audition: false,
                 destinations: Vec::new(),
+                readiness: None,
                 record: RecordView::default(),
                 device_error: None,
                 device_mode: None,
@@ -376,6 +380,14 @@ impl DemoRuntime {
     pub fn set_rate(&self, rate: Option<RateOutcomesView>) {
         let mut s = self.state.lock().expect("demo state");
         s.rate = rate;
+    }
+
+    /// Pins whether the session can broadcast at all, as the server's relay
+    /// probe reports it. A fixture holds the answer a real session gets from a
+    /// VM whose relay never came up.
+    pub fn set_broadcast_readiness(&self, readiness: Option<BroadcastReadiness>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.readiness = readiness;
     }
 
     /// Pins the recorder's reported state, the way [`Self::set_destinations`]
@@ -506,6 +518,7 @@ impl Runtime for DemoRuntime {
                     repeated_frames: d.repeated_frames,
                 })
                 .collect(),
+            readiness: s.readiness.clone(),
         };
 
         Snapshot {
@@ -675,6 +688,12 @@ impl<R: Runtime> RecordingRuntime<R> {
 
     pub fn commands(&self) -> Vec<Command> {
         self.log.lock().expect("command log").clone()
+    }
+
+    /// The runtime underneath, so a test can move the session on mid-frame the
+    /// way the server does: a relay that comes up, a take that starts.
+    pub fn inner(&self) -> &R {
+        &self.inner
     }
 }
 

@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use egui::accesskit::Role as AkRole;
 use egui::{Event, Key, Modifiers, PointerButton, vec2};
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::Harness;
+use egui_kittest::kittest::{NodeT, Queryable};
 use jamstream_client::creds::MemStore;
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME, RecordingRuntime};
 use jamstream_client::runtime::{
-    Command, DestinationState, MemberId, RecordState, Runtime, Snapshot,
+    BroadcastReadiness, Command, DestinationState, MemberId, RecordState, Runtime, Snapshot,
 };
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::session::{SessionScreen, SettingsTab};
@@ -1479,6 +1480,87 @@ fn a_pasted_key_reaches_the_server_once_and_then_going_live() {
     // and the bar's centre cluster says so.
     assert!(rt.snapshot().stream.on_air());
     assert!(harness.query_by_label("ON AIR").is_some());
+}
+
+/// A session with no broadcast relay says so and offers no way to paste a key
+/// into it. Before this the tab was identical to a working one, so a host
+/// pasted a key, pressed Go live, and learned from a failed destination that
+/// the session could never have streamed at all (#440).
+#[test]
+fn a_session_that_cannot_stream_says_so_and_takes_no_key() {
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, true);
+    demo.set_broadcast_readiness(Some(BroadcastReadiness::Unavailable {
+        reason: "the broadcast tooling could not be downloaded".to_owned(),
+    }));
+    let rt: Recorder = Arc::new(RecordingRuntime::new(demo));
+    let mut harness = drawer_harness(rt.clone(), SettingsTab::Broadcast, vec2(1280.0, 800.0));
+    harness.run_steps(2);
+
+    // The reason is on screen, in the server's words.
+    assert!(
+        harness
+            .query_by_label_contains("This session cannot stream")
+            .is_some(),
+        "the tab must say the session cannot stream"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("the broadcast tooling could not be downloaded")
+            .is_some(),
+        "the reason the server gave must be shown, not paraphrased"
+    );
+
+    // Add key is there and does nothing: the row still has to show what is
+    // configured, and a disabled control explains itself where a missing one
+    // leaves a host looking for it.
+    let add = harness
+        .get_all_by_role_and_label(AkRole::Button, "Add key")
+        .next()
+        .expect("Twitch add key");
+    assert!(
+        add.accesskit_node().is_disabled(),
+        "Add key must be off with no relay"
+    );
+    add.click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_role(AkRole::PasswordInput).is_none(),
+        "no key field may open on a session that cannot stream"
+    );
+
+    // And nothing can be put on air.
+    let go = harness.get_by_role_and_label(AkRole::Button, "Go live");
+    assert!(
+        go.accesskit_node().is_disabled(),
+        "Go live must be off with no relay"
+    );
+    go.click();
+    harness.run_steps(2);
+    assert!(
+        destination_commands(&rt).is_empty(),
+        "a session with no relay sent {:?}",
+        destination_commands(&rt)
+    );
+
+    // A relay that comes up after all reopens the tab: this is a probe, and
+    // its answer can change.
+    rt.inner()
+        .set_broadcast_readiness(Some(BroadcastReadiness::Ready));
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("This session cannot stream")
+            .is_none()
+    );
+    assert!(
+        !harness
+            .get_all_by_role_and_label(AkRole::Button, "Add key")
+            .next()
+            .expect("Twitch add key")
+            .accesskit_node()
+            .is_disabled(),
+        "a relay that came up must give the key field back"
+    );
 }
 
 /// The key pane's two keystrokes, both of which it was missing (#180): Enter
