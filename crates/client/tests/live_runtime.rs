@@ -1636,3 +1636,103 @@ fn record_on_an_unarmed_session_fails_visibly_in_the_lamp() {
     host.send(Command::Leave);
     drop(host);
 }
+
+/// The log file's first line promises that an empty file is a healthy run, and
+/// #451 is that the promise was false in the case that mattered: a member heard
+/// nobody for a whole session and the file said nothing. The playout watch that
+/// fixes it can break the promise the other way, by writing warnings on
+/// ordinary sessions until nobody reads the file, so this holds a real session
+/// to the promise: two members, audio crossing both ways, through the app's own
+/// subscriber and a real log file.
+///
+/// The file rather than a captured formatter, because the promise is about the
+/// file. One subscriber per process, which is what nextest gives every test;
+/// under `cargo test` the whole binary shares one, so the install would land in
+/// another test's file and this would read an empty one.
+#[test]
+fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        eprintln!("skipping: RUST_LOG replaces the default filter this is about");
+        return;
+    }
+    // Its own directory: the log goes through the private-file machinery, which
+    // refuses to write key material next to a world-writable temp root.
+    let dir = temp_path("quiet", "logs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let log = dir.join("app.log");
+    let installed = jamstream_client::logging::init_at(log.clone()).expect("install the log");
+    assert_eq!(installed, log);
+
+    let server = TestServer::start();
+    let a_sine = sine_fixture("quiet", 440.0, RATE);
+    let b_sine = sine_fixture("quiet", 660.0, RATE);
+    let out_a = temp_path("quiet", "out-a.wav");
+    let out_b = temp_path("quiet", "out-b.wav");
+    let a = LiveRuntime::join_offline(
+        &server.invite(1, "a"),
+        settings(),
+        WavBackend::new(Some(a_sine.clone()), Some(out_a.clone())),
+    )
+    .expect("join a");
+    let b = LiveRuntime::join_offline(
+        &server.invite(2, "b"),
+        settings(),
+        WavBackend::new(Some(b_sine.clone()), Some(out_b.clone())),
+    )
+    .expect("join b");
+    for (rt, who) in [(&a, "a"), (&b, "b")] {
+        wait_for(rt, who, Duration::from_secs(10), |s| {
+            joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+        });
+    }
+
+    // Several seconds of playing, which is many times the second of silence the
+    // watch waits out and the second its refusal window measures.
+    std::thread::sleep(Duration::from_millis(4_000));
+    for (rt, who) in [(&a, "a"), (&b, "b")] {
+        rt.send(Command::Leave);
+        wait_for(rt, who, Duration::from_secs(5), |s| {
+            s.stats.state == ConnState::Idle
+        });
+    }
+    drop(b);
+    drop(a);
+
+    // A session that carried no audio would be quiet in the log for the wrong
+    // reason, so each side has to have heard the other's tone. The personal mix
+    // excludes self, so the tone measured is the one that crossed the wire.
+    for (out, theirs, mine) in [(&out_a, 660.0, 440.0), (&out_b, 440.0, 660.0)] {
+        let (rate, samples) = tail(out, 1.0);
+        let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
+        let heard = tone_energy(&left, rate, theirs);
+        let own = tone_energy(&left, rate, mine);
+        assert!(
+            heard > own * 4.0,
+            "{out:?} heard {heard} at {theirs} Hz against {own} at its own {mine} Hz"
+        );
+    }
+
+    let text = std::fs::read_to_string(&log).expect("read the log");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|l| l.contains("empty after this line is a healthy run")),
+        "the banner is missing, so this proves nothing: {text:?}"
+    );
+    assert_eq!(lines.len(), 1, "a healthy session wrote {:#?}", &lines[1..]);
+
+    // And the file has to prove it could have carried one, or a subscriber that
+    // never installed reads as a healthy run and the assertion above is empty.
+    tracing::warn!("a line this test wrote itself");
+    let text = std::fs::read_to_string(&log).expect("reread the log");
+    assert!(
+        text.contains("a line this test wrote itself"),
+        "warnings from this process never reach the file: {text:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    for p in [&a_sine, &b_sine, &out_a, &out_b] {
+        let _ = std::fs::remove_file(p);
+    }
+}

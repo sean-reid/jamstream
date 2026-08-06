@@ -47,8 +47,24 @@ pub fn log_path() -> Option<PathBuf> {
 /// same filter the CLI uses. Called once, first thing in main: everything
 /// after it can fail visibly.
 pub fn init() -> Option<PathBuf> {
+    match log_path() {
+        Some(path) => init_at(path),
+        None => {
+            init_stderr_only();
+            None
+        }
+    }
+}
+
+/// [`init`] against a log file of the caller's choosing.
+///
+/// The seam exists because the banner's claim is about the file: an empty one
+/// is a healthy run. A test that holds a whole session to that has to read the
+/// real file, written through the real filter, rather than a formatter standing
+/// in for it (#451).
+pub fn init_at(path: PathBuf) -> Option<PathBuf> {
     let filter = jamstream_cli::logging::from_env();
-    match open_log_file() {
+    match open_log_file_at(path) {
         Some((path, file)) => {
             let file = Arc::new(file);
             // ANSI off because one format layer feeds both writers, and a
@@ -65,17 +81,19 @@ pub fn init() -> Option<PathBuf> {
             Some(path)
         }
         None => {
-            let _ = tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-                .with(filter)
-                .try_init();
+            init_stderr_only();
             None
         }
     }
 }
 
-fn open_log_file() -> Option<(PathBuf, File)> {
-    open_log_file_at(log_path()?)
+/// The fallback: a machine with no writable log file still gets its events on
+/// stderr, for the shells that have one.
+fn init_stderr_only() {
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(jamstream_cli::logging::from_env())
+        .try_init();
 }
 
 fn open_log_file_at(path: PathBuf) -> Option<(PathBuf, File)> {
