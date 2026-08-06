@@ -539,6 +539,29 @@ jobs:
         name: No exe imports the redistributable CRT
         shell: pwsh
         run: ./scripts/check-windows-crt.ps1 target/release jamstream.exe jamstream-app.exe jamstreamd.exe
+      # scripts/windows-static-crt.cmake reaches opus through four hands: the
+      # variable name in .cargo/config.toml, cmake-rs reading it, the cache
+      # entry the file forces, and the option opus declares. Any of them can
+      # drift, and the only symptom would be the linker warnings coming back,
+      # which no lint can fail on. The configured cache is where all four meet.
+      - if: runner.os == 'Windows'
+        name: opus configured against the static CRT
+        shell: bash
+        run: |
+          set -eu
+          caches=$(find target/release/build -path '*opusic-sys*/out/build/CMakeCache.txt')
+          if [ -z "$caches" ]; then
+            echo 'no opus cmake cache under target/release/build; the path moved' >&2
+            exit 1
+          fi
+          for cache in $caches; do
+            if ! grep -qx 'OPUS_STATIC_RUNTIME:BOOL=ON' "$cache"; then
+              echo "$cache configured opus against the dynamic CRT:" >&2
+              grep -n 'OPUS_STATIC_RUNTIME\|CMAKE_TOOLCHAIN_FILE:' "$cache" >&2 || true
+              exit 1
+            fi
+            echo "$cache: OPUS_STATIC_RUNTIME=ON"
+          done
 
   # Simulation harness gates: latency budgets, loss resilience, drift, chaos.
   # ~3 minutes of pure test runtime, and no audio/UI system deps (the harness

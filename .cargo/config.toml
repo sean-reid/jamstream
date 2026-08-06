@@ -8,3 +8,12 @@ xtask = "run --package xtask --"
 # them, so a Windows build that sets one has to carry this flag itself.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# ring and aws-lc-sys read the crt-static cfg and build their C against the
+# static CRT; opusic-sys does not, so opus alone compiled /MD and every Windows
+# link warned about it around 45 times, which would hide a real linker fault.
+# cmake-rs takes a toolchain file from this variable, and that is the only
+# define opusic-sys can be reached through. The path is absolute once cargo
+# resolves it, and only a build for this target reads it.
+[env]
+CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc = { value = "scripts/windows-static-crt.cmake", relative = true }
