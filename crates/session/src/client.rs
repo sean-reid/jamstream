@@ -10,8 +10,8 @@ use jamstream_engine::{
     MediaPacket, Pull, RedundancyPolicy,
 };
 use jamstream_protocol::control::{
-    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN, MemberInfo,
-    RecordOp, RecordingState, StreamOp,
+    BroadcastReadiness, ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN,
+    MemberInfo, RecordOp, RecordingState, StreamOp,
 };
 use jamstream_protocol::ids::{MemberId, Role, TokenId};
 use jamstream_protocol::invite::Invite;
@@ -153,6 +153,11 @@ pub enum ClientEvent {
         state: RecordingState,
         stems: bool,
     },
+    /// Whether the session can broadcast at all, as the server's relay probe
+    /// answers it. Arrives on change and once at join; a session that never
+    /// emits one is a server that cannot answer, which reads as "assume it
+    /// works" rather than as a failure.
+    BroadcastReadiness(BroadcastReadiness),
     /// A member's avatar bytes are cached and hash-verified; fetch them
     /// with `avatar_bytes`. Emitted once per (member, hash).
     AvatarReady {
@@ -1157,6 +1162,9 @@ impl ClientCore {
             }
             ControlMsg::RecordStatus { state, stems } => {
                 self.events.push(ClientEvent::RecordStatus { state, stems });
+            }
+            ControlMsg::BroadcastReadiness { state } => {
+                self.events.push(ClientEvent::BroadcastReadiness(state));
             }
             // The server never sends these; ignore.
             ControlMsg::MixerSet { .. }

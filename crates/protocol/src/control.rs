@@ -181,6 +181,25 @@ pub enum DestinationState {
     },
 }
 
+/// Whether this session can broadcast at all, which is a different question
+/// from what any destination is doing.
+///
+/// The encoder publishes to a relay on the session machine and every pusher
+/// reads from it, so a session whose relay never came up, or whose broadcast
+/// tooling never downloaded, cannot stream anywhere no matter what key the
+/// host pastes. Nothing used to say so: the relay's unit is `Type=simple`, and
+/// systemd calls one of those started the moment it forks, so the only
+/// evidence anyone could get said `Started mediamtx.service` whether the relay
+/// was serving or had died a second later (#441).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BroadcastReadiness {
+    /// The relay answered where the encoder publishes.
+    Ready,
+    /// It did not, and `reason` is what the host is told instead of being
+    /// offered a key field that leads nowhere.
+    Unavailable { reason: String },
+}
+
 /// Cuts a failure reason down to [`STREAM_REASON_BUDGET`], on a char
 /// boundary so the result is still a `str`.
 ///
@@ -419,6 +438,14 @@ pub enum ControlMsg {
     SetName {
         name: String,
     },
+    /// Server to all: whether this session can broadcast at all, on change and
+    /// to a member as they join. Separate from [`Self::StreamStatus`] because
+    /// it is true of the session rather than of a destination, and because the
+    /// host who most needs it has configured none yet. Trailing variant, same
+    /// postcard append-safety rule as Stats.
+    BroadcastReadiness {
+        state: BroadcastReadiness,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -635,6 +662,11 @@ fn check_lengths(msg: &ControlMsg) -> Result<(), Error> {
             state: RecordingState::Failed { reason },
             ..
         } if reason.len() > MAX_RECORD_REASON_LEN => Err(Error::Malformed),
+        // One reason per message here, not eight, so the field cap is the
+        // only one that applies.
+        ControlMsg::BroadcastReadiness {
+            state: BroadcastReadiness::Unavailable { reason },
+        } if reason.len() > MAX_STREAM_REASON_LEN => Err(Error::Malformed),
         ControlMsg::Roster(members) if members.iter().any(|m| m.name.len() > MAX_NAME_LEN) => {
             Err(Error::Malformed)
         }
@@ -1315,6 +1347,44 @@ mod tests {
         assert_eq!(status[0], 18);
     }
 
+    /// Same rule for the readiness variant: appended after SetName, so every
+    /// earlier variant's bytes are the bytes they were.
+    #[test]
+    fn appending_the_readiness_variant_left_earlier_encodings_alone() {
+        let name = postcard::to_allocvec(&ControlMsg::SetName { name: "a".into() }).unwrap();
+        assert_eq!(name[0], 19);
+        let ready = postcard::to_allocvec(&ControlMsg::BroadcastReadiness {
+            state: BroadcastReadiness::Ready,
+        })
+        .unwrap();
+        assert_eq!(ready[0], 20);
+        // Ready is the whole message: one variant byte for the message and one
+        // for the state, which is what lets it be sent once a second forever
+        // if it ever needs to be.
+        assert_eq!(ready.len(), 2);
+    }
+
+    /// A readiness message is one reason rather than eight, so it cannot
+    /// fragment the way a full `StreamStatus` can. Pinned anyway, because the
+    /// cost of finding out otherwise is a host who is never told.
+    #[test]
+    fn an_unavailable_reason_at_the_wire_cap_still_fits_one_datagram() {
+        let mut link = ControlLink::new();
+        link.send(ControlMsg::BroadcastReadiness {
+            state: BroadcastReadiness::Unavailable {
+                reason: "x".repeat(MAX_STREAM_REASON_LEN),
+            },
+        })
+        .expect("a reason at the cap must be sendable");
+        for plain in link.poll(0) {
+            let sealed = plain.len() + 11 + 16;
+            assert!(
+                sealed <= 1_472,
+                "sealed readiness is {sealed} bytes, which fragments on a 1500 byte mtu"
+            );
+        }
+    }
+
     #[test]
     fn rejects_oversized_avatar_chunk() {
         let mut a = ControlLink::new();
@@ -1645,6 +1715,11 @@ mod tests {
             }]),
             ControlMsg::SetName {
                 name: "n".repeat(MAX_NAME_LEN + 1),
+            },
+            ControlMsg::BroadcastReadiness {
+                state: BroadcastReadiness::Unavailable {
+                    reason: "x".repeat(MAX_STREAM_REASON_LEN + 1),
+                },
             },
         ];
         for msg in oversized {
