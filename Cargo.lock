@@ -2888,6 +2888,7 @@ dependencies = [
  "jamstream-broadcast",
  "jamstream-cli",
  "jamstream-cloud",
+ "jamstream-engine",
  "jamstream-protocol",
  "jamstream-server",
  "jamstream-session",

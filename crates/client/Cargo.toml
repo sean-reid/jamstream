@@ -19,6 +19,9 @@ path = "src/main.rs"
 jamstream-protocol.workspace = true
 jamstream-session.workspace = true
 jamstream-audio-io.workspace = true
+# The jitter buffer's stats type, named by the playout watch. The session core
+# links this crate already, so it costs the binary nothing.
+jamstream-engine.workspace = true
 # gcp: this surface launches GCP sessions, so it wants the RSA signing
 # jamstreamd does without.
 jamstream-cloud = { workspace = true, features = ["gcp"] }
