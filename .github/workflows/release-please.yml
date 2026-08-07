@@ -38,6 +38,14 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
+          # A fine-grained token scoped to this repository, contents and pull
+          # requests only. Not GITHUB_TOKEN: this repository's Actions policy
+          # holds a run whose actor is github-actions[bot] at action_required,
+          # so the release pull request arrives with no checks and waits for a
+          # human to close and reopen it. This token's actor is sean-reid,
+          # which the policy does not gate. The permissions above still bound
+          # what the job itself can do.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -57,7 +65,10 @@ jobs:
         with:
           # The one checkout in the repository that keeps the token: the step
           # below commits the refreshed lockfile and pushes it back to the
-          # release branch.
+          # release branch. It takes the same token as the action above for the
+          # same reason: a push credited to github-actions[bot] leaves the
+          # branch's checks at action_required.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           persist-credentials: true
           ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
       - if: steps.release.outputs.pr
