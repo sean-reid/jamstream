@@ -77,10 +77,10 @@ pub fn state_lamp_width(ui: &mut Ui, label: &str) -> f32 {
 /// warm colours apart.
 ///
 /// The accent and `meter_amber` are 1.25:1 against each other in dark and
-/// 1.20:1 in light, and ON AIR and UPLOADING could both be lit at once, so the
-/// colour was carrying no information and the words were doing all the work
-/// (#182). A state that is going out of the room is filled; one that is
-/// finishing or is only about what you hear is a ring.
+/// 1.20:1 in light, and ON AIR and UPLOADING can both be lit at once, so
+/// colour alone cannot carry the difference and shape does the work. A
+/// state that is going out of the room is filled; one that is finishing or
+/// is only about what you hear is a ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LampShape {
     Filled,
