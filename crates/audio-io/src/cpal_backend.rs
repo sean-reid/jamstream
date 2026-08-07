@@ -273,13 +273,9 @@ impl AudioBackend for CpalBackend {
         };
 
         // Started last, with nothing left to do but hand the stream over. cpal
-        // 0.18 streams start paused, and this used to play them the moment both
-        // were built, ahead of the rung report, the demotion bookkeeping, and
-        // the callback-size queries. Everything that arrives in that window
-        // arrives in a ring the caller has not been handed yet, and a device
-        // that calls back promptly puts tens of milliseconds of capture there
-        // (#436). CoreAudio happens to take about that long to deliver its
-        // first callback, so it hid the window rather than avoiding it. The
+        // 0.18 streams start paused, and anything that arrives before the open
+        // returns arrives in a ring the caller does not hold yet. A device that
+        // calls back promptly puts tens of milliseconds of capture there. The
         // Windows exclusive path already waits: its device threads do not start
         // until the handler halves are handed over at the end of the open.
         input.play().map_err(|e| map_err(&e))?;

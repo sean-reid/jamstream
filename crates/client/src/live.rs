@@ -117,13 +117,11 @@ fn playout_capacity(buffer_frames: u32) -> usize {
 /// Capture ring capacity in samples: the playout cushion, or
 /// [`CAPTURE_RING`] of audio, whichever is larger.
 ///
-/// The two rings used to share one number, and sharing it priced capture as
-/// if it were latency. It is not. The worker drains the capture ring to empty
-/// on every tick, so what a captured sample waits is the time to the next
-/// drain, set by the loop's 2.5 ms cadence and never by the capacity. What the
-/// capacity buys is how long the worker may be held up before audio is
-/// destroyed, and at two callbacks that was 5 ms, less than the session's own
-/// bring-up (#436).
+/// Deeper than playout because capture depth is not latency: the worker drains
+/// this ring to empty every tick, so a sample waits for the next 2.5 ms drain
+/// and never for the capacity. Capacity only buys how long the worker may be
+/// held up before audio is destroyed, and the session's own bring-up outlasts
+/// two callbacks of it.
 fn capture_capacity(buffer_frames: u32) -> usize {
     let slack = CAPTURE_RING.as_millis() as usize * SAMPLE_RATE as usize / 1000;
     playout_capacity(buffer_frames).max(slack * usize::from(CHANNELS))

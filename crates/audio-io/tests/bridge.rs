@@ -98,10 +98,9 @@ fn capture_overrun_drops_tail_and_counts() {
 }
 
 /// The two capacities belong to their own rings. Capture is drained to empty
-/// by its consumer and playout is kept full by its producer, so a client that
-/// wants a deep capture ring and a shallow playout one gets exactly that; the
-/// pair used to be one number, which priced capture as latency it does not
-/// cost (#436). Transposing the arguments fails here.
+/// by its consumer and playout is kept full by its producer, so a client may
+/// take a deep capture ring and a shallow playout one. Transposing the
+/// arguments fails here.
 #[test]
 fn the_two_rings_are_sized_apart() {
     let (mut device, mut engine) = CallbackBridge::new(16, 4);
@@ -122,9 +121,8 @@ fn the_two_rings_are_sized_apart() {
 /// before its first drain. Capture that arrives in that window is destroyed
 /// unless the ring can hold it, and the ring is the only thing that decides.
 ///
-/// Measured on a real CoreAudio device: 120-frame callbacks 2.5 ms apart, and a
-/// bring-up window that used to run past 20 ms (#436). Two callbacks of ring is
-/// 5 ms of it.
+/// Sized from a real CoreAudio device: 120-frame callbacks 2.5 ms apart against
+/// a bring-up window past 20 ms, where two callbacks of ring holds 5 ms.
 #[test]
 fn a_ring_holds_what_arrives_before_the_consumer_starts() {
     const CALLBACK: usize = 240;
