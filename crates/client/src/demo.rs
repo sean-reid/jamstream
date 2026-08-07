@@ -369,14 +369,14 @@ impl DemoRuntime {
     }
 
     /// Pins the sharing mode, as the real runtime reads it off the audio
-    /// backend after an open (#326).
+    /// backend after an open.
     pub fn set_device_mode(&self, mode: Option<DeviceModeView>) {
         let mut s = self.state.lock().expect("demo state");
         s.device_mode = mode;
     }
 
     /// Pins the rate outcomes, as the real runtime publishes them after an
-    /// open (#347): which rung each direction landed on and what it costs.
+    /// open: which rung each direction landed on and what it costs.
     pub fn set_rate(&self, rate: Option<RateOutcomesView>) {
         let mut s = self.state.lock().expect("demo state");
         s.rate = rate;
@@ -544,7 +544,7 @@ impl Runtime for DemoRuntime {
 
     /// The state on its own, from the one flag that decides it. The demo's
     /// snapshot copies a roster and a chat buffer like the live one does,
-    /// and the frame loop asks this every frame (#382).
+    /// and the frame loop asks this every frame.
     fn conn_state(&self) -> ConnState {
         if self.state.lock().expect("demo state").left {
             ConnState::Idle
