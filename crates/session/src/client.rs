@@ -1166,6 +1166,16 @@ impl ClientCore {
             ControlMsg::BroadcastReadiness { state } => {
                 self.events.push(ClientEvent::BroadcastReadiness(state));
             }
+            // The session server's own log, which only the host is sent.
+            // Reported rather than surfaced: it is what a host reads after a
+            // failure, not something to draw in a room full of musicians.
+            ControlMsg::ServerLog { line } => {
+                tracing::info!(
+                    target: crate::logtail::SERVER_LOG_TARGET,
+                    session = %self.invite.session_id.hex(),
+                    "{line}"
+                );
+            }
             // The server never sends these; ignore.
             ControlMsg::MixerSet { .. }
             | ControlMsg::ClickEnable { .. }

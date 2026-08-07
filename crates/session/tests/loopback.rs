@@ -9,8 +9,8 @@ use blake2::{Blake2s256, Digest};
 use jamstream_protocol::Error as ProtocolError;
 use jamstream_protocol::control::{
     AVATAR_CHUNK_BYTES, BroadcastReadiness, ControlLink, ControlMsg, DestinationState,
-    DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN, MemberInfo, RecordOp, StreamKey, StreamOp,
-    StreamPlatform,
+    DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN, MAX_SERVER_LOG_LINE, MemberInfo, RecordOp,
+    StreamKey, StreamOp, StreamPlatform, fit_server_log_line,
 };
 use jamstream_protocol::ids::DestinationId;
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
@@ -18,9 +18,10 @@ use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::media::{FrameDuration, MediaFrame};
 use jamstream_protocol::transport::{Initiator, Session, generate_keypair, reject_key_for_init};
 use jamstream_protocol::wire::{self, Packet};
+use jamstream_session::limits::SERVER_LOG_HIGH_WATER;
 use jamstream_session::{
-    ClientCore, ClientEvent, ClientState, MAX_LISTENERS, MAX_MUSICIANS, ServerConfig, ServerCore,
-    ServerEvent, VIOLATION_BURST,
+    ClientCore, ClientEvent, ClientState, LOG_TAIL_LINES, LogTail, MAX_LISTENERS, MAX_MUSICIANS,
+    ServerConfig, ServerCore, ServerEvent, VIOLATION_BURST,
 };
 use proptest::prelude::*;
 
@@ -3528,6 +3529,230 @@ fn chat_delivers_within_four_steps_while_a_max_avatar_streams() {
             Some(bytes.as_slice())
         );
     }
+}
+
+/// The process's log ring, installed on first use.
+///
+/// jamstreamd installs one per process, so a test does the same. `ServerCore`
+/// picks it up when it is built, so this runs before the harness does.
+fn log_tail() -> LogTail {
+    if let Some(tail) = jamstream_session::logtail::installed() {
+        return tail;
+    }
+    let tail = LogTail::new();
+    assert!(jamstream_session::logtail::install(tail.clone()));
+    tail
+}
+
+/// Where in a member's decrypted downlink this exact log line first appears.
+///
+/// By the wire encoding, so what is being asserted is that the member was sent
+/// the line and not that something in the harness happened to hold a copy.
+fn server_log_at(h: &Harness, id: MemberId, line: &str) -> Option<usize> {
+    let needle = postcard::to_allocvec(&ControlMsg::ServerLog {
+        line: line.to_owned(),
+    })
+    .expect("encode");
+    h.sniffer(id)
+        .seen
+        .iter()
+        .position(|p| p.windows(needle.len()).any(|w| w == needle))
+}
+
+fn saw_server_log(h: &Harness, id: MemberId, line: &str) -> bool {
+    server_log_at(h, id, line).is_some()
+}
+
+/// The server's log reaches the host while the session is running, in the
+/// order it was written, and reaches nobody else.
+///
+/// The host is the party who launched the machine and pays for it. Everyone
+/// else in the room is a musician who was handed an invite, and the log names
+/// members, addresses, and bucket paths.
+#[test]
+fn the_host_alone_is_sent_the_servers_log() {
+    let tail = log_tail();
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let host = h.add_sniffer(&h.mint(0, Role::Musician), addr_of(50));
+    let guest = h.add_sniffer(&h.mint(1, Role::Musician), addr_of(51));
+    assert_eq!(host, MemberId(0));
+    h.run_ms(200);
+
+    for line in ["encoder up", "pusher exited with status 145"] {
+        tail.push(line);
+    }
+    h.run_ms(200);
+
+    let first = server_log_at(&h, host, "encoder up").expect("the host was not sent the log");
+    let second = server_log_at(&h, host, "pusher exited with status 145")
+        .expect("the host was not sent the second line");
+    assert!(first < second, "the log arrived out of order");
+    for line in ["encoder up", "pusher exited with status 145"] {
+        assert!(
+            !saw_server_log(&h, guest, line),
+            "a guest was sent the server's log"
+        );
+    }
+}
+
+/// A session told to stop sends its last lines ahead of the Bye, in the flight
+/// the Bye travels in.
+///
+/// This is the case the whole mechanism exists for. A cloud session's machine
+/// is destroyed the moment the server exits, and the parting flight is a single
+/// send with no retransmit, so the last thing the server wrote has to be
+/// already on the wire in front of the Bye rather than waiting behind it.
+#[test]
+fn the_last_lines_go_out_in_front_of_the_bye() {
+    let tail = log_tail();
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let host = h.add_sniffer(&h.mint(0, Role::Musician), addr_of(50));
+    h.run_ms(200);
+
+    // Written after the last tick, which is what a machine being destroyed
+    // does: the self-destruct's reason is the final line in the journal.
+    tail.push("session self-destruct: idle");
+    let now = h.now_ms();
+    let farewells = h.server.shutdown(now, "session ended");
+    for (addr, dg) in farewells {
+        assert!(h.sniff(addr, &dg), "a farewell went somewhere unexpected");
+    }
+
+    let line = server_log_at(&h, host, "session self-destruct: idle")
+        .expect("the final line never left the server");
+    let bye = postcard::to_allocvec(&ControlMsg::Bye {
+        reason: "session ended".to_owned(),
+    })
+    .expect("encode");
+    let farewell = h
+        .sniffer(host)
+        .seen
+        .iter()
+        .position(|p| p.windows(bye.len()).any(|w| w == bye))
+        .expect("no Bye");
+    assert!(
+        line <= farewell,
+        "the log arrived after the Bye, so a machine already gone would have kept it"
+    );
+}
+
+/// A server that died leaves the host whatever had already been sent. There is
+/// no shutdown on this path at all: the process is gone, and the copy on the
+/// host's machine is the only one, which is the entire point.
+#[test]
+fn a_server_that_never_shuts_down_has_already_delivered() {
+    let tail = log_tail();
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let host = h.add_sniffer(&h.mint(0, Role::Musician), addr_of(50));
+    h.run_ms(200);
+    tail.push("relay refused the encoder");
+    h.run_ms(200);
+
+    assert!(saw_server_log(&h, host, "relay refused the encoder"));
+    drop(h.server);
+}
+
+/// A line past the wire's cap arrives cut rather than not arriving.
+///
+/// `ControlLink::send` refuses an over-long message whole and both call sites
+/// discard the error, so a sender that did not cut its own line would drop it
+/// silently: the one kind of failure a diagnostic must not have.
+#[test]
+fn a_line_past_the_cap_arrives_cut() {
+    let tail = log_tail();
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let host = h.add_sniffer(&h.mint(0, Role::Musician), addr_of(50));
+    h.run_ms(200);
+
+    let long = format!("ffmpeg: {}", "x".repeat(MAX_SERVER_LOG_LINE * 2));
+    tail.push(&long);
+    h.run_ms(200);
+
+    let cut = fit_server_log_line(&long);
+    assert_eq!(cut.len(), MAX_SERVER_LOG_LINE);
+    assert!(saw_server_log(&h, host, cut), "the long line never arrived");
+    // The head, which is the diagnosis: ffmpeg names the fault it hit first.
+    assert!(cut.starts_with("ffmpeg: "));
+}
+
+/// A burst of log lines never crowds the host's link, and the gap it leaves is
+/// stated rather than silent.
+///
+/// The sniffer never acks, so the host's queue only ever grows here: it is the
+/// worst case the high water mark exists for. What must survive is the roster,
+/// which is how a host learns who is in the room, and the count of what was
+/// lost, which is what stops a reader trusting a log with a hole in it.
+#[test]
+fn a_log_burst_leaves_room_for_the_rest_of_the_link() {
+    let tail = log_tail();
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let host = h.add_sniffer(&h.mint(0, Role::Musician), addr_of(50));
+    h.run_ms(200);
+
+    let line = |n: usize| format!("line {n:04}");
+    for n in 0..LOG_TAIL_LINES * 4 {
+        tail.push(&line(n));
+    }
+    h.run_ms(2_000);
+
+    let delivered = (0..LOG_TAIL_LINES * 4)
+        .filter(|n| saw_server_log(&h, host, &line(*n)))
+        .count();
+    assert!(delivered > 0, "no lines were sent at all");
+    assert!(
+        delivered <= SERVER_LOG_HIGH_WATER,
+        "{delivered} lines went to a link that acked nothing"
+    );
+    // A roster still reaches the host, which is what the high water buys.
+    let roster = postcard::to_allocvec(&ControlMsg::Roster(vec![MemberInfo {
+        id: MemberId(0),
+        role: Role::Musician,
+        name: "member 0".to_owned(),
+        connected: true,
+        avatar_hash: None,
+        quiet: false,
+    }]))
+    .expect("encode");
+    assert!(
+        h.sniffer(host)
+            .seen
+            .iter()
+            .any(|p| p.windows(roster.len()).any(|w| w == roster)),
+        "the log crowded the roster off the link"
+    );
+    // And the ring says how many lines it dropped on the floor.
+    assert!(
+        (0..LOG_TAIL_LINES * 4).any(|n| saw_server_log(
+            &h,
+            host,
+            &format!(
+                "[{n} earlier server \
+             log line(s) dropped]"
+            )
+        )),
+        "the host was never told the log had a gap"
+    );
+}
+
+/// A client that sends a server log is a client claiming to be the server, so
+/// it is charged like every other message only the server may send.
+#[test]
+fn a_server_log_from_a_client_is_a_violation() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv = h.mint(1, Role::Musician);
+    let mut raw = raw_join(&mut h, &inv, addr_of(40));
+    raw.send_control(
+        &mut h,
+        ControlMsg::ServerLog {
+            line: "i am the server".to_owned(),
+        },
+    );
+    h.server_events.extend(h.server.events());
+
+    assert!(h.server_events.contains(&ServerEvent::ProtocolViolation {
+        id: MemberId(1),
+        what: "server log from client",
+    }));
 }
 
 proptest! {

@@ -15,6 +15,7 @@ pub mod prefs;
 pub mod reveal;
 pub mod runtime;
 pub mod screens;
+pub mod server_log;
 pub mod sweep;
 pub mod theme;
 pub mod widgets;

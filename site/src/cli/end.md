@@ -36,5 +36,11 @@ $ jamstream end --last
   Instance 512190713 was already gone; marking the session ended.
   ```
 
+- If the app kept a copy of the session server's log, `end` names the file. The machine's own journal is destroyed along with the machine, so that copy is the only place a failed broadcast or take is explained:
+
+  ```text
+  The session server's log is at ~/.local/share/jamstream/sessions/logs/3f2a9c01....log.
+  ```
+
 - If the provider still lists instances for the session after the destroy call, `end` fails loudly and points you at [`jamstream sweep`](sweep.md); it never silently leaves something billing.
 - An ambiguous prefix lists nothing and asks for more characters; run [`jamstream status`](status.md) to see the ids.

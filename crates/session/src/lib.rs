@@ -7,6 +7,7 @@
 mod avatar;
 pub mod client;
 pub mod limits;
+pub mod logtail;
 pub mod server;
 
 /// The socket pump the integration suites share. Behind a feature because it
@@ -29,6 +30,7 @@ pub use limits::{
     DEFAULT_MEMBER_TIMEOUT_MS, DEFAULT_MUSICIANS, MAX_LISTENERS, MAX_MUSICIANS,
     MEMBER_QUIET_AFTER_MS, VIOLATION_BURST,
 };
+pub use logtail::{LOG_TAIL_LINES, LogTail};
 pub use server::{
     BroadcastMember, BroadcastTick, MemberStats, ServerConfig, ServerCore, ServerEvent, Stem,
     TICK_SAMPLES,

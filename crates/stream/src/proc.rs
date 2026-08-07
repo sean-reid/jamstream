@@ -493,7 +493,7 @@ impl StderrTail {
 /// and telling the two refusals apart is the whole point (#437). A URL that
 /// is not character-for-character that string is redacted, so the exception
 /// can never print anything the caller did not already know.
-fn redact<'a>(line: &'a str, relay: Option<&str>) -> Cow<'a, str> {
+pub fn redact<'a>(line: &'a str, relay: Option<&str>) -> Cow<'a, str> {
     if !line.contains("://") {
         return Cow::Borrowed(line);
     }

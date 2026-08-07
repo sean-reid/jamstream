@@ -70,6 +70,8 @@ If tagged machines already exist in your account when you host again, the CLI wa
 
 **End session for everyone** on the Invites tab destroys the machine, confirms with the provider that nothing tagged with the session is still listed, and marks the local record ended, with a progress sheet until the provider confirms. The invites are dead from that moment. Leaving is not ending: **Leave** disconnects you and the server keeps running until the host ends it or the idle exit fires.
 
+The machine takes its own log with it, so the app keeps a copy of the last of it while the session runs, in `jamstream/sessions/logs/<id>.log` under your platform's data directory; `jamstream end` prints the path. That file is where the reason a broadcast or a take failed is written down, and stream keys are stripped from it before it is written.
+
 Closing the app window while your session runs asks the same question rather than deciding for you: end the session and quit, keep it running and quit (the band plays on; the server stops itself 10 minutes after the last musician leaves, at its hard cap, or with `jamstream end`), or cancel. No dialog appears when nothing you launched is running.
 
 ## From the terminal

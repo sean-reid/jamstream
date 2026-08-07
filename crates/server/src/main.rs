@@ -42,6 +42,10 @@ fn main() -> ExitCode {
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
+        // The host's copy of the same log. A cloud session's machine deletes
+        // itself and takes its journal with it, so the last lines of it travel
+        // to the host over the control link instead.
+        .with(jamstream_server::logtail::layer())
         .with(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
     install_panic_hook();
