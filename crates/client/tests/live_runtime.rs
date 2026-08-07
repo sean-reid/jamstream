@@ -214,6 +214,26 @@ fn tail_rms(path: &Path, secs: f64) -> f64 {
     rms(&tail(path, secs).1)
 }
 
+/// RMS of the loudest `secs` window anywhere in a capture file.
+///
+/// For asking whether audio was ever there. A capture file spans from before
+/// the join to after the leave, so both ends hold silence the backend wrote
+/// while nothing played, and on a slow host that padding is longer than the
+/// window: measured 1.75 s at the front and 0.75 s at the back on a loaded
+/// Windows runner.
+fn loudest_rms(path: &Path, secs: f64) -> f64 {
+    let (rate, samples) = rate_and_samples(path);
+    let win = ((secs * f64::from(rate)) as usize * 2).max(2);
+    if samples.len() <= win {
+        return rms(&samples);
+    }
+    samples
+        .chunks(win)
+        .filter(|c| c.len() >= win / 2)
+        .map(rms)
+        .fold(0.0f64, f64::max)
+}
+
 /// Energy at one frequency, by Goertzel. Cheaper than a transform when the
 /// question is about a handful of candidates rather than a whole spectrum.
 fn tone_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
@@ -1376,7 +1396,7 @@ fn a_stream_away_for_a_few_seconds_keeps_the_jitter_buffer_moving() {
     });
     drop(b);
     drop(a);
-    let rms = tail_rms(&out_b, 1.0);
+    let rms = loudest_rms(&out_b, 1.0);
     assert!(
         rms > 0.02,
         "b heard near-silence (rms {rms}) after its stream came back"
