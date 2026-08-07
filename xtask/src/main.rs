@@ -25,8 +25,9 @@ tasks:
              regenerate the same files under target/fixtures/ on demand, so
              fixtures/ stays out of version control unless a human wants it.
 
-  prerelease Run the three tests CI cannot: the audio round trip through a
-             real device, the device and sharing-mode report, and the probe
+  prerelease Run the four tests CI cannot: the audio round trip through a
+             real device, the device and sharing-mode report, the dropped
+             capture count against a device on its own clock, and the probe
              of the shipped region catalog. Every one is #[ignore]d and no
              workflow passes --run-ignored, so this is the only place they
              run. Work through it on a machine with audio devices before

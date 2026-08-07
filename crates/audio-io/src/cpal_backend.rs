@@ -207,10 +207,6 @@ impl AudioBackend for CpalBackend {
         let (output, out_rate, out_added) =
             open_playback_side(&out_side, out_plan, &config, rates, on_playback, &flags)?;
 
-        // cpal 0.18 streams start paused.
-        input.play().map_err(|e| map_err(&e))?;
-        output.play().map_err(|e| map_err(&e))?;
-
         // The rung each direction landed on, carried on the handle so a
         // reopen racing a read can never show one stream the other's
         // outcome.
@@ -275,6 +271,15 @@ impl AudioBackend for CpalBackend {
             (Some(i), Some(o)) => Some(i.max(o)),
             (one, other) => one.or(other),
         };
+
+        // Started last, with nothing left to do but hand the stream over. cpal
+        // 0.18 streams start paused, and anything that arrives before the open
+        // returns arrives in a ring the caller does not hold yet. A device that
+        // calls back promptly puts tens of milliseconds of capture there. The
+        // Windows exclusive path already waits: its device threads do not start
+        // until the handler halves are handed over at the end of the open.
+        input.play().map_err(|e| map_err(&e))?;
+        output.play().map_err(|e| map_err(&e))?;
 
         Ok(Box::new(CpalStreamHandle {
             input,

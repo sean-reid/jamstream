@@ -1,5 +1,6 @@
 //! CallbackBridge: ordering across ring wrap, silence on underrun, drop on
-//! overrun, counters visible from the engine side.
+//! overrun, counters visible from the engine side, and the two rings sized
+//! apart from each other.
 
 use jamstream_audio_io::CallbackBridge;
 
@@ -8,7 +9,7 @@ use jamstream_audio_io::CallbackBridge;
 /// once and in order.
 #[test]
 fn capture_round_trip_preserves_order_across_wrap() {
-    let (mut device, mut engine) = CallbackBridge::new(32);
+    let (mut device, mut engine) = CallbackBridge::new(32, 32);
     let mut next_push = 0u32;
     let mut next_pull = 0u32;
     let mut chunk = [0.0f32; 7];
@@ -40,7 +41,7 @@ fn capture_round_trip_preserves_order_across_wrap() {
 /// Playout direction, same shape: engine pushes, device callback drains.
 #[test]
 fn playout_round_trip_preserves_order_across_wrap() {
-    let (mut device, mut engine) = CallbackBridge::new(32);
+    let (mut device, mut engine) = CallbackBridge::new(32, 32);
     let mut next_push = 0u32;
     let mut next_pull = 0u32;
     let mut chunk = [0.0f32; 5];
@@ -64,7 +65,7 @@ fn playout_round_trip_preserves_order_across_wrap() {
 
 #[test]
 fn playback_underrun_fills_silence_and_counts() {
-    let (mut device, mut engine) = CallbackBridge::new(16);
+    let (mut device, mut engine) = CallbackBridge::new(16, 16);
 
     let mut out = [1.0f32; 4];
     device.on_playback(&mut out);
@@ -81,7 +82,7 @@ fn playback_underrun_fills_silence_and_counts() {
 
 #[test]
 fn capture_overrun_drops_tail_and_counts() {
-    let (mut device, mut engine) = CallbackBridge::new(4);
+    let (mut device, mut engine) = CallbackBridge::new(4, 4);
 
     device.on_capture(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     assert_eq!(engine.overruns(), 1);
@@ -92,11 +93,59 @@ fn capture_overrun_drops_tail_and_counts() {
     assert_eq!(&out[..4], &[1.0, 2.0, 3.0, 4.0]);
 }
 
+/// The two capacities belong to their own rings. Capture is drained to empty
+/// by its consumer and playout is kept full by its producer, so a client may
+/// take a deep capture ring and a shallow playout one. Transposing the
+/// arguments fails here.
+#[test]
+fn the_two_rings_are_sized_apart() {
+    let (mut device, mut engine) = CallbackBridge::new(16, 4);
+
+    device.on_capture(&[1.0; 16]);
+    assert_eq!(engine.overruns(), 0, "the capture ring holds sixteen");
+
+    assert_eq!(
+        engine.push_playout(&[2.0; 16]),
+        4,
+        "the playout ring holds four"
+    );
+}
+
+/// Capture that arrives before the consumer's first drain is destroyed unless
+/// the ring can hold it, which is every session's first moments: the device
+/// runs on the sound card's clock while the worker still has work to do.
+///
+/// Counted in callbacks rather than timed, so a loaded runner cannot change the
+/// answer. A real CoreAudio device delivers 120-frame callbacks 2.5 ms apart
+/// and takes past 20 ms to hand the stream over, so eight of them is the window
+/// a ring has to survive; two callbacks of capacity holds 5 ms of it.
+#[test]
+fn a_ring_holds_what_arrives_before_the_consumer_starts() {
+    const CALLBACK: usize = 240;
+    const BRING_UP: usize = 8;
+
+    for (capacity, want_drops) in [(2 * CALLBACK, true), (16 * CALLBACK, false)] {
+        let (mut device, mut engine) = CallbackBridge::new(capacity, CALLBACK);
+        for _ in 0..BRING_UP {
+            device.on_capture(&[1.0; CALLBACK]);
+        }
+        let mut buf = vec![0.0f32; capacity];
+        let got = engine.pull_captured(&mut buf);
+        let overruns = engine.overruns();
+        assert_eq!(
+            overruns > 0,
+            want_drops,
+            "a ring of {capacity} samples saw {overruns} overruns holding \
+             {BRING_UP} callbacks of {CALLBACK}, and the first drain took {got}"
+        );
+    }
+}
+
 /// The DuplexHandler produced by into_handler shares the same rings and
 /// counters as the methods on DeviceSide.
 #[test]
 fn counters_visible_through_handler_path() {
-    let (device, mut engine) = CallbackBridge::new(4);
+    let (device, mut engine) = CallbackBridge::new(4, 4);
     let mut handler = device.into_handler();
 
     handler.on_capture(&[1.0, 2.0, 3.0, 4.0, 5.0]);
