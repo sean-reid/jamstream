@@ -15,7 +15,7 @@
 //! The encoding is split from the cell it lives in so a test can exercise it
 //! on a cell of its own. A process-wide value serialized by a comment saying
 //! only one test touches it is one added test away from a race, so the rule
-//! is held two ways instead (#395). A new test in this file fails the build
+//! is held two ways instead. A new test in this file fails the build
 //! until its author has said which kind it is, and a test anywhere in the
 //! crate that reaches the cell claims it, so a second toucher fails under
 //! libtest, which is where the two of them share a process.

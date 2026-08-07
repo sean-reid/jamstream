@@ -1,5 +1,5 @@
-//! Which rung of the #347 sample-rate ladder each direction of a stream
-//! landed on.
+//! Which rung of the sample-rate ladder each direction of a stream landed
+//! on.
 //!
 //! The wire and engine run 48 kHz whatever the device does; what varies per
 //! machine is how a direction gets there, and every answer that is not
@@ -22,7 +22,7 @@ pub enum RateOutcome {
     ClockSet { from: u32 },
     /// The OS carries the session-rate stream over a device engine running
     /// at its own rate (WASAPI render's AUTOCONVERTPCM, the PipeWire graph).
-    /// Accepted by design since #347, disclosed like our own converter.
+    /// Accepted by design because it is disclosed like our own converter.
     OsConverted { device: u32 },
     /// The boundary converter in `resample` carries the difference (rung 3),
     /// adding `added_ms` of latency on this direction. The figure comes from

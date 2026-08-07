@@ -35,7 +35,7 @@ impl CallbackBridge {
     /// device plays out of and every sample of it is latency. The capture ring
     /// is drained to empty by its consumer, so its capacity is only how long
     /// that consumer may be held up before audio is lost, and costs nothing
-    /// while the consumer keeps up (#436).
+    /// while the consumer keeps up.
     // The two halves are the product; CallbackBridge itself is never held.
     #[allow(clippy::new_ret_no_self)]
     #[must_use]

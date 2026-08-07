@@ -13,10 +13,10 @@ mod rate;
 mod types;
 mod wav;
 
-/// The device-boundary sample-rate converter (#347 rung 3). Public and hidden
-/// rather than crate-private because it runs inside device callbacks and
-/// `benches/resample.rs` is what keeps a number on that; a bench is its own
-/// crate and can reach nothing less.
+/// The device-boundary sample-rate converter, rung 3 of the ladder. Public
+/// and hidden rather than crate-private because it runs inside device
+/// callbacks and `benches/resample.rs` is what keeps a number on that; a
+/// bench is its own crate and can reach nothing less.
 #[doc(hidden)]
 pub mod resample;
 
