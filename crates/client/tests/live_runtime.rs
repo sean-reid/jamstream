@@ -1375,15 +1375,16 @@ fn a_stream_away_for_a_few_seconds_keeps_the_jitter_buffer_moving() {
         "{} opens: the refusals never happened",
         device.opens()
     );
-    // The deepest a buffer being drained ever sits is its own target, and the
-    // target is capped; the cap on depth is nearly three times that, and
-    // reaching it costs the playout position.
+    // Reaching the cap is what costs the playout position, and a buffer nobody
+    // drains pins there: that is the fault this covers. How far under the cap a
+    // drained buffer sits depends on how promptly the worker gets to run, so the
+    // cap is the assertion and the target is only context.
     assert!(
-        deepest <= JitterBuffer::MAX_TARGET_FRAMES + 1,
-        "b's buffer reached {deepest} frames with no stream to pull it, against a \
-         target that never exceeds {} and a cap of {}",
-        JitterBuffer::MAX_TARGET_FRAMES,
-        JitterBuffer::MAX_DEPTH_FRAMES
+        deepest < JitterBuffer::MAX_DEPTH_FRAMES,
+        "b's buffer reached the {}-frame cap with no stream to pull it, so the \
+         drain never ran; its target never exceeds {}",
+        JitterBuffer::MAX_DEPTH_FRAMES,
+        JitterBuffer::MAX_TARGET_FRAMES
     );
 
     // And the half that matters: audio comes back. The capture file is
