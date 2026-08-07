@@ -12,6 +12,8 @@ Playing alone on one machine also works.
 
 ## The limits, honestly
 
+Broadcasting to Twitch or YouTube Live from a local session needs `ffmpeg` and `mediamtx` on your `PATH`, which the app does not bundle, and does not work on Windows yet. [Streaming](streaming.md#when-a-session-cannot-stream) has the details. Everything else about a local session, including recording, needs nothing installed.
+
 An invite that names 192.168.1.12 means nothing outside your network. Reaching a local session across the internet would take router port forwarding: forwarding the session's UDP port to this computer in your router's admin pages, a public IP that many home connections behind carrier NAT do not have, and an invite carrying that public address, which the current build cannot mint (invites carry the network address it discovers, and multi-address invites are future work). JamStream automates none of that. If anyone is joining from outside your network, host in the cloud instead; see [Provider setup](providers.md).
 
 ## Ending and the idle exit
