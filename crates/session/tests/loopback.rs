@@ -1637,8 +1637,8 @@ fn readiness_seen(h: &Harness, i: usize) -> Vec<BroadcastReadiness> {
 }
 
 /// A session that cannot broadcast has to say so to the room, and keep saying
-/// it to whoever arrives later. Before this the only record of it was a line in
-/// a console log nobody can read (#440).
+/// it to whoever arrives later. A line in a console log is not a record anyone
+/// in the room can read.
 #[test]
 fn a_session_that_cannot_broadcast_tells_everyone_and_every_late_joiner() {
     let mut h = Harness::new(10, 20);
@@ -2089,8 +2089,8 @@ fn revoke_ejects_and_blocks_rejoin() {
 
 /// What jamstreamd does with a panic it caught partway through a datagram:
 /// drop that one peer, whose state is what stopped being trustworthy, and keep
-/// serving everyone else. Before this the unwind left the run loop and took the
-/// whole session down.
+/// serving everyone else. An unwind that reaches the run loop takes the whole
+/// session down with it.
 #[test]
 fn dropping_one_peer_leaves_the_rest_of_the_session_playing() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
@@ -2247,12 +2247,11 @@ fn timeout_then_rejoin_with_same_token() {
 /// The middle state, end to end: a member the server has stopped hearing from
 /// but has not given up on.
 ///
-/// Before this the roster had two states and the gap between them was ten
-/// seconds long (#285). A client saw everyone present, then saw one of them
-/// gone, and had nothing to show in between, which is exactly the stretch
-/// where a musician wants to know that the bass has stalled rather than
-/// stopped playing. The server is the only party that can tell: it is the only
-/// one that receives every member's packets.
+/// Without it the roster has two states with ten seconds between them: everyone
+/// present, then one of them gone, and nothing to show over exactly the stretch
+/// where a musician wants to know that the bass has stalled rather than stopped
+/// playing. The server is the only party that can tell, being the only one that
+/// receives every member's packets.
 ///
 /// Times are counted from B's last packet. MEMBER_QUIET_AFTER_MS is 2 s and
 /// the timeout is 10 s, so 1.8 s is inside the healthy window, 2.4 s is quiet,
@@ -2472,8 +2471,7 @@ fn version_reject_rate_limited_and_verified() {
 
 /// A reject is a report, not an ending. The client keeps handing the same
 /// init back at a widening interval, so a session that migrates or is
-/// redeployed onto a build it can talk to is joined without a restart. This
-/// used to be terminal: `poll` did nothing at all in the rejected state.
+/// redeployed onto a build it can talk to is joined without a restart.
 #[test]
 fn a_rejected_client_joins_when_the_server_starts_answering() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
@@ -2621,13 +2619,11 @@ fn an_honest_client_joins_through_an_init_flood() {
     );
 }
 
-/// The listener half of the same rule, which the server enforced with
-/// nothing holding it to it. It also pins the two caps as separate counters:
-/// a sold-out gallery must not cost the band a seat, which is the failure a
-/// single shared count would produce. The refusal must cost the session
-/// nothing either: the gallery keeps hearing the broadcast, and the refused
-/// client is told the gallery is full rather than left to time out, which is
-/// what it used to get.
+/// The listener half of the same rule. It also pins the two caps as separate
+/// counters: a sold-out gallery must not cost the band a seat, which is the
+/// failure a single shared count would produce. The refusal must cost the
+/// session nothing either: the gallery keeps hearing the broadcast, and the
+/// refused client is told the gallery is full rather than left to time out.
 #[test]
 fn listener_capacity_enforced() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);

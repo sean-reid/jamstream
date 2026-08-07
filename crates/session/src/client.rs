@@ -1396,10 +1396,9 @@ mod tests {
         assert!(matches!(core.leave("bye"), Err(SessionError::NotJoined)));
     }
 
-    /// Holding an invite used to be enough to forge a reject, because the MAC
-    /// was keyed on the server public key every invite carries and the
-    /// resulting state was terminal. One 21-byte packet from a revoked member
-    /// wedged a victim for good.
+    /// An invite holder has everything a MAC keyed on the server public key
+    /// needs, so a reject cannot be trusted on that alone: one 21-byte packet
+    /// from a revoked member would wedge a victim for good.
     #[test]
     fn a_reject_forged_by_an_invite_holder_is_ignored() {
         let (inv, server) = invite_and_server(Role::Musician);
@@ -1434,9 +1433,9 @@ mod tests {
     }
 
     /// Anyone who can see a connecting client's address can spray handshake
-    /// responses. Each one used to consume the handshake state and mint a
-    /// fresh init, which left the server's answer to the init already sent
-    /// unreadable, so the spray alone kept the client out of the session.
+    /// responses, so none of them may consume the handshake state and mint a
+    /// fresh init: that leaves the server's answer to the init already sent
+    /// unreadable, and the spray alone keeps the client out of the session.
     #[test]
     fn forged_handshake_responses_do_not_disturb_the_handshake() {
         let (mut core, first) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
@@ -1483,10 +1482,9 @@ mod tests {
         wire::build_capacity_reject(&key, init)
     }
 
-    /// A sold-out session used to be indistinguishable from a server that was
-    /// down: the init was dropped and the client reported its own 10 s
-    /// timeout. It now says what is true, keeps the same init on offer, and
-    /// joins when a seat frees, with no timeout in between.
+    /// A sold-out session says so, keeps the same init on offer, and joins when
+    /// a seat frees, with no timeout in between. Dropping the init instead
+    /// leaves it indistinguishable from a server that is down.
     #[test]
     fn a_full_session_is_reported_and_kept_trying_for() {
         let (inv, server) = invite_and_server(Role::Listener);
@@ -1584,9 +1582,9 @@ mod tests {
 
     /// A challenge does not prove the server sent it (any invite holder on
     /// the path holds the reply key and this init), so a client that swapped
-    /// its plain init for a cookied one would have lost its join to exactly
-    /// the trick a forged handshake response used to play. Both forms go out,
-    /// always, and the server takes whichever it can use.
+    /// its plain init for a cookied one would lose its join to a forged
+    /// challenge. Both forms go out, always, and the server takes whichever it
+    /// can use.
     #[test]
     fn a_cookie_is_offered_alongside_the_plain_init_never_instead_of_it() {
         let (inv, server) = invite_and_server(Role::Musician);
@@ -1725,8 +1723,8 @@ mod tests {
     /// init it answers. Sealed over anybody else's init, under the right key
     /// and by the right server, it is still not an answer to ours: it draws
     /// no packet, spends no budget, and cannot displace the cookie this
-    /// client already holds. This is the off-path forgery of issue #203,
-    /// which used to displace the held cookie for free.
+    /// client already holds. That is what keeps an off-path forgery from
+    /// costing the client its cookie for free.
     #[test]
     fn a_challenge_for_a_different_init_is_rejected() {
         let (inv, server) = invite_and_server(Role::Musician);
