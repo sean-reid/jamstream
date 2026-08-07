@@ -406,8 +406,8 @@ const LEAD_MAX: f32 = 140.0;
 /// after the lead, so content that has to fit knows what it has to fit in.
 ///
 /// The lead is capped by the space actually spare, measured from the column
-/// drawn last frame: a sixth of a 600 px window spent above the wizard's card
-/// is what put the card's own Launch button past the bottom edge (#179).
+/// drawn last frame: an uncapped lead spent above the content can push its
+/// own bottom edge, and whatever sits on it, past the window.
 pub fn focused_column(ui: &mut Ui, max_w: f32, room: f32, add: impl FnOnce(&mut Ui, f32)) {
     let w = ui.available_width().min(max_w);
     let pad = ((ui.available_width() - w) / 2.0).max(0.0);
@@ -465,10 +465,10 @@ pub fn mono_drag(ui: &mut Ui, drag: egui::DragValue<'_>) -> egui::Response {
 
 /// "$0.14" from microdollars: cents, and exactly two decimals.
 ///
-/// Rounded to the cent before formatting, not to four decimals. The bar read
-/// `$0.0133 so far`, which is four significant digits of a fraction of a cent
-/// in the one readout a musician glances at mid-song (#189). A session's cost
-/// is worth watching at the cent; below that it is noise that moves.
+/// Rounded to the cent before formatting, not to four decimals: a fraction
+/// of a cent is noise in the one readout a musician glances at mid-song. A
+/// session's cost is worth watching at the cent; below that it is noise
+/// that moves.
 pub fn microusd(micro: u64) -> String {
     const CENT: u64 = 10_000;
     jamstream_cloud::format_microusd((micro + CENT / 2) / CENT * CENT)
@@ -723,7 +723,7 @@ mod tests {
     /// The colour every verbatim failure reason in the app is set in, on every
     /// surface one lands on. `danger` itself measured 4.22:1 on surface1 in
     /// dark, and the test above could not see it because it only ever asked
-    /// about the two text steps (#192).
+    /// about the two text steps.
     #[test]
     fn a_failure_reason_reads_on_every_surface_it_can_land_on() {
         for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {

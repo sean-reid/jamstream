@@ -88,7 +88,7 @@ impl HomeScreen {
                 ui.label(theme::title(ui, "Join a session"));
                 // The name first: it is who the roster and the take files
                 // will say you are, and it is remembered, so most days it is
-                // already filled in (#357).
+                // already filled in.
                 ui.horizontal(|ui| {
                     ui.label(theme::muted(ui, "your name"));
                     ui.add(
@@ -171,13 +171,12 @@ impl HomeScreen {
                     ));
                 }
                 // A record of what happened, not a list of things to press.
-                // These rows had no rejoin, no end, and no click, and they
-                // read as a list you could act on because each one carried
-                // three type treatments in one line: a mono id, the
-                // provider and region proportional and muted, then the
-                // status back in mono (#187). The id is the one thing here
-                // that is a number, so it keeps the monospace; everything
-                // else is a sentence about a session that is over.
+                // These rows have no rejoin, no end, and no click, so they
+                // carry only two type treatments: a mono id, and everything
+                // else in one muted, proportional sentence. The id is the
+                // one thing here that is a number, so it keeps the
+                // monospace; everything else is a sentence about a session
+                // that is over.
                 for row in recent {
                     ui.horizontal(|ui| {
                         ui.label(theme::mono_muted(ui, row.short_id.clone()));

@@ -15,7 +15,7 @@ pub struct DeviceInfo {
     pub id: Option<String>,
     /// Buffer size bounds in frames, where the backend reports them. The
     /// buffer picker annotates choices outside them; a device is free to
-    /// deliver its own period regardless (#328).
+    /// deliver its own period regardless.
     pub min_buffer_frames: Option<u32>,
     pub max_buffer_frames: Option<u32>,
 }
@@ -138,9 +138,9 @@ pub fn buffer_bounds(
 
 /// The annotation a buffer choice earns against the device's own bounds, or
 /// `None` inside them. The choice stays clickable either way: the device
-/// negotiates what it really delivers and the ring follows it (#355), so a
-/// pick below the minimum costs the minimum, and the row says so instead of
-/// showing 2.5 ms while the device runs 10 (#328).
+/// negotiates what it really delivers and the ring follows it, so a pick
+/// below the minimum costs the minimum, and the row says so instead of
+/// showing 2.5 ms while the device runs 10.
 pub fn buffer_choice_note(frames: u32, bounds: (Option<u32>, Option<u32>)) -> Option<String> {
     let (min, max) = bounds;
     if let Some(min) = min
@@ -163,7 +163,7 @@ pub struct DevicesScreen {
     /// Whether an open may take the device exclusively (Windows). On by
     /// default: exclusive is the low-latency path the product exists for,
     /// but it mutes every other stream on the endpoint, so the setting and
-    /// its cost are on the tab instead of being a silent policy (#331).
+    /// its cost are on the tab instead of being a silent policy.
     pub allow_exclusive: bool,
     /// What the last rescan had to say for itself: a selection that fell back
     /// to the system default because its device is gone, or a scan that
@@ -185,9 +185,9 @@ impl Default for DevicesScreen {
 }
 
 /// What the stream has to say for itself under the pickers: the refusal
-/// reason while there is no stream, and the rate disclosures (#347) while
-/// there is one. Both are consequences of the pick, so they render beside
-/// the controls that made it.
+/// reason while there is no stream, and the rate disclosures while there
+/// is one. Both are consequences of the pick, so they render beside the
+/// controls that made it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamNotes<'a> {
     pub refusal: Option<&'a str>,
@@ -231,10 +231,9 @@ impl Block {
 impl DevicesScreen {
     /// The audio blocks, as the settings drawer's Audio tab.
     ///
-    /// There is no full-screen route any more. It was reachable from nothing
-    /// but a snapshot fixture, which made its baseline a picture of dead code
-    /// (#191); the tab is where these controls have lived since the drawer
-    /// existed, and it is reachable from every screen.
+    /// These controls live in the drawer's Audio tab and nowhere else, so
+    /// they are reachable from every screen rather than only from a snapshot
+    /// fixture, which would make the baseline a picture of dead code.
     ///
     /// Buffer size and the input meter come first because they are what a
     /// musician reaches for mid session, by ear and by meter, while the
@@ -244,7 +243,7 @@ impl DevicesScreen {
     /// there is no stream, the rate disclosures while there is one. The
     /// pickers are what a musician came here to change, so both belong
     /// beside them rather than only over the mixer they cannot see with
-    /// this drawer open (#263).
+    /// this drawer open.
     pub fn audio_ui(
         &mut self,
         ui: &mut Ui,
@@ -374,9 +373,9 @@ impl DevicesScreen {
                 .small(),
             );
             // How the running stream reaches 48 kHz, when that is anything
-            // other than the device's own clock (#347): the consequence of
-            // the pick belongs beside the pickers that made it. Muted, not a
-            // warning; the stream is working.
+            // other than the device's own clock: the consequence of the pick
+            // belongs beside the pickers that made it. Muted, not a warning;
+            // the stream is working.
             for line in notes.rate_lines {
                 ui.add_space(theme::SPACE_XS);
                 ui.label(theme::muted(ui, line.clone()).small());
@@ -471,9 +470,9 @@ mod tests {
         assert_eq!(buffer_bounds(&DeviceCatalog::demo(), 0, 0), (None, None));
     }
 
-    /// The shape of #328: "120 frames (2.5 ms)" picked on a device whose
-    /// period is 480 gets an annotation naming the 480 it will really get,
-    /// and choices inside the bounds stay unannotated.
+    /// The buffer-bounds annotation: "120 frames (2.5 ms)" picked on a
+    /// device whose period is 480 gets an annotation naming the 480 it will
+    /// really get, and choices inside the bounds stay unannotated.
     #[test]
     fn choices_outside_the_devices_bounds_say_what_the_device_delivers() {
         let bounds = (Some(480), Some(4800));

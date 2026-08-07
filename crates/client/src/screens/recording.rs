@@ -718,7 +718,7 @@ fn hex(bytes: &[u8]) -> String {
 /// refusing a write, so the remedy is about writing the recordings prefix
 /// and setting the lifecycle rule, and the closing verb is this tab's own
 /// Check. The provider's response goes to the log; for S3 it is a document
-/// naming the account number and the IAM ARN (#374).
+/// naming the account number and the IAM ARN.
 fn check_failure(provider: ProviderKind, err: &jamstream_cli::CliError) -> String {
     reason::error_sentence("checking the bucket", Attempt::Probe, Some(provider), err)
 }
@@ -832,10 +832,10 @@ mod tests {
         assert!(panel.setup(None).refusal().is_some());
     }
 
-    /// #374: a bucket that refused the Check put its whole answer on screen,
-    /// and for S3 that answer names the account number, the IAM ARN, a
-    /// RequestId and a HostId. What the pane draws is the sentence, with the
-    /// write permissions to add; the document is in the log.
+    /// A refused Check's full answer, for S3, names the account number, the
+    /// IAM ARN, a RequestId and a HostId. What the pane draws is the remedy
+    /// sentence, with the write permissions to add; the full document goes
+    /// to the log, not the screen.
     #[test]
     fn a_refused_check_draws_the_remedy_and_not_the_buckets_answer() {
         let denied = jamstream_cli::CliError::Provider(jamstream_cloud::ProviderError::Auth(

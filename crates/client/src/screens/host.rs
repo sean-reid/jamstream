@@ -681,7 +681,7 @@ impl HostWizard {
         };
         // Resolved against the architecture this provider launches, and
         // refused here if that architecture has no pin: the machine would
-        // download a binary it cannot run (#139).
+        // download a binary it cannot run.
         let (artifact_url, artifact_sha256) = match resolve_artifact(
             provider.kind() == ProviderKind::Local,
             provider.server_arch(),
@@ -723,10 +723,9 @@ impl HostWizard {
         true
     }
 
-    /// Stops waiting on a launch and goes back to the preview. The step used
-    /// to have no Cancel and no Back until an error arrived, so a reachability
-    /// check that never passed left quitting the app as the only way out
-    /// (#177).
+    /// Stops waiting on a launch and goes back to the preview. This gives the
+    /// Launching step a way out even when the reachability check never
+    /// passes; without it, quitting the app is the only way out.
     ///
     /// The work itself cannot be interrupted: it is a future on the executor
     /// and it may still bring a machine up. So this drops the result rather
@@ -931,7 +930,7 @@ pub async fn check_provider(provider: Box<dyn Provider>) -> Result<(), String> {
 /// provider's machine API saying no, so the remedy is about the scopes and
 /// the policy that launch machines, never a bucket. The provider's own
 /// response goes to the log, because an EC2 403 names the account number and
-/// the IAM ARN of the key that was refused (#374).
+/// the IAM ARN of the key that was refused.
 fn machine_failure(
     doing: &str,
     provider: ProviderKind,
@@ -1056,9 +1055,9 @@ async fn launch_session(
     //
     // Applied, not necessarily enforced. The call answers with what the bucket
     // actually agreed to, and a key that cannot read a lifecycle rule back
-    // leaves the choice unenforced with a note saying so. That answer rides out
-    // in the outcome; dropping it is what made an unenforced choice invisible
-    // until the bill arrived (#257).
+    // leaves the choice unenforced with a note saying so. That answer rides
+    // out in the outcome, so a host sees an unenforced retention choice
+    // before arming the recording, not after the bill arrives.
     let retention = match &params.recording {
         Some(storage) => Some(
             jamstream_cli::host::verify_bucket(storage, &session_hex)
@@ -1429,7 +1428,7 @@ impl HostWizard {
         };
         // Indented under the provider row it belongs to, not framed: a panel
         // inside the step card is a card in a card, and the destinations sheet
-        // states that rule for the same job and follows it (#192).
+        // states that rule for the same job and follows it.
         ui.indent("provider-setup", |ui| {
             ui.set_width(ui.available_width());
             match kind {
@@ -1590,7 +1589,7 @@ impl HostWizard {
             // Amber, not danger: nothing failed and nothing was lost, the table
             // is still complete, and a region is still pickable on price. The
             // session-full message on the mixer argues the same case and picks
-            // the same colour (#192).
+            // the same colour.
             let p = theme::palette_of(ui);
             ui.label(
                 RichText::new("No region answered a probe, so none of them are timed.")
@@ -2337,10 +2336,10 @@ mod tests {
         }
     }
 
-    /// #139 root cause: the pin followed the build, not the machine. The
-    /// launch must select by the provider's architecture, and the real
-    /// providers disagree (AWS launches arm64, DigitalOcean x86_64), so a
-    /// single-pin resolution cannot be right for both.
+    /// The pin follows the machine, not the build: the launch must select
+    /// by the provider's architecture, and the real providers disagree (AWS
+    /// launches arm64, DigitalOcean x86_64), so a single-pin resolution
+    /// cannot be right for both.
     #[test]
     fn the_launch_selects_the_pin_for_the_providers_architecture() {
         let pins = both_pins();
@@ -2370,8 +2369,9 @@ mod tests {
     }
 
     /// A cloud launch whose architecture has no pin must refuse before a
-    /// machine is paid for, and the error must name the architecture,
-    /// because launching would produce exactly the dead VM of #139.
+    /// machine is paid for, and the error must name the architecture:
+    /// launching anyway would produce a machine that cannot run the binary
+    /// it downloads.
     #[test]
     fn a_missing_arch_pin_refuses_to_launch_naming_the_architecture() {
         let x86_only = PinnedServerArtifacts {
@@ -2394,12 +2394,10 @@ mod tests {
         assert!(err.contains("advanced"), "error was: {err}");
     }
 
-    /// #384: the wizard and `jamstream host` take the same operator-typed
-    /// artifact pair, and for a while only the CLI checked it, so a typo in
-    /// the app bought a launch, a boot and a self-destruct before anyone
-    /// heard about it. Both go through one resolver now, and this pins them
-    /// to it: every refusal the CLI gives is the refusal the wizard gives,
-    /// word for word.
+    /// The wizard and `jamstream host` take the same operator-typed artifact
+    /// pair and both validate it through one resolver, so a typo in the app
+    /// is caught before it buys a launch, a boot and a self-destruct: every
+    /// refusal the CLI gives is the refusal the wizard gives, word for word.
     #[test]
     fn the_wizard_refuses_a_bad_artifact_pair_exactly_as_the_cli_does() {
         let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
@@ -2463,11 +2461,11 @@ mod tests {
         assert_eq!(w.step, WizardStep::Provider);
     }
 
-    /// #177: the launching step had no way out until an error arrived, and a
-    /// reachability check that never passes produces no error for 60 seconds.
-    /// Stopping the wait goes back to the preview and says what may be
-    /// running, and the job that cannot be interrupted is dropped rather than
-    /// left to drag the wizard back into the session.
+    /// The launching step needs a way out even when a reachability check
+    /// never passes and produces no error for 60 seconds. Stopping the wait
+    /// goes back to the preview and says what may be running, and the job
+    /// that cannot be interrupted is dropped rather than left to drag the
+    /// wizard back into the session.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stopping_a_wait_returns_to_the_preview_and_says_what_may_be_running() {
         let mut w = wizard();

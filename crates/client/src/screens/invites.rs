@@ -71,7 +71,7 @@ pub struct Seat {
     pub invite: Option<SeatInvite>,
     /// The name the invite was minted for, from the token's own `name_hint`:
     /// the link knows who it is for, so the row can say whose seat is still
-    /// empty (#357).
+    /// empty.
     pub hint: Option<String>,
     /// Who the revoke removed, kept greyed on the row as context. Cleared
     /// when someone else takes the seat.
@@ -808,8 +808,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// A link minted for somebody carries their name in the token (#357):
-    /// the roster and the take files read it from the first packet, and the
+    /// A link minted for somebody carries their name in the token: the
+    /// roster and the take files read it from the first packet, and the
     /// seat row says whose link is still unused. The name field is consumed
     /// by the mint that uses it, so the next link is not accidentally Ana's
     /// too.
@@ -994,15 +994,15 @@ mod tests {
         (provider, state, path)
     }
 
-    /// #195 and #196, asserted where they happened: on the app's own end, at
-    /// the effects rather than at the status word. The state file lands on disk
-    /// without the issuer key, the provider is asked to collect the firewall
-    /// the launch opened, and none of that session's ingress is left.
+    /// Asserted where it happens: on the app's own end, at the effects
+    /// rather than at the status word. The state file lands on disk without
+    /// the issuer key, the provider is asked to collect the firewall the
+    /// launch opened, and none of that session's ingress is left.
     ///
-    /// Both defects survived a test each. `wizard_local.rs` asserted the status
-    /// string this function writes and `host_flow.rs` asserted the key on the
-    /// CLI's path, so each surface was covered by a test that could not see the
-    /// other one's hole.
+    /// `wizard_local.rs` asserts the status string this function writes and
+    /// `host_flow.rs` asserts the key on the CLI's path; neither surface's
+    /// test alone can see a hole on the other one's side, so this test
+    /// checks both effects together.
     #[tokio::test]
     async fn ending_a_session_from_the_app_takes_the_key_and_the_firewall_with_it() {
         use jamstream_cloud::mock::Call;

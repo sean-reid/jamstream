@@ -57,21 +57,22 @@ pub const PRESENCE_AWAY: &str = "not connected";
 ///
 /// Being here is the assumption, so it is nearly silent: a filled dot barely
 /// off the panel. Ten bright dots in a healthy band all said nothing happened,
-/// and the one state worth catching mid-song was the quiet one (#254). Gone is
+/// and the one state worth catching mid-song was the quiet one. Gone is
 /// the ring, at the step this console uses for things that are off, alongside
 /// the whole strip greying out.
 ///
-/// `quiet` is the window in between, which had no indicator at all: the server
-/// has not heard from this member for `MEMBER_QUIET_AFTER_MS`, and will not give
-/// up on them for eight seconds more. A stall and a musician playing looked
-/// identical for that whole window, which is the state worth catching mid-song
-/// (#285). It is still filled, because they are still connected and still
-/// holding their seat; the shape carries here against gone, the way the strip's
-/// grey-out does, and the amber is the exception inside here.
+/// `quiet` is the window in between: the server has not heard from this
+/// member for `MEMBER_QUIET_AFTER_MS`, and will not give up on them for
+/// eight seconds more. Without an indicator, a stall and a musician playing
+/// would look identical for that whole window, which is the state worth
+/// catching mid-song. It is still filled, because they are still connected
+/// and still holding their seat; the shape carries here against gone, the
+/// way the strip's grey-out does, and the amber is the exception inside
+/// here.
 ///
 /// Amber and not green. Green is the meter's vocabulary and encodes a level, so
-/// a green dot beside Ana would claim a per-member link quality this side cannot
-/// measure, which is the defect #174 fixed. This amber claims no level: it is
+/// a green dot beside Ana would claim a per-member link quality this side
+/// cannot measure. This amber claims no level: it is
 /// the colour `theme::style` already sets as the app's warning ink, and it is
 /// reporting a fact the server asserted. When per-member rtt and loss do arrive
 /// with the Stats control message the dot has a real level and the rest of the
@@ -95,8 +96,8 @@ pub fn presence_dot(ui: &mut Ui, connected: bool, quiet: bool) {
         match presence_ink(p, quiet) {
             // The lamp's own lit form, rim and all, because that is what this
             // is: the one indicator in the strip that is on rather than
-            // resting. The rim is also the cue that survives the colour being
-            // missed, which is what #254 asked for.
+            // resting. The rim is also the cue that survives the colour
+            // being missed.
             (fill, Some(rim)) => {
                 ui.painter()
                     .circle(rect.center(), 4.0, fill, Stroke::new(1.0, rim));
@@ -165,11 +166,11 @@ mod tests {
     /// is where it bites, and it is why the amber is stepped rather than taken
     /// straight off the palette, which lands at 2.25:1 against the resting dot.
     ///
-    /// The last two assertions are #254's other constraint: colour must not be
-    /// the only difference, and the step must not turn the warning into some
-    /// fourth colour. The lit dot carries a rim and the resting one does not, so
-    /// the two are different marks before they are different colours, which is
-    /// the same argument `LampShape` settles for the status bar's cluster.
+    /// The last two assertions check that colour is not the only difference,
+    /// and that the step does not turn the warning into some fourth colour.
+    /// The lit dot carries a rim and the resting one does not, so the two are
+    /// different marks before they are different colours, which is the same
+    /// argument `LampShape` settles for the status bar's cluster.
     #[test]
     fn the_quiet_dot_reads_against_the_panel_and_is_not_only_a_colour() {
         for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
@@ -195,7 +196,7 @@ mod tests {
             );
             // Present is still colourless: the panel nudged toward the strip's
             // own text colour, not a level. A green dot would claim a
-            // per-member reading this side cannot measure (#174).
+            // per-member reading this side cannot measure.
             assert_eq!(here, theme::blend(p.surface1, p.text_primary, 0.2));
         }
     }
