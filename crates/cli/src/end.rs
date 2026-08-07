@@ -115,5 +115,13 @@ pub async fn run<W: Write>(
         &session.session_id_hex[..8.min(session.session_id_hex.len())],
         session.instance_id
     )?;
+    // The machine is gone and so is its journal, so this is the only copy of
+    // why anything on it failed. Named here because this is the moment a host
+    // goes looking, and nothing else on this side ever mentions the file.
+    if let Ok(log) = state::server_log_path_for(&session.session_id_hex)
+        && log.exists()
+    {
+        writeln!(out, "The session server's log is at {}.", log.display())?;
+    }
     Ok(())
 }

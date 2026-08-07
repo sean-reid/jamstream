@@ -126,10 +126,20 @@ async fn host_end_and_sweep_flow() {
     };
     let (found_path, found_session) = end::select(&end_args).unwrap();
     assert_eq!(found_path, path);
+    // The machine's journal dies with the machine, so the copy the host's
+    // client kept is the only one left and `end` is where a host goes looking.
+    let log = state::server_log_path_for(session_id).unwrap();
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, b"pusher exited with status 145\n").unwrap();
     let mut out = Vec::new();
     end::run(&found_path, found_session, &provider, &mut out)
         .await
         .unwrap();
+    let ending = String::from_utf8(out.clone()).unwrap();
+    assert!(
+        ending.contains(&log.display().to_string()),
+        "end never said where the server's log is: {ending}"
+    );
     assert!(provider.running_instances().is_empty());
     let ended = state::load(&path).unwrap();
     assert_eq!(ended.status, SessionStatus::Ended);
