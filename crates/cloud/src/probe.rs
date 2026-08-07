@@ -127,11 +127,10 @@ mod tests {
     /// held. Bound but never listened on, so a SYN draws RST while the port
     /// stays reserved.
     ///
-    /// Binding a listener and dropping it, which is what this used to do,
-    /// hands the port straight back to the kernel, and a sibling test in the
-    /// same binary can be given it before the probe runs. That is not
-    /// hypothetical: it failed exactly that way on main in run 30302091971,
-    /// reporting Some(0.039103) where the closed port should have been None.
+    /// Binding a listener and dropping it hands the port straight back to the
+    /// kernel, and a sibling test in the same binary can be given it before the
+    /// probe runs. That is not hypothetical: it reported Some(0.039103) on CI
+    /// where the closed port should have been None.
     fn reserved_closed_port() -> (TcpSocket, u16) {
         let socket = TcpSocket::new_v4().expect("v4 socket");
         socket

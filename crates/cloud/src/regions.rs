@@ -34,8 +34,8 @@ pub struct RegionTable {
 /// instance size is not available.
 ///
 /// A region that cannot run our instance is not an error, it is a region we
-/// cannot use, and it must not take the rest of the table with it: one
-/// missing size in `atl1` used to abort the whole DigitalOcean region step.
+/// cannot use, and it must not take the rest of the table with it: one missing
+/// size in `atl1` would otherwise abort the whole DigitalOcean region step.
 /// Everything else is a real failure and does stop the table, because a
 /// token that cannot read the size catalog at all, or a network that is
 /// down, would otherwise render as an empty list of regions, and a
@@ -103,9 +103,9 @@ mod tests {
         }
     }
 
-    /// The DigitalOcean defect in miniature: atl1 is a region the account
-    /// really offers, `s-2vcpu-2gb` really is not sold there, and the first
-    /// such region used to end the region step for every other region too.
+    /// atl1 is a region the account really offers and `s-2vcpu-2gb` really is
+    /// not sold there, so the first such region must not end the region step for
+    /// every other region too.
     #[tokio::test]
     async fn a_region_without_our_size_leaves_the_table_and_the_rest_stay() {
         let p = MockProvider::new(KIND)

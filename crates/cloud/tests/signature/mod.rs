@@ -1,10 +1,9 @@
 //! Recomputes a SigV4 signature from the request a wiremock fake received.
 //!
-//! Every fake in this crate used to check the shape of the `Authorization`
-//! header: that it starts with `AWS4-HMAC-SHA256 Credential=`, that a couple of
-//! headers exist. A store that signed a canonical request nobody sent, or
-//! signed everything with a constant, passed all of it, while the comment on
-//! the check claimed the fake was testing the signer.
+//! Checking the shape of the `Authorization` header, that it starts with
+//! `AWS4-HMAC-SHA256 Credential=` and that a couple of headers exist, proves
+//! nothing about a signer: a store that signed a canonical request nobody sent,
+//! or signed everything with a constant, satisfies all of it.
 //!
 //! So this rebuilds the canonical request out of what arrived on the wire (the
 //! method, the path, the query re-canonicalized by this file's own encoder, the

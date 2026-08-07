@@ -505,9 +505,8 @@ async fn keep_forever_clears_this_sessions_rule_and_leaves_the_rest() {
     });
     mount_bucket_get(&server, Some(json!([theirs.clone(), ours]))).await;
     Mock::given(method("PATCH"))
-        // Only this session's rule goes; the host's own stays. Sending an
-        // empty list, which is what "clear the expiration" used to mean,
-        // deleted every rule on the bucket.
+        // Only this session's rule goes; the host's own stays. An empty list
+        // here deletes every rule on the bucket.
         .and(body_json(json!({ "lifecycle": { "rule": [theirs] } })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)

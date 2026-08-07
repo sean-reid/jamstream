@@ -28,9 +28,9 @@ const SPACES_KEY_ID: &str = "DO00TEST";
 const SPACES_SECRET: &str = "spaces-secret";
 
 /// The name a take actually gets: the session prefix from the cloud crate, the
-/// file name from the recorder in the server crate. Written out here rather
-/// than built by a helper, because the helpers that used to name `mix.wav` are
-/// what made this suite test a scheme the product does not use.
+/// file name from the recorder in the server crate. Written out here rather than
+/// built by a helper, because a helper is free to name a scheme the product does
+/// not use and this suite would not notice.
 fn take_key() -> String {
     format!("{}jamstream-2026-07-25-1030-mix.flac", session_prefix("s1"))
 }
