@@ -220,7 +220,7 @@ impl AudioBackend for WindowsBackend {
         // The user said no to exclusive: go straight to shared, with no probe
         // to fall back from. The probe would grab the endpoint for a moment
         // even when it fails, which is exactly the interruption they opted
-        // out of (#331).
+        // out of.
         if !config.allow_exclusive {
             tracing::info!("exclusive mode is disallowed by the request; opening shared");
             return self.open_shared(capture, playback, config, handler);

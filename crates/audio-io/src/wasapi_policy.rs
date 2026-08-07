@@ -115,8 +115,8 @@ pub(crate) enum Fallback {
 /// error is the useful one. A device held exclusively by another application
 /// blocks shared clients as well: `AUDCLNT_E_DEVICE_IN_USE` fails shared-mode
 /// `Initialize` just like exclusive, so falling back only traded the
-/// classifier's words for cpal's generic "temporarily busy" error (#324).
-/// The microphone privacy toggle blocks every open the same way (#329).
+/// classifier's words for cpal's generic "temporarily busy" error.
+/// The microphone privacy toggle blocks every open the same way.
 pub(crate) const fn fallback_decision(failure: ExclusiveFailure) -> Fallback {
     match failure {
         ExclusiveFailure::InvalidConfig
