@@ -2028,58 +2028,44 @@ mod tests {
         assert_eq!(engine.overruns(), 0);
     }
 
-    /// The starvation in #436, at the shape a real device produces: 120-frame
-    /// callbacks 2.5 ms apart from a thread on its own clock, arriving while
-    /// the consumer is still coming up. The window is the measured one, a
-    /// CoreAudio open that had capture running more than 20 ms before the
-    /// caller held the handle.
+    /// The starvation in #436 at the shape a real device produces: 120-frame
+    /// callbacks arriving before the consumer's first drain exists. A CoreAudio
+    /// open had capture running more than 20 ms before the caller held the
+    /// handle, which at 2.5 ms a callback is eight of them.
     ///
-    /// Against the old shared capacity, two callbacks of ring, this drops
-    /// about eight callbacks of audio before the first drain. Nothing in the
-    /// suite could see that: the only backend a test can drive is pumped by
-    /// the worker itself, so the producer could never outrun the consumer.
+    /// Counted rather than timed. The producer is the device's clock in
+    /// production, but a test that sleeps for the window measures the runner's
+    /// scheduler instead: a loaded macOS runner stretched 20 ms to 145 ms and
+    /// delivered 58 callbacks where 8 were meant. Two callbacks of ring, the
+    /// old shared capacity, still drops this; the assertion below is what
+    /// separates them.
     #[test]
     fn a_capture_ring_absorbs_the_session_coming_up() {
         const FRAMES: u32 = 120;
-        const LATE: Duration = Duration::from_millis(20);
+        const BRING_UP: usize = 8;
         let callback = FRAMES as usize * usize::from(CHANNELS);
         let (mut device, mut engine) =
             CallbackBridge::new(capture_capacity(FRAMES), playout_capacity(FRAMES));
-        let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let producer = std::thread::Builder::new()
-            .name("device-paced-capture".into())
-            .spawn(move || {
-                let mut next = Instant::now();
-                while stop_rx.try_recv().is_err() {
-                    device.on_capture(&vec![1.0; callback]);
-                    next += TICK;
-                    let now = Instant::now();
-                    if next > now {
-                        std::thread::sleep(next - now);
-                    }
-                }
-            })
-            .expect("producer thread");
 
-        std::thread::sleep(LATE);
+        for _ in 0..BRING_UP {
+            device.on_capture(&vec![1.0; callback]);
+        }
         let mut buf = vec![0.0f32; capture_capacity(FRAMES)];
         let got = engine.pull_captured(&mut buf);
-        let overruns = engine.overruns();
-        let _ = stop_tx.send(());
-        let _ = producer.join();
 
         assert_eq!(
-            overruns,
+            engine.overruns(),
             0,
-            "{overruns} callbacks of capture were dropped while the consumer \
-             came up; the first drain took {got} samples of a \
-             {} sample ring",
+            "{} callbacks of capture were dropped while the consumer came up; \
+             the first drain took {got} samples of a {} sample ring",
+            engine.overruns(),
             capture_capacity(FRAMES)
         );
-        assert!(
-            got >= callback * 4,
-            "only {got} samples survived a {LATE:?} window, which is less than \
-             the device pushed, so the ring is not what absorbed it"
+        assert_eq!(
+            got,
+            BRING_UP * callback,
+            "the ring held {got} of the {} samples pushed before the first drain",
+            BRING_UP * callback
         );
     }
 
