@@ -1945,25 +1945,35 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     // reason, so each side has to have heard the other's tone. The personal mix
     // excludes self, so the tone measured is the one that crossed the wire.
     for (out, theirs, mine) in [(&out_a, 660.0, 440.0), (&out_b, 440.0, 660.0)] {
-        let (rate, samples) = tail(out, 1.0);
-        let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
-        let heard = tone_energy(&left, rate, theirs);
-        let own = tone_energy(&left, rate, mine);
+        // The loudest second, not the last one. The file runs from before the
+        // join to after the leave, so its ends are silence the backend wrote
+        // while nothing was playing: a slow runner put 1.75 s of it at the
+        // front and 0.75 s at the back, and the tail then measured the padding
+        // rather than the session.
+        let (rate, samples) = rate_and_samples(out);
+        let all: Vec<f32> = samples.iter().copied().step_by(2).collect();
+        let second = rate as usize;
         assert!(
-            left.len() >= rate as usize / 2,
+            all.len() >= second / 2,
             "{out:?} holds {} samples at {rate} Hz, under half a second, so there \
              is nothing to measure",
-            left.len()
+            all.len()
         );
+        let (heard, own) = all
+            .chunks(second)
+            .filter(|w| w.len() >= second / 2)
+            .map(|w| (tone_energy(w, rate, theirs), tone_energy(w, rate, mine)))
+            .max_by(|x, y| x.0.total_cmp(&y.0))
+            .expect("at least one window");
+
         // The floor comes first: a ratio between two noise floors decides
         // nothing, and a silent run reads single digits where a tone reads
         // thousands.
         assert!(
             heard > TONE_FLOOR,
-            "{out:?} heard {heard} at {theirs} Hz over {} samples, under the \
-             {TONE_FLOOR} floor, so that second carried no audio; its own \
-             {mine} Hz read {own}. The whole file: {}. The log holds: {}",
-            left.len(),
+            "{out:?} heard {heard} at {theirs} Hz in its loudest second, under \
+             the {TONE_FLOOR} floor, so no second of it carried audio; its own \
+             {mine} Hz read {own} there. The whole file: {}. The log holds: {}",
             tone_profile(out, theirs),
             std::fs::read_to_string(&log).unwrap_or_default()
         );
