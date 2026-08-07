@@ -41,10 +41,10 @@ const DRAWER_W: f32 = 340.0;
 /// backend and get the app's real wiring: the [`CostedRuntime`] wrapper, the
 /// invite book's token map, the panels the host screen hangs off.
 ///
-/// It is what closes #218. `enter_hosted_session` had no test caller at all and
-/// `wizard_local.rs` re-implemented its body by hand, so the app could have
-/// stopped wrapping in `CostedRuntime`, losing the cost meter and leaving the
-/// mixer's Revoke pointing at nothing, with the suite green.
+/// Sharing one joiner keeps `enter_hosted_session` under test instead of
+/// letting `wizard_local.rs` reimplement its body by hand, where the app
+/// could stop wrapping in `CostedRuntime`, losing the cost meter and
+/// leaving the mixer's Revoke pointing at nothing, with the suite green.
 pub type Joiner = Arc<
     dyn Fn(&jamstream_protocol::invite::Invite, AudioSettings) -> Result<LiveRuntime, LiveError>
         + Send
@@ -75,8 +75,7 @@ pub fn system_enumerator() -> Enumerator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Where the window is. There is no Devices screen: audio settings live in
-/// the drawer's Audio tab, which is reachable from everywhere, and the
-/// full-screen route was set from nowhere but a snapshot fixture (#191).
+/// the drawer's Audio tab, which is reachable from everywhere.
 pub enum Screen {
     Home,
     HostWizard,
@@ -140,7 +139,7 @@ pub struct JamApp {
     pub own_avatar: Option<AvatarHandle>,
     /// Your display name, as the join screen's field holds it: sent into
     /// presence at every join and remembered in the preferences, so the
-    /// roster stops calling people musician N (#357). Empty means unset and
+    /// roster stops calling people musician N. Empty means unset and
     /// nothing is sent.
     pub own_name: String,
     /// The same avatar's fitted bytes, kept so a join can announce it.
@@ -154,7 +153,7 @@ pub struct JamApp {
     pub enumerate: Enumerator,
     /// Where the audio setup is remembered between launches, `None` in tests
     /// and in-memory apps so no fixture reads or rewrites the developer's
-    /// own (#328).
+    /// own.
     pub settings_path: Option<std::path::PathBuf>,
     /// The log this run is writing, as [`crate::logging::init`] opened it.
     /// Set by main and nowhere else: a release build on Windows has no
@@ -178,7 +177,7 @@ pub struct JamApp {
     ending: Option<Job<Result<(), String>>>,
     /// The close-the-window confirmation is up. Only a session this app
     /// launched raises it: closing with one running strands jamstreamd
-    /// invisibly until the idle exit (#322). Public so a fixture can show
+    /// invisibly until the idle exit. Public so a fixture can show
     /// the dialog without a windowing system to close.
     pub confirm_quit: bool,
     /// The user answered the confirmation; the next close request passes.
@@ -377,7 +376,7 @@ impl JamApp {
     /// Rescan: re-enumerate and keep the selection by device id. A selected
     /// device the new catalog no longer holds falls back to the System
     /// default entry with a note under the pickers saying so; falling back
-    /// with the old name still showing was the pickers lying (#325). The
+    /// with the old name still showing would be the pickers lying. The
     /// note also covers the scan itself failing, which otherwise looks like
     /// a button that does nothing.
     pub fn rescan_devices(&mut self) {
@@ -623,7 +622,7 @@ impl JamApp {
         // The frame's one snapshot. A pull copies the roster, the chat
         // buffer, and the destinations out from under the network thread's
         // own lock, so the session screen, the drawer's tab list, and the
-        // drawer's body share this one rather than taking three (#382).
+        // drawer's body share this one rather than taking three.
         let snap = self.runtime.as_deref().map(Runtime::snapshot);
 
         egui::Panel::top(egui::Id::new("app-top")).show(ui, |ui| {
@@ -656,7 +655,7 @@ impl JamApp {
 
         // The window's close button, when this app is the one hosting: closing
         // would strand jamstreamd invisibly until the idle exit, with no CLI
-        // in an app-only install to end it (#322). The request is cancelled
+        // in an app-only install to end it. The request is cancelled
         // and the confirmation put up; anything else closes untouched.
         if ui.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.ending() {
@@ -694,8 +693,8 @@ impl JamApp {
         // Escape, and the innermost thing entered has to be the first thing
         // left. Which is why the drawer takes the key only when the screen has
         // nothing inside it waiting to be left: a confirmation standing over
-        // the drawer is inside it, and closing the drawer under one was the
-        // wrong end of the ladder (#180).
+        // the drawer is inside it, and closing the drawer under one would be
+        // the wrong end of the ladder.
         if self.settings_open
             && !self.session_overlay_open()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -767,7 +766,7 @@ impl JamApp {
                 // The drawer is drawn after the screen and covers the chat
                 // panel, so the panel is told before it draws rather than
                 // leaving its message field showing under the drawer's bottom
-                // edge (#286).
+                // edge.
                 self.session.chat_covered = self.settings_open;
                 if let (Some(rt), Some(snap)) = (self.runtime.as_deref(), snap.as_ref()) {
                     match self.session.ui(ui, snap, rt) {
@@ -907,8 +906,8 @@ impl JamApp {
 
     /// The record sheet and the settings drawer are both anchored to the right
     /// edge under the top bar, and the sheet is the wider of the two, so with
-    /// both open a 44 px sliver of chopped words stuck out to the left of the
-    /// drawer with a truncated Stop still clickable in it (#175). Whichever
+    /// both open a 44 px sliver of chopped words would stick out to the left
+    /// of the drawer with a truncated Stop still clickable in it. Whichever
     /// was opened last keeps the anchor; this is the half that runs after the
     /// screen, so the sheet's turn is the one recorded on the way past.
     fn close_the_other_sheet(&mut self) {
@@ -1342,7 +1341,7 @@ impl JamApp {
 
     /// A session that ended from the far side falls back to home. Asks the
     /// runtime for the connection state alone: a snapshot would copy the
-    /// roster and the chat buffer to answer one enum (#382). Public for the
+    /// roster and the chat buffer to answer one enum. Public for the
     /// same reason as [`Self::repaint_while_animating`].
     pub fn fall_back_when_idle(&mut self) {
         if self.screen == Screen::Session
