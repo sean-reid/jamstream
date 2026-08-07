@@ -180,10 +180,10 @@ fn full_session_frame_time() {
     );
 }
 
-/// One snapshot per frame, whatever is on screen. A pull copies the roster,
-/// the chat buffer, and the destinations out from under the network
-/// thread's lock, and the session screen, the drawer's tab list and the
-/// drawer's body used to take one each (#382).
+/// One snapshot per frame, whatever is on screen: a pull copies the roster, the
+/// chat buffer, and the destinations out from under the network thread's lock,
+/// so the session screen, the drawer's tab list and the drawer's body share the
+/// one the frame took.
 #[test]
 fn the_frame_pulls_one_snapshot() {
     for tab in [
@@ -213,10 +213,10 @@ fn the_frame_pulls_one_snapshot() {
     }
 }
 
-/// The settings drawer is not by itself a reason to run at display rate.
-/// Its one moving part is the Audio tab's input meter, which draws off a
-/// snapshot, so an open drawer on Home used to pin the app at display rate
-/// redrawing permanent zeros (#383).
+/// The settings drawer is not by itself a reason to run at display rate. Its
+/// one moving part is the Audio tab's input meter, which draws off a snapshot,
+/// so an open drawer on Home would pin the app at display rate redrawing
+/// permanent zeros.
 ///
 /// Observed where the frame loop observes it: the callback egui calls to
 /// wake a sleeping integration, on a context of this test's own.
@@ -278,9 +278,9 @@ fn full_session_frame_allocations() {
     println!(
         "session_drawer: {per_frame} allocations/frame over {FRAMES} frames (host, 20 in the room, 506 chat lines, drawer on Broadcast)"
     );
-    // 3933 on the machine this was calibrated on, against 7187 for the four
-    // pulls a frame this used to take. A pull of this session is worth about
-    // 1100 allocations, so the budget is set where one coming back fails.
+    // 3933 on the machine this was calibrated on. A pull of this session is
+    // worth about 1100 allocations, so the budget is set where a second one
+    // fails.
     assert!(
         per_frame < 5000,
         "{per_frame} allocations/frame is over the 5000 budget"

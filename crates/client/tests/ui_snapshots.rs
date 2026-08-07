@@ -48,12 +48,12 @@ fn snapshot(harness: &mut Harness<'_>, name: &str) {
 
 /// Drops `name` from the manifest if an earlier run put it there.
 ///
-/// Demoting a fixture out of [`snapshot_for_docs`], which is the act of
-/// declaring that an image no longer shows the product honestly, used to keep
-/// `site/copy-previews.sh --check` passing against the line the previous run
-/// left behind (#217). The demotion has to be the thing that removes the line,
-/// so this is that. [`fresh_manifest`] covers the fixture that is deleted
-/// outright, which leaves no test behind to demote it.
+/// Demoting a fixture out of [`snapshot_for_docs`] is the act of declaring that
+/// an image no longer shows the product honestly, so the demotion has to be
+/// what removes the line: anything else leaves `site/copy-previews.sh --check`
+/// passing against the line the previous run left behind. [`fresh_manifest`]
+/// covers the fixture that is deleted outright, which leaves no test behind to
+/// demote it.
 ///
 /// Read, filter, rename. The replacement is atomic, so no reader ever sees a
 /// partial list. Two processes doing it at once could lose an append that
@@ -123,13 +123,10 @@ fn snapshot_for_docs(harness: &mut Harness<'_>, name: &str) {
 /// Whether this write is the first of the run, and so the one that empties
 /// the manifest.
 ///
-/// The file used to be append-only and never truncated, so a fixture DELETED
-/// rather than demoted left its line behind forever and
-/// `site/copy-previews.sh --check` kept passing against it. docs-check.yml
-/// worked around that by deleting the whole preview directory first, which
-/// only fixed CI: locally the stale line survived. Truncating on the first
-/// write is the fix, and it belongs here because this is the only thing that
-/// writes the file.
+/// An append-only file leaves a fixture DELETED rather than demoted with its
+/// line in place forever, and `site/copy-previews.sh --check` keeps passing
+/// against it. Deleting the preview directory in docs-check.yml only fixes CI,
+/// so the truncation belongs here, in the only thing that writes the file.
 ///
 /// Under nextest every test is its own process, so no one of them owns the
 /// list and each would truncate away the others. There the manifest stays
@@ -191,12 +188,10 @@ fn test_app(theme: Theme) -> JamApp {
 
 /// The guard behind [`test_app`]. Every cloud provider must read "setup
 /// needed" in a fixture, on every machine, because the fixture has no
-/// credentials and cannot go looking for any. This fails on a developer
-/// machine with a saved DigitalOcean token the moment a fixture reaches the
-/// real keychain or the real environment again, which is what the snapshot
-/// binary used to do: `JamApp::new()` built a `KeyringStore`, the wizard
-/// read it while constructing itself, and macOS put up a dialog asking to
-/// unlock the developer's stored cloud tokens and stream keys.
+/// credentials and cannot go looking for any. A fixture that reaches the real
+/// keychain or the real environment fails on a developer machine with a saved
+/// DigitalOcean token, and on macOS puts up a dialog asking to unlock the
+/// developer's stored cloud tokens and stream keys.
 #[test]
 fn fixtures_cannot_see_the_machine_that_runs_them() {
     let app = test_app(Theme::Dark);
@@ -572,8 +567,8 @@ fn session_demo() {
 fn session_host() {
     // The full host bar: the session id, the timer, the cost, Record, and
     // Leave, beside the readouts on one row. This is also the cluster's empty
-    // case, so it reserves nothing and the bar is calm; `session_bar_idle`
-    // used to say that separately and was pixel-identical to this (#191).
+    // case, so it reserves nothing and the bar is calm; a fixture for the idle
+    // bar on its own would be pixel-identical to this one.
     let app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_host");
@@ -862,8 +857,7 @@ fn home_settings() {
     //
     // The faint marks at the left edge are egui's, not ours: an anchored
     // window's first pass lays out at the origin and is painted, which every
-    // other fixture hides behind session content. Identical on the commit
-    // before this one, so it is not a regression here.
+    // other fixture hides behind session content.
     let app = drawer_app(test_app(Theme::Dark), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_settings");
@@ -1418,8 +1412,7 @@ fn session_bar_on_air() {
 #[test]
 fn session_bar_both_lamps() {
     // Both: being broadcast and being recorded, side by side in the middle of
-    // the bar, in their own colours. This is the state the restructure exists
-    // for, and the one that used to have its two halves at opposite ends.
+    // the bar, in their own colours. This is the state the cluster exists for.
     let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
     rt.set_destinations(&[live(StreamPlatform::Twitch), live(StreamPlatform::YouTube)]);
     rt.set_record(RecordState::Recording, false);
@@ -1754,8 +1747,8 @@ fn wizard_region() {
 /// One region the probe never reached, and one the account cannot run this
 /// machine size in. Both facts are absent for different reasons and the
 /// table says so differently: atl1 stays, reads `no probe`, and sits at the
-/// bottom despite being the cheapest row; blr1 is gone with a line naming
-/// it. Before this, atl1 read `0 ms` and sorted first.
+/// bottom despite being the cheapest row; blr1 is gone with a line naming it.
+/// An unmeasured region must never read `0 ms` and sort first.
 #[test]
 fn wizard_region_unmeasured() {
     let survey = RegionSurvey {
@@ -1909,11 +1902,9 @@ fn wizard_launching_light() {
 /// A state record with a working issuer key.
 ///
 /// The key matters. `Mint invite` and `New link` sign with
-/// `state.issuer_private_key_b64`, and every fixture in this file used to set
-/// it to an empty string, so both buttons errored in every one of them and
-/// `session_invites.png` was a published screenshot of a panel with two broken
-/// controls that nothing clicked (#218). It is the fixture's own issuer now,
-/// the same one that minted the seats, and
+/// `state.issuer_private_key_b64`, so an empty one leaves both buttons erroring
+/// and `session_invites.png` a published screenshot of two broken controls. It
+/// is the fixture's own issuer, the same one that minted the seats, and
 /// `interactions.rs::minting_and_refilling_a_seat_work_in_the_fixtures_state`
 /// presses both.
 fn invites_state() -> (jamstream_cli::state::SessionState, PathBuf) {

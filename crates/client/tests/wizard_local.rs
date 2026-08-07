@@ -8,10 +8,9 @@
 //! The join and the end go through `JamApp::enter_hosted_session` and
 //! `JamApp::end_session`, the functions the app itself calls, with the only
 //! substitution being the offline WAV backend in place of the sound card.
-//! This file used to re-implement the body of the first of those by hand, so
-//! the app could have stopped wrapping the runtime in `CostedRuntime`, losing
-//! the cost meter and leaving the mixer's Revoke pointing at nothing, and
-//! every test here would still have passed (#218).
+//! A hand-rolled copy of either body keeps passing while the app stops
+//! wrapping the runtime in `CostedRuntime`, which loses the cost meter and
+//! leaves the mixer's Revoke pointing at nothing.
 //!
 //! One test function: the state directory and JAMSTREAMD_PATH overrides
 //! are process-global environment.

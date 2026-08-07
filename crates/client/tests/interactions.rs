@@ -51,9 +51,8 @@ fn host_harness_sized(size: egui::Vec2) -> Harness<'static> {
 
 /// An invite book with no invites in it, and a key that can mint one.
 ///
-/// The key is not decoration. `Mint invite` and `New link` sign with it, and
-/// this fixture used to set it to an empty string, so both buttons errored
-/// wherever it was used and nothing noticed (#218).
+/// The key is not decoration: `Mint invite` and `New link` sign with it, and
+/// an empty one leaves both buttons erroring wherever this fixture is used.
 fn empty_invites() -> jamstream_client::screens::invites::InvitesPanel {
     invite_book(Vec::new(), "empty")
 }
@@ -337,10 +336,10 @@ fn host_harness_lamps(size: egui::Vec2, lamps: Lamps) -> Harness<'static> {
         })
 }
 
-/// The strip invariant behind #70: a fader's track and handle may never be
-/// drawn across the name or the portrait above it. The rows below a fader
-/// stack from the bottom edge upward, so a fader handed less room than it
-/// asked for used to take the difference out of the header.
+/// The strip invariant: a fader's track and handle may never be drawn across
+/// the name or the portrait above it. The rows below a fader stack from the
+/// bottom edge upward, so a fader handed less room than it asked for must not
+/// take the difference out of the header.
 #[test]
 fn a_fader_never_crosses_the_name_above_it() {
     for size in SIZES {
@@ -473,12 +472,10 @@ fn the_drawer_leaves_no_chat_field_poking_out_below_it() {
     );
 }
 
-/// The invariant behind #122. Buffer size and input level are adjusted while
-/// listening, against the mouth-to-ear readout and the meters in the status
-/// bar, so the drawer has to fit the window and stop above them: at 800x600
-/// the sheet used to run past the bottom edge with both of them on the part
-/// that was gone. Every window size the app can be, both are on screen, and
-/// nothing in the drawer is drawn over the readouts.
+/// Buffer size and input level are adjusted while listening, against the
+/// mouth-to-ear readout and the meters in the status bar, so the drawer has to
+/// fit the window and stop above them. Every window size the app can be, both
+/// are on screen, and nothing in the drawer is drawn over the readouts.
 #[test]
 fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
     for size in SIZES {
@@ -777,10 +774,10 @@ fn escape_closes_the_settings_drawer_before_a_session_sheet() {
     );
 }
 
-/// #180, the other end of the same ladder: with the drawer open, Revoke on a
-/// strip puts a confirmation on top of it, and Escape used to close the drawer
-/// underneath and leave the confirmation standing. The innermost thing entered
-/// is the first thing left, and the drawer is not the innermost thing here.
+/// The other end of the same ladder: with the drawer open, Revoke on a strip
+/// puts a confirmation on top of it, and Escape has to take the confirmation
+/// rather than the drawer underneath. The innermost thing entered is the first
+/// thing left, and the drawer is not the innermost thing here.
 #[test]
 fn escape_leaves_a_confirmation_over_the_drawer_before_the_drawer() {
     let mut harness = settings_harness_sized(vec2(1280.0, 800.0));
@@ -1483,9 +1480,9 @@ fn a_pasted_key_reaches_the_server_once_and_then_going_live() {
 }
 
 /// A session with no broadcast relay says so and offers no way to paste a key
-/// into it. Before this the tab was identical to a working one, so a host
-/// pasted a key, pressed Go live, and learned from a failed destination that
-/// the session could never have streamed at all (#440).
+/// into it. A tab identical to a working one lets a host paste a key, press Go
+/// live, and learn from a failed destination that the session could never have
+/// streamed at all.
 #[test]
 fn a_session_that_cannot_stream_says_so_and_takes_no_key() {
     let demo = DemoRuntime::frozen(FROZEN_FRAME, true);
@@ -1728,12 +1725,11 @@ fn a_failed_destination_says_why_where_the_host_will_see_it() {
 /// A row's two actions read safe first, destructive second, and both sit under
 /// the platform they belong to.
 ///
-/// The pair used to be built inside a right_to_left layout, so it reached the
-/// screen as "Forget key" then "Use saved key": destructive first, and the
-/// opposite reading order from the same pair in the invites panel two tabs away
-/// (#183). An unconfigured platform's lone "Add key" was pinned to the drawer's
-/// right edge, a blank line below its own name (#192). Both are questions about
-/// where a rect lands, so both are asserted on rects.
+/// A right_to_left layout reaches the screen as "Forget key" then "Use saved
+/// key": destructive first, and the opposite reading order from the same pair
+/// in the invites panel two tabs away. It also pins an unconfigured platform's
+/// lone "Add key" to the drawer's right edge. Both are questions about where a
+/// rect lands, so both are asserted on rects.
 #[test]
 fn a_destination_rows_actions_read_safe_first_and_sit_under_its_name() {
     use jamstream_client::creds::CredStore as _;
@@ -2049,11 +2045,10 @@ fn a_strip_lays_out_identically_with_and_without_an_avatar() {
 
 /// A device that will not run has to be readable from inside the session: the
 /// reason the device gave, and one line saying what it costs and where to fix
-/// it, over strips that are all still there. Told, not stopped (#263).
+/// it, over strips that are all still there. Told, not stopped.
 ///
-/// The mixer used to draw nothing at all for this, so the whole of what a
-/// silent musician had was a chat line about the fallback and a log they were
-/// not reading mid-song.
+/// A chat line about the fallback and a log nobody reads mid-song are not
+/// enough for a musician who has gone silent in both directions.
 #[test]
 fn a_refused_device_puts_the_reason_over_the_strips() {
     let reason = "unsupported audio configuration: \
@@ -2445,10 +2440,10 @@ fn the_wizards_actions_are_on_screen_at_every_window_size() {
     }
 }
 
-/// #177: the launching step used to draw a spinner and nothing else until an
-/// error arrived, so a reachability check that never passed left quitting the
-/// app as the only way out. Stop waiting has to come back to the preview with
-/// the note about what may be running out there.
+/// A launching step with nothing on it but a spinner leaves quitting the app as
+/// the only way out of a reachability check that never passes. Stop waiting has
+/// to come back to the preview with the note about what may be running out
+/// there.
 ///
 /// The step is entered without a job behind it, which is the state a launch
 /// nobody can interrupt leaves the wizard in; a fixture that pressed Launch
