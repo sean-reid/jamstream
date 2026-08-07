@@ -41,6 +41,16 @@ pub const STREAM_REASON_BUDGET: usize = 128;
 pub const MAX_DESTINATIONS: usize = 8;
 /// Longest accepted failure reason in a [`RecordingState::Failed`].
 pub const MAX_RECORD_REASON_LEN: usize = 200;
+/// Longest accepted line in a [`ControlMsg::ServerLog`].
+///
+/// Wide enough for the lines a session actually fails on: an ffmpeg refusal
+/// with its timestamp, level, and target is about 180 bytes, and a systemd
+/// unit path or a bucket URL pushes a few past 250. One line travels per
+/// message, so the sealed datagram is this plus about 40 bytes of framing,
+/// well inside the smallest MTU: a log line can never fragment, and it can
+/// never cost another field its place, because it shares a message with
+/// nothing.
+pub const MAX_SERVER_LOG_LINE: usize = 320;
 /// Avatars are capped at 256 KB and identified by the Blake2s-256 of their
 /// bytes; the hash is the cache key on both ends.
 pub const MAX_AVATAR_BYTES: usize = 256 * 1024;
@@ -207,14 +217,26 @@ pub enum BroadcastReadiness {
 /// consequences of it, so the front of a reason is the diagnosis and the back
 /// is the fallout.
 pub fn fit_stream_reason(reason: &str) -> &str {
-    if reason.len() <= STREAM_REASON_BUDGET {
-        return reason;
+    fit_head(reason, STREAM_REASON_BUDGET)
+}
+
+/// Cuts one log line down to [`MAX_SERVER_LOG_LINE`], on a char boundary.
+///
+/// The head again, and for the same reason: a log line names what happened
+/// first and elaborates afterwards.
+pub fn fit_server_log_line(line: &str) -> &str {
+    fit_head(line, MAX_SERVER_LOG_LINE)
+}
+
+fn fit_head(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
     }
-    let mut end = STREAM_REASON_BUDGET;
-    while !reason.is_char_boundary(end) {
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
         end -= 1;
     }
-    &reason[..end]
+    &text[..end]
 }
 
 /// One destination as the server sees it. Deliberately key-free: this goes
@@ -446,6 +468,21 @@ pub enum ControlMsg {
     BroadcastReadiness {
         state: BroadcastReadiness,
     },
+    /// Server to host: one line of the server's own log, as it is written.
+    ///
+    /// The host is the only recipient. A cloud session's machine deletes
+    /// itself when the session ends, so its journal is the one copy of why a
+    /// broadcast or a take failed and it goes with the machine; this is how
+    /// that copy reaches somebody who can read it. A local session already
+    /// hands the same text to `sessions/<id>/server.log` on the way past.
+    ///
+    /// One line per message, sent as the line is written rather than gathered
+    /// at the end: a session ending because the VM is being destroyed gets one
+    /// flight with no retransmit, which is the worst moment to be starting.
+    /// Trailing variant, same postcard append-safety rule as Stats.
+    ServerLog {
+        line: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -667,6 +704,7 @@ fn check_lengths(msg: &ControlMsg) -> Result<(), Error> {
         ControlMsg::BroadcastReadiness {
             state: BroadcastReadiness::Unavailable { reason },
         } if reason.len() > MAX_STREAM_REASON_LEN => Err(Error::Malformed),
+        ControlMsg::ServerLog { line } if line.len() > MAX_SERVER_LOG_LINE => Err(Error::Malformed),
         ControlMsg::Roster(members) if members.iter().any(|m| m.name.len() > MAX_NAME_LEN) => {
             Err(Error::Malformed)
         }
@@ -746,6 +784,54 @@ mod tests {
                 "sealed stream status is {sealed} bytes, which fragments on a 1500 byte mtu"
             );
         }
+    }
+
+    /// A log line at the cap travels alone in its datagram and fits it with
+    /// room to spare, which is why nothing else has to be budgeted against it.
+    #[test]
+    fn a_full_server_log_line_never_fragments() {
+        let mut link = ControlLink::new();
+        link.send(ControlMsg::ServerLog {
+            line: "x".repeat(MAX_SERVER_LOG_LINE),
+        })
+        .expect("a line at the cap must be sendable");
+        for plain in link.poll(0) {
+            let sealed = plain.len() + 11 + 16;
+            assert!(
+                sealed <= 1_472,
+                "sealed server log line is {sealed} bytes, which fragments on a 1500 byte mtu"
+            );
+        }
+    }
+
+    /// The cut is what a sender applies, and the cap is what either side
+    /// refuses. A line past the cap must not be sendable at all: the link
+    /// refuses the whole message, so a sender that skipped the cut would lose
+    /// the line rather than shorten it.
+    #[test]
+    fn fitting_a_log_line_cuts_on_a_char_boundary() {
+        let short = "session server up";
+        assert_eq!(fit_server_log_line(short), short);
+
+        let wide = "☃".repeat(MAX_SERVER_LOG_LINE);
+        let cut = fit_server_log_line(&wide);
+        assert!(cut.len() <= MAX_SERVER_LOG_LINE);
+        assert!(cut.len() > MAX_SERVER_LOG_LINE - 3);
+        assert!(wide.starts_with(cut));
+
+        let mut link = ControlLink::new();
+        assert!(
+            link.send(ControlMsg::ServerLog {
+                line: cut.to_owned()
+            })
+            .is_ok()
+        );
+        assert!(
+            link.send(ControlMsg::ServerLog {
+                line: "x".repeat(MAX_SERVER_LOG_LINE + 1)
+            })
+            .is_err()
+        );
     }
 
     /// The budget is a byte count and a reason is text, so the cut has to
@@ -1720,6 +1806,9 @@ mod tests {
                 state: BroadcastReadiness::Unavailable {
                     reason: "x".repeat(MAX_STREAM_REASON_LEN + 1),
                 },
+            },
+            ControlMsg::ServerLog {
+                line: "x".repeat(MAX_SERVER_LOG_LINE + 1),
             },
         ];
         for msg in oversized {
