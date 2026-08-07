@@ -1,4 +1,4 @@
-//! The #347 sample-rate ladder for the cpal backend: which rung a direction
+//! The sample-rate ladder for the cpal backend: which rung a direction
 //! opens on, which hosts can be asked for a rate a device never advertised,
 //! what a mismatch between the device rate and the opened rate means on each
 //! host, and what to tell someone holding a device no rung can carry.
@@ -96,18 +96,18 @@ pub(crate) struct DirectionPlan {
     /// and a refusal falls to the converter at the device's own rate.
     pub(crate) attempted: bool,
     /// Open at the device's own rate with the boundary converter wrapped
-    /// around this direction's handler half (#347 rung 3).
+    /// around this direction's handler half, rung 3 of the ladder.
     pub(crate) convert: bool,
 }
 
-/// The #347 ladder for one direction. A device that advertises the session
-/// rate opens at it (on CoreAudio that open moves the device clock; rung 2
-/// lives inside cpal). One that does not is attempted anyway on a host that
-/// [reports a rate it could not honour](verifies_negotiated_rate), and opens
-/// at its own rate through the converter everywhere else. The refusal
+/// The sample-rate ladder for one direction. A device that advertises the
+/// session rate opens at it (on CoreAudio that open moves the device clock;
+/// rung 2 lives inside cpal). One that does not is attempted anyway on a host
+/// that [reports a rate it could not honour](verifies_negotiated_rate), and
+/// opens at its own rate through the converter everywhere else. The refusal
 /// survives only for a Bluetooth hands-free microphone: converting an 8 or
 /// 16 kHz voice-profile capture would carry the session in telephone
-/// quality, and #330 decided the honest answer is another microphone.
+/// quality, and the honest answer there is another microphone.
 ///
 /// `demoted` short-circuits the whole ladder to the converter while the
 /// device runs away from the session rate: its clock was set once, another
@@ -252,7 +252,7 @@ impl RateContext<'_> {
     /// A capture endpoint at a telephony rate, or on a Bluetooth or headset
     /// form factor, gets its own remedy: its hands-free mode has no 48 kHz
     /// setting anywhere, so pointing at the host's rate settings would send
-    /// the user hunting for an entry that does not exist (#330).
+    /// the user hunting for an entry that does not exist.
     pub(crate) fn refused(
         self,
         direction: Direction,
@@ -345,11 +345,11 @@ mod tests {
         assert_eq!(chosen.channels(), 2);
     }
 
-    /// The #347 ladder on a host that cannot be trusted to convert: a
+    /// The sample-rate ladder on a host that cannot be trusted to convert: a
     /// 44.1 kHz-only device opens at its own rate through the boundary
-    /// converter instead of the old refusal. Opening it at 48 kHz anyway
-    /// would play the session sharp and fast, and refusing it is what #327
-    /// showed musicians cannot act on.
+    /// converter rather than being refused. Opening it at 48 kHz anyway
+    /// would play the session sharp and fast, and refusing it instead gives
+    /// a musician nothing to act on.
     #[test]
     fn a_44_1_only_device_converts_rather_than_being_refused() {
         let native = native(44_100, 2);
@@ -448,9 +448,10 @@ mod tests {
     }
 
     /// The one refusal the ladder keeps: a hands-free microphone has no rate
-    /// worth carrying, so no rung is offered and the #330 remedy stands. Both
-    /// signals refuse, on converting and non-converting hosts alike, while
-    /// Bluetooth playback still converts: the profile problem is capture's.
+    /// worth carrying, so no rung is offered and the only remedy is another
+    /// microphone. Both signals refuse, on converting and non-converting
+    /// hosts alike, while Bluetooth playback still converts: the profile
+    /// problem is capture's.
     #[test]
     fn a_hands_free_microphone_is_refused_not_converted() {
         for (rate, form, host_converts) in [
@@ -491,7 +492,7 @@ mod tests {
         assert!(plan.convert);
     }
 
-    /// The contested-clock decision on #347: a device whose clock this app
+    /// The ladder's contested-clock rule: a device whose clock this app
     /// set and then lost the stream on is never asked again. While it runs
     /// away from the session rate the whole ladder short-circuits to the
     /// converter, even though 48 kHz is advertised; found back at the

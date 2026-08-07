@@ -51,12 +51,12 @@ pub struct DeviceInfo {
 
 /// Requested stream parameters. Everything above the device layer sees
 /// `sample_rate` in f32 whatever the hardware does, and a backend gets there
-/// however it can (#347): the device already runs there, the backend moves
-/// the device clock, the OS converts, or the backend resamples at the
-/// boundary and pays the latency. A device is refused only when no rung
-/// carries it, which since #347 means a hands-free microphone or a native
-/// open that itself failed. [`StreamHandle::rate_outcomes`] reports which
-/// rung each direction landed on and what it cost.
+/// however it can: the device already runs there, the backend moves the
+/// device clock, the OS converts, or the backend resamples at the boundary
+/// and pays the latency. A device is refused only when no rung of the
+/// ladder carries it, which means a hands-free microphone or a native open
+/// that itself failed. [`StreamHandle::rate_outcomes`] reports which rung
+/// each direction landed on and what it cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamConfig {
     pub sample_rate: u32,
@@ -196,7 +196,7 @@ pub trait StreamHandle: Send {
         false
     }
 
-    /// How each direction of this stream reaches the session rate (#347):
+    /// How each direction of this stream reaches the session rate:
     /// natively, over a device clock the backend moved, through an OS
     /// converter, or through the boundary resampler with its disclosed cost.
     /// `None` when the backend cannot say.
@@ -229,7 +229,7 @@ mod tests {
     use super::*;
 
     /// The default answers for latency, which is the product's point; saying
-    /// no is a per-machine choice the client plumbs through (#331).
+    /// no is a per-machine choice the client plumbs through.
     #[test]
     fn exclusive_is_allowed_unless_someone_says_otherwise() {
         assert!(StreamConfig::default().allow_exclusive);
