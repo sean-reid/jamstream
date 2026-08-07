@@ -376,16 +376,16 @@ fn member_jitter(s: &jamstream_harness::Scenario, id: u16) -> JitterStats {
 //   * the server's buffer for that member's uplink is `stall` frames ahead of
 //     the sequence numbers now arriving, which carried on contiguously across
 //     the gap, so every packet is late and the member is silent to everyone;
-//   * the client's own downlink buffer is `stall` frames behind the stream
-//     arriving into it, and the frames its playout position still wants were
-//     evicted from the full buffer long ago, so every pull conceals.
+//   * the client's own downlink buffer fills with a stream nobody is pulling,
+//     so it reaches its depth cap and gives its playout position up while the
+//     stall is still running.
 //
-// Before the policy both states were permanent: `late` climbing one per tick
-// (~400/s), depth pinned, playout concealed for the rest of the session. Now
-// each must detect the stuck state and re-anchor inside a bounded window.
-// The second, longer stall checks the division of labour at the other edge:
-// past 512 frames the discontinuity reset still owns the recovery and no
-// re-anchor is needed.
+// Before the policy the first state was permanent: `late` climbing one per tick
+// (~400/s), depth pinned, playout concealed for the rest of the session. Each
+// buffer must now come out of the stall inside a bounded window and stay out of
+// it. The second, longer stall checks the division of labour at the other edge:
+// past 512 frames the discontinuity reset owns the uplink's recovery and no
+// re-anchor is needed there.
 #[test]
 fn driver_stall_reanchors_and_audio_returns() {
     // 400 ticks = 1 s of frozen driver, mid-hole. 1200 ticks = 3 s, past the
@@ -462,15 +462,17 @@ fn driver_stall_reanchors_and_audio_returns() {
         "driver stall (1 s, mid-hole): server member 1 uplink {uplink:?}, \
          client 1 downlink {downlink:?}"
     );
-    // Both stuck buffers re-anchored, exactly once each, inside the window.
+    // The uplink's stuck position went exactly once, on the watchdog inside its
+    // pull. The client's own buffer had no pull to be rescued from, so its cap
+    // is what gave the position up, once per cap's worth of the stall.
     assert_eq!(
         uplink.reanchors, 1,
         "server's buffer for member 1 did not re-anchor within \
          {RECOVER_TICKS} ticks of the stall ending: {uplink:?}"
     );
-    assert_eq!(
-        downlink.reanchors, 1,
-        "client 1's own buffer did not re-anchor within {RECOVER_TICKS} ticks: {downlink:?}"
+    assert!(
+        downlink.reanchors >= 1,
+        "client 1's own buffer sat at its cap waiting for the pull that stalled: {downlink:?}"
     );
     // And nothing else in the session was disturbed.
     assert_eq!(member_jitter(&s, 0).reanchors, 0);
@@ -495,15 +497,26 @@ fn driver_stall_reanchors_and_audio_returns() {
         "server's late count for member 1 climbed {late_delta} in the second \
          after recovery (stuck would be ~400)"
     );
+    // And both stay out of it, which is the half a bounded window does not
+    // cover: a buffer whose consumer is back has no position to give up.
+    let settled = (member_jitter(&s, 1), s.client_jitter(1));
+    assert_eq!(
+        (settled.0.reanchors, settled.1.reanchors),
+        (uplink.reanchors, downlink.reanchors),
+        "a re-anchor in the second after recovery: {settled:?}"
+    );
 
-    // --- Stall past the restart threshold: RESET_JUMP's job, not the
-    // watchdog's.
+    // --- Stall past the restart threshold: RESET_JUMP's job on the uplink,
+    // where the position is ahead of the stream. The client's own buffer is
+    // filling rather than trailing, so its depth cap owns that side whatever
+    // the offset.
     let reanchors_before = (uplink.reanchors, downlink.reanchors);
     s.set_driver_stalled(1, true);
     s.run_ticks(BIG_STALL_TICKS);
     s.set_driver_stalled(1, false);
     s.run_ticks(RECOVER_TICKS);
     let healed_at = s.current_tick();
+    let healed = s.client_jitter(1);
     s.run_ms(1_000);
     let after_to = s.current_tick();
 
@@ -514,11 +527,19 @@ fn driver_stall_reanchors_and_audio_returns() {
          client 1 downlink {downlink:?}"
     );
     assert_eq!(
-        (uplink.reanchors, downlink.reanchors),
-        reanchors_before,
+        uplink.reanchors, reanchors_before.0,
         "a 3 s stall (offset past the {} frame restart threshold) should be \
-         healed by the discontinuity reset, not by a re-anchor",
+         healed by the discontinuity reset, not by a re-anchor: {uplink:?}",
         512
+    );
+    assert!(
+        downlink.reanchors > reanchors_before.1,
+        "client 1's buffer filled for 3 s with nothing pulling it and kept its \
+         playout position: {downlink:?}"
+    );
+    assert_eq!(
+        downlink.reanchors, healed.reanchors,
+        "client 1's buffer kept re-anchoring after the stall ended: {downlink:?}"
     );
     for (i, &base) in baseline.iter().enumerate() {
         let rms = s.rms_of(i, healed_at, after_to);

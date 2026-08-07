@@ -12,6 +12,7 @@ use jamstream_client::live::{AudioSettings, LiveRuntime};
 use jamstream_client::runtime::{
     Command, ConnState, MemberId, RateOutcomeView, RecordState, Runtime, Snapshot,
 };
+use jamstream_engine::JitterBuffer;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
@@ -1247,6 +1248,97 @@ fn a_device_that_will_not_stay_open_is_retried_a_few_times_and_then_left_alone()
     wait_for(&rt, "idle", Duration::from_secs(5), |s| {
         s.stats.state == ConnState::Idle
     });
+}
+
+/// User story: a musician swaps to an interface the stream it replaces has not
+/// let go of yet, so the session spends a few seconds with no audio stream at
+/// all, and when the device finally opens the band is still there.
+///
+/// The buffer left behind by those few seconds is #447. Playout is advanced only
+/// from the device-paced top-up, so a worker with no stream stopped pulling
+/// while media kept arriving and being pushed: the depth pinned at the cap the
+/// buffer holds, every later arrival was refused for it, and the frames the
+/// reopened stream would have continued from were the ones thrown away. On the
+/// session that reported it the buffer sat at the cap on both machines with
+/// `late` past a hundred thousand frames and not one re-anchor.
+#[test]
+fn a_stream_away_for_a_few_seconds_keeps_the_jitter_buffer_moving() {
+    const REFUSAL: &str = "playback device is in use by another stream";
+    let server = TestServer::start();
+    let sine = sine_fixture("stream-away", 440.0, RATE);
+    let out_b = temp_path("stream-away", "out-b.wav");
+
+    let a = LiveRuntime::join_offline(
+        &server.invite(1, "a"),
+        settings(),
+        WavBackend::new(Some(sine.clone()), None),
+    )
+    .expect("join a");
+    // Three refused reopens on the 500/1000/2000 ms cadence: seconds with no
+    // stream, inside the episode's own budget, and then a device again.
+    let backend = WavBackend::new(None, Some(out_b.clone()))
+        .refusing_reopens(3, AudioError::Unsupported(REFUSAL.to_owned()));
+    let device = backend.clone();
+    let b = LiveRuntime::join_offline(&server.invite(2, "b"), settings(), backend).expect("join b");
+
+    wait_for(&a, "a joined", Duration::from_secs(10), joined);
+    wait_for(&b, "b sees both members", Duration::from_secs(10), |s| {
+        joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+    });
+    // A's media has to be arriving before the stream goes away, or there is
+    // nothing for the buffer to fill with.
+    wait_for(&b, "b's buffer to anchor", Duration::from_secs(10), |s| {
+        s.stats.jitter_depth > 0
+    });
+
+    let mut deepest = 0usize;
+    b.reconfigure_audio(AudioSettings {
+        playback_id: Some("the other interface".to_owned()),
+        ..settings()
+    });
+    wait_for(&b, "the refusal", Duration::from_secs(10), |s| {
+        deepest = deepest.max(s.stats.jitter_depth);
+        s.device_error.is_some()
+    });
+    wait_for(&b, "the reopen", Duration::from_secs(20), |s| {
+        deepest = deepest.max(s.stats.jitter_depth);
+        s.device_error.is_none()
+    });
+    assert!(
+        device.opens() >= 4,
+        "{} opens: the refusals never happened",
+        device.opens()
+    );
+    // The deepest a buffer being drained ever sits is its own target, and the
+    // target is capped; the cap on depth is nearly three times that, and
+    // reaching it costs the playout position.
+    assert!(
+        deepest <= JitterBuffer::MAX_TARGET_FRAMES + 1,
+        "b's buffer reached {deepest} frames with no stream to pull it, against a \
+         target that never exceeds {} and a cap of {}",
+        JitterBuffer::MAX_TARGET_FRAMES,
+        JitterBuffer::MAX_DEPTH_FRAMES
+    );
+
+    // And the half that matters: audio comes back. The capture file is
+    // rewritten by the open that succeeded, so everything in it played after
+    // the stream returned.
+    std::thread::sleep(Duration::from_millis(2_500));
+    b.send(Command::Leave);
+    wait_for(&b, "b idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(b);
+    drop(a);
+    let rms = tail_rms(&out_b, 1.0);
+    assert!(
+        rms > 0.02,
+        "b heard near-silence (rms {rms}) after its stream came back"
+    );
+
+    for p in [&sine, &out_b] {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// User story: a musician swaps interfaces mid-song, the new one runs at
