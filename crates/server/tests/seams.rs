@@ -99,8 +99,9 @@ fn the_boot_script_creates_the_paths_the_processes_use() {
 
     // Stream keys. StreamConfig names this directory from a crate that cannot
     // import the constant, so a pusher whose key file is unreadable fails
-    // every destination.
-    let cfg = jamstream_stream::pipeline::StreamConfig::default();
+    // every destination. The VM's layout by name, not the default: the default
+    // is whatever machine the test is running on, which is not a VM.
+    let cfg = jamstream_stream::pipeline::StreamConfig::session_vm();
     assert_eq!(
         cfg.key_dir,
         std::path::Path::new(STREAM_KEY_DIR),
@@ -111,6 +112,17 @@ fn the_boot_script_creates_the_paths_the_processes_use() {
             "install -d -o jamstream -g jamstream -m 0700 {STREAM_KEY_DIR}"
         )),
         "bootstrap must create the key directory 0700"
+    );
+
+    // And the encoder the pipeline spawns there is spelled as an absolute path
+    // rather than resolved, so the path the bootstrap installs it to is the one
+    // it names.
+    assert!(
+        script.contains(&format!(
+            "install -m 0755 \"$tmp/ffmpeg\" {}",
+            cfg.ffmpeg.display()
+        )),
+        "the pipeline spawns an ffmpeg the bootstrap installs elsewhere"
     );
 }
 

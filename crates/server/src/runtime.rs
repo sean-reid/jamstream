@@ -215,9 +215,24 @@ impl Server {
             issuer_pk,
         ));
         let socket = UdpSocket::bind(opts.bind).await?;
-        // Encode settings and VM paths; tests override them through
-        // with_stream_config.
+        // Encode settings from the bundled catalog; paths and programs from
+        // whatever machine this is.
         let stream_cfg = StreamConfig::default();
+        // At startup rather than at the first Go Live: the layout is resolved
+        // rather than configured, so a directory the pipeline cannot have is
+        // worth finding out about while there is still a log being read.
+        if let Err(err) = std::fs::create_dir_all(&stream_cfg.work_dir) {
+            tracing::warn!(
+                error = %err,
+                work_dir = %stream_cfg.work_dir.display(),
+                "the broadcast pipeline has nowhere to work; this session cannot stream"
+            );
+        }
+        tracing::debug!(
+            work_dir = %stream_cfg.work_dir.display(),
+            ffmpeg = %stream_cfg.ffmpeg.display(),
+            "broadcast layout"
+        );
         let relay = RelayWatch::new(&stream_cfg.encoder_output, None);
         Ok(Server {
             core,
@@ -297,8 +312,9 @@ impl Server {
     }
 
     /// Overrides the broadcast pipeline's configuration (ffmpeg path, relay
-    /// URL, working directories). Tests use it; the default is the layout
-    /// cloud-init creates on the session VM.
+    /// URL, working directories). Tests use it; the default resolves the
+    /// layout of the machine this process is on, which is the configuration
+    /// every session actually runs.
     pub fn with_stream_config(mut self, cfg: StreamConfig) -> Self {
         self.stream_cfg = cfg;
         self.rearm_relay_watch();

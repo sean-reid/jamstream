@@ -12,10 +12,12 @@
 //! process still being there, so a test writes the block a real one writes.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use jamstream_broadcast::{AvatarImage, MemberVisual, Renderer, Role as VisualRole, SceneConfig};
+use jamstream_cloud::providers::local::BROADCAST_DIR_ENV;
 use jamstream_protocol::control::{
     DestinationState, DestinationStatus, StreamKey, StreamOp, StreamPlatform, fit_stream_reason,
 };
@@ -25,6 +27,7 @@ use crate::cadence::VideoCadence;
 use crate::keys::KeyStore;
 use crate::platform::PlatformCatalog;
 use crate::proc::{Exit, Feed, ProcId, ProcSpec, ProcessHost, Stdin};
+use crate::tools;
 use crate::yuv;
 
 /// Cards the renderer draws. The renderer's own cap, not a copy of it: this
@@ -78,6 +81,22 @@ const PROGRESS_HEAD_BYTES: u64 = 4_096;
 /// [`Pipeline::encoder_spec`] for why the default is a live-stream bug.
 const PROBESIZE: &str = "32";
 
+/// The tmpfs directory a session VM's units grant write access to, created by
+/// the cloud-init bootstrap before jamstreamd starts. `jamstream_cloud`'s
+/// `STREAM_KEY_DIR` is the key directory inside it, spelled from the other
+/// side; `crates/server/tests/seams.rs` holds the two together.
+const VM_RUN_DIR: &str = "/run/jamstream";
+
+/// Where the VM bootstrap installs the ffmpeg it downloads. Absolute rather
+/// than resolved, because on the VM this is a fact and PATH is systemd's.
+const VM_FFMPEG: &str = "/usr/local/bin/ffmpeg";
+
+/// What the pipeline's own directory is called inside a session's directory on
+/// a machine that is not a VM. Its appearance is how
+/// `crates/server/tests/local_provider.rs` sees that the layout a launcher named
+/// is the layout the server it spawned resolved.
+pub const BROADCAST_SUBDIR: &str = "broadcast";
+
 /// Blake2s-256 of an avatar's bytes, as the roster carries it.
 pub type AvatarHash = [u8; 32];
 
@@ -112,14 +131,72 @@ pub struct StreamConfig {
     pub pusher_input: String,
     /// Holds the video FIFO.
     pub work_dir: PathBuf,
-    /// Root-only tmpfs directory for one-shot key files.
+    /// Directory for one-shot key files, 0700 and readable by nobody but the
+    /// account running the server. See [`crate::keys`].
     pub key_dir: PathBuf,
 }
 
 impl Default for StreamConfig {
-    /// Encode settings from the bundled catalog, paths from the layout
-    /// cloud-init creates.
+    /// Encode settings from the bundled catalog, paths from whatever this
+    /// machine is. See [`StreamConfig::resolve`].
     fn default() -> Self {
+        StreamConfig::resolve(std::env::var_os(BROADCAST_DIR_ENV).as_deref())
+    }
+}
+
+impl StreamConfig {
+    /// The layout cloud-init creates on a session VM.
+    pub fn session_vm() -> StreamConfig {
+        StreamConfig::layout(PathBuf::from(VM_RUN_DIR), PathBuf::from(VM_FFMPEG))
+    }
+
+    /// The layout for a session server running on someone's own machine: the
+    /// video FIFO, every pusher's progress file and the staged keys in a
+    /// `broadcast` directory inside `dir`, which is the session's own, and
+    /// whichever ffmpeg the host installed.
+    ///
+    /// A directory of its own rather than the session's, because the session's
+    /// also holds the config and the log a host is told to read.
+    ///
+    /// A bare `ffmpeg` when this machine has none, which the OS resolves again
+    /// at each spawn, so a host who installs it mid-session gets a working
+    /// broadcast without restarting, and a spawn that still fails names the
+    /// program rather than an errno.
+    ///
+    /// Where the platform has no tmpfs, and macOS and Windows have none, this
+    /// puts the instant a stream key spends on disk on a real filesystem: one
+    /// 0600 file in a 0700 directory, opened and unlinked before the pusher
+    /// runs. On the VM that same file is on tmpfs and root-only. See
+    /// [`crate::keys`].
+    pub fn in_dir(dir: impl Into<PathBuf>) -> StreamConfig {
+        let ffmpeg = tools::on_path(tools::FFMPEG).unwrap_or_else(|| PathBuf::from(tools::FFMPEG));
+        StreamConfig::layout(dir.into().join(BROADCAST_SUBDIR), ffmpeg)
+    }
+
+    /// Which layout this machine gets: the directory a local session's
+    /// launcher named, the session VM's when the VM's tmpfs is there, and
+    /// failing both a directory of this process's own under the platform's
+    /// temp, so a jamstreamd started by hand has somewhere to work.
+    ///
+    /// Only a session VM may resolve to `/run/jamstream`. `/run` does not
+    /// exist on macOS, whose root volume is read-only, so an encoder rooted
+    /// there cannot create its FIFO at all, and there is no `/bin/sh` or
+    /// `/run` on Windows either.
+    fn resolve(broadcast_dir: Option<&OsStr>) -> StreamConfig {
+        if let Some(dir) = broadcast_dir.filter(|dir| !dir.is_empty()) {
+            return StreamConfig::in_dir(dir);
+        }
+        if Path::new(VM_RUN_DIR).is_dir() {
+            return StreamConfig::session_vm();
+        }
+        StreamConfig::in_dir(
+            std::env::temp_dir().join(format!("jamstream-broadcast-{}", std::process::id())),
+        )
+    }
+
+    /// Encode settings from the bundled catalog, so the ladder has one source
+    /// of truth, plus the paths a layout decides.
+    fn layout(dir: PathBuf, ffmpeg: PathBuf) -> StreamConfig {
         let catalog = PlatformCatalog::bundled();
         let v = catalog.video();
         let a = catalog.audio();
@@ -130,17 +207,15 @@ impl Default for StreamConfig {
             video_kbps: v.kbps,
             audio_kbps: a.kbps,
             keyframe_secs: v.keyframe_secs,
-            ffmpeg: PathBuf::from("/usr/local/bin/ffmpeg"),
+            ffmpeg,
             shell: PathBuf::from("/bin/sh"),
             encoder_output: "rtmp://127.0.0.1:1935/jamstream".to_owned(),
             pusher_input: "rtmp://127.0.0.1:1935/jamstream".to_owned(),
-            work_dir: PathBuf::from("/run/jamstream"),
-            key_dir: PathBuf::from("/run/jamstream/keys"),
+            key_dir: dir.join("keys"),
+            work_dir: dir,
         }
     }
-}
 
-impl StreamConfig {
     /// Video plus audio, the number every destination reports.
     pub fn total_kbps(&self) -> u32 {
         self.video_kbps + self.audio_kbps
@@ -494,13 +569,26 @@ impl<H: ProcessHost> Pipeline<H> {
                         let delay = self.encoder_backoff.fail();
                         self.encoder_retry_at_ms = Some(now_ms + delay);
                         tracing::error!(error = %err, delay_ms = delay, "encoder spawn failed");
-                        let reason = format!("spawn failed: {err}");
+                        let reason = self.spawn_reason(&err);
                         self.encoder_reason = Some(reason.clone());
                         self.events.push(PipelineEvent::EncoderDown { reason });
                     }
                 }
             }
         }
+    }
+
+    /// A failed encoder spawn as a host can act on it. An ffmpeg this machine
+    /// does not have is named, with how to install it, because the errno for
+    /// it is `No such file or directory`, which names neither the program nor
+    /// the fix. Checked against the filesystem rather than assumed from the
+    /// kind, so a NotFound from anything else the spawn touches keeps its own
+    /// message.
+    fn spawn_reason(&self, err: &std::io::Error) -> String {
+        if err.kind() == std::io::ErrorKind::NotFound && !tools::installed(&self.cfg.ffmpeg) {
+            return tools::missing(&self.cfg.ffmpeg);
+        }
+        format!("spawn failed: {err}")
     }
 
     fn poll_destination(&mut self, idx: usize, now_ms: u64, encoding: bool) {
@@ -1946,5 +2034,117 @@ mod tests {
         // leaning on the broadcast crate's decoder accepting this fixture.
         const PNG: &[u8] = include_bytes!("../testdata/avatar8.png");
         PNG.to_vec()
+    }
+
+    /// The shipped configuration, resolved on the machine this test is running
+    /// on and used without substituting anything for it.
+    ///
+    /// This is the test that was missing. Every other test here hands the
+    /// pipeline a temp directory first, so the layout a session actually gets
+    /// was the one layout nothing ran: off Linux it named `/run/jamstream`
+    /// under a read-only root, and the encoder's FIFO could not be created.
+    #[test]
+    fn the_default_layout_is_usable_on_the_machine_that_resolves_it() {
+        let cfg = StreamConfig::default();
+
+        // The FIFO, the progress files and the staged keys all live here, so a
+        // directory that cannot be created is a session that cannot broadcast.
+        std::fs::create_dir_all(&cfg.work_dir).unwrap_or_else(|err| {
+            panic!(
+                "the default work dir {} cannot be created here: {err}",
+                cfg.work_dir.display()
+            )
+        });
+        let probe = cfg.work_dir.join("layout-probe");
+        std::fs::write(&probe, b"x").unwrap_or_else(|err| {
+            panic!(
+                "the default work dir {} is not writable: {err}",
+                cfg.work_dir.display()
+            )
+        });
+        std::fs::remove_file(&probe).expect("remove the probe");
+
+        // Keys go under it, through the same staging a pusher spawn uses, which
+        // is what enforces 0700 on the directory.
+        let staged = KeyStore::new(cfg.key_dir.clone())
+            .stage(DestinationId(1), "rtmp://example.invalid/x?key=notakey")
+            .expect("a stream key must be stageable under the default layout");
+        assert!(staged.starts_with(&cfg.key_dir));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cfg.key_dir)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "key dir is {mode:o}");
+        }
+        let _ = std::fs::remove_file(&staged);
+
+        // And the encoder is something this machine can spawn: a path that is
+        // there, or a bare name the OS resolves at spawn time. An absolute path
+        // to a program this machine does not have is the shape of the bug.
+        assert!(
+            tools::installed(&cfg.ffmpeg) || cfg.ffmpeg == Path::new(tools::FFMPEG),
+            "the default names {}, which is not here and is not resolvable",
+            cfg.ffmpeg.display()
+        );
+
+        // Nothing of this process's is left in temp; a VM's own directory is
+        // not this test's to remove.
+        if let Some(parent) = cfg
+            .work_dir
+            .parent()
+            .filter(|parent| parent.starts_with(std::env::temp_dir()))
+        {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    /// The other half of the local session's contract: the launcher names a
+    /// directory, and everything the pipeline writes goes inside it.
+    #[test]
+    fn a_named_broadcast_dir_holds_the_whole_layout() {
+        let dir = std::env::temp_dir().join(format!("jamstream-layout-{}", std::process::id()));
+        let cfg = StreamConfig::resolve(Some(dir.as_os_str()));
+        assert_eq!(cfg.work_dir, dir.join(BROADCAST_SUBDIR));
+        assert!(cfg.key_dir.starts_with(&cfg.work_dir));
+        assert!(progress_path(&cfg.work_dir, DestinationId(1)).starts_with(&dir));
+
+        // An unset or empty variable is no answer, not an empty path: a layout
+        // rooted at "" would put the FIFO in whatever the working directory is.
+        for empty in [None, Some(OsStr::new(""))] {
+            let cfg = StreamConfig::resolve(empty);
+            assert_ne!(cfg.work_dir, Path::new(""));
+            assert!(cfg.work_dir.is_absolute(), "{}", cfg.work_dir.display());
+        }
+    }
+
+    /// The VM's layout stays spelled out, because cloud-init creates exactly
+    /// these paths and grants exactly this directory.
+    #[test]
+    fn the_session_vm_layout_is_the_one_cloud_init_creates() {
+        let cfg = StreamConfig::session_vm();
+        assert_eq!(cfg.work_dir, Path::new("/run/jamstream"));
+        assert_eq!(cfg.key_dir, Path::new("/run/jamstream/keys"));
+        assert_eq!(cfg.ffmpeg, Path::new("/usr/local/bin/ffmpeg"));
+    }
+
+    /// A missing encoder has to reach the host as the program's name and how to
+    /// get it. `spawn failed: No such file or directory (os error 2)` names
+    /// neither, and it is what a machine without ffmpeg used to be told.
+    #[test]
+    fn an_ffmpeg_this_machine_does_not_have_is_named_in_the_reason() {
+        let mut p = pipeline("noffmpeg");
+        p.cfg.ffmpeg = p.cfg.work_dir.join("ffmpeg");
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let reason = p.spawn_reason(&err);
+        assert_eq!(reason, tools::missing(Path::new("ffmpeg")));
+        assert!(!reason.contains("os error"), "{reason}");
+
+        // A NotFound from anything else the spawn touches keeps its own
+        // message: only an ffmpeg that is really absent is blamed on ffmpeg.
+        p.cfg.ffmpeg = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(p.spawn_reason(&err).starts_with("spawn failed:"));
     }
 }

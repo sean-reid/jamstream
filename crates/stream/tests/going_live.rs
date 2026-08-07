@@ -187,6 +187,55 @@ fn a_pusher_that_pushed_nothing_is_never_live_however_long_it_lives() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// What a machine without ffmpeg is told, over a real failed spawn rather than
+/// an io error a test made up: the program by name and how to install it. The
+/// errno underneath is `No such file or directory`, which names neither, and it
+/// was the whole of what a host used to get.
+#[test]
+fn a_host_without_ffmpeg_is_told_which_program_to_install() {
+    let root =
+        std::env::temp_dir().join(format!("jamstream-golive-noffmpeg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("work dir");
+    let mut pipeline = Pipeline::new(
+        StreamConfig {
+            // Named ffmpeg, and not there: what a resolution that found nothing
+            // on PATH leaves behind, one directory along.
+            ffmpeg: root.join("ffmpeg"),
+            work_dir: root.clone(),
+            key_dir: root.join("keys"),
+            ..StreamConfig::default()
+        },
+        StdProcessHost::new(),
+    );
+    pipeline.apply(0, StreamOp::Start).expect("start");
+    pipeline
+        .apply(
+            0,
+            StreamOp::AddDestination {
+                id: DestinationId(1),
+                platform: StreamPlatform::Twitch,
+                key: StreamKey::new("live_000000_notakey00"),
+            },
+        )
+        .expect("add a destination");
+
+    match state(&pipeline) {
+        DestinationState::Failed { reason } => {
+            println!("the host is told: {reason}");
+            assert!(
+                reason.starts_with("encoder down: ffmpeg is not installed"),
+                "{reason}"
+            );
+            assert!(reason.contains("PATH"), "{reason}");
+            assert!(!reason.contains("os error"), "{reason}");
+        }
+        other => panic!("a spawn of an ffmpeg that is not there reported {other:?}"),
+    }
+    drop(pipeline);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The other direction, so the state follows the report rather than the clock:
 /// the same slow pusher, reporting a push at the end of the same wait, is Live
 /// promptly afterwards and not before.
