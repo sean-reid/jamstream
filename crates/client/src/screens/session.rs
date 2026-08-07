@@ -6,16 +6,14 @@
 //!
 //! Health on the left, state in the centre, meter and action on the right.
 //! The centre is the point of it: ON AIR and REC are the two states in the
-//! product with consequences outside the room, and they used to sit at
-//! opposite ends of the bar with the session id and the cost ticker between
-//! them. They are one cluster now, in the middle, in their own lamps, and the
-//! cluster takes no space at all while all of them are off.
+//! product with consequences outside the room, so they share one cluster in
+//! the middle, each in its own lamp. The cluster takes no space at all while
+//! all of them are off.
 //!
 //! AUDITION is in there too, because "your monitor is not your monitor" is a
-//! state with consequences and it had been a 4 px dot with two lowercase words
-//! parked in the health zone (#188). Every lamp in the cluster carries a shape
-//! as well as a colour, so the two that can be lit at once are told apart
-//! without having to tell two warm oranges apart (#182).
+//! state with consequences. Every lamp in the cluster carries a shape as well
+//! as a colour, so the two that can be lit at once are told apart without
+//! having to tell two warm oranges apart.
 //!
 //! What the link is doing beyond the headline number, rtt and buffer depth
 //! and loss, is on that number's hover. It is diagnostic: worth reading when
@@ -76,8 +74,8 @@ pub const MIN_FADER_H: f32 = 32.0;
 /// The panel primitive's 10 px margins around the strip's content.
 const STRIP_FRAME_H: f32 = 20.0;
 /// The panel's hairline, one pixel on each edge, which the frame adds around
-/// the box the strip allocates inside it. Counted horizontally already; the
-/// reservation used to forget it vertically.
+/// the box the strip allocates inside it. The vertical reservation counts it,
+/// the same as the horizontal one.
 const STRIP_FRAME_STROKE_H: f32 = 2.0;
 /// The hair a fader keeps off the readout above it.
 const FADER_INSET_H: f32 = 2.0;
@@ -276,9 +274,9 @@ impl SessionScreen {
 
     /// True while this screen has something of its own that Escape has to
     /// leave first. The settings drawer is the outer surface of the two, so
-    /// the app hands the key to the screen while any of these is up: with the
-    /// drawer open, Revoke on a strip used to put a confirmation on screen
-    /// that Escape walked straight past to close the drawer under it (#180).
+    /// the app hands the key to the screen while any of these is up, so a
+    /// confirmation raised from a strip takes Escape before the drawer it sits
+    /// on top of.
     ///
     /// The narrow chat toggle is deliberately not in here: it is a view
     /// switch, not something entered, and the drawer sits on top of it.
@@ -372,9 +370,8 @@ impl SessionScreen {
 
         // A device that will not run is a genuine problem: the session is up,
         // the strips are drawn, and this musician is silent in both directions.
-        // It used to be a log line and one chat line that said what the app did
-        // about it but not why, so a swap mid-song was silence with nothing on
-        // screen (#263). Above the strips, in the danger step that reads on the
+        // A swap mid-song cannot be silence with nothing on screen, so the
+        // reason goes above the strips, in the danger step that reads on the
         // panel, never the accent, which means live.
         //
         // The device's words first and unprefixed, because a reason wrapped in
@@ -525,9 +522,8 @@ impl SessionScreen {
         );
         ui.horizontal(|ui| {
             // Presence, not link quality: the only per-member fact this side
-            // has is whether they are here. The dot used to carry your own
-            // rtt and loss on every strip, so a green dot beside Ana said
-            // nothing about Ana (#174).
+            // has is whether they are here. Your own rtt and loss belong
+            // nowhere near a strip, where they would read as that member's.
             presence_dot(ui, member.connected, member.quiet);
             // Long names truncate inside the fixed strip; the full name is
             // one hover away.
@@ -656,10 +652,9 @@ impl SessionScreen {
     fn metronome_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime, _row_w: f32) {
         theme::panel(ui).show(ui, |ui| {
             // As wide as its own content, not as wide as however many
-            // musicians are in the band. It used to track the strip row, which
-            // put "tempo 112" and three other short rows in the corner of a
-            // 1500 px box at ten musicians, with its right edge running under
-            // the settings drawer (#186).
+            // musicians are in the band: tracking the strip row would leave
+            // four short rows in the corner of a 1500 px box at ten musicians,
+            // its right edge under the settings drawer.
             ui.set_width(METRONOME_W.min(ui.available_width()));
             ui.label(theme::title(ui, "Metronome"));
             ui.add_space(theme::SPACE_XS);
@@ -1240,12 +1235,9 @@ fn cluster_entries(p: &theme::Palette, snap: &Snapshot) -> Vec<ClusterEntry> {
             hover,
         });
     }
-    // Audition used to be a 4 px accent dot and two lowercase muted words
-    // wedged into the health zone, which is the zone reserved for link
-    // quality: a third visual language for the one state of the three that is
-    // about what the host hears (#188). It is a lamp like the others now, in
-    // the cluster with them, and it is a ring in no colour at all, because
-    // nothing is wrong and nothing extra is leaving the room.
+    // Audition belongs in the cluster as a lamp like the others, not in the
+    // health zone, which is reserved for link quality. Its ring takes no
+    // colour: nothing is wrong and nothing extra is leaving the room.
     if snap.broadcast.as_ref().is_some_and(|b| b.audition) {
         entries.push(ClusterEntry {
             label: "AUDITION",
@@ -1431,13 +1423,10 @@ fn mute_button(ui: &mut Ui, muted: &mut bool, size: egui::Vec2, hover: [&str; 2]
     }
 }
 
-// No per-member meter slot. Every strip used to end in an outlined box with
-// the word "meter" in it and the explanation only on hover, so a four to ten
-// piece console showed that many empty gauges, which reads as a readout that
-// is broken rather than one that does not exist yet (#185). It was also in the
-// published screenshots. The strips get the room back until the Stats control
-// message carries per-member levels; at that point the slot comes back with
-// something in it.
+// No per-member meter slot. An empty gauge on every strip reads as a readout
+// that is broken rather than one that does not exist yet, so the strips keep
+// the room until the Stats control message carries per-member levels; at that
+// point the slot comes back with something in it.
 
 #[cfg(test)]
 mod tests {
@@ -1448,9 +1437,7 @@ mod tests {
 
     /// The console's width rule, over every width a window can leave it: what
     /// it takes is always a whole number of strips, never more room than there
-    /// is, and never one strip fewer than the room holds. The right-hand end of
-    /// a ten-piece console used to be sliced by the chat panel's edge, mid name
-    /// and mid button, with a horizontal scrollbar as the only cue (#286).
+    /// is, and never one strip fewer than the room holds.
     #[test]
     fn the_console_takes_whole_strips_and_all_of_them_that_fit() {
         let per = STRIP_OUTER_W + STRIP_GAP;

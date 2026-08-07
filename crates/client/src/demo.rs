@@ -311,10 +311,10 @@ impl DemoRuntime {
     pub fn set_destinations(&self, entries: &[(StreamPlatform, DestinationState)]) {
         // One encode feeds every destination, so both frame counters are one
         // counter each and the pipeline reports the same pair on every row
-        // (jamstream_stream::pipeline, `status`). This used to hand Twitch 0 and
-        // YouTube 41, which is a state the product cannot reach and which the
-        // docs site was publishing (#264). Nonzero whenever anything has gone
-        // wrong at all, so both readouts are still exercised.
+        // (jamstream_stream::pipeline, `status`). Per-destination figures that
+        // disagree are a state the product cannot reach, and this snapshot
+        // reaches the docs site. Nonzero whenever anything has gone wrong at
+        // all, so both readouts are still exercised.
         //
         // Repeats far outnumber losses, which is the shape a struggling machine
         // really has: it runs out of time to draw long before the encoder's

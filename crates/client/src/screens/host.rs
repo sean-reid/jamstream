@@ -1271,12 +1271,10 @@ impl HostWizard {
                     let title_font = egui::FontId::new(16.0, theme::semibold(ui));
                     ui.label(RichText::new(title).font(title_font));
                     ui.add_space(theme::SPACE_LG);
-                    // The body scrolls and the actions do not. At 800x600 the
+                    // The body scrolls and the actions do not: at 800x600 the
                     // preview step is taller than the window, and Back and
-                    // Launch used to sit past the bottom edge with a 6 px
-                    // scrollbar as the only cue that they were there (#179).
-                    // Each step keeps its own offset, so a step opens at its
-                    // own top.
+                    // Launch have to stay on screen. Each step keeps its own
+                    // offset, so a step opens at its own top.
                     let header_h = ui.cursor().top() - card_top;
                     let room_for_body =
                         (room - header_h - ACTIONS_H - CARD_BOTTOM_H).max(MIN_BODY_H);
@@ -1319,8 +1317,7 @@ impl HostWizard {
 
     /// The step's actions, on the card's bottom edge whatever the body above
     /// them is doing. Every step has a way on and, past the first, a way back;
-    /// the launch has a way to stop waiting, which is the one that used to be
-    /// missing (#177).
+    /// the launch has a way to stop waiting.
     fn actions_ui(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| match self.step {
             WizardStep::Provider => {

@@ -1320,10 +1320,10 @@ impl JamApp {
     /// a session is up. A file dialog is a second window the frame loop
     /// cannot see, so a repaint is asked for until its thread answers.
     ///
-    /// An open settings drawer used to be reason enough on any screen. Its
-    /// only moving part is the Audio tab's input meter, which reads its
-    /// levels off a snapshot, so on Home with no session behind it the
-    /// drawer held the whole app at display rate to redraw zeros (#383).
+    /// An open settings drawer counts only while a session is up. Its only
+    /// moving part is the Audio tab's input meter, which reads its levels off
+    /// a snapshot, so on Home it would hold the whole app at display rate to
+    /// redraw zeros.
     pub fn repaint_while_animating(&self, ctx: &Context) {
         let drawer_animating = self.settings_open && self.runtime.is_some();
         let animating = self.ending.is_some()

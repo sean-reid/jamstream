@@ -443,13 +443,10 @@ impl DestinationsPanel {
         // The second line: this row's actions, left to right in reading order
         // under the platform they belong to.
         //
-        // They used to sit in a right_to_left layout, which reversed them on
-        // screen so a row read "Forget key" before "Use saved key", destructive
-        // first, while the invites panel two tabs away built the same pair in a
-        // normal layout and read the other way round (#183). It also left an
-        // unconfigured platform with a lone "Add key" pinned to the drawer's
-        // right edge, 36 px below its own name with a blank line between them
-        // (#192). One layout, one reading order, under the name.
+        // Not a right_to_left layout: that reverses them on screen, so a row
+        // reads "Forget key" before "Use saved key" while the invites panel
+        // builds the same pair the other way round, and it pins an
+        // unconfigured platform's lone "Add key" to the drawer's right edge.
         ui.horizontal(|ui| {
             match configured_id {
                 Some(id) => {

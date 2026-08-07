@@ -4,12 +4,11 @@
 //!
 //! Where green ends, where amber ends, and how long a peak holds are
 //! [`jamstream_broadcast::meter`]'s, not this file's. A viewer watching the
-//! stream beside a musician looking at the app is reading one level, and this
-//! used to hold a second copy of all four numbers: the app held the peak for
-//! 1.5 s and the renderer for 45 frames, which is the same thing only at 30
-//! fps, and frame rate is data in the platform catalog (#232). The release
-//! rates below stay here, because a repainting widget and a fixed-rate encode
-//! measure decay differently.
+//! stream beside a musician looking at the app is reading one level, and a
+//! second copy of those numbers drifts as soon as frame rate does, since the
+//! renderer counts a hold in frames and frame rate is per-platform data. The
+//! release rates below stay here, because a repainting widget and a
+//! fixed-rate encode measure decay differently.
 
 use egui::{Color32, CornerRadius, Rect, Sense, Ui, Vec2, pos2};
 use jamstream_broadcast::meter::{AMBER_FROM_DB, FLOOR_DB, HOLD_SECS, RED_FROM_DB};
