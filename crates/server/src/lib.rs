@@ -4,6 +4,7 @@
 pub mod cloud_sink;
 pub mod config;
 pub mod flac;
+pub mod logtail;
 pub mod record;
 pub mod relay;
 pub mod revocations;

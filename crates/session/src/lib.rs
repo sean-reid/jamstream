@@ -22,7 +22,6 @@ pub mod testing;
 pub use avatar::{AvatarCache, AvatarHash, AvatarRx, RxStep, avatar_hash, chunk_total};
 
 pub use client::{ClientCore, ClientEvent, ClientState, ClientStats, ServerCandidates};
-pub use logtail::{LOG_TAIL_LINES, LogTail};
 /// Session capacity and the host-surface defaults, defined once in
 /// [`limits`] and re-exported here because every crate that offers seats
 /// needs them: `jamstream_session::MAX_MUSICIANS` is the number.
@@ -31,6 +30,7 @@ pub use limits::{
     DEFAULT_MEMBER_TIMEOUT_MS, DEFAULT_MUSICIANS, MAX_LISTENERS, MAX_MUSICIANS,
     MEMBER_QUIET_AFTER_MS, VIOLATION_BURST,
 };
+pub use logtail::{LOG_TAIL_LINES, LogTail};
 pub use server::{
     BroadcastMember, BroadcastTick, MemberStats, ServerConfig, ServerCore, ServerEvent, Stem,
     TICK_SAMPLES,
