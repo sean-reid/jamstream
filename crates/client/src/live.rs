@@ -98,6 +98,13 @@ const REFUSED_WINDOW_LIMIT: u64 = 200;
 /// buffer's 64-frame queue. It costs nothing in latency: see
 /// [`capture_capacity`].
 const CAPTURE_RING: Duration = Duration::from_millis(40);
+/// Wait before the ring counters are reported again, and the ceiling that wait
+/// doubles to. A burst at open is then one line, while a ring that keeps
+/// dropping says so for as long as it does without filling the file: the old
+/// once-per-stream line could not tell those apart, and #436 arrived as a
+/// single count with no way to know whether it was still climbing.
+const RING_REPORT_AGAIN: Duration = Duration::from_secs(1);
+const RING_REPORT_MAX: Duration = Duration::from_secs(60);
 
 /// Playout ring capacity in samples, which doubles as the playout depth
 /// target: the top-up loop keeps the ring full, so the device-side cushion
@@ -637,6 +644,90 @@ impl PlayoutWatch {
     }
 }
 
+/// Reports the bridge's dropped-capture and padded-playout counters as the log
+/// sees them: the first movement at once, then again on a doubling wait for as
+/// long as the count keeps climbing.
+///
+/// The cadence is the point. #436 arrived as `overruns=33` on a stream that had
+/// been up for a second, and nothing in the file could say whether that was a
+/// burst while the session came up or the first second of a drip that ran for
+/// the whole song. Those want different fixes, and the person who can hear the
+/// damage is at the other end of the session, so the log is where it has to be
+/// answerable. Each line carries the count since the last one and how long the
+/// stream has been up, so the shape reads off the timestamps.
+struct RingWatch {
+    /// When the stream this watches opened; every line is dated from it.
+    opened: Instant,
+    overruns: CounterWatch,
+    underruns: CounterWatch,
+}
+
+/// One counter's reporting state.
+#[derive(Default)]
+struct CounterWatch {
+    /// The total as the last line reported it, and when that line went out.
+    said: Option<(u64, Instant)>,
+    /// The wait owed before this counter is reported again.
+    wait: Duration,
+}
+
+impl RingWatch {
+    fn new(opened: Instant) -> RingWatch {
+        RingWatch {
+            opened,
+            overruns: CounterWatch::default(),
+            underruns: CounterWatch::default(),
+        }
+    }
+
+    /// One tick's worth of observation, against the ring the counters belong to.
+    fn observe(&mut self, now: Instant, engine: &EngineSide, ring_frames: u32) {
+        let up_ms = now.duration_since(self.opened).as_millis();
+        let overruns = engine.overruns();
+        if let Some(dropped) = self.overruns.due(now, overruns) {
+            tracing::warn!(
+                dropped,
+                overruns,
+                ring_frames,
+                up_ms,
+                "capture ring overflowed; captured audio was dropped"
+            );
+        }
+        let underruns = engine.underruns();
+        if let Some(padded) = self.underruns.due(now, underruns) {
+            tracing::warn!(
+                padded,
+                underruns,
+                ring_frames,
+                up_ms,
+                "playout ring ran dry; the device padded silence"
+            );
+        }
+    }
+}
+
+impl CounterWatch {
+    /// Whether `total` earns a line now, and the count that line carries.
+    fn due(&mut self, now: Instant, total: u64) -> Option<u64> {
+        if total == 0 {
+            return None;
+        }
+        match self.said {
+            None => {
+                self.said = Some((total, now));
+                self.wait = RING_REPORT_AGAIN;
+                Some(total)
+            }
+            Some((said, at)) if total > said && now.duration_since(at) >= self.wait => {
+                self.said = Some((total, now));
+                self.wait = (self.wait * 2).min(RING_REPORT_MAX);
+                Some(total - said)
+            }
+            Some(_) => None,
+        }
+    }
+}
+
 /// The production runtime. Construct with [`LiveRuntime::join`]; the UI
 /// consumes it as a `Box<dyn Runtime>` (an `Arc<LiveRuntime>` implements
 /// the trait too, so the app can keep a concrete handle for
@@ -727,8 +818,7 @@ impl LiveRuntime {
             driver,
             engine: Some(engine),
             device_frames,
-            ring_underrun_warned: false,
-            ring_overrun_warned: false,
+            rings: RingWatch::new(Instant::now()),
             playout: PlayoutWatch::default(),
             settings,
             shared: Arc::clone(&shared),
@@ -1081,11 +1171,10 @@ struct Worker {
     /// Frames the current ring was sized from: the settings' request, or the
     /// device's own callback size when the device negotiated a bigger one.
     device_frames: u32,
-    /// One warn per stream when each bridge counter first moves; the
-    /// counters had no other consumer, so a ring the device outgrew was
-    /// audible but invisible (#323).
-    ring_underrun_warned: bool,
-    ring_overrun_warned: bool,
+    /// The bridge counters as the log reports them; they had no other
+    /// consumer, so a ring the device outgrew was audible but invisible
+    /// (#323).
+    rings: RingWatch,
     /// One warn per episode when playout goes silent or media is refused; the
     /// jitter buffer's counters had no consumer that could say either (#451).
     playout: PlayoutWatch,
@@ -1395,8 +1484,7 @@ impl Worker {
                 self.engine = Some(engine);
                 self.opened_at = Some(Instant::now());
                 self.device_frames = device_frames;
-                self.ring_underrun_warned = false;
-                self.ring_overrun_warned = false;
+                self.rings = RingWatch::new(Instant::now());
                 self.carry_pos = 0;
                 self.carry_len = 0;
                 let mut shared = self.shared.lock().expect("live state");
@@ -1520,33 +1608,17 @@ impl Worker {
         self.levels.output_rms = inst_rms.max(self.levels.output_rms * LEVEL_DECAY);
     }
 
-    /// One warn per stream when each bridge counter first moves. Movement
-    /// means a ring too shallow for what the device delivers or for what the
-    /// worker is keeping up with, which is the shape of both #323 and #436;
-    /// the log is the one place that class of defect shows as something other
-    /// than bad audio somebody else can hear.
+    /// The bridge counters, reported by [`RingWatch`]. Movement means a ring
+    /// too shallow for what the device delivers or for what the worker is
+    /// keeping up with, which is the shape of both #323 and #436; the log is
+    /// the one place that class of defect shows as something other than bad
+    /// audio somebody else can hear.
     fn watch_ring_health(&mut self) {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
-        let underruns = engine.underruns();
-        if underruns > 0 && !self.ring_underrun_warned {
-            self.ring_underrun_warned = true;
-            tracing::warn!(
-                underruns,
-                ring_frames = self.device_frames,
-                "playout ring ran dry; the device padded silence"
-            );
-        }
-        let overruns = engine.overruns();
-        if overruns > 0 && !self.ring_overrun_warned {
-            self.ring_overrun_warned = true;
-            tracing::warn!(
-                overruns,
-                ring_frames = self.device_frames,
-                "capture ring overflowed; captured audio was dropped"
-            );
-        }
+        self.rings
+            .observe(Instant::now(), engine, self.device_frames);
     }
 
     fn drain_events(&mut self, now_ms: u64) {
@@ -2328,6 +2400,103 @@ mod tests {
         assert!(lines[0].contains("being refused"), "{:?}", lines[0]);
     }
 
+    /// A bridge whose capture ring is full, so every push overruns and every
+    /// playback callback underruns: one event per call, on demand.
+    fn full_ring() -> (jamstream_audio_io::DeviceSide, EngineSide) {
+        let (mut device, engine) = CallbackBridge::new(4, 4);
+        device.on_capture(&[1.0; 4]);
+        (device, engine)
+    }
+
+    /// The shape #436 could not be read from the log: drops that happen in a
+    /// burst and then stop say so once. The count, the ring, and how long the
+    /// stream had been up all ride the line, because those are what separate a
+    /// burst at open from a drip.
+    #[test]
+    fn a_burst_of_dropped_capture_says_so_once() {
+        let start = Instant::now();
+        let lines = captured(|| {
+            let (mut device, engine) = full_ring();
+            let mut watch = RingWatch::new(start);
+            for _ in 0..8 {
+                device.on_capture(&[1.0; 4]);
+            }
+            // A minute of ticks after the burst, at the loop's own cadence.
+            for tick in 0..24_000u32 {
+                watch.observe(start + TICK * tick, &engine, 120);
+            }
+        });
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        let line = &lines[0];
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("capture ring overflowed"), "{line}");
+        for field in ["dropped=8", "overruns=8", "ring_frames=120", "up_ms=0"] {
+            assert!(line.contains(field), "no {field} in {line}");
+        }
+    }
+
+    /// The other shape, and the one that matters: a ring that keeps dropping
+    /// keeps saying so, on a widening cadence, each line carrying what was lost
+    /// since the last. One line per stream would have said 33 and then nothing
+    /// for the rest of the song.
+    #[test]
+    fn capture_that_keeps_dropping_keeps_saying_so() {
+        let start = Instant::now();
+        let lines = captured(|| {
+            let (mut device, engine) = full_ring();
+            let mut watch = RingWatch::new(start);
+            // Ten seconds, dropping one callback every 100 ms.
+            for tick in 0..4_000u32 {
+                if tick % 40 == 0 {
+                    device.on_capture(&[1.0; 4]);
+                }
+                watch.observe(start + TICK * tick, &engine, 120);
+            }
+        });
+        assert!(lines.len() >= 4, "{lines:#?}");
+        for line in &lines {
+            assert!(line.contains("capture ring overflowed"), "{line}");
+        }
+        // The first line is the first drop; each one after it waits twice as
+        // long, so ten seconds of dropping costs four lines and not four
+        // hundred.
+        let up_ms: Vec<u64> = lines
+            .iter()
+            .map(|line| {
+                let at = line.split("up_ms=").nth(1).expect("up_ms");
+                at.split_whitespace()
+                    .next()
+                    .expect("a value")
+                    .parse()
+                    .expect("a number")
+            })
+            .collect();
+        assert_eq!(up_ms[0], 0, "{up_ms:?}");
+        for pair in up_ms[1..].windows(2) {
+            let widened = (pair[1] - pair[0]) as f64 / (pair[0].max(1)) as f64;
+            assert!(widened > 0.5, "the wait did not widen: {up_ms:?}");
+        }
+        // Every drop is accounted for across the lines, none counted twice.
+        let dropped: u64 = lines
+            .iter()
+            .map(|line| {
+                let at = line.split("dropped=").nth(1).expect("dropped");
+                at.split_whitespace()
+                    .next()
+                    .expect("a value")
+                    .parse::<u64>()
+                    .expect("a number")
+            })
+            .sum();
+        let last: u64 = lines
+            .last()
+            .and_then(|line| line.split("overruns=").nth(1))
+            .and_then(|at| at.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .expect("a total on the last line");
+        assert_eq!(dropped, last, "the deltas must add up to the total");
+    }
+
     /// #436 on a real device: the client's own ring sizes, the client's own
     /// 2.5 ms consumer cadence, and a sound card producing on its own clock,
     /// which no fake in this workspace does. The only backend a test can drive
@@ -2413,6 +2582,52 @@ mod tests {
             pulled as f64 > want,
             "only {pulled} samples came through in {RUN:?}, so the assertions above \
              passed on a device that delivered next to nothing"
+        );
+    }
+
+    /// A ring nothing has gone wrong with says nothing at all, which is what
+    /// lets an empty log file mean a healthy run.
+    #[test]
+    fn a_ring_with_room_says_nothing() {
+        let start = Instant::now();
+        let lines = captured(|| {
+            let (mut device, mut engine) = CallbackBridge::new(64, 64);
+            let mut watch = RingWatch::new(start);
+            for tick in 0..4_000u32 {
+                device.on_capture(&[1.0; 8]);
+                let mut buf = [0.0f32; 64];
+                engine.pull_captured(&mut buf);
+                engine.push_playout(&[0.5; 8]);
+                let mut out = [0.0f32; 8];
+                device.on_playback(&mut out);
+                watch.observe(start + TICK * tick, &engine, 120);
+            }
+        });
+        assert!(lines.is_empty(), "{lines:#?}");
+    }
+
+    /// The two counters are reported apart: a stream that pads playout and
+    /// never drops capture says so about playout only, in the sentence that
+    /// names the device as the one padding.
+    #[test]
+    fn a_dry_playout_ring_says_that_instead() {
+        let start = Instant::now();
+        let lines = captured(|| {
+            let (mut device, engine) = CallbackBridge::new(64, 64);
+            let mut watch = RingWatch::new(start);
+            let mut out = [0.0f32; 8];
+            device.on_playback(&mut out);
+            for tick in 0..400u32 {
+                watch.observe(start + TICK * tick, &engine, 120);
+            }
+        });
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains("padded silence"), "{:?}", lines[0]);
+        assert!(lines[0].contains("padded=1"), "{:?}", lines[0]);
+        assert!(
+            !lines[0].contains("capture ring"),
+            "a dry playout ring is not a dropped capture: {:?}",
+            lines[0]
         );
     }
 }
