@@ -5,8 +5,8 @@
 //! without. Nothing ever checked it. Its unit is `Type=simple`, and systemd
 //! calls one of those started the moment it forks, so `Started
 //! mediamtx.service` in a console log says nothing about a relay that died a
-//! second later, and everything after boot goes to a journal no host can reach
-//! (#441).
+//! second later, and everything after boot goes to a journal no host can
+//! reach.
 //!
 //! The probe lives here, in the session server, rather than in cloud-init, for
 //! three reasons. A boot-time check cannot see a relay that dies in the fortieth

@@ -18,7 +18,7 @@ pub enum FrameDuration {
 impl FrameDuration {
     /// `const` so a caller can size a buffer or a tick from the wire's own
     /// answer instead of spelling the number again. Both of the numbers below
-    /// were hand copied in jamstream-client for exactly that reason (#231).
+    /// are hand copied in jamstream-client for exactly that reason.
     pub const fn samples(self) -> u32 {
         match self {
             FrameDuration::Ms2_5 => 120,

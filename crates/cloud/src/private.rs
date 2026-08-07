@@ -226,7 +226,7 @@ fn private_dir_builder() -> std::fs::DirBuilder {
 /// write to: either way somebody else controls what sits under the key
 /// files. A pre-created `/tmp/jamstream` fails the write bits; a directory
 /// another account handed over fails `st_uid == geteuid()`, the check
-/// issue #49 asked for and only libc can make.
+/// only libc can make.
 #[cfg(unix)]
 fn check_exposure(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
@@ -310,8 +310,8 @@ fn harden_new_dir(dir: &Path) {
 /// The window is short on purpose. This process outlives the ACL it read:
 /// the desktop app runs for hours, and a memo that lasted the process
 /// turned the module's promise to vet a directory it finds into a promise
-/// to vet it once, which is what an ACL loosened mid-session walked
-/// straight through (#380).
+/// to vet it once, which is what an ACL loosened mid-session walks
+/// straight through.
 ///
 /// Two `icacls` passes, because `/remove:g` cannot touch an inherited ACE:
 ///
@@ -890,10 +890,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The case issue #380 is about. The app is a long-running process, so
-    /// a directory it hardened at launch has hours in which its ACL can be
-    /// loosened; the next write has to look again rather than answer from
-    /// the memo.
+    /// The app is a long-running process, so a directory it hardened at
+    /// launch has hours in which its ACL can be loosened; the next write
+    /// has to look again rather than answer from the memo.
     #[cfg(windows)]
     #[test]
     fn windows_an_acl_loosened_mid_session_is_tightened_again() {

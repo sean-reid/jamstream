@@ -2,13 +2,13 @@
 //! arm the self-destruct, wait for the machine's address, and prove it
 //! answers a real handshake.
 //!
-//! `jamstream host` and the desktop wizard bring a session up the same way,
-//! and for a while they did it with two copies of these functions. The
-//! copies drifted: only one of them checked the artifact pair an operator
-//! typed, so the other spent a launch, a boot and a self-destruct before
-//! anyone heard that the url was wrong (#384). What differs between the two
-//! surfaces is where an operator types the override and how the caller
-//! renders an error, and that is all this module takes as parameters.
+//! `jamstream host` and the desktop wizard bring a session up the same way:
+//! both resolve through this module, so a typo in an operator-typed
+//! artifact pair is caught here rather than costing a launch, a boot and a
+//! self-destruct before anyone notices the url was wrong. What differs
+//! between the two surfaces is where an operator types the override and
+//! how the caller renders an error, and that is all this module takes as
+//! parameters.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -81,7 +81,7 @@ impl ArtifactOverride {
 /// on), then the download pinned into this build for `arch`, the
 /// architecture of the machines the provider launches. A launch whose
 /// architecture has no pin is refused here, because the VM would download a
-/// binary that cannot execute (#139). Local and mock launches download
+/// binary that cannot execute. Local and mock launches download
 /// nothing, so without an override they get the inert placeholders.
 ///
 /// The override is the one part of the VM's root bootstrap a person types,
@@ -342,10 +342,10 @@ mod tests {
         assert!(text.contains("--artifact-url"), "error was: {text}");
     }
 
-    /// #139 root cause: the pin followed the build, not the machine. The
-    /// architecture must come from the provider doing the launching, and
-    /// the two real cloud providers with fixed instance families must pull
-    /// opposite pins from the same build.
+    /// The pin must follow the machine, not the build: the architecture
+    /// comes from the provider doing the launching, and the two real cloud
+    /// providers with fixed instance families must pull opposite pins
+    /// from the same build.
     #[test]
     fn aws_selects_the_arm64_pin_and_digitalocean_the_x86_64_one() {
         use providers::{aws::AwsProvider, digitalocean::DigitalOceanProvider};
@@ -360,7 +360,8 @@ mod tests {
 
     /// A launch whose architecture has no pin must refuse before a machine
     /// is paid for, and the error must name the architecture, because
-    /// launching would produce exactly the dead VM of #139.
+    /// launching would boot a machine that cannot execute the binary it
+    /// downloads.
     #[test]
     fn a_missing_arch_pin_refuses_to_launch_naming_the_architecture() {
         let x86_only = PinnedServerArtifacts {
@@ -425,10 +426,10 @@ mod tests {
         }
     }
 
-    /// #384: the wizard took the same operator-typed pair the CLI takes and
-    /// did not check it, so a typo cost a launch, a boot and a self-destruct
-    /// before anyone heard about it. Both surfaces resolve through this
-    /// function, so both refuse the same pairs for the same reasons.
+    /// The wizard takes the same operator-typed pair the CLI takes, and an
+    /// unchecked typo costs a launch, a boot and a self-destruct before
+    /// anyone hears about it. Both surfaces resolve through this function,
+    /// so both refuse the same pairs for the same reasons.
     #[test]
     fn a_typed_artifact_pair_is_validated_before_anything_launches() {
         let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";

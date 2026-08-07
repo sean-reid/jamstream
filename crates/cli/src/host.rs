@@ -342,11 +342,11 @@ pub async fn run<W: Write>(
 /// The launch's cost as the host is shown it: the session, plus the recording
 /// when one is armed.
 ///
-/// A recording is not free and it was not in this number. `--bucket` buys
-/// storage for the retention period and one download's worth of egress, which
-/// on a four piece recording stems for three hours is most of the bill, and the
-/// preview said nothing about it (#209). Storage prices in the bucket's own
-/// region, which is the region the launch is putting it in.
+/// A recording is not free: `--bucket` buys storage for the retention
+/// period and one download's worth of egress, which on a four piece
+/// recording stems for three hours is most of the bill, and the preview
+/// must account for it. Storage prices in the bucket's own region, which
+/// is the region the launch is putting it in.
 pub fn launch_preview(
     price: &Price,
     args: &HostArgs,
@@ -456,7 +456,7 @@ pub async fn probe_bucket(storage: &RecordingStorage, session_hex: &str) -> Resu
 /// rather than at the first take. The failure says what the bucket refused
 /// and names the prefix a key has to be able to write; the provider's own
 /// response goes to the log, because for S3 it is a document naming the
-/// account number and the IAM ARN (#374).
+/// account number and the IAM ARN.
 pub async fn probe_prefix(
     store: &dyn jamstream_cloud::ObjectStore,
     bucket: &str,
@@ -821,8 +821,8 @@ mod tests {
         );
     }
 
-    /// #209: a host arming a recording was never shown what it costs. The
-    /// preview folds the recording in, so the total a host agrees to is the
+    /// A host arming a recording must be shown what it costs. The preview
+    /// folds the recording in, so the total a host agrees to is the
     /// total, and stems, which are the expensive choice, move it.
     #[test]
     fn the_preview_prices_the_recording_a_launch_is_arming() {
@@ -978,10 +978,10 @@ mod tests {
         }
     }
 
-    /// The point of #121: a session on this machine is offered on loopback
-    /// first, so a same-machine join never leaves the host and the macOS
-    /// Application Firewall never gets a vote. The LAN address stays for
-    /// the bandmate on the same network.
+    /// A session on this machine is offered on loopback first, so a
+    /// same-machine join never leaves the host and the macOS Application
+    /// Firewall never gets a vote. The LAN address stays for the bandmate
+    /// on the same network.
     #[test]
     fn a_session_on_this_machine_offers_loopback_first() {
         let lan: IpAddr = "192.168.1.12".parse().unwrap();

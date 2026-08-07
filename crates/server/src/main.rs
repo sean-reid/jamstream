@@ -157,7 +157,7 @@ fn main() -> ExitCode {
 /// `RUST_LOG` target and level directives, or info when the variable is
 /// unset or does not parse. `Targets` rather than `EnvFilter`: same syntax
 /// for everything an operator writes here, without the regex engine that
-/// only EnvFilter's unused span-field grammar needs (#298).
+/// only EnvFilter's unused span-field grammar needs.
 fn log_filter(rust_log: Option<&str>) -> Targets {
     rust_log
         .and_then(|value| value.parse().ok())
@@ -326,9 +326,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use tracing::Level;
 
-    /// #298 moved the filter from `EnvFilter` to `Targets` to drop the
-    /// regex engine. `RUST_LOG` target directives and the unset info
-    /// default are the contract that must survive the swap.
+    /// `RUST_LOG` target directives and the unset info default are the
+    /// contract this filter must honor, without `EnvFilter`'s regex
+    /// engine.
     #[test]
     fn log_filter_honors_rust_log_and_defaults_to_info() {
         let unset = log_filter(None);
@@ -347,7 +347,7 @@ mod tests {
         assert!(!garbage.would_enable("jamstream_session", &Level::DEBUG));
     }
 
-    /// #139: the bootstrap execs `jamstreamd --version` before enabling the
+    /// The bootstrap execs `jamstreamd --version` before enabling the
     /// unit, so the flag must be recognized wherever it lands in argv and
     /// must never require a config file. The full no-config run is proven
     /// by the version integration test against the real binary.

@@ -170,7 +170,7 @@ mod tests {
     /// and the cost crate cannot read this file, so drift means we bill for a
     /// bitrate we do not send: quote 2.6 Mbps of egress, push 6, and the first
     /// the host hears of it is the provider's invoice. This crate is the one
-    /// that sees both (#232).
+    /// that sees both.
     #[test]
     fn the_billed_bitrate_is_the_bitrate_we_actually_send() {
         let cat = PlatformCatalog::bundled();

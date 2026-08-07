@@ -3,7 +3,7 @@
 //! `filter::Targets` rather than `EnvFilter`: both parse the target and
 //! level directives operators actually write, but EnvFilter's span-field
 //! grammar needs a regex engine that cost every binary about 280 KiB of
-//! .text and nothing in this repository uses (#298).
+//! .text and nothing in this repository uses.
 
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
@@ -30,8 +30,8 @@ mod tests {
     use tracing::Level;
     use tracing_subscriber::filter::LevelFilter;
 
-    /// The contract from #345: warnings show with `RUST_LOG` unset, so the
-    /// security-relevant degradations are never silently dropped.
+    /// Warnings show with `RUST_LOG` unset, so the security-relevant
+    /// degradations are never silently dropped.
     #[test]
     fn defaults_to_warn_when_rust_log_is_unset() {
         let unset = filter(None);

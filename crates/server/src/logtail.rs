@@ -1,8 +1,8 @@
 //! A second sink for this process's own log, kept in memory for the host.
 //!
 //! A cloud session's machine deletes itself when the session ends, and the
-//! journal it takes with it is the only place a broadcast failure is explained
-//! (#438). This layer keeps the last lines of that journal in
+//! journal it takes with it is the only place a broadcast failure is
+//! explained. This layer keeps the last lines of that journal in
 //! [`jamstream_session::LogTail`], where [`jamstream_session::ServerCore`]
 //! finds them and sends them to the host over the control link it already has.
 //!

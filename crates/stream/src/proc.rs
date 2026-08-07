@@ -143,10 +143,10 @@ pub trait ProcessHost {
 /// the other has the bug at a different threshold, which is exactly how this
 /// one lasted as long as it did.
 ///
-/// Feeding both pipes from one thread therefore deadlocks, and did: the
-/// writer sat in the video FIFO waiting for a reader, ffmpeg sat in stdin
-/// waiting for audio the same thread would have sent next, and neither moved
-/// again (issue #248). It is structural. No pipe size, no write ordering and
+/// Feeding both pipes from one thread therefore deadlocks: the writer sits
+/// in the video FIFO waiting for a reader, ffmpeg sits in stdin waiting
+/// for audio the same thread would send next, and neither moves again. It
+/// is structural. No pipe size, no write ordering and
 /// no ffmpeg version fixes it: 8.x only hides it by demuxing each input on
 /// its own thread.
 ///
@@ -486,7 +486,7 @@ impl StderrTail {
 /// One exception, and it is not a decision this function makes: a URL that
 /// matches `relay` exactly is replaced by [`RELAY`]. That string is our own
 /// loopback relay out of the pipeline's configuration, it never held a key,
-/// and telling the two refusals apart is the whole point (#437). A URL that
+/// and telling the two refusals apart is the whole point. A URL that
 /// is not character-for-character that string is redacted, so the exception
 /// can never print anything the caller did not already know.
 pub fn redact<'a>(line: &'a str, relay: Option<&str>) -> Cow<'a, str> {
@@ -784,7 +784,7 @@ impl ProcessHost for StdProcessHost {
                     // What the child said, if it said anything. An exit code
                     // is what is left when it did not: on its own it is a
                     // number whose meaning changes with the host OS, which
-                    // is no use to the musician reading it (#437).
+                    // is no use to the musician reading it.
                     reason: live.tail.quote().unwrap_or_else(|| describe(&status)),
                 }
             }
@@ -1307,10 +1307,10 @@ mod tests {
         assert_eq!(redact("", None), "");
     }
 
-    /// The distinction #437 turned on: a refusal from the loopback relay and
-    /// a refusal from the platform are the same errno and completely
-    /// different problems. Only the relay's own URL is named, and only when
-    /// it matches character for character.
+    /// A refusal from the loopback relay and a refusal from the platform
+    /// are the same errno and completely different problems. Only the
+    /// relay's own URL is named, and only when it matches character for
+    /// character.
     #[test]
     fn only_the_configured_relay_is_named_and_everything_else_is_redacted() {
         const RELAY_URL: &str = "rtmp://127.0.0.1:1935/jamstream";

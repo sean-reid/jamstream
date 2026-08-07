@@ -1054,9 +1054,9 @@ mod tests {
         assert_eq!(body["metadata"]["items"][0]["value"], "#cloud-config\n");
     }
 
-    /// #51: `--max-hours` reached the launch body nowhere, so a session
-    /// asked to live one hour was capped at twelve, and one asked for
-    /// twenty-four was deleted mid-jam.
+    /// `--max-hours` must reach the launch body: otherwise a session asked
+    /// to live one hour is capped at twelve, and one asked for
+    /// twenty-four is deleted mid-jam.
     #[test]
     fn the_run_cap_is_the_session_cap() {
         let p = provider();

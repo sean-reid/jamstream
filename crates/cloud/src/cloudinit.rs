@@ -45,10 +45,10 @@ pub const ACTIVITY_FILE_NAME: &str = "last-active";
 /// Where the bootstrap records that this session cannot broadcast, and why.
 ///
 /// The broadcast tooling is deliberately allowed to fail: a musician must not
-/// lose a session to a failed download. But the warning it printed went to the
-/// console log, which no host can read, and nothing else recorded it, so the
-/// app kept offering a key field that led nowhere (#440). One line here is the
-/// whole mechanism: jamstreamd reads it when its relay probe finds nothing
+/// lose a session to a failed download. But a warning printed only to the
+/// console log, which no host can read, leaves nothing recorded, and the app
+/// keeps offering a key field that leads nowhere. One line here is the whole
+/// mechanism: jamstreamd reads it when its relay probe finds nothing
 /// listening, and the host is told that sentence instead of nothing.
 ///
 /// Public because jamstreamd is in another crate and the unit does not pass a
@@ -1567,8 +1567,8 @@ mod tests {
         }
     }
 
-    /// #42: the process that parses unauthenticated UDP does not run as
-    /// root, cannot gain privileges, and cannot eat the whole instance.
+    /// The process that parses unauthenticated UDP does not run as root,
+    /// cannot gain privileges, and cannot eat the whole instance.
     #[test]
     fn jamstreamd_runs_unprivileged_and_confined() {
         let out = render(&base_config(SelfDestruct::AwsShutdown));
@@ -1597,7 +1597,7 @@ mod tests {
         ));
     }
 
-    /// #52: neither window may be derived from the wall clock. A VM whose
+    /// Neither window may be derived from the wall clock. A VM whose
     /// hardware clock is wrong at boot takes an NTP step minutes later, and
     /// a wall-clock idle window reads that step as an empty session.
     #[test]
@@ -1817,9 +1817,9 @@ mod tests {
         }
     }
 
-    /// #41, the half of it that lives in the guest: user-data holds the
-    /// server private key and, on DigitalOcean, an account API token, and
-    /// the metadata service hands user-data to any process that asks.
+    /// In the guest, user-data holds the server private key and, on
+    /// DigitalOcean, an account API token, and the metadata service hands
+    /// user-data to any process that asks.
     #[test]
     fn metadata_service_is_root_only() {
         for sd in all_variants() {
@@ -2066,8 +2066,8 @@ mod tests {
             assert_eq!(out.note, None, "a working relay must not claim otherwise");
         }
 
-        /// The case from #440: one transient failure at boot cost the session
-        /// its broadcast permanently.
+        /// A transient failure at boot must not cost the session its
+        /// broadcast permanently.
         #[test]
         fn a_transient_failure_is_retried_and_costs_the_session_nothing() {
             let out = run("transient", &[1, 0], 0);
