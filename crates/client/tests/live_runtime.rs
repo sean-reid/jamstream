@@ -231,6 +231,28 @@ fn tone_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
         .sum()
 }
 
+/// The whole file's `tone_energy` blocks at `hz`, with its duration: what a
+/// tail reading of nothing looks like across the run it came from.
+///
+/// A tail is one window of a paced file, and two very different runs read the
+/// same in it. A session that never carried audio reads nothing everywhere; a
+/// session the machine took the cpu away from reads healthy and then stops,
+/// because the offline pump replays the debt faster than media can arrive and
+/// the pulls it cannot fill are written to the capture file as zeros. Only the
+/// profile separates them, so the tail assertions print it when they fire.
+fn tone_profile(path: &Path, hz: f64) -> String {
+    let (rate, samples) = rate_and_samples(path);
+    let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
+    let profile: Vec<u64> = left
+        .chunks((rate as usize / 4).max(1))
+        .map(|c| coherent_energy(c, rate, hz) as u64)
+        .collect();
+    format!(
+        "{:.2} s at {rate} Hz reads {profile:?} per 250 ms at {hz} Hz",
+        left.len() as f64 / f64::from(rate)
+    )
+}
+
 /// One Goertzel pass. Only meaningful over a span the tone holds phase across.
 fn coherent_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
     let k = 2.0 * std::f64::consts::PI * hz / f64::from(rate);
@@ -1939,13 +1961,17 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
         assert!(
             heard > TONE_FLOOR,
             "{out:?} heard {heard} at {theirs} Hz over {} samples, under the \
-             {TONE_FLOOR} floor, so this session carried no audio; its own \
-             {mine} Hz read {own}",
-            left.len()
+             {TONE_FLOOR} floor, so that second carried no audio; its own \
+             {mine} Hz read {own}. The whole file: {}. The log holds: {}",
+            left.len(),
+            tone_profile(out, theirs),
+            std::fs::read_to_string(&log).unwrap_or_default()
         );
         assert!(
             heard > own * 4.0,
-            "{out:?} heard {heard} at {theirs} Hz against {own} at its own {mine} Hz"
+            "{out:?} heard {heard} at {theirs} Hz against {own} at its own {mine} Hz. \
+             The whole file: {}",
+            tone_profile(out, theirs)
         );
     }
 
