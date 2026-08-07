@@ -378,7 +378,7 @@ pub struct Pipeline<H: ProcessHost> {
     ///
     /// Counted apart from `dropped_frames` because the two say different
     /// things to a host: a repeat says the machine is struggling, a drop says
-    /// it has already failed to deliver (#278).
+    /// it has already failed to deliver.
     repeated_frames: u64,
     events: Vec<PipelineEvent>,
 }
@@ -390,7 +390,7 @@ impl<H: ProcessHost> Pipeline<H> {
             height: cfg.height,
             // The catalog's rate, not a constant: the renderer's peak-hold is
             // a duration, so a frame rate it does not know about would hold
-            // for the wrong length of time (#232).
+            // for the wrong length of time.
             fps: cfg.fps,
             wordmark: true,
         };
@@ -657,8 +657,7 @@ impl<H: ProcessHost> Pipeline<H> {
     /// its connect, so on a machine busy with an encode it can outlive any
     /// window worth waiting and still be short of the refusal it is heading
     /// for. What that bought was Live with nothing behind it, for as long as it
-    /// took to die, and Live is the one word a host reads as "it is working"
-    /// (#445).
+    /// took to die, and Live is the one word a host reads as "it is working".
     fn read_report(&mut self, idx: usize, now_ms: u64) {
         if now_ms < self.dests[idx].progress_at_ms {
             return;
@@ -1333,11 +1332,11 @@ mod tests {
         assert!(p.on_air());
     }
 
-    /// Issue #445, deterministically: a pusher that outlives every window a
-    /// supervisor might have waited and only then reaches its refused connect
-    /// must never have been called Live. It is a race on a loaded machine, so
-    /// the process here never dies until the test says so, which is the same
-    /// case held still.
+    /// A pusher that outlives every window a supervisor might have waited
+    /// and only then reaches its refused connect must never have been
+    /// called Live. It is a race on a loaded machine, so the process here
+    /// never dies until the test says so, which is the same case held
+    /// still.
     #[test]
     fn a_pusher_that_pushed_nothing_is_never_live_however_long_it_survives() {
         let mut p = pipeline("nothingpushed");
