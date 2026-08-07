@@ -122,6 +122,13 @@ impl JitterBuffer {
     /// watching depth can tell a refill from a buffer nobody is draining.
     pub const MAX_TARGET_FRAMES: usize = MAX_TARGET;
 
+    /// Ticks of unplayable audio the buffer may need to fix a playout position
+    /// it cannot reconcile with the arriving stream: `REANCHOR_PATIENCE` to
+    /// decide, then a refill of at most `MAX_TARGET` frames. Published because
+    /// it bounds the longest gap the buffer heals on its own, which is the
+    /// floor under any caller that reports a gap as a fault.
+    pub const HEAL_TICKS: u32 = REANCHOR_PATIENCE + MAX_TARGET as u32;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -796,8 +803,9 @@ mod tests {
         // reach, so the re-anchor is what healed it.
         assert_eq!(stats.resurrected, 0, "offset {offset}: {stats:?}");
 
-        // Healing is bounded: patience ticks of detection plus a refill of at
-        // most MAX_TARGET frames, i.e. at most 210 ms, inside a second.
+        // Healing is bounded by the figure `HEAL_TICKS` publishes: patience
+        // ticks of detection plus a refill of at most MAX_TARGET frames, i.e.
+        // at most 210 ms, inside a second.
         let at = first_frame_tick.unwrap_or_else(|| panic!("offset {offset}: never recovered"));
         assert!(
             at > REANCHOR_PATIENCE / 2,
@@ -805,8 +813,10 @@ mod tests {
              ordinary reordering would trip it"
         );
         assert!(
-            at <= REANCHOR_PATIENCE + MAX_TARGET as u32,
-            "offset {offset}: took {at} ticks to recover (patience {REANCHOR_PATIENCE})"
+            at <= JitterBuffer::HEAL_TICKS,
+            "offset {offset}: took {at} ticks to recover, past the published \
+             bound of {}",
+            JitterBuffer::HEAL_TICKS
         );
 
         // Delivery resumed and stayed up for the rest of the run.

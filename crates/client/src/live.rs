@@ -84,6 +84,14 @@ const SYSTEM_MEMBER: MemberId = MemberId(u16::MAX);
 /// `MAX_TARGET` of 24 frames, 60 ms, so a second of it is not the buffer
 /// filling: it is a member hearing silence.
 const SILENT_PLAYOUT_AFTER: Duration = Duration::from_secs(1);
+/// How long every pull may conceal on a joined session before the log calls it
+/// a dropout. Two bounds set it. Below [`JitterBuffer::HEAL_TICKS`], 210 ms, the
+/// gap may still be the buffer fixing a playout position it cannot reconcile,
+/// so a warning there would name the cure as the disease. And a quarter second
+/// is the loosest silence the harness lets the media path pass, so nothing this
+/// warns about is a gap the product already calls acceptable. Under it sits
+/// ordinary jitter, a frame or a few, which is what concealment exists to hide.
+const CONCEALED_GAP_AFTER: Duration = Duration::from_millis(250);
 /// Window the refused-frame rate is measured over, and the count inside it
 /// that means the arriving stream disagrees with playout rather than the
 /// network dropping the odd packet. Media arrives one frame per tick, 400 a
@@ -569,20 +577,23 @@ impl ReopenEpisode {
     }
 }
 
-/// Watches the local jitter buffer for the two faults that leave a connected
+/// Watches the local jitter buffer for the three faults that leave a connected
 /// session sounding broken and show up nowhere else: playout handing out zeros
-/// because the buffer never filled, and frames arriving only to be refused.
+/// because the buffer never filled, playout concealing a gap long enough to
+/// hear, and frames arriving only to be refused.
 ///
-/// Both are warnings because the log file promises that an empty file is a
+/// All three are warnings because the log file promises that an empty file is a
 /// healthy run, and a member who heard nobody for a whole session found nothing
-/// in it (#451). Both are one line per episode, like the ring counters: at
+/// in it (#451). All three are one line per episode, like the ring counters: at
 /// 2.5 ms a tick, warning per tick would put hundreds of lines a second in a
 /// file people mail us.
 ///
 /// It reads counters rather than pull outcomes, so it needs no seam through the
-/// core: `waiting` moving while `pulled` stands still is exactly a run of
-/// `Pull::Waiting`, the one branch that writes literal zeros, and `late` is the
-/// frames the buffer refused, which no other surface carries at all.
+/// core. `waiting` moving while `pulled` stands still is exactly a run of
+/// `Pull::Waiting`, the one branch that writes literal zeros. `lost` moving
+/// with `pulled` frame for frame is a run where every pull concealed, the
+/// branch that writes invented audio. And `late` is the frames the buffer
+/// refused, which no other surface carries at all.
 #[derive(Default)]
 struct PlayoutWatch {
     /// Last tick's counters; the deltas are what they mean here.
@@ -590,9 +601,22 @@ struct PlayoutWatch {
     /// When the current run of silence began, and whether it has been said.
     silent_since: Option<Instant>,
     silent_said: bool,
+    /// The open run of concealed pulls, and whether it has been said.
+    gap: Option<Gap>,
+    gap_said: bool,
     /// The open refusal window: when it started and `late` as it stood then.
     refused_window: Option<(Instant, u64)>,
     refused_said: bool,
+}
+
+/// A run of ticks whose every pull concealed, from the first one seen and the
+/// counters as they stood before it, so the line carries the run's own numbers
+/// rather than the session's totals.
+#[derive(Clone, Copy)]
+struct Gap {
+    since: Instant,
+    lost: u64,
+    late: u64,
 }
 
 impl PlayoutWatch {
@@ -609,7 +633,11 @@ impl PlayoutWatch {
         let Some(prev) = prev else { return };
         // A reconnect builds a fresh buffer, so a counter that went backwards
         // is a new stream and not an event.
-        if stats.pulled < prev.pulled || stats.late < prev.late || stats.waiting < prev.waiting {
+        if stats.pulled < prev.pulled
+            || stats.late < prev.late
+            || stats.lost < prev.lost
+            || stats.waiting < prev.waiting
+        {
             self.forget();
             return;
         }
@@ -632,6 +660,40 @@ impl PlayoutWatch {
         } else {
             self.silent_since = None;
             self.silent_said = false;
+        }
+
+        // Every pull since the last tick concealed, so what went out was the
+        // decoder inventing audio the stream did not carry. A tick that pulled
+        // nothing holds the run open rather than ending it: a growth hold
+        // conceals too, and a re-anchored buffer plays nothing while it refills.
+        let pulled = stats.pulled - prev.pulled;
+        if pulled > 0 {
+            if stats.lost - prev.lost == pulled {
+                self.gap.get_or_insert(Gap {
+                    since: now,
+                    lost: prev.lost,
+                    late: prev.late,
+                });
+            } else {
+                self.gap = None;
+                self.gap_said = false;
+            }
+        }
+        if let Some(gap) = self.gap {
+            let held = now.duration_since(gap.since);
+            if !self.gap_said && held >= CONCEALED_GAP_AFTER {
+                self.gap_said = true;
+                tracing::warn!(
+                    member = member.0,
+                    gap_ms = held.as_millis(),
+                    concealed = stats.lost - gap.lost,
+                    refused = stats.late - gap.late,
+                    reanchors = stats.reanchors,
+                    depth_frames = stats.depth_frames,
+                    target_frames = stats.target_frames,
+                    "playout is concealing a gap: nothing arrived in time to play"
+                );
+            }
         }
 
         match self.refused_window {
@@ -658,11 +720,13 @@ impl PlayoutWatch {
         }
     }
 
-    /// Drops both episodes without saying anything: the stream this was
+    /// Drops every episode without saying anything: the stream this was
     /// watching is gone, and the next one starts its own.
     fn forget(&mut self) {
         self.silent_since = None;
         self.silent_said = false;
+        self.gap = None;
+        self.gap_said = false;
         self.refused_window = None;
         self.refused_said = false;
     }
@@ -2383,6 +2447,18 @@ mod tests {
         jitter.push(media(tick));
     }
 
+    /// Nothing arrives at all, so every pull has nothing to play.
+    fn nothing(_: &mut JitterBuffer, _: u32) {}
+
+    /// This tick's frame every tick, save one that never arrives: the single
+    /// concealed frame ordinary jitter produces, and the whole reason the
+    /// decoder conceals.
+    fn one_frame_short(jitter: &mut JitterBuffer, tick: u32) {
+        if tick != 200 {
+            jitter.push(media(tick));
+        }
+    }
+
     /// This tick's frame plus a copy of the one from 100 ms back, which is
     /// behind playout by more than the buffer is deep and is refused for it.
     fn stale_copies(jitter: &mut JitterBuffer, tick: u32) {
@@ -2453,6 +2529,96 @@ mod tests {
     fn an_ordinary_stream_says_nothing() {
         let lines = captured(|| Ticker::new().run(1_200, Some(ME), healthy));
         assert!(lines.is_empty(), "{lines:#?}");
+    }
+
+    /// A stream that stops for a second and comes back. The buffer anchored
+    /// long ago, so every pull conceals rather than waiting, and concealment has
+    /// energy: no surface but this one can say the musician heard nothing. One
+    /// line, and it names the gap's own length.
+    #[test]
+    fn a_dropout_says_how_long_it_lasted() {
+        let lines = captured(|| {
+            let mut t = Ticker::new();
+            t.run(400, Some(ME), healthy);
+            t.run(400, Some(ME), nothing);
+            t.run(400, Some(ME), healthy);
+        });
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        let line = &lines[0];
+        assert!(
+            line.contains("WARN"),
+            "not a warning, so the file never sees it: {line}"
+        );
+        assert!(line.contains("concealing a gap"), "{line}");
+        assert!(
+            !line.contains("playout is silence"),
+            "a buffer that anchored and ran dry is not one that never filled: {line}"
+        );
+        // The synthetic clock advances exactly one tick per pull, so the
+        // reported length is the threshold to the millisecond.
+        for field in [
+            "member=7",
+            "gap_ms=250",
+            "concealed=101",
+            "refused=0",
+            "reanchors=0",
+            "depth_frames=0",
+        ] {
+            assert!(line.contains(field), "no {field} in {line}");
+        }
+    }
+
+    /// The frame the decoder exists to hide says nothing. A watch that fired on
+    /// one concealed pull would warn on every session that ever loses a packet.
+    #[test]
+    fn a_single_concealed_frame_says_nothing() {
+        let lines = captured(|| Ticker::new().run(1_200, Some(ME), one_frame_short));
+        assert!(lines.is_empty(), "{lines:#?}");
+    }
+
+    /// 200 ms of concealment says nothing either: it is inside the longest gap
+    /// the buffer closes on its own, and inside the silence the harness lets the
+    /// media path pass, so it cannot yet be called a fault.
+    #[test]
+    fn a_gap_the_buffer_could_still_heal_says_nothing() {
+        let lines = captured(|| {
+            let mut t = Ticker::new();
+            t.run(400, Some(ME), healthy);
+            t.run(80, Some(ME), nothing);
+            t.run(400, Some(ME), healthy);
+        });
+        assert!(lines.is_empty(), "{lines:#?}");
+    }
+
+    /// Recovery ends the episode, so a session that drops out twice says so
+    /// twice. Otherwise the second half of a bad session reads as clean.
+    #[test]
+    fn a_second_dropout_is_its_own_episode() {
+        let lines = captured(|| {
+            let mut t = Ticker::new();
+            for _ in 0..2 {
+                t.run(400, Some(ME), healthy);
+                t.run(400, Some(ME), nothing);
+            }
+            t.run(400, Some(ME), healthy);
+        });
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        for line in &lines {
+            assert!(line.contains("concealing a gap"), "{line}");
+            assert!(line.contains("gap_ms=250"), "{line}");
+        }
+    }
+
+    /// The threshold's floor, held against the buffer that sets it: a gap
+    /// shorter than the buffer's own healing bound may be the buffer working.
+    #[test]
+    fn the_dropout_threshold_clears_the_buffer_healing_itself() {
+        let heal = TICK * JitterBuffer::HEAL_TICKS;
+        assert!(
+            CONCEALED_GAP_AFTER > heal,
+            "{CONCEALED_GAP_AFTER:?} would warn while the buffer is still \
+             recovering, which takes up to {heal:?}"
+        );
     }
 
     /// Silence before the session is up belongs to the connection, which
