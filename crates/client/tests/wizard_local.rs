@@ -242,7 +242,7 @@ async fn wizard_hosts_a_real_local_session() {
     let mut panel = app.session.invites.take().expect("the invite book");
     let rt: &dyn Runtime = &*owned;
     let snap = wait_for(rt, "host joined", Duration::from_secs(15), |s| {
-        s.stats.state == ConnState::Joined
+        s.stats.state == ConnState::Joined && s.members.iter().any(|m| m.id == HOST_MEMBER_ID)
     });
     assert!(snap.is_host, "member 0 is the host");
     // The CostedRuntime wrapper the app put around the live one: the cost view
