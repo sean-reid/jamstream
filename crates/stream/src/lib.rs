@@ -41,6 +41,7 @@ pub mod keys;
 pub mod pipeline;
 pub mod platform;
 pub mod proc;
+pub mod tools;
 pub mod worker;
 pub mod yuv;
 
