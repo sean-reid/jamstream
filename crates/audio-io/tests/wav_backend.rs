@@ -631,7 +631,7 @@ fn a_device_period_beyond_the_request_survives_a_ring_sized_for_it() {
 
     // 2x the 480-frame callback, stereo: the client's sizing convention.
     let capacity = 2 * 480 * 2;
-    let (device, mut engine) = CallbackBridge::new(capacity);
+    let (device, mut engine) = CallbackBridge::new(capacity, capacity);
     let backend = WavBackend::new(Some(input_path.clone()), Some(output_path.clone()))
         .with_device_period(480);
     let cfg = StreamConfig {
@@ -680,7 +680,7 @@ fn a_device_period_beyond_the_request_overwhelms_a_request_sized_ring() {
     let input = write_ramp(&input_path, 4_800);
 
     let capacity = 2 * 120 * 2;
-    let (device, mut engine) = CallbackBridge::new(capacity);
+    let (device, mut engine) = CallbackBridge::new(capacity, capacity);
     let backend = WavBackend::new(Some(input_path.clone()), None).with_device_period(480);
     let cfg = StreamConfig {
         buffer_frames: 120,
@@ -775,7 +775,7 @@ fn bridge_conversion_case(name: &str, period: Option<u32>) {
     let callback_frames = period.unwrap_or(120);
     let session_callback = (callback_frames as usize * 48_000).div_ceil(44_100);
     let capacity = 2 * session_callback * 2;
-    let (device, mut engine) = jamstream_audio_io::CallbackBridge::new(capacity);
+    let (device, mut engine) = jamstream_audio_io::CallbackBridge::new(capacity, capacity);
 
     let mut backend = WavBackend::new(Some(input_path.clone()), Some(output_path.clone()))
         .with_device_rate(44_100);

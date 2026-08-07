@@ -91,12 +91,35 @@ const SILENT_PLAYOUT_AFTER: Duration = Duration::from_secs(1);
 /// frames refused cannot be that.
 const REFUSED_WINDOW: Duration = Duration::from_secs(1);
 const REFUSED_WINDOW_LIMIT: u64 = 200;
+/// Audio the capture ring holds, which is how long the worker may be held up
+/// before captured audio is dropped rather than delayed. Forty milliseconds
+/// covers the session's own bring-up and a stalled tick, and a stall that long
+/// replays as 16 frames arriving at once, well inside the receiving jitter
+/// buffer's 64-frame queue. It costs nothing in latency: see
+/// [`capture_capacity`].
+const CAPTURE_RING: Duration = Duration::from_millis(40);
 
-/// Ring capacity in samples. It doubles as the playout depth target: the
-/// top-up loop keeps the ring full, so the device-side cushion sits at
-/// ~2x buffer_frames. Floor of one 2.5 ms frame of slack.
-fn ring_capacity(buffer_frames: u32) -> usize {
+/// Playout ring capacity in samples, which doubles as the playout depth
+/// target: the top-up loop keeps the ring full, so the device-side cushion
+/// sits at ~2x buffer_frames and every sample of it is latency. Floor of one
+/// 2.5 ms frame of slack.
+fn playout_capacity(buffer_frames: u32) -> usize {
     2 * buffer_frames.max(FRAME_FRAMES as u32) as usize * usize::from(CHANNELS)
+}
+
+/// Capture ring capacity in samples: the playout cushion, or
+/// [`CAPTURE_RING`] of audio, whichever is larger.
+///
+/// The two rings used to share one number, and sharing it priced capture as
+/// if it were latency. It is not. The worker drains the capture ring to empty
+/// on every tick, so what a captured sample waits is the time to the next
+/// drain, set by the loop's 2.5 ms cadence and never by the capacity. What the
+/// capacity buys is how long the worker may be held up before audio is
+/// destroyed, and at two callbacks that was 5 ms, less than the session's own
+/// bring-up (#436).
+fn capture_capacity(buffer_frames: u32) -> usize {
+    let slack = CAPTURE_RING.as_millis() as usize * SAMPLE_RATE as usize / 1000;
+    playout_capacity(buffer_frames).max(slack * usize::from(CHANNELS))
 }
 
 /// The device request as [`AudioSettings`] spells it: the session rate and
@@ -305,11 +328,19 @@ impl Driver {
     /// callers close the previous stream first so real backends never see
     /// two streams on one device.
     ///
-    /// Returns the engine side, the frames the ring was sized from, and the
+    /// Returns the engine side, the frames the rings were sized from, and the
     /// stream's own rate-outcome report. The callback size is only knowable
-    /// from an open stream, so the ring is first sized from the request;
-    /// when the stream then reports callbacks the ring cannot absorb, it is
-    /// reopened once over a ring that can.
+    /// from an open stream, so the rings are first sized from the request;
+    /// when the stream then reports callbacks they cannot absorb, it is
+    /// reopened once over rings that can.
+    ///
+    /// The playout ring is filled with silence before the stream opens, so the
+    /// device's first callback finds it at its steady-state depth rather than
+    /// empty. Refilling it from the core instead would burst-pull several
+    /// frames in zero wall time, running the jitter consumer clock past the
+    /// sender; the buffer can step back at most one frame, so every later
+    /// packet would be dropped as late and playout would stay silent for the
+    /// rest of the session.
     fn open(
         &mut self,
         settings: &AudioSettings,
@@ -319,7 +350,9 @@ impl Driver {
         let mut frames = requested;
         let mut resized = false;
         loop {
-            let (device, engine) = CallbackBridge::new(ring_capacity(frames));
+            let (device, mut engine) =
+                CallbackBridge::new(capture_capacity(frames), playout_capacity(frames));
+            engine.push_playout(&vec![0.0; playout_capacity(frames)]);
             let (negotiated, rate) = self.open_stream(config, device.into_handler(), settings)?;
             let rate = rate.map(rate_view);
             let needed = ring_frames(requested, negotiated);
@@ -660,9 +693,15 @@ impl LiveRuntime {
         mut driver: Driver,
     ) -> Result<LiveRuntime, LiveError> {
         let addr = *invite.addresses.first().ok_or(LiveError::NoAddress)?;
-        let (mut engine, device_frames, rate) = driver.open(&settings).map_err(LiveError::Audio)?;
+        // Everything that can be done before the device starts is done before
+        // the device starts. Capture flows from the moment the stream opens,
+        // into a ring whose only consumer is the worker thread below, so any
+        // work between those two points is audio at risk (#436). The join
+        // datagram waits for the open to succeed: a failed open leaves no
+        // half-joined member on the server.
         let socket = connect_socket(addr).map_err(LiveError::Io)?;
         let (core, init) = ClientCore::connect(invite, 0).map_err(LiveError::Session)?;
+        let (engine, device_frames, rate) = driver.open(&settings).map_err(LiveError::Audio)?;
         let _ = socket.send(&init);
 
         let mut state = SharedState::new(invite, addr);
@@ -679,11 +718,6 @@ impl LiveRuntime {
         }
         let shared = Arc::new(Mutex::new(state));
         let (tx, rx) = mpsc::channel();
-        let capture_capacity = ring_capacity(device_frames);
-        // A fresh ring starts at its steady-state depth, as in try_open:
-        // real device callbacks begin before the worker's first top-up, and
-        // an empty ring would read as an underrun at every session start.
-        engine.push_playout(&vec![0.0; capture_capacity]);
         let worker = Worker {
             core,
             socket,
@@ -701,7 +735,7 @@ impl LiveRuntime {
             rx,
             rx_buf: vec![0u8; MAX_DATAGRAM_BYTES].into_boxed_slice(),
             epoch: Instant::now(),
-            capture_buf: vec![0.0; capture_capacity],
+            capture_buf: vec![0.0; capture_capacity(device_frames)],
             mono_buf: Vec::new(),
             carry: [0.0; CHUNK_STEREO],
             carry_pos: 0,
@@ -1352,16 +1386,12 @@ impl Worker {
 
     fn try_open(&mut self) -> Result<(), AudioError> {
         match self.driver.open(&self.settings) {
-            Ok((mut engine, device_frames, rate)) => {
-                let capacity = ring_capacity(device_frames);
-                self.capture_buf.resize(capacity, 0.0);
-                // Prefill the fresh playout ring (its steady-state depth) with
-                // silence. Refilling it from the core would burst-pull several
-                // frames in zero wall time, running the jitter consumer clock
-                // past the sender; the buffer can step back at most one frame,
-                // so every later packet would be dropped as late and playout
-                // would stay silent for the rest of the session.
-                engine.push_playout(&vec![0.0; capacity]);
+            Ok((engine, device_frames, rate)) => {
+                // Sized to the whole ring, so one pull always empties it:
+                // a shorter buffer would leave a backlog behind on every
+                // tick, which is capture latency that never drains.
+                self.capture_buf
+                    .resize(capture_capacity(device_frames), 0.0);
                 self.engine = Some(engine);
                 self.opened_at = Some(Instant::now());
                 self.device_frames = device_frames;
@@ -1490,11 +1520,11 @@ impl Worker {
         self.levels.output_rms = inst_rms.max(self.levels.output_rms * LEVEL_DECAY);
     }
 
-    /// One warn per stream when each bridge counter first moves. Steady
-    /// movement means the ring is undersized for the callbacks the device
-    /// really delivers, which is exactly the shape of #323; the log is the
-    /// one place that class of defect shows as something other than bad
-    /// audio.
+    /// One warn per stream when each bridge counter first moves. Movement
+    /// means a ring too shallow for what the device delivers or for what the
+    /// worker is keeping up with, which is the shape of both #323 and #436;
+    /// the log is the one place that class of defect shows as something other
+    /// than bad audio somebody else can hear.
     fn watch_ring_health(&mut self) {
         let Some(engine) = self.engine.as_ref() else {
             return;
@@ -1862,14 +1892,14 @@ mod tests {
         assert_eq!(CHUNK_STEREO, FRAME_FRAMES * usize::from(CHANNELS));
     }
 
-    /// The sizing at the heart of #323: the ring must fit the callbacks the
+    /// The sizing at the heart of #323: the rings must fit the callbacks the
     /// device really delivers, and the request is only a lower bound.
     #[test]
     fn the_ring_is_sized_from_what_the_device_delivers() {
         // WASAPI shared mode: 120 asked for, the ~10 ms device period given.
         assert_eq!(ring_frames(120, Some(480)), 480);
         assert_eq!(
-            ring_capacity(ring_frames(120, Some(480))),
+            playout_capacity(ring_frames(120, Some(480))),
             2 * 480 * usize::from(CHANNELS),
             "the 2x headroom applies to the negotiated size"
         );
@@ -1879,6 +1909,108 @@ mod tests {
         assert_eq!(ring_frames(240, None), 240);
         // A smaller negotiation never shrinks the ring below the request.
         assert_eq!(ring_frames(240, Some(32)), 240);
+    }
+
+    /// What the two capacities cost, which is why they are two (#436). The
+    /// playout ring is held full, so its capacity is mouth-to-ear and stays at
+    /// the two callbacks #323 settled on. The capture ring is drained to empty,
+    /// so its capacity is only stall tolerance and buys 40 ms of it.
+    #[test]
+    fn the_capture_ring_is_deeper_than_the_playout_cushion_and_costs_nothing() {
+        let ms =
+            |samples: usize| samples as f64 / f64::from(CHANNELS) / f64::from(SAMPLE_RATE) * 1000.0;
+        for frames in [32u32, 120, 240] {
+            assert_eq!(
+                ms(playout_capacity(frames)),
+                2.0 * f64::from(frames.max(FRAME_FRAMES as u32)) / 48.0,
+                "the playout cushion is the latency and may not grow"
+            );
+            assert_eq!(
+                ms(capture_capacity(frames)),
+                CAPTURE_RING.as_millis() as f64,
+                "{frames}-frame callbacks want {CAPTURE_RING:?} of capture ring"
+            );
+        }
+        // A device period past the floor takes the deeper of the two rather
+        // than losing the callback slack #323 established.
+        assert_eq!(capture_capacity(2_400), playout_capacity(2_400));
+    }
+
+    /// The claim the capture ring rests on: its depth is stall tolerance, not
+    /// latency. A worker-paced consumer against a device-paced producer leaves
+    /// at most one callback waiting whatever the capacity is, because every
+    /// drain empties the ring.
+    #[test]
+    fn a_deeper_capture_ring_does_not_deepen_what_waits_in_it() {
+        const FRAMES: u32 = 120;
+        let callback = FRAMES as usize * usize::from(CHANNELS);
+        let (mut device, mut engine) =
+            CallbackBridge::new(capture_capacity(FRAMES), playout_capacity(FRAMES));
+        let mut buf = vec![0.0f32; capture_capacity(FRAMES)];
+        let mut deepest = 0usize;
+        // One device callback per worker tick, the steady state of a device
+        // opened at the loop's own frame size.
+        for _ in 0..400 {
+            device.on_capture(&vec![1.0; callback]);
+            deepest = deepest.max(engine.pull_captured(&mut buf));
+        }
+        assert_eq!(deepest, callback, "one callback waits, not the ring");
+        assert_eq!(engine.overruns(), 0);
+    }
+
+    /// The starvation in #436, at the shape a real device produces: 120-frame
+    /// callbacks 2.5 ms apart from a thread on its own clock, arriving while
+    /// the consumer is still coming up. The window is the measured one, a
+    /// CoreAudio open that had capture running more than 20 ms before the
+    /// caller held the handle.
+    ///
+    /// Against the old shared capacity, two callbacks of ring, this drops
+    /// about eight callbacks of audio before the first drain. Nothing in the
+    /// suite could see that: the only backend a test can drive is pumped by
+    /// the worker itself, so the producer could never outrun the consumer.
+    #[test]
+    fn a_capture_ring_absorbs_the_session_coming_up() {
+        const FRAMES: u32 = 120;
+        const LATE: Duration = Duration::from_millis(20);
+        let callback = FRAMES as usize * usize::from(CHANNELS);
+        let (mut device, mut engine) =
+            CallbackBridge::new(capture_capacity(FRAMES), playout_capacity(FRAMES));
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let producer = std::thread::Builder::new()
+            .name("device-paced-capture".into())
+            .spawn(move || {
+                let mut next = Instant::now();
+                while stop_rx.try_recv().is_err() {
+                    device.on_capture(&vec![1.0; callback]);
+                    next += TICK;
+                    let now = Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    }
+                }
+            })
+            .expect("producer thread");
+
+        std::thread::sleep(LATE);
+        let mut buf = vec![0.0f32; capture_capacity(FRAMES)];
+        let got = engine.pull_captured(&mut buf);
+        let overruns = engine.overruns();
+        let _ = stop_tx.send(());
+        let _ = producer.join();
+
+        assert_eq!(
+            overruns,
+            0,
+            "{overruns} callbacks of capture were dropped while the consumer \
+             came up; the first drain took {got} samples of a \
+             {} sample ring",
+            capture_capacity(FRAMES)
+        );
+        assert!(
+            got >= callback * 4,
+            "only {got} samples survived a {LATE:?} window, which is less than \
+             the device pushed, so the ring is not what absorbed it"
+        );
     }
 
     /// The chat copy per rung change, the #347 disclosure contract: rung 2
@@ -2194,5 +2326,93 @@ mod tests {
             "the healthy stream after it said nothing new"
         );
         assert!(lines[0].contains("being refused"), "{:?}", lines[0]);
+    }
+
+    /// #436 on a real device: the client's own ring sizes, the client's own
+    /// 2.5 ms consumer cadence, and a sound card producing on its own clock,
+    /// which no fake in this workspace does. The only backend a test can drive
+    /// is pumped by the consumer itself, so the producer could never be early
+    /// and this whole class of fault had nowhere to show.
+    ///
+    /// A device starts delivering the moment its stream opens, which is before
+    /// the caller holds the handle and well before a worker thread drains
+    /// anything: measured here, a CoreAudio open hands over with 2 to 11
+    /// callbacks already captured, up to 27 ms of audio. Against the old
+    /// two-callback ring, 5 ms, the rest of that was dropped, which is what the
+    /// report counted. Against the capture ring it is held and then drained in
+    /// one pull.
+    ///
+    /// The last assertion is what stops the others passing on a machine
+    /// producing nothing at all.
+    #[test]
+    #[ignore = "requires a real capture and playback device"]
+    fn a_real_device_loses_no_capture_while_a_session_comes_up() {
+        const FRAMES: u32 = 120;
+        const RUN: Duration = Duration::from_secs(1);
+
+        let settings = AudioSettings {
+            buffer_frames: FRAMES,
+            ..AudioSettings::default()
+        };
+        let config = stream_config(&settings);
+        let (device, mut engine) =
+            CallbackBridge::new(capture_capacity(FRAMES), playout_capacity(FRAMES));
+        engine.push_playout(&vec![0.0; playout_capacity(FRAMES)]);
+
+        let backend = jamstream_audio_io::backend();
+        let stream = backend
+            .open_duplex(None, None, config, device.into_handler())
+            .expect("the default capture and playback devices open");
+        // Read before anything else: whatever is already in the ring was
+        // captured while the caller had no way to drain it.
+        let mut capture_buf = vec![0.0f32; capture_capacity(FRAMES)];
+        let early = engine.pull_captured(&mut capture_buf);
+        let negotiated = stream.buffer_frames();
+        println!("negotiated callback frames: {negotiated:?}");
+
+        // The worker's own loop: drain the whole capture ring and refill
+        // playout once per 2.5 ms tick.
+        let silence = vec![0.0f32; playout_capacity(FRAMES)];
+        let mut pulled = early;
+        let deadline = Instant::now() + RUN;
+        let mut next = Instant::now() + TICK;
+        while Instant::now() < deadline {
+            pulled += engine.pull_captured(&mut capture_buf);
+            while engine.push_playout(&silence) > 0 {}
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            }
+            next += TICK;
+        }
+        let overruns = engine.overruns();
+        let underruns = engine.underruns();
+        let errored = stream.errored();
+        stream.close();
+
+        let callback = negotiated.unwrap_or(FRAMES) as usize * usize::from(CHANNELS);
+        println!(
+            "{early} samples were waiting when the open returned ({} callbacks, \
+             {:.1} ms); the consumer pulled {pulled} in {RUN:?}; \
+             overruns={overruns} underruns={underruns}",
+            early / callback.max(1),
+            early as f64 / f64::from(CHANNELS) / 48.0,
+        );
+        assert!(!errored, "the backend reported a fatal stream error");
+        assert_eq!(
+            overruns,
+            0,
+            "{overruns} capture callbacks were dropped in {RUN:?} against a ring of \
+             {} samples, of which the consumer pulled {pulled}",
+            capture_capacity(FRAMES)
+        );
+        // Half of real time is a wide floor: it separates a device that ran
+        // from one delivering nothing, without failing on a slow start.
+        let want = RUN.as_secs_f64() * f64::from(SAMPLE_RATE) * f64::from(CHANNELS) / 2.0;
+        assert!(
+            pulled as f64 > want,
+            "only {pulled} samples came through in {RUN:?}, so the assertions above \
+             passed on a device that delivered next to nothing"
+        );
     }
 }

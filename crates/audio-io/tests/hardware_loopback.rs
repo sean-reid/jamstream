@@ -90,7 +90,7 @@ fn a_tone_survives_the_round_trip_through_real_hardware() {
     // that a backend which negotiated a much larger buffer shows up as
     // underruns rather than being hidden.
     let capacity = config.buffer_frames as usize * channels * 4;
-    let (device, mut engine) = CallbackBridge::new(capacity);
+    let (device, mut engine) = CallbackBridge::new(capacity, capacity);
 
     let mut encoder = Encoder::new(Channels::Stereo, FrameDuration::Ms2_5, 96_000)
         .expect("opus encoder at the session's 2.5 ms stereo settings");

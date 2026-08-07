@@ -26,14 +26,22 @@ struct Counters {
 pub struct CallbackBridge;
 
 impl CallbackBridge {
-    /// Capacity is in f32 samples per ring. Multichannel callers should pass
-    /// frames times channels since the rings carry interleaved samples.
+    /// Capacities are in f32 samples, one per ring. Multichannel callers
+    /// should pass frames times channels since the rings carry interleaved
+    /// samples.
+    ///
+    /// The two are separate because they cost different things. The playout
+    /// ring is kept full by its producer, so its capacity is the cushion the
+    /// device plays out of and every sample of it is latency. The capture ring
+    /// is drained to empty by its consumer, so its capacity is only how long
+    /// that consumer may be held up before audio is lost, and costs nothing
+    /// while the consumer keeps up (#436).
     // The two halves are the product; CallbackBridge itself is never held.
     #[allow(clippy::new_ret_no_self)]
     #[must_use]
-    pub fn new(capacity_frames: usize) -> (DeviceSide, EngineSide) {
-        let (capture_tx, capture_rx) = RingBuffer::new(capacity_frames);
-        let (playout_tx, playout_rx) = RingBuffer::new(capacity_frames);
+    pub fn new(capture_capacity: usize, playout_capacity: usize) -> (DeviceSide, EngineSide) {
+        let (capture_tx, capture_rx) = RingBuffer::new(capture_capacity);
+        let (playout_tx, playout_rx) = RingBuffer::new(playout_capacity);
         let counters = Arc::new(Counters::default());
         (
             DeviceSide {
