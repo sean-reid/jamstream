@@ -1,4 +1,5 @@
-//! Fixed-ratio sample-rate conversion at the device boundary (#347 rung 3).
+//! Fixed-ratio sample-rate conversion at the device boundary, rung 3 of the
+//! ladder.
 //!
 //! A device that cannot clock at the session rate opens at its own rate and
 //! each direction's handler half is wrapped here: capture converts
@@ -510,8 +511,8 @@ mod tests {
     /// across the rest of the table is the product claim: no device the
     /// ladder carries costs more than a few milliseconds here. The widest
     /// figure is capture from 8 kHz, where the filter's delay is six output
-    /// frames per input frame, and that is a direction the ladder refuses
-    /// before this code sees it (#330).
+    /// frames per input frame; the ladder refuses that direction before it
+    /// reaches this converter.
     #[test]
     fn the_reported_added_latency_matches_the_documented_figures() {
         let (_, _, capture_added) = capture_rig(DEVICE);

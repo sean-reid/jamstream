@@ -23,7 +23,7 @@ const WAV_CAPTURE_ID: &str = "wav-capture";
 const WAV_PLAYBACK_ID: &str = "wav-playback";
 
 /// How one direction of a modelled device reaches the session rate: the rung
-/// of the #347 ladder it lands on, as the real backends report it.
+/// of the sample-rate ladder it lands on, as the real backends report it.
 ///
 /// The rungs are not interchangeable, and the difference is observable. A
 /// clock this app moved and an OS converter both leave the stream itself at
@@ -141,9 +141,9 @@ impl WavBackend {
     }
 
     /// Models an interface clocked at `rate`: a session at any other rate
-    /// opens through the boundary converter (#347 rung 3), so the handler
-    /// keeps seeing session-rate audio while [`WavStream::pump`], the input
-    /// WAV, and the capture output all move in device-rate frames.
+    /// opens through the boundary converter, rung 3 of the ladder, so the
+    /// handler keeps seeing session-rate audio while [`WavStream::pump`],
+    /// the input WAV, and the capture output all move in device-rate frames.
     #[must_use]
     pub fn with_device_rate(mut self, rate: u32) -> Self {
         let rung = DeviceRung::Converted { device: rate };
@@ -254,7 +254,7 @@ impl WavBackend {
     /// reach [`WavStream::pump`] without downcasting.
     ///
     /// A direction on [`DeviceRung::Converted`] opens with the boundary
-    /// converter wrapped around its handler half, the #347 rung 3 shape: that
+    /// converter wrapped around its handler half, rung 3 of the ladder: that
     /// direction's file and its share of the pump run in device-rate frames
     /// while the handler keeps its session-rate view. Every other rung leaves
     /// the direction at the session rate, because that is what the real

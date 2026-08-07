@@ -1,6 +1,6 @@
 //! What the device-boundary converter costs inside one device callback.
 //!
-//! Rung 3 of the #347 ladder wraps a direction's handler half in a sinc
+//! Rung 3 of the sample-rate ladder wraps a direction's handler half in a sinc
 //! converter and runs it on the device thread, so its cost comes straight out
 //! of the callback deadline: 10 ms at these period sizes, and the rest of the
 //! callback still has the channel map, the bridge push, and on a 44.1 kHz
