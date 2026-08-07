@@ -212,7 +212,7 @@ mod tests {
 
     /// The list is the whole point, so it has to be the whole list. A test
     /// nobody runs and nobody has written down reads like coverage and is
-    /// not (#394).
+    /// not.
     #[test]
     fn the_hand_checks_are_every_ignored_test() {
         let mut listed: Vec<(String, String, String)> = HAND_CHECKS
