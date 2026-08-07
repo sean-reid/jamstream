@@ -115,7 +115,7 @@ jobs:
       # Commit pins, per the policy documented in ci.yml. These actions run in
       # the jobs that build what a release publishes, and the macos job below
       # also holds the Developer ID certificate and the notary key.
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
@@ -228,7 +228,7 @@ jobs:
           # to be when the build starts, which with parallel PRs merging
           # is not the tagged commit.
           ref: ${{ github.event.release.tag_name || inputs.tag }}
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -459,7 +459,7 @@ jobs:
           # to be when the build starts, which with parallel PRs merging
           # is not the tagged commit.
           ref: ${{ github.event.release.tag_name || inputs.tag }}
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
       # No build cache; see server-musl.
@@ -569,7 +569,7 @@ jobs:
           # to be when the build starts, which with parallel PRs merging
           # is not the tagged commit.
           ref: ${{ github.event.release.tag_name || inputs.tag }}
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
       # No build cache; see server-musl.
