@@ -44,7 +44,7 @@ type PlaybackFn = Box<dyn FnMut(&mut [f32]) + Send>;
 pub struct CpalBackend {
     host: cpal::Host,
     /// Devices whose clock this app set and then lost the stream on: the
-    /// contested-clock demotion (#347). Another app snapping the nominal
+    /// contested-clock demotion. Another app snapping the nominal
     /// rate back kills the stream; re-setting the clock on the reopen would
     /// play tug-of-war with a musician's other software, so a demoted
     /// device is opened at its own rate through the boundary converter for
@@ -305,11 +305,11 @@ fn device_demoted(demoted: &Mutex<HashSet<String>>, device: &cpal::Device) -> bo
 /// Everything a dead stream demotes, so every later open in this backend
 /// takes those devices at their own rate through the boundary converter.
 ///
-/// The clock this app set is demoted whatever killed the stream (#347's
-/// contested-clock decision: no retry, no fight). A device running at a rate
-/// it never advertised is demoted only when the host is what refused it,
-/// because an unplug says nothing about the rate and putting a working device
-/// on the converter for good would cost latency for nothing.
+/// The clock this app set is demoted whatever killed the stream: no retry,
+/// no fight. A device running at a rate it never advertised is demoted only
+/// when the host is what refused it, because an unplug says nothing about
+/// the rate and putting a working device on the converter for good would
+/// cost latency for nothing.
 fn demote_dead_stream(
     demoted: &Mutex<HashSet<String>>,
     clock_set: &[String],
@@ -355,9 +355,9 @@ struct SideContext<'a> {
 
 /// Builds the capture stream for its plan. An attempted session-rate open
 /// that the host refuses falls to the boundary converter at the device's own
-/// rate (#347 rung 3); the refusal survives only when that native-rate open
-/// fails too. Returns the stream, the rate it opened at, and the converter's
-/// added latency when this direction converts.
+/// rate, rung 3 of the ladder; the refusal survives only when that
+/// native-rate open fails too. Returns the stream, the rate it opened at,
+/// and the converter's added latency when this direction converts.
 fn open_capture_side(
     side: &SideContext<'_>,
     plan: DirectionPlan,
@@ -889,7 +889,7 @@ mod tests {
         assert!(demoted.lock().unwrap().contains("clocked"));
     }
 
-    /// The #367 handoff, in the sequence cpal imposes: the build takes the
+    /// The handoff, in the sequence cpal imposes: the build takes the
     /// callback by value and drops it on failure, so the native-rate retry
     /// can only run the handler the slot gives back. If that handoff broke,
     /// the fallback stream would run a dead closure and the session would go

@@ -68,7 +68,7 @@ pub struct JitterStats {
     /// zeros handed to playout because the buffer has not reached target depth
     /// since it was last anchored. The only branch that plays silence rather
     /// than concealment, so a caller can tell "hearing nothing" from
-    /// "hearing a concealed stream" and say so (#451).
+    /// "hearing a concealed stream" and say so.
     pub waiting: u64,
     /// Times the buffer gave up on a playout position it could not reconcile
     /// with the arriving stream and re-anchored on the newest arrivals, exactly
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(stats.target_frames, 1);
         // Nothing was ever played as silence: the first packet was already in
         // hand when the first pull came, so a caller watching `waiting` sees a
-        // healthy stream as zero (#451).
+        // healthy stream as zero.
         assert_eq!(stats.waiting, 0);
         assert_eq!(jb.loss_ratio_recent(), 0.0);
     }
@@ -595,7 +595,7 @@ mod tests {
 
     /// A buffer handed nothing at all counts every silent frame it plays: this
     /// is the state a client is in when its user hears nothing for a whole
-    /// session, and before #451 no counter named it.
+    /// session, and `waiting` is the counter that names it.
     #[test]
     fn silence_is_counted_for_as_long_as_the_buffer_stays_unfilled() {
         let mut jb = JitterBuffer::new();
@@ -870,8 +870,7 @@ mod tests {
     /// It has to hold with the copies as well as without them: a pull that
     /// finds a redundant copy of the frame it wanted is not concealment, so it
     /// resets the watchdog's counter, and a buffer whose every pull is answered
-    /// that way stays a stream's length behind for the rest of the session
-    /// (#447).
+    /// that way stays a stream's length behind for the rest of the session.
     fn assert_heals_from_a_playout_stall(redundant: bool) {
         let cover = |seq: u32| redundant.then(|| seq.wrapping_sub(1)).filter(|_| seq > 0);
         let mut jb = JitterBuffer::new();
