@@ -46,7 +46,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use wasapi::{
-    AudioCaptureClient, AudioClient, AudioRenderClient, Device, DeviceEnumerator,
+    AudioCaptureClient, AudioClient, AudioRenderClient, Device, DeviceCollection, DeviceEnumerator,
     Direction as WasapiDirection, Handle, SampleType, StreamMode, WasapiError, WaveFormat,
     deinitialize, initialize_mta,
 };
@@ -773,18 +773,7 @@ fn prepare(params: &ThreadParams) -> std::result::Result<Prepared, Report> {
         None => enumerator
             .get_default_device(&wanted)
             .map_err(|e| Report::new(classify(&e), format!("default device: {e}")))?,
-        Some(id) => {
-            let device = enumerator
-                .get_device(id)
-                .map_err(|e| Report::new(classify(&e), format!("device {id}: {e}")))?;
-            if device.get_direction() != wanted {
-                return Err(Report::new(
-                    ExclusiveFailure::DeviceNotFound,
-                    format!("device {id} is not a {:?} endpoint", params.direction),
-                ));
-            }
-            device
-        }
+        Some(id) => endpoint(&enumerator, params.direction, id)?,
     };
 
     let mut client = device
@@ -867,6 +856,71 @@ fn prepare(params: &ThreadParams) -> std::result::Result<Prepared, Report> {
         spec,
         buffer_frames,
     })
+}
+
+/// The endpoint a requested id names, resolved among the endpoints enumerated
+/// for `direction` alone.
+///
+/// Deliberately not `IMMDeviceEnumerator::GetDevice`: the wasapi 0.23 wrapper
+/// builds its `PCWSTR` from an `HSTRING` that is dropped before the call, so
+/// the endpoint that comes back is whatever the freed bytes still spell, which
+/// on a machine opening both directions at once can be the other direction's
+/// device.
+fn endpoint(
+    enumerator: &DeviceEnumerator,
+    direction: Direction,
+    id: &str,
+) -> std::result::Result<Device, Report> {
+    let collection = enumerator
+        .get_device_collection(&wasapi_direction(direction))
+        .map_err(|e| Report::from_wasapi("IMMDeviceEnumerator::EnumAudioEndpoints", &e))?;
+    let endpoints = endpoint_ids(&collection);
+    let ids: Vec<&str> = endpoints.iter().map(|(_, id)| id.as_str()).collect();
+    let other = other_direction(direction);
+    match policy::find_endpoint(id, &ids, || {
+        enumerator
+            .get_device_collection(&wasapi_direction(other))
+            .map(|collection| {
+                endpoint_ids(&collection)
+                    .into_iter()
+                    .map(|(_, id)| id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }) {
+        policy::Endpoint::At(index) => collection
+            .get_device_at_index(endpoints[index].0)
+            .map_err(|e| Report::from_wasapi("IMMDeviceCollection::Item", &e)),
+        policy::Endpoint::Missing(ExclusiveFailure::WrongDirection) => Err(Report::new(
+            ExclusiveFailure::WrongDirection,
+            format!("device {id} is a {other:?} endpoint, not a {direction:?} one"),
+        )),
+        policy::Endpoint::Missing(failure) => Err(Report::new(
+            failure,
+            format!("no {direction:?} endpoint has id {id}"),
+        )),
+    }
+}
+
+/// Every endpoint in `collection` as its index paired with its id. A device
+/// that vanishes mid-enumeration is skipped rather than shifting the indices of
+/// the ones after it.
+fn endpoint_ids(collection: &DeviceCollection) -> Vec<(u32, String)> {
+    (0..collection.get_nbr_devices().unwrap_or(0))
+        .filter_map(|index| {
+            Some((
+                index,
+                collection.get_device_at_index(index).ok()?.get_id().ok()?,
+            ))
+        })
+        .collect()
+}
+
+const fn other_direction(direction: Direction) -> Direction {
+    match direction {
+        Direction::Capture => Direction::Playback,
+        Direction::Playback => Direction::Capture,
+    }
 }
 
 /// Offer formats to the driver best-first and return the first it accepts,
@@ -1304,6 +1358,38 @@ mod tests {
         assert_eq!(
             wasapi_direction(Direction::Playback),
             WasapiDirection::Render
+        );
+    }
+
+    #[test]
+    fn each_direction_looks_for_a_mismatched_id_in_the_other_one() {
+        assert_eq!(other_direction(Direction::Capture), Direction::Playback);
+        assert_eq!(other_direction(Direction::Playback), Direction::Capture);
+    }
+
+    /// An id no endpoint has must come back as an error rather than as some
+    /// other endpoint, which is the whole reason the lookup walks one
+    /// direction's collection instead of asking the enumerator by string.
+    /// Enumerates only; opens nothing, so it runs on a CI runner with no
+    /// audio device.
+    #[test]
+    fn an_id_no_endpoint_has_never_resolves_to_a_device() {
+        let _com = ComGuard::init().expect("COM initialisation");
+        let enumerator = DeviceEnumerator::new().expect("IMMDeviceEnumerator");
+        let report = endpoint(
+            &enumerator,
+            Direction::Capture,
+            "{0.0.1.00000000}.{00000000-0000-0000-0000-000000000000}",
+        )
+        .err()
+        .expect("an id nothing has must not resolve");
+        // Either the enumeration ran and the id was in neither direction, or
+        // the runner has no endpoints to enumerate at all.
+        assert!(
+            report.failure == ExclusiveFailure::DeviceNotFound
+                || report.detail.contains("EnumAudioEndpoints"),
+            "{}",
+            report.detail
         );
     }
 

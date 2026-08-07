@@ -46,6 +46,9 @@ pub(crate) enum ExclusiveFailure {
     InvalidConfig,
     /// The requested endpoint is not present, or vanished mid-open.
     DeviceNotFound,
+    /// The requested endpoint is one this machine has facing the other way: a
+    /// playback endpoint asked for as capture, or the reverse.
+    WrongDirection,
     /// The driver rejected every format we offered at the requested rate.
     UnsupportedFormat,
     /// Another process already holds the endpoint in exclusive mode.
@@ -77,7 +80,8 @@ impl ExclusiveFailure {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidConfig => "invalid configuration",
-            Self::DeviceNotFound => "device not found",
+            Self::DeviceNotFound => "requested endpoint is not present",
+            Self::WrongDirection => "requested endpoint faces the other direction",
             Self::UnsupportedFormat => "no exclusive-mode format accepted",
             Self::DeviceInUse => "device held exclusively by another application",
             Self::AccessDenied => "microphone access denied by Windows privacy settings",
@@ -119,6 +123,7 @@ pub(crate) const fn fallback_decision(failure: ExclusiveFailure) -> Fallback {
         | ExclusiveFailure::DeviceInUse
         | ExclusiveFailure::AccessDenied => Fallback::Reject,
         ExclusiveFailure::DeviceNotFound
+        | ExclusiveFailure::WrongDirection
         | ExclusiveFailure::UnsupportedFormat
         | ExclusiveFailure::ExclusiveNotAllowed
         | ExclusiveFailure::BufferSizeNotAligned
@@ -145,6 +150,7 @@ pub(crate) const fn retry_cooldown(failure: ExclusiveFailure) -> Duration {
     match failure {
         // Static properties of the endpoint, its driver, or a settings toggle.
         ExclusiveFailure::ExclusiveNotAllowed
+        | ExclusiveFailure::WrongDirection
         | ExclusiveFailure::UnsupportedFormat
         | ExclusiveFailure::BufferSizeNotAligned
         | ExclusiveFailure::InvalidDevicePeriod
@@ -201,7 +207,9 @@ pub(crate) fn open_error(failure: ExclusiveFailure, detail: &str) -> AudioError 
         ExclusiveFailure::DeviceNotFound | ExclusiveFailure::DeviceInvalidated => {
             AudioError::DeviceGone
         }
-        ExclusiveFailure::InvalidConfig | ExclusiveFailure::UnsupportedFormat => {
+        ExclusiveFailure::InvalidConfig
+        | ExclusiveFailure::UnsupportedFormat
+        | ExclusiveFailure::WrongDirection => {
             AudioError::Unsupported(format!("{reason}: {detail}"))
         }
         // A privacy denial is a setting a human has to flip, so the error
@@ -211,6 +219,39 @@ pub(crate) fn open_error(failure: ExclusiveFailure, detail: &str) -> AudioError 
         }
         _ => AudioError::Backend(format!("{reason}: {detail}")),
     }
+}
+
+/// Where a requested endpoint id sits in the enumeration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Endpoint {
+    /// Position of the id among the ids given for the direction being opened.
+    At(usize),
+    /// Nothing to open, and why not.
+    Missing(ExclusiveFailure),
+}
+
+/// Find the endpoint a requested id names among those the machine enumerates
+/// for the direction being opened.
+///
+/// Resolving inside one direction's own endpoints is what keeps a playback
+/// endpoint from ever being opened for capture. `others` lists the opposite
+/// direction's ids and is called only when the wanted direction does not hold
+/// the id, because an endpoint the machine has facing the other way is a
+/// different problem from one it does not have at all, and sending someone to
+/// look for a missing device that is plugged in and working wastes their
+/// evening.
+pub(crate) fn find_endpoint(
+    id: &str,
+    wanted: &[&str],
+    others: impl FnOnce() -> Vec<String>,
+) -> Endpoint {
+    if let Some(index) = wanted.iter().position(|candidate| *candidate == id) {
+        return Endpoint::At(index);
+    }
+    if others().iter().any(|candidate| candidate == id) {
+        return Endpoint::Missing(ExclusiveFailure::WrongDirection);
+    }
+    Endpoint::Missing(ExclusiveFailure::DeviceNotFound)
 }
 
 /// How long a device thread blocks on its buffer event before looking at the
@@ -357,6 +398,7 @@ mod tests {
     fn conditions_a_shared_stream_survives_fall_back_to_shared() {
         for failure in [
             ExclusiveFailure::DeviceNotFound,
+            ExclusiveFailure::WrongDirection,
             ExclusiveFailure::UnsupportedFormat,
             ExclusiveFailure::ExclusiveNotAllowed,
             ExclusiveFailure::BufferSizeNotAligned,
@@ -435,6 +477,87 @@ mod tests {
             retry_cooldown(ExclusiveFailure::DeviceNotFound),
             Duration::ZERO
         );
+        // A picked endpoint does not turn around mid-session, so re-probing it
+        // twice a second only fills the log.
+        assert_eq!(
+            retry_cooldown(ExclusiveFailure::WrongDirection),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// The two endpoint ids from a Windows 10 joiner's log. The data flow is
+    /// the third field of the prefix: 0 is render, 1 is capture.
+    const RENDER_ID: &str = "{0.0.0.00000000}.{49c3b8e4-1fb7-4d7c-8ee3-1f4b30ccb591}";
+    const CAPTURE_ID: &str = "{0.0.1.00000000}.{9d2f0b3c-6a41-4f0e-9c7a-2b8e5d1a7f60}";
+
+    /// The endpoint being opened is the one the requested direction lists, so
+    /// an id belonging to the other direction cannot resolve to a device at
+    /// all, and it must not be reported as a device that is not there: the
+    /// device is present, plugged in, and working, and "device not found" sends
+    /// its owner looking for hardware instead of at their selection.
+    #[test]
+    fn an_id_from_the_other_direction_is_a_direction_mismatch_not_a_missing_device() {
+        let found = find_endpoint(RENDER_ID, &[CAPTURE_ID], || vec![RENDER_ID.to_owned()]);
+        assert_eq!(
+            found,
+            Endpoint::Missing(ExclusiveFailure::WrongDirection),
+            "a render id offered as capture is a mismatch"
+        );
+        let message = open_error(ExclusiveFailure::WrongDirection, RENDER_ID).to_string();
+        assert!(message.contains("faces the other direction"), "{message}");
+        assert!(message.contains(RENDER_ID), "{message}");
+        assert_ne!(
+            ExclusiveFailure::WrongDirection.as_str(),
+            ExclusiveFailure::DeviceNotFound.as_str()
+        );
+    }
+
+    #[test]
+    fn an_id_no_direction_has_is_a_missing_device() {
+        let found = find_endpoint("{0.0.1.00000000}.{gone}", &[CAPTURE_ID], || {
+            vec![RENDER_ID.to_owned()]
+        });
+        assert_eq!(found, Endpoint::Missing(ExclusiveFailure::DeviceNotFound));
+    }
+
+    /// The id resolves to its place in the direction's own list, and the
+    /// opposite direction is not enumerated to find that out: enumeration
+    /// happens on the open path, which runs on every reopen.
+    #[test]
+    fn an_id_this_direction_holds_resolves_without_looking_at_the_other() {
+        let asked = std::cell::Cell::new(false);
+        let found = find_endpoint(
+            CAPTURE_ID,
+            &["{0.0.1.00000000}.{other}", CAPTURE_ID],
+            || {
+                asked.set(true);
+                Vec::new()
+            },
+        );
+        assert_eq!(found, Endpoint::At(1));
+        assert!(
+            !asked.get(),
+            "the other direction was enumerated for nothing"
+        );
+    }
+
+    /// A mismatch still leaves the user with sound: shared mode is opened
+    /// rather than the stream failing, and the gate stops the doomed exclusive
+    /// probe from repeating on every reopen.
+    #[test]
+    fn a_direction_mismatch_falls_back_and_stops_re_deciding() {
+        assert_eq!(
+            fallback_decision(ExclusiveFailure::WrongDirection),
+            Fallback::Shared
+        );
+        let now = Instant::now();
+        let mut gate = RetryGate::new();
+        gate.block(
+            "request",
+            retry_cooldown(ExclusiveFailure::WrongDirection),
+            now,
+        );
+        assert!(gate.remaining(&"request", now).is_some());
     }
 
     #[test]
@@ -490,6 +613,7 @@ mod tests {
         for failure in [
             ExclusiveFailure::InvalidConfig,
             ExclusiveFailure::DeviceNotFound,
+            ExclusiveFailure::WrongDirection,
             ExclusiveFailure::UnsupportedFormat,
             ExclusiveFailure::DeviceInUse,
             ExclusiveFailure::AccessDenied,
@@ -749,6 +873,7 @@ mod tests {
         for failure in [
             ExclusiveFailure::InvalidConfig,
             ExclusiveFailure::DeviceNotFound,
+            ExclusiveFailure::WrongDirection,
             ExclusiveFailure::UnsupportedFormat,
             ExclusiveFailure::DeviceInUse,
             ExclusiveFailure::AccessDenied,
