@@ -52,5 +52,6 @@ $ pass show band/seat | jamstream join --headless \
 - The output WAV is written on the four session endings as well as a clean one: ejected, rejected, timed out, and session full. A socket or file error, or an `--input` file that fails validation, exits without writing it.
 - Chat lines, roster changes, metronome changes, and ejection reasons print one per line; latency samples are not printed.
 - The session's recorder prints as `record: idle`, `record: recording (mix and stems)`, or `record: failed: <reason>` on every transition, so a rig can assert that a take ran. See [Recording a session](../guides/recording.md).
+- Whether the session can broadcast at all prints as `broadcast: ready` or `broadcast: unavailable, <reason>` when the server first answers and whenever the answer changes. See [when a session cannot stream](../guides/streaming.md#when-a-session-cannot-stream).
 - A version mismatch fails at the handshake with both versions named, never with silence.
 - A session with no free seat for the invite's role prints `session full` and exits nonzero, instead of waiting out a connection timeout. The desktop app keeps retrying instead, since a seat frees when somebody leaves.

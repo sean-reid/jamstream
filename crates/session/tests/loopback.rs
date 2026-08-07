@@ -8,8 +8,9 @@ use std::net::SocketAddr;
 use blake2::{Blake2s256, Digest};
 use jamstream_protocol::Error as ProtocolError;
 use jamstream_protocol::control::{
-    AVATAR_CHUNK_BYTES, ControlLink, ControlMsg, DestinationState, DestinationStatus,
-    MAX_AVATAR_BYTES, MAX_NAME_LEN, MemberInfo, RecordOp, StreamKey, StreamOp, StreamPlatform,
+    AVATAR_CHUNK_BYTES, BroadcastReadiness, ControlLink, ControlMsg, DestinationState,
+    DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN, MemberInfo, RecordOp, StreamKey, StreamOp,
+    StreamPlatform,
 };
 use jamstream_protocol::ids::DestinationId;
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
@@ -1621,6 +1622,73 @@ fn record_ops(h: &Harness) -> Vec<RecordOp> {
             _ => None,
         })
         .collect()
+}
+
+fn readiness_seen(h: &Harness, i: usize) -> Vec<BroadcastReadiness> {
+    h.clients[i]
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            ClientEvent::BroadcastReadiness(state) => Some(state.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A session that cannot broadcast has to say so to the room, and keep saying
+/// it to whoever arrives later. Before this the only record of it was a line in
+/// a console log nobody can read (#440).
+#[test]
+fn a_session_that_cannot_broadcast_tells_everyone_and_every_late_joiner() {
+    let mut h = Harness::new(10, 20);
+    let inv_host = h.mint(0, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_host, Some(440.0));
+    h.add_client(&inv_l, None);
+    h.run_ms(1_000);
+
+    // Nothing said until the probe answers: a surface that dimmed Go Live
+    // before then would refuse a broadcast the session can serve.
+    for i in 0..2 {
+        assert!(readiness_seen(&h, i).is_empty());
+    }
+
+    let unavailable = BroadcastReadiness::Unavailable {
+        reason: "the broadcast tooling could not be downloaded".to_owned(),
+    };
+    h.server.set_broadcast_readiness(unavailable.clone());
+    h.run_ms(250);
+    for i in 0..2 {
+        assert_eq!(readiness_seen(&h, i), vec![unavailable.clone()]);
+    }
+
+    // The same answer for the next hour costs one message, not one a second.
+    for _ in 0..20 {
+        h.server.set_broadcast_readiness(unavailable.clone());
+        h.run_ms(100);
+    }
+    for i in 0..2 {
+        assert_eq!(readiness_seen(&h, i).len(), 1);
+    }
+
+    // Someone joining after the answer arrived is told at once. This is the
+    // host's own case: they open the app, then open the Broadcast tab.
+    let inv_late = h.mint(6, Role::Listener);
+    let late = h.add_client(&inv_late, None);
+    h.run_ms(150);
+    assert_eq!(readiness_seen(&h, late), vec![unavailable.clone()]);
+
+    // And a relay that comes up later says so, so the tab does not stay
+    // closed for a session that can stream after all.
+    h.server.set_broadcast_readiness(BroadcastReadiness::Ready);
+    h.run_ms(250);
+    for i in 0..3 {
+        assert_eq!(
+            readiness_seen(&h, i).last(),
+            Some(&BroadcastReadiness::Ready),
+            "client {i}"
+        );
+    }
 }
 
 #[test]

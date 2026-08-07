@@ -13,7 +13,8 @@ use jamstream_client::creds::{self, CredStore, EnvReader, MemStore};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
 use jamstream_client::exec::Executor;
 use jamstream_client::runtime::{
-    DestinationState, RateOutcomeView, RateOutcomesView, RecordState, StreamPlatform,
+    BroadcastReadiness, DestinationState, RateOutcomeView, RateOutcomesView, RecordState,
+    StreamPlatform,
 };
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
@@ -1348,6 +1349,30 @@ fn session_destinations_failed() {
     let mut harness = app_harness(app, WIDE);
     scroll_drawer(&mut harness, WIDE);
     snapshot_for_docs(&mut harness, "session_destinations_failed");
+}
+
+#[test]
+fn session_destinations_unavailable() {
+    // The session has no broadcast relay, so there is nothing to stream
+    // through: the reason is the server's own sentence, Add key and Go live
+    // are both off, and one platform has a key on this computer, which is the
+    // state where "Forget key" still has to work.
+    //
+    // Publishable: nothing here is stubbed that a real host would have. This
+    // is a VM whose broadcast tooling never downloaded, which is what #440 is
+    // about, and it is the only image that shows what that looks like.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_broadcast_readiness(Some(BroadcastReadiness::Unavailable {
+        reason: "the broadcast tooling could not be downloaded".to_owned(),
+    }));
+    let mut app = host_app(rt, Theme::Dark);
+    app.session.destinations = Some(DestinationsPanel::new(saved_keys(&[
+        StreamPlatform::Twitch,
+    ])));
+    let app = drawer_app(app, SettingsTab::Broadcast);
+    let mut harness = app_harness(app, WIDE);
+    scroll_drawer(&mut harness, WIDE);
+    snapshot_for_docs(&mut harness, "session_destinations_unavailable");
 }
 
 #[test]

@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use jamstream_cloud::cloudinit::{
-    ACTIVITY_FILE, RECORDING_CONFIG_PATH, RecordingStorage, SERVER_CONFIG_PATH,
+    ACTIVITY_FILE, BROADCAST_NOTE_FILE, RECORDING_CONFIG_PATH, RecordingStorage, SERVER_CONFIG_PATH,
 };
 use jamstream_server::config::Config;
 use jamstream_server::revocations::Revocations;
@@ -119,6 +119,9 @@ fn main() -> ExitCode {
                 let mut server = server
                     .with_idle_exit(idle_exit)
                     .with_max_duration(max_duration)
+                    // Unconditional: a local session simply has no such file,
+                    // and the relay probe answers on its own there.
+                    .with_broadcast_note(PathBuf::from(BROADCAST_NOTE_FILE))
                     .with_revocations(Revocations::new(
                         arg_value("--revoked-file")
                             .map_or_else(|| PathBuf::from(DEFAULT_REVOKED), PathBuf::from),

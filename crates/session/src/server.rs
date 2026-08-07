@@ -13,8 +13,8 @@ use jamstream_engine::{
 };
 use jamstream_protocol::PROTOCOL_VERSION;
 use jamstream_protocol::control::{
-    ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN, MAX_STREAM_KEY_LEN,
-    MemberInfo, RecordOp, RecordingState, StreamOp,
+    BroadcastReadiness, ControlLink, ControlMsg, DestinationStatus, MAX_AVATAR_BYTES, MAX_NAME_LEN,
+    MAX_STREAM_KEY_LEN, MemberInfo, RecordOp, RecordingState, StreamOp,
 };
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::verify_token;
@@ -422,6 +422,11 @@ pub struct ServerCore {
     /// Key-free by construction: this goes to every member.
     stream_status: Vec<DestinationStatus>,
     last_stream_status_ms: u64,
+    /// Whether this session can broadcast at all, as the driver's relay probe
+    /// last answered. None until it has answered once, which is the only state
+    /// that reads as "assume it works": a surface that dimmed Go Live before
+    /// the first probe would refuse a broadcast the session can serve.
+    broadcast_ready: Option<BroadcastReadiness>,
     /// Latest recorder state, as the driver reported it.
     record_status: RecordingState,
     /// Whether stems are captured alongside the mix; fixed for the session.
@@ -479,6 +484,7 @@ impl ServerCore {
             last_stats_ms: 0,
             stream_status: Vec::new(),
             last_stream_status_ms: 0,
+            broadcast_ready: None,
             record_status: RecordingState::Idle,
             record_stems: false,
             roster_epoch: 0,
@@ -986,6 +992,29 @@ impl ServerCore {
         &self.stream_status
     }
 
+    /// Publishes whether this session can broadcast at all, from the driver's
+    /// relay probe. On change only: it answers the same way for hours at a
+    /// time, and every member holds the latest answer.
+    ///
+    /// Sent to everyone rather than the host alone, like the on-air state: a
+    /// musician who can see the room is not being broadcast is better informed
+    /// than one who cannot.
+    pub fn set_broadcast_readiness(&mut self, state: BroadcastReadiness) {
+        if self.broadcast_ready.as_ref() == Some(&state) {
+            return;
+        }
+        self.broadcast_ready = Some(state.clone());
+        let msg = ControlMsg::BroadcastReadiness { state };
+        for m in self.members.values_mut().filter(|m| m.connected) {
+            let _ = m.link.send(msg.clone());
+        }
+    }
+
+    /// The last readiness answer, or None while the probe has not answered.
+    pub fn broadcast_readiness(&self) -> Option<&BroadcastReadiness> {
+        self.broadcast_ready.as_ref()
+    }
+
     /// Recorder state from its driver, broadcast to every member on change.
     /// Unlike stream status there is no periodic re-send: the recorder has
     /// no per-second numbers, only transitions, and the latest snapshot is
@@ -1468,6 +1497,14 @@ impl ServerCore {
                 destinations: self.stream_status.clone(),
             });
         }
+        // And whether the session can broadcast at all, which changes at most
+        // once or twice a session: a host who joins after the answer arrived
+        // would otherwise wait for it to change, which it never does.
+        if let Some(state) = self.broadcast_ready.clone()
+            && let Some(m) = self.members.get_mut(&id)
+        {
+            let _ = m.link.send(ControlMsg::BroadcastReadiness { state });
+        }
         // Same for a take: a mid-take joiner is being recorded and gets told
         // so before their first note, not on the next transition.
         if self.record_status != RecordingState::Idle
@@ -1867,6 +1904,9 @@ impl ServerCore {
             }
             ControlMsg::RecordStatus { .. } => {
                 self.violation(now_ms, from, "record status from client")
+            }
+            ControlMsg::BroadcastReadiness { .. } => {
+                self.violation(now_ms, from, "broadcast readiness from client")
             }
         }
     }

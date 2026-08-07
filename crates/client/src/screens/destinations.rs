@@ -57,6 +57,19 @@ fn refusal(key: &str) -> Option<String> {
     None
 }
 
+/// The sentence a session with no relay leads with. A colon, because the
+/// server's reason is a clause rather than a sentence and reads as one word
+/// after a full stop; the stop is added only if the reason lacks one, since it
+/// can be a line cloud-init wrote rather than one of ours.
+fn cannot_stream_line(reason: &str) -> String {
+    let tail = if reason.ends_with(['.', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
+    format!("This session cannot stream: {reason}{tail}")
+}
+
 /// Where each platform's key actually lives, for the button that opens it.
 /// The path through the interface is in the catalog's guidance text; this is
 /// just the front door.
@@ -331,6 +344,27 @@ impl DestinationsPanel {
             )
             .small(),
         );
+        // A session whose relay never came up cannot stream anywhere, whatever
+        // key is pasted, so it says so here rather than letting a host paste
+        // one and find out from a failed destination (#440). The rows stay
+        // visible: a saved key is still worth seeing, and Forget key still has
+        // to work.
+        if let Some(reason) = snap.stream.unavailable_reason() {
+            ui.add_space(theme::SPACE_XS);
+            theme::reason(ui, cannot_stream_line(reason));
+            // No advice here on purpose. A cloud session is fixed by starting
+            // another one and a local session by installing the tooling, and
+            // this side cannot tell which it is looking at; the streaming
+            // guide can say both.
+            ui.label(
+                theme::muted(
+                    ui,
+                    "The relay runs on the session's own machine, so nothing on \
+                     this computer changes it.",
+                )
+                .small(),
+            );
+        }
         ui.add_space(theme::SPACE_SM);
         for index in 0..self.rows.len() {
             // A gap between platforms wider than the gap inside one, so the
@@ -432,8 +466,18 @@ impl DestinationsPanel {
                     }
                 }
                 None => {
+                    // A key leads nowhere on a session that cannot stream, so
+                    // the two controls that send one are off. Forget key is
+                    // not: a key on this computer is still a key on this
+                    // computer, and deleting it must always work.
+                    let can_stream = snap.stream.unavailable_reason().is_none();
+                    let dead_end = "this session cannot stream, so a key would go nowhere";
                     if self.rows[index].saved {
-                        if ui.button("Use saved key").clicked() {
+                        if ui
+                            .add_enabled(can_stream, Button::new("Use saved key"))
+                            .on_disabled_hover_text(dead_end)
+                            .clicked()
+                        {
                             action = Some(RowAction::UseSaved);
                         }
                         if ui
@@ -445,7 +489,11 @@ impl DestinationsPanel {
                         }
                     // Deliberately not a selected button: the open pane
                     // below is the state, and the accent belongs to air.
-                    } else if ui.button("Add key").clicked() {
+                    } else if ui
+                        .add_enabled(can_stream, Button::new("Add key"))
+                        .on_disabled_hover_text(dead_end)
+                        .clicked()
+                    {
                         action = Some(RowAction::ToggleEntry);
                     }
                 }
@@ -565,16 +613,23 @@ impl DestinationsPanel {
                     format!("{} on air", snap.stream.live_count()),
                 ));
             } else {
+                let can_stream = snap.stream.unavailable_reason().is_none();
                 if ui
-                    .add_enabled(configured > 0, Button::new("Go live"))
+                    .add_enabled(configured > 0 && can_stream, Button::new("Go live"))
+                    .on_disabled_hover_text(if can_stream {
+                        "add a key first"
+                    } else {
+                        "this session has no broadcast relay to stream through"
+                    })
                     .clicked()
                 {
                     rt.send(Command::StartStream);
                 }
-                note = Some(match configured {
-                    0 => "Add a key to stream somewhere.".to_owned(),
-                    1 => "Everyone in the session sees the on air lamp.".to_owned(),
-                    n => format!("{n} destinations, one at a time or all at once."),
+                note = Some(match (can_stream, configured) {
+                    (false, _) => "No broadcast relay, so nothing can go on air.".to_owned(),
+                    (true, 0) => "Add a key to stream somewhere.".to_owned(),
+                    (true, 1) => "Everyone in the session sees the on air lamp.".to_owned(),
+                    (true, n) => format!("{n} destinations, one at a time or all at once."),
                 });
             }
             // Counted in both states: every destination failing at once puts
@@ -873,6 +928,20 @@ mod tests {
             })
             .next_back();
         assert_eq!(last, Some(DestinationId(2)));
+    }
+
+    /// The reason is the server's, so the line around it has to survive one
+    /// that already ends in a full stop as well as one that does not.
+    #[test]
+    fn the_cannot_stream_line_reads_as_one_sentence() {
+        assert_eq!(
+            cannot_stream_line("the broadcast tooling could not be downloaded"),
+            "This session cannot stream: the broadcast tooling could not be downloaded."
+        );
+        assert_eq!(
+            cannot_stream_line("the relay is gone."),
+            "This session cannot stream: the relay is gone."
+        );
     }
 
     /// The row's state is the server's, not the panel's: whatever this panel

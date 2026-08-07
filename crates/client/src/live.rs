@@ -33,9 +33,9 @@ use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 
 use crate::avatar;
 use crate::runtime::{
-    AvatarHandle, BroadcastView, ChatLine, Command, ConnState, CostView, DestinationView,
-    FaderView, LevelsView, MemberId, MemberView, MetronomeView, RateOutcomeView, RateOutcomesView,
-    RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamView,
+    AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState, CostView,
+    DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView, RateOutcomeView,
+    RateOutcomesView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamView,
 };
 use crate::screens::invites::TokenMap;
 
@@ -201,6 +201,9 @@ struct SharedState {
     /// honest one, and a destination that failed to come up must not read as
     /// live for even one frame.
     stream: Vec<DestinationView>,
+    /// Whether the session can broadcast at all, as the server last said.
+    /// None until it says, which reads as "assume it works".
+    readiness: Option<BroadcastReadiness>,
     /// Last `RecordStatus` the server sent, verbatim, for the same reason:
     /// only the recorder knows whether a take is really being captured.
     record: RecordView,
@@ -246,6 +249,7 @@ impl SharedState {
             broadcast_faders: HashMap::new(),
             audition: false,
             stream: Vec::new(),
+            readiness: None,
             record: RecordView::default(),
             chat: VecDeque::new(),
             levels: LevelsView::default(),
@@ -826,6 +830,7 @@ impl LiveRuntime {
             broadcast,
             stream: StreamView {
                 destinations: s.stream.clone(),
+                readiness: s.readiness.clone(),
             },
             record: s.record.clone(),
             // The wizard's [`CostedRuntime`] wrapper fills this for
@@ -1582,6 +1587,7 @@ impl Worker {
                         })
                         .collect();
                 }
+                ClientEvent::BroadcastReadiness(state) => s.readiness = Some(state),
                 ClientEvent::RecordStatus { state, stems } => {
                     s.record = RecordView {
                         state: match state {
