@@ -422,16 +422,16 @@ fn gcs_rule_is_ours(rule: &Value) -> bool {
 /// `#[must_use]` because the two arms are the difference between a promise the
 /// bucket is keeping and a promise nobody is keeping, and the call that
 /// produces this also *does* something, so dropping the answer looks like a
-/// complete statement. That is #257: the wizard called `verify_bucket` for the
-/// effect and wrote `.map_err(...)?;`, which discards a
-/// `RetentionEnforcement`, and a host who picked "delete after 30 days" on a
-/// key that cannot write a lifecycle rule launched a session that looked
-/// exactly like one where the rule applied. Whoever holds this value owes the
-/// host [`RetentionEnforcement::describe`].
+/// complete statement. A caller can invoke `verify_bucket` for the effect and
+/// write `.map_err(...)?;`, which discards a `RetentionEnforcement`, and a
+/// host who picked "delete after 30 days" on a key that cannot write a
+/// lifecycle rule then launches a session that looks exactly like one where
+/// the rule applied. Whoever holds this value owes the host
+/// [`RetentionEnforcement::describe`].
 ///
 /// Do not over-trust the attribute. It fires on a bare expression statement,
-/// which is the discard #257 actually had, and it does *not* fire on
-/// `if let Err(e) = set_retention(..).await`, where the pattern drops the `Ok`
+/// the same shape as the `.map_err(...)?;` call above, and it does *not* fire
+/// on `if let Err(e) = set_retention(..).await`, where the pattern drops the `Ok`
 /// value and the expression's own type is `()`. The test that carries this
 /// promise is still the one that asserts on what the rendered screen says,
 /// `crates/client/tests/retention.rs`, because a caller that drops the value

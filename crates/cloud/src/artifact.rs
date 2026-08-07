@@ -9,8 +9,8 @@
 //! downloads the release published, and cloud hosting works without the
 //! user ever seeing an artifact URL or hash. Two pins because the
 //! providers do not agree on a CPU: AWS launches Graviton (arm64) while
-//! GCP and DigitalOcean launch x86_64, and #139 was a released app
-//! booting an arm64 machine with only an x86_64 binary to give it.
+//! GCP and DigitalOcean launch x86_64, and an arm64 launch given only the
+//! x86_64 binary has nothing it can execute.
 //! Development builds have no variables set and get an empty set; there
 //! the CLI's `--artifact-url`/`--artifact-sha256` overrides are the only
 //! way to host on a cloud provider.
@@ -187,8 +187,8 @@ mod tests {
         }
     }
 
-    /// #139: the pin an AWS (arm64) launch selects must never be the
-    /// x86_64 build, and vice versa.
+    /// The pin an AWS (arm64) launch selects must never be the x86_64
+    /// build, and vice versa.
     #[test]
     fn each_architecture_selects_its_own_pin() {
         let x86 = PinnedServerArtifact {

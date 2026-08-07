@@ -705,9 +705,9 @@ impl Provider for AwsProvider {
     }
 
     /// One security-group describe: the launch's first EC2 call and the
-    /// exact permission a real launch found missing from a hand-written
-    /// policy (#118). Failing it here puts the action name on screen while
-    /// the host is still pasting keys.
+    /// exact permission a hand-written policy can leave out. Failing it
+    /// here puts the action name on screen while the host is still
+    /// pasting keys.
     async fn preflight(&self) -> Result<()> {
         let region = self
             .regions()
@@ -1972,8 +1972,8 @@ mod tests {
         assert_eq!(instance_type(InstanceClass::Standard), "t4g.medium");
     }
 
-    /// #223: both classes map to T instances, so both need the credit
-    /// parameter, not just the Standard default.
+    /// Both classes map to T instances, so both need the credit parameter,
+    /// not just the Standard default.
     #[test]
     fn every_class_launches_a_burstable_type() {
         for class in [InstanceClass::Small, InstanceClass::Standard] {
@@ -2022,8 +2022,8 @@ mod tests {
         assert_eq!(credit_specification("m7g.medium"), None);
     }
 
-    /// #139: every instance type here is Graviton and the AMI parameter is
-    /// the arm64 build, so the artifact this provider selects must be the
+    /// Every instance type here is Graviton and the AMI parameter is the
+    /// arm64 build, so the artifact this provider selects must be the
     /// aarch64 one; the x86_64 binary dies at exec on these machines.
     #[test]
     fn launches_arm64_machines_and_says_so() {
