@@ -16,11 +16,10 @@
 //! and `trace_headers` on the H.264 SPS, never our own opinion of ourselves.
 //!
 //! Missing tools are a FAILURE on Linux, which is where jamstreamd runs and
-//! where CI installs ffmpeg. This used to return early instead, with no
-//! `#[ignore]` and no runner carrying ffmpeg, so the whole RTMP path reported
-//! PASS on every OS in the matrix and nothing ever checked H.264, AAC-LC,
-//! `nal-hrd=cbr`, the keyframe cadence or A/V drift. See `common::require`,
-//! which is where that rule now lives for both suites.
+//! where CI installs ffmpeg. Returning early instead reports PASS on every OS
+//! in the matrix with nothing checking H.264, AAC-LC, `nal-hrd=cbr`, the
+//! keyframe cadence or A/V drift. See `common::require`, which holds that rule
+//! for both suites.
 //!
 //! The whole file is unix-only: the pipeline hands video to ffmpeg through a
 //! named pipe. On Windows this target compiles to nothing rather than to a test
@@ -198,9 +197,9 @@ fn real_ffmpeg_produces_a_stream_the_platforms_would_accept() {
     // `nal-hrd=cbr` is the one platform requirement with no visible
     // consequence in a probe of the streams: it writes HRD parameters into the
     // SPS VUI with cbr_flag set, and Twitch reads them (platform.rs:164).
-    // Nothing before this ever checked it. Profile comes from the same place
-    // because x264 silently downgrades a profile it cannot honour, so `-profile
-    // main` in argv is not evidence that the file is Main.
+    // Profile comes from the same place because x264 silently downgrades a
+    // profile it cannot honour, so `-profile main` in argv is not evidence that
+    // the file is Main.
     let headers = h264_headers(&ffmpeg, &out_file);
     assert_eq!(
         header_field(&headers, "nal_hrd_parameters_present_flag"),

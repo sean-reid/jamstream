@@ -980,8 +980,8 @@ impl<H: ProcessHost> Pipeline<H> {
     /// stream with no duration is five seconds of *content*. Off a file that is
     /// a few milliseconds of reading; off a live pipe it is five seconds of
     /// waiting, during which ffmpeg reads one video frame and then nothing but
-    /// audio. That is the read pattern that used to deadlock us, and with the
-    /// deadlock fixed it still cost the first five seconds of every broadcast
+    /// audio. That read pattern deadlocks a writer feeding both pipes, and
+    /// short of a deadlock it costs the first five seconds of every broadcast
     /// as dropped frames. Both inputs are fully described right here in argv,
     /// so there is nothing to analyse: the floor of 32 bytes and no duration.
     fn encoder_spec(&self) -> ProcSpec {

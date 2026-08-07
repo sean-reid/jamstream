@@ -139,11 +139,10 @@ fn frame(fill: u8) -> Vec<u8> {
 
 /// A child that drains audio and never touches video.
 ///
-/// This is ffmpeg's demuxer having decided it wants audio, frozen there. Under
-/// a single writer thread this hung on the second frame: the write blocked with
-/// twenty pipe fulls to go, so the audio that would have released it was never
-/// sent. The submissions are interleaved here in the order `push_tick` makes
-/// them, which is the interleaving that used to hang.
+/// This is ffmpeg's demuxer having decided it wants audio, frozen there. A
+/// single writer thread hangs on the second frame: the video write blocks with
+/// twenty pipe fulls to go, so the audio that would release it is never sent.
+/// The submissions are interleaved here in the order `push_tick` makes them.
 ///
 /// Unpaced on purpose. There is nothing to pace against when the child reads no
 /// video, and running flat out is what fills the queue quickly enough to prove
@@ -221,13 +220,12 @@ fn a_child_that_never_reads_video_still_gets_every_byte_of_audio() {
 /// answer to a child that has stopped reading it: report a broken feed and let
 /// the supervisor restart the encode.
 ///
-/// It does not assert that nothing was dropped, and an earlier version did,
-/// which was wrong and went red on macOS. Whether a child keeps up with 41 MB/s
-/// of 720p is a fact about a machine's pipes rather than about this code: a
-/// frame is 21 pipe fulls where a pipe holds 65536 and 84 where it holds 16384,
-/// and Darwin picks between those at runtime. The contract is that a submission
-/// reported as queued arrives whole and in order, and that acceptance keeps
-/// happening, so that is what this asserts.
+/// It cannot assert that nothing was dropped. Whether a child keeps up with
+/// 41 MB/s of 720p is a fact about a machine's pipes rather than about this
+/// code: a frame is 21 pipe fulls where a pipe holds 65536 and 84 where it holds
+/// 16384, and Darwin picks between those at runtime. The contract is that a
+/// submission reported as queued arrives whole and in order, and that acceptance
+/// keeps happening, so that is what this asserts.
 #[test]
 fn a_child_that_never_reads_audio_keeps_taking_video_throughout() {
     deadline("a_child_that_never_reads_audio_keeps_taking_video_throughout");

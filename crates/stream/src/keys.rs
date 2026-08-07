@@ -124,9 +124,8 @@ mod tests {
     }
 
     /// A directory anyone can write to is somebody else's to swap files in,
-    /// which is why `jamstream_cloud::private` refuses one instead of quietly
-    /// tightening it. This crate used to chmod it to 0700 and carry on, and
-    /// checked no ownership at all.
+    /// which is why `jamstream_cloud::private` refuses one, and checks its
+    /// owner, rather than chmodding it to 0700 and carrying on.
     #[test]
     fn a_world_writable_directory_is_refused_rather_than_chmodded() {
         let dir = tmp_dir("exposed");
