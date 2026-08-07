@@ -98,6 +98,34 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
     private_file_options().open(path)
 }
 
+/// Opens `path` for appending as a file only this account can read, creating
+/// it when it is not there yet.
+///
+/// The case [`create_private_file`] cannot serve: a log that outlives the
+/// process writing it, where replacing the file would throw away what an
+/// earlier run of the app recorded about the same session. So an existing file
+/// is reopened rather than replaced, and the two things replacing bought are
+/// bought another way: the directory is vetted first, which is what says who
+/// could have put a file at this path, and a symlink found at the path is
+/// refused outright rather than followed and written through.
+pub fn append_private(path: &Path) -> io::Result<File> {
+    check_exposure(parent_of(path))?;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a symlink; refusing to append", path.display()),
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 /// How every file this module creates is opened. `create_new` is
 /// `O_CREAT|O_EXCL`, which fails rather than following a symlink or
 /// opening a file another account got there first, and the mode applies

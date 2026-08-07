@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use jamstream_cloud::private::{create_private_dir, create_private_file};
 
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::fmt::writer::MakeWriterExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -73,9 +74,13 @@ pub fn init_at(path: PathBuf) -> Option<PathBuf> {
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
-                        .with_writer(std::io::stderr.and(Arc::clone(&file))),
+                        .with_writer(std::io::stderr.and(Arc::clone(&file)))
+                        // The filter belongs to this layer rather than to the
+                        // subscriber, so a session server's log reaches its own
+                        // file whatever RUST_LOG says about the app's.
+                        .with_filter(filter),
                 )
-                .with(filter)
+                .with(crate::server_log::layer())
                 .try_init();
             install_panic_hook(file);
             Some(path)
@@ -91,8 +96,12 @@ pub fn init_at(path: PathBuf) -> Option<PathBuf> {
 /// stderr, for the shells that have one.
 fn init_stderr_only() {
     let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(jamstream_cli::logging::from_env())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(jamstream_cli::logging::from_env()),
+        )
+        .with(crate::server_log::layer())
         .try_init();
 }
 

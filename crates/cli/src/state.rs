@@ -230,6 +230,19 @@ pub fn recording_path_for(session_id_hex: &str) -> Result<PathBuf, CliError> {
         .join(format!("{session_id_hex}.json")))
 }
 
+/// Where a session's server log lands: a file of its own under `logs`, beside
+/// the session records, named for the session like every other sidecar.
+///
+/// A cloud session's machine deletes itself when the session ends, so the log
+/// explaining a failure has to be somewhere else by then. The host's client
+/// writes this while the session runs; a local session's full log is separate,
+/// under the per-session server directory the local provider owns.
+pub fn server_log_path_for(session_id_hex: &str) -> Result<PathBuf, CliError> {
+    Ok(state_dir()?
+        .join("logs")
+        .join(format!("{session_id_hex}.log")))
+}
+
 /// Records where a session's takes are going. Called at launch, once.
 pub fn save_recording(
     session_id_hex: &str,
@@ -516,6 +529,22 @@ mod tests {
         match recording_path_for("deadbeef") {
             Ok(resolved) => {
                 assert!(resolved.ends_with("buckets/deadbeef.json"));
+                assert_eq!(
+                    resolved.parent().unwrap().parent(),
+                    Some(&*state_dir().unwrap())
+                );
+            }
+            Err(err) => assert!(err.to_string().contains(STATE_DIR_ENV)),
+        }
+    }
+
+    /// The server log is a sidecar like the bucket details: one directory
+    /// below the session records, so the session listing never sees it.
+    #[test]
+    fn the_server_log_sits_below_the_session_records() {
+        match server_log_path_for("deadbeef") {
+            Ok(resolved) => {
+                assert!(resolved.ends_with("logs/deadbeef.log"));
                 assert_eq!(
                     resolved.parent().unwrap().parent(),
                     Some(&*state_dir().unwrap())
