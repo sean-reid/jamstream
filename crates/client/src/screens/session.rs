@@ -164,7 +164,7 @@ pub struct SessionScreen {
     pub retention_note: Option<crate::screens::recording::RetentionNote>,
     /// Set for the frame the record sheet opens. It shares [`theme::SHEET_OFFSET`]
     /// with the settings drawer, so the app closes the drawer instead of
-    /// letting the wider sheet stick out to the left of it (#175).
+    /// letting the wider sheet stick out past the drawer's left edge.
     pub took_the_sheet_anchor: bool,
     /// Where the status bar starts, from this frame. The settings drawer is
     /// drawn after the screen and stops here, so it never covers the
@@ -174,9 +174,9 @@ pub struct SessionScreen {
     /// height of the window between the bars and wider than the panel, so it
     /// hides the conversation and leaves the message field showing under its
     /// bottom edge: a lone text field with a message placeholder and no
-    /// messages, two surfaces overlapping the way the two sheets did in #175.
+    /// messages, two surfaces overlapping.
     /// The panel keeps its place in the layout and draws nothing while it is
-    /// covered, so opening the drawer moves no strip (#286).
+    /// covered, so opening the drawer moves no strip.
     pub chat_covered: bool,
 }
 
@@ -230,7 +230,7 @@ impl SessionScreen {
                     // opening the drawer moves no strip; it draws nothing
                     // while the drawer is over it, because the only part of
                     // it that reached past the drawer's bottom edge was the
-                    // message field (#286). The narrow layout is not covered
+                    // message field. The narrow layout is not covered
                     // this way: there the chat is the whole content and the
                     // drawer takes less than half of it.
                     if !self.chat_covered {
@@ -376,9 +376,10 @@ impl SessionScreen {
         //
         // The device's words first and unprefixed, because a reason wrapped in
         // a sentence of ours reads "no audio device is running: unsupported
-        // audio configuration: ...", which is the stutter #286 objects to a
-        // crate away. What it costs and what to do about it go underneath, in
-        // the muted step, the way the session-full and no-probe lines do it.
+        // audio configuration: ...", repeating "no audio device is running"
+        // from the muted line below. What it costs and what to do about it go
+        // underneath, in the muted step, the way the session-full and
+        // no-probe lines do it.
         if let Some(reason) = &snap.device_error {
             theme::reason(ui, reason.clone());
             ui.label(theme::muted(
@@ -407,9 +408,9 @@ impl SessionScreen {
         let bar = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
         let scroll_h = ui.available_height();
         // The console extends sideways past the window; the lower panel stays
-        // within it. Never part of a strip: a musician at the right-hand end of
-        // a ten-piece console had a name cut mid-word and a Mute they could not
-        // press, with a horizontal scrollbar as the only cue (#286).
+        // within it. Never part of a strip: a strip cut down the middle leaves
+        // a musician's name broken mid-word and a Mute they cannot press, with
+        // a horizontal scrollbar as the only cue.
         let room = ui.available_width() - if needed > scroll_h - bar { bar } else { 0.0 };
         let visible_w = whole_strips_w(room, musicians.len());
         let lower_w = row_w.min(visible_w);
@@ -679,9 +680,9 @@ impl SessionScreen {
                                 .changed();
                         ui.end_row();
                         ui.label(theme::muted(ui, "click"));
-                        // The same word a musician reads for the same fact. A
-                        // host's row said "enabled" and a musician's said "on"
-                        // (#192).
+                        // The same word for the same fact: a host's row and a
+                        // musician's row use the same label for this
+                        // control's state.
                         let word = if enabled { "on" } else { "off" };
                         changed |= ui.checkbox(&mut enabled, word).changed();
                         ui.end_row();
@@ -823,8 +824,8 @@ impl SessionScreen {
         }
         bar_divider(ui);
         // Accent means the live state, so it follows the take and not the
-        // sheet. Lit while the sheet was open, this button claimed a take
-        // existed when none did, in the same colour as the ON AIR lamp (#181).
+        // sheet: lighting it for an open sheet with no take running would
+        // claim a take exists, in the same colour as the ON AIR lamp.
         // The sheet being on screen is what says the sheet is open.
         let capturing = matches!(snap.record.state, crate::runtime::RecordState::Recording);
         if snap.is_host
@@ -1108,8 +1109,8 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
             );
             ui.label(RichText::new("mouth to ear").size(9.5).color(p.text_muted));
         });
-        // The persistent converting tag (#347): while a direction rides the
-        // boundary converter, the device's own rate sits beside the number
+        // The converting tag persists for as long as a direction rides the
+        // boundary converter: the device's own rate sits beside the number
         // its cost is inside of. Muted, because it is a fact, not a fault.
         //
         // Both rates and the verb, because a bare "44.1 kHz" beside the
@@ -1144,9 +1145,8 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
 /// The latency number's hover, line by line: the link's own figures, then
 /// what the device stream got from the OS. Which WASAPI mode won and how
 /// each direction reaches the session rate are the facts that move this
-/// number between days on the same machine (#326, #347); a platform that
-/// reports neither adds no line, because a made-up answer is worse than
-/// none.
+/// number between days on the same machine; a platform that reports
+/// neither adds no line, because a made-up answer is worse than none.
 fn latency_hover(s: &crate::runtime::StatsView) -> String {
     let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
     let mut text = format!(
@@ -1315,9 +1315,8 @@ fn strips_w(count: usize) -> f32 {
 
 /// The width to hand the console: as many whole strips as `room` holds, and
 /// never part of one more. A strip cut down the middle is a name broken
-/// mid-word and a Mute that cannot be pressed, which is what the right-hand end
-/// of a ten-piece console showed at the chat panel's edge (#286). One strip
-/// always, so a window narrower than a single one clips rather than vanishes.
+/// mid-word and a Mute that cannot be pressed. One strip always, so a window
+/// narrower than a single one clips rather than vanishes.
 fn whole_strips_w(room: f32, count: usize) -> f32 {
     let per = STRIP_OUTER_W + STRIP_GAP;
     let fits = ((room + STRIP_GAP) / per).floor().max(1.0) as usize;
@@ -1327,7 +1326,7 @@ fn whole_strips_w(room: f32, count: usize) -> f32 {
 /// What a strip's button rows actually draw at. egui floors a button at its
 /// text height plus the style's vertical padding whatever size it is added
 /// at, so the console asks rather than assumes: it reserved a flat 22, both
-/// rows drew 24, and the fader absorbed the difference (#173).
+/// rows drew 24, and the fader absorbed the difference.
 fn button_row_h(ui: &Ui) -> f32 {
     let h = (ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y)
         .max(ui.spacing().interact_size.y)
@@ -1513,10 +1512,9 @@ mod tests {
 
     /// Two lamps lit at once may never be the same lamp.
     ///
-    /// ON AIR and UPLOADING were both a filled circle in a warm orange 1.25:1
-    /// apart, and they can be lit together, so the colour carried nothing and
-    /// the words did all of the work (#182). Shape is the cue that survives
-    /// two hues nobody can separate at 5 px.
+    /// ON AIR and UPLOADING sit a warm orange 1.25:1 apart and can be lit
+    /// together, so colour alone cannot tell them apart. Shape is the cue
+    /// that survives two hues nobody can separate at 5 px.
     #[test]
     fn no_two_lamps_that_light_together_look_alike() {
         for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
