@@ -1008,11 +1008,11 @@ mod tests {
         Duration::from_secs_f64(laptop.as_secs_f64() * scale)
     }
 
-    /// The one that punched a hole in the mix: open_stem used to encode the
-    /// whole take's silence inline, about 38 ms per minute of take, so past
-    /// roughly 26 minutes a musician walking in cost more than the queue's one
-    /// second and the mix recording went to gap-filled silence. Measured on
-    /// this test's take before the fix: 840 ms. After: under a millisecond.
+    /// `open_stem` cannot encode the take's lead-in silence inline: that costs
+    /// about 38 ms per minute of take, so past roughly 26 minutes a musician
+    /// walking in costs more than the queue's one second and the mix recording
+    /// goes to gap-filled silence. Under a millisecond on this test's take,
+    /// against 840 ms for the inline encode.
     #[test]
     fn a_join_deep_into_a_take_does_not_stall_the_mix() {
         let minutes = 45u64;

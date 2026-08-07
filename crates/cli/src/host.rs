@@ -853,7 +853,7 @@ mod tests {
         let mix = launch_preview(&price, &args, Some(&storage(false))).expect("mix only");
         let stems = launch_preview(&price, &args, Some(&storage(true))).expect("mix and stems");
 
-        // Recording is never free, and it never used to be in this figure.
+        // Recording is never free, so the figure has to carry it.
         assert!(
             mix.total_microusd > session.total_microusd,
             "recording the mix has to cost something: {} vs {}",

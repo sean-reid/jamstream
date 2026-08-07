@@ -844,9 +844,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The case issue #333 is about: a `JAMSTREAM_STATE_DIR` that existed
-    /// before this process did, carrying whatever ACEs its parent handed
-    /// down, gets tightened on the write path rather than trusted.
+    /// A `JAMSTREAM_STATE_DIR` that existed before this process did, carrying
+    /// whatever ACEs its parent handed down, gets tightened on the write path
+    /// rather than trusted.
     #[cfg(windows)]
     #[test]
     fn windows_pre_existing_state_dirs_are_hardened_too() {

@@ -857,9 +857,9 @@ impl ServerCore {
 
     /// Tells every connected member the session is over and returns the
     /// datagrams to send. One flight each, no retransmit: the process is going
-    /// away, and a client that misses this finds out by timeout, which is what
-    /// used to happen to everyone. Members are marked disconnected, so a
-    /// caller that keeps running (the harness) sees a clean roster.
+    /// away, and a client that misses this finds out by timeout. Members are
+    /// marked disconnected, so a caller that keeps running (the harness) sees a
+    /// clean roster.
     pub fn shutdown(&mut self, now_ms: u64, reason: &str) -> Outgoing {
         let mut out = Vec::new();
         // Before the Bye, so the last lines the server wrote ride the same
@@ -936,8 +936,8 @@ impl ServerCore {
     /// The last tick's broadcast audio on its own, for a consumer that wants
     /// the samples and nothing else. [`ServerCore::broadcast_tick`] also
     /// builds the card roster, which costs an allocation and an avatar cache
-    /// lookup per musician; the recorder wants none of it and used to pay for
-    /// it 400 times a second.
+    /// lookup per musician; the recorder wants none of it and calls 400 times
+    /// a second.
     pub fn broadcast_audio(&self) -> &[f32] {
         let start = self.bcast_slot * MIX_LEN;
         &self.bcast_accum[start..start + MIX_LEN]
@@ -2053,10 +2053,10 @@ impl ServerCore {
 
     /// Records that a member is waiting for avatar bytes the server does not
     /// have yet. Only a hash some member currently announces can be waited
-    /// on, so entries for hashes nobody announces any more are dead: they
-    /// used to be dropped only when a train completed, which let a member
-    /// alternating SetAvatar and AvatarRequest on its own hash leave one
-    /// permanent entry per pair of packets.
+    /// on, so entries for hashes nobody announces any more are dead and are
+    /// dropped here rather than when a train completes: a member alternating
+    /// SetAvatar and AvatarRequest on its own hash completes no train and would
+    /// leave one permanent entry per pair of packets.
     fn note_avatar_waiter(&mut self, hash: AvatarHash, waiter: MemberId) {
         let cap = self.cfg.max_musicians + self.cfg.max_listeners;
         if self.avatar_waiters.len() >= cap && !self.avatar_waiters.contains_key(&hash) {
@@ -2080,10 +2080,9 @@ impl ServerCore {
     }
 
     /// Charges one protocol violation against a member, ejecting them once
-    /// they run their budget out. Every violation site funnels through here;
-    /// the counter used to be incremented in five places and read nowhere, so
-    /// an admitted peer, a listener invite included, could send illegal
-    /// packets at line rate forever.
+    /// they run their budget out. Every violation site funnels through here,
+    /// which is what keeps an admitted peer, a listener invite included, from
+    /// sending illegal packets at line rate forever.
     fn violation(&mut self, now_ms: u64, id: MemberId, what: &'static str) {
         let Some(m) = self.members.get_mut(&id) else {
             self.events
@@ -2804,8 +2803,8 @@ mod tests {
     }
 
     /// The reject carries a MAC over a secret recovered from the init, so an
-    /// init this server cannot read leaves nobody to authenticate it to. It
-    /// used to answer any wrong-version packet over the minimum length.
+    /// init this server cannot read leaves nobody to authenticate it to and
+    /// draws no answer, whatever its version says.
     #[test]
     fn an_unreadable_init_draws_no_reject() {
         let (mut core, _issuer, _public) = server_with_issuer();
@@ -2815,9 +2814,9 @@ mod tests {
 
     /// The capacity check runs after the token verifies, so the peer has
     /// already proven it holds an invite this session issued and can safely
-    /// be told the truth. Before this, a listener joining a full gallery
-    /// waited out its own 10 s timeout and could not tell a sold-out session
-    /// from a server that was down.
+    /// be told the truth. Silence instead leaves a listener joining a full
+    /// gallery to wait out its own 10 s timeout, unable to tell a sold-out
+    /// session from a server that is down.
     #[test]
     fn a_full_role_draws_an_authenticated_capacity_reject() {
         let issuer = Issuer::generate();

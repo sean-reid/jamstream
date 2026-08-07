@@ -187,9 +187,9 @@ pub async fn wait_for_ip(
 /// which launches no server.
 ///
 /// Every address in the invite gets a turn, so this reports what a joining
-/// musician will actually experience rather than what the first entry alone
-/// would. A host whose invite lists a LAN address first used to get a false
-/// "not reachable" on a session the CLI would have connected to (#227).
+/// musician will actually experience. Trying the first entry alone gives a host
+/// whose invite lists a LAN address first a false "not reachable" on a session
+/// the CLI would have connected to.
 pub async fn verify_reachable(invite: &Invite, cap: Duration) -> Result<(), CliError> {
     let mut candidates = ServerCandidates::new(invite)?;
     let mut socket = connected_socket(candidates.current()).await?;

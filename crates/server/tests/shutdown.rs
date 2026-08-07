@@ -178,7 +178,7 @@ async fn a_revoked_invite_stays_revoked_across_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A stop used to break the loop and drop the socket. Members must be told.
+/// A stop tells every member before it drops the socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_graceful_stop_tells_every_member_before_exiting() {
     let f = Session::new();

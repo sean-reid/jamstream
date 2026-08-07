@@ -394,9 +394,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// The whole point of #49: with no platform data directory the records
-    /// used to land in the temp directory, so the issuer private key sat at
-    /// a fully predictable path in a place every account can write.
+    /// With no platform data directory the records must not fall back to the
+    /// temp directory: that puts the issuer private key at a fully predictable
+    /// path in a place every account can write.
     #[test]
     fn no_data_directory_is_an_error_not_a_detour_through_tmp() {
         let err = resolve_data_dir(None).unwrap_err().to_string();

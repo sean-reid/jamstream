@@ -20,9 +20,9 @@ use crate::widgets::LampShape;
 /// The recorder keeps one colour through the whole take, `meter_red`, which is
 /// what musicians expect on a record lamp. Capturing is filled; the upload
 /// draining is the same red hollowed out, because it is the same take
-/// finishing. It used to be `meter_amber`, which is 1.25:1 against the accent
-/// the ON AIR lamp beside it carries, so two states with very different
-/// consequences were told apart by their words alone (#182).
+/// finishing. It cannot be `meter_amber`: that is 1.25:1 against the accent
+/// the ON AIR lamp beside it carries, leaving two states with very different
+/// consequences told apart by their words alone.
 ///
 /// A failed recorder takes the danger colour and a ring, because nothing is
 /// being captured. It cannot be a filled danger disc: STREAM FAILED already is

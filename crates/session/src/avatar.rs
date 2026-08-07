@@ -265,10 +265,9 @@ mod tests {
     fn reinsert_reclaims_an_earlier_overshoot() {
         // Found by the avatar_rx_push fuzz target (nightly 2026-08-01,
         // corpus seed reinsert_reclaims_overshoot): with h(1) pinned, the
-        // oversized h(2) rightly stays at its own insert, but re-inserting
-        // h(1) used to return on the touch path without evicting, so the
-        // cache held h(2)'s overshoot for as long as the inserts kept
-        // being duplicates.
+        // oversized h(2) rightly stays at its own insert, so re-inserting h(1)
+        // has to evict rather than return on the touch path, or the cache holds
+        // h(2)'s overshoot for as long as the inserts keep being duplicates.
         let mut cache = AvatarCache::new(10);
         let pins: BTreeSet<AvatarHash> = [h(1)].into();
         cache.insert(h(1), vec![0; 8], &pins);

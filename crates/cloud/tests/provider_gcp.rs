@@ -161,10 +161,9 @@ async fn launch_inserts_instance_with_expected_body() {
     assert_eq!(body["serviceAccounts"], json!([]));
 }
 
-/// #51 end to end: `--max-hours` used to reach the API nowhere, so every
-/// GCP session was capped at the 12 h default however long the host asked
-/// for. The cap travels in the cloud-init the VM boots from, which is the
-/// only channel a `LaunchSpec` has for it.
+/// `--max-hours` has to reach the API, or a GCP session is capped at the 12 h
+/// default however long the host asked for. The cap travels in the cloud-init
+/// the VM boots from, which is the only channel a `LaunchSpec` has for it.
 #[tokio::test]
 async fn the_run_cap_on_the_wire_is_the_session_cap() {
     let server = MockServer::start().await;

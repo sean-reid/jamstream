@@ -579,9 +579,8 @@ mod tests {
         assert_eq!(usize::from(args.musicians), MAX_MUSICIANS);
     }
 
-    // --musicians counts the host, which is a change from an earlier build:
-    // the help text has to say so, because the same number used to mean
-    // guests only.
+    // --musicians counts the host, and the help text has to say so: the number
+    // reads as guests only otherwise.
     #[test]
     fn musicians_help_says_the_host_is_counted() {
         let mut cmd = Cli::command();

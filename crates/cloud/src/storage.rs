@@ -100,11 +100,8 @@ pub const MAX_PARTS: u32 = 10_000;
 /// Rounds a requested part size up to one both providers accept: at least
 /// [`MIN_PART_SIZE`], and a whole number of [`PART_SIZE_MULTIPLE`].
 ///
-/// `with_part_size` on every real store goes through this. It used to take the
-/// number as given, so every multipart test in the crate ran at 8 or 2048
-/// bytes, sizes S3 answers with EntityTooSmall and GCS with a 400, and the
-/// only part size that had ever crossed a wire in this repository was one no
-/// provider would accept.
+/// `with_part_size` on every real store goes through this, so nothing can run a
+/// multipart upload at a size S3 answers with EntityTooSmall and GCS with a 400.
 pub fn clamp_part_size(bytes: usize) -> usize {
     bytes
         .max(MIN_PART_SIZE)
@@ -155,12 +152,9 @@ impl ObjectMeta {
 /// This is the whole key layout this crate owns. Everything after the prefix
 /// is a take's file name, which is built where the take is (`Recorder` in the
 /// server crate) and handed to [`ObjectSink`] with the prefix in front of it.
-/// There used to be `mix_key`, `stem_key` and `manifest_key` here as well,
-/// naming `mix.wav`, `stems/<member>.wav` and `manifest.json`: three objects
-/// nothing has ever written, in a format nothing has ever recorded. Every test
-/// in the crate built its keys from them, so the whole storage suite ran on a
-/// scheme the product does not use. Do not add one back; a function of the
-/// session id alone cannot name a take, because a session has many.
+/// Do not add a `mix_key`, `stem_key` or `manifest_key` beside it: a function of
+/// the session id alone cannot name a take, because a session has many, and
+/// tests built on one run against a scheme the product does not use.
 pub fn session_prefix(session_id: &str) -> String {
     format!("{RECORDING_PREFIX}/{}/", sanitize_component(session_id))
 }
@@ -841,7 +835,7 @@ mod tests {
 
     #[test]
     fn a_part_size_no_provider_would_take_is_raised_to_one_they_would() {
-        // The sizes every multipart test in this crate used to run at.
+        // Sizes a test reaches for and no provider accepts.
         assert_eq!(clamp_part_size(8), MIN_PART_SIZE);
         assert_eq!(clamp_part_size(2048), MIN_PART_SIZE);
         assert_eq!(clamp_part_size(0), MIN_PART_SIZE);

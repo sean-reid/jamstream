@@ -65,10 +65,9 @@ async fn mount_security_group(server: &MockServer, group_id: &str) {
 /// Matches a request whose signature, recomputed from the method, path, query,
 /// headers and body that arrived, is the signature that arrived.
 ///
-/// This used to check the shape of the header instead: the prefix, the scope
-/// substring, the signed-header list. A provider that signed a canonical
-/// request nobody sent passed all of it, which is the whole point of a signer
-/// test and the one thing it was not doing.
+/// Not the shape of the header, the prefix, the scope substring or the
+/// signed-header list: a provider that signed a canonical request nobody sent
+/// satisfies all of those.
 struct SignedFor {
     region: &'static str,
     service: &'static str,

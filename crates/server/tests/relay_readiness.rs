@@ -2,13 +2,12 @@
 //! jamstreamd over real UDP, a real relay socket that goes away, and a real
 //! client core on the other end.
 //!
-//! The interesting case is not a healthy relay. It is the one that happened: a
-//! relay that is there and then is not, which used to be indistinguishable from
-//! a working one because systemd calls a `Type=simple` unit started the moment
-//! it forks and everything after boot goes to a journal no host can read
-//! (#441). Paired with the reason cloud-init leaves behind when the broadcast
-//! tooling never downloaded at all (#440), which is the sentence the host is
-//! shown instead of a generic absence.
+//! The interesting case is not a healthy relay but one that is there and then
+//! is not. Nothing else tells that apart from a working one: systemd calls a
+//! `Type=simple` unit started the moment it forks, and everything after boot
+//! goes to a journal no host can read. Paired with the reason cloud-init leaves
+//! behind when the broadcast tooling never downloaded at all, which is the
+//! sentence the host is shown instead of a generic absence.
 
 mod common;
 

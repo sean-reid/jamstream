@@ -63,8 +63,8 @@
 //! reading them fails closed: a key that is missing or unreadable falls
 //! back to [`DEFAULT_IDLE_SHUTDOWN_MIN`] and
 //! [`DEFAULT_MAX_DURATION_MIN`], never to "no limit". A key that says 0
-//! still means no limit, because that is a host saying so on purpose; the
-//! absent case is the one that used to say it by accident.
+//! still means no limit, because that is a host saying so on purpose, which
+//! an absent key is not.
 //!
 //! # Shutdown: the sentinel file
 //!
@@ -1306,11 +1306,11 @@ fn same_command(observed: &str, expected: &str) -> bool {
 /// only, now that unix probes and signals through libc instead of spawning
 /// anything.
 ///
-/// Every one of these used to go through `PATH`, so a writable directory
-/// early in it meant code execution on every liveness probe, in a process
-/// that is about to signal something. The candidates below are where the
-/// platform actually keeps these; the bare name is the last resort, for an
-/// unusual layout, and it is the only case that reads `PATH` at all.
+/// Resolving one through `PATH` turns a writable directory early in it into
+/// code execution on every liveness probe, in a process that is about to signal
+/// something. The candidates below are where the platform actually keeps these;
+/// the bare name is the last resort, for an unusual layout, and it is the only
+/// case that reads `PATH` at all.
 #[cfg(windows)]
 fn system_tool(name: &str, candidates: &[&str]) -> PathBuf {
     candidates
@@ -1981,10 +1981,9 @@ mod tests {
     /// The app-bundling story: release artifacts place jamstreamd beside
     /// the app/CLI binary, and resolution must find it there with no
     /// override, no env var, and no PATH entry. Asserted against a private
-    /// directory standing in for the install dir: this test used to drop
-    /// its fixture beside the real test executable, and on Windows a new
-    /// exe-named file in the shared target/ dir loses sharing-violation
-    /// races with the scanners watching it.
+    /// directory standing in for the install dir, never beside the real test
+    /// executable: on Windows a new exe-named file in the shared target/ dir
+    /// loses sharing-violation races with the scanners watching it.
     #[test]
     fn resolves_the_binary_beside_the_current_executable() {
         let dir = temp_dir("adjacent");
@@ -2018,9 +2017,9 @@ mod tests {
         assert_eq!(fs_safe("my_session-1"), "my_session-1");
     }
 
-    /// A one-byte flip in the registry used to fail every local operation
-    /// for the life of the file, and `sweep` logged that and carried on, so
-    /// local sweeping was off with nothing to show for it.
+    /// A one-byte flip in the registry cannot fail every local operation for the
+    /// life of the file: `sweep` logs a read error and carries on, which leaves
+    /// local sweeping off with nothing to show for it.
     #[tokio::test]
     async fn a_corrupt_registry_is_set_aside_rather_than_fatal() {
         let dir = temp_dir("corrupt");
@@ -2048,9 +2047,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The app sweeping on launch while the CLI is mid-host is two
-    /// processes in the same load-modify-save cycle, and the loser's entry
-    /// used to vanish, leaving a server nothing would ever destroy.
+    /// The app sweeping on launch while the CLI is mid-host is two processes in
+    /// the same load-modify-save cycle. Unlocked, the loser's entry vanishes and
+    /// leaves a server nothing will ever destroy.
     #[test]
     fn the_registry_lock_excludes_another_holder_and_breaks_a_stale_one() {
         let dir = temp_dir("lock");

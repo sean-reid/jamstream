@@ -371,9 +371,8 @@ fn every_rung_is_reportable_and_none_of_them_lies_about_the_clock() {
 /// The asymmetric pair the outcome type exists for: a 44.1 kHz microphone
 /// beside 48 kHz monitors. Capture converts and keeps the interface's clock,
 /// playback is native on the session's, and each file is written at the clock
-/// of the endpoint that produced it. The fake had one rate for the whole
-/// stream before this, so nothing anywhere could reach two different
-/// outcomes at once.
+/// of the endpoint that produced it. The fake carries a rate per endpoint, not
+/// one for the whole stream, or nothing can reach two outcomes at once.
 #[test]
 fn two_endpoints_on_two_clocks_convert_one_direction_only() {
     use jamstream_audio_io::{DeviceRung, RateOutcome};

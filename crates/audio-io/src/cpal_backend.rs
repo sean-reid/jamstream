@@ -3,7 +3,7 @@
 //! `WindowsBackend`, which prefers the direct WASAPI exclusive-mode path; see
 //! `backend()` in lib.rs.
 //!
-//! The handler always sees the session rate; the #347 ladder decides how
+//! The handler always sees the session rate; the ladder decides how
 //! each direction gets there, in one place, [`plan_direction`], which lives
 //! with the rest of the rate policy in [`crate::cpal_policy`]. A device
 //! that runs at the session rate opens as it is. A device that does not is
@@ -15,10 +15,9 @@
 //! that direction's handler half. A host that only refuses once the stream is
 //! up, which is how PipeWire negotiates, kills it from the error callback
 //! instead; the device is demoted there so the reopen lands on the converter
-//! rather than repeating the same attempt. The refusal that used to be the
-//! whole policy survives only for a device whose native-rate open itself
-//! fails, and for a Bluetooth hands-free microphone, which has no rate worth
-//! carrying (#330).
+//! rather than repeating the same attempt. An outright refusal is left for a
+//! device whose native-rate open itself fails, and for a Bluetooth hands-free
+//! microphone, which has no rate worth carrying.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -490,9 +490,9 @@ impl Scenario {
     /// A frozen audio driver. The device thread delivers no capture and asks
     /// for no playout, so this tick's frames simply never happen: the
     /// swallowed capture is dropped rather than replayed, leaving the resumed
-    /// uplink with a hole in its frame clock and contiguous sequence numbers
-    /// (exactly what a partial pump catch-up used to produce), and the
-    /// downlink jitter buffer filling with nobody reading it. The socket side
+    /// uplink with a hole in its frame clock and contiguous sequence numbers,
+    /// and the downlink jitter buffer filling with nobody reading it. A partial
+    /// pump catch-up here would hide the whole scenario. The socket side
     /// keeps running, because a stalled device thread does not stop the
     /// network thread: the member stays joined and keeps answering pings.
     fn step_client_stalled(&mut self, now_us: u64, now_ms: u64, idx: usize) {

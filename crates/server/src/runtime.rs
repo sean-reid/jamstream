@@ -587,8 +587,8 @@ impl Server {
     }
 
     /// Tells every connected member the session is ending, one flight each,
-    /// then returns. No retransmit: the process is going away. Before this
-    /// existed, every client discovered a stop by ten-second timeout.
+    /// then returns. No retransmit: the process is going away, and a client
+    /// that misses the flight falls back to its ten-second timeout.
     async fn say_goodbye(&mut self, now_ms: u64, reason: &str) {
         let farewells = self.core.shutdown(now_ms, reason);
         let members = farewells.len();
@@ -682,9 +682,9 @@ impl Server {
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
                     // One peer's datagram must not be able to take the session
-                    // with it. The core is one struct in one task, so an
-                    // unwind from here used to leave run(), block_on, and
-                    // main, dropping every member.
+                    // with it. The core is one struct in one task, so an unwind
+                    // from here reaches run(), block_on and main, dropping every
+                    // member.
                     let core = &mut self.core;
                     let replies = guard(|| core.handle_datagram(now_ms, now_unix, src, &buf[..len]));
                     let Some(replies) = replies else {

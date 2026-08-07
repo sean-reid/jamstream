@@ -368,10 +368,9 @@ fn member_jitter(s: &jamstream_harness::Scenario, id: u16) -> JitterStats {
 // A client's audio driver freezes mid-session (a multi-second process stall
 // under load). While frozen it captures nothing - and those frames are gone,
 // not replayed - and asks for no playout, so two buffers come out of the
-// stall out of phase with the streams feeding them, both inside the hole the
-// buffer used to have no answer for (an offset of 2..512 frames: past the
-// resurrect path's one-frame reach, short of the 512-frame restart
-// threshold):
+// stall out of phase with the streams feeding them, at an offset of 2..512
+// frames, past the resurrect path's one-frame reach and short of the 512-frame
+// restart threshold:
 //
 //   * the server's buffer for that member's uplink is `stall` frames ahead of
 //     the sequence numbers now arriving, which carried on contiguously across

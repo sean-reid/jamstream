@@ -54,11 +54,11 @@ const COOKIE_NONCE_DOMAIN: &[u8] = b"jamstream-cookie-nonce";
 /// shared secret between the server's static key and the per-connection
 /// static key of the client that sent the init being answered.
 ///
-/// It used to be the server's public key, which ships in every invite, so
-/// any invite holder including a revoked one could forge a reject at any
-/// client whose address they could see. A shared secret needs the server's
-/// static private key on one side and that one client's private key on the
-/// other, and neither is in an invite. [`crate::transport`] derives it.
+/// It cannot be the server's public key: that ships in every invite, so any
+/// invite holder including a revoked one could forge a reject at any client
+/// whose address they could see. A shared secret needs the server's static
+/// private key on one side and that one client's private key on the other, and
+/// neither is in an invite. [`crate::transport`] derives it.
 #[derive(Clone)]
 pub struct RejectKey(Zeroizing<[u8; 32]>);
 

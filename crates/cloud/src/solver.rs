@@ -96,15 +96,14 @@ pub fn rank(matrix: &ProbeMatrix, candidates: &[(Region, Price)]) -> Vec<RegionS
                 .collect();
             // Nobody has a probe for this region, either because nobody
             // probed it or because nobody probed anything. Both are
-            // "unknown", and unknown is not zero: this branch used to
-            // return 0.0 with full coverage when the matrix was empty,
-            // which rendered as "0 ms" for every region, including
-            // sa-east-1 from North America, and sorted the regions we know
-            // least about to the top of the table. INFINITY keeps unknown
-            // out of the 5 ms bucket arithmetic entirely (see rtt_bucket)
-            // and sends it to the end of the order; price still decides
-            // among rows that are all unknown, which is the only signal
-            // left when no probe answered.
+            // "unknown", and unknown is not zero: 0.0 with full coverage
+            // renders as "0 ms" for every region, sa-east-1 from North
+            // America included, and sorts the regions we know least about
+            // to the top of the table. INFINITY keeps unknown out of the
+            // 5 ms bucket arithmetic entirely (see rtt_bucket) and sends it
+            // to the end of the order; price still decides among rows that
+            // are all unknown, which is the only signal left when no probe
+            // answered.
             let (worst, mean, coverage) = if rtts.is_empty() {
                 (f32::INFINITY, f32::INFINITY, 0.0)
             } else {

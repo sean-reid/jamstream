@@ -1,11 +1,10 @@
 //! What it takes for a destination to be called Live, against real processes.
 //!
 //! The fake host proves the state machine and the unit tests hold the clock
-//! still, which is exactly what the bug this guards was hiding behind. A pusher
-//! is two execs and an ffmpeg startup ahead of its connect, so on a machine
-//! busy with an encode it can outlive any settling window and still be short of
-//! the refusal it is heading for. That used to be reported Live, with nothing
-//! being broadcast, for as long as it took to die (#445).
+//! still, which is where a promotion based on survival hides. A pusher is two
+//! execs and an ffmpeg startup ahead of its connect, so on a machine busy with
+//! an encode it can outlive any settling window and still be short of the
+//! refusal it is heading for, with nothing being broadcast the whole time.
 //!
 //! So the two children here are shell, and the timing is the point: one takes
 //! its time and then fails, the other takes the same time and then reports a
@@ -34,9 +33,8 @@ const PROGRESS_BLOCK: &str = include_str!("../testdata/pusher.progress");
 
 /// How long a stand-in pusher takes before it does anything at all.
 ///
-/// Longer than the three seconds of survival that used to promote a
-/// destination, because the whole question is what happens in the gap between
-/// surviving that long and having pushed anything.
+/// Longer than three seconds, so the child spends the test in the gap between
+/// outliving any settling window and having pushed anything.
 const SLOW_MS: u64 = 4_000;
 
 /// How long a test watches before it gives up on its child.
@@ -133,9 +131,8 @@ fn state(pipeline: &Pipeline<StdProcessHost>) -> DestinationState {
         .expect("one destination")
 }
 
-/// The whole of #445, over fork and exec: a pusher that outlives the window
-/// survival used to buy and only then reaches its refused connect must never
-/// have been called Live.
+/// Over fork and exec: a pusher that outlives any settling window and only then
+/// reaches its refused connect must never have been called Live.
 #[test]
 fn a_pusher_that_pushed_nothing_is_never_live_however_long_it_lives() {
     let (root, mut pipeline) = rig(

@@ -10,7 +10,7 @@
 //! counting who is *connected*. So this panel counts seats too. Revoking
 //! ejects the holder, which frees the seat on the server; a panel that went
 //! on counting the revoked invite would refuse to mint a replacement the
-//! server would happily admit, which is what it used to do.
+//! server would happily admit.
 //!
 //! A freed seat is minted into again, member id and all. That is safe
 //! because revocation keys on the token's `jti`, never on the member id:
@@ -402,11 +402,10 @@ fn record_holds(record: &InviteRecord, member: MemberId, token: TokenId) -> bool
 /// it, verify nothing tagged remains, and rewrite the state file as ended
 /// without the issuer key.
 ///
-/// The two steps this used to skip are the ones with nothing on screen to
-/// notice them. A session ended from the app left its per-session firewall in
-/// the account, one per session forever (#196), and left the key that signs
-/// its invites in the state directory after the server that key authenticated
-/// against was gone (#195).
+/// Closing the firewall and dropping the issuer key are the two steps with
+/// nothing on screen to notice if they are skipped: one leaves a firewall per
+/// session in the account forever, the other leaves the key that signs the
+/// session's invites behind after the server it authenticated against is gone.
 pub async fn end_session(
     provider: &dyn Provider,
     mut state: SessionState,
@@ -868,9 +867,9 @@ mod tests {
             .collect()
     }
 
-    /// The defect in #81: revoking every musician used to leave the session
-    /// unable to mint a single replacement, because the panel counted
-    /// invites ever issued while the server counted people connected.
+    /// Revoking every musician leaves the session able to mint replacements,
+    /// which holds only while the panel counts people connected the way the
+    /// server does, rather than invites ever issued.
     #[test]
     fn revoking_frees_the_seat_and_the_band_refills_it() {
         let (state, path) = fixture("free");

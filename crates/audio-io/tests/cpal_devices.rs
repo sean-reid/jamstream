@@ -7,9 +7,8 @@
 //! audio content and needs a loopback device to do it.
 //!
 //! Asking for it is asserting you have devices, so a machine with none fails
-//! here rather than printing a note and passing. It used to do the latter,
-//! which meant the only way to run it reported success whether or not it had
-//! tested anything.
+//! here rather than printing a note and passing: a note and a pass means the
+//! only way to run this reports success whether or not it tested anything.
 
 #![cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 

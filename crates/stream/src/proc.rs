@@ -173,20 +173,16 @@ pub trait ProcessHost {
 /// ## Why a child's stderr is read rather than inherited
 ///
 /// ffmpeg's one-line errors are the most useful thing in the log when a
-/// platform refuses a key, and they used to be inherited straight to ours for
-/// that reason. The trouble is what a refused connect prints: ffmpeg names its
-/// output URL, and for a pusher the stream key is in that URL. So the one
-/// message worth keeping was also the one message that put a key into journald
-/// on the session VM and into the local provider's per-session log (#204).
-///
-/// Each child's stderr is a pipe now, read by a thread that redacts every URL
-/// and logs what is left against the child's label. See [`redact`].
+/// platform refuses a key, and they are also where a key escapes: a refused
+/// connect names the output URL, and for a pusher the stream key is in it.
+/// Inherited stderr puts that key into journald on the session VM and into the
+/// local provider's per-session log. Each child's stderr is a pipe instead,
+/// read by a thread that redacts every URL and logs what is left against the
+/// child's label. See [`redact`].
 ///
 /// The log is also the wrong place for it to stop. A session VM's journal is
 /// somewhere no host can reach, so the last redacted lines are kept per child
-/// and become the reason [`ProcessHost::poll`] reports when it dies: the one
-/// place the failure was visible used to be the one place the explanation was
-/// not (#437).
+/// and become the reason [`ProcessHost::poll`] reports when it dies.
 #[derive(Debug, Default)]
 pub struct StdProcessHost {
     next_id: ProcId,
@@ -974,10 +970,8 @@ fn open_fifo_write(_path: &std::path::Path) -> io::Result<std::fs::File> {
 
 /// A scriptable [`ProcessHost`] with a call log; it spawns nothing.
 ///
-/// cfg(test), because the only callers are this crate's own unit tests. It
-/// used to be compiled unconditionally for integration tests in `tests/`, and
-/// the two that exist there drive real processes, so all that reached was
-/// jamstreamd.
+/// cfg(test), because the only callers are this crate's own unit tests: the two
+/// integration tests in `tests/` drive real processes and want none of it.
 #[cfg(test)]
 pub mod fake {
     use super::{Exit, Feed, ProcId, ProcSpec, ProcessHost, Stdin};
@@ -1465,10 +1459,9 @@ mod tests {
             }
         }
 
-        /// The whole of #437, against a real process: a host who pasted a
-        /// good key into a session that cannot reach the platform used to be
-        /// shown an integer. Now the row carries the sentence ffmpeg wrote,
-        /// and the key that sentence contained is still not in it.
+        /// Against a real process: a host who pasted a good key into a session
+        /// that cannot reach the platform gets the sentence ffmpeg wrote rather
+        /// than an integer, and the key that sentence contained is not in it.
         #[test]
         fn a_dead_pusher_reports_what_it_printed_and_not_the_key_in_it() {
             const KEY: &str = "live_918273645_TZq0cVnB4kLsX";

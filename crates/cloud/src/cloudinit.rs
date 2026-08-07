@@ -607,7 +607,7 @@ rm -f \"$tmp/{name}.archive\" \"$tmp/{name}\"
 const MEDIA_FETCH_FATAL: u8 = 2;
 
 /// Attempts the bootstrap gives the media fetch, and the pause before each
-/// retry in seconds. One 503 from a mirror at boot used to cost the session
+/// retry in seconds. One 503 from a mirror at boot otherwise costs the session
 /// its broadcast for the rest of its life.
 const MEDIA_FETCH_TRIES: u8 = 3;
 const MEDIA_FETCH_BACKOFF_SECS: u8 = 10;
@@ -1127,11 +1127,10 @@ mod tests {
         assert!(out.contains("https://api.digitalocean.com/v2/droplets/$droplet_id"));
     }
 
-    /// #51: the idle path used to fetch a service account token from
-    /// metadata, and no service account was ever attached, so the fetch
-    /// failed and the script fell through to `poweroff`. Compute Engine
-    /// clears a stopped VM's termination timestamp, so that left an
-    /// instance nothing would ever collect.
+    /// The idle path cannot fetch a service account token from metadata: no
+    /// service account is attached, so the fetch fails and the script falls
+    /// through to `poweroff`. Compute Engine clears a stopped VM's termination
+    /// timestamp, which leaves an instance nothing will ever collect.
     #[test]
     fn snapshot_gcp_max_run_duration() {
         let out = render(&base_config(SelfDestruct::GcpMaxRunDuration));
@@ -1484,10 +1483,10 @@ mod tests {
         }
     }
 
-    /// The ordering defect this test exists for: the firewall and the dead
-    /// man's switch used to be the last two steps of the bootstrap, so any
-    /// earlier failure (a checksum mismatch, a GitHub 503 past --retry 5)
-    /// left a VM with provider default networking and no cap on its life.
+    /// The firewall and the dead man's switch cannot be the last two steps of
+    /// the bootstrap: any earlier failure (a checksum mismatch, a GitHub 503
+    /// past --retry 5) then leaves a VM with provider default networking and no
+    /// cap on its life.
     #[test]
     fn guard_and_firewall_are_armed_before_anything_can_fail() {
         for sd in all_variants() {
@@ -1544,12 +1543,12 @@ mod tests {
         }
     }
 
-    /// #139: `systemctl enable --now` on a simple-type unit reports success
-    /// at fork, so a downloaded binary that dies at exec (an x86_64 build on
-    /// a Graviton machine) used to leave the bootstrap exiting 0, the trap
-    /// disarmed, and the VM billing with no server. The script must run the
-    /// binary itself, after the hash check and before the unit is enabled,
-    /// so an exec failure trips the trap and destroys the machine.
+    /// `systemctl enable --now` on a simple-type unit reports success at fork,
+    /// so a downloaded binary that dies at exec (an x86_64 build on a Graviton
+    /// machine) leaves the bootstrap exiting 0, the trap disarmed, and the VM
+    /// billing with no server. The script must run the binary itself, after the
+    /// hash check and before the unit is enabled, so an exec failure trips the
+    /// trap and destroys the machine.
     #[test]
     fn the_binary_must_execute_before_the_unit_is_enabled() {
         for sd in all_variants() {
@@ -1920,9 +1919,9 @@ mod tests {
         );
     }
 
-    /// #440: the fetch is allowed to fail, and every way it can end without a
-    /// relay has to leave the reason where jamstreamd can read it, because the
-    /// console log it used to warn into is not somewhere a host can look.
+    /// The fetch is allowed to fail, and every way it can end without a relay
+    /// has to leave the reason where jamstreamd can read it. The console log is
+    /// not somewhere a host can look.
     #[test]
     fn a_session_that_cannot_broadcast_leaves_the_reason_for_the_server() {
         let script = broadcast_up_script(
@@ -2100,8 +2099,8 @@ mod tests {
             );
         }
 
-        /// The other way this ends without a relay, and the one whose status
-        /// the bootstrap's `set -e` used to turn into a destroyed VM.
+        /// The other way this ends without a relay. Its exit status must stay
+        /// out of the bootstrap's `set -e`, which would destroy the VM over it.
         #[test]
         fn a_relay_that_will_not_start_is_recorded_rather_than_fatal() {
             let out = run("nostart", &[0], 1);

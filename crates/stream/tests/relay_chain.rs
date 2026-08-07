@@ -414,10 +414,9 @@ fn the_encoder_reaches_a_pusher_through_the_relay_we_ship() {
     // Connecting.
     //
     // Never Live, at any point, which is the assertion this loop is really for.
-    // How long that pusher takes to reach its failure is exactly the window
-    // #445 lived in: it is two execs and an ffmpeg startup ahead of the
-    // connect, and on a loaded runner it used to outlast the three seconds of
-    // survival that promoted a destination.
+    // The pusher is two execs and an ffmpeg startup ahead of its connect, so on
+    // a loaded runner it outlasts any settling window a promotion could be
+    // hung on.
     feed_programme(&mut pipeline, 12 * TICKS_PER_SEC, |tick, p| {
         for event in p.events() {
             println!("  {} ms {event:?}", tick_ms(tick));

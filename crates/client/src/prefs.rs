@@ -91,7 +91,7 @@ impl RecordingPrefs {
 
 /// The audio setup this computer uses, restored at the next launch: the
 /// selected devices by backend id (`None` is the System default entry), and
-/// the buffer size. Every launch used to start back on the defaults (#328).
+/// the buffer size.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPrefs {
     #[serde(default)]

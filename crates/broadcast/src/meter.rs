@@ -5,15 +5,13 @@
 //! is: the desktop client draws a meter for the same signal, and a viewer
 //! watching the stream beside a musician looking at the app must not see two
 //! different readings of one level. This is the copy to read from; nothing
-//! here needs a second one (#232).
+//! here needs a second one.
 //!
-//! The hold is in seconds because that is what a viewer perceives. It used to
-//! be 45 frames in the renderer, which is 1.5 s only at 30 fps, while the app
-//! held for 1.5 s outright. Frame rate is data in `data/platforms.json`, so
-//! the two already disagreed at any rate other than the one the constant was
-//! written for: at 60 fps the stream's peak segment dropped after 0.75 s while
-//! the musician's own meter still showed it, and the same level looked like two
-//! different performances.
+//! The hold is in seconds because that is what a viewer perceives. A count of
+//! frames is 1.5 s at exactly one frame rate, and frame rate is data in
+//! `data/platforms.json`: at 60 fps a 45-frame hold drops the stream's peak
+//! segment after 0.75 s while the musician's own meter still shows it, and the
+//! same level looks like two different performances.
 
 /// Bottom of the scale. At or below this a channel reads as silent.
 pub const FLOOR_DB: f32 = -60.0;
@@ -46,9 +44,9 @@ pub fn frames_for(secs: f32, fps: u32) -> u64 {
 mod tests {
     use super::*;
 
-    /// The frame counts the renderer used to spell out, and what they become
-    /// at the rates a catalog edit could ask for. The hold is 1.5 s at every
-    /// one of them, which is the whole point of deriving it.
+    /// The frame counts the renderer derives at the rates a catalog edit could
+    /// ask for. The hold is 1.5 s at every one of them, which is the whole point
+    /// of deriving it.
     #[test]
     fn the_hold_is_the_same_time_at_any_frame_rate() {
         assert_eq!(frames_for(HOLD_SECS, 30), 45);

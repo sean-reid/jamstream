@@ -21,9 +21,8 @@ pub async fn assert_object_store_contract(store: &dyn ObjectStore, bucket: &str)
     let prefix = session_prefix(session);
     // The three objects a session really writes: a take, a second take, and the
     // launch's write probe. The names are the recorder's shape, spelled out
-    // here rather than built by a key helper, because the helpers that used to
-    // live in `storage` named objects nothing writes and every store test
-    // believed them.
+    // here rather than built by a key helper, because a helper is free to name
+    // objects nothing writes and every store test will believe it.
     let mix = format!("{prefix}jamstream-2026-07-25-1030-mix.flac");
     let stem = format!("{prefix}jamstream-2026-07-25-1030-contract-member.flac");
     let probe = format!("{prefix}.jamstream-probe");

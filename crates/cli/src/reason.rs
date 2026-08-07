@@ -201,11 +201,10 @@ fn rejected(attempt: Attempt) -> String {
 
 /// A 403, with the remedy the provider that refused actually has.
 ///
-/// This used to name `s3:ListBucket` to everyone, which is a policy only AWS
-/// has: a Spaces key carries no policy at all, and a GCS bucket grants a role
-/// to the service account behind the HMAC key. The published screenshot of
-/// that row was a DigitalOcean session being told to edit an S3 policy. Each
-/// remedy is the step that provider's own setup guide ends on.
+/// It cannot name `s3:ListBucket` to everyone, which is a policy only AWS has:
+/// a Spaces key carries no policy at all, and a GCS bucket grants a role to the
+/// service account behind the HMAC key. Each remedy is the step that provider's
+/// own setup guide ends on.
 fn denied(attempt: Attempt, provider: Option<ProviderKind>) -> String {
     let remedy = match (attempt, provider) {
         (Attempt::Takes, Some(ProviderKind::Aws)) => {
