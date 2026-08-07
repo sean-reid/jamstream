@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/sean-reid/jamstream/compare/v0.4.0...v0.4.1) (2026-08-07)
+
+
+### Features
+
+* **client:** warn on a dropout the listener actually heard ([#477](https://github.com/sean-reid/jamstream/issues/477)) ([a727053](https://github.com/sean-reid/jamstream/commit/a727053b514a266b4e4677459f717744b30daa9f))
+
 ## [0.4.0](https://github.com/sean-reid/jamstream/compare/v0.3.0...v0.4.0) (2026-08-07)
 
 
