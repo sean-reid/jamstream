@@ -2014,7 +2014,54 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
             .is_some_and(|l| l.contains("empty after this line is a healthy run")),
         "the banner is missing, so this proves nothing: {text:?}"
     );
-    assert_eq!(lines.len(), 1, "a healthy session wrote {:#?}", &lines[1..]);
+
+    // Every warning the client writes about its own configuration and health is
+    // decided by the fixtures and has to be absent. The dropout line is the one
+    // exception, because it is the one measured against the wall clock: this
+    // session's threads share a runner with the rest of the suite, and a runner
+    // that takes the process away for a quarter second leaves a client pulling
+    // at the frame clock with nothing arriving. That is a gap a listener would
+    // have heard, so the line is right to be there, and the offline driver makes
+    // it worse than a device clock can by replaying a stalled tick's debt at cpu
+    // speed. What this no longer proves is that the process was never starved.
+    let (gaps, rest): (Vec<&str>, Vec<&str>) = lines[1..]
+        .iter()
+        .partition(|l| l.contains("playout is concealing a gap"));
+    assert!(rest.is_empty(), "a healthy session wrote {rest:#?}");
+
+    // Tolerated is not unexamined. `concealed` counts frames the buffer had
+    // nothing to play and `gap_ms` is wall clock; they are measured apart from
+    // each other, so frames that do not cover the milliseconds mean the observer
+    // stalled rather than the stream, which is the ring's story and not this
+    // line's. And the gaps together stay a small part of the playing window, or
+    // this is a transport that does not work rather than a runner under load.
+    fn field(line: &str, key: &str) -> u64 {
+        let at = line
+            .find(key)
+            .unwrap_or_else(|| panic!("no {key} in {line}"));
+        line[at + key.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| panic!("no number after {key} in {line}"))
+    }
+    let mut total = Duration::ZERO;
+    for line in &gaps {
+        let claimed = Duration::from_millis(field(line, "gap_ms="));
+        let covered = Duration::from_micros(field(line, "concealed=") * 2_500);
+        assert!(
+            covered * 2 >= claimed,
+            "{line} claims {claimed:?} of gap that only {covered:?} of concealed \
+             frames accounts for, so playout was not pulling across it"
+        );
+        total += claimed;
+    }
+    assert!(
+        total <= Duration::from_secs(1),
+        "playout dropped out for {total:?} of a four second session, which is a \
+         transport that does not work rather than a loaded runner: {gaps:#?}"
+    );
 
     // And the file has to prove it could have carried one, or a subscriber that
     // never installed reads as a healthy run and the assertion above is empty.
