@@ -5,6 +5,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use jamstream_audio_io::{AudioError, DeviceRung, WavBackend};
@@ -29,6 +30,29 @@ const RATE: u32 = 48_000;
 /// the loudest failure, so it answers only the question it is asked.
 const TONE_FLOOR: f64 = 100.0;
 
+/// Held for as long as any test in this binary has a session running, shared by
+/// all of them but one, and taken exclusively by the test whose subject is the
+/// log file.
+///
+/// That log's subscriber is process wide, and under `cargo test` the whole
+/// binary is one process running tests on parallel threads, so a test asserting
+/// its own log holds nothing reads what the tests beside it wrote and fails on
+/// their warnings. Every session in this file starts from a `TestServer`, which
+/// is what makes the shared side automatic: a new test cannot reach a runtime
+/// without passing through it.
+static SESSIONS: RwLock<()> = RwLock::new(());
+
+/// Which side of [`SESSIONS`] a server holds. Never read, only dropped: how
+/// long it lives is the whole of it.
+enum Bystanders {
+    Beside {
+        _shared: RwLockReadGuard<'static, ()>,
+    },
+    None {
+        _exclusive: RwLockWriteGuard<'static, ()>,
+    },
+}
+
 /// A real server on loopback, owned by a private tokio runtime so the tests
 /// themselves stay synchronous like the app.
 struct TestServer {
@@ -39,6 +63,7 @@ struct TestServer {
     issuer: Issuer,
     server_pk: [u8; 32],
     session_id: SessionId,
+    _bystanders: Bystanders,
 }
 
 impl TestServer {
@@ -58,7 +83,32 @@ impl TestServer {
         }))
     }
 
+    /// Waits until no other test in this process has a session running, and
+    /// keeps it that way until the server is dropped. For a test that reads a
+    /// process-wide surface and has to know that only its own session wrote to
+    /// it. Take it before touching that surface, not after.
+    ///
+    /// A poisoned lock is taken anyway: one test failing must not turn into
+    /// every later test panicking here instead of reporting what it found.
+    fn alone_in_the_process() -> Self {
+        TestServer::build(
+            None,
+            Bystanders::None {
+                _exclusive: SESSIONS.write().unwrap_or_else(PoisonError::into_inner),
+            },
+        )
+    }
+
     fn with_recording(recording: Option<RecordingOptions>) -> Self {
+        TestServer::build(
+            recording,
+            Bystanders::Beside {
+                _shared: SESSIONS.read().unwrap_or_else(PoisonError::into_inner),
+            },
+        )
+    }
+
+    fn build(recording: Option<RecordingOptions>, bystanders: Bystanders) -> Self {
         let issuer = Issuer::generate();
         let keys = generate_keypair();
         let session_id = SessionId::generate();
@@ -101,6 +151,7 @@ impl TestServer {
             issuer,
             server_pk: keys.public,
             session_id,
+            _bystanders: bystanders,
         }
     }
 
@@ -201,7 +252,16 @@ fn rms(samples: &[f32]) -> f64 {
         .sqrt()
 }
 
+/// Channel 0 of an interleaved stereo buffer.
+fn left(stereo: &[f32]) -> Vec<f32> {
+    stereo.iter().copied().step_by(2).collect()
+}
+
 /// The final `secs` seconds of a stereo capture file, with the file's rate.
+///
+/// Only for a span that is meant to be silent, where the padding [`loudest`]
+/// describes reads the same as the thing under test. Everything asserting that
+/// audio was there wants [`loudest`] instead.
 fn tail(path: &Path, secs: f64) -> (u32, Vec<f32>) {
     let (rate, samples) = rate_and_samples(path);
     let take = ((secs * f64::from(rate)) as usize * 2).min(samples.len());
@@ -214,24 +274,35 @@ fn tail_rms(path: &Path, secs: f64) -> f64 {
     rms(&tail(path, secs).1)
 }
 
-/// RMS of the loudest `secs` window anywhere in a capture file.
+/// The loudest `secs` window anywhere in a stereo capture file, with the
+/// file's rate: where a measurement of the session goes.
 ///
-/// For asking whether audio was ever there. A capture file spans from before
-/// the join to after the leave, so both ends hold silence the backend wrote
-/// while nothing played, and on a slow host that padding is longer than the
-/// window: measured 1.75 s at the front and 0.75 s at the back on a loaded
-/// Windows runner.
-fn loudest_rms(path: &Path, secs: f64) -> f64 {
+/// A capture file spans from before the join to after the leave, so both ends
+/// hold silence the backend wrote while nothing played, and on a slow host that
+/// padding is longer than the window: measured 1.75 s at the front and 0.75 s
+/// at the back on a loaded Windows runner. Candidates step by a quarter window
+/// so one can land clear of the padding rather than straddling it, which a
+/// zero-run reading would not survive.
+fn loudest(path: &Path, secs: f64) -> (u32, Vec<f32>) {
     let (rate, samples) = rate_and_samples(path);
-    let win = ((secs * f64::from(rate)) as usize * 2).max(2);
-    if samples.len() <= win {
-        return rms(&samples);
+    assert!(samples.len() >= 2, "no samples to measure in {path:?}");
+    let frames = samples.len() / 2;
+    let win = ((secs * f64::from(rate)) as usize).max(1);
+    if frames <= win {
+        return (rate, samples);
     }
-    samples
-        .chunks(win)
-        .filter(|c| c.len() >= win / 2)
-        .map(rms)
-        .fold(0.0f64, f64::max)
+    let start = (0..=frames - win)
+        .step_by((win / 4).max(1))
+        .map(|f| (f, rms(&samples[f * 2..(f + win) * 2])))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("at least one window")
+        .0;
+    (rate, samples[start * 2..(start + win) * 2].to_vec())
+}
+
+/// RMS of the loudest `secs` window anywhere in a capture file.
+fn loudest_rms(path: &Path, secs: f64) -> f64 {
+    rms(&loudest(path, secs).1)
 }
 
 /// Energy at one frequency, by Goertzel. Cheaper than a transform when the
@@ -262,14 +333,14 @@ fn tone_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
 /// profile separates them, so the tail assertions print it when they fire.
 fn tone_profile(path: &Path, hz: f64) -> String {
     let (rate, samples) = rate_and_samples(path);
-    let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
-    let profile: Vec<u64> = left
+    let mono = left(&samples);
+    let profile: Vec<u64> = mono
         .chunks((rate as usize / 4).max(1))
         .map(|c| coherent_energy(c, rate, hz) as u64)
         .collect();
     format!(
         "{:.2} s at {rate} Hz reads {profile:?} per 250 ms at {hz} Hz",
-        left.len() as f64 / f64::from(rate)
+        mono.len() as f64 / f64::from(rate)
     )
 }
 
@@ -286,9 +357,10 @@ fn coherent_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
     (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt()
 }
 
-/// Pitch of channel 0 over the final `secs` seconds of a stereo capture
-/// file, measured on the file's own clock, as the strongest tone between
-/// 300 and 700 Hz.
+/// Pitch of channel 0 of one stereo window, measured on the file's own clock,
+/// as the strongest tone between 300 and 700 Hz. Give it a window that carries
+/// audio: an argmax over silence returns a plausible frequency rather than
+/// failing, so a window of padding reads as a wrong answer.
 ///
 /// Not zero crossings. That counted every crossing the signal made, so a
 /// dropout or a bit of ringing added cycles that were never in the tone,
@@ -298,21 +370,99 @@ fn coherent_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
 /// the waveform is around it, so a glitchy 440 still reads as 440, and the
 /// dropouts it used to disguise are left to `longest_zero_run` and `rms`,
 /// which is where a test can say what it actually found.
-fn tail_pitch_hz(path: &Path, secs: f64) -> f64 {
-    let (rate, samples) = tail(path, secs);
-    let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
+fn pitch_hz(stereo: &[f32], rate: u32) -> f64 {
+    let mono = left(stereo);
     // 2 Hz steps: an order finer than the +-20 Hz the callers allow, and
     // far finer than the 8.8% a rate mismatch would move the tone.
     let mut best = (0.0f64, 0.0f64);
     let mut hz = 300.0;
     while hz <= 700.0 {
-        let energy = tone_energy(&left, rate, hz);
+        let energy = tone_energy(&mono, rate, hz);
         if energy > best.1 {
             best = (hz, energy);
         }
         hz += 2.0;
     }
     best.0
+}
+
+/// A capture file shaped like the ones the sessions leave: two seconds of a
+/// 440 Hz tone with `front` and `back` seconds of the silence the backend
+/// writes while nothing is playing.
+fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
+    let path = temp_path("padding", &format!("{label}.wav"));
+    let mut writer = hound::WavWriter::create(
+        &path,
+        hound::WavSpec {
+            channels: 2,
+            sample_rate: RATE,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .expect("padded wav");
+    let quiet = ((front * f64::from(RATE)) as usize, RATE as usize * 2);
+    for i in 0..quiet.0 + quiet.1 + (back * f64::from(RATE)) as usize {
+        let s = match i.checked_sub(quiet.0) {
+            Some(t) if t < quiet.1 => {
+                (t as f32 / RATE as f32 * 440.0 * std::f32::consts::TAU).sin() * 0.5
+            }
+            _ => 0.0,
+        };
+        for _ in 0..2 {
+            writer.write_sample(s).expect("padded sample");
+        }
+    }
+    writer.finalize().expect("finalize padded wav");
+    path
+}
+
+/// What makes a loudest-window reading evidence rather than a substitution that
+/// happens to pass: the three readings the session tests take, on a file with
+/// the padding a loaded Windows runner profiled around its audio, 1.75 s at the
+/// front and 0.75 s at the back.
+///
+/// The tail of the same file is what the padding costs. At the padding as
+/// profiled it holds three quarters of a second of exact zeros, which is the
+/// silence-run assertion failing on a session that was healthy; one step slower
+/// than that and the window is padding outright, with no level in it and a
+/// pitch of nothing. That is the shape of the run in #464, which read 6 in its
+/// last second against 8290 in its loudest.
+#[test]
+fn a_measurement_reads_the_audio_and_not_the_padding_around_it() {
+    for (label, back) in [("as-profiled", 0.75), ("a-slower-leave", 1.25)] {
+        let path = padded_fixture(label, 1.75, back);
+
+        let (rate, window) = loudest(&path, 1.0);
+        assert_eq!(rate, RATE);
+        let level = rms(&window);
+        assert!(level > 0.02, "the loudest second reads {level}");
+        let run = longest_zero_run(&window);
+        assert!(run < 240, "the loudest second straddles the padding: {run}");
+        let hz = pitch_hz(&window, rate);
+        assert!(
+            (hz - 440.0).abs() < 20.0,
+            "the loudest second reads {hz} Hz"
+        );
+
+        let (_, last) = tail(&path, 1.0);
+        let run = longest_zero_run(&last);
+        assert!(
+            run > (back * f64::from(RATE)) as usize,
+            "the tail holds a {run}-sample silence run, so this proves nothing"
+        );
+        if back > 1.0 {
+            let level = rms(&last);
+            assert!(level < 0.001, "a tail of pure padding reads {level}");
+            let hz = pitch_hz(&last, rate);
+            assert!(
+                (hz - 440.0).abs() > 20.0,
+                "a tail of pure padding reads {hz} Hz, which would pass the bound"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Polls snapshots until `pred` holds; panics with the last state on timeout.
@@ -442,10 +592,10 @@ fn two_runtimes_hear_each_other() {
 
     // The personal mix excludes self, so energy in B's playout proves A's
     // sine crossed the server.
-    let energy = tail_rms(&out_b, 1.0);
+    let energy = loudest_rms(&out_b, 1.0);
     assert!(
         energy > 0.02,
-        "b heard near-silence (rms {energy}); a's audio never arrived"
+        "b's loudest second is near-silence (rms {energy}); a's audio never arrived"
     );
 
     for p in [&sine, &out_b] {
@@ -520,12 +670,12 @@ fn fader_mute_silences_the_member() {
     drop(a);
     drop(b);
 
-    let samples = wav_samples(&out_a);
-    // The pre-mute window: one second ending 2.5 s before the file's end,
-    // safely inside the audible span.
-    let end = samples.len().saturating_sub((RATE as usize * 2) * 5 / 2);
-    let start = end.saturating_sub(RATE as usize * 2);
-    let audible = rms(&samples[start..end]);
+    // The loudest second is the pre-mute one, since the mute is what the rest
+    // of the file is: a fixed offset from the end walks off the audio entirely
+    // once a slow leave stretches the padding behind it. The tail stays the
+    // tail, because here the tail is the muted period and padding is silence
+    // too.
+    let audible = loudest_rms(&out_a, 1.0);
     let muted = tail_rms(&out_a, 1.0);
     assert!(
         audible > 0.02,
@@ -723,10 +873,10 @@ fn reconfigure_audio_swaps_the_stream_mid_session() {
         "post-swap capture too short: {} samples",
         samples.len()
     );
-    let energy = tail_rms(&out_b, 1.0);
+    let energy = loudest_rms(&out_b, 1.0);
     assert!(
         energy > 0.02,
-        "audio did not resume after the swap (rms {energy})"
+        "audio did not resume after the swap (loudest second rms {energy})"
     );
 
     for p in [&sine, &out_b] {
@@ -886,19 +1036,17 @@ fn a_device_period_larger_than_the_request_still_carries_audio() {
     drop(b);
     drop(a);
 
-    let samples = wav_samples(&out_b);
-    let take = ((1.0 * f64::from(RATE)) as usize * 2).min(samples.len());
-    let tail = &samples[samples.len() - take..];
+    let (_, window) = loudest(&out_b, 1.0);
     // A's sine arrived at all (capture side made it through the ring)...
-    let energy = rms(tail);
+    let energy = rms(&window);
     assert!(
         energy > 0.02,
-        "b heard near-silence (rms {energy}); a's audio never arrived"
+        "b's loudest second is near-silence (rms {energy}); a's audio never arrived"
     );
     // ...and B's render never went hungry: an undersized ring pads ~480
     // zeros per callback, so anything close to that run length is padding,
     // not music.
-    let run = longest_zero_run(tail);
+    let run = longest_zero_run(&window);
     assert!(
         run < 240,
         "steady-state playout contains a {run}-sample silence run; the ring underran"
@@ -951,19 +1099,19 @@ fn a_44_1_interface_carries_the_session_both_ways() {
     drop(b);
     drop(a);
 
-    let (rate, samples) = tail(&out_b, 1.0);
+    let (rate, window) = loudest(&out_b, 1.0);
     assert_eq!(rate, 44_100, "b's device writes on its own clock");
-    let energy = rms(&samples);
+    let energy = rms(&window);
     assert!(
         energy > 0.02,
-        "b heard near-silence (rms {energy}); a's audio never arrived"
+        "b's loudest second is near-silence (rms {energy}); a's audio never arrived"
     );
-    let run = longest_zero_run(&samples);
+    let run = longest_zero_run(&window);
     assert!(
         run < 240,
         "steady-state playout contains a {run}-sample silence run"
     );
-    let hz = tail_pitch_hz(&out_b, 1.0);
+    let hz = pitch_hz(&window, rate);
     assert!(
         (hz - 440.0).abs() < 20.0,
         "the sine crossed two conversions off pitch: {hz:.1} Hz"
@@ -1052,22 +1200,23 @@ fn a_44_1_host_and_a_native_joiner_hear_each_other() {
         (&out_host, "host", HOST_HZ, JOINER_HZ, 44_100),
         (&out_joiner, "joiner", JOINER_HZ, HOST_HZ, RATE),
     ] {
-        let (rate, samples) = tail(path, 1.0);
+        let (rate, window) = loudest(path, 1.0);
         assert_eq!(rate, device_rate, "{who} writes on its own device clock");
-        let energy = rms(&samples);
+        let energy = rms(&window);
         assert!(
             energy > 0.02,
-            "{who} heard near-silence (rms {energy}); the other member's audio never arrived"
+            "{who}'s loudest second is near-silence (rms {energy}); the other \
+             member's audio never arrived"
         );
-        let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
-        let wanted = tone_energy(&left, rate, theirs);
-        let leaked = tone_energy(&left, rate, mine);
+        let mono = left(&window);
+        let wanted = tone_energy(&mono, rate, theirs);
+        let leaked = tone_energy(&mono, rate, mine);
         assert!(
             wanted > leaked * 4.0,
             "{who} played {mine} Hz at {leaked:.1} against {theirs} Hz at {wanted:.1}: \
              that is its own signal, not the other member's"
         );
-        let run = longest_zero_run(&samples);
+        let run = longest_zero_run(&window);
         assert!(
             run < 240,
             "{who}'s steady-state playout contains a {run}-sample silence run"
@@ -1490,22 +1639,22 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
     drop(b);
     drop(a);
 
-    let (rate, samples) = tail(&out_b, 1.0);
+    let (rate, window) = loudest(&out_b, 1.0);
     assert_eq!(
         rate, 44_100,
         "the swapped-in device writes on its own clock"
     );
-    let energy = rms(&samples);
+    let energy = rms(&window);
     assert!(
         energy > 0.02,
-        "b heard near-silence after the swap (rms {energy})"
+        "b's loudest second after the swap is near-silence (rms {energy})"
     );
-    let run = longest_zero_run(&samples);
+    let run = longest_zero_run(&window);
     assert!(
         run < 240,
         "post-swap playout contains a {run}-sample silence run"
     );
-    let hz = tail_pitch_hz(&out_b, 1.0);
+    let hz = pitch_hz(&window, rate);
     assert!(
         (hz - 440.0).abs() < 20.0,
         "a's sine arrived off pitch: {hz:.1} Hz"
@@ -1910,15 +2059,19 @@ fn record_on_an_unarmed_session_fails_visibly_in_the_lamp() {
 /// subscriber and a real log file.
 ///
 /// The file rather than a captured formatter, because the promise is about the
-/// file. One subscriber per process, which is what nextest gives every test;
-/// under `cargo test` the whole binary shares one, so the install would land in
-/// another test's file and this would read an empty one.
+/// file. The subscriber and the file are both process wide, so the session below
+/// has to be the only one in the process for its whole length, install included:
+/// that is `alone_in_the_process`, and it is what makes the answer the same
+/// under `cargo test`, where the binary runs every test on threads of one
+/// process, as under nextest, where each test gets a process of its own.
 #[test]
 fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     if std::env::var_os("RUST_LOG").is_some() {
         eprintln!("skipping: RUST_LOG replaces the default filter this is about");
         return;
     }
+    let server = TestServer::alone_in_the_process();
+
     // Its own directory: the log goes through the private-file machinery, which
     // refuses to write key material next to a world-writable temp root.
     let dir = temp_path("quiet", "logs");
@@ -1927,7 +2080,6 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     let installed = jamstream_client::logging::init_at(log.clone()).expect("install the log");
     assert_eq!(installed, log);
 
-    let server = TestServer::start();
     let a_sine = sine_fixture("quiet", 440.0, RATE);
     let b_sine = sine_fixture("quiet", 660.0, RATE);
     let out_a = temp_path("quiet", "out-a.wav");
@@ -1966,26 +2118,16 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     // reason, so each side has to have heard the other's tone. The personal mix
     // excludes self, so the tone measured is the one that crossed the wire.
     for (out, theirs, mine) in [(&out_a, 660.0, 440.0), (&out_b, 440.0, 660.0)] {
-        // The loudest second, not the last one. The file runs from before the
-        // join to after the leave, so its ends are silence the backend wrote
-        // while nothing was playing: a slow runner put 1.75 s of it at the
-        // front and 0.75 s at the back, and the tail then measured the padding
-        // rather than the session.
-        let (rate, samples) = rate_and_samples(out);
-        let all: Vec<f32> = samples.iter().copied().step_by(2).collect();
-        let second = rate as usize;
+        let (rate, window) = loudest(out, 1.0);
+        let mono = left(&window);
         assert!(
-            all.len() >= second / 2,
-            "{out:?} holds {} samples at {rate} Hz, under half a second, so there \
+            mono.len() >= rate as usize / 2,
+            "{out:?} holds {} frames at {rate} Hz, under half a second, so there \
              is nothing to measure",
-            all.len()
+            mono.len()
         );
-        let (heard, own) = all
-            .chunks(second)
-            .filter(|w| w.len() >= second / 2)
-            .map(|w| (tone_energy(w, rate, theirs), tone_energy(w, rate, mine)))
-            .max_by(|x, y| x.0.total_cmp(&y.0))
-            .expect("at least one window");
+        let heard = tone_energy(&mono, rate, theirs);
+        let own = tone_energy(&mono, rate, mine);
 
         // The floor comes first: a ratio between two noise floors decides
         // nothing, and a silent run reads single digits where a tone reads
