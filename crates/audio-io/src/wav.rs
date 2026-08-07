@@ -104,6 +104,8 @@ pub struct WavBackend {
     /// the device clock, which is this backend's own bookkeeping and nothing
     /// a real one can produce.
     refuse_reopen: Option<AudioError>,
+    /// How many opens the refusal covers, and None for every one of them.
+    refuse_reopens: Option<u32>,
     /// Streams opened so far. Shared, so the count survives the clone a
     /// caller keeps to watch it and a caller that moved the backend away.
     opens: Arc<AtomicU32>,
@@ -125,6 +127,7 @@ impl WavBackend {
             loss_fired: Arc::new(AtomicBool::new(false)),
             reopen_rungs: None,
             refuse_reopen: None,
+            refuse_reopens: None,
             opens: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -231,6 +234,19 @@ impl WavBackend {
     #[must_use]
     pub fn refusing_reopen(mut self, error: AudioError) -> Self {
         self.refuse_reopen = Some(error);
+        self.refuse_reopens = None;
+        self
+    }
+
+    /// Models a device still held by the stream it is replacing: the next
+    /// `count` opens after the first are refused with `error` and the one after
+    /// them succeeds. A WASAPI endpoint and a macOS aggregate both refuse for a
+    /// few hundred milliseconds after a close, so the caller spends a bounded
+    /// stretch with no stream and then gets one back.
+    #[must_use]
+    pub fn refusing_reopens(mut self, count: u32, error: AudioError) -> Self {
+        self.refuse_reopen = Some(error);
+        self.refuse_reopens = Some(count);
         self
     }
 
@@ -244,8 +260,12 @@ impl WavBackend {
     /// the direction at the session rate, because that is what the real
     /// backends leave it at.
     pub fn open_offline(&self, config: StreamConfig, handler: DuplexHandler) -> Result<WavStream> {
-        let reopen = self.opens.fetch_add(1, Ordering::Relaxed) > 0;
-        if reopen && let Some(err) = &self.refuse_reopen {
+        let opened = self.opens.fetch_add(1, Ordering::Relaxed);
+        let reopen = opened > 0;
+        if reopen
+            && let Some(err) = &self.refuse_reopen
+            && self.refuse_reopens.is_none_or(|n| opened <= n)
+        {
             return Err(err.clone());
         }
         let session = config.sample_rate;

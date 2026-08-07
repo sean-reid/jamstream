@@ -117,6 +117,11 @@ impl JitterBuffer {
     /// has this long to notice before the buffer gives the position up.
     pub const MAX_DEPTH_FRAMES: usize = MAX_BUFFERED;
 
+    /// Deepest target the adaptive law will ask for, in frames. Published
+    /// because it is the deepest a healthy buffer ever sits, so a caller
+    /// watching depth can tell a refill from a buffer nobody is draining.
+    pub const MAX_TARGET_FRAMES: usize = MAX_TARGET;
+
     pub fn new() -> Self {
         Self::default()
     }

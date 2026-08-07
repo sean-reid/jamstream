@@ -22,7 +22,7 @@ use jamstream_audio_io::{
     AudioBackend, AudioError, CallbackBridge, DuplexHandler, EngineSide, StreamConfig,
     StreamHandle, WavBackend, WavStream,
 };
-use jamstream_engine::JitterStats;
+use jamstream_engine::{JitterBuffer, JitterStats};
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
 use jamstream_protocol::control::{RecordOp, RecordingState};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
@@ -105,6 +105,20 @@ const CAPTURE_RING: Duration = Duration::from_millis(40);
 /// single count with no way to know whether it was still climbing.
 const RING_REPORT_AGAIN: Duration = Duration::from_secs(1);
 const RING_REPORT_MAX: Duration = Duration::from_secs(60);
+/// Floor under [`playout_stall_after`], so a ring only a frame or two deep does
+/// not read a scheduling hiccup as a device that has stopped rendering.
+const PLAYOUT_STALL_FLOOR: Duration = Duration::from_millis(40);
+/// Ceiling under [`playout_stall_after`]: half the arrivals a jitter buffer
+/// holds before it gives its playout position up, so the drain always starts
+/// while the audio a reopened stream would continue from is still there.
+const PLAYOUT_STALL_CEILING: Duration = Duration::from_micros(
+    FrameDuration::Ms2_5.micros() as u64 * JitterBuffer::MAX_DEPTH_FRAMES as u64 / 2,
+);
+/// Audio [`Worker::drain_stalled_playout`] catches up on in one pass. A worker
+/// held up longer than this cannot pay the debt back at the frame clock, so it
+/// abandons the gap: the jitter buffer treats a hole this size as a restart
+/// anyway.
+const PLAYOUT_DRAIN_MAX: Duration = Duration::from_millis(160);
 
 /// Playout ring capacity in samples, which doubles as the playout depth
 /// target: the top-up loop keeps the ring full, so the device-side cushion
@@ -125,6 +139,18 @@ fn playout_capacity(buffer_frames: u32) -> usize {
 fn capture_capacity(buffer_frames: u32) -> usize {
     let slack = CAPTURE_RING.as_millis() as usize * SAMPLE_RATE as usize / 1000;
     playout_capacity(buffer_frames).max(slack * usize::from(CHANNELS))
+}
+
+/// How long the playout ring may accept nothing before the device counts as
+/// having stopped rendering: four device callbacks, since the top-up loop keeps
+/// the ring full and a rendering device makes room for one callback on every
+/// callback. Clamped between [`PLAYOUT_STALL_FLOOR`] and
+/// [`PLAYOUT_STALL_CEILING`].
+fn playout_stall_after(buffer_frames: u32) -> Duration {
+    let period = Duration::from_micros(
+        u64::from(buffer_frames.max(FRAME_FRAMES as u32)) * 1_000_000 / u64::from(SAMPLE_RATE),
+    );
+    (period * 4).clamp(PLAYOUT_STALL_FLOOR, PLAYOUT_STALL_CEILING)
 }
 
 /// The device request as [`AudioSettings`] spells it: the session rate and
@@ -828,6 +854,8 @@ impl LiveRuntime {
             carry: [0.0; CHUNK_STEREO],
             carry_pos: 0,
             carry_len: 0,
+            ring_took: Instant::now(),
+            drain_from: None,
             levels: LevelsView::default(),
             avatar_failed: HashSet::new(),
             reopen_attempts: 0,
@@ -1190,6 +1218,12 @@ struct Worker {
     carry: [f32; CHUNK_STEREO],
     carry_pos: usize,
     carry_len: usize,
+    /// Last time the playout ring accepted a sample, which a device that is
+    /// rendering makes room for on every callback.
+    ring_took: Instant,
+    /// Frame clock [`Worker::drain_stalled_playout`] is paying from, and None
+    /// whenever the device is taking audio and owes it nothing.
+    drain_from: Option<Instant>,
     levels: LevelsView,
     /// Hashes whose bytes did not decode; never retried, so one bad avatar
     /// costs one decode attempt per session.
@@ -1267,6 +1301,7 @@ impl Worker {
             }
         }
 
+        self.drain_stalled_playout();
         self.watch_ring_health();
 
         let now_ms = self.now_ms();
@@ -1485,6 +1520,9 @@ impl Worker {
                 self.rings = RingWatch::new(Instant::now());
                 self.carry_pos = 0;
                 self.carry_len = 0;
+                // The ring opens full of silence, so the first callback owes
+                // this stream nothing yet.
+                self.ring_took = Instant::now();
                 let mut shared = self.shared.lock().expect("live state");
                 shared.reopen_attempts = self.reopen_attempts;
                 shared.device_error = None;
@@ -1578,10 +1616,12 @@ impl Worker {
         let mut inst_peak = 0.0f32;
         let mut inst_sq = 0.0f32;
         let mut n = 0usize;
+        let mut took = false;
         if let Some(engine) = self.engine.as_mut() {
             loop {
                 if self.carry_pos < self.carry_len {
                     let pushed = engine.push_playout(&self.carry[self.carry_pos..self.carry_len]);
+                    took |= pushed > 0;
                     self.carry_pos += pushed;
                     if self.carry_pos < self.carry_len {
                         break; // ring is full
@@ -1597,6 +1637,9 @@ impl Worker {
                 self.carry_len = CHUNK_STEREO;
             }
         }
+        if took {
+            self.ring_took = Instant::now();
+        }
         let inst_rms = if n == 0 {
             0.0
         } else {
@@ -1604,6 +1647,39 @@ impl Worker {
         };
         self.levels.output_peak = inst_peak.max(self.levels.output_peak * LEVEL_DECAY);
         self.levels.output_rms = inst_rms.max(self.levels.output_rms * LEVEL_DECAY);
+    }
+
+    /// The playout path while the device is not taking audio, which is the
+    /// stream being reopened, a reopen that keeps failing, and a ring the device
+    /// has stopped emptying. `pull_playout_raw` is the only thing that advances
+    /// the jitter buffer's playout position, and it is otherwise reached only
+    /// from the device-paced fill above, so the buffer would fill to its depth
+    /// cap and give the position up while the frames it was holding were the
+    /// only audio the reopened stream could have started from (#447). What comes
+    /// out here is dropped: there is no device to play it.
+    fn drain_stalled_playout(&mut self) {
+        let now = Instant::now();
+        if self.engine.is_some()
+            && now.duration_since(self.ring_took) < playout_stall_after(self.device_frames)
+        {
+            self.drain_from = None;
+            return;
+        }
+        let from = *self.drain_from.get_or_insert(now);
+        let owed = now.duration_since(from).as_micros() / TICK.as_micros();
+        let cap = PLAYOUT_DRAIN_MAX.as_micros() / TICK.as_micros();
+        let frames = owed.min(cap);
+        for _ in 0..frames {
+            self.core.pull_playout_raw(&mut self.carry);
+        }
+        // Whatever the ring refused belongs to a position this has walked past.
+        self.carry_pos = 0;
+        self.carry_len = 0;
+        self.drain_from = Some(if owed > cap {
+            now
+        } else {
+            from + TICK * frames as u32
+        });
     }
 
     /// The bridge counters, reported by [`RingWatch`]. Movement means a ring
@@ -1939,7 +2015,7 @@ fn loss_pct(stats: &ClientStats) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jamstream_engine::{JitterBuffer, MediaPacket};
+    use jamstream_engine::MediaPacket;
 
     /// The loop's pace against the audio it moves. Both constants come off
     /// [`FrameDuration::Ms2_5`] now, so asserting each against its own source
@@ -2004,6 +2080,30 @@ mod tests {
         // A device period past the floor takes the deeper of the two rather
         // than losing the callback slack #323 established.
         assert_eq!(capture_capacity(2_400), playout_capacity(2_400));
+    }
+
+    /// The stall threshold sits between two things it must not collide with: the
+    /// device period, since a device that renders makes room once a period and
+    /// must never be drained behind its own back, and the depth the jitter
+    /// buffer holds before it gives its playout position up, since a drain that
+    /// starts after that has nothing left to keep moving.
+    #[test]
+    fn the_stall_threshold_outlasts_a_callback_and_beats_the_buffer_cap() {
+        let cap = TICK * JitterBuffer::MAX_DEPTH_FRAMES as u32;
+        // Every buffer the Audio tab offers, and negotiated periods well past
+        // the largest of them.
+        for frames in [0u32, 32, 120, 240, 480, 960] {
+            let period = TICK * frames.max(FRAME_FRAMES as u32) / FRAME_FRAMES as u32;
+            let after = playout_stall_after(frames);
+            assert!(
+                after >= period * 2,
+                "{frames}-frame callbacks: {after:?} is inside two device periods"
+            );
+            assert!(
+                after < cap,
+                "{frames}-frame callbacks: {after:?} outlasts the {cap:?} the buffer holds"
+            );
+        }
     }
 
     /// The claim the capture ring rests on: its depth is stall tolerance, not
