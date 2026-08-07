@@ -150,6 +150,103 @@ jobs:
       # shellcheck-clean (shellcheck is preinstalled on ubuntu runners).
       - name: Shellcheck the repository scripts
         run: shellcheck scripts/*.sh
+      - name: No test measures the machine instead of the thing
+        run: scripts/check-test-timing.sh
+      # A gate nobody has seen fire is a gate nobody knows works, so the same
+      # script runs over fixtures. Rejected: the ring reproduction and the
+      # activity watch as they were first written, and a measurement taken
+      # from the tail of a capture file. Accepted: the same properties
+      # asserted without a clock, beside the lengths, the zero and the
+      # ignored test that must never be mistaken for any of them.
+      - name: The timing gate accepts and rejects
+        run: |
+          set -eu
+          dir=$RUNNER_TEMP/timing-gate
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          cat > "$dir/rejected.rs" <<'RS'
+          #[test]
+          fn a_ring_holds_what_arrives_before_the_consumer_starts() {
+              let (device, mut engine) = CallbackBridge::new(2 * CALLBACK, CALLBACK);
+              let _producer = producer_on_its_own_clock(device, CALLBACK);
+              std::thread::sleep(Duration::from_millis(20));
+              assert_eq!(
+                  engine.callbacks(),
+                  8,
+                  "eight callbacks arrive while the session comes up"
+              );
+          }
+
+          #[tokio::test]
+          async fn the_activity_file_advances_while_musicians_are_connected() {
+              let watch = ActivityWatch::on(&path);
+              tokio::time::sleep(Duration::from_secs(3)).await;
+              let advances = watch.advances();
+              assert_eq!(advances, 3, "the heartbeat touches the file once a second");
+          }
+          RS
+          cat > "$dir/tailed.rs" <<'RS'
+          fn tail_rms(path: &Path, secs: f64) -> f64 {
+              rms(&tail(path, secs).1)
+          }
+
+          #[test]
+          fn a_44_1_interface_carries_the_session_both_ways() {
+              let energy = tail_rms(&out_b, 1.0);
+              assert!(energy > 0.02, "the joiner heard near-silence");
+          }
+          RS
+          cat > "$dir/accepted.rs" <<'RS'
+          #[test]
+          fn a_ring_holds_what_arrives_before_the_consumer_starts() {
+              let (mut device, mut engine) = CallbackBridge::new(2 * CALLBACK, CALLBACK);
+              for _ in 0..8 {
+                  device.on_capture(&[1.0; CALLBACK]);
+              }
+              assert_eq!(engine.overruns(), 3, "a shallow ring drops the rest");
+          }
+
+          #[tokio::test]
+          async fn the_activity_file_advances_while_musicians_are_connected() {
+              let watch = ActivityWatch::on(&path);
+              let until = Instant::now() + budget(Duration::from_secs(8));
+              while watch.advances() < 3 && Instant::now() < until {
+                  tokio::time::sleep(Duration::from_millis(100)).await;
+              }
+              assert_eq!(watch.advances(), 3, "the heartbeat stopped touching the file");
+          }
+
+          #[test]
+          fn an_avatar_crosses_between_runtimes_and_decodes_once() {
+              std::thread::sleep(Duration::from_millis(50));
+              let handle = runtime.avatar_of(HOST_MEMBER_ID);
+              assert_eq!(handle.hash.len(), 64, "a blake2s digest in hex");
+              assert_eq!(handle.rgba.len(), 120 * 60 * 4);
+          }
+
+          #[test]
+          fn the_encoder_reaches_a_pusher_through_the_relay_we_ship() {
+              std::thread::sleep(Duration::from_secs(2));
+              assert_eq!(pipeline.dropped_frames(), 0, "a real-time guarantee");
+          }
+
+          #[test]
+          #[ignore = "requires a real capture and playback device"]
+          fn a_real_device_loses_no_capture_while_a_session_comes_up() {
+              std::thread::sleep(RUN);
+              let overruns = engine.overruns();
+              assert_eq!(overruns, 8, "an ignored test never runs on a runner");
+          }
+          RS
+          scripts/check-test-timing.sh "$dir/accepted.rs"
+          status=0
+          for f in rejected tailed; do
+            if scripts/check-test-timing.sh "$dir/$f.rs" >/dev/null 2>&1; then
+              echo "the gate accepted $f.rs" >&2
+              status=1
+            fi
+          done
+          exit $status
       # The title gate reads its accepted types out of release-please-config
       # .json, so exercise it against the real file: a parse that stopped
       # finding the changelog sections, or a section deleted from the config,
