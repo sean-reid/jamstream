@@ -5,6 +5,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use jamstream_audio_io::{AudioError, DeviceRung, WavBackend};
@@ -29,6 +30,29 @@ const RATE: u32 = 48_000;
 /// the loudest failure, so it answers only the question it is asked.
 const TONE_FLOOR: f64 = 100.0;
 
+/// Held for as long as any test in this binary has a session running, shared by
+/// all of them but one, and taken exclusively by the test whose subject is the
+/// log file.
+///
+/// That log's subscriber is process wide, and under `cargo test` the whole
+/// binary is one process running tests on parallel threads, so a test asserting
+/// its own log holds nothing reads what the tests beside it wrote and fails on
+/// their warnings. Every session in this file starts from a `TestServer`, which
+/// is what makes the shared side automatic: a new test cannot reach a runtime
+/// without passing through it.
+static SESSIONS: RwLock<()> = RwLock::new(());
+
+/// Which side of [`SESSIONS`] a server holds. Never read, only dropped: how
+/// long it lives is the whole of it.
+enum Bystanders {
+    Beside {
+        _shared: RwLockReadGuard<'static, ()>,
+    },
+    None {
+        _exclusive: RwLockWriteGuard<'static, ()>,
+    },
+}
+
 /// A real server on loopback, owned by a private tokio runtime so the tests
 /// themselves stay synchronous like the app.
 struct TestServer {
@@ -39,6 +63,7 @@ struct TestServer {
     issuer: Issuer,
     server_pk: [u8; 32],
     session_id: SessionId,
+    _bystanders: Bystanders,
 }
 
 impl TestServer {
@@ -58,7 +83,32 @@ impl TestServer {
         }))
     }
 
+    /// Waits until no other test in this process has a session running, and
+    /// keeps it that way until the server is dropped. For a test that reads a
+    /// process-wide surface and has to know that only its own session wrote to
+    /// it. Take it before touching that surface, not after.
+    ///
+    /// A poisoned lock is taken anyway: one test failing must not turn into
+    /// every later test panicking here instead of reporting what it found.
+    fn alone_in_the_process() -> Self {
+        TestServer::build(
+            None,
+            Bystanders::None {
+                _exclusive: SESSIONS.write().unwrap_or_else(PoisonError::into_inner),
+            },
+        )
+    }
+
     fn with_recording(recording: Option<RecordingOptions>) -> Self {
+        TestServer::build(
+            recording,
+            Bystanders::Beside {
+                _shared: SESSIONS.read().unwrap_or_else(PoisonError::into_inner),
+            },
+        )
+    }
+
+    fn build(recording: Option<RecordingOptions>, bystanders: Bystanders) -> Self {
         let issuer = Issuer::generate();
         let keys = generate_keypair();
         let session_id = SessionId::generate();
@@ -101,6 +151,7 @@ impl TestServer {
             issuer,
             server_pk: keys.public,
             session_id,
+            _bystanders: bystanders,
         }
     }
 
@@ -2008,15 +2059,19 @@ fn record_on_an_unarmed_session_fails_visibly_in_the_lamp() {
 /// subscriber and a real log file.
 ///
 /// The file rather than a captured formatter, because the promise is about the
-/// file. One subscriber per process, which is what nextest gives every test;
-/// under `cargo test` the whole binary shares one, so the install would land in
-/// another test's file and this would read an empty one.
+/// file. The subscriber and the file are both process wide, so the session below
+/// has to be the only one in the process for its whole length, install included:
+/// that is `alone_in_the_process`, and it is what makes the answer the same
+/// under `cargo test`, where the binary runs every test on threads of one
+/// process, as under nextest, where each test gets a process of its own.
 #[test]
 fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     if std::env::var_os("RUST_LOG").is_some() {
         eprintln!("skipping: RUST_LOG replaces the default filter this is about");
         return;
     }
+    let server = TestServer::alone_in_the_process();
+
     // Its own directory: the log goes through the private-file machinery, which
     // refuses to write key material next to a world-writable temp root.
     let dir = temp_path("quiet", "logs");
@@ -2025,7 +2080,6 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     let installed = jamstream_client::logging::init_at(log.clone()).expect("install the log");
     assert_eq!(installed, log);
 
-    let server = TestServer::start();
     let a_sine = sine_fixture("quiet", 440.0, RATE);
     let b_sine = sine_fixture("quiet", 660.0, RATE);
     let out_a = temp_path("quiet", "out-a.wav");
