@@ -217,6 +217,22 @@ fn tail_rms(path: &Path, secs: f64) -> f64 {
 /// Energy at one frequency, by Goertzel. Cheaper than a transform when the
 /// question is about a handful of candidates rather than a whole spectrum.
 fn tone_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
+    // Summed over blocks, not measured in one pass. A Goertzel is coherent, so
+    // a phase discontinuity inside the window cancels a tone that is plainly
+    // audible: one inversion halfway through a second takes 12000 to 0, and
+    // concealed or repeated frames put such steps in real playout. Block
+    // magnitudes add instead, which cost a quarter of a block per step. A
+    // quarter second resolves 4 Hz, finer than the 20 Hz the pitch callers
+    // allow.
+    let block = (rate as usize / 4).max(1);
+    samples
+        .chunks(block)
+        .map(|c| coherent_energy(c, rate, hz))
+        .sum()
+}
+
+/// One Goertzel pass. Only meaningful over a span the tone holds phase across.
+fn coherent_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
     let k = 2.0 * std::f64::consts::PI * hz / f64::from(rate);
     let coeff = 2.0 * k.cos();
     let (mut s1, mut s2) = (0.0f64, 0.0f64);
