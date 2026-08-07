@@ -476,8 +476,8 @@ impl ClientCore {
                         // Keep the handshake state and the init bytes. A
                         // forged response is free to send for anyone who can
                         // see this client's address, and starting over on
-                        // each one meant the genuine response, computed
-                        // against the init already sent, no longer fitted.
+                        // each one would leave the genuine response, computed
+                        // against the init already sent, unable to verify.
                         // Logged at debug because an attacker sets the rate.
                         tracing::debug!("handshake response failed to verify");
                         self.initiator = retry.into_initiator();
@@ -571,9 +571,10 @@ impl ClientCore {
                 // arrives sealed to the exact init this client sent (the
                 // AEAD's additional data), under a key only `server_pk`
                 // derives, so an off-path forger cannot mint one this open
-                // accepts: what pinned a client to a cookie the server would
-                // refuse (issue #203) now dies here. The open costs one hash
-                // and one ChaCha pass, the going rate for parsing.
+                // accepts: a forged challenge dies here instead of replacing
+                // a working cookie with one the server would refuse. The
+                // open costs one hash and one ChaCha pass, the going rate
+                // for parsing.
                 if self.state != ClientState::Connecting {
                     return out;
                 }
@@ -1658,12 +1659,12 @@ mod tests {
 
     /// Every cookie this client holds is one it answered with. The stored
     /// cookie is what the next resend offers, so a challenge that arrives with
-    /// the answer budget already spent must not replace it: that turned an
-    /// injected challenge into a way to point the client at a cookie the
-    /// server will refuse, while the plain init only drew another challenge
-    /// (issue #203). The AEAD binding stops a forger who lacks the key or the
-    /// init; this guard prices out the sender who has both, so an eviction
-    /// costs one of the same tokens that bound the answers.
+    /// the answer budget already spent must not replace it: doing so would let
+    /// an injected challenge point the client at a cookie the server will
+    /// refuse, where a plain init would only draw another challenge. The AEAD
+    /// binding stops a forger who lacks the key or the init; this guard prices
+    /// out the sender who has both, so an eviction costs one of the same
+    /// tokens that bound the answers.
     #[test]
     fn a_challenge_we_cannot_answer_does_not_replace_the_cookie_we_hold() {
         let (inv, server) = invite_and_server(Role::Musician);

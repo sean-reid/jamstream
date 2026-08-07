@@ -53,7 +53,7 @@ pub const DEFAULT_MEMBER_TIMEOUT_MS: u64 = 10_000;
 /// keepalives once a second, so it is two missed keepalives. Meanwhile
 /// [`DEFAULT_MEMBER_TIMEOUT_MS`] is 10 s, which leaves an eight second window
 /// in which a client can say "gone quiet" instead of showing a healthy dot
-/// over a member who stopped playing eight seconds ago (#285).
+/// over a member who stopped playing eight seconds ago.
 ///
 /// It also bounds how often the flag can move. Going quiet costs the member
 /// two seconds of silence, so no member can flip more than once a second, and

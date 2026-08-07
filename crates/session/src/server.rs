@@ -833,7 +833,7 @@ impl ServerCore {
         // above, a different threshold, and it publishes rather than reaps: a
         // member unheard from for MEMBER_QUIET_AFTER_MS is still connected and
         // still holding their seat, but the roster now says nobody has heard
-        // from them, which is the state a client had no way to show (#285).
+        // from them, a state a client otherwise has no way to show.
         //
         // Only a change queues a roster, so a session where everyone is
         // talking sends nothing extra ever. It runs after the reap so a

@@ -16,7 +16,7 @@ use crate::client::{ClientCore, ClientEvent};
 /// above that never fires, so every pass waits for its last packet and costs
 /// the count times the gap in wall time. Whatever the caller does between
 /// passes is then production the pump never catches up on, and it reads
-/// further behind real time on every iteration (#389, #415).
+/// further behind real time on every iteration.
 ///
 /// Send errors are dropped. A pump runs across teardown, where the server has
 /// already gone and a refused send is the expected result rather than a
