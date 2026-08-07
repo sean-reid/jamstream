@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/sean-reid/jamstream/compare/v0.2.1...v0.3.0) (2026-08-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **server:** check the relay is up and tell the host when it is not ([#455](https://github.com/sean-reid/jamstream/issues/455))
+
+### Features
+
+* **client:** warn when a connected session is handing out silence ([#454](https://github.com/sean-reid/jamstream/issues/454)) ([4d6241d](https://github.com/sean-reid/jamstream/commit/4d6241d8e02302854928a24dfe59b305d8180121))
+* **server:** check the relay is up and tell the host when it is not ([#455](https://github.com/sean-reid/jamstream/issues/455)) ([90c298f](https://github.com/sean-reid/jamstream/commit/90c298f34b8160332f8be6483705e890b82afac6))
+
+
+### Bug Fixes
+
+* **client:** hold captured audio while the session comes up ([#458](https://github.com/sean-reid/jamstream/issues/458)) ([236a403](https://github.com/sean-reid/jamstream/commit/236a403b32662b46f766d50775b7890bf8401d31))
+* **stream:** a destination is Live when its pusher reports a push ([#456](https://github.com/sean-reid/jamstream/issues/456)) ([3378f83](https://github.com/sean-reid/jamstream/commit/3378f83ba5c251d26eafa92e1edbe56beefc9fce))
+* **stream:** report what a broadcast child printed, not its exit code ([#443](https://github.com/sean-reid/jamstream/issues/443)) ([f46bdad](https://github.com/sean-reid/jamstream/commit/f46bdad326b902dee058fee535fccb9efef5531d))
+
 ## [0.2.1](https://github.com/sean-reid/jamstream/compare/v0.2.0...v0.2.1) (2026-08-02)
 
 
