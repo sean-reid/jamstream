@@ -71,9 +71,10 @@ pub struct JitterStats {
     /// "hearing a concealed stream" and say so (#451).
     pub waiting: u64,
     /// Times the buffer gave up on a playout position it could not reconcile
-    /// with the arriving stream (see `REANCHOR_PATIENCE`) and re-anchored on
-    /// the newest arrivals, exactly as it does for a stream restart. Each one
-    /// costs the concealment already counted in `lost` plus a refill; a
+    /// with the arriving stream and re-anchored on the newest arrivals, exactly
+    /// as it does for a stream restart: either every pull concealed while
+    /// packets were dropped (see `REANCHOR_PATIENCE`), or the depth reached
+    /// `MAX_BUFFERED` with none of it played. Each one costs a refill; a
     /// healthy session never re-anchors.
     pub reanchors: u64,
 }
@@ -100,10 +101,9 @@ pub struct JitterBuffer {
     /// Seq the most recent pull concealed (Missing with nothing usable).
     /// While set, `next_seq == concealed + 1`; delivering any frame clears it.
     concealed: Option<u32>,
-    /// A packet was dropped without ever playing since the last pull, either
-    /// as late (seq already behind playout) or evicted from a full buffer.
-    /// Both are `late` in the stats and both mean the arriving stream and the
-    /// playout position disagree.
+    /// A packet arrived behind the playout position since the last pull and was
+    /// dropped as late, which means the arriving stream and the playout
+    /// position disagree.
     dropped_since_pull: bool,
     /// Consecutive stuck ticks: pulls that concealed with nothing playable
     /// while `dropped_since_pull` was set. Any delivery clears it.
@@ -112,6 +112,11 @@ pub struct JitterBuffer {
 }
 
 impl JitterBuffer {
+    /// Depth at which the buffer stops believing its playout position and
+    /// re-anchors, in frames. Published because a consumer that stops pulling
+    /// has this long to notice before the buffer gives the position up.
+    pub const MAX_DEPTH_FRAMES: usize = MAX_BUFFERED;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -162,10 +167,15 @@ impl JitterBuffer {
             }
         }
         self.frames.entry(packet.seq).or_insert(packet.payload);
-        while self.frames.len() > MAX_BUFFERED {
-            self.frames.pop_first();
-            self.late += 1;
-            self.dropped_since_pull = true;
+        // A buffer this deep holds `MAX_BUFFERED` frames of audio the playout
+        // position has not reached, against a target that never exceeds
+        // `MAX_TARGET`: the two cannot be reconciled, so playout gives up this
+        // one and re-anchors on the arrivals still to come. It belongs here
+        // rather than in `pull` because a buffer nobody pulls is how a buffer
+        // gets this deep, and nothing in `pull` runs then.
+        if self.frames.len() > MAX_BUFFERED {
+            self.reset();
+            self.reanchors += 1;
         }
     }
 
@@ -238,17 +248,17 @@ impl JitterBuffer {
             self.over_ticks = 0;
         }
 
-        // Re-anchor watchdog. Between the resurrect path (which steps back
-        // exactly one frame) and RESET_JUMP (which treats a discontinuity
-        // over 512 frames as a restart) sits a hole: a persistent offset of
-        // 2..512 frames between the playout position and the arriving stream.
-        // Every packet is then dropped without ever playing - as late when
-        // the consumer overran the producer, as an eviction from a full
-        // buffer when it fell behind by more than MAX_BUFFERED - while every
-        // pull conceals, forever. The signature is exactly that: a concealed
-        // pull with nothing playable, on a tick that dropped a packet. Held
-        // past REANCHOR_PATIENCE it cannot be reordering or a brief stall, so
-        // treat it as a stream restart and re-anchor on the newest arrivals.
+        // Re-anchor watchdog for the consumer that overran the producer.
+        // Between the resurrect path (which steps back exactly one frame) and
+        // RESET_JUMP (which treats a discontinuity over 512 frames as a
+        // restart) sits a hole: a persistent offset of 2..512 frames with the
+        // playout position ahead of the arriving stream, so every packet is
+        // dropped as late while every pull conceals, forever. The signature is
+        // exactly that: a concealed pull with nothing playable, on a tick that
+        // dropped a packet. Held past REANCHOR_PATIENCE it cannot be reordering
+        // or a brief stall, so treat it as a stream restart and re-anchor on
+        // the newest arrivals. The mirror case, playout behind the stream, is
+        // caught in `push` by the depth itself.
         let stuck = matches!(result, Pull::Missing) && self.dropped_since_pull;
         self.dropped_since_pull = false;
         if stuck {
@@ -730,8 +740,9 @@ mod tests {
     /// Playout must never go backwards, and after a re-anchor it must be
     /// essentially gapless: the only frames a healthy re-anchored stream
     /// skips are the shrink path's, one per surplus episode while the jitter
-    /// estimate the stall inflated decays back.
-    fn assert_playout_forward(case: &str, played: &[u32]) {
+    /// estimate the stall inflated decays back, so `shrinks` is how many
+    /// surplus episodes the case's own arrival pattern earns.
+    fn assert_playout_forward(case: &str, played: &[u32], shrinks: usize) {
         assert!(!played.is_empty(), "{case}: nothing played");
         for pair in played.windows(2) {
             assert!(pair[1] > pair[0], "{case}: playout went backwards {pair:?}");
@@ -739,8 +750,8 @@ mod tests {
         let span = (played[played.len() - 1] - played[0] + 1) as usize;
         let skipped = span - played.len();
         assert!(
-            skipped <= 2,
-            "{case}: {skipped} frames skipped after recovery (shrink allows at most 2)"
+            skipped <= shrinks,
+            "{case}: {skipped} frames skipped after recovery (shrink allows at most {shrinks})"
         );
     }
 
@@ -799,7 +810,7 @@ mod tests {
             "offset {offset}: only {} frames played after recovery",
             played.len()
         );
-        assert_playout_forward(&format!("offset {offset}"), &played);
+        assert_playout_forward(&format!("offset {offset}"), &played, 2);
 
         // `late` stopped climbing once playout re-anchored: the drops are
         // confined to the detection window.
@@ -834,61 +845,103 @@ mod tests {
         assert_heals_from_overrun(500);
     }
 
-    // The mirror image inside the same hole: playout stalls (nothing pulled)
-    // long enough that the frames at the playout position are evicted from
-    // the full buffer, so afterwards every arrival is dropped by MAX_BUFFERED
-    // eviction, the playout position never catches the surviving window, and
-    // depth stays pinned at the cap. Same signature, same cure.
-    #[test]
-    fn playout_stall_past_max_buffered_reanchors() {
+    /// The mirror image inside the same hole: playout stalls, nothing is
+    /// pulled, and arrivals keep coming. `redundant` says whether each packet
+    /// carries a copy of its predecessor, which is what the sender attaches
+    /// under loss.
+    ///
+    /// The buffer must give the playout position up while the stall is still
+    /// running, because the consumer that would notice is the one that stopped.
+    /// It has to hold with the copies as well as without them: a pull that
+    /// finds a redundant copy of the frame it wanted is not concealment, so it
+    /// resets the watchdog's counter, and a buffer whose every pull is answered
+    /// that way stays a stream's length behind for the rest of the session
+    /// (#447).
+    fn assert_heals_from_a_playout_stall(redundant: bool) {
+        let cover = |seq: u32| redundant.then(|| seq.wrapping_sub(1)).filter(|_| seq > 0);
         let mut jb = JitterBuffer::new();
         let mut seq = 0u32;
         for _ in 0..20 {
-            jb.push(packet(seq, None));
+            jb.push(packet(seq, cover(seq)));
             assert_eq!(jb.pull(), Pull::Frame(payload_for(seq)));
             seq += 1;
         }
-        // A frozen consumer: 200 frames arrive with nothing pulled, so the
-        // 64-frame cap throws away everything the playout position still
-        // wants. 200 stays under RESET_JUMP.
+        // A frozen consumer: 200 frames arrive with nothing pulled, three times
+        // the depth the buffer will hold. 200 stays under RESET_JUMP.
         for _ in 0..200 {
-            jb.push(packet(seq, None));
+            jb.push(packet(seq, cover(seq)));
             seq += 1;
         }
-        assert_eq!(jb.stats().depth_frames, MAX_BUFFERED);
-        assert_eq!(jb.stats().reanchors, 0);
+        let stalled = jb.stats();
+        assert!(
+            stalled.reanchors > 0,
+            "the buffer waited for a pull that was never coming: {stalled:?}"
+        );
+        assert!(
+            stalled.depth_frames <= MAX_BUFFERED,
+            "depth pinned at the cap: {stalled:?}"
+        );
+        // Nothing is refused on the way there: the frames thrown away are the
+        // ones the abandoned position wanted, not the arrivals.
+        assert_eq!(stalled.late, 0, "{stalled:?}");
 
+        let reanchors_stalled = stalled.reanchors;
         let mut first_frame_tick = None;
         let mut played = Vec::new();
         for tick in 1..=400u32 {
-            jb.push(packet(seq, None));
+            jb.push(packet(seq, cover(seq)));
             seq += 1;
             match jb.pull() {
                 Pull::Frame(p) => {
                     first_frame_tick.get_or_insert(tick);
                     played.push(seq_of(&p));
                 }
+                Pull::Recovered(p) => {
+                    first_frame_tick.get_or_insert(tick);
+                    played.push(seq_of(&p));
+                }
                 Pull::Missing | Pull::Waiting => {}
-                other => panic!("tick {tick}: unexpected {other:?}"),
             }
         }
         let stats = jb.stats();
-        assert_eq!(stats.reanchors, 1, "{stats:?}");
-        let at = first_frame_tick.expect("never recovered from the playout stall");
-        // Patience, plus a refill to the target the stall's arrival pattern
-        // inflated (no pulls means no tick advance, which reads as jitter).
-        assert!(
-            at <= REANCHOR_PATIENCE + MAX_TARGET as u32,
-            "took {at} ticks to recover from a playout stall"
+        // The stall was already resolved, so resuming costs a refill and
+        // nothing else.
+        assert_eq!(
+            stats.reanchors, reanchors_stalled,
+            "resuming the pull re-anchored again: {stats:?}"
         );
-        assert_playout_forward("playout stall", &played);
-        // Depth is back under control instead of pinned at the cap.
+        let at = first_frame_tick.expect("never recovered from the playout stall");
+        assert!(
+            at <= MAX_TARGET as u32 + 1,
+            "took {at} ticks to play again after a resolved stall"
+        );
+        assert!(
+            played.len() >= 380,
+            "only {} frames played after the stall",
+            played.len()
+        );
+        assert_playout_forward("playout stall", &played, 3);
+        // And it keeps up from there instead of trailing the stream.
         assert!(
             stats.depth_frames <= stats.target_frames + 1,
-            "depth {} still above target {} + 1 after re-anchoring",
+            "depth {} still above target {} + 1: {stats:?}",
             stats.depth_frames,
             stats.target_frames
         );
+        assert_eq!(
+            stats.late, 0,
+            "arrivals refused after the stall was over: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn playout_stall_past_max_buffered_reanchors() {
+        assert_heals_from_a_playout_stall(false);
+    }
+
+    #[test]
+    fn playout_stall_covered_by_redundancy_reanchors() {
+        assert_heals_from_a_playout_stall(true);
     }
 
     // Negative control: garden-variety 2% loss with reordering deep enough to
