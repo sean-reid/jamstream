@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.0](https://github.com/sean-reid/jamstream/compare/v0.3.0...v0.4.0) (2026-08-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **protocol:** bring a cloud session's server log home ([#470](https://github.com/sean-reid/jamstream/issues/470))
+
+### Features
+
+* **protocol:** bring a cloud session's server log home ([#470](https://github.com/sean-reid/jamstream/issues/470)) ([c5059bf](https://github.com/sean-reid/jamstream/commit/c5059bfbcc5507950df270e615b52dc39cd71c65))
+
+
+### Bug Fixes
+
+* **client:** keep pulling playout when the device stops taking audio ([#462](https://github.com/sean-reid/jamstream/issues/462)) ([ab4e2e2](https://github.com/sean-reid/jamstream/commit/ab4e2e2157419434e75710ffeb302048d082582e))
+* **client:** two Windows defects from a joiner's log ([#466](https://github.com/sean-reid/jamstream/issues/466)) ([63831ec](https://github.com/sean-reid/jamstream/commit/63831ecaa491bf63492741bde8552fafe73ee4a6))
+* **stream:** root a local session's broadcast layout somewhere writable ([#468](https://github.com/sean-reid/jamstream/issues/468)) ([4cf4f88](https://github.com/sean-reid/jamstream/commit/4cf4f88d270e442dc33340d663c1d53aeaa1e30e))
+
 ## [0.3.0](https://github.com/sean-reid/jamstream/compare/v0.2.1...v0.3.0) (2026-08-07)
 
 
