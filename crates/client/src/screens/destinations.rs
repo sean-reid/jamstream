@@ -346,7 +346,7 @@ impl DestinationsPanel {
         );
         // A session whose relay never came up cannot stream anywhere, whatever
         // key is pasted, so it says so here rather than letting a host paste
-        // one and find out from a failed destination (#440). The rows stay
+        // one and find out from a failed destination. The rows stay
         // visible: a saved key is still worth seeing, and Forget key still has
         // to work.
         if let Some(reason) = snap.stream.unavailable_reason() {
@@ -652,12 +652,12 @@ impl DestinationsPanel {
 ///
 /// It is one counter for the whole encode, so a per-row copy of it was a shared
 /// number rendered as though it belonged to one destination, which invites
-/// exactly the wrong fix: removing a destination does nothing about it (#264).
+/// exactly the wrong fix: removing a destination does nothing about it.
 /// The bitrate is a line under the rows for the same reason, and this is the
 /// same shape of fact.
 ///
-/// Two counts, because one could not say which of two opposite things a host
-/// was looking at (#278). A repeat means the machine ran out of time to draw a
+/// Two counts, because one count cannot say which of two opposite things a
+/// host is looking at. A repeat means the machine ran out of time to draw a
 /// frame and sent the last picture again: nothing is missing, the audio stays
 /// in step, and the cost is a stutter. A loss means the encoder's queue refused
 /// a frame, so the video is that many pictures short of its audio and the
@@ -689,9 +689,9 @@ fn frame_counts(ui: &mut Ui, snap: &Snapshot) {
              is at its limit",
         );
         ui.label(theme::mono_muted(ui, "·"));
-        // "dropped" keeps the word every streamer already has for a frame that
-        // never arrived. It is only now true of this counter: until #278 it
-        // covered repeats too, which are the opposite reading.
+        // "dropped" keeps the word every streamer already has for a frame
+        // that never arrived; a repeat is the opposite reading, nothing
+        // lost, just resent.
         count(
             ui,
             dropped,
