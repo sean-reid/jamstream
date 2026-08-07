@@ -310,10 +310,10 @@ pub struct MemberInfo {
     /// on them either. `connected` is still true; that is the point.
     ///
     /// With `connected` this is a three-state presence, which is what a
-    /// musician mid-song needs: here, gone quiet, gone. Before it existed a
-    /// client saw the roster before a member vanished and the roster after,
-    /// with nothing in between, so a stall and a healthy player looked the
-    /// same until the server gave up ten seconds later (#285). The server is
+    /// musician mid-song needs: here, gone quiet, gone. Without it, a
+    /// client sees the roster before a member vanishes and the roster
+    /// after, with nothing in between, so a stall and a healthy player look
+    /// the same until the server gives up ten seconds later. The server is
     /// the only party that can know: it is the only one that receives every
     /// member's packets.
     ///
@@ -1323,7 +1323,7 @@ mod tests {
         assert!(postcard::from_bytes::<ControlMsg>(&[0x10, 0x01, 0x01, 0x00, 0x04]).is_err());
     }
 
-    /// The same note as `MemberInfo`, for the field #278 appended: bytes from
+    /// The same note as `MemberInfo`, for the appended field: bytes from
     /// before it are short of the new encoding and fail to decode instead of
     /// reading as "no repeats". Breaking pre-release, by decision.
     #[test]
@@ -1484,7 +1484,7 @@ mod tests {
     /// Pins what postcard actually does with the trailing fields added to
     /// MemberInfo: old bytes are short of the new ones and fail to decode
     /// instead of misreading. Breaking pre-release, by decision, twice now:
-    /// the `avatar_hash` Option and then the `quiet` flag (#285).
+    /// the `avatar_hash` Option and then the `quiet` flag.
     #[test]
     fn member_info_trailing_fields_changed_the_roster_encoding() {
         #[derive(Serialize)]

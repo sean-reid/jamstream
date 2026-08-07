@@ -9,9 +9,9 @@
 /// under the join field, as `error: {}` from the cli, and as `session: {}`
 /// through the client's `LiveError`.
 ///
-/// That contract went unwritten and the cost was "invite is not valid: not
-/// valid encoding" on screen (#286), from a format string that said the invite
-/// was not valid and a detail that said it again. So:
+/// Skip the contract and the screen renders "invite is not valid: not
+/// valid encoding", from a format string that says the invite is not
+/// valid and a detail that says it again. So:
 ///
 /// - Name the subject once. `invite has invalid encoding`, not
 ///   `invite is not valid: invalid invite encoding`.

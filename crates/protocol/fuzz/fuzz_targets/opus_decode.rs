@@ -2,7 +2,7 @@
 //! bytes reach C. Every uplink frame in the mix tick goes through it on a
 //! publicly reachable VM (`session/src/server.rs`, the per-member decode at
 //! the top of `tick`), into vendored libopus, so it is the highest-value
-//! unfuzzed surface in the repo. See issue #53.
+//! unfuzzed surface in the repo.
 //!
 //! Current posture, verified rather than assumed and recorded here so it
 //! cannot regress quietly:
