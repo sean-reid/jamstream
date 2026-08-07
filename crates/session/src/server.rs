@@ -25,8 +25,10 @@ use jamstream_protocol::wire::{self, CHANNEL_CONTROL, CHANNEL_MEDIA, COOKIE_BYTE
 use crate::avatar::{AVATAR_CHUNKS_PER_POLL, AvatarCache, AvatarHash, AvatarRx, AvatarTx, RxStep};
 use crate::limits::{
     DEFAULT_MEMBER_TIMEOUT_MS, FANOUT_BURST, FANOUT_REFILL_PER_SEC, MAX_LISTENERS, MAX_MUSICIANS,
-    MEMBER_QUIET_AFTER_MS, TokenBucket, VIOLATION_BURST, VIOLATION_REFILL_PER_SEC,
+    MEMBER_QUIET_AFTER_MS, SERVER_LOG_BURST, SERVER_LOG_HIGH_WATER, SERVER_LOG_PER_SEC, TokenBucket,
+    VIOLATION_BURST, VIOLATION_REFILL_PER_SEC,
 };
+use crate::logtail::LogTail;
 
 /// Samples per mix tick: 2.5 ms at 48 kHz.
 pub const TICK_SAMPLES: usize = 120;
@@ -434,6 +436,11 @@ pub struct ServerCore {
     roster_epoch: u64,
     /// Set by any roster change, cleared by the next tick's fanout.
     roster_dirty: bool,
+    /// The server process's own log, when a binary published one. None under
+    /// the harness and under every test that does not ask for it, which is
+    /// what keeps a core with no subscriber behind it deterministic.
+    log_tail: Option<LogTail>,
+    log_budget: TokenBucket,
 }
 
 impl ServerCore {
@@ -489,6 +496,8 @@ impl ServerCore {
             record_stems: false,
             roster_epoch: 0,
             roster_dirty: false,
+            log_tail: crate::logtail::installed(),
+            log_budget: TokenBucket::new(SERVER_LOG_BURST, SERVER_LOG_PER_SEC),
         }
     }
 
@@ -749,6 +758,8 @@ impl ServerCore {
         // Whatever changed the roster this tick, it fans out once.
         self.flush_roster();
 
+        self.feed_server_log(now_ms);
+
         // Control-plane retransmits and acks. Avatar trains are fed here,
         // capped per tick, so bulk bytes never starve normal control
         // traffic on the ordered link (see the avatar module comment).
@@ -851,6 +862,11 @@ impl ServerCore {
     /// caller that keeps running (the harness) sees a clean roster.
     pub fn shutdown(&mut self, now_ms: u64, reason: &str) -> Outgoing {
         let mut out = Vec::new();
+        // Before the Bye, so the last lines the server wrote ride the same
+        // flight and arrive ahead of the word that the session is over. This
+        // is the moment the whole mechanism exists for: a machine that is
+        // being destroyed writes its most useful line last.
+        self.feed_server_log(now_ms);
         let connected: Vec<MemberId> = self
             .members
             .iter()
@@ -1908,6 +1924,7 @@ impl ServerCore {
             ControlMsg::BroadcastReadiness { .. } => {
                 self.violation(now_ms, from, "broadcast readiness from client")
             }
+            ControlMsg::ServerLog { .. } => self.violation(now_ms, from, "server log from client"),
         }
     }
 
@@ -1923,6 +1940,50 @@ impl ServerCore {
                     }
                 }
             }
+        }
+    }
+
+    /// Moves whatever the server process has written to its log onto the
+    /// host's link, a line per message.
+    ///
+    /// Host only. The log names members, addresses, and bucket paths, and the
+    /// host is the party who launched the machine and pays for it; nobody else
+    /// in the room has any business reading it.
+    ///
+    /// Lines go as they are written rather than being gathered for the end. A
+    /// session that ends because the VM is being destroyed gets a single
+    /// flight with no retransmit, so a log that waited for that moment would
+    /// be delivering its first byte at the worst possible one; everything sent
+    /// during the session has the ordered link's retransmits behind it
+    /// instead. What the ring drops is counted and said out loud, because a
+    /// gap a reader cannot see is worse than no log at all.
+    fn feed_server_log(&mut self, now_ms: u64) {
+        let Some(tail) = self.log_tail.as_ref() else {
+            return;
+        };
+        let Some(host) = self.members.get_mut(&HOST_MEMBER_ID) else {
+            return;
+        };
+        if !host.connected {
+            return;
+        }
+        while host.link.pending_len() < SERVER_LOG_HIGH_WATER {
+            let dropped = tail.dropped();
+            let line = if dropped > 0 {
+                format!("[{dropped} earlier server log line(s) dropped]")
+            } else {
+                match tail.take(1).pop() {
+                    Some(line) => line,
+                    None => break,
+                }
+            };
+            if !self.log_budget.take(now_ms) {
+                break;
+            }
+            if dropped > 0 {
+                tail.clear_dropped();
+            }
+            let _ = host.link.send(ControlMsg::ServerLog { line });
         }
     }
 

@@ -8,6 +8,12 @@ impl SessionId {
     pub fn generate() -> Self {
         Self(crate::rand_bytes())
     }
+
+    /// Lowercase hex, which is how every surface that keeps a file per
+    /// session names it.
+    pub fn hex(&self) -> String {
+        hex(&self.0)
+    }
 }
 
 impl std::fmt::Debug for SessionId {

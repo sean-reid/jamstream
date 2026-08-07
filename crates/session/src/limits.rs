@@ -82,6 +82,23 @@ pub const VIOLATION_BURST: u32 = 32;
 /// locked out of the session for good.
 pub const VIOLATION_REFILL_PER_SEC: u32 = 1;
 
+/// Log lines the server sends the host per second, and the burst allowed.
+///
+/// A session logs a handful of lines a minute and a burst when something
+/// breaks, which is the burst this allows through at once. The cap is what
+/// bounds a server whose logging has run away: at the wire's line cap it is
+/// under 3 KB/s, against the 40 KB/s one musician's uplink already costs.
+pub const SERVER_LOG_BURST: u32 = 32;
+pub const SERVER_LOG_PER_SEC: u32 = 8;
+
+/// Queue depth on the host's link at which log lines stop being added.
+///
+/// Well under [`jamstream_protocol::control::RECV_WINDOW`], so a burst of
+/// lines can never fill the window the host's roster, on-air state, and
+/// parting Bye have to travel in. Diagnostics are worth having and worth
+/// nothing at that price.
+pub const SERVER_LOG_HIGH_WATER: usize = 16;
+
 /// A token bucket over integer milliseconds. Time-free like the rest of the
 /// cores: the caller passes `now_ms`, so the harness replays a rate limit
 /// exactly. Refill is accounted in thousandths of a token, which makes the

@@ -7,6 +7,7 @@
 mod avatar;
 pub mod client;
 pub mod limits;
+pub mod logtail;
 pub mod server;
 
 /// The socket pump the integration suites share. Behind a feature because it
@@ -21,6 +22,7 @@ pub mod testing;
 pub use avatar::{AvatarCache, AvatarHash, AvatarRx, RxStep, avatar_hash, chunk_total};
 
 pub use client::{ClientCore, ClientEvent, ClientState, ClientStats, ServerCandidates};
+pub use logtail::{LOG_TAIL_LINES, LogTail};
 /// Session capacity and the host-surface defaults, defined once in
 /// [`limits`] and re-exported here because every crate that offers seats
 /// needs them: `jamstream_session::MAX_MUSICIANS` is the number.
