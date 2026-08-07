@@ -87,9 +87,9 @@ const MAX_SENDS: u32 = 36;
 /// Sequence numbers past the cumulative ack that a receiver will hold while
 /// waiting for the gap to fill. `ack_bits` advertises exactly 32 entries, so
 /// anything further out cannot be selectively acked and gets retransmitted
-/// whether or not it was buffered, so holding it buys nothing and costs about
-/// 2 KB of permanently live heap per packet from any peer that simply never
-/// sends `recv_next`.
+/// whether or not it was buffered. Holding it buys nothing and costs about 2 KB
+/// of permanently live heap per packet from any peer that simply never sends
+/// `recv_next`.
 pub const RECV_WINDOW: u64 = 32;
 
 /// Messages one link will hold queued or unacknowledged before refusing more.
