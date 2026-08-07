@@ -2130,9 +2130,9 @@ mod tests {
         assert_eq!(cfg.ffmpeg, Path::new("/usr/local/bin/ffmpeg"));
     }
 
-    /// A missing encoder has to reach the host as the program's name and how to
-    /// get it. `spawn failed: No such file or directory (os error 2)` names
-    /// neither, and it is what a machine without ffmpeg used to be told.
+    /// A missing encoder has to reach the host as the program's name and how
+    /// to get it. `spawn failed: No such file or directory (os error 2)` names
+    /// neither.
     #[test]
     fn an_ffmpeg_this_machine_does_not_have_is_named_in_the_reason() {
         let mut p = pipeline("noffmpeg");

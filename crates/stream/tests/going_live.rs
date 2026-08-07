@@ -189,8 +189,7 @@ fn a_pusher_that_pushed_nothing_is_never_live_however_long_it_lives() {
 
 /// What a machine without ffmpeg is told, over a real failed spawn rather than
 /// an io error a test made up: the program by name and how to install it. The
-/// errno underneath is `No such file or directory`, which names neither, and it
-/// was the whole of what a host used to get.
+/// errno underneath is `No such file or directory`, which names neither.
 #[test]
 fn a_host_without_ffmpeg_is_told_which_program_to_install() {
     let root =
