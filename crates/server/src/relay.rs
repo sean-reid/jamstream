@@ -19,13 +19,16 @@
 //!
 //! What cloud-init contributes is the half a probe cannot know: when the tooling
 //! never downloaded, it leaves the reason in a note file, and that sentence is
-//! what the host is told instead of a generic absence.
+//! what the host is told instead of a generic absence. On a session hosted on
+//! someone's own machine nothing downloads anything, so the equivalent half is
+//! the relay binary itself: a machine that does not have it is told so by name.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jamstream_protocol::control::{BroadcastReadiness, fit_stream_reason};
+use jamstream_stream::tools;
 
 /// How often the relay is probed. A loopback connect costs microseconds, so
 /// the interval is about noise in the log rather than about cost.
@@ -140,7 +143,18 @@ impl RelayWatch {
         self.note
             .as_deref()
             .and_then(read_note)
-            .unwrap_or_else(|| format!("no broadcast relay is listening on {}", self.addr))
+            .unwrap_or_else(|| absence(self.addr, tools::installed(Path::new(tools::MEDIAMTX))))
+    }
+}
+
+/// Why nothing is listening, in the two shapes it comes in. A machine without
+/// the relay program is the case a host can act on, so it is named instead of
+/// being described as a quiet port.
+fn absence(addr: SocketAddr, relay_installed: bool) -> String {
+    if relay_installed {
+        format!("no broadcast relay is listening on {addr}")
+    } else {
+        tools::missing(Path::new(tools::MEDIAMTX))
     }
 }
 
@@ -156,6 +170,34 @@ fn read_note(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// Whether a reason describes a relay that is not there, in whichever of
+    /// its two shapes this machine earns: the port when the relay program is
+    /// installed, the program when it is not. Every runner is one or the
+    /// other, and `absence` below pins both branches exactly.
+    fn names_the_absence(reason: &str, addr: SocketAddr) -> bool {
+        reason == absence(addr, true) || reason == absence(addr, false)
+    }
+
+    /// A quiet port is worth reporting; a machine that has no relay program at
+    /// all is worth naming, because that one a host can fix.
+    #[test]
+    fn an_absence_names_the_relay_program_when_this_machine_has_none() {
+        let addr: SocketAddr = "127.0.0.1:1935".parse().unwrap();
+        let listening = absence(addr, true);
+        assert!(
+            listening.contains("no broadcast relay is listening"),
+            "{listening}"
+        );
+        assert!(listening.contains("127.0.0.1:1935"), "{listening}");
+
+        let uninstalled = absence(addr, false);
+        assert!(
+            uninstalled.starts_with("mediamtx is not installed"),
+            "{uninstalled}"
+        );
+        assert_eq!(fit_stream_reason(&uninstalled), uninstalled);
+    }
 
     /// The address the pipeline's default actually names, so a change to
     /// either side shows up here rather than as a probe of the wrong port.
@@ -220,11 +262,7 @@ mod tests {
         drop(listener);
         match watch.observe(6_000).await {
             Some(BroadcastReadiness::Unavailable { reason }) => {
-                assert!(reason.contains(&addr.to_string()), "{reason}");
-                assert!(
-                    reason.contains("no broadcast relay is listening"),
-                    "{reason}"
-                );
+                assert!(names_the_absence(&reason, addr), "{reason}");
             }
             other => panic!("a dead relay reported {other:?}"),
         }
@@ -251,10 +289,7 @@ mod tests {
             .with_grace(Duration::ZERO);
         match watch.observe(0).await {
             Some(BroadcastReadiness::Unavailable { reason }) => {
-                assert!(
-                    reason.contains("no broadcast relay is listening"),
-                    "{reason}"
-                );
+                assert!(names_the_absence(&reason, addr), "{reason}");
             }
             other => panic!("nothing listening reported {other:?}"),
         }

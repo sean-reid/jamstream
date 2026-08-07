@@ -166,6 +166,16 @@ const LOCK_STALE: Duration = Duration::from_secs(30);
 const SHUTDOWN_FILE: &str = "shutdown";
 const SHUTDOWN_SUPPORTED_FILE: &str = "shutdown.supported";
 
+/// Where the spawned server does the broadcast pipeline's file work: the video
+/// FIFO, each pusher's progress file, and the 0700 directory a stream key is
+/// staged in for the instant a spawn takes.
+///
+/// It is an environment variable rather than a flag because the reader is
+/// `jamstream_stream`'s `StreamConfig`, which no command line reaches. Without
+/// it that layout is the session VM's `/run/jamstream`, which off Linux is a
+/// directory under a read-only root, and the encoder cannot create its FIFO.
+pub const BROADCAST_DIR_ENV: &str = "JAMSTREAM_BROADCAST_DIR";
+
 #[cfg(windows)]
 const BIN_NAME: &str = "jamstreamd.exe";
 #[cfg(not(windows))]
@@ -576,6 +586,9 @@ impl Provider for LocalProvider {
         // build that predates the server half costs nothing.
         let mut command = Command::new(&binary);
         command
+            // The broadcast pipeline's working files go in this session's own
+            // directory, which destroy removes with the rest of it.
+            .env(BROADCAST_DIR_ENV, &dir)
             .arg("--config")
             .arg(&config_path)
             .arg("--activity-file")

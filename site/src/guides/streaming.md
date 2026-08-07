@@ -44,7 +44,9 @@ The **Broadcast** tab says so when it is missing, with the reason, and both **Ad
 ![The Broadcast tab reading that this session cannot stream because the broadcast tooling could not be downloaded, with Add key and Go live both disabled](../images/session_destinations_unavailable.png)
 *Nothing on this computer can fix this one: the relay is on the session machine.*
 
-The session server checks the relay every few seconds for as long as the session lasts, so this appears if the relay dies mid-session too, and clears if it comes back. Nothing on your computer affects it: to broadcast, start another session. A session hosted on your own machine needs `ffmpeg` and `mediamtx` in `/usr/local/bin` instead.
+The session server checks the relay every few seconds for as long as the session lasts, so this appears if the relay dies mid-session too, and clears if it comes back. Nothing on your computer affects it: to broadcast, start another session.
+
+A session hosted on your own machine is the other way round, because the session machine is yours. It broadcasts through `ffmpeg` and `mediamtx` on your own `PATH`, and the app installs neither: `brew install ffmpeg mediamtx` on macOS, `apt install ffmpeg` plus a [mediamtx release](https://github.com/bluenviron/mediamtx/releases) on Linux. Without them the reason says which one is missing. Broadcasting from a local session does not work on Windows at all yet; host in the cloud for that.
 
 ## While you are on air
 

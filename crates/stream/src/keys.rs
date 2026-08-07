@@ -1,8 +1,14 @@
 //! Staging a stream key for one pusher spawn.
 //!
 //! The rule from the threat model: a stream key lives in server memory and,
-//! for the instant it takes to spawn a pusher, in a root-only file on tmpfs.
-//! It is never an argument and never touches persistent disk.
+//! for the instant it takes to spawn a pusher, in a file only the account
+//! running the server can read. It is never an argument.
+//!
+//! On a session VM that file is on tmpfs and the account is root, so it never
+//! touches persistent disk. A session hosted on someone's own machine has no
+//! tmpfs on macOS or Windows and no privilege separation to speak of, so there
+//! the instant between the write and the unlink is on a real filesystem, in the
+//! session's own 0700 directory, owned by the host's own account.
 //!
 //! The file is created with mode 0600 by `open`, not by a later chmod, so
 //! there is no window where it is group or world readable. The directory

@@ -19,6 +19,7 @@ use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
 use jamstream_session::client::{ClientCore, ClientEvent};
+use jamstream_stream::pipeline::BROADCAST_SUBDIR;
 use tokio::net::UdpSocket;
 
 struct SessionMaterial {
@@ -221,6 +222,55 @@ async fn launch_join_destroy_end_to_end() {
             .is_empty(),
         "destroyed session still listed"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Where a locally hosted session broadcasts from, over a real spawn: the
+/// provider names this session's own directory and the server it starts puts
+/// the pipeline's working files inside it.
+///
+/// Nothing else in the workspace sees both halves of that. The layout on the
+/// other side of it is a resolution rather than a flag, its fallback is the
+/// session VM's `/run/jamstream`, and off Linux that is a directory under a
+/// read-only root: no FIFO, no encode, no broadcast.
+#[tokio::test]
+async fn a_locally_spawned_server_broadcasts_from_the_session_directory() {
+    let dir = scratch_dir("localmode-broadcast-dir");
+    let provider = LocalProvider::new(dir.clone())
+        .with_server_binary(server_binary())
+        .with_bind(IpAddr::V4(BIND));
+    let mut mat = session_material(10);
+    mat.reserved.release();
+    let instance = provider
+        .launch(launch_spec(&provider, &mat, "broadcast-dir"))
+        .await
+        .expect("launch");
+
+    // The provider creates the session directory and nothing inside it that
+    // belongs to the pipeline, so this directory can only be the spawned
+    // server's own answer to where it would broadcast from.
+    let session_dir = dir.join("sessions").join("broadcast-dir");
+    let work_dir = session_dir.join(BROADCAST_SUBDIR);
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
+    while Instant::now() < deadline && !work_dir.is_dir() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        work_dir.is_dir(),
+        "the spawned server never made {}, so its broadcast layout is somewhere else, \
+         and off Linux that somewhere is a read-only root",
+        work_dir.display()
+    );
+    let log = std::fs::read_to_string(session_dir.join("server.log")).expect("the server log");
+    assert!(
+        !log.contains("nowhere to work"),
+        "the server could not use the directory it was given: {log}"
+    );
+
+    provider
+        .destroy(&instance.region.id, &instance.id)
+        .await
+        .expect("destroy");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
