@@ -20,6 +20,14 @@ use jamstream_server::config::Config;
 use jamstream_server::runtime::{Options, RecordingOptions, Server};
 
 const RATE: u32 = 48_000;
+/// Separates "carried no audio" from "carried a badly separated tone", which the
+/// ratio below cannot: two noise floors have a ratio too. `tone_energy` is
+/// unnormalised, so a second of one fixture tone reads in the thousands. Ten
+/// measurements on a healthy pair: 822, 3593, 6071, 6707, 7272, 7396, 7893,
+/// 7915, 8003, 8467. Two Windows runs that failed the ratio read 0.7 and 3.0.
+/// This sits an order of magnitude under the worst healthy reading and two above
+/// the loudest failure, so it answers only the question it is asked.
+const TONE_FLOOR: f64 = 100.0;
 
 /// A real server on loopback, owned by a private tokio runtime so the tests
 /// themselves stay synchronous like the app.
@@ -1903,6 +1911,22 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
         let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
         let heard = tone_energy(&left, rate, theirs);
         let own = tone_energy(&left, rate, mine);
+        assert!(
+            left.len() >= rate as usize / 2,
+            "{out:?} holds {} samples at {rate} Hz, under half a second, so there \
+             is nothing to measure",
+            left.len()
+        );
+        // The floor comes first: a ratio between two noise floors decides
+        // nothing, and a silent run reads single digits where a tone reads
+        // thousands.
+        assert!(
+            heard > TONE_FLOOR,
+            "{out:?} heard {heard} at {theirs} Hz over {} samples, under the \
+             {TONE_FLOOR} floor, so this session carried no audio; its own \
+             {mine} Hz read {own}",
+            left.len()
+        );
         assert!(
             heard > own * 4.0,
             "{out:?} heard {heard} at {theirs} Hz against {own} at its own {mine} Hz"
