@@ -78,10 +78,15 @@ async fn activity_file_advances_with_musicians_and_stops_after_they_leave() {
     }
 
     // While both are connected the heartbeat touches the file about once a
-    // second; over ~3.5 s of polling the mtime must advance repeatedly.
+    // second, and the mtime must keep advancing. Waited for rather than
+    // counted inside a fixed window: at a one second heartbeat three advances
+    // need three seconds, so a 3.5 s window carries no margin and a loaded
+    // Windows runner delivers two.
+    const ADVANCES: usize = 3;
+    let watch = budget(Duration::from_secs(8));
     let mut observed: Vec<SystemTime> = Vec::new();
-    let watch_until = Instant::now() + Duration::from_millis(3_500);
-    while Instant::now() < watch_until {
+    let watch_until = Instant::now() + watch;
+    while observed.len() < ADVANCES && Instant::now() < watch_until {
         for c in &mut clients {
             c.pump(now()).await;
         }
@@ -93,8 +98,8 @@ async fn activity_file_advances_with_musicians_and_stops_after_they_leave() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        observed.len() >= 3,
-        "activity mtime advanced only {} time(s) in 3.5 s with musicians connected",
+        observed.len() >= ADVANCES,
+        "activity mtime advanced only {} time(s) in {watch:?} with musicians connected",
         observed.len()
     );
 
