@@ -87,9 +87,9 @@ const MAX_SENDS: u32 = 36;
 /// Sequence numbers past the cumulative ack that a receiver will hold while
 /// waiting for the gap to fill. `ack_bits` advertises exactly 32 entries, so
 /// anything further out cannot be selectively acked and gets retransmitted
-/// whether or not it was buffered: holding it buys nothing and, before this
-/// bound existed, cost about 2 KB of permanently live heap per packet from
-/// any peer that simply never sent `recv_next`.
+/// whether or not it was buffered, so holding it buys nothing and costs about
+/// 2 KB of permanently live heap per packet from any peer that simply never
+/// sends `recv_next`.
 pub const RECV_WINDOW: u64 = 32;
 
 /// Messages one link will hold queued or unacknowledged before refusing more.
@@ -197,10 +197,10 @@ pub enum DestinationState {
 /// The encoder publishes to a relay on the session machine and every pusher
 /// reads from it, so a session whose relay never came up, or whose broadcast
 /// tooling never downloaded, cannot stream anywhere no matter what key the
-/// host pastes. Nothing used to say so: the relay's unit is `Type=simple`, and
-/// systemd calls one of those started the moment it forks, so the only
-/// evidence anyone could get said `Started mediamtx.service` whether the relay
-/// was serving or had died a second later (#441).
+/// host pastes. Nothing else says so: the relay's unit is `Type=simple`, and
+/// systemd calls one of those started the moment it forks, so the journal reads
+/// `Started mediamtx.service` whether the relay is serving or died a second
+/// later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BroadcastReadiness {
     /// The relay answered where the encoder publishes.
@@ -253,11 +253,9 @@ pub struct DestinationStatus {
     /// Genuine loss: the frame was never delivered, so the broadcast's video
     /// timeline is this many pictures short of its audio.
     ///
-    /// This used to count repeats as well, which is what
-    /// [`Self::repeated_frames`] is for now (#278). One number could not say
-    /// which of the two a host was looking at, and they mean opposite things:
-    /// a repeat says the machine is struggling, a drop says it has already
-    /// failed to deliver.
+    /// Repeats are counted separately, by [`Self::repeated_frames`], because the
+    /// two mean opposite things: a repeat says the machine is struggling, a drop
+    /// says it has already failed to deliver.
     pub dropped_frames: u64,
     /// Catch-up frames the renderer had no time to draw, cumulative and
     /// pipeline-wide. Delivered, as a repeat of the previous picture: the
@@ -1598,10 +1596,10 @@ mod tests {
         assert!(postcard::from_bytes::<ControlMsg>(&golden[..golden.len() - 1]).is_err());
     }
 
-    /// The reassembly buffer used to grow without limit for any peer that
-    /// simply never sent the sequence number the receiver was waiting for.
-    /// Each frame can carry a 1 KB avatar chunk, so 2,000 packets, one home
-    /// connection's worth at 2,000 pps, pinned megabytes per second.
+    /// An unbounded reassembly buffer grows for any peer that simply never sends
+    /// the sequence number the receiver is waiting for. Each frame can carry a
+    /// 1 KB avatar chunk, so 2,000 packets, one home connection's worth at
+    /// 2,000 pps, pins megabytes per second.
     #[test]
     fn out_of_order_growth_is_bounded_by_the_window() {
         let mut b = ControlLink::new();
