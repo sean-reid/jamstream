@@ -250,21 +250,22 @@ impl KeyringStore {
     /// account key, and a directory that has stopped being private since
     /// the key was written is one somebody else can hand a key back from.
     ///
-    /// A refusal reads as nothing saved, which is a state the wizard
-    /// already explains; the reason goes to the log, naming the path and
-    /// never the value.
-    fn read_fallback(path: &Path) -> Option<String> {
+    /// `Ok(None)` is nothing saved here; `Err` is something saved that we
+    /// will not read, which the caller logs. A refusal reads back as
+    /// nothing saved either way, a state the wizard already explains.
+    ///
+    /// Vetting starts at the file, not at the directory: a machine that
+    /// never saved a credential has no credentials directory, and vetting
+    /// one that is not there turns "nothing saved" into a refusal for
+    /// every key name in turn.
+    fn read_fallback(path: &Path) -> std::io::Result<Option<String>> {
+        if !path.exists() {
+            return Ok(None);
+        }
         match read_private(path) {
-            Ok(bytes) => String::from_utf8(bytes).ok().filter(|v| !v.is_empty()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    path = %path.display(),
-                    "refusing to read a saved credential"
-                );
-                None
-            }
+            Ok(bytes) => Ok(String::from_utf8(bytes).ok().filter(|v| !v.is_empty())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
         }
     }
 }
@@ -276,7 +277,17 @@ impl CredStore for KeyringStore {
             .filter(|v| !v.is_empty())
             .or_else(|| {
                 let path = self.fallback_path(provider, field).ok()?;
-                Self::read_fallback(&path)
+                match Self::read_fallback(&path) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            path = %path.display(),
+                            "refusing to read a saved credential"
+                        );
+                        None
+                    }
+                }
             })
     }
 
@@ -818,11 +829,44 @@ mod tests {
             None,
             "a key read back out of a world writable directory"
         );
+        assert!(
+            KeyringStore::read_fallback(&dir.join("gcp.service_account_json")).is_err(),
+            "a directory that cannot be trusted is a refusal, not an empty slot"
+        );
 
         // Tightened again, it is the same key it always was.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         assert_eq!(store.get(provider, field).as_deref(), Some(secret.as_str()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A joiner has no cloud credentials and never will, so their machine
+    /// has no credentials directory either. Every slot has to read back as
+    /// nothing saved, silently: reporting a directory that was never
+    /// created as one whose permissions we refuse to trust put nine
+    /// warnings at the top of a Windows guest's log, in a file that asks
+    /// for anything in it to be reported as a bug (#461).
+    #[test]
+    fn no_credentials_directory_is_nothing_saved_rather_than_a_refusal() {
+        let (store, dir) = capped_store("absent");
+        assert!(!dir.exists(), "the fixture starts with no directory");
+        for (provider, field) in [
+            DO_TOKEN,
+            AWS_ACCESS_KEY_ID,
+            AWS_SECRET_ACCESS_KEY,
+            GCP_SERVICE_ACCOUNT_JSON,
+        ] {
+            let path = dir.join(KeyringStore::account(provider, field));
+            assert_eq!(
+                KeyringStore::read_fallback(&path).expect("an absent path is not a refusal"),
+                None
+            );
+            assert_eq!(store.get(provider, field), None);
+        }
+        assert!(
+            !dir.exists(),
+            "looking for a credential created the directory"
+        );
     }
 
     /// A secret the keychain takes never reaches the disk: not the file,
