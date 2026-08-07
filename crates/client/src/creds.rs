@@ -20,10 +20,9 @@
 //! is undone by pasting again, and the character count catches the paste that
 //! took half a token, which is the failure a reveal was there for.
 //!
-//! The destinations sheet argued this for stream keys and held the line while
-//! the host wizard's API token field kept a Show button and the Recording
-//! tab's key pair kept another, so two surfaces disagreed about whether the
-//! same class of secret was safe to put on a screen (#184). It is not.
+//! No surface gets an exception: a Show button on any credential field would
+//! let that class of secret disagree with every other about whether it is
+//! safe on a screen. It is not.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -380,8 +379,8 @@ pub fn build_provider(
 /// [`build_provider`] for a launch, which has to name the port the session
 /// will listen on: that is the one port the provider opens in the firewall it
 /// creates, so a provider built without it can leave the machine behind a
-/// firewall for a different port. `jamstream host` threads it through
-/// `providers::resolve_for_port` and the app dropped it (#227).
+/// firewall for a different port. The app threads it through here the same
+/// way `jamstream host` threads it through `providers::resolve_for_port`.
 pub fn build_provider_for_port(
     name: &str,
     session_port: u16,
@@ -391,7 +390,7 @@ pub fn build_provider_for_port(
     // The cloud crate's own parser, not a fifth table of the same four
     // spellings: `ProviderKind::as_str` is authoritative and the hand-written
     // matches kept drifting from it, so a fifth provider is a compile error in
-    // the arms below rather than a wrong error message here (#233).
+    // the arms below rather than a wrong error message here.
     let kind: ProviderKind = name
         .parse()
         .map_err(|e: jamstream_cloud::ProviderError| e.to_string())?;
@@ -843,9 +842,9 @@ mod tests {
     /// A joiner has no cloud credentials and never will, so their machine
     /// has no credentials directory either. Every slot has to read back as
     /// nothing saved, silently: reporting a directory that was never
-    /// created as one whose permissions we refuse to trust put nine
+    /// created as one whose permissions we refuse to trust would put nine
     /// warnings at the top of a Windows guest's log, in a file that asks
-    /// for anything in it to be reported as a bug (#461).
+    /// for anything in it to be reported as a bug.
     #[test]
     fn no_credentials_directory_is_nothing_saved_rather_than_a_refusal() {
         let (store, dir) = capped_store("absent");

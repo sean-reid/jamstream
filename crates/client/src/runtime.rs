@@ -284,7 +284,7 @@ pub struct StatsView {
     /// opens and on platforms with no shared/exclusive split, which is why
     /// the readout says nothing rather than inventing an answer.
     pub device_mode: Option<DeviceModeView>,
-    /// How each direction reached the session rate (#347): the device's own
+    /// How each direction reached the session rate: the device's own
     /// clock, a clock this app moved, an OS converter, or the boundary
     /// resampler with its cost. `None` while there is no stream.
     pub rate: Option<RateOutcomesView>,
@@ -444,7 +444,7 @@ pub struct Snapshot {
     /// Why this computer has no audio stream, in the device's own words, for
     /// as long as it has none. A device swapped mid-song and refused leaves
     /// the session up and the musician silent, so the reason belongs on
-    /// screen rather than only in the log (#263).
+    /// screen rather than only in the log.
     pub device_error: Option<String>,
 }
 
@@ -458,7 +458,7 @@ pub trait Runtime: Send {
     /// ended" check. The default answer is the snapshot's, so an
     /// implementation is free to ignore this; one whose snapshot copies a
     /// roster and a chat buffer should not, because this is asked every
-    /// frame and the answer is one enum (#382).
+    /// frame and the answer is one enum.
     fn conn_state(&self) -> ConnState {
         self.snapshot().stats.state
     }

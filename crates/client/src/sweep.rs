@@ -2,9 +2,9 @@
 //! then bring the session records back in line with what is really running.
 //!
 //! `jamstream sweep` is what saves a host when a launch half-failed or a
-//! record is wrong, and it lived only in the CLI. The DMG and the Scoop app
-//! package ship no CLI, so the person most likely to strand a billing machine
-//! was the one who could not run the command that finds it (#371).
+//! record is wrong. The DMG and the Scoop app package ship no CLI, so the
+//! person most likely to strand a billing machine has no way to run the
+//! command that finds it unless the app carries its own sweep too.
 //!
 //! The engine is [`jamstream_cloud::sweep`] and the record reconciliation is
 //! [`jamstream_cli::sweep::reconcile`], both called here rather than

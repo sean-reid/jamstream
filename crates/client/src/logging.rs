@@ -62,7 +62,7 @@ pub fn init() -> Option<PathBuf> {
 /// The seam exists because the banner's claim is about the file: an empty one
 /// is a healthy run. A test that holds a whole session to that has to read the
 /// real file, written through the real filter, rather than a formatter standing
-/// in for it (#451).
+/// in for it.
 pub fn init_at(path: PathBuf) -> Option<PathBuf> {
     let filter = jamstream_cli::logging::from_env();
     match open_log_file_at(path) {
@@ -168,7 +168,7 @@ mod tests {
     /// The app takes the CLI's filter wholesale: warnings by default so
     /// degradations show, and a `RUST_LOG` target directive still wins.
     /// Pinned from this binary's side so the shared module cannot drift
-    /// out from under it (#298 moved it from EnvFilter to Targets).
+    /// out from under it.
     #[test]
     fn the_filter_defaults_to_warn_and_honors_rust_log() {
         use tracing::Level;

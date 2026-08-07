@@ -46,10 +46,8 @@ use crate::screens::invites::TokenMap;
 const SAMPLE_RATE: u32 = jamstream_protocol::SAMPLE_RATE;
 const CHANNELS: u16 = 2;
 /// The pace this side loops at and the frame it sends, both belonging to
-/// [`FrameDuration::Ms2_5`] and both taken from it. They used to be hand
-/// computed here, with `the_frame_matches_the_wires_own_frame` holding them to
-/// the wire's answer; the accessors are const fns now, so the derivation
-/// replaces the assertion (#231).
+/// [`FrameDuration::Ms2_5`] and derived from its const fns, so both always
+/// match the wire's own frame instead of a hand-computed copy of it.
 const TICK: Duration = Duration::from_micros(FrameDuration::Ms2_5.micros() as u64);
 /// One frame: 120 mono capture samples, 240 interleaved playout.
 const FRAME_FRAMES: usize = FrameDuration::Ms2_5.samples() as usize;
@@ -108,9 +106,9 @@ const REFUSED_WINDOW_LIMIT: u64 = 200;
 const CAPTURE_RING: Duration = Duration::from_millis(40);
 /// Wait before the ring counters are reported again, and the ceiling that wait
 /// doubles to. A burst at open is then one line, while a ring that keeps
-/// dropping says so for as long as it does without filling the file: the old
-/// once-per-stream line could not tell those apart, and #436 arrived as a
-/// single count with no way to know whether it was still climbing.
+/// dropping says so for as long as it does without filling the file: a single
+/// once-per-stream count cannot distinguish a burst from a total that is
+/// still climbing.
 const RING_REPORT_AGAIN: Duration = Duration::from_secs(1);
 const RING_REPORT_MAX: Duration = Duration::from_secs(60);
 /// Floor under [`playout_stall_after`], so a ring only a frame or two deep does
@@ -178,7 +176,7 @@ fn stream_config(settings: &AudioSettings) -> StreamConfig {
 /// device negotiated when that is bigger. A device is free to ignore the
 /// request (WASAPI shared mode calls back at its period, ~480 frames against
 /// the 120 default), and a ring sized from the request alone then underruns
-/// on every render callback and drops the tail of every capture (#323).
+/// on every render callback and drops the tail of every capture.
 fn ring_frames(requested: u32, negotiated: Option<u32>) -> u32 {
     negotiated.unwrap_or(0).max(requested)
 }
@@ -290,8 +288,8 @@ struct SharedState {
     /// reads it the way it reads the connection state rather than being told
     /// once in a chat line it may already have scrolled past.
     device_error: Option<String>,
-    /// How each direction of the running stream reaches the session rate
-    /// (#347), from the backend's report at open; None while there is no
+    /// How each direction of the running stream reaches the session rate,
+    /// from the backend's report at open; None while there is no
     /// stream, so the UI never shows a dead stream's outcome.
     rate: Option<RateOutcomesView>,
 }
@@ -584,7 +582,7 @@ impl ReopenEpisode {
 ///
 /// All three are warnings because the log file promises that an empty file is a
 /// healthy run, and a member who heard nobody for a whole session found nothing
-/// in it (#451). All three are one line per episode, like the ring counters: at
+/// in it. All three are one line per episode, like the ring counters: at
 /// 2.5 ms a tick, warning per tick would put hundreds of lines a second in a
 /// file people mail us.
 ///
@@ -736,10 +734,10 @@ impl PlayoutWatch {
 /// sees them: the first movement at once, then again on a doubling wait for as
 /// long as the count keeps climbing.
 ///
-/// The cadence is the point. #436 arrived as `overruns=33` on a stream that had
-/// been up for a second, and nothing in the file could say whether that was a
-/// burst while the session came up or the first second of a drip that ran for
-/// the whole song. Those want different fixes, and the person who can hear the
+/// The cadence is the point: a single total, like `overruns=33` on a stream
+/// that has been up for a second, cannot say whether that is a burst while
+/// the session came up or the first second of a drip that runs for the
+/// whole song. Those want different fixes, and the person who can hear the
 /// damage is at the other end of the session, so the log is where it has to be
 /// answerable. Each line carries the count since the last one and how long the
 /// stream has been up, so the shape reads off the timestamps.
@@ -875,7 +873,7 @@ impl LiveRuntime {
         // Everything that can be done before the device starts is done before
         // the device starts. Capture flows from the moment the stream opens,
         // into a ring whose only consumer is the worker thread below, so any
-        // work between those two points is audio at risk (#436). The join
+        // work between those two points is audio at risk. The join
         // datagram waits for the open to succeed: a failed open leaves no
         // half-joined member on the server.
         let socket = connect_socket(addr).map_err(LiveError::Io)?;
@@ -960,7 +958,7 @@ impl LiveRuntime {
     /// The connection state without a snapshot behind it. The frame loop
     /// asks every frame only to see whether the session has ended, and
     /// [`Self::snapshot_now`] would copy the roster, the chat buffer, and
-    /// the destinations to answer it (#382).
+    /// the destinations to answer it.
     fn conn_now(&self) -> ConnState {
         self.shared.lock().expect("live state").conn.clone()
     }
@@ -1261,12 +1259,13 @@ struct Worker {
     /// Frames the current ring was sized from: the settings' request, or the
     /// device's own callback size when the device negotiated a bigger one.
     device_frames: u32,
-    /// The bridge counters as the log reports them; they had no other
-    /// consumer, so a ring the device outgrew was audible but invisible
-    /// (#323).
+    /// The bridge counters as the log reports them; nothing else consumes
+    /// them, so without this a ring the device outgrows is audible but
+    /// invisible.
     rings: RingWatch,
-    /// One warn per episode when playout goes silent or media is refused; the
-    /// jitter buffer's counters had no consumer that could say either (#451).
+    /// One warn per episode when playout goes silent or media is refused;
+    /// nothing else consumes the jitter buffer's counters, so without this
+    /// neither would be said.
     playout: PlayoutWatch,
     settings: AudioSettings,
     shared: Arc<Mutex<SharedState>>,
@@ -1467,10 +1466,10 @@ impl Worker {
 
     /// Closes and reopens the audio stream with new settings; the network
     /// side never pauses. On failure the user's selection is kept and the
-    /// reopen cadence keeps trying exactly it: rewriting the settings
-    /// to the system default here left the Audio tab claiming a device the
-    /// stream did not run, from then on, with only a chat line to say so
-    /// (#327). The refusal itself stays on screen through `device_error`.
+    /// reopen cadence keeps trying exactly it: rewriting the settings to the
+    /// system default here would leave the Audio tab claiming a device the
+    /// stream does not run, with only a chat line to say otherwise. The
+    /// refusal itself stays on screen through `device_error`.
     fn reconfigure(&mut self, settings: AudioSettings) {
         // Drain what the old ring already captured so those samples reach
         // the core before the endpoints are dropped; orphaning them would
@@ -1719,7 +1718,7 @@ impl Worker {
     /// the jitter buffer's playout position, and it is otherwise reached only
     /// from the device-paced fill above, so the buffer would fill to its depth
     /// cap and give the position up while the frames it was holding were the
-    /// only audio the reopened stream could have started from (#447). What comes
+    /// only audio the reopened stream could have started from. What comes
     /// out here is dropped: there is no device to play it.
     fn drain_stalled_playout(&mut self) {
         let now = Instant::now();
@@ -1748,9 +1747,8 @@ impl Worker {
 
     /// The bridge counters, reported by [`RingWatch`]. Movement means a ring
     /// too shallow for what the device delivers or for what the worker is
-    /// keeping up with, which is the shape of both #323 and #436; the log is
-    /// the one place that class of defect shows as something other than bad
-    /// audio somebody else can hear.
+    /// keeping up with; the log is the one place that class of defect shows
+    /// as something other than bad audio somebody else can hear.
     fn watch_ring_health(&mut self) {
         let Some(engine) = self.engine.as_ref() else {
             return;
@@ -2102,7 +2100,7 @@ mod tests {
         assert_eq!(CHUNK_STEREO, FRAME_FRAMES * usize::from(CHANNELS));
     }
 
-    /// The sizing at the heart of #323: the rings must fit the callbacks the
+    /// The sizing that matters: the rings must fit the callbacks the
     /// device really delivers, and the request is only a lower bound.
     #[test]
     fn the_ring_is_sized_from_what_the_device_delivers() {
@@ -2121,10 +2119,11 @@ mod tests {
         assert_eq!(ring_frames(240, Some(32)), 240);
     }
 
-    /// What the two capacities cost, which is why they are two (#436). The
+    /// What the two capacities cost, which is why they are two. The
     /// playout ring is held full, so its capacity is mouth-to-ear and stays at
-    /// the two callbacks #323 settled on. The capture ring is drained to empty,
-    /// so its capacity is only stall tolerance and buys 40 ms of it.
+    /// the two callbacks of headroom the design settles on. The capture ring
+    /// is drained to empty, so its capacity is only stall tolerance and buys
+    /// 40 ms of it.
     #[test]
     fn the_capture_ring_is_deeper_than_the_playout_cushion_and_costs_nothing() {
         let ms =
@@ -2142,7 +2141,7 @@ mod tests {
             );
         }
         // A device period past the floor takes the deeper of the two rather
-        // than losing the callback slack #323 established.
+        // than losing the two-callback slack the ring depends on.
         assert_eq!(capture_capacity(2_400), playout_capacity(2_400));
     }
 
@@ -2192,9 +2191,9 @@ mod tests {
         assert_eq!(engine.overruns(), 0);
     }
 
-    /// The starvation in #436 at the shape a real device produces: 120-frame
-    /// callbacks arriving before the consumer's first drain exists. A CoreAudio
-    /// open had capture running more than 20 ms before the caller held the
+    /// The starvation shape a real device produces: 120-frame callbacks
+    /// arriving before the consumer's first drain exists. A CoreAudio open
+    /// has capture running more than 20 ms before the caller holds the
     /// handle, which at 2.5 ms a callback is eight of them.
     ///
     /// Counted rather than timed. The producer is the device's clock in
@@ -2233,8 +2232,8 @@ mod tests {
         );
     }
 
-    /// The chat copy per rung change, the #347 disclosure contract: rung 2
-    /// and rung 3 are announced once, an unchanged rung and rung 1 say
+    /// The chat copy per rung change, the rate-rung disclosure contract: rung
+    /// 2 and rung 3 are announced once, an unchanged rung and rung 1 say
     /// nothing (so the reopen cadence cannot flood chat), the OS converter
     /// stays hover-only, and a converter that replaced a clock this app set
     /// names the contest instead of reading like a random downgrade.
@@ -2468,11 +2467,11 @@ mod tests {
         }
     }
 
-    /// #451: a joined client handed no media at all hears silence for the whole
-    /// session, and the log used to carry nothing about it. One line, naming
-    /// the numbers that separate "nothing is arriving" from "arriving and being
-    /// refused", and one line only: three seconds of it at 2.5 ms a tick would
-    /// otherwise be 1200 of them.
+    /// A joined client handed no media at all hears silence for the whole
+    /// session. The log names it in one line, giving the numbers that
+    /// separate "nothing is arriving" from "arriving and being refused", and
+    /// one line only: three seconds of it at 2.5 ms a tick would otherwise be
+    /// 1200 of them.
     #[test]
     fn a_client_handed_no_media_says_so_once() {
         let lines = captured(|| Ticker::new().run(1_200, Some(ME), |_, _| {}));
@@ -2494,11 +2493,12 @@ mod tests {
         }
     }
 
-    /// The other half of #451: media that arrives and is refused. Every tick
-    /// carries this tick's frame and a copy of one from 100 ms back, which is
-    /// behind playout and dropped, so `late` climbs while depth stays at
-    /// target and audio keeps playing. The reader has to be able to tell this
-    /// from hearing nothing, because the causes are nothing alike.
+    /// Media that arrives and is refused: the counterpart to a client
+    /// hearing nothing at all. Every tick carries this tick's frame and a
+    /// copy of one from 100 ms back, which is behind playout and dropped, so
+    /// `late` climbs while depth stays at target and audio keeps playing.
+    /// The reader has to be able to tell this from hearing nothing, because
+    /// the causes are nothing alike.
     #[test]
     fn a_client_whose_media_is_refused_says_something_else() {
         let lines = captured(|| Ticker::new().run(1_200, Some(ME), stale_copies));
@@ -2658,8 +2658,8 @@ mod tests {
         (device, engine)
     }
 
-    /// The shape #436 could not be read from the log: drops that happen in a
-    /// burst and then stop say so once. The count, the ring, and how long the
+    /// The shape a single total misses: drops that happen in a burst and
+    /// then stop say so once. The count, the ring, and how long the
     /// stream had been up all ride the line, because those are what separate a
     /// burst at open from a drip.
     #[test]
@@ -2747,7 +2747,7 @@ mod tests {
         assert_eq!(dropped, last, "the deltas must add up to the total");
     }
 
-    /// #436 on a real device: the client's own ring sizes, the client's own
+    /// A real device test: the client's own ring sizes, the client's own
     /// 2.5 ms consumer cadence, and a sound card producing on its own clock,
     /// which no fake in this workspace does. The only backend a test can drive
     /// is pumped by the consumer itself, so the producer could never be early
@@ -2756,10 +2756,9 @@ mod tests {
     /// A device starts delivering the moment its stream opens, which is before
     /// the caller holds the handle and well before a worker thread drains
     /// anything: measured here, a CoreAudio open hands over with 2 to 11
-    /// callbacks already captured, up to 27 ms of audio. Against the old
-    /// two-callback ring, 5 ms, the rest of that was dropped, which is what the
-    /// report counted. Against the capture ring it is held and then drained in
-    /// one pull.
+    /// callbacks already captured, up to 27 ms of audio. A two-callback ring,
+    /// 5 ms, drops the rest of that. The capture ring holds it and drains it
+    /// in one pull.
     ///
     /// The last assertion is what stops the others passing on a machine
     /// producing nothing at all.
