@@ -201,10 +201,10 @@ fn telephony_mic(direction: Direction, native_rate: u32, form: FormFactor) -> bo
 }
 
 /// What the person at the keyboard can do about a device that will not open
-/// at any rate the ladder can carry. Rare since #347: the converter takes
-/// what used to be refused, so this sentence is read only when the
-/// native-rate open itself failed. Per host rather than per platform, because
-/// the two Linux hosts fail for opposite reasons.
+/// at any rate the ladder can carry. Rare, because the converter takes the
+/// rates the ladder cannot: this sentence is read only when the native-rate
+/// open itself failed. Per host rather than per platform, because the two Linux
+/// hosts fail for opposite reasons.
 fn rate_remedy(host: &str, rate: u32) -> String {
     match host {
         // mmsys.cpl by name, because Windows 11's Settings app no longer has
@@ -386,9 +386,8 @@ mod tests {
         assert_eq!(chosen.sample_format(), SampleFormat::I16);
     }
 
-    /// The regression this whole path exists for: a PipeWire graph at 44.1 kHz
-    /// advertises 44100 and nothing else, and used to be refused, even though
-    /// PipeWire would have carried a 48 kHz client stream correctly.
+    /// A PipeWire graph at 44.1 kHz advertises 44100 and nothing else, and must
+    /// still be attempted: PipeWire carries a 48 kHz client stream correctly.
     #[test]
     fn a_graph_that_advertises_only_44_1_is_attempted_on_a_converting_host() {
         let native = native(44_100, 2);

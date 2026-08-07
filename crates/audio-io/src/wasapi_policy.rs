@@ -432,8 +432,8 @@ mod tests {
     }
 
     /// The whole point of rejecting DeviceInUse: the words the user sees name
-    /// the exclusive holder instead of cpal's generic "temporarily busy",
-    /// which is what falling back used to produce.
+    /// the exclusive holder instead of cpal's generic "temporarily busy", which
+    /// is what falling back produces.
     #[test]
     fn a_device_held_exclusively_rejects_with_the_classifier_words() {
         let message = open_error(
