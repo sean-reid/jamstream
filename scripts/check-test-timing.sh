@@ -24,10 +24,10 @@ set -eu
 cd "$(dirname "$0")/.."
 
 # Every occurrence outside its own definition measures a position in a file
-# whose length depends on how fast the machine ran. #474 is converting the
-# ones already here, so the budget holds the ground until it reaches zero.
+# whose length depends on how fast the machine ran. Two are deliberate: both
+# read a span meant to be silent, where padding is silence too.
 TAIL_FILE=crates/client/tests/live_runtime.rs
-TAIL_BUDGET=8
+TAIL_BUDGET=2
 
 SLEEP_SCAN=$(mktemp)
 TAIL_SCAN=$(mktemp)
