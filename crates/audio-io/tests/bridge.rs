@@ -2,10 +2,6 @@
 //! overrun, counters visible from the engine side, and the two rings sized
 //! apart from each other.
 
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
-
 use jamstream_audio_io::CallbackBridge;
 
 /// Capture direction: device pushes chunks of 7, engine drains with a 5-wide
@@ -115,51 +111,32 @@ fn the_two_rings_are_sized_apart() {
     );
 }
 
-/// A device-paced producer against a consumer that has not started yet, which
-/// is every session's first moments: the device thread runs on the sound card's
-/// clock and the ring's only consumer is a thread that still has work to do
-/// before its first drain. Capture that arrives in that window is destroyed
-/// unless the ring can hold it, and the ring is the only thing that decides.
+/// Capture that arrives before the consumer's first drain is destroyed unless
+/// the ring can hold it, which is every session's first moments: the device
+/// runs on the sound card's clock while the worker still has work to do.
 ///
-/// Sized from a real CoreAudio device: 120-frame callbacks 2.5 ms apart against
-/// a bring-up window past 20 ms, where two callbacks of ring holds 5 ms.
+/// Counted in callbacks rather than timed, so a loaded runner cannot change the
+/// answer. A real CoreAudio device delivers 120-frame callbacks 2.5 ms apart
+/// and takes past 20 ms to hand the stream over, so eight of them is the window
+/// a ring has to survive; two callbacks of capacity holds 5 ms of it.
 #[test]
 fn a_ring_holds_what_arrives_before_the_consumer_starts() {
     const CALLBACK: usize = 240;
-    const PERIOD: Duration = Duration::from_micros(2_500);
-    const LATE: Duration = Duration::from_millis(20);
+    const BRING_UP: usize = 8;
 
     for (capacity, want_drops) in [(2 * CALLBACK, true), (16 * CALLBACK, false)] {
         let (mut device, mut engine) = CallbackBridge::new(capacity, CALLBACK);
-        let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let producer = thread::spawn(move || {
-            let mut next = Instant::now();
-            let mut pushed = 0usize;
-            while stop_rx.try_recv().is_err() {
-                device.on_capture(&[1.0; CALLBACK]);
-                pushed += CALLBACK;
-                next += PERIOD;
-                let now = Instant::now();
-                if next > now {
-                    thread::sleep(next - now);
-                }
-            }
-            pushed
-        });
-
-        thread::sleep(LATE);
+        for _ in 0..BRING_UP {
+            device.on_capture(&[1.0; CALLBACK]);
+        }
         let mut buf = vec![0.0f32; capacity];
         let got = engine.pull_captured(&mut buf);
         let overruns = engine.overruns();
-        let _ = stop_tx.send(());
-        let pushed = producer.join().expect("producer thread");
-
         assert_eq!(
             overruns > 0,
             want_drops,
-            "a ring of {capacity} samples saw {overruns} overruns over a {LATE:?} \
-             window in which the device pushed {pushed} samples and the first \
-             drain took {got}"
+            "a ring of {capacity} samples saw {overruns} overruns holding \
+             {BRING_UP} callbacks of {CALLBACK}, and the first drain took {got}"
         );
     }
 }
