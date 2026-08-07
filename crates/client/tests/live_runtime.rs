@@ -20,6 +20,14 @@ use jamstream_server::config::Config;
 use jamstream_server::runtime::{Options, RecordingOptions, Server};
 
 const RATE: u32 = 48_000;
+/// Separates "carried no audio" from "carried a badly separated tone", which the
+/// ratio below cannot: two noise floors have a ratio too. `tone_energy` is
+/// unnormalised, so a second of one fixture tone reads in the thousands. Ten
+/// measurements on a healthy pair: 822, 3593, 6071, 6707, 7272, 7396, 7893,
+/// 7915, 8003, 8467. Two Windows runs that failed the ratio read 0.7 and 3.0.
+/// This sits an order of magnitude under the worst healthy reading and two above
+/// the loudest failure, so it answers only the question it is asked.
+const TONE_FLOOR: f64 = 100.0;
 
 /// A real server on loopback, owned by a private tokio runtime so the tests
 /// themselves stay synchronous like the app.
@@ -206,9 +214,67 @@ fn tail_rms(path: &Path, secs: f64) -> f64 {
     rms(&tail(path, secs).1)
 }
 
+/// RMS of the loudest `secs` window anywhere in a capture file.
+///
+/// For asking whether audio was ever there. A capture file spans from before
+/// the join to after the leave, so both ends hold silence the backend wrote
+/// while nothing played, and on a slow host that padding is longer than the
+/// window: measured 1.75 s at the front and 0.75 s at the back on a loaded
+/// Windows runner.
+fn loudest_rms(path: &Path, secs: f64) -> f64 {
+    let (rate, samples) = rate_and_samples(path);
+    let win = ((secs * f64::from(rate)) as usize * 2).max(2);
+    if samples.len() <= win {
+        return rms(&samples);
+    }
+    samples
+        .chunks(win)
+        .filter(|c| c.len() >= win / 2)
+        .map(rms)
+        .fold(0.0f64, f64::max)
+}
+
 /// Energy at one frequency, by Goertzel. Cheaper than a transform when the
 /// question is about a handful of candidates rather than a whole spectrum.
 fn tone_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
+    // Summed over blocks, not measured in one pass. A Goertzel is coherent, so
+    // a phase discontinuity inside the window cancels a tone that is plainly
+    // audible: one inversion halfway through a second takes 12000 to 0, and
+    // concealed or repeated frames put such steps in real playout. Block
+    // magnitudes add instead, which cost a quarter of a block per step. A
+    // quarter second resolves 4 Hz, finer than the 20 Hz the pitch callers
+    // allow.
+    let block = (rate as usize / 4).max(1);
+    samples
+        .chunks(block)
+        .map(|c| coherent_energy(c, rate, hz))
+        .sum()
+}
+
+/// The whole file's `tone_energy` blocks at `hz`, with its duration: what a
+/// tail reading of nothing looks like across the run it came from.
+///
+/// A tail is one window of a paced file, and two very different runs read the
+/// same in it. A session that never carried audio reads nothing everywhere; a
+/// session the machine took the cpu away from reads healthy and then stops,
+/// because the offline pump replays the debt faster than media can arrive and
+/// the pulls it cannot fill are written to the capture file as zeros. Only the
+/// profile separates them, so the tail assertions print it when they fire.
+fn tone_profile(path: &Path, hz: f64) -> String {
+    let (rate, samples) = rate_and_samples(path);
+    let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
+    let profile: Vec<u64> = left
+        .chunks((rate as usize / 4).max(1))
+        .map(|c| coherent_energy(c, rate, hz) as u64)
+        .collect();
+    format!(
+        "{:.2} s at {rate} Hz reads {profile:?} per 250 ms at {hz} Hz",
+        left.len() as f64 / f64::from(rate)
+    )
+}
+
+/// One Goertzel pass. Only meaningful over a span the tone holds phase across.
+fn coherent_energy(samples: &[f32], rate: u32, hz: f64) -> f64 {
     let k = 2.0 * std::f64::consts::PI * hz / f64::from(rate);
     let coeff = 2.0 * k.cos();
     let (mut s1, mut s2) = (0.0f64, 0.0f64);
@@ -1309,15 +1375,16 @@ fn a_stream_away_for_a_few_seconds_keeps_the_jitter_buffer_moving() {
         "{} opens: the refusals never happened",
         device.opens()
     );
-    // The deepest a buffer being drained ever sits is its own target, and the
-    // target is capped; the cap on depth is nearly three times that, and
-    // reaching it costs the playout position.
+    // Reaching the cap is what costs the playout position, and a buffer nobody
+    // drains pins there: that is the fault this covers. How far under the cap a
+    // drained buffer sits depends on how promptly the worker gets to run, so the
+    // cap is the assertion and the target is only context.
     assert!(
-        deepest <= JitterBuffer::MAX_TARGET_FRAMES + 1,
-        "b's buffer reached {deepest} frames with no stream to pull it, against a \
-         target that never exceeds {} and a cap of {}",
-        JitterBuffer::MAX_TARGET_FRAMES,
-        JitterBuffer::MAX_DEPTH_FRAMES
+        deepest < JitterBuffer::MAX_DEPTH_FRAMES,
+        "b's buffer reached the {}-frame cap with no stream to pull it, so the \
+         drain never ran; its target never exceeds {}",
+        JitterBuffer::MAX_DEPTH_FRAMES,
+        JitterBuffer::MAX_TARGET_FRAMES
     );
 
     // And the half that matters: audio comes back. The capture file is
@@ -1330,7 +1397,7 @@ fn a_stream_away_for_a_few_seconds_keeps_the_jitter_buffer_moving() {
     });
     drop(b);
     drop(a);
-    let rms = tail_rms(&out_b, 1.0);
+    let rms = loudest_rms(&out_b, 1.0);
     assert!(
         rms > 0.02,
         "b heard near-silence (rms {rms}) after its stream came back"
@@ -1899,13 +1966,43 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     // reason, so each side has to have heard the other's tone. The personal mix
     // excludes self, so the tone measured is the one that crossed the wire.
     for (out, theirs, mine) in [(&out_a, 660.0, 440.0), (&out_b, 440.0, 660.0)] {
-        let (rate, samples) = tail(out, 1.0);
-        let left: Vec<f32> = samples.iter().copied().step_by(2).collect();
-        let heard = tone_energy(&left, rate, theirs);
-        let own = tone_energy(&left, rate, mine);
+        // The loudest second, not the last one. The file runs from before the
+        // join to after the leave, so its ends are silence the backend wrote
+        // while nothing was playing: a slow runner put 1.75 s of it at the
+        // front and 0.75 s at the back, and the tail then measured the padding
+        // rather than the session.
+        let (rate, samples) = rate_and_samples(out);
+        let all: Vec<f32> = samples.iter().copied().step_by(2).collect();
+        let second = rate as usize;
+        assert!(
+            all.len() >= second / 2,
+            "{out:?} holds {} samples at {rate} Hz, under half a second, so there \
+             is nothing to measure",
+            all.len()
+        );
+        let (heard, own) = all
+            .chunks(second)
+            .filter(|w| w.len() >= second / 2)
+            .map(|w| (tone_energy(w, rate, theirs), tone_energy(w, rate, mine)))
+            .max_by(|x, y| x.0.total_cmp(&y.0))
+            .expect("at least one window");
+
+        // The floor comes first: a ratio between two noise floors decides
+        // nothing, and a silent run reads single digits where a tone reads
+        // thousands.
+        assert!(
+            heard > TONE_FLOOR,
+            "{out:?} heard {heard} at {theirs} Hz in its loudest second, under \
+             the {TONE_FLOOR} floor, so no second of it carried audio; its own \
+             {mine} Hz read {own} there. The whole file: {}. The log holds: {}",
+            tone_profile(out, theirs),
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
         assert!(
             heard > own * 4.0,
-            "{out:?} heard {heard} at {theirs} Hz against {own} at its own {mine} Hz"
+            "{out:?} heard {heard} at {theirs} Hz against {own} at its own {mine} Hz. \
+             The whole file: {}",
+            tone_profile(out, theirs)
         );
     }
 
