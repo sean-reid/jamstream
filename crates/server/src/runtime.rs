@@ -854,8 +854,8 @@ mod tests {
         );
     }
 
-    /// The whole point of #47: an unwind out of the core stops here instead of
-    /// leaving run(), block_on, and main, which took every member with it.
+    /// An unwind out of the core stops here instead of leaving run(),
+    /// block_on, and main, which took every member with it.
     #[test]
     fn guard_turns_an_unwind_into_a_value_the_loop_can_handle() {
         assert_eq!(guard(|| 7), Some(7));
