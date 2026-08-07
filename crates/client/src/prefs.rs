@@ -107,7 +107,7 @@ pub struct AppPrefs {
     #[serde(default)]
     pub allow_exclusive: Option<bool>,
     /// The display name last joined with, pre-filling the join screen so a
-    /// band member types who they are once, not once per session (#357).
+    /// band member types who they are once, not once per session.
     #[serde(default)]
     pub display_name: Option<String>,
 }
