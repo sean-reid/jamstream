@@ -1013,6 +1013,19 @@ impl TakesScreen {
                     if let Some(err) = self.error.clone() {
                         theme::reason(ui, err);
                     }
+                    // With the listing error rather than under the scroll
+                    // area: the area fills what is left of the window, so
+                    // anything after it is below the bottom edge.
+                    if let Some((path, err)) = &self.reveal_error {
+                        theme::reason(ui, format!("{err}. The take is here:"));
+                        let mut shown = path.display().to_string();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut shown)
+                                .desired_width(ui.available_width())
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.add_space(theme::SPACE_SM);
+                    }
                     if self.rows.is_empty() && self.error.is_none() {
                         theme::panel(ui).show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -1049,16 +1062,6 @@ impl TakesScreen {
                                 ui.add_space(theme::SPACE_MD);
                             }
                         });
-                    if let Some((path, err)) = &self.reveal_error {
-                        ui.add_space(theme::SPACE_SM);
-                        theme::reason(ui, format!("{err}. The take is here:"));
-                        let mut shown = path.display().to_string();
-                        ui.add(
-                            egui::TextEdit::singleline(&mut shown)
-                                .desired_width(ui.available_width())
-                                .font(egui::TextStyle::Monospace),
-                        );
-                    }
                 },
             );
         });

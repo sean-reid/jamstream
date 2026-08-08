@@ -74,126 +74,141 @@ impl HomeScreen {
     ) -> Option<HomeAction> {
         let mut action = None;
         let room = ui.available_height();
-        theme::focused_column(ui, 560.0, room, |ui, _| {
-            theme::wordmark(ui, 26.0);
-            ui.add_space(theme::SPACE_XS);
-            ui.label(theme::muted(
-                ui,
-                "Play music together over a server that exists only while you play.",
-            ));
-            ui.add_space(theme::SPACE_XL);
-
-            theme::panel(ui).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(theme::title(ui, "Join a session"));
-                // The name first: it is who the roster and the take files
-                // will say you are, and it is remembered, so most days it is
-                // already filled in.
-                ui.horizontal(|ui| {
-                    ui.label(theme::muted(ui, "your name"));
-                    ui.add(
-                        TextEdit::singleline(name)
-                            .desired_width(200.0)
-                            .char_limit(64)
-                            .hint_text("how the roster shows you"),
-                    );
-                });
-                ui.add_space(theme::SPACE_XS);
-                ui.horizontal(|ui| {
-                    let button_w = 52.0;
-                    let field = ui.add(
-                        TextEdit::singleline(&mut self.invite_text)
-                            .desired_width(ui.available_width() - button_w)
-                            .hint_text("paste an invite, jamstream://join/..."),
-                    );
-                    let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    if ui.button("Join").clicked() || submitted {
-                        match Invite::decode(&self.invite_text) {
-                            Ok(invite) => {
-                                self.error = None;
-                                action = Some(HomeAction::Join(Box::new(invite)));
-                            }
-                            Err(err) => self.error = Some(err.to_string()),
-                        }
-                    }
-                });
-                if let Some(err) = self.error.clone() {
-                    theme::reason(ui, err);
-                }
-            });
-            ui.add_space(theme::SPACE_MD);
-
-            theme::panel(ui).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(theme::title(ui, "Host a session"));
-                ui.label(theme::muted(
-                    ui,
-                    "Launches a short-lived server near your group and mints the invites.",
-                ));
-                ui.add_space(theme::SPACE_XS);
-                if ui.button("Host a session").clicked() {
-                    action = Some(HomeAction::Host);
-                }
-            });
-            ui.add_space(theme::SPACE_MD);
-
-            theme::panel(ui).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                // Takes is the way to what those sessions recorded, and Stop
-                // strays is the way to correct them: the rows are a record of
-                // what happened, and both acts belong to the record rather
-                // than to a fourth card or a fourth thing in the top bar.
-                // Stop strays is here even with no rows, because a machine
-                // this computer never recorded is exactly the one that
-                // strands.
-                ui.horizontal(|ui| {
-                    ui.label(theme::title(ui, "Recent sessions"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!sweep.busy, egui::Button::new("Stop strays"))
-                            .on_hover_text(
-                                "Find and stop every jamstream machine in the accounts \
-                                 this computer can reach",
-                            )
-                            .clicked()
-                        {
-                            action = Some(HomeAction::Sweep);
-                        }
-                        if !recent.is_empty() && ui.button("Takes").clicked() {
-                            action = Some(HomeAction::Takes);
-                        }
-                    });
-                });
-                if recent.is_empty() {
+        // The recent list is every session this computer ever recorded, so the
+        // column outgrows the window on any machine that has hosted for a
+        // while. The lead stays measured against the viewport so a short page
+        // still sits where it always did.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                theme::focused_column(ui, 560.0, room, |ui, _| {
+                    theme::wordmark(ui, 26.0);
+                    ui.add_space(theme::SPACE_XS);
                     ui.label(theme::muted(
                         ui,
-                        "No sessions yet; host one or paste an invite above.",
+                        "Play music together over a server that exists only while you play.",
                     ));
-                }
-                // A record of what happened, not a list of things to press.
-                // These rows have no rejoin, no end, and no click, so they
-                // carry only two type treatments: a mono id, and everything
-                // else in one muted, proportional sentence. The id is the
-                // one thing here that is a number, so it keeps the
-                // monospace; everything else is a sentence about a session
-                // that is over.
-                for row in recent {
-                    ui.horizontal(|ui| {
-                        ui.label(theme::mono_muted(ui, row.short_id.clone()));
+                    ui.add_space(theme::SPACE_XL);
+
+                    theme::panel(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(theme::title(ui, "Join a session"));
+                        // The name first: it is who the roster and the take files
+                        // will say you are, and it is remembered, so most days it is
+                        // already filled in.
+                        ui.horizontal(|ui| {
+                            ui.label(theme::muted(ui, "your name"));
+                            ui.add(
+                                TextEdit::singleline(name)
+                                    .desired_width(200.0)
+                                    .char_limit(64)
+                                    .hint_text("how the roster shows you"),
+                            );
+                        });
+                        ui.add_space(theme::SPACE_XS);
+                        ui.horizontal(|ui| {
+                            let button_w = 52.0;
+                            let field = ui.add(
+                                TextEdit::singleline(&mut self.invite_text)
+                                    .desired_width(ui.available_width() - button_w)
+                                    .hint_text("paste an invite, jamstream://join/..."),
+                            );
+                            let submitted =
+                                field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                            if ui.button("Join").clicked() || submitted {
+                                match Invite::decode(&self.invite_text) {
+                                    Ok(invite) => {
+                                        self.error = None;
+                                        action = Some(HomeAction::Join(Box::new(invite)));
+                                    }
+                                    Err(err) => self.error = Some(err.to_string()),
+                                }
+                            }
+                        });
+                        if let Some(err) = self.error.clone() {
+                            theme::reason(ui, err);
+                        }
+                    });
+                    ui.add_space(theme::SPACE_MD);
+
+                    theme::panel(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(theme::title(ui, "Host a session"));
                         ui.label(theme::muted(
                             ui,
-                            format!("{} {}, {}", row.provider, row.region, row.status),
+                            "Launches a short-lived server near your group and mints the invites.",
                         ));
+                        ui.add_space(theme::SPACE_XS);
+                        if ui.button("Host a session").clicked() {
+                            action = Some(HomeAction::Host);
+                        }
                     });
-                }
-                sweep_report(ui, sweep);
+                    ui.add_space(theme::SPACE_MD);
+
+                    theme::panel(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        // Takes is the way to what those sessions recorded, and Stop
+                        // strays is the way to correct them: the rows are a record of
+                        // what happened, and both acts belong to the record rather
+                        // than to a fourth card or a fourth thing in the top bar.
+                        // Stop strays is here even with no rows, because a machine
+                        // this computer never recorded is exactly the one that
+                        // strands.
+                        ui.horizontal(|ui| {
+                            ui.label(theme::title(ui, "Recent sessions"));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(!sweep.busy, egui::Button::new("Stop strays"))
+                                        .on_hover_text(
+                                            "Find and stop every jamstream machine in the accounts \
+                                         this computer can reach",
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(HomeAction::Sweep);
+                                    }
+                                    if !recent.is_empty() && ui.button("Takes").clicked() {
+                                        action = Some(HomeAction::Takes);
+                                    }
+                                },
+                            );
+                        });
+                        // Above the rows, because the button that produces it is
+                        // above them too and the list is long enough to carry a
+                        // report off the bottom of the window.
+                        sweep_report(ui, sweep);
+                        if recent.is_empty() {
+                            ui.label(theme::muted(
+                                ui,
+                                "No sessions yet; host one or paste an invite above.",
+                            ));
+                        }
+                        // A record of what happened, not a list of things to press.
+                        // These rows have no rejoin, no end, and no click, so they
+                        // carry only two type treatments: a mono id, and everything
+                        // else in one muted, proportional sentence. The id is the
+                        // one thing here that is a number, so it keeps the
+                        // monospace; everything else is a sentence about a session
+                        // that is over.
+                        for row in recent {
+                            ui.horizontal(|ui| {
+                                ui.label(theme::mono_muted(ui, row.short_id.clone()));
+                                ui.label(theme::muted(
+                                    ui,
+                                    format!("{} {}, {}", row.provider, row.region, row.status),
+                                ));
+                            });
+                        }
+                    });
+                });
             });
-        });
         action
     }
 }
 
-/// What the last sweep did, under the rows it corrected.
+/// What the last sweep did, above the rows it corrected.
 ///
 /// Three registers, and the difference between them is the point. The
 /// headline is what happened, the notes are what it tidied, and the warnings
