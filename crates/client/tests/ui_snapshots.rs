@@ -31,6 +31,9 @@ use jamstream_cloud::{
 
 const WIDE: egui::Vec2 = vec2(1280.0, 800.0);
 const NARROW: egui::Vec2 = vec2(800.0, 600.0);
+/// Kittest reports node rects in physical pixels, so a point-sized window
+/// has to be scaled by this before a rect can be compared against it.
+const PPP: f32 = 2.0;
 
 fn preview_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
@@ -159,7 +162,7 @@ fn app_harness(mut app: JamApp, size: egui::Vec2) -> Harness<'static> {
     // 2x: pixel-true to a retina display; layout stays in points.
     Harness::builder()
         .with_size(size)
-        .with_pixels_per_point(2.0)
+        .with_pixels_per_point(PPP)
         .build_ui(move |ui| {
             theme::apply(ui.ctx(), theme);
             let fill = theme::palette(theme).surface0;
@@ -304,6 +307,82 @@ fn home_sweep_confirm() {
     app.confirm_sweep = true;
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "home_sweep_confirm");
+}
+
+/// Enough sessions to outgrow the window, which is what a computer that has
+/// hosted for a few months actually holds. The list is every session ever
+/// recorded, so this is the ordinary case rather than an extreme one.
+fn many_recent() -> Vec<RecentSession> {
+    let places = [
+        ("aws", "us-west-1"),
+        ("aws", "us-east-2"),
+        ("local", "local"),
+        ("digitalocean", "sfo3"),
+        ("mock", "mock-west"),
+    ];
+    (0..22)
+        .map(|i| {
+            let (provider, region) = places[i % places.len()];
+            RecentSession {
+                short_id: format!("{:08x}", 0xc101_beae_u32.wrapping_add(i as u32 * 0x9e37)),
+                provider: provider.to_owned(),
+                region: region.to_owned(),
+                status: "ended".to_owned(),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn home_many_sessions() {
+    let mut app = test_app(Theme::Dark);
+    app.recent = many_recent();
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "home_many_sessions");
+}
+
+#[test]
+fn home_sweep_report_over_a_long_list() {
+    // The report has to be readable without leaving the window, and the
+    // button that produces it is at the top of this card. A report drawn
+    // under twenty-two rows is off the bottom of the screen.
+    let mut app = test_app(Theme::Dark);
+    app.recent = many_recent();
+    app.swept = Some(unaccounted_sweep());
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "home_sweep_report_over_a_long_list");
+}
+
+/// The report has to be on screen, not merely drawn. Both halves are checked
+/// against geometry rather than an image, because an image only catches this
+/// when somebody looks at it.
+#[test]
+fn the_sweep_report_stays_on_screen_above_a_long_list() {
+    let mut app = test_app(Theme::Dark);
+    app.recent = many_recent();
+    app.swept = Some(unaccounted_sweep());
+    let mut harness = app_harness(app, WIDE);
+    harness.run_steps(4);
+
+    let report = harness
+        .get_all_by_label_contains("Found 1 machine")
+        .next()
+        .expect("the report says what it found")
+        .rect();
+    let first_row = harness
+        .get_all_by_label_contains("aws us-west-1")
+        .next()
+        .expect("the rows are drawn")
+        .rect();
+    assert!(
+        report.bottom() <= first_row.top(),
+        "the report is under the rows: report {report:?}, first row {first_row:?}"
+    );
+    assert!(
+        report.bottom() <= WIDE.y * PPP,
+        "the report is off the bottom of a {} point window: {report:?}",
+        WIDE.y
+    );
 }
 
 #[test]
@@ -544,6 +623,44 @@ fn takes_listing_refused() {
     ));
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "takes_listing_refused");
+}
+
+#[test]
+fn takes_reveal_error() {
+    // A file manager that would not open, which is feedback on a button
+    // inside a row. The list fills the rest of the window, so this has to
+    // sit above it or it is off the bottom edge with no way to reach it.
+    let mut app = takes_app(Theme::Dark);
+    app.takes.reveal_error = Some((
+        std::path::PathBuf::from("/Users/sean/Music/jamstream/a3f29c41/mix.flac"),
+        "no file manager answered".to_owned(),
+    ));
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "takes_reveal_error");
+}
+
+/// The same rule on the takes screen: the list fills the window, so feedback
+/// after it is unreachable.
+#[test]
+fn a_take_that_would_not_open_says_so_on_screen() {
+    let mut app = takes_app(Theme::Dark);
+    app.takes.reveal_error = Some((
+        std::path::PathBuf::from("/Users/sean/Music/jamstream/a3f29c41/mix.flac"),
+        "no file manager answered".to_owned(),
+    ));
+    let mut harness = app_harness(app, WIDE);
+    harness.run_steps(4);
+
+    let reason = harness
+        .get_all_by_label_contains("no file manager answered")
+        .next()
+        .expect("the reason is drawn")
+        .rect();
+    assert!(
+        reason.bottom() <= WIDE.y * PPP,
+        "the reason is off the bottom of a {} point window: {reason:?}",
+        WIDE.y
+    );
 }
 
 #[test]
