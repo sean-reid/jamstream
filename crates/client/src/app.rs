@@ -528,7 +528,13 @@ impl JamApp {
             let path = panel.path;
             self.ending = Some(self.exec.run(async move {
                 let provider = provider?;
-                invites::end_session(provider.as_ref(), state, path).await
+                invites::end_session(
+                    provider.as_ref(),
+                    state,
+                    path,
+                    &jamstream_cloud::TokioSleeper,
+                )
+                .await
             }));
         }
         self.runtime = None;

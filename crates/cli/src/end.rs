@@ -76,20 +76,6 @@ pub async fn run<W: Write>(
         Err(e) => return Err(e.into()),
     }
 
-    // The instance is gone, so its firewall has nothing behind it. AWS may
-    // still refuse while the network interface detaches, in which case the
-    // next sweep collects it, so this never fails an otherwise clean end.
-    match provider.destroy_orphan_firewalls().await {
-        Ok(names) if !names.is_empty() => {
-            writeln!(out, "Closed {} session firewall(s).", names.len())?;
-        }
-        Ok(_) => {}
-        Err(e) => writeln!(
-            out,
-            "Could not close the session firewall ({e}); jamstream sweep will retry."
-        )?,
-    }
-
     let remaining = provider
         .list_tagged(Some(&session.session_id_hex))
         .await?
@@ -100,6 +86,30 @@ pub async fn run<W: Write>(
             remaining.len(),
             &session.session_id_hex[..8.min(session.session_id_hex.len())]
         )));
+    }
+
+    // Only once the instance is really gone, and then retried rather than
+    // attempted once: AWS refuses to delete a security group until the
+    // terminated instance's network interface has detached, which is always
+    // later than this call. A firewall whose instance is still listed is one
+    // the provider is right to keep. A sweep still collects it if the budget
+    // runs out, so this never fails an otherwise clean end.
+    match jamstream_cloud::sweeper::close_session_firewall(
+        provider,
+        &session.session_id_hex,
+        &jamstream_cloud::TokioSleeper,
+        jamstream_cloud::sweeper::FIREWALL_WAIT,
+    )
+    .await
+    {
+        Ok(names) if !names.is_empty() => {
+            writeln!(out, "Closed {} session firewall(s).", names.len())?;
+        }
+        Ok(_) => {}
+        Err(e) => writeln!(
+            out,
+            "Could not close the session firewall ({e}); jamstream sweep will retry."
+        )?,
     }
 
     session.mark_ended(

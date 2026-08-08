@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::artifact::ServerArch;
-use crate::provider::{Provider, ProviderError, Result};
+use crate::provider::{Provider, ProviderError, Result, Sleeper};
 use crate::types::{
     ANY_IPV4, ANY_IPV6, DEFAULT_SESSION_PORT, IngressRule, Instance, LaunchSpec, Listing, Price,
     ProviderKind, Region, RegionId, session_id_from_tags,
@@ -46,6 +47,7 @@ struct State {
     launch_failures: VecDeque<ProviderError>,
     destroy_failures: VecDeque<ProviderError>,
     list_failures: VecDeque<ProviderError>,
+    firewall_failures: VecDeque<ProviderError>,
     /// Regions whose listing never answers: see
     /// [`MockProvider::unsearchable_region`].
     unsearchable: Vec<RegionId>,
@@ -53,6 +55,27 @@ struct State {
 }
 
 /// In-memory Provider for server, CLI, and E2E tests.
+/// Records requested sleeps and returns immediately, so a backoff loop can be
+/// asserted without spending the wait.
+#[derive(Default)]
+pub struct RecordingSleeper {
+    slept: std::sync::Mutex<Vec<Duration>>,
+}
+
+impl RecordingSleeper {
+    /// Every wait it was asked for, in order.
+    pub fn slept(&self) -> Vec<Duration> {
+        self.slept.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Sleeper for RecordingSleeper {
+    async fn sleep(&self, d: Duration) {
+        self.slept.lock().unwrap().push(d);
+    }
+}
+
 pub struct MockProvider {
     kind: ProviderKind,
     regions: Vec<Region>,
@@ -157,6 +180,15 @@ impl MockProvider {
     /// The next `n` list calls fail with a clone of `err`. A provider that
     /// cannot be listed is one the sweeper never searched, which is a
     /// different outcome from finding nothing.
+    /// Refuses the next `n` firewall sweeps, which is what AWS does while a
+    /// terminated instance's network interface is still detaching.
+    pub fn fail_next_firewall_sweeps(&self, n: usize, err: ProviderError) {
+        let mut s = self.state.lock().unwrap();
+        for _ in 0..n {
+            s.firewall_failures.push_back(err.clone());
+        }
+    }
+
     pub fn fail_next_lists(&self, n: usize, err: ProviderError) {
         let mut s = self.state.lock().unwrap();
         for _ in 0..n {
@@ -365,6 +397,9 @@ impl Provider for MockProvider {
     async fn destroy_orphan_firewalls(&self) -> Result<Vec<String>> {
         let mut s = self.state.lock().unwrap();
         s.calls.push(Call::DestroyOrphanFirewalls);
+        if let Some(err) = s.firewall_failures.pop_front() {
+            return Err(err);
+        }
         let live: Vec<String> = s
             .instances
             .iter()

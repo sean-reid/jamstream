@@ -31,7 +31,7 @@ use egui::{Align2, Button, Ui, vec2};
 /// row whatever the label says.
 const SEAT_LABEL_W: f32 = 92.0;
 use jamstream_cli::state::{InviteRecord, SessionState, SessionStatus};
-use jamstream_cloud::{Provider, ProviderError, RegionId};
+use jamstream_cloud::{Provider, ProviderError, RegionId, Sleeper};
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 
@@ -410,6 +410,7 @@ pub async fn end_session(
     provider: &dyn Provider,
     mut state: SessionState,
     path: PathBuf,
+    sleeper: &dyn Sleeper,
 ) -> Result<(), String> {
     let region = RegionId::new(state.region.clone());
     match provider.destroy(&region, &state.instance_id).await {
@@ -417,13 +418,6 @@ pub async fn end_session(
         // Already gone: crashed earlier, self-destructed, or swept.
         Err(ProviderError::NotFound(_)) => {}
         Err(e) => return Err(e.to_string()),
-    }
-    // The instance is gone, so its firewall has nothing behind it. AWS can
-    // still refuse while the network interface detaches, and the next sweep
-    // collects it then, so this never fails an otherwise clean end.
-    match provider.destroy_orphan_firewalls().await {
-        Ok(closed) => tracing::info!(count = closed.len(), "closed session firewalls"),
-        Err(err) => tracing::warn!(%err, "could not close the session firewall; sweep will retry"),
     }
     let remaining = provider
         .list_tagged(Some(&state.session_id_hex))
@@ -436,6 +430,24 @@ pub async fn end_session(
              the home screen, or run jamstream sweep",
             remaining.len()
         ));
+    }
+    // Only once the instance is really gone, and then retried rather than
+    // attempted once: AWS refuses to delete a security group until the
+    // terminated instance's network interface has detached, which is always
+    // later than this call. A firewall whose instance is still listed is one
+    // the provider is right to keep, so waiting on it would be waiting for
+    // something that must not happen. This runs off the UI thread, and a sweep
+    // still collects it if the budget runs out.
+    match jamstream_cloud::sweeper::close_session_firewall(
+        provider,
+        &state.session_id_hex,
+        sleeper,
+        jamstream_cloud::sweeper::FIREWALL_WAIT,
+    )
+    .await
+    {
+        Ok(closed) => tracing::info!(count = closed.len(), "closed session firewalls"),
+        Err(err) => tracing::warn!(%err, "could not close the session firewall; sweep will retry"),
     }
     state.status = SessionStatus::Ended;
     // Nothing can be minted or revoked for a session whose server is gone, so
@@ -1022,9 +1034,14 @@ mod tests {
             "the launch opens exactly one port for the session"
         );
 
-        end_session(&provider, state.clone(), path.clone())
-            .await
-            .expect("end session");
+        end_session(
+            &provider,
+            state.clone(),
+            path.clone(),
+            &jamstream_cloud::mock::RecordingSleeper::default(),
+        )
+        .await
+        .expect("end session");
 
         let ended = jamstream_cli::state::load(&path).expect("state reloads");
         assert_eq!(ended.status, SessionStatus::Ended);
@@ -1053,21 +1070,63 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// A firewall that cannot be closed yet is not a failed end: AWS refuses
-    /// while the network interface detaches, and the next sweep collects it.
-    /// The session is still ended and the key is still gone.
+    /// The case a real end hits every time on AWS: the group is still attached
+    /// when the teardown asks, so the first attempts are refused. The end has
+    /// to keep asking rather than leave the firewall for a later sweep, which
+    /// is what it did before and what left one per session in the account.
     #[tokio::test]
-    async fn a_firewall_that_will_not_close_yet_does_not_fail_the_end() {
+    async fn an_end_keeps_asking_until_the_firewall_is_actually_closed() {
+        let (provider, state, path) = launched("refused").await;
+        provider.fail_next_firewall_sweeps(
+            3,
+            jamstream_cloud::ProviderError::Transient(
+                "resource sg-1 has a dependent object".to_owned(),
+            ),
+        );
+
+        end_session(
+            &provider,
+            state.clone(),
+            path.clone(),
+            &jamstream_cloud::mock::RecordingSleeper::default(),
+        )
+        .await
+        .expect("a refused firewall is retried, not a failed end");
+
+        assert!(
+            provider
+                .session_ingress(&state.session_id_hex)
+                .await
+                .expect("the mock answers")
+                .is_empty(),
+            "the session's ingress is still open after the end returned"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An instance still listed is reported, and the firewall is not waited on:
+    /// a provider keeps a live session's firewall on purpose, so the wait could
+    /// only ever run out the budget. The recorded sleeper is the proof, because
+    /// a teardown that waited here would hold a real one for the whole of it.
+    #[tokio::test]
+    async fn an_instance_still_listed_is_reported_without_waiting_on_its_firewall() {
         let (provider, state, path) = launched("firewall").await;
         // An instance the destroy cannot find leaves the firewall behind with
         // the session still listed as live, which is the shape of the case the
         // sweeper is there for.
         let mut state = state;
         state.instance_id = "not-this-one".to_owned();
-        let err = end_session(&provider, state.clone(), path.clone())
+        let sleeper = jamstream_cloud::mock::RecordingSleeper::default();
+        let err = end_session(&provider, state.clone(), path.clone(), &sleeper)
             .await
             .expect_err("an instance still listed must not read as a clean end");
         assert!(err.contains("sweep"), "error was {err:?}");
+        assert!(
+            sleeper.slept().is_empty(),
+            "it waited on a firewall its own instance is still holding: {:?}",
+            sleeper.slept()
+        );
 
         std::fs::remove_file(&path).ok();
     }
