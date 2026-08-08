@@ -377,13 +377,17 @@ fn lift(c: Color32, theme: Theme, amount: i16) -> Color32 {
 }
 
 /// The one panel primitive: surface1, hairline border, uniform radius.
+/// The panel frame's inner margin, as a float for anything measuring against
+/// the window edge.
+pub const PANEL_INSET: f32 = 10.0;
+
 pub fn panel(ui: &Ui) -> Frame {
     let p = palette_of(ui);
     Frame::new()
         .fill(p.surface1)
         .stroke(Stroke::new(1.0, p.border))
         .corner_radius(CornerRadius::same(RADIUS))
-        .inner_margin(Margin::same(10))
+        .inner_margin(Margin::same(PANEL_INSET as i8))
 }
 
 /// Linear blend of `b` into `a`; `t` in 0..1. Used for tinted surfaces.

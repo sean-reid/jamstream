@@ -217,7 +217,7 @@ fn sample_recent() -> Vec<RecentSession> {
         short_id: "a3f29c41".to_owned(),
         provider: "mock".to_owned(),
         region: "mock-east".to_owned(),
-        status: "running".to_owned(),
+        running: true,
     }]
 }
 
@@ -327,10 +327,87 @@ fn many_recent() -> Vec<RecentSession> {
                 short_id: format!("{:08x}", 0xc101_beae_u32.wrapping_add(i as u32 * 0x9e37)),
                 provider: provider.to_owned(),
                 region: region.to_owned(),
-                status: "ended".to_owned(),
+                running: false,
             }
         })
         .collect()
+}
+
+/// Running sessions buried in a long history. Each is a machine still being
+/// billed, so each has to be on screen whatever the ended ones do.
+fn many_recent_with_strays() -> Vec<RecentSession> {
+    let mut rows = many_recent();
+    for (i, row) in rows.iter_mut().enumerate() {
+        row.running = i % 9 == 4;
+    }
+    rows
+}
+
+#[test]
+fn home_running_sessions_survive_a_long_history() {
+    let mut app = test_app(Theme::Dark);
+    app.recent = many_recent_with_strays();
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "home_running_sessions_survive_a_long_history");
+}
+
+/// The count of ended rows depends on the window, so the short window is the
+/// one that proves the fill is measured rather than a constant.
+#[test]
+fn home_many_sessions_narrow() {
+    let mut app = test_app(Theme::Dark);
+    app.recent = many_recent();
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "home_many_sessions_narrow");
+}
+
+/// A running session is a machine still being billed, and Stop strays is how
+/// it gets stopped, so no window size may bury one behind the fold.
+#[test]
+fn a_running_session_is_never_dropped() {
+    for size in [WIDE, NARROW] {
+        let rows = many_recent_with_strays();
+        let running: Vec<String> = rows
+            .iter()
+            .filter(|row| row.running)
+            .map(|row| row.short_id.clone())
+            .collect();
+        assert!(running.len() >= 2, "the fixture needs strays: {running:?}");
+        let mut app = test_app(Theme::Dark);
+        app.recent = rows;
+        let mut harness = app_harness(app, size);
+        harness.run_steps(4);
+        for id in &running {
+            let node = harness
+                .get_all_by_label_contains(id.as_str())
+                .next()
+                .unwrap_or_else(|| panic!("{id} is not drawn at {size:?}"));
+            assert!(
+                node.rect().bottom() <= size.y * PPP,
+                "{id} is below the window edge at {size:?}: {:?}",
+                node.rect()
+            );
+        }
+    }
+}
+
+/// Whatever the fill leaves out, the screen says how much. A list that stops
+/// without saying so reads as the whole list.
+#[test]
+fn home_says_how_many_sessions_it_left_out() {
+    for size in [WIDE, NARROW] {
+        let mut app = test_app(Theme::Dark);
+        app.recent = many_recent();
+        let mut harness = app_harness(app, size);
+        harness.run_steps(4);
+        assert!(
+            harness
+                .get_all_by_label_contains("older ended sessions are not shown")
+                .next()
+                .is_some(),
+            "nothing said what was left out at {size:?}"
+        );
+    }
 }
 
 #[test]
@@ -449,6 +526,13 @@ fn unaccounted_sweep() -> SweepOutcome {
 /// because a baseline that rendered the developer's own would never match
 /// twice.
 fn takes_app(theme: Theme) -> JamApp {
+    takes_app_with_expired(theme, 0)
+}
+
+/// The same fixture plus `expired` sessions whose retention deadline is a week
+/// behind the fixture's clock, none of them downloaded. They are what the
+/// screen is entitled to drop.
+fn takes_app_with_expired(theme: Theme, expired: usize) -> JamApp {
     use jamstream_cli::recordings::Take;
     use jamstream_cli::state::{RecordingRecord, RetentionApplied, SessionStatus};
     use jamstream_client::screens::takes::{LocalTake, rows_from, takes_from_objects};
@@ -505,7 +589,7 @@ fn takes_app(theme: Theme) -> JamApp {
         out
     };
 
-    let sessions = vec![
+    let mut sessions = vec![
         (
             session("a3f29c41deadbeef", 1_785_264_000, 2_820, "digitalocean"),
             Some(record(RetentionApplied::ServerSide)),
@@ -523,6 +607,19 @@ fn takes_app(theme: Theme) -> JamApp {
             None,
         ),
     ];
+    // 37 days before the fixture's clock against a 30 day rule, so the
+    // deadline is a week gone.
+    for i in 0..expired {
+        sessions.push((
+            session(
+                &format!("{:016x}", 0xe0e0_0000_0000_0000_u64 + i as u64),
+                NOW - 37 * 86_400 - i as u64 * 3_600,
+                1_800,
+                "digitalocean",
+            ),
+            Some(record(RetentionApplied::ServerSide)),
+        ));
+    }
     let local = vec![LocalTake {
         path: disk.join("jamstream-2026-07-25-1730-mix.flac"),
         bytes: 2_400_000_000,
@@ -661,6 +758,54 @@ fn a_take_that_would_not_open_says_so_on_screen() {
         "the reason is off the bottom of a {} point window: {reason:?}",
         WIDE.y
     );
+}
+
+#[test]
+fn takes_with_expired_takes() {
+    let mut harness = app_harness(takes_app_with_expired(Theme::Dark, 10), WIDE);
+    snapshot(&mut harness, "takes_with_expired_takes");
+}
+
+/// A take inside its window, or already on this computer, is one somebody can
+/// still play, so no window size may drop one. The expired ones with nothing
+/// here are the only rows the screen is allowed to leave out.
+#[test]
+fn a_take_still_worth_playing_is_never_dropped() {
+    for size in [WIDE, NARROW] {
+        let app = takes_app_with_expired(Theme::Dark, 10);
+        let worth_playing: Vec<String> = app
+            .takes
+            .rows
+            .iter()
+            .filter(|row| !row.expired() || row.downloaded())
+            .map(|row| row.short_id.clone())
+            .collect();
+        assert_eq!(
+            worth_playing.len(),
+            4,
+            "the fixture's four keepers: {worth_playing:?}"
+        );
+        let mut harness = app_harness(app, size);
+        harness.run_steps(4);
+        for id in &worth_playing {
+            assert!(
+                harness
+                    .get_all_by_label_contains(id.as_str())
+                    .next()
+                    .is_some(),
+                "{id} is not on screen at {size:?}"
+            );
+        }
+        // Whatever it left out, it has to say so: a silent list reads as the
+        // whole list.
+        assert!(
+            harness
+                .get_all_by_label_contains("expired takes are not shown")
+                .next()
+                .is_some(),
+            "nothing said what was left out at {size:?}"
+        );
+    }
 }
 
 #[test]

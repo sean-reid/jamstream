@@ -13,7 +13,9 @@ pub struct RecentSession {
     pub short_id: String,
     pub provider: String,
     pub region: String,
-    pub status: String,
+    /// A session that has not ended is a machine still being billed, which is
+    /// why it is never one of the rows this screen drops.
+    pub running: bool,
 }
 
 impl RecentSession {
@@ -26,10 +28,7 @@ impl RecentSession {
                 short_id: s.session_id_hex.chars().take(8).collect(),
                 provider: s.provider,
                 region: s.region,
-                status: match s.status {
-                    jamstream_cli::state::SessionStatus::Running => "running".to_owned(),
-                    jamstream_cli::state::SessionStatus::Ended => "ended".to_owned(),
-                },
+                running: matches!(s.status, jamstream_cli::state::SessionStatus::Running),
             })
             .collect();
         rows.reverse();
@@ -192,20 +191,58 @@ impl HomeScreen {
                         // one thing here that is a number, so it keeps the
                         // monospace; everything else is a sentence about a session
                         // that is over.
-                        for row in recent {
-                            ui.horizontal(|ui| {
-                                ui.label(theme::mono_muted(ui, row.short_id.clone()));
-                                ui.label(theme::muted(
-                                    ui,
-                                    format!("{} {}, {}", row.provider, row.region, row.status),
-                                ));
-                            });
+                        // Every running session, however many there are: each
+                        // one is a machine still being billed, and the way to
+                        // stop it must not be behind a fold. Ended ones are a
+                        // record, so they fill what is left of the window and
+                        // the remainder is dropped with its count said out
+                        // loud.
+                        // A line of slack, because the count of what was
+                        // dropped is itself a line and it has to land inside
+                        // the window rather than one row past it.
+                        let floor = ui.ctx().viewport_rect().bottom() - row_height(ui);
+                        let (running, ended): (Vec<_>, Vec<_>) =
+                            recent.iter().partition(|row| row.running);
+                        for row in &running {
+                            session_row(ui, row);
+                        }
+                        let mut drawn = 0;
+                        for row in &ended {
+                            if ui.cursor().top() + row_height(ui) > floor {
+                                break;
+                            }
+                            session_row(ui, row);
+                            drawn += 1;
+                        }
+                        let dropped = ended.len() - drawn;
+                        if dropped > 0 {
+                            ui.label(theme::muted(
+                                ui,
+                                format!("{dropped} older ended sessions are not shown."),
+                            ));
                         }
                     });
                 });
             });
         action
     }
+}
+
+/// One row: a mono id, then one muted sentence about a session that is over.
+fn session_row(ui: &mut Ui, row: &RecentSession) {
+    ui.horizontal(|ui| {
+        ui.label(theme::mono_muted(ui, row.short_id.clone()));
+        let status = if row.running { "running" } else { "ended" };
+        ui.label(theme::muted(
+            ui,
+            format!("{} {}, {}", row.provider, row.region, status),
+        ));
+    });
+}
+
+/// What one row costs, so the fill can stop before it draws past the window.
+fn row_height(ui: &Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y
 }
 
 /// What the last sweep did, above the rows it corrected.

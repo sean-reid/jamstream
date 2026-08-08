@@ -2491,7 +2491,7 @@ fn takes_is_reached_from_the_recent_sessions_card_and_only_when_there_are_any() 
         short_id: "a3f29c41".to_owned(),
         provider: "digitalocean".to_owned(),
         region: "sfo3".to_owned(),
-        status: "ended".to_owned(),
+        running: false,
     }];
     for rows in [Vec::new(), recent] {
         let any = !rows.is_empty();

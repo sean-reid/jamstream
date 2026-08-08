@@ -192,6 +192,20 @@ pub struct SessionTakes {
 }
 
 impl SessionTakes {
+    /// Past its retention deadline, so the bucket may delete these takes at any
+    /// time. `None` days means nothing is enforcing a rule.
+    pub fn expired(&self) -> bool {
+        self.expires_in_days.is_some_and(|days| days < 0)
+    }
+
+    /// Any part of any take already on this computer, which is a file somebody
+    /// can still play whatever the bucket does next.
+    pub fn downloaded(&self) -> bool {
+        self.takes
+            .iter()
+            .any(|take| take.mix.here().is_some() || take.stems.here().is_some())
+    }
+
     /// The bucket details, for a session that recorded to one.
     pub fn record(&self) -> Option<&RecordingRecord> {
         match &self.place {
@@ -1036,15 +1050,27 @@ impl TakesScreen {
                             ));
                         });
                     }
+                    // A take inside its retention window, or already on this
+                    // computer, is one somebody can still play, so every one of
+                    // those is drawn however many there are. The rest are past
+                    // their deadline with no copy here: they fill what is left
+                    // of the window and the remainder is dropped, with the
+                    // count said out loud rather than silently.
+                    let floor = ui.ctx().viewport_rect().bottom() - theme::PANEL_INSET;
+                    let (keep, gone): (Vec<&SessionTakes>, Vec<&SessionTakes>) = self
+                        .rows
+                        .iter()
+                        .partition(|row| !row.expired() || row.downloaded());
+                    let mut dropped = 0;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for row in &self.rows {
+                            let fetching = self.fetching.as_ref();
+                            let landed = self.landed.as_ref();
+                            let mut card = |ui: &mut Ui, row: &SessionTakes| {
                                 theme::panel(ui).show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    if let Some(action) =
-                                        session_card(ui, row, self.fetching.as_ref())
-                                    {
+                                    if let Some(action) = session_card(ui, row, fetching) {
                                         match action {
                                             CardAction::Reveal(path) => reveal = Some(path),
                                             CardAction::Download(base, half) => {
@@ -1053,13 +1079,29 @@ impl TakesScreen {
                                             }
                                         }
                                     }
-                                    if let Some(landed) = &self.landed
+                                    if let Some(landed) = landed
                                         && landed.session_id == row.session_id
                                     {
                                         landing(ui, landed);
                                     }
                                 });
                                 ui.add_space(theme::SPACE_MD);
+                            };
+                            for row in &keep {
+                                card(ui, row);
+                            }
+                            for row in &gone {
+                                if ui.cursor().top() >= floor {
+                                    dropped += 1;
+                                    continue;
+                                }
+                                card(ui, row);
+                            }
+                            if dropped > 0 {
+                                ui.label(theme::muted(
+                                    ui,
+                                    format!("{dropped} expired takes are not shown."),
+                                ));
                             }
                         });
                 },
