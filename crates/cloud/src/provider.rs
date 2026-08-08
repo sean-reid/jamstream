@@ -192,22 +192,9 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::mock::MockProvider;
-
-    /// Records requested sleeps and returns immediately.
-    struct RecordingSleeper {
-        slept: Mutex<Vec<Duration>>,
-    }
-
-    #[async_trait]
-    impl Sleeper for RecordingSleeper {
-        async fn sleep(&self, d: Duration) {
-            self.slept.lock().unwrap().push(d);
-        }
-    }
+    use crate::mock::{MockProvider, RecordingSleeper};
 
     fn opts() -> WaitOpts {
         WaitOpts {
@@ -220,9 +207,7 @@ mod tests {
     #[tokio::test]
     async fn wait_reachable_succeeds_after_retries() {
         let provider = MockProvider::new(ProviderKind::Aws);
-        let sleeper = RecordingSleeper {
-            slept: Mutex::new(Vec::new()),
-        };
+        let sleeper = RecordingSleeper::default();
         let attempts = AtomicU32::new(0);
         let probe = move || -> ProbeFuture {
             let n = attempts.fetch_add(1, Ordering::SeqCst);
@@ -233,7 +218,7 @@ mod tests {
             .await
             .unwrap();
         // Three failures before success: 100, 200, 400 ms backoffs.
-        let slept = sleeper.slept.lock().unwrap().clone();
+        let slept = sleeper.slept();
         assert_eq!(
             slept,
             vec![
@@ -247,16 +232,14 @@ mod tests {
     #[tokio::test]
     async fn wait_reachable_times_out_with_capped_backoff() {
         let provider = MockProvider::new(ProviderKind::Gcp);
-        let sleeper = RecordingSleeper {
-            slept: Mutex::new(Vec::new()),
-        };
+        let sleeper = RecordingSleeper::default();
         let probe = || -> ProbeFuture { Box::pin(async { false }) };
         let err = provider
             .wait_reachable(&probe, &sleeper, opts())
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::Transient(_)));
-        let slept = sleeper.slept.lock().unwrap().clone();
+        let slept = sleeper.slept();
         // 100 + 200 + 400 + 400 + 400 = 1500 lands exactly on the timeout;
         // one more 400 would exceed it, so the wait fails there.
         assert_eq!(

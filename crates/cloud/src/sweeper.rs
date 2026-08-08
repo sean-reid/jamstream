@@ -1,7 +1,7 @@
 //! Orphan sweeper: nothing tagged jamstream may keep billing. Runs across
 //! every configured provider on every app and CLI launch.
 
-use crate::provider::{Provider, ProviderError};
+use crate::provider::{Provider, ProviderError, Sleeper, WaitOpts};
 use crate::types::{Instance, ProviderKind, RegionId};
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -54,6 +54,62 @@ pub struct SweepReport {
     /// terminating instance's network interface is gone, so a group that was
     /// still attached during one sweep is collected by the next.
     pub firewalls_removed: Vec<String>,
+}
+
+/// How long a teardown keeps asking for the firewall. AWS detaches a
+/// terminated instance's network interface in tens of seconds; past this a
+/// sweep is a better place for it than a teardown that will not return.
+pub const FIREWALL_WAIT: WaitOpts = WaitOpts {
+    initial_backoff: std::time::Duration::from_secs(1),
+    max_backoff: std::time::Duration::from_secs(8),
+    total_timeout: std::time::Duration::from_secs(90),
+};
+
+/// Deletes the firewall a finished session leaves behind, retrying while the
+/// provider still refuses.
+///
+/// A teardown asks for this straight after `destroy`, and on AWS that is too
+/// early: a security group cannot be deleted until the terminated instance's
+/// network interface has detached, which takes longer than the destroy call
+/// does. One attempt therefore leaves a firewall per session in the account
+/// until some later sweep collects it. This keeps asking until the session has
+/// no ingress left or the budget is spent, and reports what it removed.
+///
+/// `session_ingress` is the condition rather than a non-empty return, because a
+/// session that never opened one has nothing to delete and must not spend the
+/// whole budget discovering that.
+pub async fn close_session_firewall(
+    provider: &dyn Provider,
+    session: &str,
+    sleeper: &dyn Sleeper,
+    opts: WaitOpts,
+) -> Result<Vec<String>, ProviderError> {
+    let mut backoff = opts.initial_backoff;
+    let mut elapsed = std::time::Duration::ZERO;
+    let mut removed = Vec::new();
+    let mut refusal = None;
+    loop {
+        match provider.destroy_orphan_firewalls().await {
+            Ok(names) => removed.extend(names),
+            Err(err) => refusal = Some(err),
+        }
+        match provider.session_ingress(session).await {
+            Ok(open) if open.is_empty() => return Ok(removed),
+            Ok(_) => {}
+            Err(err) => refusal = Some(err),
+        }
+        if elapsed + backoff > opts.total_timeout {
+            return Err(refusal.unwrap_or_else(|| {
+                ProviderError::Transient(format!(
+                    "session {session} still has ingress open after {:?}",
+                    opts.total_timeout
+                ))
+            }));
+        }
+        sleeper.sleep(backoff).await;
+        elapsed += backoff;
+        backoff = (backoff * 2).min(opts.max_backoff);
+    }
 }
 
 /// How much of one provider a sweep managed to search. A provider whose
@@ -163,8 +219,10 @@ pub async fn sweep(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
-    use crate::mock::MockProvider;
+    use crate::mock::{MockProvider, RecordingSleeper};
     use crate::types::{InstanceClass, LaunchSpec, session_tag};
 
     fn seeded(kind: ProviderKind, sessions: &[&str]) -> MockProvider {
@@ -206,6 +264,94 @@ mod tests {
                 .instances
                 .len(),
             1
+        );
+    }
+
+    /// One session, launched then destroyed, with the firewall left behind the
+    /// way AWS leaves it while the network interface detaches.
+    async fn ended_session(refusals: usize) -> MockProvider {
+        let p = MockProvider::with_default_regions(ProviderKind::Aws);
+        let region = p.regions()[0].clone();
+        let instance = p
+            .launch(LaunchSpec {
+                region: region.clone(),
+                instance_class: InstanceClass::Small,
+                user_data: String::new(),
+                tags: vec![session_tag("ended")],
+            })
+            .await
+            .unwrap();
+        p.destroy(&instance.region.id, &instance.id).await.unwrap();
+        p.fail_next_firewall_sweeps(
+            refusals,
+            ProviderError::Transient("resource sg-1 has a dependent object".to_owned()),
+        );
+        p
+    }
+
+    /// The whole point: a teardown asks too early, is refused, and the firewall
+    /// is still gone by the time the call returns rather than being left for a
+    /// later sweep.
+    #[tokio::test]
+    async fn a_firewall_refused_at_teardown_is_closed_before_the_call_returns() {
+        let p = ended_session(3).await;
+        let sleeper = RecordingSleeper::default();
+        let closed = close_session_firewall(&p, "ended", &sleeper, WaitOpts::default())
+            .await
+            .expect("the firewall closes once the interface detaches");
+        assert_eq!(closed, vec!["ended".to_owned()]);
+        assert!(
+            p.session_ingress("ended").await.unwrap().is_empty(),
+            "the session still has ingress open"
+        );
+        // Refused three times, so it waited three times and backed off.
+        let waits = sleeper.slept();
+        assert_eq!(waits.len(), 3, "{waits:?}");
+        assert!(waits[1] > waits[0], "the backoff must grow: {waits:?}");
+    }
+
+    /// A session that never opened one must not spend the budget finding out.
+    #[tokio::test]
+    async fn a_session_with_no_firewall_returns_without_waiting() {
+        let p = MockProvider::with_default_regions(ProviderKind::Aws);
+        let sleeper = RecordingSleeper::default();
+        let closed = close_session_firewall(&p, "never-launched", &sleeper, WaitOpts::default())
+            .await
+            .expect("nothing to close is not a failure");
+        assert!(closed.is_empty(), "{closed:?}");
+        assert!(
+            sleeper.slept().is_empty(),
+            "it waited for a firewall that never existed"
+        );
+    }
+
+    /// When the provider refuses for longer than the budget, the caller has to
+    /// hear about it: that is the case a sweep still has to collect.
+    #[tokio::test]
+    async fn a_firewall_that_never_detaches_is_reported_not_swallowed() {
+        // More refusals than the budget below allows attempts, without asking
+        // the mock to queue an unbounded number of them.
+        let p = ended_session(50).await;
+        let sleeper = RecordingSleeper::default();
+        let err = close_session_firewall(
+            &p,
+            "ended",
+            &sleeper,
+            WaitOpts {
+                initial_backoff: Duration::from_millis(500),
+                max_backoff: Duration::from_secs(8),
+                total_timeout: Duration::from_secs(30),
+            },
+        )
+        .await
+        .expect_err("a firewall that never detaches is not a success");
+        assert!(
+            err.to_string().contains("dependent object"),
+            "the provider's own refusal is what the caller reports: {err}"
+        );
+        assert!(
+            !p.session_ingress("ended").await.unwrap().is_empty(),
+            "the fixture must still have the firewall open"
         );
     }
 
