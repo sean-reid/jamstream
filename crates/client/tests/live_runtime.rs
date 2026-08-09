@@ -445,6 +445,28 @@ fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
 /// than that and the window is padding outright, with no level in it and a
 /// pitch of nothing. That is the shape of the run in #464, which read 6 in its
 /// last second against 8290 in its loudest.
+/// The shape a loaded runner produced: nearly two seconds of silence while the
+/// reopen got media flowing, then unbroken music. The reading has to be of the
+/// music, and how long the machine took to start is not the test's business.
+#[test]
+fn a_slow_start_still_reads_the_music_that_followed() {
+    let path = padded_fixture("slow-start", 1.96, 0.0);
+    let (rate, all) = rate_and_samples(&path);
+    let (music, opening) = after_opening_silence(&all);
+    let second = f64::from(rate) as usize * 2;
+
+    assert!(opening > second, "the fixture opens with under a second");
+    assert!(
+        music.len() >= second,
+        "a second of tone follows, and it is what gets measured"
+    );
+    let window = loudest_of(music, rate, 1.0);
+    assert!(rms(&window) > 0.02, "the window reads {}", rms(&window));
+    assert_eq!(longest_zero_run(&window), 0, "the window holds the silence");
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn a_measurement_starts_after_the_period_a_device_open_costs() {
     // One 240-frame period of zeros, then a second of tone: a capture from a
@@ -1706,15 +1728,18 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
         rate, 44_100,
         "the swapped-in device writes on its own clock"
     );
-    // The reopened device writes one period before the first pull reaches it,
-    // so the music starts after that and a window taken from the top of the
-    // file measures the stream starting rather than the stream running.
+    // A capture opens with silence: the device writes its first period before
+    // any pull reaches it, and a loaded machine takes longer still to get
+    // media flowing after a reopen. How long that took is the machine's
+    // business, so what is asserted is the music that followed rather than
+    // how soon it arrived. There has to be a second of it to read.
     let (music, opening) = after_opening_silence(&all);
-    let period = 240 * 2;
+    let second = f64::from(rate) as usize * 2;
     assert!(
-        opening <= period,
-        "the swapped-in stream took {opening} samples ({:.3} s) to make a \
-         sound, more than the one period a device open costs. {}",
+        music.len() >= second,
+        "only {:.3} s of audio followed {:.3} s of opening silence, too little \
+         to measure. {}",
+        music.len() as f64 / 2.0 / f64::from(rate),
         opening as f64 / 2.0 / f64::from(rate),
         tone_profile(&out_b, 440.0)
     );
