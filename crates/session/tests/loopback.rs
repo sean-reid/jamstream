@@ -3956,7 +3956,6 @@ fn a_capture_gap_the_length_of_a_device_reopen() {
 /// inflates it, so the re-anchor asks for a target the stream cannot reach when
 /// arrivals and pulls both run at one frame per tick.
 #[test]
-#[ignore = "reproduces #523: the re-anchor watchdog never fires once a stream has measured jitter"]
 fn a_capture_gap_on_a_jittery_stream() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
@@ -3986,10 +3985,12 @@ fn a_capture_gap_on_a_jittery_stream() {
         .expect("b is still a member");
     let pulled_after = m.jitter.pulled;
     println!(
-        "PROBE jittery: refused={} late={} lost={} waiting={} pulled={} depth={} target={} reanchors={}",
+        "PROBE jittery: refused={} late={} lost={} recovered={} resurrected={} waiting={} pulled={} depth={} target={} reanchors={}",
         m.opens_refused,
         m.jitter.late,
         m.jitter.lost,
+        m.jitter.recovered,
+        m.jitter.resurrected,
         m.jitter.waiting,
         pulled_after,
         m.jitter.depth_frames,
