@@ -2153,6 +2153,26 @@ fn wizard_launching() {
     wizard_snapshot(wizard_launching_app(Theme::Dark), "wizard_launching");
 }
 
+/// A launch that failed, which is the state a real one reaches often enough:
+/// the reason, what to do about a machine that may already be up, and one way
+/// out. Cloud rather than local, because the stray-machine line only applies
+/// there and it is the half that costs money.
+#[test]
+fn wizard_launch_failed() {
+    let mut app = test_app(Theme::Dark);
+    let mut w = fixed_wizard();
+    w.select_provider(1); // digitalocean, so the stray-machine note applies
+    w.advance_from_provider();
+    w.regions = fixed_regions();
+    w.selected_region = Some(0);
+    w.step = jamstream_client::screens::host::WizardStep::Launching;
+    w.launch_error =
+        Some("server did not complete a handshake within 60 s on 203.0.113.7:43210".to_owned());
+    app.wizard = w;
+    app.screen = Screen::HostWizard;
+    wizard_snapshot(app, "wizard_launch_failed");
+}
+
 #[test]
 fn wizard_launching_light() {
     wizard_snapshot(wizard_launching_app(Theme::Light), "wizard_launching_light");
