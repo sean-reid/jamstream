@@ -26,7 +26,7 @@ Check these in order of payoff:
 
 1. **Bluetooth.** Bluetooth headphones or earbuds add more delay than JamStream's entire network path. Use wired headphones, always. This is the most common cause of "it feels wrong" with a good-looking number.
 2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. Hover the latency number for the `buffer` readout, which reads "buffer 3/4 frames": the depth it is holding against the depth it is aiming for, in 2.5 ms frames. If it sits high or climbs, plug in ethernet.
-3. **Buffer size.** On the Audio tab of Settings, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that plays clean. Crackles mean one step up. A choice below the device's own minimum is annotated with the size the device really delivers.
+3. **Buffer size.** On the Audio tab of Settings, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that plays clean. Crackles, or chat saying playout is clicking, mean one step up. A choice below the device's own minimum is annotated with the size the device really delivers.
 4. **Sample rate.** A device that does not run at 48 kHz plays through a converter that adds about 3 ms per converted direction.
    A muted tag beside the latency number names both rates ("converting 44.1 to 48 kHz"); the headline number already includes the cost, and the hover breaks out each direction's milliseconds. To remove it, set the device itself to 48 kHz in the system's sound settings; see [Device problems](#device-problems).
 5. **WASAPI mode, on Windows.** Exclusive mode adds about 10 ms; shared mode adds 20 to 30 ms. The latency number's hover names which one this session got.
