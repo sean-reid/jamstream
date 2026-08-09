@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.1](https://github.com/sean-reid/jamstream/compare/v0.4.0...v0.4.1) (2026-08-09)
+
+
+### Features
+
+* **client:** keep what costs money on screen and fill the rest ([#491](https://github.com/sean-reid/jamstream/issues/491)) ([2d4235c](https://github.com/sean-reid/jamstream/commit/2d4235cb072355fe4e751b081d950bae0add159e))
+* **client:** warn on a dropout the listener actually heard ([#477](https://github.com/sean-reid/jamstream/issues/477)) ([a727053](https://github.com/sean-reid/jamstream/commit/a727053b514a266b4e4677459f717744b30daa9f))
+
+
+### Bug Fixes
+
+* **client:** let home scroll and put the sweep report where you pressed ([#490](https://github.com/sean-reid/jamstream/issues/490)) ([0768617](https://github.com/sean-reid/jamstream/commit/076861777c8cc9ac978345e8036388ff97313bc3))
+* **cloud:** close the firewall the session opened, not the next sweep ([#492](https://github.com/sean-reid/jamstream/issues/492)) ([191881a](https://github.com/sean-reid/jamstream/commit/191881a4e22176d14a0877587e63ac71b7756cfd))
+
 ## [0.4.0](https://github.com/sean-reid/jamstream/compare/v0.3.0...v0.4.0) (2026-08-07)
 
 
