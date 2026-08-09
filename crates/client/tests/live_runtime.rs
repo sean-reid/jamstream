@@ -902,6 +902,65 @@ fn leave_tears_down_and_shrinks_the_roster() {
 }
 
 #[test]
+fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
+    let server = TestServer::start();
+    let sine_b = sine_fixture("reconf-up", 660.0, RATE);
+    let out_a = temp_path("reconf-up", "out-a.wav");
+
+    // B is the one who plays and the one who changes settings; A only
+    // listens, so this asks whether a swap costs B their uplink.
+    let a = LiveRuntime::join_offline(
+        &server.invite(1, "a"),
+        settings(),
+        WavBackend::new(None, Some(out_a.clone())),
+    )
+    .expect("join a");
+    let b = LiveRuntime::join_offline(
+        &server.invite(2, "b"),
+        settings(),
+        WavBackend::new(Some(sine_b.clone()), None),
+    )
+    .expect("join b");
+
+    wait_for(&b, "b joined", Duration::from_secs(10), joined);
+    wait_for(&a, "a sees both members", Duration::from_secs(10), |s| {
+        joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+    });
+    std::thread::sleep(Duration::from_millis(1_000));
+
+    b.reconfigure_audio(AudioSettings {
+        capture_id: None,
+        playback_id: None,
+        buffer_frames: 240,
+        ..AudioSettings::default()
+    });
+    // Much longer after than before, so the back of this capture is post-swap
+    // audio on any machine rather than at one particular speed.
+    std::thread::sleep(Duration::from_millis(3_500));
+
+    a.send(Command::Leave);
+    wait_for(&a, "a idle", Duration::from_secs(3), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(a);
+    drop(b);
+
+    let (rate, all) = rate_and_samples(&out_a);
+    let frames = all.len() / 2;
+    // The back half only. The loudest second of the whole file would be the
+    // second before the swap, so a lost uplink would read as a pass.
+    let back = &all[(frames / 2) * 2..];
+    let window = loudest_of(back, rate, 1.0);
+    let heard = tone_energy(left(&window).as_slice(), rate, 660.0);
+    assert!(
+        heard > TONE_FLOOR,
+        "a stopped hearing b after b changed its buffer: {heard} at 660 Hz, \
+         floor {TONE_FLOOR}. {}",
+        tone_profile(&out_a, 660.0)
+    );
+}
+
+#[test]
 fn reconfigure_audio_swaps_the_stream_mid_session() {
     let server = TestServer::start();
     let sine = sine_fixture("reconf", 440.0, RATE);
