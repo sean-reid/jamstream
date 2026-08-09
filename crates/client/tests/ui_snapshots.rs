@@ -985,24 +985,6 @@ fn session_device_refused_narrow() {
     snapshot(&mut harness, "session_device_refused_narrow");
 }
 
-/// A session whose playout ring has been running dry for a while: the same
-/// chat column any other device notice reaches, naming the buffer as what to
-/// change rather than a count of how many times it happened.
-fn clicking_notice_app(theme: Theme) -> JamApp {
-    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
-    rt.push_system_chat(
-        "playout keeps running dry and clicking; raise Buffer size on the Audio tab",
-        200_000,
-    );
-    session_app(rt, theme)
-}
-
-#[test]
-fn session_clicking_notice() {
-    let mut harness = app_harness(clicking_notice_app(Theme::Dark), WIDE);
-    snapshot(&mut harness, "session_clicking_notice");
-}
-
 /// A session riding the boundary converter on both directions (#347 rung 3),
 /// the shape a 44.1 kHz interface gives a session on a host with no clock to
 /// move: the status bar carries the muted device-rate tag beside mouth to
@@ -1034,6 +1016,31 @@ fn session_converting_narrow() {
     // never push the readout out of the zone.
     let mut harness = app_harness(converting_app(Theme::Dark), NARROW);
     snapshot(&mut harness, "session_converting_narrow");
+}
+
+/// A session whose playout ring is in a clicking run: the persistent state
+/// the status bar and the Audio tab both read off the snapshot, in place of
+/// a chat line that may already have scrolled past by the time somebody
+/// looks up.
+fn clicking_app(theme: Theme, clicking: bool) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_clicking(clicking);
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_clicking_narrow() {
+    // The narrowest window, where the tag competes hardest with the meters
+    // and the two lamps for the bar's own room.
+    let mut harness = app_harness(clicking_app(Theme::Dark, true), NARROW);
+    snapshot(&mut harness, "session_clicking_narrow");
+}
+
+#[test]
+fn session_clicking_narrow_clear() {
+    // The same fixture with the run over, for a direct look at the tag gone.
+    let mut harness = app_harness(clicking_app(Theme::Dark, false), NARROW);
+    snapshot(&mut harness, "session_clicking_narrow_clear");
 }
 
 /// The drawer open on one tab. Every settings fixture goes through here, so
@@ -1101,6 +1108,22 @@ fn session_settings_converting() {
     let app = drawer_app(converting_app(Theme::Dark), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_converting");
+}
+
+#[test]
+fn session_settings_clicking() {
+    // The remedy sits with the control it names: a notice beside Buffer size
+    // while the ring is running dry, on the tab a musician opens to act on it.
+    let app = drawer_app(clicking_app(Theme::Dark, true), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_clicking");
+}
+
+#[test]
+fn session_settings_clicking_clear() {
+    let app = drawer_app(clicking_app(Theme::Dark, false), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_clicking_clear");
 }
 
 #[test]

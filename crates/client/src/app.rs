@@ -1037,6 +1037,7 @@ impl JamApp {
                 let notes = StreamNotes {
                     refusal: snap.and_then(|s| s.device_error.as_deref()),
                     rate_lines: &rate_lines,
+                    clicking: snap.is_some_and(|s| s.stats.clicking),
                 };
                 let event =
                     self.devices

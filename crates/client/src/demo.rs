@@ -138,6 +138,10 @@ struct DemoState {
     /// no stream shows.
     device_mode: Option<DeviceModeView>,
     rate: Option<RateOutcomesView>,
+    /// Whether the playout ring is pinned as clicking: the real runtime
+    /// derives this from the ring's own counters, so a fixture pins the
+    /// answer instead.
+    clicking: bool,
     /// Your own display name, as [`Command::SetOwnName`] set it: the demo
     /// stands in for the roster fanout the real server answers with.
     own_name: Option<String>,
@@ -300,6 +304,7 @@ impl DemoRuntime {
                 device_error: None,
                 device_mode: None,
                 rate: None,
+                clicking: false,
                 own_name: None,
             }),
             is_host,
@@ -400,17 +405,11 @@ impl DemoRuntime {
         s.record = RecordView { state, stems };
     }
 
-    /// Appends a device notice the way [`crate::live::LiveRuntime`] itself
-    /// does, so a fixture can show one in the same chat column a real
-    /// session would put it in.
-    pub fn push_system_chat(&self, text: &str, at_ms: u64) {
+    /// Pins whether the playout ring reads as clicking, as the real runtime
+    /// derives it from the ring's own underrun counters.
+    pub fn set_clicking(&self, clicking: bool) {
         let mut s = self.state.lock().expect("demo state");
-        s.extra_chat.push(ChatLine {
-            from_name: "system".to_owned(),
-            from_id: crate::live::SYSTEM_MEMBER,
-            text: text.to_owned(),
-            at_ms,
-        });
+        s.clicking = clicking;
     }
 
     fn scripted_chat() -> Vec<ChatLine> {
@@ -476,6 +475,7 @@ impl Runtime for DemoRuntime {
             mouth_to_ear_ms: Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32),
             device_mode: s.device_mode,
             rate: s.rate,
+            clicking: s.clicking,
         };
 
         let members = s

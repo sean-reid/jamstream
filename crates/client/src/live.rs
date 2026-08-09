@@ -76,7 +76,7 @@ const STREAM_SETTLED_AFTER: Duration = Duration::from_secs(5);
 const PUMP_REPLAY_MAX_SECS: u64 = 2;
 /// Synthetic sender id for system chat lines (device notices). Real member
 /// ids are assigned from zero, far below this.
-pub(crate) const SYSTEM_MEMBER: MemberId = MemberId(u16::MAX);
+const SYSTEM_MEMBER: MemberId = MemberId(u16::MAX);
 /// How long playout may hand out nothing but zeros on a joined session before
 /// the log says so. The deepest legitimate refill is the buffer's own
 /// `MAX_TARGET` of 24 frames, 60 ms, so a second of it is not the buffer
@@ -111,17 +111,15 @@ const CAPTURE_RING: Duration = Duration::from_millis(40);
 /// still climbing.
 const RING_REPORT_AGAIN: Duration = Duration::from_secs(1);
 const RING_REPORT_MAX: Duration = Duration::from_secs(60);
-/// Underruns inside this window that earn a chat line, and the window a run
-/// of them has to hold inside. One underrun alone is what opening a stream
-/// costs; a floor of three sits above that and below the five a clicking run
-/// took in ninety seconds on real hardware, so the window matches the run
-/// that shape came from.
+/// Underruns inside this window that mark a run as clicking, and the window
+/// a run of them has to hold inside. One underrun alone is what opening a
+/// stream costs; a floor of three sits above that and below the five a
+/// clicking run took in ninety seconds on real hardware. The same window
+/// closes a run out again: this long without a fresh underrun is a stretch
+/// of playing the ring kept up with, so the state clears rather than
+/// latching for the rest of the session.
 const CLICKING_EPISODE_COUNT: u64 = 3;
 const CLICKING_EPISODE_WINDOW: Duration = Duration::from_secs(90);
-/// What the chat line says, naming the one setting that fixes it rather than
-/// a count that means nothing to whoever is holding an instrument.
-const CLICKING_LINE: &str =
-    "playout keeps running dry and clicking; raise Buffer size on the Audio tab";
 /// Floor under [`playout_stall_after`], so a ring only a frame or two deep does
 /// not read a scheduling hiccup as a device that has stopped rendering.
 const PLAYOUT_STALL_FLOOR: Duration = Duration::from_millis(40);
@@ -309,6 +307,10 @@ struct SharedState {
     /// from the backend's report at open; None while there is no
     /// stream, so the UI never shows a dead stream's outcome.
     rate: Option<RateOutcomesView>,
+    /// Whether [`ClickEpisode`] currently has a run open. Set every tick
+    /// from the ring's own counters and cleared the tick the run ends, so
+    /// the UI reads it like connection state rather than a one-shot line.
+    clicking: bool,
 }
 
 impl SharedState {
@@ -345,6 +347,7 @@ impl SharedState {
             reopen_attempts: 0,
             device_error: None,
             rate: None,
+            clicking: false,
         }
     }
 
@@ -777,18 +780,25 @@ struct CounterWatch {
 }
 
 /// Whether the current stretch of underruns is dense enough for the person
-/// playing to have heard it, the way [`PlayoutWatch`]'s concealed-gap warning
-/// reports a run rather than a running total. A window that reaches
-/// [`CLICKING_EPISODE_COUNT`] fresh underruns earns one line; a window that
-/// runs out first restarts from where it ran out, so a slow drip that never
-/// bunches up inside one window stays quiet and a burst that does is said
-/// promptly rather than on a fixed clock.
+/// playing to have heard it, the way [`PlayoutWatch`]'s concealed-gap state
+/// holds for a run rather than firing on a sample. A window that reaches
+/// [`CLICKING_EPISODE_COUNT`] fresh underruns turns the state on; a window
+/// that runs out first without reaching it restarts from where it ran out,
+/// so a slow drip that never bunches up inside one window never turns it on
+/// at all. Once on, the same window without a fresh underrun turns it back
+/// off, so the state reads as "is this ring dry right now" rather than
+/// "has it ever been".
 #[derive(Default)]
 struct ClickEpisode {
     prev: Option<u64>,
-    /// When the current window opened and the total as it stood then.
+    /// When the run building toward the floor started, and the total as it
+    /// stood then. `None` once the floor is reached; there is nothing left
+    /// to build toward while the state is already on.
     since: Option<(Instant, u64)>,
-    said: bool,
+    /// The last tick a fresh underrun landed, which is what an active run
+    /// measures its own quiet against to decide when it is over.
+    last: Option<Instant>,
+    active: bool,
 }
 
 impl RingWatch {
@@ -802,13 +812,8 @@ impl RingWatch {
     }
 
     /// One tick's worth of observation, against the ring the counters belong
-    /// to. Returns the chat line this tick's underruns just earned, if any.
-    fn observe(
-        &mut self,
-        now: Instant,
-        engine: &EngineSide,
-        ring_frames: u32,
-    ) -> Option<&'static str> {
+    /// to. Returns whether the ring is in a clicking run as of this tick.
+    fn observe(&mut self, now: Instant, engine: &EngineSide, ring_frames: u32) -> bool {
         let up_ms = now.duration_since(self.opened).as_millis();
         let overruns = engine.overruns();
         if let Some(dropped) = self.overruns.due(now, overruns) {
@@ -830,9 +835,7 @@ impl RingWatch {
                 "playout ring ran dry; the device padded silence"
             );
         }
-        self.clicking
-            .observe(now, underruns)
-            .then_some(CLICKING_LINE)
+        self.clicking.observe(now, underruns)
     }
 }
 
@@ -859,29 +862,50 @@ impl CounterWatch {
 }
 
 impl ClickEpisode {
-    /// Whether this tick's underrun total just earned a chat line.
+    /// Whether the ring is in a clicking run as of this tick.
     fn observe(&mut self, now: Instant, total: u64) -> bool {
         let prev = self.prev.replace(total);
         if prev.is_some_and(|p| total < p) {
             // The ring's own counter moved backward: a fresh stream, whose
-            // window starts empty rather than continuing the old one.
+            // run starts empty rather than continuing the old one.
             self.since = None;
-            self.said = false;
+            self.last = None;
+            self.active = false;
             return false;
         }
-        let (since, base) = *self.since.get_or_insert((now, total));
-        if now.duration_since(since) > CLICKING_EPISODE_WINDOW {
-            // This window ran out under the floor: the next one starts from
-            // here, not from a start that is now stale.
-            self.since = Some((now, total));
-            self.said = false;
+        let fresh = prev.is_some_and(|p| total > p);
+        if fresh {
+            self.last = Some(now);
+        }
+        if self.active {
+            if self
+                .last
+                .is_some_and(|t| now.duration_since(t) >= CLICKING_EPISODE_WINDOW)
+            {
+                self.active = false;
+            }
+            return self.active;
+        }
+        if !fresh {
+            // No new underrun this tick: a window this stale never reached
+            // the floor and is not worth carrying forward.
+            if self
+                .since
+                .is_some_and(|(since, _)| now.duration_since(since) > CLICKING_EPISODE_WINDOW)
+            {
+                self.since = None;
+            }
             return false;
         }
-        if !self.said && total - base >= CLICKING_EPISODE_COUNT {
-            self.said = true;
-            return true;
+        let base = self
+            .since
+            .get_or_insert((now, prev.expect("fresh implies a previous total")))
+            .1;
+        if total - base >= CLICKING_EPISODE_COUNT {
+            self.active = true;
+            self.since = None;
         }
-        false
+        self.active
     }
 }
 
@@ -1109,6 +1133,7 @@ impl LiveRuntime {
                     None => None,
                 },
                 rate: s.rate,
+                clicking: s.clicking,
             },
             members,
             chat: s.chat.iter().cloned().collect(),
@@ -1921,17 +1946,18 @@ impl Worker {
     /// The bridge counters, reported by [`RingWatch`]. Movement means a ring
     /// too shallow for what the device delivers or for what the worker is
     /// keeping up with; the log is the one place that class of defect shows
-    /// as something other than bad audio somebody else can hear.
+    /// as something other than bad audio somebody else can hear. Whether the
+    /// ring is in a clicking run reaches the snapshot too, so the status bar
+    /// and the Audio tab read it the way they read connection state: no
+    /// stream, no run in progress.
     fn watch_ring_health(&mut self) {
-        let Some(engine) = self.engine.as_ref() else {
-            return;
+        let clicking = match self.engine.as_ref() {
+            Some(engine) => self
+                .rings
+                .observe(Instant::now(), engine, self.device_frames),
+            None => false,
         };
-        if let Some(line) = self
-            .rings
-            .observe(Instant::now(), engine, self.device_frames)
-        {
-            self.system_line(line);
-        }
+        self.shared.lock().expect("live state").clicking = clicking;
     }
 
     fn drain_events(&mut self, now_ms: u64) {
@@ -3058,84 +3084,122 @@ mod tests {
     }
 
     /// One underrun anywhere in the window it opens with is what a stream
-    /// open costs, and stays quiet for the rest of the session: the chat
-    /// line reads what to change, not a count, so it must never fire on a
-    /// single event a guitarist would never have heard.
+    /// open costs, and must never turn the state on however long the
+    /// session runs afterward: the snapshot reads what to change, not a
+    /// count, so a single event a guitarist would never have heard cannot
+    /// earn it.
     #[test]
-    fn a_single_underrun_never_earns_a_chat_line() {
+    fn a_single_underrun_never_turns_clicking_on() {
         let start = Instant::now();
         let (mut device, engine) = CallbackBridge::new(64, 64);
         let mut watch = RingWatch::new(start);
+        // The window opens on the stream's first tick, before any underrun,
+        // exactly as the worker's own ring health check does from the
+        // moment the device opens.
+        watch.observe(start, &engine, 120);
         let mut out = [0.0f32; 8];
         device.on_playback(&mut out);
-        // Two windows and a half, so a stale one restarts at least once
-        // without a second underrun ever arriving to fill it.
+        // Two windows and a half, so a stale attempt restarts at least once
+        // without a second underrun ever arriving to complete it.
         let ticks = (CLICKING_EPISODE_WINDOW.as_micros() * 5 / 2 / TICK.as_micros()) as u32;
-        for tick in 0..ticks {
+        for tick in 1..=ticks {
             assert!(
-                watch.observe(start + TICK * tick, &engine, 120).is_none(),
-                "a single underrun must not reach chat"
+                !watch.observe(start + TICK * tick, &engine, 120),
+                "a single underrun must never turn clicking on"
             );
         }
     }
 
-    /// Several underruns inside one window are the shape the concealed-gap
-    /// warning already reports on: a run, said once, naming the buffer as
-    /// what to change. [`CLICKING_EPISODE_COUNT`] sits above the one
-    /// underrun a stream open costs and below the five a clicking run took
-    /// in ninety seconds on real hardware.
+    /// Several underruns inside one window are the shape [`PlayoutWatch`]'s
+    /// concealed-gap state already holds for a run rather than firing on a
+    /// sample: the state turns on with the underrun that crosses
+    /// [`CLICKING_EPISODE_COUNT`], not later, and holds on for as long as
+    /// the run keeps going. The floor sits above the one underrun a stream
+    /// open costs and below the five a clicking run took in ninety seconds
+    /// on real hardware.
     #[test]
-    fn a_run_of_underruns_earns_the_chat_line_once() {
+    fn a_run_of_underruns_turns_clicking_on_and_holds_it() {
         let start = Instant::now();
         let (mut device, engine) = CallbackBridge::new(64, 64);
         let mut watch = RingWatch::new(start);
-        let mut said: Vec<&str> = Vec::new();
-        // The window opens on the stream's first tick, before any underrun,
-        // exactly as the worker's own ring health check does from the
-        // moment the device opens.
+        watch.observe(start, &engine, 120);
+        let mut tick = 1u32;
+        let mut readings = Vec::new();
+        for _ in 0..CLICKING_EPISODE_COUNT {
+            let mut out = [0.0f32; 8];
+            device.on_playback(&mut out);
+            readings.push(watch.observe(start + TICK * tick, &engine, 120));
+            tick += 1;
+            // A few seconds of quiet between each: still one stretch of
+            // playing, and nowhere near spending the whole window.
+            for _ in 0..1_000 {
+                readings.push(watch.observe(start + TICK * tick, &engine, 120));
+                tick += 1;
+            }
+        }
+        let turned_on = readings
+            .iter()
+            .position(|&on| on)
+            .expect("three underruns in one window must turn clicking on");
+        assert_eq!(
+            turned_on,
+            readings.len() - 1_001,
+            "must turn on with the third underrun, not later: {readings:?}"
+        );
+        assert!(
+            readings[turned_on..].iter().all(|&on| on),
+            "must hold on once turned on: {readings:?}"
+        );
+    }
+
+    /// The window running out under the floor is not the same as the state
+    /// having ever turned on. Once on, the same window without a fresh
+    /// underrun turns it back off, the stretch of playing the ring kept up
+    /// with; and a run that starts afterward turns the state on again
+    /// rather than finding it already spent, exactly as a second dropout is
+    /// its own episode in [`PlayoutWatch`].
+    #[test]
+    fn clicking_turns_off_after_a_quiet_stretch_and_a_new_run_turns_it_on_again() {
+        let start = Instant::now();
+        let (mut device, engine) = CallbackBridge::new(64, 64);
+        let mut watch = RingWatch::new(start);
         watch.observe(start, &engine, 120);
         let mut tick = 1u32;
         for _ in 0..CLICKING_EPISODE_COUNT {
             let mut out = [0.0f32; 8];
             device.on_playback(&mut out);
-            said.extend(watch.observe(start + TICK * tick, &engine, 120));
+            watch.observe(start + TICK * tick, &engine, 120);
             tick += 1;
-            // A few seconds between each: still one stretch of playing, and
-            // nowhere near spending the whole window.
-            for _ in 0..1_000 {
-                said.extend(watch.observe(start + TICK * tick, &engine, 120));
-                tick += 1;
-            }
         }
-        assert_eq!(said, vec![CLICKING_LINE], "{said:?}");
-    }
 
-    /// The window running out under the floor is not the same as it never
-    /// filling: a stretch that comes back after a quiet spell earns its own
-    /// line rather than reusing a spent one, exactly as a second dropout
-    /// does.
-    #[test]
-    fn a_second_run_of_underruns_earns_its_own_line() {
-        let start = Instant::now();
-        let (mut device, engine) = CallbackBridge::new(64, 64);
-        let mut watch = RingWatch::new(start);
-        let mut said: Vec<&str> = Vec::new();
-        watch.observe(start, &engine, 120);
-        let mut tick = 1u32;
-        let window_ticks = (CLICKING_EPISODE_WINDOW.as_micros() / TICK.as_micros()) as u32 + 10;
-        for _ in 0..2 {
-            for _ in 0..CLICKING_EPISODE_COUNT {
-                let mut out = [0.0f32; 8];
-                device.on_playback(&mut out);
-                said.extend(watch.observe(start + TICK * tick, &engine, 120));
-                tick += 1;
-            }
-            // Past the window with nothing more arriving: the run is over.
-            for _ in 0..window_ticks {
-                said.extend(watch.observe(start + TICK * tick, &engine, 120));
-                tick += 1;
-            }
+        // Comfortably inside the window since the last fresh underrun.
+        let half_window = (CLICKING_EPISODE_WINDOW.as_micros() / 2 / TICK.as_micros()) as u32;
+        tick += half_window;
+        assert!(
+            watch.observe(start + TICK * tick, &engine, 120),
+            "must still be on well inside the window"
+        );
+        tick += 1;
+
+        // Comfortably past a whole window with nothing fresh.
+        let past_window = (CLICKING_EPISODE_WINDOW.as_micros() / TICK.as_micros()) as u32 + 10;
+        tick += past_window;
+        assert!(
+            !watch.observe(start + TICK * tick, &engine, 120),
+            "a whole window with nothing fresh must turn clicking off"
+        );
+        tick += 1;
+
+        // A second run turns it on again rather than finding it spent.
+        for _ in 0..CLICKING_EPISODE_COUNT {
+            let mut out = [0.0f32; 8];
+            device.on_playback(&mut out);
+            watch.observe(start + TICK * tick, &engine, 120);
+            tick += 1;
         }
-        assert_eq!(said, vec![CLICKING_LINE, CLICKING_LINE], "{said:?}");
+        assert!(
+            watch.observe(start + TICK * tick, &engine, 120),
+            "a second run of underruns must turn clicking on again"
+        );
     }
 }
