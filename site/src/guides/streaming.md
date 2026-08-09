@@ -15,8 +15,12 @@ The broadcast mix, over a card showing everyone in the session. The host shapes 
 
 Both platforms give you a key that keeps working session after session.
 
-- **Twitch**: Creator Dashboard, Settings, Stream, Primary Stream key.
-- **YouTube Live**: YouTube Studio, Go Live, Stream, Stream key. A channel needs live streaming enabled once before this appears, which can take 24 hours on a new account. Do it before the band is waiting.
+| Platform | Where to find it |
+|---|---|
+| Twitch | Creator Dashboard, Settings, Stream, Primary Stream key |
+| YouTube Live | YouTube Studio, Go Live, Stream, Stream key |
+
+A YouTube channel needs live streaming enabled once before that key appears, which can take 24 hours on a new account. Do it before the band is waiting.
 
 **Add key** under Destinations shows these steps and opens the right page.
 
@@ -44,9 +48,13 @@ The **Broadcast** tab says so when it is missing, with the reason, and both **Ad
 ![The Broadcast tab reading that this session cannot stream because the broadcast tooling could not be downloaded, with Add key and Go live both disabled](../images/session_destinations_unavailable.png)
 *Nothing on this computer can fix this one: the relay is on the session machine.*
 
-The session server checks the relay every few seconds for as long as the session lasts, so this appears if the relay dies mid-session too, and clears if it comes back. Nothing on your computer affects it: to broadcast, start another session.
+The session server checks the relay every few seconds for as long as the session lasts. This appears if the relay dies mid-session too, and clears if it comes back; nothing on your computer affects it, so to broadcast, start another session.
 
-A session hosted on your own machine is the other way round, because the session machine is yours. It broadcasts through `ffmpeg` and `mediamtx` on your own `PATH`, and the app installs neither: `brew install ffmpeg mediamtx` on macOS, `apt install ffmpeg` plus a [mediamtx release](https://github.com/bluenviron/mediamtx/releases) on Linux. Without them the reason says which one is missing. Broadcasting from a local session does not work on Windows at all yet; host in the cloud for that.
+A session hosted on your own machine is the other way round, because the session machine is yours.
+
+> It broadcasts through `ffmpeg` and `mediamtx` on your own `PATH`, and the app installs neither: `brew install ffmpeg mediamtx` on macOS, `apt install ffmpeg` plus a [mediamtx release](https://github.com/bluenviron/mediamtx/releases) on Linux.
+>
+> Without them the reason says which one is missing. Broadcasting from a local session does not work on Windows at all yet; host in the cloud for that.
 
 ## While you are on air
 
@@ -62,13 +70,14 @@ Each row says what that platform is actually doing:
 | `live` | the platform is receiving the broadcast |
 | `failed` | it stopped, with the reason on the next line |
 
-Under the encode line are two frame counts, and they mean different things.
+Under the encode line are two frame counts. Both are one count for the whole broadcast, so every row shows the same pair, and each changes color as it rises:
 
-**repeated** is frames the machine had no time to draw. The video runs at 30 frames a second and the frame count is what holds it in step with the sound, so a frame with no time to draw goes out again as the last picture. Nothing is missing and the sound stays in step; the video stutters. A figure that climbs means the machine is at its limit.
+| Term | What it counts | What it means |
+|---|---|---|
+| repeated | frames the machine had no time to draw; sent again as the last picture | sound stays in step but the video stutters; a climbing count means the machine is at its limit |
+| dropped | frames the encoder would not take; gone for good | the video falls that many pictures short of the sound |
 
-**dropped** is frames the encoder would not take, and those are gone: the video is that many pictures short of the sound. Repeats come first and losses only once the machine is well past keeping up, so any dropped frame is worth acting on.
-
-Both are one count for the whole broadcast, so both rows show the same pair, and each changes color as it rises. Removing a destination brings neither down, because one encode feeds every platform. What helps is a shorter session, a smaller machine load, or one platform instead of two.
+Repeats come first, and losses only once the machine is well past keeping up, so any dropped frame is worth acting on. Removing a destination brings neither count down, because one encode feeds every platform. What helps is a shorter session, a smaller machine load, or one platform instead of two.
 
 ## When a platform fails
 
@@ -77,7 +86,11 @@ Both are one count for the whole broadcast, so both rows show the same pair, and
 
 A stream that dies quietly is worse than one that never started, so a failure shows in three places: the row goes red with the reason under it, the tab counts the failures, and the status bar lights STREAM FAILED beside ON AIR even with Settings closed.
 
-A destination that stops is retried on its own, on a backoff that starts at 500 ms and doubles to 16 seconds: the row goes back to `connecting`, and to `live` once the platform is taking the broadcast again. Expect a few seconds of `connecting` either way, most of it before the first byte leaves: a row that says `connecting` for five seconds is normal, and a row that says `live` is a platform receiving something. A key the platform rejects fails every time, and the reason says so: **Remove** that destination and add the key again.
+A destination that stops is retried on its own, on a backoff that starts at 500 ms and doubles to 16 seconds: the row goes back to `connecting`, and to `live` once the platform is taking the broadcast again.
+
+> Expect a few seconds of `connecting` either way, most of it before the first byte leaves. `connecting` for five seconds is normal; `live` means the platform is receiving something.
+
+A key the platform rejects fails every time, and the reason says so: **Remove** that destination and add the key again.
 
 The reason is the line the encoder or the pusher printed, quoted, with the destination URL removed because a stream key is in it. Read the front of it first.
 
@@ -86,7 +99,9 @@ The reason is the line the encoder or the pusher printed, quoted, with the desti
 | `push failed:` | sending the encode to the platform |
 | `encoder down:` | making the encode in the first place, before any platform is involved |
 
-Then read what follows. `Failed to connect to rtmps://<redacted>` with `Connection refused` or `authentication failed` is the platform saying no, so the key is wrong, was reset, or belongs to another channel. `Failed to connect to <local relay>` is the session machine failing to talk to itself, which no key change will fix; restart the session.
+Then read what follows. `Failed to connect to rtmps://<redacted>` with `Connection refused` or `authentication failed` is the platform saying no, so the key is wrong, was reset, or belongs to another channel.
+
+`Failed to connect to <local relay>` is the session machine failing to talk to itself, which no key change will fix; restart the session.
 
 **Stop streaming** takes everything off air at once, with no confirmation step, because a host who needs the stream to stop needs it to stop now. Ending the session stops it too.
 
