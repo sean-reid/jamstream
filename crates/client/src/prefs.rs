@@ -92,6 +92,11 @@ impl RecordingPrefs {
 /// The audio setup this computer uses, restored at the next launch: the
 /// selected devices by backend id (`None` is the System default entry), and
 /// the buffer size.
+///
+/// Nothing here records whether somebody is on headphones, and nothing asks:
+/// hearing yourself through the server is off until it is asked for on the
+/// Audio tab, which says it needs them, because that answer changes per
+/// session and this file is per computer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPrefs {
     #[serde(default)]
@@ -273,6 +278,30 @@ mod tests {
         std::fs::write(&path, "{not json").expect("write");
         assert_eq!(AppPrefs::load_from(&path), AppPrefs::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hearing yourself through the server is a choice made on the Audio tab
+    /// while a session is running, not a remembered answer, so this file has
+    /// nowhere to hold one.
+    #[test]
+    fn the_preferences_file_has_nowhere_to_answer_the_headphone_question() {
+        let prefs = AppPrefs {
+            capture_id: Some("coreaudio:scarlett-in".to_owned()),
+            playback_id: Some("coreaudio:scarlett-out".to_owned()),
+            buffer_frames: Some(120),
+            allow_exclusive: Some(true),
+            display_name: Some("Ana".to_owned()),
+        };
+        let value = serde_json::to_value(&prefs).expect("encode");
+        let fields = value.as_object().expect("an object");
+        for field in fields.keys() {
+            for word in ["headphone", "hear", "monitor"] {
+                assert!(
+                    !field.contains(word),
+                    "{field:?} answers a question the app does not ask"
+                );
+            }
+        }
     }
 
     #[test]
