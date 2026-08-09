@@ -66,7 +66,7 @@ irm https://github.com/sean-reid/jamstream/releases/latest/download/SHA256SUMS -
 
 ## Package managers
 
-Homebrew (macOS and Linux) and Scoop (Windows) are live; winget and the AUR are planned. Both channels track releases on their own once added.
+Homebrew (macOS and Linux) and Scoop (Windows) are live, and both follow new releases, so an upgrade comes from the package manager rather than from this page. winget and the AUR are planned.
 
 ```console
 $ brew install --cask sean-reid/jamstream/jamstream   # desktop app
