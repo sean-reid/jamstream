@@ -2,11 +2,19 @@
 
 ## The machine
 
-When you host, your computer asks a cloud provider for one small Linux VM, hands it a boot script, and completes an encrypted handshake with it before showing you any invite, so a session is never announced that cannot be joined. In [local mode](guides/local.md) there is no VM: the same server runs as a process on your own machine.
+When you host, your computer asks a cloud provider for one small Linux VM, hands it a boot script, and completes an encrypted handshake with it before showing you any invite. A session is never announced that cannot be joined.
+
+In [local mode](guides/local.md) there is no VM: the same server runs as a process on your own machine.
 
 Only the one UDP session port is reachable from outside. Nothing about a session persists in the cloud after it ends.
 
-The machine destroys itself three ways: when you end the session, when no musician has been connected for the idle window (default 10 minutes), and at the hard cap (default 12 hours) regardless. The provider and the machine enforce those, not your laptop, so quitting the app does not leave anything running and billing. `jamstream sweep` destroys anything tagged that somehow survives.
+The machine destroys itself three ways:
+
+- When you end the session.
+- When no musician has been connected for the idle window (default 10 minutes).
+- At the hard cap (default 12 hours), regardless.
+
+The provider and the machine enforce those, not your laptop, so quitting the app does not leave anything running and billing. `jamstream sweep` destroys anything tagged that somehow survives.
 
 GCP differs in one way worth knowing: an idle session stops serving but the machine is not deleted until you end the session, until your next `jamstream sweep`, or at the hard cap. The other two providers delete it on idle.
 
