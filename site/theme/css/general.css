@@ -127,7 +127,7 @@ html:not(.js) .page-wrapper,
    than a different centred width per table. .table-wrapper keeps a wide one
    scrollable on a narrow screen. */
 table {
-    margin: 0;
+    margin: 20px 0;
     width: 100%;
     border-collapse: collapse;
 }
