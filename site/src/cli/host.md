@@ -25,9 +25,9 @@ With `--provider local` (the default) there is nothing to rank or bill: the serv
 | `--max-hours <MAX_HOURS>` | `12` | Hard cap on session length in hours. Invites expire at the cap. |
 | `--record` | off | Let this session record. A local session's takes land as FLAC files in a recordings folder on this computer and the launch output prints its path; a cloud session needs `--bucket`, because the machine deletes itself at the end and a take on its disk goes with it. |
 | `--record-stems` | off | Also capture a stereo stem per musician alongside the mix, named for them. Implies `--record`. |
-| `--bucket <BUCKET>` | none | Bucket a cloud session records to, in the session's own region. Implies `--record`. The launch writes a probe object to prove the key can write, applies the retention rule, and saves the bucket beside the session record so [`jamstream recordings`](recordings.md) can find the takes later. Needs a storage key in the environment; see that page for the variables. |
+| `--bucket <BUCKET>` | none | Bucket a cloud session records to, in its own region. Implies `--record`. Proves the key can write, applies the retention rule, and saves the bucket beside the session record for [`jamstream recordings`](recordings.md). Needs a storage key; see that page for the variables. |
 | `--retention <RETENTION>` | `30d` | How long the bucket keeps this session's takes: `7d`, `30d`, `90d`, or `forever`. Applies to `--bucket`, and is enforced by the bucket's own lifecycle rule, so it keeps working after the machine is gone. |
-| `--artifact-url <ARTIFACT_URL>` | pinned into release builds | Override the URL of the `jamstreamd` artifact the VM downloads at boot. Release builds carry the release's own server build pinned in, so cloud hosting normally needs no flag; a source build has no pin and must pass both artifact flags to host on a cloud provider. Local mode runs a binary already on this machine and downloads nothing. |
+| `--artifact-url <ARTIFACT_URL>` | pinned into release builds | Override the URL of the `jamstreamd` artifact the VM downloads at boot. Release builds pin their own server build, so hosting on a cloud normally needs no flag; a source build has no pin and must pass both artifact flags. Local mode downloads nothing. |
 | `--artifact-sha256 <ARTIFACT_SHA256>` | pinned into release builds | Override the expected sha256 of the `jamstreamd` artifact. Must be passed together with `--artifact-url`; the VM refuses to start on a mismatch. |
 | `--yes` | off | Skip the launch confirmation. |
 | `--json` | off | Emit one JSON object instead of human-readable output. |
@@ -67,6 +67,7 @@ The [quickstart](../quickstart.md#from-the-terminal) shows a full run end to end
 ## Notes
 
 - If JamStream-tagged machines already exist on the provider, they are listed with a warning before anything launches; run [`jamstream sweep`](sweep.md) if they are strays.
-- `--record` arms recording, it does not start it: the host presses Record in the session, and each Record to Stop is one take. Finished takes are FLAC files named by date and time in the printed folder (`record_dir` in the `--json` output), and they stay there after `jamstream end`. See [Recording a session](../guides/recording.md).
+- `--record` arms recording, it does not start it: the host presses Record in the session, and each Record to Stop is one take.
+- Finished takes are FLAC files named by date and time in the printed folder (`record_dir` in the `--json` output), and they stay there after `jamstream end`. See [Recording a session](../guides/recording.md).
 - `--json` prints the session id, address, invites, cost estimate, recording folder, and state file path as one object, for scripts.
 - The state file lands under your platform's data directory in `jamstream/sessions/` and is what [`jamstream status`](status.md) and [`jamstream end`](end.md) read.

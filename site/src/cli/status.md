@@ -6,7 +6,9 @@ List known sessions with elapsed time and accrued cost.
 Usage: jamstream status [OPTIONS]
 ```
 
-Reads the local state files written by [`jamstream host`](host.md) and prints one row per session. Running sessions accrue by the second; ended ones show their final figures. A row recorded as running is checked against its provider first: if the instance is gone the row prints `stale` instead, with a pointer at [`jamstream end`](end.md) to close the record.
+Reads the local state files written by [`jamstream host`](host.md) and prints one row per session. Running sessions accrue by the second; ended ones show their final figures.
+
+A row recorded as running is checked against its provider first: if the instance is gone the row prints `stale` instead, with a pointer at [`jamstream end`](end.md) to close the record.
 
 ## Options
 

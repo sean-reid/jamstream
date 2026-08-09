@@ -6,7 +6,11 @@ Find and destroy orphaned jamstream instances.
 Usage: jamstream sweep [OPTIONS]
 ```
 
-Every machine JamStream launches carries a `jamstream` tag with its session id. Sweep lists everything with that tag, across every provider whose credentials are in the environment, and destroys it. Local sessions need no credentials and are always included, so a stray server process on this computer is found the same way. This is the backstop for crashed sessions, lost laptops, and anything else that slipped past [`jamstream end`](end.md).
+Every machine JamStream launches carries a `jamstream` tag with its session id. Sweep lists everything with that tag, across every provider whose credentials are in the environment, and destroys it.
+
+Local sessions need no credentials and are always included, so a stray server process on this computer is found the same way.
+
+This is the backstop for crashed sessions, lost laptops, and anything else that slipped past [`jamstream end`](end.md).
 
 ## Options
 
@@ -40,5 +44,6 @@ No jamstream-tagged instances found.
 
 - `sweep --dry-run --provider <name>` doubles as the credential check for a newly configured provider; see [Provider setup](../guides/providers.md#verifying-any-provider).
 - Sweep destroys by tag, so it also catches machines from other computers and old versions, and nothing untagged is ever touched.
-- Sweep also closes this machine's record of any session whose instance it destroyed or found already gone, so [`jamstream status`](status.md) stops reporting it as running. Closing a record is only done on evidence: a provider that could not be searched, or one region of it that could not be listed, leaves its records alone.
+- Sweep also closes this machine's record of any session whose instance it destroyed or found already gone, so [`jamstream status`](status.md) stops reporting it as running.
+- Closing a record is only done on evidence: a provider that could not be searched, or one region of it that could not be listed, leaves its records alone.
 - If a destroy fails, or a provider or any of its regions could not be searched, sweep exits nonzero and says which, because anything it could not account for may still be billing.
