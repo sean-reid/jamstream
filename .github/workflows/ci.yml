@@ -379,7 +379,6 @@ jobs:
 
   lint:
     needs: [changes]
-    if: needs.changes.outputs.docs-only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -409,23 +408,30 @@ jobs:
       #              gh api repos/EmbarkStudios/cargo-deny-action/git/ref/tags/v2
       #              gh api repos/taiki-e/install-action/git/ref/tags/v2
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+        if: needs.changes.outputs.docs-only != 'true'
       # Staleness gate. cargo-deny audits Cargo.lock and every cargo
       # invocation in this repo passes --locked, so a lockfile that does not
       # match Cargo.toml turns into a build failure minutes into some other
       # job. This fails in seconds and names the offending dependency. It
       # needs no system libraries, so it runs before the apt step.
       - name: Cargo.lock is current
+        if: needs.changes.outputs.docs-only != 'true'
         run: cargo metadata --locked --format-version 1 > /dev/null
       # libasound2-dev: cpal/alsa-sys. libxkbcommon-dev + libwayland-dev:
       # eframe 0.35 (winit/wayland) build-time requirements on Linux.
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+        if: needs.changes.outputs.docs-only != 'true'
       - run: cargo fmt --all --check
+        if: needs.changes.outputs.docs-only != 'true'
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        if: needs.changes.outputs.docs-only != 'true'
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        if: needs.changes.outputs.docs-only != 'true'
 
   # Unit, property, integration, and E2E story tests, plus a production
   # build of every binary. The harness gate suite runs in its own job below
@@ -443,7 +449,6 @@ jobs:
   # full workspace on macOS, everything but the snapshot binary elsewhere.
   test:
     needs: [changes]
-    if: needs.changes.outputs.docs-only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -471,6 +476,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           toolchain: stable
           components: clippy
@@ -480,9 +486,10 @@ jobs:
       # first. Saving what the failed run compiled makes the retry warm.
       # The ceiling itself is untouched; it defends steady-state wall time.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           cache-on-failure: true
-      - if: runner.os == 'Linux'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
       # ffmpeg is what makes crates/stream's real_ffmpeg test a test. Without it
       # that test returned early and printed PASS, so nothing in CI ever checked
@@ -498,10 +505,10 @@ jobs:
       # on 8.x, would each have reported something untrue of what ships. The
       # installer verifies the same sha256 the VM does, so a bad pin fails here
       # rather than at somebody's session boot.
-      - if: runner.os == 'Linux'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         name: Install the ffmpeg a session VM runs
         run: scripts/install-pinned-ffmpeg.sh "$RUNNER_TEMP/pinned-ffmpeg"
-      - if: runner.os == 'Linux'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         run: echo "$RUNNER_TEMP/pinned-ffmpeg" >> "$GITHUB_PATH"
       # And the relay, from the same pin file, for crates/stream's relay_chain
       # test. The encoder publishes to a MediaMTX on loopback and every pusher
@@ -510,12 +517,13 @@ jobs:
       # thing that runs the relay config cloud-init generates against the
       # release a session boots: mediamtx refuses an unknown key and exits, and
       # systemd reports a Type=simple unit as started either way.
-      - if: runner.os == 'Linux'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         name: Install the mediamtx a session VM runs
         run: scripts/install-pinned-mediamtx.sh "$RUNNER_TEMP/pinned-mediamtx"
-      - if: runner.os == 'Linux'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         run: echo "$RUNNER_TEMP/pinned-mediamtx" >> "$GITHUB_PATH"
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           tool: cargo-nextest
       # JAMSTREAM_PERF_BUDGET_SECS was set only on the harness job, so a
@@ -526,11 +534,11 @@ jobs:
       # and a 20084 us max through the full network simulation. Same value as
       # the harness job, so every scaled deadline in the repo agrees on one
       # number.
-      - if: runner.os == 'macOS'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'macOS')
         run: cargo nextest run --locked --workspace --exclude jamstream-harness
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
-      - if: runner.os != 'macOS'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os != 'macOS')
         run: cargo nextest run --locked --workspace --exclude jamstream-harness -E 'not binary(ui_snapshots)'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
@@ -541,7 +549,7 @@ jobs:
       # resource scripts and persistence deps added, pushed this leg past
       # its 20 minute ceiling; scoping to the bench crates keeps
       # the coverage and drops the duplicate work.
-      - if: runner.os == 'Windows'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Windows')
         run: cargo check --locked --benches -p jamstream-engine -p jamstream-protocol -p jamstream-server -p jamstream-audio-io
       # nextest does not run doctests, and nothing else did either, so a doctest
       # would have compiled on the author's machine and never once in CI (#295).
@@ -551,7 +559,7 @@ jobs:
       # is exactly the kind of test added without wondering whether CI runs it.
       # Linux only. Doctests here exercise no platform-specific path, so running
       # them three times would buy nothing.
-      - if: runner.os == 'Linux'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         name: Run doctests, which nextest does not
         run: cargo test --locked --workspace --doc
       # `cargo xtask fixtures` was invoked by nothing, and its WAV generator is
@@ -566,7 +574,7 @@ jobs:
       # caller), hence the floor rather than an exact count. The real fix is
       # one generator with one caller; that needs crates/cli, so this holds the
       # line until then.
-      - if: runner.os == 'Linux'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         name: The xtask fixtures and the test fixtures are the same bytes
         run: |
           set -eu
@@ -589,12 +597,12 @@ jobs:
       # code: audio-io (the WASAPI backend), cloud (icacls hardening and the
       # tasklist/taskkill process module), and client (reveal, and whatever
       # arrives next in the crate Windows users run).
-      - if: runner.os == 'Windows'
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Windows')
         run: cargo clippy --locked -p jamstream-audio-io -p jamstream-cloud -p jamstream-client --all-targets -- -D warnings
       # The snapshot tests drop a human-reviewable PNG of every screen under
       # target/ui-previews/; upload them even when a pixel diff fails, since
       # a failing run is exactly when a human wants to look.
-      - if: always() && runner.os == 'macOS'
+      - if: always() && needs.changes.outputs.docs-only != 'true' && (runner.os == 'macOS')
         uses: actions/upload-artifact@v7
         with:
           name: ui-previews
@@ -665,7 +673,6 @@ jobs:
   # wires engine + protocol to virtual clocks), so no apt step.
   harness:
     needs: [changes]
-    if: needs.changes.outputs.docs-only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -681,10 +688,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+        if: needs.changes.outputs.docs-only != 'true'
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           tool: cargo-nextest
       # One run again. #282 split this into two so the two wall-clock gates
@@ -697,6 +707,7 @@ jobs:
       # which had the same exposure and no fix (#283), and a laptop, which had
       # neither.
       - run: cargo nextest run --locked -p jamstream-harness
+        if: needs.changes.outputs.docs-only != 'true'
         env:
           # Shared runners are several times slower than a developer
           # machine; the gate catches order-of-magnitude regressions.
@@ -877,7 +888,6 @@ jobs:
   # A configuration nobody builds is a configuration nobody has tested.
   features:
     needs: [changes]
-    if: needs.changes.outputs.docs-only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -885,17 +895,20 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+        if: needs.changes.outputs.docs-only != 'true'
       - name: The crate as jamstreamd takes it, without gcp
+        if: needs.changes.outputs.docs-only != 'true'
         run: cargo test --locked -p jamstream-cloud --no-default-features --all-targets
       - name: And with every feature on
+        if: needs.changes.outputs.docs-only != 'true'
         run: cargo test --locked -p jamstream-cloud --all-features --all-targets
 
   musl:
     needs: [changes]
-    if: needs.changes.outputs.docs-only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -903,16 +916,21 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           toolchain: stable
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+        if: needs.changes.outputs.docs-only != 'true'
       - run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+        if: needs.changes.outputs.docs-only != 'true'
       - run: cargo build --locked -p jamstream-server --release --target x86_64-unknown-linux-musl
+        if: needs.changes.outputs.docs-only != 'true'
       # See release.yml for why fortify is off: the gnu-targeted cross gcc
       # compiles the vendored C against glibc headers, whose fortify layer
       # emits *_chk symbols musl does not have.
       - run: cargo build --locked -p jamstream-server --release --target aarch64-unknown-linux-musl
+        if: needs.changes.outputs.docs-only != 'true'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
@@ -921,6 +939,7 @@ jobs:
       # architecture its name claims; #139 was a machine downloading a
       # binary of the wrong architecture.
       - name: Verify both binaries are fully static and the right arch
+        if: needs.changes.outputs.docs-only != 'true'
         run: |
           set -eu
           for PAIR in "x86_64:x86-64" "aarch64:aarch64"; do
@@ -939,11 +958,13 @@ jobs:
             fi
           done
       - uses: actions/upload-artifact@v7
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           name: jamstreamd-x86_64-unknown-linux-musl
           path: target/x86_64-unknown-linux-musl/release/jamstreamd
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
+        if: needs.changes.outputs.docs-only != 'true'
         with:
           name: jamstreamd-aarch64-unknown-linux-musl
           path: target/aarch64-unknown-linux-musl/release/jamstreamd
@@ -1055,12 +1076,18 @@ jobs:
           # a gate that accepts any skip would accept that too.
           PUSH_ONLY='coverage release-build'
           PR_ONLY='pr-title'
-          # The jobs the changes job turns off when the whole diff is docs.
-          # Skipped is their correct result then and a failure any other
-          # time; keep this list equal to the jobs whose if: reads
-          # docs-only above, in both directions, or the next docs-only run
-          # fails here and says which side drifted.
-          DOCS_SKIP='lint test release-build harness features musl coverage'
+          # The jobs the changes job turns off entirely when the whole diff
+          # is docs. Skipped is their correct result then and a failure any
+          # other time; keep this list equal to the jobs whose own if: reads
+          # docs-only, in both directions, or the next docs-only run fails
+          # here and says which side drifted.
+          #
+          # lint, test, harness, features and musl are deliberately not here.
+          # Each is a required context, and a required context that reports
+          # skipped does not satisfy branch protection, so a docs-only pull
+          # request could never merge. They run and skip their own cargo
+          # steps instead, which reports success in seconds.
+          DOCS_SKIP='release-build coverage'
           status=0
           for job in $(printf '%s' "$NEEDS" | jq -r 'keys[]'); do
             result=$(printf '%s' "$NEEDS" | jq -r --arg j "$job" '.[$j].result')
