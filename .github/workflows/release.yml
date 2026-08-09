@@ -89,6 +89,35 @@ env:
   TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
+  # A release is public the moment release-please merges its pull request, but
+  # its assets take a quarter of an hour to arrive. install.sh resolves the
+  # latest release, so that window hands somebody a release whose SHA256SUMS
+  # does not describe the files beside it. Drafting it takes it out of "latest"
+  # until `publish` puts it back, complete.
+  #
+  # Gated on the release being incomplete, because the live path in is
+  # workflow_dispatch and a human rebuilding an old tag must not unpublish a
+  # good release. A finished release always carries SHA256SUMS.
+  hold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Hide the release until its assets are all here
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          if gh release view "$TAG" --repo "$REPO" --json assets \
+            --jq '.assets[].name' | grep -qx SHA256SUMS; then
+            echo "$TAG already carries SHA256SUMS, so it is complete; leaving it as it is"
+            exit 0
+          fi
+          gh release edit "$TAG" --repo "$REPO" --draft
+          echo "$TAG is a draft until publish says otherwise"
+
   # Static musl servers, one per architecture the providers launch: the
   # artifacts session VMs download at boot. Runs first because the URLs
   # and sha256s are compiled into every client and CLI build below.
@@ -814,3 +843,41 @@ jobs:
           git commit -m "chore: jamstream $TAG"
           git push origin "HEAD:refs/heads/$BRANCH"
           echo "pushed $TAG to https://github.com/$BUCKET_REPO ($BRANCH)"
+
+  # Puts the release back in "latest", once every file SHA256SUMS names is
+  # really attached to it. Runs only when every build succeeded, so a release
+  # that failed half way stays a draft: hidden is the right state for one whose
+  # assets do not match its sums file, and a re-run finishes the job.
+  publish:
+    needs: [hold, checksums, packaging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Every file the sums name is attached, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS \
+            --output SHA256SUMS --clobber
+          gh release view "$TAG" --repo "$REPO" --json assets \
+            --jq '.assets[].name' | sort > attached
+          awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort > named
+          echo "SHA256SUMS names $(grep -c . named) files; the release carries $(grep -c . attached)"
+          # Every named file present. The reverse is not a fault: SHA256SUMS
+          # and the packaging bundle are both attached and neither is named in
+          # it, the bundle deliberately so, being derived from it.
+          if ! missing=$(comm -23 named attached) || [ -n "$missing" ]; then
+            echo "these files are named in SHA256SUMS but not attached to $TAG:" >&2
+            printf '%s\n' "$missing" >&2
+            exit 1
+          fi
+          for want in SHA256SUMS jamstream-packaging.tar.gz; do
+            grep -qx "$want" attached ||
+              { echo "$TAG is missing $want" >&2; exit 1; }
+          done
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+          echo "$TAG is public, with $(grep -c . attached) assets"

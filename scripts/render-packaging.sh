@@ -165,8 +165,16 @@ if [ -n "$SUMS_FILE" ]; then
   printf 'using local checksums: %s\n' "$SUMS"
 else
   SUMS="$TMP/SHA256SUMS"
-  api_get "${RELEASE_BASE}/${TAG}/SHA256SUMS" > "$SUMS" \
-    || fail "cannot download ${RELEASE_BASE}/${TAG}/SHA256SUMS; is $TAG published and are its uploads finished?"
+  # gh, not the public download url: a release is a draft until its last
+  # asset lands, and draft assets are served only by the api that gh uses.
+  if [ -n "${GH_TOKEN:-}" ] && command -v gh > /dev/null 2>&1; then
+    gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS \
+      --output "$SUMS" --clobber \
+      || fail "cannot download SHA256SUMS from $TAG; did the checksums job run?"
+  else
+    api_get "${RELEASE_BASE}/${TAG}/SHA256SUMS" > "$SUMS" \
+      || fail "cannot download ${RELEASE_BASE}/${TAG}/SHA256SUMS; is $TAG published and are its uploads finished?"
+  fi
   printf 'fetched checksums for %s\n' "$TAG"
 fi
 
