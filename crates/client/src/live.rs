@@ -918,6 +918,7 @@ impl LiveRuntime {
             mono_buf: Vec::new(),
             shut_at: None,
             moved_since_reopen: None,
+            sent_since_reopen: None,
             carry: [0.0; CHUNK_STEREO],
             carry_pos: 0,
             carry_len: 0,
@@ -1290,6 +1291,9 @@ struct Worker {
     /// Capture samples moved since a reopen, counted until the first report.
     /// Zero means the device came back and the microphone did not.
     moved_since_reopen: Option<usize>,
+    /// Packets the uplink produced since a reopen. Samples reaching the core
+    /// prove capture; only this proves anything left the machine.
+    sent_since_reopen: Option<usize>,
     /// Playout staged toward the ring: pulled from the core but not yet
     /// accepted, so a full ring never discards decoded audio.
     carry: [f32; CHUNK_STEREO],
@@ -1609,6 +1613,7 @@ impl Worker {
                         "audio reopened after a settings change; nothing was captured while it was shut"
                     );
                     self.moved_since_reopen = Some(0);
+                    self.sent_since_reopen = Some(0);
                 }
                 let mut shared = self.shared.lock().expect("live state");
                 shared.reopen_attempts = self.reopen_attempts;
@@ -1693,9 +1698,11 @@ impl Worker {
                 if *moved >= SAMPLE_RATE as usize * 2 {
                     let moved = *moved;
                     self.moved_since_reopen = None;
+                    let sent = self.sent_since_reopen.take().unwrap_or(0);
                     let st = self.core.stats();
                     tracing::warn!(
                         moved,
+                        sent,
                         server_says_loss_pct = ?st.uplink_loss_pct,
                         server_says_depth = ?st.uplink_jitter_depth,
                         own_late = st.jitter.late,
@@ -1705,6 +1712,9 @@ impl Worker {
                 }
             }
             for pkt in self.core.push_capture_raw(now_ms, &self.mono_buf) {
+                if let Some(sent) = self.sent_since_reopen.as_mut() {
+                    *sent += 1;
+                }
                 let _ = self.socket.send(&pkt);
             }
         }
