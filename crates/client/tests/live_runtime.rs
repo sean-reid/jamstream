@@ -2318,6 +2318,87 @@ fn record_on_an_unarmed_session_fails_visibly_in_the_lamp() {
 /// that is `alone_in_the_process`, and it is what makes the answer the same
 /// under `cargo test`, where the binary runs every test on threads of one
 /// process, as under nextest, where each test gets a process of its own.
+/// A settings change is the one moment this client cannot see into: the device
+/// is shut for as long as the platform takes and nothing is captured then. The
+/// two lines exist so the next report of silence after a swap says whether the
+/// microphone came back and what the server made of the stream. A diagnostic
+/// nobody proved fires is worth nothing, so this asserts both of them.
+#[test]
+fn a_settings_change_says_what_the_reopen_cost() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        eprintln!("skipping: RUST_LOG replaces the default filter this is about");
+        return;
+    }
+    let server = TestServer::alone_in_the_process();
+
+    let dir = temp_path("reopen-diag", "logs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let log = dir.join("app.log");
+    // Needs a process to itself: the subscriber is global, installing truncates
+    // the file, and the quiet-log test asserts its own log holds only a banner.
+    // Under `cargo test` the two share a process and whichever installs second
+    // erases the other's lines. nextest gives every test its own, and CI runs
+    // nextest.
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipping: this needs a process to itself; run it under nextest");
+        return;
+    }
+    let installed = jamstream_client::logging::init_at(log.clone()).expect("install the log");
+    assert_eq!(installed, log);
+
+    let sine = sine_fixture("reopen-diag", 440.0, RATE);
+    let out_b = temp_path("reopen-diag", "out-b.wav");
+    let a = LiveRuntime::join_offline(
+        &server.invite(1, "a"),
+        settings(),
+        WavBackend::new(Some(sine.clone()), None),
+    )
+    .expect("join a");
+    let b = LiveRuntime::join_offline(
+        &server.invite(2, "b"),
+        settings(),
+        WavBackend::new(Some(sine.clone()), Some(out_b.clone())),
+    )
+    .expect("join b");
+    wait_for(&b, "b sees both members", Duration::from_secs(10), |s| {
+        joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+    });
+
+    b.reconfigure_audio(AudioSettings {
+        capture_id: None,
+        playback_id: None,
+        buffer_frames: 240,
+        ..AudioSettings::default()
+    });
+    // Two seconds of capture have to move before the second line reports, so
+    // that the server's opinion of the uplink has arrived and is not None.
+    std::thread::sleep(Duration::from_millis(3_000));
+
+    b.send(Command::Leave);
+    wait_for(&b, "b idle", Duration::from_secs(3), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(b);
+    drop(a);
+
+    let text = std::fs::read_to_string(&log).expect("the log is readable");
+    assert!(
+        text.contains("audio reopened after a settings change"),
+        "the reopen said nothing about how long the device was shut. Log:\n{text}"
+    );
+    assert!(
+        text.contains("capture after the reopen"),
+        "nothing reported whether capture resumed. Log:\n{text}"
+    );
+    assert!(
+        text.contains("moved="),
+        "the report carries no sample count, which is the whole question. Log:\n{text}"
+    );
+
+    let _ = std::fs::remove_file(&sine);
+    let _ = std::fs::remove_file(&out_b);
+}
+
 #[test]
 fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     if std::env::var_os("RUST_LOG").is_some() {

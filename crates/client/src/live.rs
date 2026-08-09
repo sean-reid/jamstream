@@ -916,6 +916,8 @@ impl LiveRuntime {
             epoch: Instant::now(),
             capture_buf: vec![0.0; capture_capacity(device_frames)],
             mono_buf: Vec::new(),
+            shut_at: None,
+            moved_since_reopen: None,
             carry: [0.0; CHUNK_STEREO],
             carry_pos: 0,
             carry_len: 0,
@@ -1281,6 +1283,13 @@ struct Worker {
     epoch: Instant,
     capture_buf: Vec<f32>,
     mono_buf: Vec<f32>,
+    /// When a settings change closed the device, so the reopen can say how
+    /// long nothing was captured. A real device takes real time here and the
+    /// fake takes none, which is the difference no offline test can see.
+    shut_at: Option<Instant>,
+    /// Capture samples moved since a reopen, counted until the first report.
+    /// Zero means the device came back and the microphone did not.
+    moved_since_reopen: Option<usize>,
     /// Playout staged toward the ring: pulled from the core but not yet
     /// accepted, so a full ring never discards decoded audio.
     carry: [f32; CHUNK_STEREO],
@@ -1477,6 +1486,7 @@ impl Worker {
     /// stream does not run, with only a chat line to say otherwise. The
     /// refusal itself stays on screen through `device_error`.
     fn reconfigure(&mut self, settings: AudioSettings) {
+        self.shut_at = Some(Instant::now());
         // Drain what the old ring already captured so those samples reach
         // the core before the endpoints are dropped; orphaning them would
         // shift our uplink frame clock behind the server's.
@@ -1592,6 +1602,14 @@ impl Worker {
                 // The ring opens full of silence, so the first callback owes
                 // this stream nothing yet.
                 self.ring_took = Instant::now();
+                if let Some(shut) = self.shut_at.take() {
+                    tracing::warn!(
+                        shut_ms = shut.elapsed().as_millis() as u64,
+                        device_frames,
+                        "audio reopened after a settings change; nothing was captured while it was shut"
+                    );
+                    self.moved_since_reopen = Some(0);
+                }
                 let mut shared = self.shared.lock().expect("live state");
                 shared.reopen_attempts = self.reopen_attempts;
                 shared.device_error = None;
@@ -1665,6 +1683,27 @@ impl Worker {
                 inst_sq += s * s;
             }
             n = self.mono_buf.len();
+            if let Some(moved) = self.moved_since_reopen.as_mut() {
+                *moved += n;
+                // A second of a 48 kHz mono uplink. Reported once, because the
+                // question is whether the microphone came back at all, and the
+                // answer does not change after the first second.
+                // Two seconds, so the server has had time to send a stats
+                // report and its opinion of our uplink is not None.
+                if *moved >= SAMPLE_RATE as usize * 2 {
+                    let moved = *moved;
+                    self.moved_since_reopen = None;
+                    let st = self.core.stats();
+                    tracing::warn!(
+                        moved,
+                        server_says_loss_pct = ?st.uplink_loss_pct,
+                        server_says_depth = ?st.uplink_jitter_depth,
+                        own_late = st.jitter.late,
+                        own_reanchors = st.jitter.reanchors,
+                        "capture after the reopen, and what the server makes of it"
+                    );
+                }
+            }
             for pkt in self.core.push_capture_raw(now_ms, &self.mono_buf) {
                 let _ = self.socket.send(&pkt);
             }
