@@ -256,6 +256,8 @@ struct SharedState {
     broadcast_faders: HashMap<MemberId, FaderView>,
     /// Client-local optimistic audition state; the server sends no echo.
     audition: bool,
+    /// Client-local optimistic hear-self state; the server sends no echo.
+    hear_self: bool,
     /// Last `StreamStatus` the server sent, verbatim. Unlike the faders
     /// there is no optimistic copy: the pipeline's own view is the only
     /// honest one, and a destination that failed to come up must not read as
@@ -308,6 +310,7 @@ impl SharedState {
             faders: HashMap::new(),
             broadcast_faders: HashMap::new(),
             audition: false,
+            hear_self: false,
             stream: Vec::new(),
             readiness: None,
             record: RecordView::default(),
@@ -1048,6 +1051,7 @@ impl LiveRuntime {
             // The wizard's [`CostedRuntime`] wrapper fills this for
             // sessions this app launched; plain joins have no meter.
             cost: None,
+            hear_self: s.hear_self,
             session_short: s.session_short.clone(),
             server_addr: s.server_addr.clone(),
             is_host,
@@ -1103,6 +1107,7 @@ impl LiveRuntime {
                     );
                 }
                 Command::SetBroadcastAudition(on) => s.audition = *on,
+                Command::SetHearSelf(on) => s.hear_self = *on,
                 // Your own picture comes back through the roster like
                 // anyone else's; dropping it can only be local.
                 Command::SetOwnAvatar(bytes) => s.own_dropped = bytes.is_none(),
@@ -1400,6 +1405,7 @@ impl Worker {
                 muted,
             } => self.core.set_broadcast_fader(member, gain_db, pan, muted),
             Command::SetBroadcastAudition(on) => self.core.set_broadcast_audition(on),
+            Command::SetHearSelf(on) => self.core.set_hear_self(on),
             Command::SendChat(text) => self.core.send_chat(&text),
             Command::Revoke(jti) => self.core.revoke(jti),
             // The bytes arrive raw from the settings sheet: hashing,

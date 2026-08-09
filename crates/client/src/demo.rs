@@ -122,6 +122,7 @@ struct DemoState {
     quiet: Vec<u16>,
     left: bool,
     audition: bool,
+    hear_self: bool,
     destinations: Vec<Destination>,
     /// Whether the session can broadcast at all. None is a session that has
     /// not been asked, which is every demo one; a fixture pins the answer.
@@ -292,6 +293,7 @@ impl DemoRuntime {
                 quiet: Vec::new(),
                 left: false,
                 audition: false,
+                hear_self: false,
                 destinations: Vec::new(),
                 readiness: None,
                 record: RecordView::default(),
@@ -535,6 +537,7 @@ impl Runtime for DemoRuntime {
                 accrued_microusd: HOURLY_MICROUSD * elapsed_secs / 3600,
                 elapsed_secs,
             }),
+            hear_self: s.hear_self,
             session_short: "a3f29c41".to_owned(),
             server_addr: "203.0.113.10:43210".to_owned(),
             is_host: self.is_host,
@@ -600,6 +603,7 @@ impl Runtime for DemoRuntime {
                 }
             }
             Command::SetBroadcastAudition(on) => s.audition = on,
+            Command::SetHearSelf(on) => s.hear_self = on,
             // The demo stands in for the runtime's decode step: raw file
             // bytes in, pixels on your own strip out, or the initials disc
             // back when they are dropped.

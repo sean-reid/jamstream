@@ -82,6 +82,9 @@ pub enum Command {
     /// Host only: while on, the host's monitor carries the exact
     /// post-limiter listener signal, own voice included.
     SetBroadcastAudition(bool),
+    /// Any member: while on, your personal mix includes your own signal
+    /// instead of the usual removal.
+    SetHearSelf(bool),
     /// Your own avatar: raw file bytes as read from disk, or None to drop
     /// it. The runtime hashes, validates, and announces; the UI never sees
     /// a hash. Bytes past the transfer cap are refused with a log line, the
@@ -437,6 +440,9 @@ pub struct Snapshot {
     /// reason as the on-air lamp: everyone in the room is on the take.
     pub record: RecordView,
     pub cost: Option<CostView>,
+    /// Whether your personal mix includes your own signal. Client-local
+    /// optimistic state: the server sends no echo.
+    pub hear_self: bool,
     /// First 8 hex characters of the session id.
     pub session_short: String,
     pub server_addr: String,
