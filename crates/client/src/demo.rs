@@ -400,6 +400,19 @@ impl DemoRuntime {
         s.record = RecordView { state, stems };
     }
 
+    /// Appends a device notice the way [`crate::live::LiveRuntime`] itself
+    /// does, so a fixture can show one in the same chat column a real
+    /// session would put it in.
+    pub fn push_system_chat(&self, text: &str, at_ms: u64) {
+        let mut s = self.state.lock().expect("demo state");
+        s.extra_chat.push(ChatLine {
+            from_name: "system".to_owned(),
+            from_id: crate::live::SYSTEM_MEMBER,
+            text: text.to_owned(),
+            at_ms,
+        });
+    }
+
     fn scripted_chat() -> Vec<ChatLine> {
         let line = |id: u16, name: &str, text: &str, at_ms: u64| ChatLine {
             from_name: name.to_owned(),

@@ -985,6 +985,24 @@ fn session_device_refused_narrow() {
     snapshot(&mut harness, "session_device_refused_narrow");
 }
 
+/// A session whose playout ring has been running dry for a while: the same
+/// chat column any other device notice reaches, naming the buffer as what to
+/// change rather than a count of how many times it happened.
+fn clicking_notice_app(theme: Theme) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.push_system_chat(
+        "playout keeps running dry and clicking; raise Buffer size on the Audio tab",
+        200_000,
+    );
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_clicking_notice() {
+    let mut harness = app_harness(clicking_notice_app(Theme::Dark), WIDE);
+    snapshot(&mut harness, "session_clicking_notice");
+}
+
 /// A session riding the boundary converter on both directions (#347 rung 3),
 /// the shape a 44.1 kHz interface gives a session on a host with no clock to
 /// move: the status bar carries the muted device-rate tag beside mouth to
