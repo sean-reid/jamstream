@@ -78,7 +78,7 @@ Storage is the small one:
 | Storage | Price | 30 days of stems, the default retention (~6 GB) |
 |---|---|---|
 | S3 | $0.023/GB-month | about $0.14 |
-| Cloud Storage | about $0.02/GB-month | |
+| Cloud Storage | about $0.02/GB-month | about $0.12 |
 | DigitalOcean Spaces | $5/month flat, includes 250 GB | included |
 
 A Spaces subscription already covers a take at that price. Uploading itself costs nothing, since the machine and the bucket sit at the same provider.
