@@ -7,7 +7,7 @@ Two paths from nothing to a running session, both in the desktop app.
 | Local | About 5 minutes | No cloud account | Musicians in the same room or on the same network |
 | Internet | About 20 minutes the first time | A DigitalOcean account | Bandmates anywhere |
 
-This page walks the local path first, then the internet path.
+Most of that 20 minutes is setting up the DigitalOcean account, not the app. This page walks the local path first, then the internet path.
 
 ## 1. Get the app
 
