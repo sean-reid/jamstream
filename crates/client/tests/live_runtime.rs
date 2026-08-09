@@ -687,6 +687,101 @@ fn two_runtimes_hear_each_other() {
     }
 }
 
+/// Both sides play a tone of their own, at different frequencies so "own" and
+/// "other" cannot be confused. A asks to hear itself; B never does, and it is
+/// B's own exclusion still holding that makes A's inclusion mean something
+/// rather than a personal mix that always included everyone.
+#[test]
+fn hear_self_puts_your_own_tone_in_your_own_playout() {
+    let server = TestServer::start();
+    let sine_a = sine_fixture("hear-self", 440.0, RATE);
+    let sine_b = sine_fixture("hear-self", 660.0, RATE);
+    let out_a = temp_path("hear-self", "out-a.wav");
+    let out_b = temp_path("hear-self", "out-b.wav");
+
+    let a = LiveRuntime::join_offline(
+        &server.invite(1, "a"),
+        settings(),
+        WavBackend::new(Some(sine_a.clone()), Some(out_a.clone())),
+    )
+    .expect("join a");
+    let b = LiveRuntime::join_offline(
+        &server.invite(2, "b"),
+        settings(),
+        WavBackend::new(Some(sine_b.clone()), Some(out_b.clone())),
+    )
+    .expect("join b");
+
+    for (rt, who) in [(&a, "a"), (&b, "b")] {
+        wait_for(rt, who, Duration::from_secs(10), |s| {
+            joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+        });
+    }
+
+    // The personal mix excludes self by default; give that a real stretch to
+    // run before asking otherwise.
+    std::thread::sleep(Duration::from_millis(2_000));
+    a.send(Command::SetHearSelf(true));
+    // Once A's own tone joins B's in A's mix, this stretch outweighs the
+    // excluded-self one before it, so the whole file's loudest second lands
+    // here rather than needing a fixed offset to find it.
+    std::thread::sleep(Duration::from_millis(2_500));
+
+    for rt in [&a, &b] {
+        rt.send(Command::Leave);
+    }
+    for (rt, who) in [(&a, "a"), (&b, "b")] {
+        wait_for(rt, who, Duration::from_secs(3), |s| {
+            s.stats.state == ConnState::Idle
+        });
+    }
+    drop(a);
+    drop(b);
+
+    // The back half, then the loudest second inside it. `loudest` over the
+    // whole file picks by total level, which the other runtime's tone
+    // dominates from the first second, so it can land before the command took
+    // effect and read A's own tone as absent.
+    let (rate_a, all_a) = rate_and_samples(&out_a);
+    let back_a = &all_a[(all_a.len() / 4) * 2..];
+    let window_a = loudest_of(back_a, rate_a, 1.0);
+    let mono_a = left(&window_a);
+    let own_in_a = tone_energy(&mono_a, rate_a, 440.0);
+    let other_in_a = tone_energy(&mono_a, rate_a, 660.0);
+    assert!(
+        own_in_a > TONE_FLOOR,
+        "a asked to hear itself and its own 440 Hz tone still reads {own_in_a} \
+         in its loudest second, under the {TONE_FLOOR} floor. Whole file: {}",
+        tone_profile(&out_a, 440.0)
+    );
+    assert!(
+        other_in_a > TONE_FLOOR,
+        "a should still hear b's 660 Hz tone alongside its own, reads {other_in_a}"
+    );
+
+    let (rate_b, all_b) = rate_and_samples(&out_b);
+    let back_b = &all_b[(all_b.len() / 4) * 2..];
+    let window_b = loudest_of(back_b, rate_b, 1.0);
+    let mono_b = left(&window_b);
+    let own_in_b = tone_energy(&mono_b, rate_b, 660.0);
+    let other_in_b = tone_energy(&mono_b, rate_b, 440.0);
+    assert!(
+        other_in_b > TONE_FLOOR,
+        "b's mix should be unchanged and still carry a's 440 Hz tone, reads {other_in_b}"
+    );
+    assert!(
+        other_in_b > own_in_b * 4.0,
+        "b never asked to hear itself, so its mix must keep excluding its own \
+         660 Hz tone: heard {other_in_b} at 440 Hz against {own_in_b} at its own \
+         660 Hz. Whole file: {}",
+        tone_profile(&out_b, 660.0)
+    );
+
+    for p in [&sine_a, &sine_b, &out_a, &out_b] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 #[test]
 fn chat_crosses_between_runtimes() {
     let server = TestServer::start();
