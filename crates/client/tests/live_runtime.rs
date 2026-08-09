@@ -1713,8 +1713,10 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
     let period = 240 * 2;
     assert!(
         opening <= period,
-        "the swapped-in stream took {opening} samples to make a sound, more \
-         than the one period a device open costs"
+        "the swapped-in stream took {opening} samples ({:.3} s) to make a \
+         sound, more than the one period a device open costs. {}",
+        opening as f64 / 2.0 / f64::from(rate),
+        tone_profile(&out_b, 440.0)
     );
     let window = loudest_of(music, rate, 1.0);
     let energy = rms(&window);
