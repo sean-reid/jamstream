@@ -2,7 +2,9 @@
 
 ## License
 
-JamStream is free software, dual-licensed under [MIT](https://github.com/sean-reid/jamstream/blob/main/LICENSE-MIT) and [Apache 2.0](https://github.com/sean-reid/jamstream/blob/main/LICENSE-APACHE); use it under either. The bundled fonts, Public Sans and IBM Plex Mono, are under the SIL Open Font License, included alongside the font files in the repository and on this site.
+JamStream is free software, dual-licensed under [MIT](https://github.com/sean-reid/jamstream/blob/main/LICENSE-MIT) and [Apache 2.0](https://github.com/sean-reid/jamstream/blob/main/LICENSE-APACHE); use it under either.
+
+The bundled fonts, Public Sans and IBM Plex Mono, are under the SIL Open Font License, included alongside the font files in the repository and on this site.
 
 ## Source
 
