@@ -71,6 +71,16 @@ on:
         required: true
         type: string
 
+# One build per tag, whatever started it. release-please's publish and a hand
+# dispatch both reach this workflow, and two runs of it each build their own
+# jamstreamd, each upload it with --clobber, and each compile a client pinning
+# their own copy's sha256. Whichever binary lands last, half the clients demand
+# the other one and every VM they launch refuses to start on a hash mismatch.
+# Not cancel-in-progress: a half-uploaded release is worse than a queued one.
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
 # Read by default; the jobs that upload assets raise themselves to
 # contents: write. Nothing here needs actions, packages, or id-token.
 permissions:
@@ -849,7 +859,7 @@ jobs:
   # that failed half way stays a draft: hidden is the right state for one whose
   # assets do not match its sums file, and a re-run finishes the job.
   publish:
-    needs: [hold, checksums, packaging]
+    needs: [hold, server-musl, checksums, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -859,10 +869,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          PINNED_X86_64: ${{ needs.server-musl.outputs.server_sha256_x86_64 }}
+          PINNED_AARCH64: ${{ needs.server-musl.outputs.server_sha256_aarch64 }}
         run: |
           set -eu
           gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS \
             --output SHA256SUMS --clobber
+          # The clients built in this run demand these exact bytes at boot, and
+          # a VM refuses to start on a mismatch. If another run of this
+          # workflow replaced the binary after this one pinned it, the two
+          # halves of the release disagree and no cloud session can start, so
+          # the release stays a draft instead.
+          for pair in "jamstreamd-linux-x86_64-musl:$PINNED_X86_64" \
+                      "jamstreamd-linux-aarch64-musl:$PINNED_AARCH64"; do
+            name=${pair%%:*}
+            want=${pair#*:}
+            have=$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1 }' SHA256SUMS)
+            if [ "$have" != "$want" ]; then
+              echo "$name on the release is $have but this run's clients pin $want." >&2
+              echo "Another build of $TAG replaced it; rebuild the tag from one run." >&2
+              exit 1
+            fi
+            echo "ok    $name matches what this run's clients pin"
+          done
           gh release view "$TAG" --repo "$REPO" --json assets \
             --jq '.assets[].name' | sort > attached
           awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort > named

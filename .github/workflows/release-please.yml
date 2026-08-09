@@ -95,25 +95,3 @@ jobs:
           git commit -m "chore: refresh Cargo.lock for the version bump"
           git push
 
-  # Events published with the workflow token do not trigger workflows
-  # (recursion guard), so the artifact build is chained by explicit dispatch,
-  # which is the sanctioned exception.
-  #
-  # This is a separate job so that actions: write, which can start any
-  # workflow in the repository, is never held by the job that runs the
-  # third-party release-please action. The two permissions together are the
-  # whole attack: push a tag, then dispatch the notarizing build at it.
-  dispatch-release:
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          # Bound to env rather than interpolated into the command, so a tag
-          # name is never shell input.
-          TAG: ${{ needs.release-please.outputs.tag_name }}
-        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" -f "tag=$TAG"
