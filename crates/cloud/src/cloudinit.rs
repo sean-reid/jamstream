@@ -820,6 +820,10 @@ User={user}
 Group={user}
 # The guard is the cap that actually destroys the VM. These two make the
 # server stop serving on its own if the guard ever stops running.
+# The broadcast layout is this machine's to declare: /run/jamstream below is
+# the directory this unit is granted, and jamstreamd reads this to choose it
+# rather than inferring it from the directory being there.
+Environment=JAMSTREAM_SESSION_VM=1
 ExecStart=/usr/local/bin/jamstreamd --config {server_cfg} \
 --idle-exit-min {idle_min} --max-duration-min {max_min}
 Restart=on-failure
@@ -1106,6 +1110,31 @@ mod tests {
             panic!("missing snapshot {path:?}; run with UPDATE_SNAPSHOTS=1 to create")
         });
         assert_eq!(rendered, expected, "snapshot mismatch for {name}");
+    }
+
+    /// The other half of the broadcast layout contract: jamstreamd picks the
+    /// VM's layout from this variable and nothing else does, so a unit that
+    /// loses the line is a session that broadcasts into a temp directory the
+    /// firewall and the tmpfs grant know nothing about.
+    #[test]
+    fn the_unit_tells_jamstreamd_it_is_a_session_vm() {
+        let out = render(&base_config(SelfDestruct::AwsShutdown));
+        // Sliced at the unit's own file entry and stopped at the next one, so
+        // this cannot pass on a line belonging to another unit.
+        let unit = out
+            .split_once("- path: /etc/systemd/system/jamstreamd.service")
+            .expect("the server unit is written")
+            .1
+            .split("- path:")
+            .next()
+            .expect("the unit has a body");
+        assert!(
+            unit.contains(&format!(
+                "Environment={}=1",
+                jamstream_cloud::providers::local::SESSION_VM_ENV
+            )),
+            "the server unit does not declare itself a session VM"
+        );
     }
 
     #[test]
