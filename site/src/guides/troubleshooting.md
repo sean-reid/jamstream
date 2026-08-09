@@ -44,6 +44,9 @@ This is a different complaint from a high latency number: everyone sounds right 
 |---|---|---|
 | Timing holds up solo, and drags once the whole band plays, worse with distance | Each player hears their own instrument immediately and everyone else a full network path away, so the timing error every player feels is the mouth-to-ear number the [status bar](#latency-feels-high) already shows, and no two players carry the same number | Turn on the click. It's mixed into every player's personal mix on the server, so it reaches everyone on the same timeline and the band follows it instead of each other. It does not change the mouth-to-ear number, and it does not need to |
 
+Not every band plays to a click. The other fix: turn on **Hear yourself through the server**, on the Audio tab of Settings.
+Your own sound joins the mix, so the error you hear becomes the gap between two uplinks instead of the whole network path. It wants headphones, because playing that mix through speakers loops your own signal back into the microphone.
+
 ## Device problems
 
 Input and output devices are picked on the Audio tab of Settings, under Devices: a Capture picker, a Playback picker, and an input level meter that should move when you play.

@@ -29,7 +29,7 @@ What you are looking at:
 
 - One mixer strip per musician: an avatar disc, a presence dot, name, fader, pan, dB readout, and a Mute button. This is your personal monitor mix; moving Ana's fader changes what you hear, not what anyone else hears.
 - The avatar disc shows a member's picture if they set one, and their initials on a color hashed from their name if they have not. The same disc and color appear on the card the broadcast renders, so a member looks the same in the app and on a stream.
-- Your own strip is dimmed with a "you" tag. Self monitoring is local, on your interface, not through the server, so your own channel has no fader in the mix.
+- Your own strip is dimmed with a "you" tag, with no fader on it: there is no separate gain for your own channel. Self monitoring is local by default; the Audio tab's **Hear yourself through the server** choice puts your own sound in the mix too, on the band's timeline instead of off it.
 - The host additionally sees a Revoke button on every other strip. Revoking ejects that member and kills their invite, with a confirmation step.
 - Chat, with timestamps. The metronome panel shows tempo, beats per bar, and click state; the host sets them, and "hear the click" is your own choice.
 - The **ON AIR** lamp, in the middle of the status bar, is absent until the host starts a broadcast and amber while one is running; hover it to see how many platforms are receiving it.
@@ -57,12 +57,13 @@ Settings in the top bar opens over the session without covering the strips or th
 - **Recording**, for where takes go; a setting of this computer, present whatever the session is.
 - **You**, for your avatar and the theme.
 
-![The Audio tab of the Settings drawer beside the session: buffer size choices with the current mouth to ear figure, an input level meter, and capture and playback pickers](../images/session_settings.png)
+![The Audio tab of the Settings drawer beside the session: buffer size choices with the current mouth to ear figure, an input level meter, the Hear yourself through the server choice, and capture and playback pickers](../images/session_settings.png)
 *Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*
 
 - **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that plays clean; crackles mean one step up. The mouth to ear figure under the choices moves with them, because the buffer is part of it.
 - A choice outside what the selected device can deliver is annotated with the device's own minimum or maximum, because that is what you will really get.
 - The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.
+- **Hear yourself through the server** is off by default; turning it on puts your own sound in your mix too, on the band's timeline. See [The band can't keep together](troubleshooting.md#the-band-cant-keep-together) for why, and note it wants headphones.
 - **Capture** and **Playback** list a System default entry first, then your machine's real audio devices. Changing one mid-session reopens the audio stream on the new device without leaving the session, and Rescan picks up an interface plugged in after launch.
 - Device and buffer choices are remembered across launches; a remembered device that is not connected at startup falls back to the system default until it returns.
 - Any sample rate works. Sessions run at 48 kHz, and an interface at another rate (a 44.1 kHz deck, say) joins anyway: where the platform allows, JamStream sets the device to 48 kHz and says so in chat.
