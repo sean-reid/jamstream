@@ -7,7 +7,9 @@ Usage: jamstream recordings [OPTIONS] [COMMAND]
        jamstream recordings get [OPTIONS] <SESSION>
 ```
 
-A cloud session records into your own bucket, because the machine deletes itself at the end and a take on its disk goes with it. This is how the takes come back out. Local sessions need none of this: their takes are already on this computer, in the directory [`jamstream host`](host.md) printed.
+A cloud session records into your own bucket, because the machine deletes itself at the end and a take on its disk goes with it. This is how the takes come back out.
+
+Local sessions need none of this: their takes are already on this computer, in the directory [`jamstream host`](host.md) printed.
 
 Both forms read the bucket details [`jamstream host`](host.md) saved beside each session record when the session was launched with a bucket, and the storage key from the environment.
 
@@ -64,7 +66,7 @@ Pass `--yes` in a script. Progress is whole lines at fixed percentages, so a log
 
 ## The storage key
 
-The object stores want an access key pair, which is not the credential that launches machines. It goes in two variables of its own, on every provider:
+The object stores want an access key pair, which is not the credential that launches machines. It goes in two variables of its own:
 
 ```console
 $ export JAMSTREAM_RECORDING_ACCESS_KEY_ID=...
@@ -73,11 +75,19 @@ $ export JAMSTREAM_RECORDING_SECRET_ACCESS_KEY=...
 
 In PowerShell: `$env:JAMSTREAM_RECORDING_ACCESS_KEY_ID = '...'` and `$env:JAMSTREAM_RECORDING_SECRET_ACCESS_KEY = '...'`.
 
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are deliberately not read here, because they are the pair that launches instances and this key is written into a machine's user data. Scope this key to writing the recordings prefix of one bucket; the last section of your [provider's page](../guides/providers.md) creates it.
+`JAMSTREAM_RECORDING_ACCESS_KEY_ID` and `JAMSTREAM_RECORDING_SECRET_ACCESS_KEY` are read on every provider. Some providers also read their own pair, since neither is a launch credential there:
 
-`SPACES_ACCESS_KEY_ID` and `SPACES_SECRET_ACCESS_KEY` on DigitalOcean, and `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY` on GCP, are read as well: neither pair is a launch credential on its provider.
+| Provider | Also reads |
+|---|---|
+| AWS | nothing extra. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are deliberately not read here, because that pair launches instances and gets written into a machine's user data |
+| DigitalOcean | `SPACES_ACCESS_KEY_ID`, `SPACES_SECRET_ACCESS_KEY` |
+| GCP | `GCS_ACCESS_KEY_ID`, `GCS_SECRET_ACCESS_KEY` |
 
-The app keeps the same key in your system keychain instead, and its [Takes screen](../guides/recording.md#getting-your-takes) fetches from there. This command does not read that keychain, so export the pair here even when the app already has the key. The key is never written to disk: only the bucket, region, and retention are kept beside the session record.
+Scope this key to writing the recordings prefix of one bucket; the last section of your [provider's page](../guides/providers.md) creates it.
+
+The app keeps the same key in your system keychain instead, and its [Takes screen](../guides/recording.md#getting-your-takes) fetches from there. This command does not read that keychain, so export the pair here even when the app already has the key.
+
+The key is never written to disk: only the bucket, region, and retention are kept beside the session record.
 
 ## Notes
 
