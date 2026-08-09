@@ -919,6 +919,7 @@ impl LiveRuntime {
             shut_at: None,
             moved_since_reopen: None,
             sent_since_reopen: None,
+            send_errors: 0,
             carry: [0.0; CHUNK_STEREO],
             carry_pos: 0,
             carry_len: 0,
@@ -1294,6 +1295,9 @@ struct Worker {
     /// Packets the uplink produced since a reopen. Samples reaching the core
     /// prove capture; only this proves anything left the machine.
     sent_since_reopen: Option<usize>,
+    /// Sends the socket refused. Producing a packet and sending one are not
+    /// the same event, and the error was thrown away at all four call sites.
+    send_errors: u64,
     /// Playout staged toward the ring: pulled from the core but not yet
     /// accepted, so a full ring never discards decoded audio.
     carry: [f32; CHUNK_STEREO],
@@ -1387,7 +1391,7 @@ impl Worker {
 
         let now_ms = self.now_ms();
         for pkt in self.core.poll(now_ms) {
-            let _ = self.socket.send(&pkt);
+            self.send_datagram(&pkt);
         }
         self.drain_events(now_ms);
         let stats = self.core.stats();
@@ -1477,7 +1481,7 @@ impl Worker {
         // One poll flushes the queued Bye; delivery is best effort, the
         // server also ejects on silence.
         for pkt in self.core.poll(now_ms) {
-            let _ = self.socket.send(&pkt);
+            self.send_datagram(&pkt);
         }
         self.driver.close();
         self.shared.lock().expect("live state").conn = ConnState::Idle;
@@ -1665,13 +1669,30 @@ impl Worker {
             };
             let now_ms = self.now_ms();
             for pkt in self.core.handle_datagram(now_ms, &self.rx_buf[..len]) {
-                let _ = self.socket.send(&pkt);
+                self.send_datagram(&pkt);
             }
         }
     }
 
     /// Device-paced capture: whatever arrived in the ring goes through the
     /// raw path, which emits zero or more sealed frames.
+    /// Sends one datagram, counting a refusal instead of discarding it. A
+    /// socket that stops accepting looks exactly like a server that stopped
+    /// listening, and both were invisible here.
+    fn send_datagram(&mut self, pkt: &[u8]) {
+        if let Err(err) = self.socket.send(pkt) {
+            self.send_errors = self.send_errors.saturating_add(1);
+            if self.send_errors.is_power_of_two() {
+                tracing::warn!(
+                    refused = self.send_errors,
+                    bytes = pkt.len(),
+                    %err,
+                    "the socket would not send a packet"
+                );
+            }
+        }
+    }
+
     fn move_capture(&mut self, now_ms: u64) {
         let mut inst_peak = 0.0f32;
         let mut inst_sq = 0.0f32;
@@ -1714,6 +1735,7 @@ impl Worker {
                         own_late = st.jitter.late,
                         own_reanchors = st.jitter.reanchors,
                         secs = moved / SAMPLE_RATE as usize,
+                        send_errors = self.send_errors,
                         "capture after the reopen, and what the server makes of it"
                     );
                     if moved >= SAMPLE_RATE as usize * 10 {
@@ -1726,7 +1748,7 @@ impl Worker {
                 if let Some(sent) = self.sent_since_reopen.as_mut() {
                     *sent += 1;
                 }
-                let _ = self.socket.send(&pkt);
+                self.send_datagram(&pkt);
             }
         }
         let inst_rms = if n == 0 {
