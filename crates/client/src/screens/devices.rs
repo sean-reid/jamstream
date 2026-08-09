@@ -359,19 +359,24 @@ impl DevicesScreen {
                     );
                     ui.end_row();
                 });
-            ui.add_space(theme::SPACE_SM);
-            ui.checkbox(
-                &mut self.allow_exclusive,
-                "Allow exclusive access (Windows, lowest latency)",
-            );
-            ui.label(
-                theme::muted(
-                    ui,
-                    "Exclusive mutes other apps on the device while a session runs. \
-                     Off shares it with them and adds 10 to 20 ms.",
-                )
-                .small(),
-            );
+            // The WASAPI backend is the only reader of `allow_exclusive`; on
+            // every other platform the question has no answer to give, so
+            // the control is absent rather than a checkbox nothing reads.
+            if cfg!(windows) {
+                ui.add_space(theme::SPACE_SM);
+                ui.checkbox(
+                    &mut self.allow_exclusive,
+                    "Allow exclusive access (Windows, lowest latency)",
+                );
+                ui.label(
+                    theme::muted(
+                        ui,
+                        "Exclusive mutes other apps on the device while a session runs. \
+                         Off shares it with them and adds 10 to 20 ms.",
+                    )
+                    .small(),
+                );
+            }
             // How the running stream reaches 48 kHz, when that is anything
             // other than the device's own clock: the consequence of the pick
             // belongs beside the pickers that made it. Muted, not a warning;

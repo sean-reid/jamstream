@@ -2948,6 +2948,10 @@ fn rescan_keeps_the_selection_by_id_and_a_lost_device_falls_back_visibly() {
 /// only while the catalog still holds the device (#328). The write is driven
 /// by the real click, so the persistence hangs off the same change detection
 /// that reconfigures a live stream.
+///
+/// The exclusive checkbox only exists on Windows: on every other platform
+/// this proves the opposite of a click, that the saved answer rides through
+/// untouched with no widget to blame it on.
 #[test]
 fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
     use jamstream_client::app::{JamApp, Screen};
@@ -2983,21 +2987,36 @@ fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
         .get_by_role_and_label(AkRole::RadioButton, "240 frames (5.0 ms)")
         .click_accesskit();
     harness.run_steps(4);
-    harness
-        .get_by_role_and_label(
-            AkRole::CheckBox,
-            "Allow exclusive access (Windows, lowest latency)",
-        )
-        .click_accesskit();
+    let checkbox = harness.query_by_role_and_label(
+        AkRole::CheckBox,
+        "Allow exclusive access (Windows, lowest latency)",
+    );
+    if cfg!(windows) {
+        checkbox
+            .expect("the checkbox is drawn on Windows")
+            .click_accesskit();
+    } else {
+        assert!(
+            checkbox.is_none(),
+            "the exclusive checkbox has no reader off Windows"
+        );
+    }
     harness.run_steps(4);
 
     let saved = std::fs::read_to_string(&path).expect("the click has to write settings.json");
     assert!(saved.contains("240"), "{saved}");
     assert!(saved.contains("demo:Scarlett 2i2 input"), "{saved}");
-    assert!(
-        saved.contains("\"allow_exclusive\": false"),
-        "the exclusive answer has to persist: {saved}"
-    );
+    if cfg!(windows) {
+        assert!(
+            saved.contains("\"allow_exclusive\": false"),
+            "the exclusive answer has to persist: {saved}"
+        );
+    } else {
+        assert!(
+            saved.contains("\"allow_exclusive\": true"),
+            "nothing on this platform may turn the default off: {saved}"
+        );
+    }
 
     // The next launch: same file, and the device is still in the catalog.
     let mut next = JamApp::in_memory();
@@ -3005,7 +3024,14 @@ fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
     next.restore_audio_prefs();
     assert_eq!(next.devices.buffer_frames, 240);
     assert_eq!(next.devices.capture_idx, 1, "restored by id, not by index");
-    assert!(!next.devices.allow_exclusive, "the toggle restores too");
+    if cfg!(windows) {
+        assert!(!next.devices.allow_exclusive, "the toggle restores too");
+    } else {
+        assert!(
+            next.devices.allow_exclusive,
+            "the saved default round-trips even with no control to show for it"
+        );
+    }
 
     // And a launch whose catalog no longer holds the device stays on the
     // system default instead of showing some other device's name.
