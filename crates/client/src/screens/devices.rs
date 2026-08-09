@@ -199,6 +199,16 @@ pub struct StreamNotes<'a> {
     pub crackling: bool,
 }
 
+/// What only exists once you have joined something: the mouth-to-ear figure
+/// buffer size is traded against, and whether your own signal is in your
+/// personal mix. Both `None` outside a session.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionAudio {
+    pub mouth_to_ear_ms: Option<f32>,
+    /// Mirrors [`crate::runtime::Snapshot::hear_self`].
+    pub hear_self: Option<bool>,
+}
+
 /// What the Audio tab asks the app to do; the tab cannot reach the platform
 /// backend itself, which is what keeps every fixture off the real sound card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +216,9 @@ pub enum DevicesEvent {
     /// Re-enumerate the devices: something was plugged in or enabled since
     /// the last look.
     Rescan,
+    /// Ask the server to include your own signal in your personal mix, or
+    /// drop it back out.
+    SetHearSelf(bool),
 }
 
 /// How a block is set. On its own screen each one is a panel, sitting on the
@@ -241,28 +254,38 @@ impl DevicesScreen {
     /// fixture, which would make the baseline a picture of dead code.
     ///
     /// Buffer size and the input meter come first because they are what a
-    /// musician reaches for mid session, by ear and by meter, while the
-    /// device pickers are set once. Whatever is last is what a short window
-    /// puts behind a scroll, so the order is the priority.
-    /// `notes` is what the stream reports about the pick: the refusal while
-    /// there is no stream, the rate disclosures while there is one, and
-    /// whether the ring is crackling. All three belong beside the controls
-    /// that made them rather than only over the mixer they cannot see with
-    /// this drawer open.
+    /// musician reaches for mid session, by ear and by meter, while hearing
+    /// yourself is a call made once and the device pickers are set once too.
+    /// Whatever is last is what a short window puts behind a scroll, so the
+    /// order is the priority.
+    ///
+    /// `session` carries the two facts that only exist once you have joined
+    /// something. `notes` is what the stream reports about the pick: the
+    /// refusal while there is no stream, the rate disclosures while there is
+    /// one, and whether the ring is crackling. All of it belongs beside the
+    /// controls that made it rather than only over the mixer they cannot see
+    /// with this drawer open.
     pub fn audio_ui(
         &mut self,
         ui: &mut Ui,
         block: Block,
         catalog: &DeviceCatalog,
         levels: &LevelsView,
-        mouth_to_ear_ms: Option<f32>,
+        session: SessionAudio,
         notes: StreamNotes<'_>,
     ) -> Option<DevicesEvent> {
-        self.buffer_ui(ui, block, catalog, mouth_to_ear_ms, notes.crackling);
+        self.buffer_ui(ui, block, catalog, session.mouth_to_ear_ms, notes.crackling);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
+        let hear_self_event = session.hear_self.and_then(|on| {
+            ui.add_space(theme::SPACE_MD);
+            hear_self_ui(ui, block, on)
+        });
         ui.add_space(theme::SPACE_MD);
-        self.devices_ui(ui, block, catalog, notes)
+        let devices_event = self.devices_ui(ui, block, catalog, notes);
+        hear_self_event
+            .map(DevicesEvent::SetHearSelf)
+            .or(devices_event)
     }
 
     fn buffer_ui(
@@ -423,6 +446,37 @@ impl DevicesScreen {
 
 /// The label column in the device grid: "Capture" and "Playback".
 const DEVICE_LABEL_W: f32 = 66.0;
+
+/// The checkbox that asks the server to fold your own signal into your
+/// personal mix. `Some` only when it changed this frame, carrying the value
+/// to send.
+fn hear_self_ui(ui: &mut Ui, block: Block, hear_self: bool) -> Option<bool> {
+    let mut enabled = hear_self;
+    let mut changed = false;
+    block.show(ui, |ui| {
+        changed = ui
+            .checkbox(&mut enabled, "Hear yourself through the server")
+            .changed();
+        ui.label(
+            theme::muted(
+                ui,
+                "Your own sound joins the mix with everyone else's, so the gap you \
+                 hear becomes the difference between two uplinks instead of the \
+                 whole network path.",
+            )
+            .small(),
+        );
+        ui.label(
+            theme::muted(
+                ui,
+                "Needs headphones: playing this mix through speakers loops your \
+                 own signal straight back into the microphone.",
+            )
+            .small(),
+        );
+    });
+    changed.then_some(enabled)
+}
 
 fn input_level_ui(ui: &mut Ui, block: Block, levels: &LevelsView) {
     block.show(ui, |ui| {
