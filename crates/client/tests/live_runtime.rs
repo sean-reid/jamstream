@@ -1040,10 +1040,31 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     std::thread::sleep(Duration::from_millis(3_500));
 
     // B's own snapshot carries the server's opinion of B's uplink, the field
-    // that read 100 percent on a real machine. Read while B is alive, and one
-    // step earlier than the audio, so it does not depend on which window a
-    // measurement lands in.
-    let loss = b.snapshot().stats.loss_pct;
+    // that read 100 percent on a real machine. The server measures loss over a
+    // one second window, so a single reading taken this soon still holds the
+    // gap the reopen itself left, which is several percent on a slow machine.
+    // What marks the fault apart is that it never clears: the buffer stayed at
+    // depth zero for the rest of the session. So wait for recovery and let the
+    // deadline be the assertion. The sharp detector for the fault itself is
+    // `a_capture_gap_on_a_jittery_stream` in the session crate, which fails
+    // every run in under half a second and depends on no wall clock. This one
+    // is the story a person lives through, so it holds a threshold loose enough
+    // to survive a loaded runner.
+    let swapped = Instant::now();
+    let loss = wait_for(
+        &b,
+        "the server to stop reporting loss on b's uplink after a buffer change",
+        Duration::from_secs(20),
+        |s| s.stats.loss_pct < 5.0,
+    )
+    .stats
+    .loss_pct;
+    // Kept on a passing run, because a threshold nobody can see the distance to
+    // cannot be calibrated.
+    eprintln!(
+        "b's uplink read {loss}% loss {:?} after the swap",
+        swapped.elapsed()
+    );
 
     a.send(Command::Leave);
     wait_for(&a, "a idle", Duration::from_secs(3), |s| {
@@ -1051,11 +1072,6 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     });
     drop(a);
     drop(b);
-
-    assert!(
-        loss < 5.0,
-        "the server is losing {loss}% of b's uplink after b changed its buffer"
-    );
 
     let (rate, all) = rate_and_samples(&out_a);
     let frames = all.len() / 2;
