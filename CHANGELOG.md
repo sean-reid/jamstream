@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.2](https://github.com/sean-reid/jamstream/compare/v0.4.1...v0.4.2) (2026-08-09)
+
+
+### Bug Fixes
+
+* **ci:** keep a release private until its assets are all there ([#505](https://github.com/sean-reid/jamstream/issues/505)) ([b4138f8](https://github.com/sean-reid/jamstream/commit/b4138f80213b68b8f82edf239d1331849c700f7a))
+* **cloud:** pin an ffmpeg upstream keeps, and notice when one rots ([#507](https://github.com/sean-reid/jamstream/issues/507)) ([8729c29](https://github.com/sean-reid/jamstream/commit/8729c29338351ea57bc16046f53bd0e9b8d77f3a))
+* **stream:** the session VM declares its layout instead of being sniffed ([#508](https://github.com/sean-reid/jamstream/issues/508)) ([82a71be](https://github.com/sean-reid/jamstream/commit/82a71bee7bcdcc2fda6ee5e4df76fe3c6f89e4af))
+
 ## [0.4.1](https://github.com/sean-reid/jamstream/compare/v0.4.0...v0.4.1) (2026-08-09)
 
 
