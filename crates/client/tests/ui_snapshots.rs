@@ -263,7 +263,7 @@ fn home_empty() {
 
 #[test]
 fn home_invalid_invite() {
-    // The exact error a failed Join produces; clicking itself is covered
+    // The exact error a failed Join produces; crackling itself is covered
     // by the interaction tests.
     let bad = "jamstream://join/not-a-real-invite";
     let err = jamstream_protocol::invite::Invite::decode(bad)
@@ -1018,29 +1018,29 @@ fn session_converting_narrow() {
     snapshot(&mut harness, "session_converting_narrow");
 }
 
-/// A session whose playout ring is in a clicking run: the persistent state
+/// A session whose playout ring is in a crackling run: the persistent state
 /// the status bar and the Audio tab both read off the snapshot, in place of
 /// a chat line that may already have scrolled past by the time somebody
 /// looks up.
-fn clicking_app(theme: Theme, clicking: bool) -> JamApp {
+fn crackling_app(theme: Theme, crackling: bool) -> JamApp {
     let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
-    rt.set_clicking(clicking);
+    rt.set_crackling(crackling);
     session_app(rt, theme)
 }
 
 #[test]
-fn session_clicking_narrow() {
+fn session_crackling_narrow() {
     // The narrowest window, where the tag competes hardest with the meters
     // and the two lamps for the bar's own room.
-    let mut harness = app_harness(clicking_app(Theme::Dark, true), NARROW);
-    snapshot(&mut harness, "session_clicking_narrow");
+    let mut harness = app_harness(crackling_app(Theme::Dark, true), NARROW);
+    snapshot(&mut harness, "session_crackling_narrow");
 }
 
 #[test]
-fn session_clicking_narrow_clear() {
+fn session_crackling_narrow_clear() {
     // The same fixture with the run over, for a direct look at the tag gone.
-    let mut harness = app_harness(clicking_app(Theme::Dark, false), NARROW);
-    snapshot(&mut harness, "session_clicking_narrow_clear");
+    let mut harness = app_harness(crackling_app(Theme::Dark, false), NARROW);
+    snapshot(&mut harness, "session_crackling_narrow_clear");
 }
 
 /// The drawer open on one tab. Every settings fixture goes through here, so
@@ -1111,19 +1111,19 @@ fn session_settings_converting() {
 }
 
 #[test]
-fn session_settings_clicking() {
+fn session_settings_crackling() {
     // The remedy sits with the control it names: a notice beside Buffer size
     // while the ring is running dry, on the tab a musician opens to act on it.
-    let app = drawer_app(clicking_app(Theme::Dark, true), SettingsTab::Audio);
+    let app = drawer_app(crackling_app(Theme::Dark, true), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_settings_clicking");
+    snapshot(&mut harness, "session_settings_crackling");
 }
 
 #[test]
-fn session_settings_clicking_clear() {
-    let app = drawer_app(clicking_app(Theme::Dark, false), SettingsTab::Audio);
+fn session_settings_crackling_clear() {
+    let app = drawer_app(crackling_app(Theme::Dark, false), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
-    snapshot(&mut harness, "session_settings_clicking_clear");
+    snapshot(&mut harness, "session_settings_crackling_clear");
 }
 
 #[test]

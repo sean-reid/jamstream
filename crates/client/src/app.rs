@@ -1037,7 +1037,7 @@ impl JamApp {
                 let notes = StreamNotes {
                     refusal: snap.and_then(|s| s.device_error.as_deref()),
                     rate_lines: &rate_lines,
-                    clicking: snap.is_some_and(|s| s.stats.clicking),
+                    crackling: snap.is_some_and(|s| s.stats.crackling),
                 };
                 let event =
                     self.devices
@@ -1150,7 +1150,7 @@ impl JamApp {
         ));
         // On commit rather than per keystroke: a SetName per character would
         // put the roster through every prefix of the name. A singleline
-        // TextEdit reports lost_focus for Enter as well as for clicking
+        // TextEdit reports lost_focus for Enter as well as for crackling
         // away, so checking the key too would announce twice for one edit.
         if response.lost_focus() {
             self.announce_own_name();

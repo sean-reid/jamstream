@@ -1133,13 +1133,13 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
                 );
             });
         }
-        // Persists for as long as the playout ring is in a clicking run: in
+        // Persists for as long as the playout ring is in a crackling run: in
         // danger ink rather than converting's muted one, because this is a
         // fault. The fix is a Buffer size pick, not something to say here, so
         // the word is bare and the remedy lives on the Audio tab instead.
-        if s.clicking {
+        if s.crackling {
             ui.label(
-                RichText::new("clicking")
+                RichText::new("crackling")
                     .size(9.5)
                     .color(theme::danger_ink(p)),
             );

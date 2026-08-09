@@ -186,17 +186,17 @@ impl Default for DevicesScreen {
 
 /// What the stream has to say for itself under the pickers: the refusal
 /// reason while there is no stream, the rate disclosures while there is
-/// one, and whether the playout ring is in a clicking run. All three are
+/// one, and whether the playout ring is in a crackling run. All three are
 /// consequences of the pick, so they render beside the controls that made
 /// it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamNotes<'a> {
     pub refusal: Option<&'a str>,
     pub rate_lines: &'a [String],
-    /// Whether the playout ring is currently in a clicking run: while it
+    /// Whether the playout ring is currently in a crackling run: while it
     /// holds, the fix is right here, so the notice sits beside Buffer size
     /// rather than only in the status bar's tag.
-    pub clicking: bool,
+    pub crackling: bool,
 }
 
 /// What the Audio tab asks the app to do; the tab cannot reach the platform
@@ -246,7 +246,7 @@ impl DevicesScreen {
     /// puts behind a scroll, so the order is the priority.
     /// `notes` is what the stream reports about the pick: the refusal while
     /// there is no stream, the rate disclosures while there is one, and
-    /// whether the ring is clicking. All three belong beside the controls
+    /// whether the ring is crackling. All three belong beside the controls
     /// that made them rather than only over the mixer they cannot see with
     /// this drawer open.
     pub fn audio_ui(
@@ -258,7 +258,7 @@ impl DevicesScreen {
         mouth_to_ear_ms: Option<f32>,
         notes: StreamNotes<'_>,
     ) -> Option<DevicesEvent> {
-        self.buffer_ui(ui, block, catalog, mouth_to_ear_ms, notes.clicking);
+        self.buffer_ui(ui, block, catalog, mouth_to_ear_ms, notes.crackling);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
         ui.add_space(theme::SPACE_MD);
@@ -271,7 +271,7 @@ impl DevicesScreen {
         block: Block,
         catalog: &DeviceCatalog,
         mouth_to_ear_ms: Option<f32>,
-        clicking: bool,
+        crackling: bool,
     ) {
         let bounds = buffer_bounds(catalog, self.capture_idx, self.playback_idx);
         block.show(ui, |ui| {
@@ -298,11 +298,11 @@ impl DevicesScreen {
             // Beside the choices it names, for as long as the run holds: the
             // status bar's tag says a fault exists, and this is the screen
             // somebody opens to act on it.
-            if clicking {
+            if crackling {
                 ui.add_space(theme::SPACE_SM);
                 theme::reason(
                     ui,
-                    "This device's playout ring is running dry; try the next buffer size up.",
+                    "Crackling: this device is not keeping up. Try the next size up.",
                 );
             }
             // The number the choice is being traded against. The capture

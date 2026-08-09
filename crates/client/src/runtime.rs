@@ -295,7 +295,7 @@ pub struct StatsView {
     /// underruns to have been heard, for as long as that stretch holds:
     /// read like connection state, not like a one-shot event that may
     /// already have scrolled past by the time somebody looks up.
-    pub clicking: bool,
+    pub crackling: bool,
 }
 
 /// Linear levels in 0..1. dB conversion is the meter widget's job.
