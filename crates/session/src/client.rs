@@ -1050,6 +1050,14 @@ impl ClientCore {
         Ok(())
     }
 
+    /// Asks the server to include this member's own signal in the personal
+    /// mix it sends back, instead of removing it.
+    pub fn set_hear_self(&mut self, enabled: bool) -> Result<(), SessionError> {
+        self.require_joined()?;
+        self.link.send(ControlMsg::HearSelf { enabled })?;
+        Ok(())
+    }
+
     /// Host-only server-side; invalidates one invite and ejects its member.
     pub fn revoke(&mut self, jti: TokenId) -> Result<(), SessionError> {
         self.require_joined()?;
@@ -1181,6 +1189,7 @@ impl ClientCore {
             ControlMsg::MixerSet { .. }
             | ControlMsg::ClickEnable { .. }
             | ControlMsg::BroadcastAudition { .. }
+            | ControlMsg::HearSelf { .. }
             | ControlMsg::Revoke { .. }
             | ControlMsg::SetAvatar { .. }
             | ControlMsg::StreamCtl { .. }
