@@ -1003,7 +1003,6 @@ fn leave_tears_down_and_shrinks_the_roster() {
 /// --run-ignored all` and expect the tone profile to go to zero at the swap.
 /// It goes back in the suite with the fix.
 #[test]
-#[ignore = "reproduces #523; a buffer swap loses the uplink about one run in four"]
 fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     let server = TestServer::start();
     let sine_b = sine_fixture("reconf-up", 660.0, RATE);
@@ -2338,11 +2337,11 @@ fn record_on_an_unarmed_session_fails_visibly_in_the_lamp() {
 /// process, as under nextest, where each test gets a process of its own.
 /// A settings change is the one moment this client cannot see into: the device
 /// is shut for as long as the platform takes and nothing is captured then. The
-/// two lines exist so the next report of silence after a swap says whether the
-/// microphone came back and what the server made of the stream. A diagnostic
-/// nobody proved fires is worth nothing, so this asserts both of them.
+/// reopen carries diagnostics for that gap, and they speak only when the gap
+/// costs something, because a buffer size somebody chose is not a fault and this
+/// file's first line promises a healthy run leaves it empty.
 #[test]
-fn a_settings_change_says_what_the_reopen_cost() {
+fn a_settings_change_that_worked_stays_out_of_the_log() {
     if std::env::var_os("RUST_LOG").is_some() {
         eprintln!("skipping: RUST_LOG replaces the default filter this is about");
         return;
@@ -2400,21 +2399,17 @@ fn a_settings_change_says_what_the_reopen_cost() {
     drop(a);
 
     let text = std::fs::read_to_string(&log).expect("the log is readable");
+    let noise: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("reopen") || line.contains("uplink"))
+        .collect();
     assert!(
-        text.contains("audio reopened after a settings change"),
-        "the reopen said nothing about how long the device was shut. Log:\n{text}"
+        noise.is_empty(),
+        "a settings change that worked wrote {} line(s) to a file whose first \
+         line promises to stay empty on a healthy run:\n{}",
+        noise.len(),
+        noise.join("\n")
     );
-    assert!(
-        text.contains("capture after the reopen"),
-        "nothing reported whether capture resumed. Log:\n{text}"
-    );
-    for want in ["moved=", "sent="] {
-        assert!(
-            text.contains(want),
-            "the report is missing {want}, and the three together are the \
-             question: what was captured and what actually left. Log:\n{text}"
-        );
-    }
 
     let _ = std::fs::remove_file(&sine);
     let _ = std::fs::remove_file(&out_b);

@@ -125,6 +125,10 @@ const PLAYOUT_STALL_CEILING: Duration = Duration::from_micros(
 /// abandons the gap: the jitter buffer treats a hole this size as a restart
 /// anyway.
 const PLAYOUT_DRAIN_MAX: Duration = Duration::from_millis(160);
+/// A reopen slower than this is worth a warning of its own. A device shut and
+/// reopened for a settings change costs a few hundred milliseconds of capture on
+/// every platform measured; a whole second is something else going on.
+const SLOW_REOPEN: Duration = Duration::from_secs(1);
 
 /// Playout ring capacity in samples, which doubles as the playout depth
 /// target: the top-up loop keeps the ring full, so the device-side cushion
@@ -1563,11 +1567,22 @@ impl Worker {
         self.last_reopen = Some(Instant::now());
         self.reopen_attempts += 1;
         self.episode.attempts += 1;
-        tracing::warn!(
-            attempt = self.reopen_attempts,
-            in_episode = self.episode.attempts,
-            "reopening audio stream"
-        );
+        // A first attempt at a reopen somebody asked for is not a fault, and the
+        // log file promises to stay empty on a healthy run. A retry is a fault
+        // whatever started the episode, and so is any reopen nobody asked for.
+        let asked_for = self.shut_at.is_some() && self.episode.attempts == 1;
+        if asked_for {
+            tracing::debug!(
+                attempt = self.reopen_attempts,
+                "reopening the audio stream for a settings change"
+            );
+        } else {
+            tracing::warn!(
+                attempt = self.reopen_attempts,
+                in_episode = self.episode.attempts,
+                "reopening audio stream"
+            );
+        }
         match self.try_open() {
             Ok(()) => {
                 if self.episode.said_stopped && !self.episode.said_reopened {
@@ -1611,11 +1626,20 @@ impl Worker {
                 // this stream nothing yet.
                 self.ring_took = Instant::now();
                 if let Some(shut) = self.shut_at.take() {
-                    tracing::warn!(
-                        shut_ms = shut.elapsed().as_millis() as u64,
-                        device_frames,
-                        "audio reopened after a settings change; nothing was captured while it was shut"
-                    );
+                    let shut_ms = shut.elapsed().as_millis() as u64;
+                    // Nothing is captured while the device is shut, so the gap is
+                    // a hole in what everybody else hears. A few hundred
+                    // milliseconds is what a reopen costs; a second is a device
+                    // taking far longer than one, and worth saying out loud.
+                    if shut_ms >= SLOW_REOPEN.as_millis() as u64 {
+                        tracing::warn!(
+                            shut_ms,
+                            device_frames,
+                            "the audio device took a long time to reopen, and captured nothing while it was shut"
+                        );
+                    } else {
+                        tracing::debug!(shut_ms, device_frames, "audio reopened");
+                    }
                     self.moved_since_reopen = Some(0);
                     self.sent_since_reopen = Some(0);
                 }
@@ -1711,36 +1735,33 @@ impl Worker {
             n = self.mono_buf.len();
             if let Some(moved) = self.moved_since_reopen.as_mut() {
                 *moved += n;
-                // A second of a 48 kHz mono uplink. Reported once, because the
-                // question is whether the microphone came back at all, and the
-                // answer does not change after the first second.
-                // Three readings, not one. The server's loss figure covers the
-                // second before it was sent, so a single sample taken just
-                // after a reopen can report the gap itself and read as
-                // permanent. Ten seconds of silence is a fault; two is the
-                // window catching up.
-                let due = [2, 5, 10].iter().any(|s| {
-                    *moved >= SAMPLE_RATE as usize * s
-                        && *moved < SAMPLE_RATE as usize * s + FRAME_FRAMES
-                });
-                if due {
+                // Ten seconds of a 48 kHz mono uplink, read once, and only
+                // reported if it has something to complain about. The server's
+                // loss figure covers the second before it was sent, so a sample
+                // taken right after a reopen can report the gap itself and read
+                // as permanent. Ten seconds is long enough for the window to
+                // have caught up. A settings change is a thing somebody asked
+                // for, so a healthy one leaves this file empty, which is what
+                // its first line promises the reader.
+                if *moved >= SAMPLE_RATE as usize * 10 {
                     let moved = *moved;
-                    let sent = self.sent_since_reopen.unwrap_or(0);
+                    let sent = self.sent_since_reopen.take().unwrap_or(0);
+                    self.moved_since_reopen = None;
                     let st = self.core.stats();
-                    tracing::warn!(
-                        moved,
-                        sent,
-                        server_says_loss_pct = ?st.uplink_loss_pct,
-                        server_says_depth = ?st.uplink_jitter_depth,
-                        own_late = st.jitter.late,
-                        own_reanchors = st.jitter.reanchors,
-                        secs = moved / SAMPLE_RATE as usize,
-                        send_errors = self.send_errors,
-                        "capture after the reopen, and what the server makes of it"
-                    );
-                    if moved >= SAMPLE_RATE as usize * 10 {
-                        self.moved_since_reopen = None;
-                        self.sent_since_reopen = None;
+                    let recovered = st.uplink_loss_pct.is_some_and(|pct| pct < 5.0)
+                        && moved > 0
+                        && self.send_errors == 0;
+                    if !recovered {
+                        tracing::warn!(
+                            moved,
+                            sent,
+                            server_says_loss_pct = ?st.uplink_loss_pct,
+                            server_says_depth = ?st.uplink_jitter_depth,
+                            own_late = st.jitter.late,
+                            own_reanchors = st.jitter.reanchors,
+                            send_errors = self.send_errors,
+                            "ten seconds after the reopen the uplink has not come back"
+                        );
                     }
                 }
             }
