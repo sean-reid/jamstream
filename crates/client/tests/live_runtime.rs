@@ -738,7 +738,13 @@ fn hear_self_puts_your_own_tone_in_your_own_playout() {
     drop(a);
     drop(b);
 
-    let (rate_a, window_a) = loudest(&out_a, 1.0);
+    // The back half, then the loudest second inside it. `loudest` over the
+    // whole file picks by total level, which the other runtime's tone
+    // dominates from the first second, so it can land before the command took
+    // effect and read A's own tone as absent.
+    let (rate_a, all_a) = rate_and_samples(&out_a);
+    let back_a = &all_a[(all_a.len() / 4) * 2..];
+    let window_a = loudest_of(back_a, rate_a, 1.0);
     let mono_a = left(&window_a);
     let own_in_a = tone_energy(&mono_a, rate_a, 440.0);
     let other_in_a = tone_energy(&mono_a, rate_a, 660.0);
@@ -753,7 +759,9 @@ fn hear_self_puts_your_own_tone_in_your_own_playout() {
         "a should still hear b's 660 Hz tone alongside its own, reads {other_in_a}"
     );
 
-    let (rate_b, window_b) = loudest(&out_b, 1.0);
+    let (rate_b, all_b) = rate_and_samples(&out_b);
+    let back_b = &all_b[(all_b.len() / 4) * 2..];
+    let window_b = loudest_of(back_b, rate_b, 1.0);
     let mono_b = left(&window_b);
     let own_in_b = tone_energy(&mono_b, rate_b, 660.0);
     let other_in_b = tone_energy(&mono_b, rate_b, 440.0);
