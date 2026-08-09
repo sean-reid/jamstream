@@ -176,6 +176,11 @@ const SHUTDOWN_SUPPORTED_FILE: &str = "shutdown.supported";
 /// directory under a read-only root, and the encoder cannot create its FIFO.
 pub const BROADCAST_DIR_ENV: &str = "JAMSTREAM_BROADCAST_DIR";
 
+/// Set by the session VM's systemd unit, and nowhere else, so the broadcast
+/// layout is chosen by the machine that knows rather than guessed from a
+/// directory anything can create.
+pub const SESSION_VM_ENV: &str = "JAMSTREAM_SESSION_VM";
+
 #[cfg(windows)]
 const BIN_NAME: &str = "jamstreamd.exe";
 #[cfg(not(windows))]

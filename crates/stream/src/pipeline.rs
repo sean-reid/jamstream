@@ -17,7 +17,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use jamstream_broadcast::{AvatarImage, MemberVisual, Renderer, Role as VisualRole, SceneConfig};
-use jamstream_cloud::providers::local::BROADCAST_DIR_ENV;
+use jamstream_cloud::providers::local::{BROADCAST_DIR_ENV, SESSION_VM_ENV};
 use jamstream_protocol::control::{
     DestinationState, DestinationStatus, StreamKey, StreamOp, StreamPlatform, fit_stream_reason,
 };
@@ -178,15 +178,16 @@ impl StreamConfig {
     /// failing both a directory of this process's own under the platform's
     /// temp, so a jamstreamd started by hand has somewhere to work.
     ///
-    /// Only a session VM may resolve to `/run/jamstream`. `/run` does not
-    /// exist on macOS, whose root volume is read-only, so an encoder rooted
-    /// there cannot create its FIFO at all, and there is no `/bin/sh` or
-    /// `/run` on Windows either.
+    /// Only a session VM may resolve to `/run/jamstream`, and it says so: the
+    /// unit cloud-init writes sets `JAMSTREAM_SESSION_VM`. The layout used to
+    /// be inferred from that directory existing, which anything can create,
+    /// and a jamstreamd with no `--revoked` creates exactly it to hold the
+    /// revocation list.
     fn resolve(broadcast_dir: Option<&OsStr>) -> StreamConfig {
         if let Some(dir) = broadcast_dir.filter(|dir| !dir.is_empty()) {
             return StreamConfig::in_dir(dir);
         }
-        if Path::new(VM_RUN_DIR).is_dir() {
+        if std::env::var_os(SESSION_VM_ENV).is_some() {
             return StreamConfig::session_vm();
         }
         StreamConfig::in_dir(
@@ -1238,6 +1239,11 @@ pub(crate) fn report_push(work_dir: &Path, id: DestinationId) {
 
 #[cfg(test)]
 mod tests {
+
+    /// `cargo test` shares one process across these tests while nextest does
+    /// not, so anything setting a variable another test reads takes this
+    /// first.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
     use crate::proc::fake::{Call, FakeProcessHost};
 
@@ -2104,6 +2110,7 @@ mod tests {
     /// directory, and everything the pipeline writes goes inside it.
     #[test]
     fn a_named_broadcast_dir_holds_the_whole_layout() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("jamstream-layout-{}", std::process::id()));
         let cfg = StreamConfig::resolve(Some(dir.as_os_str()));
         assert_eq!(cfg.work_dir, dir.join(BROADCAST_SUBDIR));
@@ -2116,7 +2123,38 @@ mod tests {
             let cfg = StreamConfig::resolve(empty);
             assert_ne!(cfg.work_dir, Path::new(""));
             assert!(cfg.work_dir.is_absolute(), "{}", cfg.work_dir.display());
+            // Nothing but the VM's own unit may land on the VM's layout. This
+            // held by accident of `/run` being root owned, until a windows
+            // runner made C:\run\jamstream and a host adopted a layout
+            // naming /usr/local/bin/ffmpeg.
+            assert_ne!(
+                cfg.work_dir,
+                Path::new(VM_RUN_DIR),
+                "a host with no session-vm flag resolved to the VM's layout"
+            );
         }
+    }
+
+    /// The other side of the contract cloud-init writes: the unit sets this
+    /// variable and it is what selects the VM's layout. Serialised with the
+    /// resolve test above, because both read the process environment.
+    #[test]
+    fn the_session_vm_flag_is_what_picks_the_vm_layout() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Safety: the guard serialises every test here that touches this
+        // variable, and it is removed before the guard is dropped.
+        unsafe { std::env::set_var(SESSION_VM_ENV, "1") };
+        let flagged = StreamConfig::resolve(None);
+        unsafe { std::env::remove_var(SESSION_VM_ENV) };
+        let plain = StreamConfig::resolve(None);
+
+        assert_eq!(flagged.work_dir, Path::new(VM_RUN_DIR));
+        assert_eq!(flagged.ffmpeg, Path::new(VM_FFMPEG));
+        assert_ne!(
+            plain.work_dir,
+            Path::new(VM_RUN_DIR),
+            "without the flag nothing may resolve to the VM's layout"
+        );
     }
 
     /// The VM's layout stays spelled out, because cloud-init creates exactly

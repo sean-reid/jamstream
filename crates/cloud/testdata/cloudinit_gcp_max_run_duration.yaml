@@ -313,6 +313,10 @@ write_files:
       Group=jamstream
       # The guard is the cap that actually destroys the VM. These two make the
       # server stop serving on its own if the guard ever stops running.
+      # The broadcast layout is this machine's to declare: /run/jamstream below is
+      # the directory this unit is granted, and jamstreamd reads this to choose it
+      # rather than inferring it from the directory being there.
+      Environment=JAMSTREAM_SESSION_VM=1
       ExecStart=/usr/local/bin/jamstreamd --config /etc/jamstream/config --idle-exit-min 10 --max-duration-min 720
       Restart=on-failure
       RestartSec=2
