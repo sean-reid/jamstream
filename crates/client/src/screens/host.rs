@@ -1930,10 +1930,6 @@ impl HostWizard {
                      home screen finds and removes it.",
                 ));
             }
-            ui.add_space(theme::SPACE_LG);
-            if ui.button("Back").clicked() {
-                self.back();
-            }
             return;
         }
         let phase = self.launch_phase();
