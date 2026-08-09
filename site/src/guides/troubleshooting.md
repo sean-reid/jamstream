@@ -42,7 +42,7 @@ This is a different complaint from a high latency number: everyone sounds right 
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Timing holds up solo, and drags once the whole band plays, worse with distance | Each player hears their own instrument immediately and everyone else a full network path away, so the timing error every player feels is the mouth-to-ear number the [status bar](#latency-feels-high) already shows, and no two players carry the same number | Turn on the click. It's mixed into every player's personal mix on the server, so it reaches everyone on the same timeline instead of each player chasing a different number; watch the mouth-to-ear figure settle once the band follows it |
+| Timing holds up solo, and drags once the whole band plays, worse with distance | Each player hears their own instrument immediately and everyone else a full network path away, so the timing error every player feels is the mouth-to-ear number the [status bar](#latency-feels-high) already shows, and no two players carry the same number | Turn on the click. It's mixed into every player's personal mix on the server, so it reaches everyone on the same timeline and the band follows it instead of each other. It does not change the mouth-to-ear number, and it does not need to |
 
 ## Device problems
 
