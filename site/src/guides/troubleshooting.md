@@ -36,6 +36,14 @@ Check these in order of payoff:
 6. **Region.** If the session's round trip (`rtt`, on the latency number's hover) is high for you specifically, the server is far from you. The host can pick a fairer region next time; see [Hosting a session](hosting.md#the-region-table).
 7. **Loss.** The `loss` percentage, on the same hover, should sit near 0.0%. Sustained loss above 1% points at the local network: congested wifi, a saturated uplink, a bad cable.
 
+## The band can't keep together
+
+This is a different complaint from a high latency number: everyone sounds right alone, and only together does the tempo sag, worse the further apart the band is.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Timing holds up solo, and drags once the whole band plays, worse with distance | Each player hears their own instrument immediately and everyone else a full network path away, so the timing error every player feels is the mouth-to-ear number the [status bar](#latency-feels-high) already shows, and no two players carry the same number | Turn on the click. It's mixed into every player's personal mix on the server, so it reaches everyone on the same timeline instead of each player chasing a different number; watch the mouth-to-ear figure settle once the band follows it |
+
 ## Device problems
 
 Input and output devices are picked on the Audio tab of Settings, under Devices: a Capture picker, a Playback picker, and an input level meter that should move when you play.
