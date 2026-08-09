@@ -481,6 +481,13 @@ pub enum ControlMsg {
     ServerLog {
         line: String,
     },
+    /// Client to server: a musician asking their own personal mix to include
+    /// their own signal, rather than the usual removal. Per member rather
+    /// than host-gated, unlike [`Self::BroadcastAudition`]. Trailing
+    /// variant, same postcard append-safety rule as Stats.
+    HearSelf {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1446,6 +1453,36 @@ mod tests {
         // for the state, which is what lets it be sent once a second forever
         // if it ever needs to be.
         assert_eq!(ready.len(), 2);
+    }
+
+    /// Same rule for `HearSelf`: appended after `ServerLog`, so every earlier
+    /// variant's bytes are the bytes they were.
+    #[test]
+    fn appending_the_hear_self_variant_left_earlier_encodings_alone() {
+        let log = postcard::to_allocvec(&ControlMsg::ServerLog { line: "x".into() }).unwrap();
+        assert_eq!(log[0], 21);
+        let hear_self = postcard::to_allocvec(&ControlMsg::HearSelf { enabled: true }).unwrap();
+        assert_eq!(hear_self[0], 22);
+        assert_eq!(hear_self.len(), 2);
+    }
+
+    #[test]
+    fn hear_self_round_trips() {
+        let msgs = [
+            ControlMsg::HearSelf { enabled: true },
+            ControlMsg::HearSelf { enabled: false },
+        ];
+        for m in &msgs {
+            let bytes = postcard::to_allocvec(m).unwrap();
+            let back: ControlMsg = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(&back, m);
+        }
+        let mut a = ControlLink::new();
+        let mut b = ControlLink::new();
+        for m in &msgs {
+            a.send(m.clone()).unwrap();
+        }
+        assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
     }
 
     /// A readiness message is one reason rather than eight, so it cannot

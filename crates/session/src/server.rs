@@ -311,6 +311,9 @@ struct Member {
     encoder: Option<Encoder>,
     faders: BTreeMap<MemberId, Fader>,
     click_enabled: bool,
+    /// This member asked their personal mix to include their own signal.
+    /// Survives disconnect and rejoin like the fader table and the click.
+    hear_self: bool,
     connected: bool,
     last_heard_ms: u64,
     /// Published on the roster: silent for longer than
@@ -633,13 +636,14 @@ impl ServerCore {
             self.limiter.process(slot);
         }
 
-        // Personal stereo mixes, each excluding its own member and shaped by
-        // that member's fader table. An auditioning host instead gets this
-        // tick's broadcast slice: the exact post-limiter stereo signal
-        // listeners get, the host's own signal included, because hearing
-        // what the stream hears is the point of auditioning. It still rides
-        // the host's Ms2_5 musician encoder, so latency and cadence stay
-        // musician-grade. No click either: listeners never hear it.
+        // Personal stereo mixes, each excluding its own member (unless that
+        // member asked to hear themselves) and shaped by that member's fader
+        // table. An auditioning host instead gets this tick's broadcast
+        // slice: the exact post-limiter stereo signal listeners get, the
+        // host's own signal included, because hearing what the stream hears
+        // is the point of auditioning. It still rides the host's Ms2_5
+        // musician encoder, so latency and cadence stay musician-grade. No
+        // click either: listeners never hear it.
         let audition_pcm: Option<&[f32]> = if self.audition {
             Some(&self.bcast_accum[idx * MIX_LEN..(idx + 1) * MIX_LEN])
         } else {
@@ -652,10 +656,15 @@ impl ServerCore {
             let pcm: &[f32] = match audition_pcm {
                 Some(b) if id == HOST_MEMBER_ID => b,
                 _ => {
+                    // Unlimited, deliberately: personal mixes carry no
+                    // limiter today, and adding one more source to a sum
+                    // that already isn't limiter-protected is not a new
+                    // risk worth a per-member Limiter instance.
+                    let exclude = if m.hear_self { None } else { Some(id) };
                     mix_into(
                         &sources,
                         |t| m.faders.get(&t).copied().unwrap_or_default(),
-                        Some(id),
+                        exclude,
                         &mut self.mix_buf,
                     );
                     if self.metronome_enabled && m.click_enabled {
@@ -1446,26 +1455,29 @@ impl ServerCore {
         // The violation record follows the member across a rejoin for the
         // same reason the fader table does: a fresh handshake is not a fresh
         // reputation.
-        let (faders, click_enabled, avatar, violations, violation_budget) = prev.map_or_else(
-            || {
-                (
-                    BTreeMap::new(),
-                    true,
-                    None,
-                    0,
-                    TokenBucket::new(VIOLATION_BURST, VIOLATION_REFILL_PER_SEC),
-                )
-            },
-            |p| {
-                (
-                    p.faders,
-                    p.click_enabled,
-                    p.avatar,
-                    p.violations,
-                    p.violation_budget,
-                )
-            },
-        );
+        let (faders, click_enabled, hear_self, avatar, violations, violation_budget) = prev
+            .map_or_else(
+                || {
+                    (
+                        BTreeMap::new(),
+                        true,
+                        false,
+                        None,
+                        0,
+                        TokenBucket::new(VIOLATION_BURST, VIOLATION_REFILL_PER_SEC),
+                    )
+                },
+                |p| {
+                    (
+                        p.faders,
+                        p.click_enabled,
+                        p.hear_self,
+                        p.avatar,
+                        p.violations,
+                        p.violation_budget,
+                    )
+                },
+            );
         self.members.insert(
             id,
             Member {
@@ -1485,6 +1497,7 @@ impl ServerCore {
                 encoder,
                 faders,
                 click_enabled,
+                hear_self,
                 connected: true,
                 last_heard_ms: now_ms,
                 quiet: false,
@@ -1667,6 +1680,18 @@ impl ServerCore {
                 if let Some(m) = self.members.get_mut(&from) {
                     m.click_enabled = enabled;
                 }
+            }
+            ControlMsg::HearSelf { enabled } => {
+                let Some(m) = self.members.get_mut(&from) else {
+                    return;
+                };
+                // A listener's audio is the broadcast mix; there is no
+                // personal mix for this to change.
+                if m.role != Role::Musician {
+                    self.violation(now_ms, from, "hear self by listener");
+                    return;
+                }
+                m.hear_self = enabled;
             }
             ControlMsg::BroadcastMixSet {
                 target,

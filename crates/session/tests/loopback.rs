@@ -2012,6 +2012,75 @@ fn audition_swaps_host_playout_to_broadcast_and_back() {
 }
 
 #[test]
+fn hear_self_includes_own_signal_when_asked() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    h.run_ms(1_000);
+
+    let win = 48_000;
+    // Baseline, minus-self on both sides: neither hears their own tone.
+    assert!(tail_tone(&h, a, win, 440.0) < 0.02);
+    assert!(tail_tone(&h, b, win, 660.0) < 0.02);
+
+    h.clients[a].core.set_hear_self(true).unwrap();
+    h.run_ms(250);
+    h.clear_playouts();
+    h.run_ms(1_000);
+
+    // A asked to hear themselves over the real wire, and their own tone is
+    // really in the mix they got back, alongside B's, which was never
+    // excluded.
+    assert!(
+        tail_tone(&h, a, win, 440.0) > 0.1,
+        "A asked to hear themselves and still doesn't, tone {}",
+        tail_tone(&h, a, win, 440.0)
+    );
+    assert!(
+        tail_tone(&h, a, win, 660.0) > 0.1,
+        "A should still hear B, tone {}",
+        tail_tone(&h, a, win, 660.0)
+    );
+    // B never asked, so B's mix still excludes B; without this the test
+    // could not fail for the right reason.
+    assert!(
+        tail_tone(&h, b, win, 660.0) < 0.02,
+        "B's mix must still exclude B, tone {}",
+        tail_tone(&h, b, win, 660.0)
+    );
+    assert!(
+        tail_tone(&h, b, win, 440.0) > 0.1,
+        "B should still hear A, tone {}",
+        tail_tone(&h, b, win, 440.0)
+    );
+}
+
+#[test]
+fn hear_self_from_a_listener_is_a_violation() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_l = h.mint(5, Role::Listener);
+    h.add_client(&inv_a, Some(440.0));
+    let l = h.add_client(&inv_l, None);
+    h.run_ms(500);
+
+    h.clients[l].core.set_hear_self(true).unwrap();
+    h.run_ms(250);
+
+    assert!(
+        h.server_events.iter().any(|e| matches!(
+            e,
+            ServerEvent::ProtocolViolation { id: MemberId(5), what: w }
+                if *w == "hear self by listener"
+        )),
+        "missing violation: {:?}",
+        h.server_events
+    );
+}
+
+#[test]
 fn broadcast_fader_changes_relay_to_all_members() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_host = h.mint(0, Role::Musician);
