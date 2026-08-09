@@ -134,13 +134,13 @@ write_files:
       set -eu
       tmp=$(mktemp -d)
       trap 'rm -rf "$tmp"' EXIT
-      # ffmpeg n7.1.5-10-g2aefd64d48, GPL-3.0-or-later. Pinned in data/media_artifacts.json.
+      # ffmpeg n7.1.5-12-g1fdbca85aa, GPL-3.0-or-later. Pinned in data/media_artifacts.json.
       # JamStream never links it, only spawns it, which is what keeps the
       # copyleft obligation at the process boundary.
-      # Source: https://github.com/BtbN/FFmpeg-Builds (autobuild-2026-07-26-13-28, gpl, non-shared)
+      # Source: https://github.com/BtbN/FFmpeg-Builds (autobuild-2026-07-31-14-10, gpl, non-shared)
       case "$(uname -m)" in
-        aarch64|arm64) url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-26-13-28/ffmpeg-n7.1.5-10-g2aefd64d48-linuxarm64-gpl-7.1.tar.xz"; sha="b803fab318029e530ecd4859013ffbd743a549d0ee4e1bced5e5c3be59bf11e3" ;;
-        x86_64) url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-26-13-28/ffmpeg-n7.1.5-10-g2aefd64d48-linux64-gpl-7.1.tar.xz"; sha="92f7ca590bb4cc17e596c4a9747e3c85d7456fde7bf6e297c48640b471be8f74" ;;
+        aarch64|arm64) url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linuxarm64-gpl-7.1.tar.xz"; sha="a9a50c5782ef5e45306d58d1a9a819015b472d8da30ab6a77f15f571c861a71b" ;;
+        x86_64) url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz"; sha="c1e6caf48923dd8e6bc5e54d51ba70c321175b8162ae9c414c392990e72f0e79" ;;
         *) echo "jamstream: no pinned ffmpeg for $(uname -m)" >&2; exit 2 ;;
       esac
       curl -fsSL --retry 5 -o "$tmp/ffmpeg.archive" "$url"

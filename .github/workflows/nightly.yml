@@ -40,6 +40,20 @@ jobs:
   # copied into a second list, because only one of two lists would keep the
   # arguments for why each is accepted. A parse that read nothing would leave
   # the quick-xml entries unignored and fail this job loudly, not widen it.
+  # A pinned media artifact that upstream has deleted breaks broadcast for
+  # everyone, because the VM fetches it at boot, and nothing in the product
+  # notices until a session has no encoder. Checked here rather than per pull
+  # request: it is a fact about the internet on a given day, not about a diff.
+  media-pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: The pinned ffmpeg and mediamtx still resolve
+        run: scripts/check-media-pins.sh
+
   advisories:
     runs-on: ubuntu-latest
     timeout-minutes: 15
