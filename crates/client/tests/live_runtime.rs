@@ -286,10 +286,16 @@ fn tail_rms(path: &Path, secs: f64) -> f64 {
 fn loudest(path: &Path, secs: f64) -> (u32, Vec<f32>) {
     let (rate, samples) = rate_and_samples(path);
     assert!(samples.len() >= 2, "no samples to measure in {path:?}");
+    (rate, loudest_of(&samples, rate, secs))
+}
+
+/// The loudest `secs` window of samples a caller already holds, for a
+/// measurement that has to start somewhere other than the top of the file.
+fn loudest_of(samples: &[f32], rate: u32, secs: f64) -> Vec<f32> {
     let frames = samples.len() / 2;
     let win = ((secs * f64::from(rate)) as usize).max(1);
     if frames <= win {
-        return (rate, samples);
+        return samples.to_vec();
     }
     let start = (0..=frames - win)
         .step_by((win / 4).max(1))
@@ -297,7 +303,18 @@ fn loudest(path: &Path, secs: f64) -> (u32, Vec<f32>) {
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .expect("at least one window")
         .0;
-    (rate, samples[start * 2..(start + win) * 2].to_vec())
+    samples[start * 2..(start + win) * 2].to_vec()
+}
+
+/// Samples from the first one that is not silent, and how many were skipped.
+///
+/// A device that has just opened writes its first period before any pull has
+/// reached it, so a capture begins with one period of zeros that is the stream
+/// starting rather than a gap in it. Callers bound what they skip, because a
+/// long opening silence is a fault and must not be trimmed away.
+fn after_opening_silence(samples: &[f32]) -> (&[f32], usize) {
+    let skipped = samples.iter().take_while(|v| **v == 0.0).count();
+    (&samples[skipped..], skipped)
 }
 
 /// RMS of the loudest `secs` window anywhere in a capture file.
@@ -428,6 +445,73 @@ fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
 /// than that and the window is padding outright, with no level in it and a
 /// pitch of nothing. That is the shape of the run in #464, which read 6 in its
 /// last second against 8290 in its loudest.
+/// The shape a loaded runner produced: nearly two seconds of silence while the
+/// reopen got media flowing, then unbroken music. The reading has to be of the
+/// music, and how long the machine took to start is not the test's business.
+#[test]
+fn a_slow_start_still_reads_the_music_that_followed() {
+    let path = padded_fixture("slow-start", 1.96, 0.0);
+    let (rate, all) = rate_and_samples(&path);
+    let (music, opening) = after_opening_silence(&all);
+    let second = f64::from(rate) as usize * 2;
+
+    assert!(opening > second, "the fixture opens with under a second");
+    assert!(
+        music.len() >= second,
+        "a second of tone follows, and it is what gets measured"
+    );
+    let window = loudest_of(music, rate, 1.0);
+    assert!(rms(&window) > 0.02, "the window reads {}", rms(&window));
+    assert_eq!(longest_zero_run(&window), 0, "the window holds the silence");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_measurement_starts_after_the_period_a_device_open_costs() {
+    // One 240-frame period of zeros, then a second of tone: a capture from a
+    // device that has just opened, which is what a reopen leaves behind.
+    let period = 240 * 2;
+    let path = padded_fixture("device-open", 240.0 / f64::from(RATE), 0.0);
+    let (rate, all) = rate_and_samples(&path);
+    assert_eq!(rate, RATE);
+
+    let (music, opening) = after_opening_silence(&all);
+    // A sine starts at zero, so the first sample of the tone is silent too and
+    // the count runs a sample or two past the period rather than landing on it.
+    assert!(
+        (period..period + 4).contains(&opening),
+        "the fixture opens with one period, and the count read {opening}"
+    );
+    assert_eq!(
+        longest_zero_run(&loudest_of(music, rate, 1.0)),
+        0,
+        "the measured window still holds the silence the open wrote"
+    );
+
+    // The window taken from the top of the file is what used to be measured,
+    // and it carries the whole opening period, so the bound the swap test
+    // applies really does depend on starting after it.
+    assert_eq!(
+        longest_zero_run(&all[..period]),
+        period,
+        "the opening period is not silent, so this proves nothing"
+    );
+
+    // A stream that took much longer than a period to make a sound is a fault
+    // rather than an open, and the count says so instead of being trimmed away.
+    let slow = padded_fixture("device-open-slow", 0.5, 0.0);
+    let (_, all) = rate_and_samples(&slow);
+    let (_, opening) = after_opening_silence(&all);
+    assert!(
+        opening > period,
+        "a half second of silence read as one period: {opening}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&slow);
+}
+
 #[test]
 fn a_measurement_reads_the_audio_and_not_the_padding_around_it() {
     for (label, back) in [("as-profiled", 0.75), ("a-slower-leave", 1.25)] {
@@ -1639,11 +1723,27 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
     drop(b);
     drop(a);
 
-    let (rate, window) = loudest(&out_b, 1.0);
+    let (rate, all) = rate_and_samples(&out_b);
     assert_eq!(
         rate, 44_100,
         "the swapped-in device writes on its own clock"
     );
+    // A capture opens with silence: the device writes its first period before
+    // any pull reaches it, and a loaded machine takes longer still to get
+    // media flowing after a reopen. How long that took is the machine's
+    // business, so what is asserted is the music that followed rather than
+    // how soon it arrived. There has to be a second of it to read.
+    let (music, opening) = after_opening_silence(&all);
+    let second = f64::from(rate) as usize * 2;
+    assert!(
+        music.len() >= second,
+        "only {:.3} s of audio followed {:.3} s of opening silence, too little \
+         to measure. {}",
+        music.len() as f64 / 2.0 / f64::from(rate),
+        opening as f64 / 2.0 / f64::from(rate),
+        tone_profile(&out_b, 440.0)
+    );
+    let window = loudest_of(music, rate, 1.0);
     let energy = rms(&window);
     assert!(
         energy > 0.02,
