@@ -1,8 +1,12 @@
 # GCP
 
-Google Cloud works well; the setup has the most moving parts of the three providers: a project, an API to enable, a service account, and a key file. Budget 30 minutes. If you are starting from nothing, [DigitalOcean](digitalocean.md) is less work, and GCP is the only one of the three that bills the session's audio traffic on top of the machine.
+Google Cloud works well; the setup has the most moving parts of the three providers: a project, an API to enable, a service account, and a key file. Budget 30 minutes.
 
-JamStream launches an `e2-medium` instance: about $0.034 per hour in us-central1 as of July 2026 ([VM pricing](https://cloud.google.com/compute/vm-instance-pricing)). Internet egress on the default premium tier costs $0.12 per GiB after the first free GiB each month ([network pricing](https://cloud.google.com/vpc/network-pricing)), which adds roughly $0.19 to a three hour four musician session.
+If you are starting from nothing, [DigitalOcean](digitalocean.md) is less work, and GCP is the only one of the three that bills the session's audio traffic on top of the machine.
+
+JamStream launches an `e2-medium` instance: about $0.034 per hour in us-central1 as of July 2026 ([VM pricing](https://cloud.google.com/compute/vm-instance-pricing)).
+
+Internet egress on the default premium tier costs $0.12 per GiB after the first free GiB each month ([network pricing](https://cloud.google.com/vpc/network-pricing)), which adds roughly $0.19 to a three hour four musician session.
 
 ## 1. Create the account
 
@@ -29,11 +33,19 @@ Scoped this way, the key can manage Compute Engine instances in this one project
 ## 4. Create a JSON key
 
 1. Open the `jamstream` service account, go to the **Keys** tab, click **Add key**, then **Create new key**, choose **JSON**, and click **Create** ([key docs](https://docs.cloud.google.com/iam/docs/keys-create-delete)). The key file downloads once; store it like a password.
-2. If the create button is blocked with an organization policy error: organizations created since May 2024 disable service account key creation by default ([secure by default](https://docs.cloud.google.com/resource-manager/docs/secure-by-default-organizations)). Personal accounts without an organization are unaffected. An organization admin can lift `iam.disableServiceAccountKeyCreation` for the project; otherwise use a short-lived token instead, below.
+2. If the create button is blocked with an organization policy error: organizations created since May 2024 disable service account key creation by default ([secure by default](https://docs.cloud.google.com/resource-manager/docs/secure-by-default-organizations)).
+
+   Personal accounts without an organization are unaffected. An organization admin can lift `iam.disableServiceAccountKeyCreation` for the project; otherwise use a short-lived token instead, below.
 
 ## 5. Connect the app
 
-In the host wizard, select **gcp**; while no credential is saved the row reads `setup needed` and the Connect Google Cloud pane opens, with **Open the service accounts page** landing in the right console section. Paste the downloaded key file's contents into the service account JSON field, or enter the file's path and click **Load file**, then click **Check credentials**. The app authenticates against the API with the pasted key, and only a passing check saves it: the pane says "Works. Saved to your keychain." and the row flips to `ready`. A failure is shown verbatim, and nothing is stored.
+In the host wizard, select **gcp**. While no credential is saved the row reads `setup needed` and the Connect Google Cloud pane opens; **Open the service accounts page** lands in the right console section.
+
+1. Paste the downloaded key file's contents into the service account JSON field, or enter the file's path and click **Load file**.
+2. Click **Check credentials**. The app authenticates against the API with the pasted key.
+3. A passing check saves it: the pane says "Works. Saved to your keychain." and the row flips to `ready`.
+
+A failure is shown verbatim, and nothing is stored.
 
 The key lives in your system keychain from then on; the project id is read from the key itself. You are ready to host; continue with the [quickstart](../../quickstart.md#host-on-the-internet-with-digitalocean), picking gcp in the wizard instead.
 
@@ -42,10 +54,14 @@ The key lives in your system keychain from then on; the project id is read from 
 [Recording a cloud session](../recording.md) writes takes to a Cloud Storage bucket in your own account, through Cloud Storage's S3-compatible interoperability endpoint. The credential is an HMAC key pair, an access key id beginning `GOOG` and a secret, not the JSON key from step 4.
 
 1. Create a Standard bucket in the location you host in: **Cloud Storage**, **Buckets**, **Create**. Give recordings a bucket that holds nothing else.
-2. On that bucket's **Permissions** tab, **Grant access**, with the `jamstream` service account as the principal and one role: **Storage Admin**, `roles/storage.admin`, on this bucket alone. Arming a session writes and deletes a probe object, and reads and sets the bucket's expiry rules; the object-only roles cannot do the last two.
+2. On that bucket's **Permissions** tab, **Grant access**, with the `jamstream` service account as the principal and one role: **Storage Admin**, `roles/storage.admin`, on this bucket alone.
+
+   Arming a session writes and deletes a probe object, and reads and sets the bucket's expiry rules; the object-only roles cannot do the last two.
 3. Create the key: **Cloud Storage**, **Settings**, the **Interoperability** tab, **Create a key for a service account**, pick `jamstream`, then **Create key**. Copy both values; the secret is shown once.
 
-Paste both values into **Settings**, then **Recording**, in the app, and click Check. From the terminal the pair goes in `JAMSTREAM_RECORDING_ACCESS_KEY_ID` and `JAMSTREAM_RECORDING_SECRET_ACCESS_KEY`, or in `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY`; [`jamstream recordings`](../../cli/recordings.md#the-storage-key) covers every provider.
+Paste both values into **Settings**, then **Recording**, in the app, and click Check.
+
+From the terminal the pair goes in `JAMSTREAM_RECORDING_ACCESS_KEY_ID` and `JAMSTREAM_RECORDING_SECRET_ACCESS_KEY`, or in `GCS_ACCESS_KEY_ID` and `GCS_SECRET_ACCESS_KEY`; [`jamstream recordings`](../../cli/recordings.md#the-storage-key) covers every provider.
 
 Granted on one bucket, the key can do anything inside that bucket and nothing outside it, which is why recordings belong in a bucket of their own: launching a recorded session writes this key into the machine's user data, and the JSON key from step 4 must never go there.
 
