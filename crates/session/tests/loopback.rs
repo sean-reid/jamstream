@@ -3879,3 +3879,74 @@ proptest! {
         client.poll(1);
     }
 }
+
+/// What a device reopen looks like from the core's side: capture stops for as
+/// long as the platform takes to shut and reopen a stream, then resumes. On a
+/// real machine that is about 148 ms, and afterwards the server reports 100
+/// percent loss on the uplink with an empty buffer while the client is sending
+/// 798 packets in every 2 seconds. This asks the two halves in one process,
+/// where the reason is readable instead of inferred.
+#[test]
+fn a_capture_gap_the_length_of_a_device_reopen() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    for _ in 0..400 {
+        h.step();
+    }
+
+    let before = h.server.stats();
+    let b_before = before.iter().find(|m| m.id == MemberId(1)).cloned();
+
+    // The device is shut: nothing captured, while poll keeps the connection
+    // alive exactly as it does on a real machine.
+    h.clients[b].tone_hz = None;
+    for _ in 0..60 {
+        h.step();
+    }
+    h.clients[b].tone_hz = Some(660.0);
+    for _ in 0..800 {
+        h.step();
+    }
+
+    let after = h.server.stats();
+    for m in &after {
+        println!(
+            "PROBE member {}: refused={} late={} lost={} pulled={} depth={}",
+            m.id.0,
+            m.opens_refused,
+            m.jitter.late,
+            m.jitter.lost,
+            m.jitter.pulled,
+            m.jitter.depth_frames
+        );
+    }
+    let m = after
+        .iter()
+        .find(|m| m.id == MemberId(1))
+        .expect("b is still a member");
+    println!(
+        "PROBE after the gap: opens_refused={} late={} lost={} pulled={} depth={} reanchors={} violations={}",
+        m.opens_refused,
+        m.jitter.late,
+        m.jitter.lost,
+        m.jitter.pulled,
+        m.jitter.depth_frames,
+        m.jitter.reanchors,
+        m.violations
+    );
+    if let Some(b0) = b_before {
+        println!(
+            "PROBE before the gap: opens_refused={} late={} lost={} pulled={}",
+            b0.opens_refused, b0.jitter.late, b0.jitter.lost, b0.jitter.pulled
+        );
+    }
+    let _ = a;
+    assert_eq!(
+        m.opens_refused, 0,
+        "the server refused {} packets from b after the gap",
+        m.opens_refused
+    );
+}

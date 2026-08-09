@@ -1693,12 +1693,18 @@ impl Worker {
                 // A second of a 48 kHz mono uplink. Reported once, because the
                 // question is whether the microphone came back at all, and the
                 // answer does not change after the first second.
-                // Two seconds, so the server has had time to send a stats
-                // report and its opinion of our uplink is not None.
-                if *moved >= SAMPLE_RATE as usize * 2 {
+                // Three readings, not one. The server's loss figure covers the
+                // second before it was sent, so a single sample taken just
+                // after a reopen can report the gap itself and read as
+                // permanent. Ten seconds of silence is a fault; two is the
+                // window catching up.
+                let due = [2, 5, 10].iter().any(|s| {
+                    *moved >= SAMPLE_RATE as usize * s
+                        && *moved < SAMPLE_RATE as usize * s + FRAME_FRAMES
+                });
+                if due {
                     let moved = *moved;
-                    self.moved_since_reopen = None;
-                    let sent = self.sent_since_reopen.take().unwrap_or(0);
+                    let sent = self.sent_since_reopen.unwrap_or(0);
                     let st = self.core.stats();
                     tracing::warn!(
                         moved,
@@ -1707,8 +1713,13 @@ impl Worker {
                         server_says_depth = ?st.uplink_jitter_depth,
                         own_late = st.jitter.late,
                         own_reanchors = st.jitter.reanchors,
+                        secs = moved / SAMPLE_RATE as usize,
                         "capture after the reopen, and what the server makes of it"
                     );
+                    if moved >= SAMPLE_RATE as usize * 10 {
+                        self.moved_since_reopen = None;
+                        self.sent_since_reopen = None;
+                    }
                 }
             }
             for pkt in self.core.push_capture_raw(now_ms, &self.mono_buf) {

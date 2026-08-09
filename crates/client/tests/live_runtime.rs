@@ -1040,12 +1040,23 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     // audio on any machine rather than at one particular speed.
     std::thread::sleep(Duration::from_millis(3_500));
 
+    // B's own snapshot carries the server's opinion of B's uplink, the field
+    // that read 100 percent on a real machine. Read while B is alive, and one
+    // step earlier than the audio, so it does not depend on which window a
+    // measurement lands in.
+    let loss = b.snapshot().stats.loss_pct;
+
     a.send(Command::Leave);
     wait_for(&a, "a idle", Duration::from_secs(3), |s| {
         s.stats.state == ConnState::Idle
     });
     drop(a);
     drop(b);
+
+    assert!(
+        loss < 5.0,
+        "the server is losing {loss}% of b's uplink after b changed its buffer"
+    );
 
     let (rate, all) = rate_and_samples(&out_a);
     let frames = all.len() / 2;
