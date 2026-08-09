@@ -1,9 +1,12 @@
 # Download
 
+Most people want the desktop app: pick your platform below, download it, and open it. Every app build bundles its own `jamstreamd` session server, so hosting and joining need nothing else installed.
 
-Most people want the desktop app: pick your platform below, download it, open it, and you can host and join sessions with nothing else installed, because every app build bundles its own `jamstreamd` session server. The `jamstream` CLI, for terminals and automation, installs in one line at the [bottom of this page](#install-the-cli-in-one-line).
+The `jamstream` CLI, for terminals and automation, installs in one line at the [bottom of this page](#install-the-cli-in-one-line).
 
-Every link on this page points at the latest release by a stable name, so a new release updates them all in place. All artifacts are listed on the [releases page](https://github.com/sean-reid/jamstream/releases/latest). Building from source also works on every platform: clone [the repository](https://github.com/sean-reid/jamstream) and run `cargo install --path crates/cli`.
+Every link on this page points at the latest release by a stable name, so a new release updates them all in place. All artifacts are listed on the [releases page](https://github.com/sean-reid/jamstream/releases/latest).
+
+Building from source also works on every platform: clone [the repository](https://github.com/sean-reid/jamstream) and run `cargo install --path crates/cli`.
 
 ## macOS
 
@@ -15,9 +18,11 @@ Every link on this page points at the latest release by a stable name, so a new 
 - Desktop app: [jamstream-app-windows-x86_64.zip](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-app-windows-x86_64.zip)
 - CLI: [jamstream-cli-windows-x86_64.zip](https://github.com/sean-reid/jamstream/releases/latest/download/jamstream-cli-windows-x86_64.zip)
 
-Extract the app zip and run `jamstream-app.exe`. The other file in it, `jamstreamd.exe`, is the bundled session server; keep it beside the app or hosting on this computer stops working. Both downloads are x86_64 only; no Windows arm64 builds are published yet, so build from source on that platform.
+Extract the app zip and run `jamstream-app.exe`. The zip's other file, `jamstreamd.exe`, is the bundled session server: keep it beside the app, or hosting on this computer stops working.
 
-The binaries are plain zips and are not code signed. SmartScreen may show "Windows protected your PC" the first time you run the app: click More info, then Run anyway. Right-clicking the downloaded zip, opening Properties, and ticking Unblock before extracting clears the mark for everything inside; without that, the app zip's two exes can each raise the warning once. The warning is expected, and [verifying the download](#verifying-a-download) is the way to confirm you have the real file.
+> The binaries are plain zips and are not code signed. SmartScreen may show "Windows protected your PC" the first time you run the app: click **More info**, then **Run anyway**.
+>
+> Right-clicking the downloaded zip, opening Properties, and ticking **Unblock** before extracting clears the mark for everything inside; without that, the app zip's two exes can each raise the warning once. [Verifying the download](#verifying-a-download) confirms you have the real file.
 
 ## Linux
 
@@ -28,7 +33,17 @@ The binaries are plain zips and are not code signed. SmartScreen may show "Windo
 - Session server, static musl build (aarch64), tarred: [jamstreamd-linux-aarch64-musl.tar.gz](https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-aarch64-musl.tar.gz)
 - Session server, the same build as a bare binary: [jamstreamd-linux-aarch64-musl](https://github.com/sean-reid/jamstream/releases/latest/download/jamstreamd-linux-aarch64-musl)
 
-The session server downloads are only for [hosting on your own computer](guides/local.md) with the CLI alone; the desktop app bundles its own. No arm64 Linux app or CLI builds are published yet; build from source on that platform.
+The session server downloads are only for [hosting on your own computer](guides/local.md) with the CLI alone; the desktop app bundles its own.
+
+## Architecture availability
+
+| Platform | App | CLI | Session server |
+|---|---|---|---|
+| macOS | Apple silicon + Intel (universal) | Apple silicon + Intel (universal) | bundled in app |
+| Windows | x86_64 | x86_64 | bundled in app |
+| Linux | x86_64 | x86_64 | x86_64 and aarch64 |
+
+No arm64 builds of the app or CLI are published yet for Windows or Linux; build from source there.
 
 ## Verifying a download
 
@@ -66,13 +81,20 @@ scoop install jamstream       # CLI
 
 ## Install the CLI in one line
 
-The CLI suits scripts, automation, and machines without a display; the [CLI reference](cli/index.md) documents every command. On macOS and Linux:
+The CLI suits scripts, automation, and machines without a display; the [CLI reference](cli/index.md) documents every command.
+
+On macOS and Linux:
 
 ```console
 curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
 ```
 
-The script detects your platform, downloads the matching archive, verifies its sha256 against `SHA256SUMS`, and installs `jamstream` to `/usr/local/bin` when that is writable, otherwise to `~/.local/bin`. Set `JAMSTREAM_INSTALL_DIR` to pick the directory yourself. Appending `-s -- --with-server` also installs the `jamstreamd` session server on Linux x86_64, which [local mode](guides/local.md) with the CLI alone uses, and `-s -- --tag v0.2.0` installs that release instead of the newest one.
+The script:
+
+- Detects your platform, downloads the matching archive, and verifies its sha256 against `SHA256SUMS`.
+- Installs `jamstream` to `/usr/local/bin` when that is writable, otherwise to `~/.local/bin`. Set `JAMSTREAM_INSTALL_DIR` to pick the directory yourself.
+- With `-s -- --with-server`, also installs the `jamstreamd` session server on Linux x86_64, which [local mode](guides/local.md) with the CLI alone uses.
+- With `-s -- --tag v0.2.0`, installs that release instead of the newest one.
 
 Uninstalling is the same shape:
 
@@ -80,7 +102,7 @@ Uninstalling is the same shape:
 curl -fsSL https://sean-reid.github.io/jamstream/uninstall.sh | sh
 ```
 
-It removes what install.sh installed and nothing else. A session still running makes it stop and say so, since the binary being removed is what ends sessions; your session records are kept unless you pass `--purge`, and credentials stay in your OS keychain either way.
+It removes what install.sh installed and nothing else. A session still running makes it stop and say so, since the binary being removed is what ends sessions; session records are kept unless you pass `--purge`, and credentials stay in your OS keychain either way.
 
 On Windows:
 
@@ -88,9 +110,11 @@ On Windows:
 powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
 ```
 
-The script installs to `%LOCALAPPDATA%\Programs\jamstream` (set `JAMSTREAM_INSTALL_DIR` to pick the directory yourself) and adds that directory to your user Path; open a new terminal to pick it up. Flags need the script saved first, because `iex` cannot pass them:
+The script installs to `%LOCALAPPDATA%\Programs\jamstream` (set `JAMSTREAM_INSTALL_DIR` to pick the directory yourself) and adds that directory to your user Path; open a new terminal to pick it up.
 
-```console
+Flags need the script saved first, because `iex` cannot pass them:
+
+```powershell
 irm https://sean-reid.github.io/jamstream/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -WithApp
 ```
