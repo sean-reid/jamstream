@@ -123,8 +123,12 @@ html:not(.js) .page-wrapper,
     text-decoration: none;
 }
 
+/* Full width and flush left, so a page of tables has one block edge rather
+   than a different centred width per table. .table-wrapper keeps a wide one
+   scrollable on a narrow screen. */
 table {
-    margin: 0 auto;
+    margin: 0;
+    width: 100%;
     border-collapse: collapse;
 }
 table td {
