@@ -4,16 +4,19 @@
 //! survives a provider restart (the sweeper story). Plus the two self-exit
 //! windows: an unjoined server with --idle-exit-min set exits on its own,
 //! and a server with --max-duration-min set exits at the cap even with a
-//! connected, actively sending musician.
+//! connected, actively sending musician. And the graceful half of teardown:
+//! the sentinel the provider writes, the marker the spawned server answers
+//! it with, and the goodbye a member gets because of them.
 
 mod common;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use common::{BIND, ChildGuard, ReservedPort, budget, scratch_dir, server_binary};
 
-use jamstream_cloud::providers::local::LocalProvider;
+use jamstream_cloud::providers::local::{LocalProvider, shutdown_supported_path};
 use jamstream_cloud::{BootConfig, InstanceClass, LaunchSpec, Provider, SelfDestruct, session_tag};
 use jamstream_protocol::ids::{MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Issuer, Token};
@@ -154,6 +157,16 @@ fn command_line_of(pid: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// What the provider actually passed for a flag, read off the live process so
+/// a test asserting on it restates nothing. The value runs to the next flag,
+/// so a temp path with a space in it survives.
+fn flag_value(cmdline: &str, flag: &str) -> String {
+    let (_, after) = cmdline
+        .split_once(&format!("{flag} "))
+        .unwrap_or_else(|| panic!("the provider passed no {flag}: {cmdline}"));
+    after.split(" --").next().unwrap_or(after).trim_end().into()
+}
+
 #[tokio::test]
 async fn launch_join_destroy_end_to_end() {
     let dir = scratch_dir("localmode-e2e");
@@ -222,6 +235,102 @@ async fn launch_join_destroy_end_to_end() {
             .is_empty(),
         "destroyed session still listed"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The graceful half of teardown, over a real spawn, on the one door Windows
+/// has: the provider spawns jamstreamd with a sentinel path, the server
+/// answers with the marker the provider grants its grace period for, and the
+/// member in the session is told the session is over before the process goes.
+///
+/// The sentinel is written here rather than by destroy(), because destroy
+/// sends SIGTERM beside it and on unix that alone ends the process and sends
+/// the goodbye: the marker has no effect a unix machine can observe through
+/// destroy. This is the shape of a Windows teardown, run wherever the suite
+/// runs. What stays windows-only is the grace period itself, `term_grace`,
+/// which the provider's own cfg(windows) tests cover on the Windows runner.
+#[tokio::test]
+async fn a_spawned_server_says_goodbye_when_the_sentinel_appears() {
+    let dir = scratch_dir("localmode-goodbye");
+    let provider = LocalProvider::new(dir.clone())
+        .with_server_binary(server_binary())
+        .with_bind(IpAddr::V4(BIND));
+    let mut mat = session_material(10);
+    mat.reserved.release();
+    let instance = provider
+        .launch(launch_spec(&provider, &mat, "goodbye-session"))
+        .await
+        .expect("launch");
+
+    let (mut client, socket, start) = join_musician(&mat, "told-goodbye").await;
+    let now = || start.elapsed().as_millis() as u64;
+
+    // The sentinel path is the provider's own, off the command line of the
+    // process it spawned, so nothing here spells it a second time.
+    let cmdline = command_line_of(&instance.id);
+    let sentinel = PathBuf::from(flag_value(&cmdline, "--shutdown-file"));
+    let marker = shutdown_supported_path(&sentinel);
+    assert_eq!(
+        marker.file_name().and_then(|name| name.to_str()),
+        Some("shutdown.supported"),
+        "the marker's name is a contract between two binaries that ship and \
+         are found separately: rename it and a provider paired with any other \
+         jamstreamd waits for nothing, which on Windows is the entire grace \
+         period"
+    );
+    assert!(
+        marker.is_file(),
+        "the spawned server left no marker at {}, so the provider that \
+         spawned it force-kills instead of asking",
+        marker.display()
+    );
+
+    // What destroy writes, without the SIGTERM it writes it beside.
+    std::fs::write(&sentinel, b"requested_unix=0\n").unwrap();
+
+    // The goodbye, which is what makes a graceful shutdown graceful. A forced
+    // kill satisfies every other observable here, an exit inside a window and
+    // an empty registry, and satisfies this one never.
+    let mut buf = [0u8; 2048];
+    let mut told = false;
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
+    while Instant::now() < deadline && !told {
+        for pkt in client.poll(now()) {
+            let _ = socket.send(&pkt).await;
+        }
+        if let Ok(Ok(len)) =
+            tokio::time::timeout(Duration::from_millis(20), socket.recv(&mut buf)).await
+        {
+            for pkt in client.handle_datagram(now(), &buf[..len]) {
+                let _ = socket.send(&pkt).await;
+            }
+        }
+        // Ejected only: a client that finds out by its own ten second timeout
+        // was told nothing by the server.
+        told |= client
+            .events()
+            .iter()
+            .any(|e| matches!(e, ClientEvent::Ejected { .. }));
+    }
+    assert!(
+        told,
+        "the sentinel ended the session without telling the member"
+    );
+
+    // And the process left on its own. Nothing in this test signals or kills
+    // it, so an empty listing is the provider watching its own spawn go.
+    let mut gone = false;
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
+    while Instant::now() < deadline && !gone {
+        gone = provider
+            .list_tagged(None)
+            .await
+            .unwrap()
+            .instances
+            .is_empty();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the server said goodbye and kept running");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
