@@ -365,7 +365,7 @@ struct SharedState {
     /// from the backend's report at open; None while there is no
     /// stream, so the UI never shows a dead stream's outcome.
     rate: Option<RateOutcomesView>,
-    /// Whether [`CrackleEpisode`] currently has a run open. Set every tick
+    /// Whether the ring's underrun [`EpisodeWatch`] has a run open. Set every tick
     /// from the ring's own counters and cleared the tick the run ends, so
     /// the UI reads it like connection state rather than a one-shot line.
     crackling: bool,
@@ -881,7 +881,7 @@ struct RingWatch {
     opened: Instant,
     overruns: CounterWatch,
     underruns: CounterWatch,
-    crackling: CrackleEpisode,
+    crackling: EpisodeWatch,
     /// The last closed window's low water mark in frames. `None` means no
     /// render callback ran inside it.
     low_water_frames: Option<usize>,
@@ -898,23 +898,30 @@ struct CounterWatch {
     wait: Duration,
 }
 
-/// Whether the current stretch of underruns is dense enough for the person
-/// playing to have heard it, the way [`PlayoutWatch`]'s concealed-gap state
-/// holds for a run rather than firing on a sample. A window that reaches
-/// [`CRACKLE_EPISODE_COUNT`] fresh underruns turns the state on; a window
-/// that runs out first without reaching it restarts from where it ran out,
-/// so a slow drip that never bunches up inside one window never turns it on
-/// at all. Once on, the same window without a fresh underrun turns it back
-/// off, so the state reads as "is this ring dry right now" rather than
-/// "has it ever been".
-#[derive(Default)]
-struct CrackleEpisode {
+/// Whether a counter is climbing densely enough for the person playing to
+/// have noticed, the way [`PlayoutWatch`]'s concealed-gap state holds for a
+/// run rather than firing on a sample. A window that reaches `count` fresh
+/// increments turns the state on; a window that runs out first without
+/// reaching it restarts from where it ran out, so a slow drip that never
+/// bunches up inside one window never turns it on at all. Once on, the same
+/// window without a fresh increment turns it back off, so the state reads as
+/// "is this happening now" rather than "has it ever".
+///
+/// Two conditions ride on it: the playout ring's underruns, whose counter
+/// belongs to a ring and starts again with each stream, and the device
+/// streams that stopped on their own, whose counter runs for the session.
+struct EpisodeWatch {
+    /// Fresh increments inside `window` that turn the state on.
+    count: u64,
+    /// Both the window a run has to bunch up inside and the quiet that ends
+    /// one.
+    window: Duration,
     prev: Option<u64>,
     /// When the run building toward the floor started, and the total as it
     /// stood then. `None` once the floor is reached; there is nothing left
     /// to build toward while the state is already on.
     since: Option<(Instant, u64)>,
-    /// The last tick a fresh underrun landed, which is what an active run
+    /// The last tick a fresh increment landed, which is what an active run
     /// measures its own quiet against to decide when it is over.
     last: Option<Instant>,
     active: bool,
@@ -926,7 +933,7 @@ impl RingWatch {
             opened,
             overruns: CounterWatch::default(),
             underruns: CounterWatch::default(),
-            crackling: CrackleEpisode::default(),
+            crackling: EpisodeWatch::new(CRACKLE_EPISODE_COUNT, CRACKLE_EPISODE_WINDOW),
             low_water_frames: None,
             low_water_from: opened,
         }
@@ -1000,13 +1007,25 @@ impl CounterWatch {
     }
 }
 
-impl CrackleEpisode {
-    /// Whether the ring is in a crackling run as of this tick.
+impl EpisodeWatch {
+    fn new(count: u64, window: Duration) -> EpisodeWatch {
+        EpisodeWatch {
+            count,
+            window,
+            prev: None,
+            since: None,
+            last: None,
+            active: false,
+        }
+    }
+
+    /// Whether the run is open as of this tick, against the counter's total
+    /// now.
     fn observe(&mut self, now: Instant, total: u64) -> bool {
         let prev = self.prev.replace(total);
         if prev.is_some_and(|p| total < p) {
-            // The ring's own counter moved backward: a fresh stream, whose
-            // run starts empty rather than continuing the old one.
+            // The counter moved backward: a fresh one, whose run starts empty
+            // rather than continuing the old one.
             self.since = None;
             self.last = None;
             self.active = false;
@@ -1019,18 +1038,18 @@ impl CrackleEpisode {
         if self.active {
             if self
                 .last
-                .is_some_and(|t| now.duration_since(t) >= CRACKLE_EPISODE_WINDOW)
+                .is_some_and(|t| now.duration_since(t) >= self.window)
             {
                 self.active = false;
             }
             return self.active;
         }
         if !fresh {
-            // No new underrun this tick: a window this stale never reached
-            // the floor and is not worth carrying forward.
+            // Nothing new this tick: a window this stale never reached the
+            // floor and is not worth carrying forward.
             if self
                 .since
-                .is_some_and(|(since, _)| now.duration_since(since) > CRACKLE_EPISODE_WINDOW)
+                .is_some_and(|(since, _)| now.duration_since(since) > self.window)
             {
                 self.since = None;
             }
@@ -1040,7 +1059,7 @@ impl CrackleEpisode {
             .since
             .get_or_insert((now, prev.expect("fresh implies a previous total")))
             .1;
-        if total - base >= CRACKLE_EPISODE_COUNT {
+        if total - base >= self.count {
             self.active = true;
             self.since = None;
         }
