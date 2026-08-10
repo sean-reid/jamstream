@@ -157,7 +157,7 @@ pub struct ChatLine {
     pub at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ConnState {
     Connecting,
     Joined,
@@ -167,7 +167,9 @@ pub enum ConnState {
     /// client keeps trying, because a seat frees when somebody leaves, so
     /// this reads as waiting rather than as a failure.
     SessionFull,
-    /// No session; also the state after a clean leave.
+    /// No session; also the state after a clean leave, and what a snapshot
+    /// nothing has measured yet carries.
+    #[default]
     Idle,
 }
 
@@ -312,7 +314,10 @@ pub fn khz(rate: u32) -> String {
     format!("{}", f64::from(rate) / 1000.0)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Every figure defaults to absent, so a runtime names the ones it measures
+/// and one added here arrives on every producer at once rather than as an
+/// initialiser each of them has to carry.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct StatsView {
     pub state: ConnState,
     pub rtt_ms: Option<f32>,
