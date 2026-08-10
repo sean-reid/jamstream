@@ -21,6 +21,11 @@ use jamstream_broadcast::{Renderer, SceneConfig};
 /// moved 1.7x and the tail moved 36x, so the gate is 9x above the worst median
 /// measured on a machine with no idle core, and the 4x runner multiplier is on
 /// top of that.
+///
+/// This crate is also in the coverage job, which is the tightest configuration
+/// the gate runs in. Instrumentation costs it 1.12x: five runs under
+/// `cargo llvm-cov nextest` measured a median of 0.073 to 0.074 ms, because the
+/// pixels are pushed by tiny-skia and llvm-cov instruments this workspace only.
 const LAPTOP_FRAME_MS: f64 = 1.0;
 
 #[test]
