@@ -567,7 +567,9 @@ const CUSHION_QUIET: Duration = CRACKLE_EPISODE_WINDOW;
 /// down buys that latency back and nothing else, while getting it wrong is an
 /// audible dropout, so it takes [`CUSHION_QUIET`] of readings that would every
 /// one of them have survived the shallower depth, and gives back a frame rather
-/// than returning to the floor.
+/// than returning to the floor. While a take is recording or the broadcast is on
+/// air it gives nothing back at all, because the dropout it would risk lands in
+/// audio nobody can play again.
 ///
 /// Nearly dry is one device callback, which is what the next drain takes, plus
 /// one [`CUSHION_STEP`], which is what one top-up puts back. A dip that leaves
@@ -637,7 +639,11 @@ impl CushionControl {
     /// in frames, and `at` is when the window closed. A window already acted
     /// on moves nothing, and a window no render callback ran in is no evidence
     /// in either direction.
-    pub(super) fn observe(&mut self, at: Instant, low: Option<usize>) {
+    ///
+    /// `held` is a take being recorded or a broadcast on air, either of which
+    /// makes a step down a dropout in audio nobody can play again. Growing
+    /// still happens, because the alternative there is the dropout.
+    pub(super) fn observe(&mut self, at: Instant, low: Option<usize>, held: bool) {
         if self.read_at == Some(at) {
             return;
         }
@@ -660,6 +666,14 @@ impl CushionControl {
             return;
         }
         self.said = false;
+        if held {
+            // The quiet a frame back costs starts again once the take stops:
+            // this reading is one the controller declined to act on, and
+            // handing a frame back on it the tick a take ends is the same
+            // decision taken one tick later.
+            self.quiet_since = None;
+            return;
+        }
         self.give_back(at, low);
     }
 
@@ -960,12 +974,15 @@ mod tests {
 
     use jamstream_audio_io::CallbackBridge;
     use jamstream_engine::{JitterBuffer, MediaPacket};
+    use jamstream_protocol::control::{DestinationState, StreamPlatform};
+    use jamstream_protocol::ids::DestinationId;
 
     use super::*;
     use crate::live::tests::top_up;
     use crate::live::{
         FRAME_FRAMES, capture_capacity, fill_playout_to, playout_capacity, playout_target,
     };
+    use crate::runtime::{DestinationView, RecordState, RecordView, recording_or_on_air};
 
     /// The cadence a device that keeps dying is retried on: the first loss at
     /// once, so a genuine unplug comes back on the next tick, then a doubling
@@ -1868,6 +1885,12 @@ mod tests {
         rings: RingWatch,
         cushion: CushionControl,
         at: Instant,
+        /// The two states the worker reads off its snapshot to decide whether a
+        /// step down is allowed, asked here through the same predicate the
+        /// worker asks, so a test cannot hold the cushion still on a state the
+        /// worker would not.
+        record: RecordView,
+        stream: Vec<DestinationView>,
     }
 
     impl CushionRig {
@@ -1886,6 +1909,8 @@ mod tests {
                 rings: RingWatch::new(start),
                 cushion: CushionControl::new(frames),
                 at: start,
+                record: RecordView::default(),
+                stream: Vec::new(),
             }
         }
 
@@ -1906,8 +1931,11 @@ mod tests {
             }
             while fill_playout_to(&mut self.engine, &self.silence, self.cushion.target()) > 0 {}
             self.rings.observe(self.at, &self.engine, self.frames);
-            self.cushion
-                .observe(self.rings.low_water_at(), self.rings.playout_low_frames());
+            self.cushion.observe(
+                self.rings.low_water_at(),
+                self.rings.playout_low_frames(),
+                recording_or_on_air(&self.record, &self.stream),
+            );
         }
 
         /// `windows` water-mark windows of worker time, with the worker held up
@@ -1926,6 +1954,19 @@ mod tests {
         /// stretch.
         fn quiet_windows() -> usize {
             (CUSHION_QUIET.as_micros() / PLAYOUT_LOW_WINDOW.as_micros()) as usize + 2
+        }
+    }
+
+    /// One destination somebody is watching. Its figures are not read: the
+    /// state is the whole of what holds a broadcast.
+    fn watched_destination() -> DestinationView {
+        DestinationView {
+            id: DestinationId(0),
+            platform: StreamPlatform::Twitch,
+            state: DestinationState::Live,
+            bitrate_kbps: 0,
+            dropped_frames: 0,
+            repeated_frames: 0,
         }
     }
 
@@ -2015,6 +2056,91 @@ mod tests {
             floor,
             "the floor is the shallowest cushion, however quiet the machine gets"
         );
+    }
+
+    /// Growing is the direction a take needs most, because the alternative is
+    /// the dry ring a musician hears. A held cushion deepens on the reading
+    /// that saw the dip and settles where the same machine settles with
+    /// nothing to hold it.
+    #[test]
+    fn a_take_does_not_stop_the_cushion_growing() {
+        const FRAMES: u32 = 120;
+        let mut held = CushionRig::new(FRAMES, Instant::now());
+        held.record.state = RecordState::Recording;
+        held.stream = vec![watched_destination()];
+        held.run(8, 2);
+        let mut free = CushionRig::new(FRAMES, Instant::now());
+        free.run(8, 2);
+
+        assert!(
+            held.cushion.target() > playout_target(FRAMES),
+            "a take stopped the cushion covering the stall it was there for"
+        );
+        assert_eq!(
+            held.cushion.target(),
+            free.cushion.target(),
+            "a take moved the depth the same stall settles on"
+        );
+    }
+
+    /// A cushion a stall grew, three quiet stretches with `hold` applied, and
+    /// then the same quiet with nothing holding it: the frame comes back only
+    /// once, and only a whole stretch after the hold lifts.
+    ///
+    /// That last part is the stretch starting again rather than carrying on. A
+    /// stretch carried through would hand a frame back on the tick the hold
+    /// lifts, on readings the controller had just declined to act on, at the
+    /// moment the next take is likeliest to be starting.
+    fn a_held_cushion_waits(what: &str, hold: impl Fn(&mut CushionRig)) {
+        const FRAMES: u32 = 120;
+        let mut rig = CushionRig::new(FRAMES, Instant::now());
+        rig.run(8, 2);
+        let grown = rig.cushion.target();
+        assert!(
+            grown >= playout_target(FRAMES) + CUSHION_STEP,
+            "{what}: the stall grew nothing"
+        );
+
+        hold(&mut rig);
+        rig.run(3 * CushionRig::quiet_windows(), 0);
+        assert_eq!(
+            rig.cushion.target(),
+            grown,
+            "the cushion handed a frame back while {what}"
+        );
+
+        rig.record = RecordView::default();
+        rig.stream = Vec::new();
+        rig.run(CushionRig::quiet_windows() / 2, 0);
+        assert_eq!(
+            rig.cushion.target(),
+            grown,
+            "the quiet while {what} paid for a frame the moment it stopped"
+        );
+        rig.run(CushionRig::quiet_windows(), 0);
+        assert_eq!(
+            rig.cushion.target(),
+            grown - CUSHION_STEP,
+            "the cushion stayed deep after {what} stopped"
+        );
+    }
+
+    /// A take is audio nobody gets to play again, so the frame the quiet earned
+    /// waits for the recorder to stop.
+    #[test]
+    fn a_cushion_holds_still_while_a_take_records() {
+        a_held_cushion_waits("a take was recording", |rig| {
+            rig.record.state = RecordState::Recording;
+        });
+    }
+
+    /// A broadcast is the same claim about somebody watching it: a step down
+    /// they hear cannot be taken again either.
+    #[test]
+    fn a_cushion_holds_still_while_a_destination_is_watched() {
+        a_held_cushion_waits("a destination was watched", |rig| {
+            rig.stream = vec![watched_destination()];
+        });
     }
 
     /// The depth a machine still missing top-ups settled on is one it keeps. A
@@ -2170,7 +2296,8 @@ mod tests {
             } else {
                 while fill_playout_to(&mut engine, &silence, cushion.target()) > 0 {}
                 rings.observe(now, &engine, ring);
-                cushion.observe(rings.low_water_at(), rings.playout_low_frames());
+                // Nothing recorded or watched: this run measures the device.
+                cushion.observe(rings.low_water_at(), rings.playout_low_frames(), false);
             }
             if now >= start + PLAYOUT_LOW_WINDOW * window {
                 out.push(RealWindow {
