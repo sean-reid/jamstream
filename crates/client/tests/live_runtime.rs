@@ -1161,6 +1161,49 @@ fn reconfigure_audio_swaps_the_stream_mid_session() {
     }
 }
 
+/// A reopen somebody asked for is not a device failing, however many of them
+/// they ask for: the counter behind the cutting-out state moves only for a
+/// stream that stopped on its own. Four buffer changes is past the floor, so a
+/// counter that took them would have this device reading as broken on the
+/// screen of somebody who was only trying sizes out.
+#[test]
+fn settings_changes_never_read_as_a_device_cutting_out() {
+    let server = TestServer::start();
+    let sine = sine_fixture("settings-stops", 440.0, RATE);
+    let backend = WavBackend::new(Some(sine.clone()), None);
+    let device = backend.clone();
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+
+    // The join's own open is the first, so each pick waits for the next one.
+    for (opens, buffer_frames) in [(2, 240u32), (3, 480), (4, 120), (5, 240)] {
+        rt.reconfigure_audio(AudioSettings {
+            buffer_frames,
+            ..settings()
+        });
+        wait_for(&rt, "the reopen", Duration::from_secs(10), |_| {
+            device.opens() >= opens
+        });
+    }
+
+    let snap = rt.snapshot();
+    assert_eq!(
+        snap.stats.cutting_out,
+        None,
+        "{} picks the musician made read as a device cutting out",
+        device.opens() - 1
+    );
+    assert_eq!(snap.audio_fault, None, "and none of them is a fault");
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(rt);
+    let _ = std::fs::remove_file(&sine);
+}
+
 /// Finished takes under `dir`: `.flac` files, never `.part` leftovers.
 fn finished_takes(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1623,6 +1666,10 @@ fn a_device_lost_mid_session_is_reopened_without_dropping_the_session() {
     std::thread::sleep(Duration::from_millis(200));
     let snap = rt.snapshot();
     assert_eq!(snap.audio_fault, None, "the fault is over");
+    assert_eq!(
+        snap.stats.cutting_out, None,
+        "one device that came back is a blip, not a device cutting out"
+    );
     assert_eq!(snap.device_error, None, "nothing refused");
     assert!(
         snap.chat.is_empty(),
@@ -1691,6 +1738,14 @@ fn a_device_that_will_not_stay_open_is_retried_a_few_times_and_then_left_alone()
         tries + 1,
         "the state claims {tries} tries after {} opens",
         device.opens()
+    );
+    // Every one of those opens latched, so every one of them was a stream that
+    // stopped on its own: the stops the cutting-out state counts are the opens
+    // the fake counted, and no test fixture stands between the two.
+    assert_eq!(
+        snap.stats.cutting_out,
+        Some(u64::from(device.opens())),
+        "a device that dies on every open is a device cutting out"
     );
 
     // Nothing more is tried, and the session is still up: the network side

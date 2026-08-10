@@ -2092,7 +2092,7 @@ fn a_refused_device_puts_the_reason_over_the_strips() {
 #[test]
 fn a_dead_audio_stream_shows_in_the_bar_and_on_the_audio_tab() {
     let fault = AudioFaultView::GaveUp { tries: 6 };
-    let mut harness = fault_harness(Some(fault));
+    let mut harness = device_harness(Some(fault), None);
     harness.run_steps(4);
     assert!(
         harness.query_by_label("no audio").is_some(),
@@ -2105,19 +2105,53 @@ fn a_dead_audio_stream_shows_in_the_bar_and_on_the_audio_tab() {
     );
 
     // And it is the state that draws them: a running stream says neither.
-    let mut harness = fault_harness(None);
+    let mut harness = device_harness(None, None);
     harness.run_steps(4);
     assert!(harness.query_by_label("no audio").is_none());
     assert!(harness.query_by_label_contains("No audio:").is_none());
 }
 
-/// The session shell with the drawer open on the Audio tab and one audio
-/// fault pinned, which is the only pair of surfaces that has to agree.
-fn fault_harness(fault: Option<AudioFaultView>) -> Harness<'static> {
+/// The pattern a fault cannot carry, on the same two surfaces: a stop the
+/// cadence heals on the next tick is gone before a frame could draw the fault,
+/// so a device doing that all afternoon is audible gaps and nothing on screen.
+/// It reads as its own thing rather than the dead-stream wording, because the
+/// stream is running as this is read and what it says is that it will not keep
+/// running.
+#[test]
+fn a_device_that_keeps_cutting_out_shows_in_the_bar_and_on_the_audio_tab() {
+    let mut harness = device_harness(None, Some(7));
+    harness.run_steps(4);
+    assert!(
+        harness.query_by_label("cutting out").is_some(),
+        "the bar must carry the state beside the latency number"
+    );
+    assert!(
+        harness.query_by_label("no audio").is_none(),
+        "the stream is running: nothing may say otherwise"
+    );
+    let line = jamstream_client::screens::devices::cutting_out_line(7);
+    assert!(
+        harness.query_by_label_contains(&line).is_some(),
+        "the Audio tab must carry the sentence with the count in it: {line}"
+    );
+
+    // And it is the state that draws them: a device that is holding says
+    // neither, whatever it did earlier in the session.
+    let mut harness = device_harness(None, None);
+    harness.run_steps(4);
+    assert!(harness.query_by_label("cutting out").is_none());
+    assert!(harness.query_by_label_contains("Cutting out:").is_none());
+}
+
+/// The session shell with the drawer open on the Audio tab and what the device
+/// is doing pinned: the fault at this instant, and the stops behind a device
+/// that keeps losing the stream. Those are the surfaces that have to agree.
+fn device_harness(fault: Option<AudioFaultView>, cutting_out: Option<u64>) -> Harness<'static> {
     use jamstream_client::app::{JamApp, Screen};
 
     let demo = DemoRuntime::frozen(FROZEN_FRAME, false);
     demo.set_audio_fault(fault);
+    demo.set_cutting_out(cutting_out);
     let mut app = JamApp::in_memory();
     app.recent = Vec::new();
     app.runtime = Some(Box::new(demo));

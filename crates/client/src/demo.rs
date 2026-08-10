@@ -151,6 +151,10 @@ struct DemoState {
     /// the reopen cadence, which a fixture has no way to run, so it pins the
     /// answer instead.
     audio_fault: Option<AudioFaultView>,
+    /// How many stops the device has run up while it reads as cutting out: the
+    /// real runtime counts them over a window a fixture cannot wait out, so it
+    /// pins the answer instead.
+    cutting_out: Option<u64>,
     /// Your own display name, as [`Command::SetOwnName`] set it: the demo
     /// stands in for the roster fanout the real server answers with.
     own_name: Option<String>,
@@ -317,6 +321,7 @@ impl DemoRuntime {
                 uplink_loss_pct: 0.0,
                 downlink_loss_pct: 0.2,
                 audio_fault: None,
+                cutting_out: None,
                 own_name: None,
             }),
             is_host,
@@ -440,6 +445,13 @@ impl DemoRuntime {
         s.crackling = crackling;
     }
 
+    /// Pins the stops behind a device that reads as cutting out, as the real
+    /// runtime counts them across the session.
+    pub fn set_cutting_out(&self, stops: Option<u64>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.cutting_out = stops;
+    }
+
     fn scripted_chat() -> Vec<ChatLine> {
         let line = |id: u16, name: &str, text: &str, at_ms: u64| ChatLine {
             from_name: name.to_owned(),
@@ -508,6 +520,7 @@ impl Runtime for DemoRuntime {
             playout_low_frames: None,
             // Nothing fills a ring here, so there is no thread to time.
             wake: None,
+            cutting_out: s.cutting_out,
         };
 
         let members = s
