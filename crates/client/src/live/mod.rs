@@ -38,7 +38,7 @@ use crate::runtime::{
     AudioFaultView, AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState,
     CostView, DestinationView, DeviceBuffersView, FaderView, LevelsView, MemberId, MemberView,
     MetronomeView, RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime,
-    Snapshot, StatsView, StreamView, WakeView,
+    Snapshot, StatsView, StreamView, WakeView, recording_or_on_air,
 };
 use crate::screens::invites::TokenMap;
 
@@ -1706,8 +1706,13 @@ impl Worker {
                 (false, now, None)
             }
         };
-        self.cushion.observe(low_at, low);
-        self.shared.lock().expect("live state").stats.crackling = crackling;
+        let mut s = self.shared.lock().expect("live state");
+        s.stats.crackling = crackling;
+        // The server owns both states, so this is what its last RecordStatus
+        // and StreamStatus said.
+        let held = recording_or_on_air(&s.record, &s.stream);
+        drop(s);
+        self.cushion.observe(low_at, low, held);
     }
 
     fn drain_events(&mut self, now_ms: u64) {
@@ -2066,6 +2071,9 @@ fn conn_state(state: &ClientState) -> ConnState {
 
 #[cfg(test)]
 mod tests {
+    use jamstream_protocol::control::{DestinationState, StreamPlatform};
+    use jamstream_protocol::ids::DestinationId;
+
     use super::watch::CUSHION_STEP;
     use super::*;
 
@@ -2136,6 +2144,49 @@ mod tests {
             step_ms,
             "the headline figure moved by the frame the cushion moved and nothing else"
         );
+    }
+
+    /// Which states the cushion may not hand latency back in. A take under the
+    /// recorder and a destination somebody is watching, and neither of the two
+    /// states that look like them: an upload is a take that already stopped,
+    /// and a destination still coming up has nobody to hear a dropout.
+    #[test]
+    fn only_a_running_take_or_a_watched_destination_holds_the_cushion() {
+        let take = |state| RecordView {
+            state,
+            stems: false,
+        };
+        let destination = |state| {
+            vec![DestinationView {
+                id: DestinationId(0),
+                platform: StreamPlatform::Twitch,
+                state,
+                bitrate_kbps: 0,
+                dropped_frames: 0,
+                repeated_frames: 0,
+            }]
+        };
+        let idle = take(RecordState::Idle);
+
+        assert!(!recording_or_on_air(&idle, &[]));
+        assert!(recording_or_on_air(&take(RecordState::Recording), &[]));
+        assert!(!recording_or_on_air(&take(RecordState::Uploading), &[]));
+        assert!(recording_or_on_air(
+            &idle,
+            &destination(DestinationState::Live)
+        ));
+        for state in [
+            DestinationState::Idle,
+            DestinationState::Connecting,
+            DestinationState::Failed {
+                reason: "no relay".into(),
+            },
+        ] {
+            assert!(
+                !recording_or_on_air(&idle, &destination(state.clone())),
+                "{state:?} held the cushion still"
+            );
+        }
     }
 
     /// The sizing that matters: the rings must fit the callbacks the

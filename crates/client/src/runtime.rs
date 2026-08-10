@@ -486,6 +486,22 @@ pub enum RecordState {
     },
 }
 
+/// Whether any of `destinations` is being watched, off the destination list
+/// alone so the worker can ask it of the list it publishes.
+pub(crate) fn on_air(destinations: &[DestinationView]) -> bool {
+    destinations
+        .iter()
+        .any(|d| d.state == DestinationState::Live)
+}
+
+/// Whether the room is making audio nobody gets to play again: a take under
+/// the recorder, or a destination somebody is watching. One condition because
+/// the cost is the same, a dropout in a performance that only happened once.
+/// An upload is not one of them: the take stopped before it started.
+pub(crate) fn recording_or_on_air(record: &RecordView, destinations: &[DestinationView]) -> bool {
+    record.state == RecordState::Recording || on_air(destinations)
+}
+
 /// Where the broadcast is going, as everyone in the room sees it. Empty
 /// until the server reports a destination, which is also how "nothing
 /// configured" reads.
@@ -513,9 +529,7 @@ impl StreamView {
     /// connecting destinations are not on air, and a failed one is the
     /// opposite of on air.
     pub fn on_air(&self) -> bool {
-        self.destinations
-            .iter()
-            .any(|d| d.state == DestinationState::Live)
+        on_air(&self.destinations)
     }
 
     pub fn live_count(&self) -> usize {
