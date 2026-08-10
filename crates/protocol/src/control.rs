@@ -262,11 +262,6 @@ pub struct DestinationStatus {
     /// frame count is what holds video in step with audio, so a frame with no
     /// time to draw goes out again rather than being skipped. Nothing is
     /// missing and A/V sync stays exact; the cost is a stutter.
-    ///
-    /// Trailing field, appended while protocol version 1 is unreleased.
-    /// Postcard writes struct fields in order with no framing, so bytes
-    /// written before it are short of the new encoding and fail to decode
-    /// rather than misreading, the same note as `MemberInfo::avatar_hash`.
     pub repeated_frames: u64,
 }
 
@@ -299,12 +294,7 @@ pub struct MemberInfo {
     pub role: Role,
     pub name: String,
     pub connected: bool,
-    /// Blake2s-256 of the member's avatar bytes; None when unset. Trailing
-    /// field, but postcard encodes struct fields in order with no framing,
-    /// so old roster bytes lack the Option tag byte and fail to decode
-    /// (UnexpectedEnd) rather than misreading. That makes this a breaking
-    /// change to the roster encoding, accepted deliberately while protocol
-    /// version 1 is unreleased; no compat fixtures reference roster bytes.
+    /// Blake2s-256 of the member's avatar bytes; None when unset.
     pub avatar_hash: Option<[u8; 32]>,
     /// The server has not heard from this member lately, but has not given up
     /// on them either. `connected` is still true; that is the point.
@@ -319,12 +309,20 @@ pub struct MemberInfo {
     ///
     /// `jamstream_session::MEMBER_QUIET_AFTER_MS` is the threshold and
     /// `DEFAULT_MEMBER_TIMEOUT_MS` is when `connected` goes false, so the
-    /// quiet window is the gap between them. Trailing field, so the same
-    /// encoding note as `avatar_hash` applies: one byte, appended, and bytes
-    /// written before it fail to decode rather than misreading.
+    /// quiet window is the gap between them.
     pub quiet: bool,
 }
 
+/// Everything the control plane carries. The declaration is the wire: postcard
+/// writes a variant index as a varint and struct fields in order with no
+/// framing between them, so a new variant belongs at the end, where it leaves
+/// every existing variant's bytes alone, and a new field changes the encoding
+/// of the message that gains it.
+///
+/// Either way a peer at the older version refuses the bytes rather than reading
+/// a message that means something else: an unknown variant index does not
+/// decode, and [`ControlLink::receive`] refuses a datagram with bytes left
+/// over. So an addition here moves `PROTOCOL_VERSION`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
     /// Full roster snapshot; the server sends one on every change.
@@ -368,12 +366,6 @@ pub enum ControlMsg {
     /// Server's once-per-second view of a musician's uplink, feeding the
     /// sender's redundancy decision. Percentages are 0..=100 over the last
     /// reporting window.
-    ///
-    /// Appended last on purpose: postcard encodes the variant index as a
-    /// varint discriminant, so adding a variant at the end leaves every
-    /// existing variant's bytes unchanged. A peer without this variant only
-    /// fails to decode messages that actually carry it; protocol version 1
-    /// is unreleased, so no such peer exists.
     Stats {
         uplink_loss_pct: f32,
         uplink_jitter_depth: u16,
@@ -382,9 +374,6 @@ pub enum ControlMsg {
     /// Host shapes one member's fader in the broadcast mix (host to server);
     /// the server relays accepted changes to every connected member so UIs
     /// can mirror the state.
-    ///
-    /// Appended after Stats, same postcard append-safety rule: trailing
-    /// variants leave every existing variant's bytes unchanged.
     BroadcastMixSet {
         target: MemberId,
         gain_db: f32,
@@ -392,13 +381,12 @@ pub enum ControlMsg {
         muted: bool,
     },
     /// Host to server: while enabled, the host hears the broadcast mix
-    /// instead of their personal mix. Trailing variant, as above.
+    /// instead of their personal mix.
     BroadcastAudition {
         enabled: bool,
     },
     /// Client to server: announce or replace this member's avatar by
     /// content hash. The bytes follow only if the server asks for them.
-    /// Trailing variant, same postcard append-safety rule as Stats.
     SetAvatar {
         hash: [u8; 32],
         len: u32,
@@ -422,26 +410,23 @@ pub enum ControlMsg {
     /// counts a violation against any other sender. The key inside rides
     /// the Noise transport, never touches disk outside the pusher's
     /// root-only spawn file, and never appears in any relayed message.
-    /// Trailing variant, same postcard append-safety rule as Stats.
     StreamCtl {
         op: StreamOp,
     },
     /// Server to all: the on-air state, once a second while streaming and
     /// immediately on any transition. Every member sees it, not just the
     /// host, because everyone in the room deserves to know they are live.
-    /// Trailing variant, as above.
     StreamStatus {
         destinations: Vec<DestinationStatus>,
     },
     /// Host to server: start or stop the session recording. Host-only; the
-    /// server counts a violation against any other sender. Trailing variant,
-    /// same postcard append-safety rule as Stats.
+    /// server counts a violation against any other sender.
     RecordCtl {
         op: RecordOp,
     },
     /// Server to all: the recorder's state, immediately on any transition
     /// and to a member who joins mid-take. A full snapshot, so the latest
-    /// one is always sufficient. Trailing variant, as above.
+    /// one is always sufficient.
     RecordStatus {
         state: RecordingState,
         /// Whether per-member stems are captured alongside the mix, so
@@ -453,16 +438,14 @@ pub enum ControlMsg {
     /// only: the sender is the target, exactly as `Chat` forces `from`.
     /// Names past [`MAX_NAME_LEN`] are refused at the link, the same cap the
     /// roster enforces, so a name the roster could not carry never leaves
-    /// the client. Trailing variant, same postcard append-safety rule as
-    /// Stats.
+    /// the client.
     SetName {
         name: String,
     },
     /// Server to all: whether this session can broadcast at all, on change and
     /// to a member as they join. Separate from [`Self::StreamStatus`] because
     /// it is true of the session rather than of a destination, and because the
-    /// host who most needs it has configured none yet. Trailing variant, same
-    /// postcard append-safety rule as Stats.
+    /// host who most needs it has configured none yet.
     BroadcastReadiness {
         state: BroadcastReadiness,
     },
@@ -477,14 +460,12 @@ pub enum ControlMsg {
     /// One line per message, sent as the line is written rather than gathered
     /// at the end: a session ending because the VM is being destroyed gets one
     /// flight with no retransmit, which is the worst moment to be starting.
-    /// Trailing variant, same postcard append-safety rule as Stats.
     ServerLog {
         line: String,
     },
     /// Client to server: a musician asking their own personal mix to include
     /// their own signal, rather than the usual removal. Per member rather
-    /// than host-gated, unlike [`Self::BroadcastAudition`]. Trailing
-    /// variant, same postcard append-safety rule as Stats.
+    /// than host-gated, unlike [`Self::BroadcastAudition`].
     HearSelf {
         enabled: bool,
     },
@@ -598,9 +579,8 @@ impl ControlLink {
     /// returns any messages now deliverable in order.
     ///
     /// A datagram accounts for every byte in it: anything after the packet is
-    /// refused rather than ignored, so a peer whose encoding has grown a field
-    /// fails to be understood here instead of having its message read as the
-    /// one it sent before the addition.
+    /// refused rather than ignored, so a message from a peer whose encoding has
+    /// grown a field is refused rather than read as the message without it.
     pub fn receive(&mut self, buf: &[u8]) -> Result<Vec<ControlMsg>, Error> {
         if buf.first() != Some(&CHANNEL_CONTROL) {
             return Err(Error::Malformed);
@@ -1753,20 +1733,20 @@ mod tests {
         assert!(postcard::from_bytes::<ControlMsg>(&[0x10, 0x01, 0x01, 0x00, 0x04]).is_err());
     }
 
-    /// The same note as `MemberInfo`, for the appended field: bytes from
-    /// before it are short of the new encoding and fail to decode instead of
-    /// reading as "no repeats". Breaking pre-release, by decision.
+    /// The other half of the rule on `ControlMsg`, for a field: a status one
+    /// field short does not decode, rather than reading as no repeats. The
+    /// struct below is what a peer that lacks the repeat count encodes.
     #[test]
-    fn destination_status_trailing_field_changed_the_status_encoding() {
+    fn a_status_without_the_repeat_count_does_not_decode() {
         #[derive(Serialize)]
-        struct OldDestinationStatus {
+        struct StatusWithoutRepeats {
             id: DestinationId,
             platform: StreamPlatform,
             state: DestinationState,
             bitrate_kbps: u32,
             dropped_frames: u64,
         }
-        let old = postcard::to_allocvec(&OldDestinationStatus {
+        let short = postcard::to_allocvec(&StatusWithoutRepeats {
             id: DestinationId(1),
             platform: StreamPlatform::Twitch,
             state: DestinationState::Live,
@@ -1774,9 +1754,9 @@ mod tests {
             dropped_frames: 9,
         })
         .unwrap();
-        assert!(postcard::from_bytes::<DestinationStatus>(&old).is_err());
+        assert!(postcard::from_bytes::<DestinationStatus>(&short).is_err());
 
-        let now = DestinationStatus {
+        let full = DestinationStatus {
             id: DestinationId(1),
             platform: StreamPlatform::Twitch,
             state: DestinationState::Live,
@@ -1784,12 +1764,12 @@ mod tests {
             dropped_frames: 9,
             repeated_frames: 0,
         };
-        let bytes = postcard::to_allocvec(&now).unwrap();
-        // The repeat count is exactly the byte the old encoding lacked.
-        assert_eq!(bytes.len(), old.len() + 1);
+        let bytes = postcard::to_allocvec(&full).unwrap();
+        // The repeat count is exactly the byte the shorter encoding lacks.
+        assert_eq!(bytes.len(), short.len() + 1);
         assert_eq!(
             postcard::from_bytes::<DestinationStatus>(&bytes).unwrap(),
-            now
+            full
         );
     }
 
@@ -1819,11 +1799,13 @@ mod tests {
         );
     }
 
-    /// Trailing variants must leave every earlier variant's bytes alone:
-    /// postcard writes the variant index as a varint, so appending only
-    /// widens the tag space.
+    /// The half of the rule on `ControlMsg` that lets it grow: a variant index
+    /// is a varint, so a message at the end of the declaration only widens the
+    /// tag space and every earlier variant keeps the bytes it has. A variant
+    /// inserted rather than appended shifts every index after it and fails
+    /// here.
     #[test]
-    fn appending_stream_variants_left_earlier_encodings_alone() {
+    fn the_stream_variants_leave_earlier_encodings_alone() {
         let earlier = ControlMsg::Chat {
             from: MemberId(1),
             text: "hi".into(),
@@ -1831,7 +1813,7 @@ mod tests {
         // Chat is variant index 1: tag byte 1, then the payload.
         let bytes = postcard::to_allocvec(&earlier).unwrap();
         assert_eq!(bytes[0], 1);
-        // The new variants land last, after AvatarRequest.
+        // The stream pair sits after AvatarRequest.
         let ctl = postcard::to_allocvec(&ControlMsg::StreamCtl {
             op: StreamOp::Start,
         })
@@ -1844,10 +1826,9 @@ mod tests {
         assert_eq!(status[0], 16);
     }
 
-    /// Same rule for the recording variants: appended after StreamStatus,
-    /// leaving every earlier variant's bytes unchanged.
+    /// The same rule, for the recording pair after `StreamStatus`.
     #[test]
-    fn appending_record_variants_left_earlier_encodings_alone() {
+    fn the_record_variants_leave_earlier_encodings_alone() {
         let ctl = postcard::to_allocvec(&ControlMsg::RecordCtl {
             op: RecordOp::Start,
         })
@@ -1861,10 +1842,9 @@ mod tests {
         assert_eq!(status[0], 18);
     }
 
-    /// Same rule for the readiness variant: appended after SetName, so every
-    /// earlier variant's bytes are the bytes they were.
+    /// The same rule, for the readiness variant after `SetName`.
     #[test]
-    fn appending_the_readiness_variant_left_earlier_encodings_alone() {
+    fn the_readiness_variant_leaves_earlier_encodings_alone() {
         let name = postcard::to_allocvec(&ControlMsg::SetName { name: "a".into() }).unwrap();
         assert_eq!(name[0], 19);
         let ready = postcard::to_allocvec(&ControlMsg::BroadcastReadiness {
@@ -1878,10 +1858,9 @@ mod tests {
         assert_eq!(ready.len(), 2);
     }
 
-    /// Same rule for `HearSelf`: appended after `ServerLog`, so every earlier
-    /// variant's bytes are the bytes they were.
+    /// The same rule, for `HearSelf` after `ServerLog`.
     #[test]
-    fn appending_the_hear_self_variant_left_earlier_encodings_alone() {
+    fn the_hear_self_variant_leaves_earlier_encodings_alone() {
         let log = postcard::to_allocvec(&ControlMsg::ServerLog { line: "x".into() }).unwrap();
         assert_eq!(log[0], 21);
         let hear_self = postcard::to_allocvec(&ControlMsg::HearSelf { enabled: true }).unwrap();
@@ -1941,27 +1920,26 @@ mod tests {
         assert!(a.send(big).is_err());
     }
 
-    /// Pins what postcard actually does with the trailing fields added to
-    /// MemberInfo: old bytes are short of the new ones and fail to decode
-    /// instead of misreading. Breaking pre-release, by decision, twice now:
-    /// the `avatar_hash` Option and then the `quiet` flag.
+    /// The same for the roster's two trailing fields: a member short of either
+    /// does not decode, rather than reading as an avatarless member who is
+    /// talking. The struct below is what a peer that lacks both encodes.
     #[test]
-    fn member_info_trailing_fields_changed_the_roster_encoding() {
+    fn a_member_without_the_trailing_fields_does_not_decode() {
         #[derive(Serialize)]
-        struct OldMemberInfo {
+        struct MemberWithoutAvatarOrQuiet {
             id: MemberId,
             role: Role,
             name: String,
             connected: bool,
         }
-        let old = postcard::to_allocvec(&OldMemberInfo {
+        let short = postcard::to_allocvec(&MemberWithoutAvatarOrQuiet {
             id: MemberId(3),
             role: Role::Musician,
             name: "ana".into(),
             connected: true,
         })
         .unwrap();
-        assert!(postcard::from_bytes::<MemberInfo>(&old).is_err());
+        assert!(postcard::from_bytes::<MemberInfo>(&short).is_err());
 
         let unset = MemberInfo {
             id: MemberId(3),
@@ -1972,13 +1950,12 @@ mod tests {
             quiet: false,
         };
         let bytes = postcard::to_allocvec(&unset).unwrap();
-        // The Option tag and the quiet byte are exactly the two the oldest
-        // encoding lacked.
-        assert_eq!(bytes.len(), old.len() + 2);
+        // The Option tag and the quiet byte are exactly the two the shorter
+        // encoding lacks.
+        assert_eq!(bytes.len(), short.len() + 2);
         assert_eq!(postcard::from_bytes::<MemberInfo>(&bytes).unwrap(), unset);
 
-        // And the encoding from between the two changes, which had the Option
-        // and not the flag, is also refused rather than read as quiet: false.
+        // One field short is also refused, rather than read as quiet: false.
         assert!(postcard::from_bytes::<MemberInfo>(&bytes[..bytes.len() - 1]).is_err());
 
         let set = MemberInfo {
@@ -2260,12 +2237,12 @@ mod tests {
         }
     }
 
-    /// The reverse of `member_info_trailing_fields_changed_the_roster_encoding`:
-    /// a peer whose encoding has grown a field sends bytes this build cannot
+    /// The reverse of `a_member_without_the_trailing_fields_does_not_decode`: a
+    /// peer whose encoding has grown a field sends bytes this build cannot
     /// account for, and refusing them is what keeps the addition from being
     /// read as the message without it. The bytes are built by appending the new
-    /// field to a real datagram, which is exactly what that peer would put on
-    /// the wire, because the message this frame carries is the last thing a
+    /// field to a real datagram, which is exactly what that peer puts on the
+    /// wire, because the message a frame carries is the last thing a
     /// `CtlPacket` encodes.
     #[test]
     fn receive_refuses_a_frame_whose_encoding_grew_a_field() {
