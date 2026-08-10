@@ -680,8 +680,9 @@ jobs:
           done
 
   # Simulation harness gates: latency budgets, loss resilience, drift, chaos.
-  # ~3 minutes of pure test runtime, and no audio/UI system deps (the harness
-  # wires engine + protocol to virtual clocks), so no apt step.
+  # ~3 minutes of pure test runtime. Its playout runs through the client's real
+  # audio ring, so it links jamstream-audio-io and needs that crate's Linux
+  # build deps; the UI ones are still nothing to do with it.
   harness:
     needs: [changes]
     strategy:
@@ -708,6 +709,10 @@ jobs:
         if: needs.changes.outputs.docs-only != 'true'
         with:
           tool: cargo-nextest
+      # libasound2-dev, libpipewire-0.3-dev, libdbus-1-dev: cpal's Linux hosts
+      # and its realtime thread promotion, which jamstream-audio-io pulls in.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libdbus-1-dev
+        if: matrix.os == 'ubuntu-latest' && needs.changes.outputs.docs-only != 'true'
       # One run again. #282 split this into two so the two wall-clock gates
       # could have the runner to themselves, and .config/nextest.toml now says
       # the same thing where nextest reads it on every path: those tests

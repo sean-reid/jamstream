@@ -1,9 +1,10 @@
 //! Scenario runner: a real `ServerCore` plus N real `ClientCore`s wired
-//! through the seeded network simulator on a 2.5 ms master tick. One process,
-//! no sockets, no threads. For a fixed builder configuration and seed, every
-//! packet's size and send instant is fixed by the tick schedule, so the
-//! seeded network draws identically and the media path replays exactly, even
-//! though the handshake bytes themselves use fresh Noise keys per run.
+//! through the seeded network simulator on a 2.5 ms master tick, each one
+//! playing out through a real [`PlayoutDevice`]. One process, no sockets, no
+//! threads. For a fixed builder configuration and seed, every packet's size
+//! and send instant is fixed by the tick schedule, so the seeded network draws
+//! identically and the media path replays exactly, even though the handshake
+//! bytes themselves use fresh Noise keys per run.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,6 +21,7 @@ use jamstream_session::{
 };
 
 use crate::clock::{SkewedClock, VirtualClock};
+use crate::device::PlayoutDevice;
 use crate::net::{EndpointId, Profile, SimNet};
 
 /// Master tick: 2.5 ms, one media frame.
@@ -30,6 +32,9 @@ pub const FRAME_SAMPLES: usize = 120;
 pub const STEREO_FRAME: usize = FRAME_SAMPLES * 2;
 /// Impulse detection threshold in the playout recording.
 pub const DETECT_THRESHOLD: f32 = 0.05;
+/// Device callback in frames unless a scenario asks for another size: the
+/// client's own default, where one callback is one master tick.
+pub const DEVICE_FRAMES: u32 = FRAME_SAMPLES as u32;
 
 const SERVER_ENDPOINT: EndpointId = EndpointId(0);
 /// Fixed unix time handed to token verification; tokens never expire here.
@@ -120,26 +125,38 @@ impl TickCost {
     }
 }
 
+/// One master tick of playout as the device asked for it. Silence and rms
+/// gates read this, not the raw audio, so it carries the sample count too: a
+/// callback longer than a tick plays nothing on the ticks between its own.
+#[derive(Debug, Default, Clone, Copy)]
+struct Meter {
+    peak: f32,
+    energy: f32,
+    samples: usize,
+}
+
 struct SimClient {
     endpoint: EndpointId,
     addr: SocketAddr,
     core: ClientCore,
+    /// Playout ring and device callback between this client's engine and its
+    /// recording, so the recorded audio is what a speaker gets.
+    device: PlayoutDevice,
     role: Role,
     jti: TokenId,
     source: Source,
     skew: Option<SkewedClock>,
     frames_emitted: u64,
-    /// Raw mode: fractional device-sample accumulators (a +-ppm device
-    /// delivers 120 * (1 +- ppm e-6) samples per master tick) and the
-    /// capture sample index the source renders from.
+    /// Raw mode: fractional capture accumulator (a +-ppm device delivers
+    /// 120 * (1 +- ppm e-6) samples per master tick) and the capture sample
+    /// index the source renders from. Playout keeps its own accumulator in
+    /// [`PlayoutDevice`], which is where the device clock belongs.
     capture_acc: f64,
-    playout_acc: f64,
     capture_samples: u64,
     /// Full interleaved stereo playout; only kept when `keep_audio` is set.
     recording: Vec<f32>,
-    /// Per tick: (peak abs, sum of squares) over that tick's playout frame.
-    /// Always kept; silence and rms gates read this, not the raw audio.
-    meter: Vec<(f32, f32)>,
+    /// One [`Meter`] per master tick. Always kept.
+    meter: Vec<Meter>,
     events: Vec<ClientEvent>,
     /// While set, every outgoing datagram is replaced by seeded garbage of
     /// the same length (a client gone haywire, from the server's view).
@@ -147,6 +164,44 @@ struct SimClient {
     /// While set, this client's audio driver is frozen: no capture is
     /// delivered and no playout is asked for. See `set_driver_stalled`.
     stalled: bool,
+}
+
+impl SimClient {
+    /// Runs this client's playout device for one master tick, `frames` of the
+    /// device's own clock, and records what it played.
+    fn play_tick(&mut self, frames: f64, raw: bool, keep_audio: bool) {
+        let SimClient {
+            core,
+            device,
+            recording,
+            meter,
+            ..
+        } = self;
+        let played = device.run(frames, |buf| {
+            if raw {
+                core.pull_playout_raw(buf);
+            } else {
+                core.pull_playout(buf);
+            }
+        });
+        record(meter, recording, keep_audio, played);
+    }
+}
+
+/// One per-tick meter entry over `buf`, plus the raw audio when kept.
+fn record(meter: &mut Vec<Meter>, recording: &mut Vec<f32>, keep_audio: bool, buf: &[f32]) {
+    let mut m = Meter {
+        samples: buf.len(),
+        ..Meter::default()
+    };
+    for &s in buf {
+        m.peak = m.peak.max(s.abs());
+        m.energy += s * s;
+    }
+    meter.push(m);
+    if keep_audio {
+        recording.extend_from_slice(buf);
+    }
 }
 
 pub struct ScenarioBuilder {
@@ -161,6 +216,7 @@ pub struct ScenarioBuilder {
     keep_audio: bool,
     raw_audio: bool,
     tick_cost: bool,
+    device_frames: u32,
 }
 
 impl ScenarioBuilder {
@@ -177,6 +233,7 @@ impl ScenarioBuilder {
             keep_audio: true,
             raw_audio: false,
             tick_cost: false,
+            device_frames: DEVICE_FRAMES,
         }
     }
 
@@ -232,6 +289,17 @@ impl ScenarioBuilder {
     /// compensators must steer out.
     pub fn raw_audio(mut self, raw: bool) -> Self {
         self.raw_audio = raw;
+        self
+    }
+
+    /// Device callback size in frames for every client's playout, which sets
+    /// the cushion the top-up loop holds: two callbacks, so 120 frames costs
+    /// 5 ms of mouth-to-ear and 480 frames costs 20 ms. A user picks this on
+    /// the settings screen, and it is the one term of the latency budget that
+    /// the machine rather than the network decides.
+    pub fn device_frames(mut self, frames: u32) -> Self {
+        assert!(frames > 0, "a device callback asks for at least one frame");
+        self.device_frames = frames;
         self
     }
 
@@ -313,13 +381,13 @@ impl ScenarioBuilder {
                 endpoint,
                 addr,
                 core,
+                device: PlayoutDevice::new(self.device_frames),
                 role,
                 jti: invite.token.jti,
                 source: self.sources.get(&i).copied().unwrap_or(Source::Silence),
                 skew: self.skews.get(&i).map(|&ppm| SkewedClock::new(ppm)),
                 frames_emitted: 0,
                 capture_acc: 0.0,
-                playout_acc: 0.0,
                 capture_samples: 0,
                 recording: Vec::new(),
                 meter: Vec::new(),
@@ -380,7 +448,7 @@ pub struct Scenario {
 impl Scenario {
     /// One 2.5 ms master tick: advance time, deliver due packets to their
     /// cores, run the server mix tick, then let every client capture, poll,
-    /// and pull playout.
+    /// and run its playout device.
     pub fn step(&mut self) {
         self.clock.advance_us(TICK_US);
         let now_us = self.clock.now_us();
@@ -451,9 +519,8 @@ impl Scenario {
         let dgs = self.clients[idx].core.poll(now_ms);
         self.forward_client(now_us, idx, dgs);
 
-        let mut buf = [0.0f32; STEREO_FRAME];
-        self.clients[idx].core.pull_playout(&mut buf);
-        self.record(idx, &buf);
+        let keep = self.keep_audio;
+        self.clients[idx].play_tick(FRAME_SAMPLES as f64, false, keep);
     }
 
     /// Raw device-paced drive: the client's virtual sound card runs at
@@ -479,12 +546,8 @@ impl Scenario {
         let dgs = self.clients[idx].core.poll(now_ms);
         self.forward_client(now_us, idx, dgs);
 
-        self.clients[idx].playout_acc += rate;
-        let m = self.clients[idx].playout_acc as usize;
-        self.clients[idx].playout_acc -= m as f64;
-        let mut buf = [0.0f32; 4 * FRAME_SAMPLES];
-        self.clients[idx].core.pull_playout_raw(&mut buf[..m * 2]);
-        self.record(idx, &buf[..m * 2]);
+        let keep = self.keep_audio;
+        self.clients[idx].play_tick(rate, true, keep);
     }
 
     /// A frozen audio driver. The device thread delivers no capture and asks
@@ -503,9 +566,6 @@ impl Scenario {
             let n = self.clients[idx].capture_acc as usize;
             self.clients[idx].capture_acc -= n as f64;
             self.clients[idx].capture_samples += n as u64;
-            self.clients[idx].playout_acc += rate;
-            let m = self.clients[idx].playout_acc as usize;
-            self.clients[idx].playout_acc -= m as f64;
         } else {
             self.clients[idx].frames_emitted = match self.clients[idx].skew {
                 Some(sk) => sk.map(now_us) / TICK_US,
@@ -516,25 +576,11 @@ impl Scenario {
         let dgs = self.clients[idx].core.poll(now_ms);
         self.forward_client(now_us, idx, dgs);
 
-        // A dead device plays nothing, and the meter must stay tick-aligned
-        // for `rms_of` and `longest_silence_ms` to index by tick.
-        self.record(idx, &[0.0; STEREO_FRAME]);
-    }
-
-    /// One per-tick meter entry (peak, energy) over this tick's playout,
-    /// plus the raw audio when `keep_audio` is set.
-    fn record(&mut self, idx: usize, buf: &[f32]) {
+        // A dead device plays nothing, and the recording stays a continuous
+        // 48 kHz stream so a sample index is still an instant.
+        let keep = self.keep_audio;
         let c = &mut self.clients[idx];
-        let mut peak = 0.0f32;
-        let mut energy = 0.0f32;
-        for &s in buf {
-            peak = peak.max(s.abs());
-            energy += s * s;
-        }
-        c.meter.push((peak, energy));
-        if self.keep_audio {
-            c.recording.extend_from_slice(buf);
-        }
+        record(&mut c.meter, &mut c.recording, keep, &[0.0; STEREO_FRAME]);
     }
 
     pub fn run_ticks(&mut self, ticks: u64) {
@@ -717,9 +763,14 @@ impl Scenario {
     /// Mouth-to-ear latencies in ms: pairs each threshold crossing in the
     /// listener's recording (from `from_tick` on) with the impulse the
     /// emitter's source produced just before it. Capture sample k*period is
-    /// generated during master tick k*period/120, and playout sample p is
-    /// recorded during master tick p/120, so the sample-index difference is
-    /// exactly the mouth-to-ear delay at 48 samples per ms.
+    /// generated during master tick k*period/120, and playout sample p leaves
+    /// the device p/48 ms after the stream opened, because the device drains
+    /// its ring at 48 kHz from the first callback on, so the sample-index
+    /// difference is exactly the mouth-to-ear delay at 48 samples per ms.
+    ///
+    /// It is mouth to ear as far as our own last buffer: the recording is what
+    /// the device callback was handed, and whatever the sound card holds after
+    /// that is not visible from this side of it.
     pub fn impulse_latencies(&self, emitter: usize, listener: usize, from_tick: u64) -> Vec<f32> {
         let Source::ImpulseTrain { period_samples } = self.clients[emitter].source else {
             panic!("client {emitter} is not an ImpulseTrain source");
@@ -745,16 +796,26 @@ impl Scenario {
     }
 
     /// RMS of the playout over `[from_tick, to_tick)`, from the per-tick meter.
+    /// Over the samples the device asked for in that window, so a callback
+    /// longer than a tick averages over the audio and not over the ticks it
+    /// happens to fall on.
     pub fn rms_of(&self, client: usize, from_tick: u64, to_tick: u64) -> f32 {
         let m = &self.clients[client].meter;
         let (a, b) = (from_tick as usize, (to_tick as usize).min(m.len()));
         assert!(a < b, "empty rms window {from_tick}..{to_tick}");
-        let energy: f32 = m[a..b].iter().map(|&(_, e)| e).sum();
-        (energy / ((b - a) * STEREO_FRAME) as f32).sqrt()
+        let energy: f32 = m[a..b].iter().map(|e| e.energy).sum();
+        let samples: usize = m[a..b].iter().map(|e| e.samples).sum();
+        assert!(
+            samples > 0,
+            "no playout in rms window {from_tick}..{to_tick}"
+        );
+        (energy / samples as f32).sqrt()
     }
 
-    /// Longest run of ticks in `[from_tick, to_tick)` whose playout peak
-    /// stays under `threshold`, in ms.
+    /// Longest stretch of playout in `[from_tick, to_tick)` whose peak stays
+    /// under `threshold`, in ms. Measured in samples played rather than in
+    /// ticks, so a tick the device asked nothing on neither counts as silence
+    /// nor breaks a run.
     pub fn longest_silence_ms(
         &self,
         client: usize,
@@ -765,17 +826,25 @@ impl Scenario {
         let m = &self.clients[client].meter;
         let (a, b) = (from_tick as usize, (to_tick as usize).min(m.len()));
         assert!(a < b, "empty silence window {from_tick}..{to_tick}");
-        let mut run = 0u64;
-        let mut longest = 0u64;
-        for &(peak, _) in &m[a..b] {
-            if peak < threshold {
-                run += 1;
+        let mut run = 0usize;
+        let mut longest = 0usize;
+        for e in &m[a..b] {
+            if e.peak < threshold {
+                run += e.samples;
                 longest = longest.max(run);
             } else {
                 run = 0;
             }
         }
-        longest as f32 * (TICK_US as f32 / 1_000.0)
+        longest as f32 / 2.0 / 48.0
+    }
+
+    /// Playback callbacks that found this client's playout ring short of a
+    /// whole callback and padded with silence. Nonzero means the figures from
+    /// [`Scenario::impulse_latencies`] carry invented silence as well as the
+    /// cushion.
+    pub fn playout_underruns(&self, client: usize) -> u64 {
+        self.clients[client].device.underruns()
     }
 
     /// Files one timed tick under broadcast or ordinary. A tick is a broadcast

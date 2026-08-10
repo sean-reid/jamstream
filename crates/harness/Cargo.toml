@@ -8,9 +8,18 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The real playout ring, so the latency gates measure the device stage instead
+# of a stand-in that would agree with whatever the gates already assumed.
+jamstream-audio-io.workspace = true
 jamstream-protocol.workspace = true
 jamstream-engine.workspace = true
 jamstream-session.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# The source-text check in src/device.rs, which holds the playout cushion here
+# to the one the client fills to. A path dependency and not a workspace one, as
+# in crates/audio-io and crates/cli: nothing ships xtask.
+[dev-dependencies]
+xtask = { path = "../../xtask" }

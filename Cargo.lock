@@ -2942,12 +2942,14 @@ dependencies = [
 name = "jamstream-harness"
 version = "0.4.2"
 dependencies = [
+ "jamstream-audio-io",
  "jamstream-engine",
  "jamstream-protocol",
  "jamstream-session",
  "rand 0.10.2",
  "serde",
  "serde_json",
+ "xtask",
 ]
 
 [[package]]
