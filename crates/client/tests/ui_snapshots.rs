@@ -186,6 +186,11 @@ fn test_app(theme: Theme) -> JamApp {
     let mut app = JamApp::in_memory();
     app.theme = theme;
     app.recent = Vec::new();
+    // Whether the Audio tab asks about exclusive access is a platform fact,
+    // and a baseline that took it from the machine rendering it would hold a
+    // different layout on each. Pinned here, set by the fixtures that render
+    // the other answer.
+    app.devices.exclusive_offered = false;
     app
 }
 
@@ -198,6 +203,11 @@ fn test_app(theme: Theme) -> JamApp {
 #[test]
 fn fixtures_cannot_see_the_machine_that_runs_them() {
     let app = test_app(Theme::Dark);
+    assert!(
+        !app.devices.exclusive_offered,
+        "the exclusive control has to be pinned, or a Windows render of the \
+         Audio tab holds a control the baseline does not"
+    );
     for row in &app.wizard.providers {
         let expected = if row.name == "local" {
             ProviderStatus::NoAccountNeeded
@@ -1163,6 +1173,50 @@ fn session_settings_narrow() {
     );
     let mut harness = app_harness(app, NARROW);
     snapshot(&mut harness, "session_settings_narrow");
+}
+
+/// The Audio tab where a backend can open a device exclusively, which is
+/// Windows. The pair with [`session_settings`] is the only difference the
+/// platform makes to this tab: the checkbox and its consequence under the
+/// device pickers.
+#[test]
+fn session_settings_exclusive() {
+    let mut app = drawer_app(
+        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
+        SettingsTab::Audio,
+    );
+    app.devices.exclusive_offered = true;
+    let mut harness = app_harness(app, WIDE);
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("Allow exclusive access")
+            .is_some(),
+        "the checkbox is the whole fixture; a baseline without it locks in the \
+         absence"
+    );
+    snapshot(&mut harness, "session_settings_exclusive");
+}
+
+/// The same control in the smallest window the app opens, which is where an
+/// extra checkbox and two lines of explanation cost the most: the drawer is
+/// scrolled to the end, so the bottom of the Devices block is what this shows.
+#[test]
+fn session_settings_exclusive_narrow() {
+    let mut app = drawer_app(
+        host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark),
+        SettingsTab::Audio,
+    );
+    app.devices.exclusive_offered = true;
+    let mut harness = app_harness(app, NARROW);
+    scroll_drawer(&mut harness, NARROW);
+    assert!(
+        harness
+            .query_by_label_contains("Allow exclusive access")
+            .is_some(),
+        "the checkbox has to be reachable in the narrow drawer"
+    );
+    snapshot(&mut harness, "session_settings_exclusive_narrow");
 }
 
 #[test]

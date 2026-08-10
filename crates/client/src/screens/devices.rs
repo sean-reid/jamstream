@@ -165,6 +165,11 @@ pub struct DevicesScreen {
     /// but it mutes every other stream on the endpoint, so the setting and
     /// its cost are on the tab instead of being a silent policy.
     pub allow_exclusive: bool,
+    /// Whether the platform's backend can open a device exclusively at all,
+    /// which is WASAPI and nothing else. Set from the running platform, and a
+    /// field rather than a `cfg!` at the draw site so a snapshot can render
+    /// both answers from one machine.
+    pub exclusive_offered: bool,
     /// What the last rescan had to say for itself: a selection that fell back
     /// to the system default because its device is gone, or a scan that
     /// failed. Shown under the pickers until the next rescan; a fallback
@@ -179,6 +184,7 @@ impl Default for DevicesScreen {
             playback_idx: 0,
             buffer_frames: BUFFER_CHOICES[0],
             allow_exclusive: true,
+            exclusive_offered: cfg!(windows),
             rescan_note: None,
         }
     }
@@ -401,7 +407,7 @@ impl DevicesScreen {
             // The WASAPI backend is the only reader of `allow_exclusive`; on
             // every other platform the question has no answer to give, so
             // the control is absent rather than a checkbox nothing reads.
-            if cfg!(windows) {
+            if self.exclusive_offered {
                 ui.add_space(theme::SPACE_SM);
                 ui.checkbox(
                     &mut self.allow_exclusive,
@@ -565,5 +571,13 @@ mod tests {
             Some("device delivers 4800 maximum")
         );
         assert_eq!(buffer_choice_note(120, (None, None)), None);
+    }
+
+    /// The platform decides whether the exclusive question gets asked, and a
+    /// launch never decides otherwise: only a fixture rendering the other
+    /// platform's layout sets this by hand.
+    #[test]
+    fn the_exclusive_control_is_offered_where_a_backend_can_answer_for_it() {
+        assert_eq!(DevicesScreen::default().exclusive_offered, cfg!(windows));
     }
 }
