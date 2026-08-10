@@ -478,6 +478,16 @@ pub fn microusd(micro: u64) -> String {
     jamstream_cloud::format_microusd((micro + CENT / 2) / CENT * CENT)
 }
 
+/// [`microusd`] unless the figure rounds away to nothing.
+///
+/// For the one place a price is the argument rather than a detail: "$0.00" on a
+/// line whose point is that money is being spent reads as reassurance, so a
+/// caller says the rest of the sentence without it.
+pub fn microusd_nonzero(micro: u64) -> Option<String> {
+    let shown = microusd(micro);
+    (shown != microusd(0)).then_some(shown)
+}
+
 /// WCAG relative luminance of an sRGB color.
 fn relative_luminance(c: Color32) -> f64 {
     let lin = |v: u8| {
@@ -797,6 +807,16 @@ mod tests {
             let decimals = text.split_once('.').expect("a decimal point").1.len();
             assert_eq!(decimals, 2, "{micro} rendered as {text}");
         }
+    }
+
+    /// A price that rounds to nothing is worse than no price where the price is
+    /// the whole argument, so it comes back as no price.
+    #[test]
+    fn a_figure_under_half_a_cent_is_no_figure() {
+        assert_eq!(microusd_nonzero(0), None);
+        assert_eq!(microusd_nonzero(4_999), None);
+        assert_eq!(microusd_nonzero(5_000).as_deref(), Some("$0.01"));
+        assert_eq!(microusd_nonzero(110_000).as_deref(), Some("$0.11"));
     }
 
     /// `crates/broadcast/src/palette.rs` spells the dark palette a second
