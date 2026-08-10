@@ -45,8 +45,8 @@ use crate::screens::invites::TokenMap;
 mod watch;
 
 use watch::{
-    CUTTING_OUT_COUNT, CUTTING_OUT_WINDOW, DownlinkLoss, EpisodeWatch, HearSelfOffer, PlayoutWatch,
-    ReopenEpisode, RingWatch, STREAM_SETTLED_AFTER, WakeWatch, as_ms,
+    CUTTING_OUT_COUNT, CUTTING_OUT_WINDOW, CushionControl, DownlinkLoss, EpisodeWatch,
+    HearSelfOffer, PlayoutWatch, ReopenEpisode, RingWatch, STREAM_SETTLED_AFTER, WakeWatch, as_ms,
 };
 
 /// The session rate, from the protocol rather than a second copy of 48000:
@@ -125,13 +125,24 @@ fn playout_target(buffer_frames: u32) -> usize {
     playout_cushion_samples(buffer_frames as usize * usize::from(CHANNELS), CHUNK_STEREO)
 }
 
-/// The depth target as time, which is the audio the device drains while the
-/// worker filling it is asleep. The target and not the capacity: the ring is cut
-/// for the deepest cushion the app can ever hold, and what the device actually
-/// finds banked is the depth the loop fills to.
-fn playout_cushion(buffer_frames: u32) -> Duration {
-    let frames = playout_target(buffer_frames) / usize::from(CHANNELS);
+/// A depth target as time, which is the audio the device drains while the
+/// worker filling it is asleep. Takes the target rather than a device size,
+/// because [`CushionControl`] moves the target while the stream stays open and
+/// a deadline read off the device size would stand still under it.
+fn cushion_time(target: usize) -> Duration {
+    let frames = target / usize::from(CHANNELS);
     Duration::from_micros(frames as u64 * 1_000_000 / u64::from(SAMPLE_RATE))
+}
+
+/// The two device terms in the latency figure. The capture buffer is the size
+/// the device negotiated; the playout term is the depth the top-up loop is
+/// filling to as of now, which is what a sample queues behind, so a cushion
+/// that moves moves the figure with it.
+fn device_buffers(device_frames: u32, target: usize) -> DeviceBuffersView {
+    DeviceBuffersView {
+        capture_ms: device_frames as f32 / 48.0,
+        playout_ms: (target / usize::from(CHANNELS)) as f32 / 48.0,
+    }
 }
 
 /// Capture ring capacity in samples: the playout cushion, or
@@ -643,7 +654,7 @@ impl LiveRuntime {
             driver,
             engine: Some(engine),
             device_frames,
-            playout_target: playout_target(device_frames),
+            cushion: CushionControl::new(device_frames),
             rings: RingWatch::new(Instant::now()),
             wake: WakeWatch::new(Instant::now()),
             playout: PlayoutWatch::default(),
@@ -1007,11 +1018,11 @@ struct Worker {
     /// Frames the current ring was sized from: the settings' request, or the
     /// device's own callback size when the device negotiated a bigger one.
     device_frames: u32,
-    /// Samples [`Worker::top_up_playout`] holds in the playout ring, which is
+    /// The depth [`Worker::top_up_playout`] holds the playout ring at, which is
     /// the cushion the device plays out of and the latency it costs. The ring is
-    /// cut for [`PLAYOUT_CUSHION_MAX`] at open, so this is free to move without
-    /// the device.
-    playout_target: usize,
+    /// cut for [`PLAYOUT_CUSHION_MAX`] at open, so this moves without the
+    /// device.
+    cushion: CushionControl,
     /// The bridge counters as the log reports them; nothing else consumes
     /// them, so without this a ring the device outgrows is audible but
     /// invisible.
@@ -1420,7 +1431,10 @@ impl Worker {
                 self.engine = Some(engine);
                 self.opened_at = Some(Instant::now());
                 self.device_frames = device_frames;
-                self.playout_target = playout_target(device_frames);
+                // A fresh ring at a fresh device size: the cushion this one
+                // settled on says nothing about the next one, and the first
+                // window of a stream holds the open itself.
+                self.cushion = CushionControl::new(device_frames);
                 self.rings = RingWatch::new(Instant::now());
                 self.carry_pos = 0;
                 self.carry_len = 0;
@@ -1581,22 +1595,23 @@ impl Worker {
         self.levels.input_rms = inst_rms.max(self.levels.input_rms * LEVEL_DECAY);
     }
 
-    /// Holds the playout ring at [`Worker::playout_target`] samples, which is
-    /// the cushion the device plays out of; the ring itself is cut deeper, so
-    /// that depth is a number and not a device size. The carry holds anything
-    /// the ring refused so no decoded audio is dropped.
+    /// Holds the playout ring at the depth [`CushionControl`] is asking for,
+    /// which is the cushion the device plays out of; the ring itself is cut
+    /// deeper, so that depth is a number and not a device size. The carry holds
+    /// anything the ring refused so no decoded audio is dropped.
     fn top_up_playout(&mut self) {
         let mut inst_peak = 0.0f32;
         let mut inst_sq = 0.0f32;
         let mut n = 0usize;
         let mut took = false;
+        let target = self.cushion.target();
         if let Some(engine) = self.engine.as_mut() {
             loop {
                 if self.carry_pos < self.carry_len {
                     let pushed = fill_playout_to(
                         engine,
                         &self.carry[self.carry_pos..self.carry_len],
-                        self.playout_target,
+                        target,
                     );
                     took |= pushed > 0;
                     self.carry_pos += pushed;
@@ -1665,7 +1680,7 @@ impl Worker {
     /// where a late wakeup delays playout instead of emptying it.
     fn watch_wakeup(&mut self) {
         let cushion = (self.engine.is_some() && matches!(self.driver, Driver::Real { .. }))
-            .then(|| playout_cushion(self.device_frames));
+            .then(|| cushion_time(self.cushion.target()));
         self.wake.observe(Instant::now(), cushion, self.priority);
     }
 
@@ -1677,17 +1692,21 @@ impl Worker {
     /// and the Audio tab read it the way they read connection state: no
     /// stream, no run in progress.
     fn watch_ring_health(&mut self) {
-        let crackling = match self.engine.as_ref() {
-            Some(engine) => self
-                .rings
-                .observe(Instant::now(), engine, self.device_frames),
+        let now = Instant::now();
+        let (crackling, low_at, low) = match self.engine.as_ref() {
+            Some(engine) => (
+                self.rings.observe(now, engine, self.device_frames),
+                self.rings.low_water_at(),
+                self.rings.playout_low_frames(),
+            ),
             // A ring that is gone is not a ring keeping up, and a stale water
-            // mark is what a controller would act on.
+            // mark is what the cushion would act on.
             None => {
                 self.rings.forget();
-                false
+                (false, now, None)
             }
         };
+        self.cushion.observe(low_at, low);
         self.shared.lock().expect("live state").stats.crackling = crackling;
     }
 
@@ -1868,10 +1887,7 @@ impl Worker {
         s.stats.uplink_loss_pct = stats.uplink_loss_pct;
         s.stats.downlink_loss_pct = downlink;
         let convert_ms = s.stats.rate.map_or(0.0, |r| r.added_ms());
-        let device = DeviceBuffersView {
-            capture_ms: self.device_frames as f32 / 48.0,
-            playout_ms: (self.playout_target / usize::from(CHANNELS)) as f32 / 48.0,
-        };
+        let device = device_buffers(self.device_frames, self.cushion.target());
         s.stats.mouth_to_ear_ms = stats
             .rtt_ms_last
             .map(|rtt| mouth_to_ear_ms(rtt, stats.jitter.depth_frames, device, convert_ms));
@@ -2050,6 +2066,7 @@ fn conn_state(state: &ClientState) -> ConnState {
 
 #[cfg(test)]
 mod tests {
+    use super::watch::CUSHION_STEP;
     use super::*;
 
     /// The loop's pace against the audio it moves. Both constants come off
@@ -2097,6 +2114,30 @@ mod tests {
             "a converted direction costs its disclosed figure and nothing else"
         );
     }
+
+    /// The figure a musician reads is the depth the loop fills to, so a cushion
+    /// that moves moves it, live: the term follows the target and nothing else
+    /// in the sum does.
+    #[test]
+    fn the_latency_figure_follows_the_cushion_that_is_held() {
+        const FRAMES: u32 = 120;
+        let floor = playout_target(FRAMES);
+        let base = device_buffers(FRAMES, floor);
+        let deeper = device_buffers(FRAMES, floor + CUSHION_STEP);
+        let step_ms = as_ms(TICK) as f32;
+
+        assert_eq!(
+            base.capture_ms, deeper.capture_ms,
+            "the capture buffer is the device's and the cushion is not"
+        );
+        assert_eq!(deeper.playout_ms - base.playout_ms, step_ms);
+        assert_eq!(
+            mouth_to_ear_ms(45.0, 3, deeper, 0.0) - mouth_to_ear_ms(45.0, 3, base, 0.0),
+            step_ms,
+            "the headline figure moved by the frame the cushion moved and nothing else"
+        );
+    }
+
     /// The sizing that matters: the rings must fit the callbacks the
     /// device really delivers, and the request is only a lower bound.
     #[test]
@@ -2417,28 +2458,28 @@ mod tests {
     }
 
     /// The cushion the worker's pacing is judged against is the depth the loop
-    /// fills to, as time, which is two device callbacks of audio. The ring is cut
-    /// deeper than that and the device never finds the difference, so a deadline
-    /// read off the capacity would be one nothing has to meet. A target set from
-    /// what the device negotiated rather than from what was asked for moves the
-    /// deadline with it, and the 480-frame WASAPI shared period is the case that
-    /// matters.
+    /// fills to, as time, which starts at two device callbacks of audio. The ring
+    /// is cut deeper than that and the device never finds the difference, so a
+    /// deadline read off the capacity would be one nothing has to meet. A target
+    /// set from what the device negotiated rather than from what was asked for
+    /// moves the deadline with it, and the 480-frame WASAPI shared period is the
+    /// case that matters.
     #[test]
     fn the_cushion_is_two_device_callbacks_of_audio() {
-        assert_eq!(playout_cushion(120), Duration::from_millis(5));
-        assert_eq!(playout_cushion(480), Duration::from_millis(20));
+        assert_eq!(cushion_time(playout_target(120)), Duration::from_millis(5));
+        assert_eq!(cushion_time(playout_target(480)), Duration::from_millis(20));
         for frames in [0u32, 32, 120, 240, 480, 960] {
             let period = Duration::from_micros(
                 u64::from(frames.max(FRAME_FRAMES as u32)) * 1_000_000 / u64::from(SAMPLE_RATE),
             );
             assert_eq!(
-                playout_cushion(frames),
+                cushion_time(playout_target(frames)),
                 period * 2,
                 "{frames}-frame callbacks against a target of {} samples",
                 playout_target(frames)
             );
             assert!(
-                playout_cushion(frames)
+                cushion_time(playout_target(frames))
                     <= playout_capacity(frames) as u32 * TICK
                         / (FRAME_FRAMES * usize::from(CHANNELS)) as u32,
                 "{frames}-frame callbacks: the cushion cannot outlast the ring holding it"
