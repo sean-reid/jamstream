@@ -46,7 +46,7 @@ mod wasapi_policy;
 #[cfg(target_os = "windows")]
 mod wasapi_backend;
 
-pub use bridge::{CallbackBridge, DeviceSide, EngineSide};
+pub use bridge::{CallbackBridge, DeviceSide, EngineSide, playout_cushion_samples};
 pub use mode::{DeviceMode, active_device_mode};
 pub use priority::{AudioPriority, ThreadPriority};
 pub use rate::{RateOutcome, RateOutcomes};

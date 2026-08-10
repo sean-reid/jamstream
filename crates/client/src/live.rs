@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use data_encoding::HEXLOWER;
 use jamstream_audio_io::{
     AudioBackend, AudioError, AudioPriority, CallbackBridge, DuplexHandler, EngineSide,
-    StreamConfig, StreamHandle, ThreadPriority, WavBackend, WavStream,
+    StreamConfig, StreamHandle, ThreadPriority, WavBackend, WavStream, playout_cushion_samples,
 };
 use jamstream_engine::{JitterBuffer, JitterStats, LossWindow};
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
@@ -203,12 +203,13 @@ fn playout_capacity(buffer_frames: u32) -> usize {
     playout_target(buffer_frames).max(deepest * usize::from(CHANNELS))
 }
 
-/// Playout depth in samples the top-up loop fills to, which is the cushion the
-/// device plays out of: ~2x buffer_frames, with a floor of one 2.5 ms frame of
-/// slack. Every sample of it is latency, which is why it is a target and not
-/// the ring it sits in.
+/// Playout depth in samples [`Worker::top_up_playout`] fills to, which is the
+/// cushion the device plays out of. The depth itself is
+/// [`playout_cushion_samples`], in the crate that owns the ring, because the
+/// latency harness holds the same depth and its figures are this client's only
+/// while the two are one number.
 fn playout_target(buffer_frames: u32) -> usize {
-    2 * buffer_frames.max(FRAME_FRAMES as u32) as usize * usize::from(CHANNELS)
+    playout_cushion_samples(buffer_frames as usize * usize::from(CHANNELS), CHUNK_STEREO)
 }
 
 /// The depth target as time, which is the audio the device drains while the
