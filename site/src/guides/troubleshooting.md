@@ -62,13 +62,14 @@ A change mid-session reopens the stream on the new device without leaving the se
 | "no devices found" in a picker | The platform reported nothing for that direction | Check the interface is connected and visible to other apps, then Rescan |
 | Selected device disappears mid-session | A rescan found the device gone | The picker falls back to System default and says so under the pickers |
 | A device pick does not take | The device refused to open | The pick stays selected, the app retries every half second, and the device's own reason sits under the pickers until an open succeeds; pick another device to get sound back sooner |
+| Sound stops, and a **no audio** tag appears beside the latency number | The stream stopped and is being reopened, or was reopened six times without staying open | The Audio tab says which; once it says the device did not stay open, nothing more is tried until you pick a device there |
 | Other apps go silent while you play (Windows) | Exclusive mode holds the device alone for the lowest latency | Untick "Allow exclusive access" under Devices to share the device, at the 10 to 20 ms shared-mode cost |
 
 Sessions run at 48 kHz, and JamStream carries a device at any other rate automatically:
 
-- A device that can run at 48 kHz is opened there. On macOS that moves the device's own clock, and chat says so ("moved the capture device to 48 kHz (was 44.1)").
-- A device that cannot plays anyway through JamStream's converter: a tag beside the latency number names both rates, chat notes the conversion once, and its few milliseconds are counted in the mouth-to-ear figure.
-- The worked example is BlackHole held at 44.1 kHz by GarageBand: joining moves BlackHole to 48 kHz and GarageBand keeps playing, because macOS resamples app output to the device's rate. If GarageBand takes the clock back mid-session, JamStream does not fight it: it stops touching that device's clock, converts instead, and says so in one line.
+- A device that can run at 48 kHz is opened there. On macOS that moves the device's own clock, and a note under the pickers says so ("moved the capture device to 48 kHz (was 44.1)").
+- A device that cannot plays anyway through JamStream's converter: a tag beside the latency number names both rates, a note under the pickers names the conversion, and its few milliseconds are counted in the mouth-to-ear figure.
+- The worked example is BlackHole held at 44.1 kHz by GarageBand: joining moves BlackHole to 48 kHz and GarageBand keeps playing, because macOS resamples app output to the device's rate. If GarageBand takes the clock back mid-session, JamStream does not fight it: it stops touching that device's clock and converts instead, which both the tag and the note change to say.
 
 The conversion is free to ignore. To shave its ~3 ms per direction, set the device to 48 kHz yourself:
 
