@@ -10,11 +10,19 @@
 //! the next 2.5 ms poll boundary; each jitter buffer holds `target` frames
 //! where target = round(3 * jitter_ewma) + 1 (see engine::jitter), and on a
 //! clean link a frame arrives and is consumed in the same tick, so a steady
-//! buffer contributes ~0 extra; the server mixes in the arrival tick.
+//! buffer contributes ~0 extra; the server mixes in the arrival tick; and the
+//! listener's playout ring holds two device callbacks, 5 ms at the 120-frame
+//! default, which every sample queues behind before the device plays it.
+//!
+//! What the gates below cover is capture to our own last buffer. The playout
+//! cushion is the final stage this side can see; whatever the sound card holds
+//! after the callback is not knowable from here and is in none of these
+//! numbers.
 
 use std::time::Instant;
 
 use jamstream_engine::JitterStats;
+use jamstream_harness::scenario::DEVICE_FRAMES;
 use jamstream_harness::{ScenarioBuilder, Source, profiles};
 use jamstream_session::{ClientState, MAX_LISTENERS, MAX_MUSICIANS, ServerEvent};
 
@@ -24,13 +32,20 @@ fn median(mut v: Vec<f32>) -> f32 {
     v[v.len() / 2]
 }
 
-/// Two musicians, member 0 emitting one impulse per 200 ms (9600 samples).
-/// Returns the median mouth-to-ear latency measured at member 1 over 8 s of
-/// virtual time after a 2 s settle.
 fn median_latency_ms(profile_name: &str, seed: u64) -> f32 {
+    median_latency_with_device(profile_name, seed, DEVICE_FRAMES).0
+}
+
+/// Two musicians, member 0 emitting one impulse per 200 ms (9600 samples) and
+/// both playing out through a device that calls back for `device_frames` frames
+/// at a time. Returns the median mouth-to-ear latency measured at member 1 over
+/// 8 s of virtual time after a 2 s settle, and the depth its jitter buffer
+/// settled on, which is the other term that moves with the callback size.
+fn median_latency_with_device(profile_name: &str, seed: u64, device_frames: u32) -> (f32, usize) {
     let mut s = ScenarioBuilder::new(seed)
         .profile(profiles::profile(profile_name))
         .musicians(2)
+        .device_frames(device_frames)
         .source(
             0,
             Source::ImpulseTrain {
@@ -48,15 +63,22 @@ fn median_latency_ms(profile_name: &str, seed: u64) -> f32 {
         "{profile_name}: expected ~40 impulses in 8 s, detected {}",
         latencies.len()
     );
-    median(latencies)
+    // Silence a starved device invents is latency the figures below would
+    // carry without the cushion being the reason for it.
+    assert_eq!(
+        s.playout_underruns(1),
+        0,
+        "{profile_name}: listener's playout ring ran dry"
+    );
+    (median(latencies), s.client_jitter(1).target_frames)
 }
 
 // lan-fiber: one-way 0.5 ms, jitter 0.05 ms.
 // Floor: capture frame 2.5 + uplink ceil(0.5/2.5)*2.5 = 2.5 + server buffer
 // ~0 (clean link, target 1, consumed on arrival) + mix in arrival tick +
-// downlink 2.5 + client buffer ~0 = ~5 ms expected. Physical floor 2*0.5 =
-// 1 ms. Product gate for LAN: 15 ms, leaving ~10 ms of margin for buffer
-// adaptation regressions.
+// downlink 2.5 + client buffer ~0 + playout cushion 5 = ~10 ms expected,
+// measured 14.67. Physical floor 2*0.5 = 1 ms. Product gate for LAN: 15 ms,
+// which the cushion leaves 0.33 ms of.
 #[test]
 fn latency_lan_fiber() {
     let m = median_latency_ms("lan-fiber", 0xA1);
@@ -73,8 +95,10 @@ fn latency_lan_fiber() {
 
 // regional-fiber: one-way 6 ms, jitter 0.5 ms.
 // Floor: capture 2.5 + uplink ceil(6.75/2.5)*2.5 = 7.5 + server buffer ~0 +
-// downlink 7.5 + client buffer ~0 = ~17.5 ms expected. Physical floor 12 ms.
-// Gate 30 ms: the product promise (sub-30 ms same-region mouth-to-ear).
+// downlink 7.5 + client buffer ~0 + playout cushion 5 = ~22.5 ms expected,
+// measured 24.31. Physical floor 12 ms. Gate 30 ms: the product promise
+// (sub-30 ms same-region mouth-to-ear), and the cushion is the last stage this
+// side of the sound card, so the gate now covers the whole of it.
 #[test]
 fn latency_regional_fiber() {
     let m = median_latency_ms("regional-fiber", 0xA2);
@@ -92,8 +116,10 @@ fn latency_regional_fiber() {
 // dsl-cross-country: one-way 22.5 ms, jitter 2.5 ms.
 // Floor: capture 2.5 + uplink ceil((22.5+j)/2.5)*2.5 = 25..27.5 + server
 // buffer ~0..5 (jitter straddles tick boundaries, target 1-2) + downlink
-// 25..27.5 + client buffer ~0..5 = ~52.5-65 ms expected. Physical floor
-// 45 ms. Gate 65 ms.
+// 25..27.5 + client buffer ~0..5 + playout cushion 5 = ~57.5-70 ms expected,
+// measured 69.75. Physical floor 45 ms. Gate 65 ms, which the cushion breaks:
+// the path was already 64.75 ms to the engine boundary, so this profile cannot
+// meet 65 ms with a device on the end of it.
 #[test]
 fn latency_dsl() {
     let m = median_latency_ms("dsl-cross-country", 0xA3);
@@ -106,6 +132,57 @@ fn latency_dsl() {
         m <= 65.0,
         "dsl-cross-country median mouth-to-ear {m:.2} ms exceeds the 65 ms gate"
     );
+}
+
+// The device stage is in the three numbers above.
+//
+// Playout runs through the client's own ring, and the depth the top-up loop
+// holds is two device callbacks, so the callback size sets the cushion: 5 ms at
+// the 120-frame default, 10 ms at 240, 20 ms at 480. A measurement that stopped
+// at the engine boundary would read one number for all of them, so a bigger
+// callback costing at least its extra cushion is what says the device stage is
+// in there.
+//
+// It costs more than the cushion once a callback outlasts the 2.5 ms master
+// tick, and the second assertion is where that cost is accounted for rather
+// than waved at. The worker tops the ring up on the tick and the device drains
+// it on its own clock, so a 240-frame callback takes two frames out of the
+// engine at once and a 480-frame one takes four; pulled in bursts, the
+// listener's jitter buffer settles deeper, and every frame of that depth is
+// latency too.
+//
+// Measured on lan-fiber, seed 0xA7: 14.67 ms at 120 frames with a 1-frame
+// buffer, 27.17 at 240 with 4, 39.67 at 480 with 6. Both tolerances are one
+// frame, since the buffer depth is read at the end of the run and the median is
+// over the whole of it.
+#[test]
+fn playout_cushion_is_in_the_latency() {
+    const FRAME_MS: f32 = 2.5;
+    let (base, base_depth) = median_latency_with_device("lan-fiber", 0xA7, DEVICE_FRAMES);
+    println!("lan-fiber at {DEVICE_FRAMES}-frame callbacks: {base:.2} ms, buffer {base_depth}");
+    for frames in [2 * DEVICE_FRAMES, 4 * DEVICE_FRAMES] {
+        let (m, depth) = median_latency_with_device("lan-fiber", 0xA7, frames);
+        let cushion_ms = 2.0 * (frames - DEVICE_FRAMES) as f32 / 48.0;
+        let buffer_ms = (depth - base_depth) as f32 * FRAME_MS;
+        println!(
+            "lan-fiber at {frames}-frame callbacks: {m:.2} ms, buffer {depth}, against \
+             {base:.2} ms and {base_depth} at {DEVICE_FRAMES}"
+        );
+        assert!(
+            m - base >= cushion_ms - FRAME_MS,
+            "a {frames}-frame callback holds {cushion_ms:.2} ms more cushion than a \
+             {DEVICE_FRAMES}-frame one and mouth-to-ear moved by {:.2} ms ({m:.2} against \
+             {base:.2}); the device stage is not in the measurement",
+            m - base
+        );
+        assert!(
+            m - base <= cushion_ms + buffer_ms + FRAME_MS,
+            "a {frames}-frame callback moved mouth-to-ear by {:.2} ms ({m:.2} against \
+             {base:.2}), more than its {cushion_ms:.2} ms of extra cushion and the \
+             {buffer_ms:.2} ms the listener's buffer grew by",
+            m - base
+        );
+    }
 }
 
 // hostile-wifi: 20 ms RTT, 7.5 ms jitter with 20 ms reorder spikes, 2% loss.
@@ -1045,12 +1122,11 @@ fn capacity_latency_ms(profile_name: &str, seed: u64) -> f32 {
 
 // Same three profiles and the same product gates as the two-musician runs
 // above, on a full room, plus the one those gates cannot be. Latency is set
-// by the tick schedule and the wire, not by how many people are in the
-// session, so the capacity median and the two-musician median are the same
-// number: 9.67 / 19.31 / 64.75 ms, and the same on either seed. The product
-// gates sit 5 to 20 ms above that, which is room enough for the whole
-// regression this test exists to catch, so the gate is the difference between
-// the two rooms rather than the band.
+// by the tick schedule, the wire and the playout cushion, not by how many
+// people are in the session, so the capacity median and the two-musician
+// median are the same number: 14.67 / 24.31 / 69.75 ms, and the same on either
+// seed. The gate that this test alone can hold is the difference between the
+// two rooms rather than the band.
 #[test]
 fn latency_at_capacity() {
     // A tenth of a tick. The two rooms come out bit-identical today and the
