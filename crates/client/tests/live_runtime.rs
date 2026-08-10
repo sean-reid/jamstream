@@ -30,6 +30,17 @@ const RATE: u32 = 48_000;
 /// the loudest failure, so it answers only the question it is asked.
 const TONE_FLOOR: f64 = 100.0;
 
+/// Uplink loss a buffer change may leave behind, as a percentage the server
+/// reports over a one second window. Ten readings on this macOS box sat between
+/// 0 and 1.4 either side of the swap. The fault this defends against reads 100
+/// and stays there, so the ceiling only has to clear ordinary noise.
+const SWAP_LOSS_CEILING: f32 = 5.0;
+/// Allowed on top of whatever the machine already reported before the swap. A
+/// Windows runner has been seen holding its own figure above the ceiling for
+/// twenty seconds, so the comparison is against that machine rather than against
+/// a number picked here.
+const SWAP_LOSS_MARGIN: f32 = 5.0;
+
 /// Held for as long as any test in this binary has a session running, shared by
 /// all of them but one, and taken exclusively by the test whose subject is the
 /// log file.
@@ -996,12 +1007,9 @@ fn leave_tears_down_and_shrinks_the_roster() {
     });
 }
 
-/// Parked, not deleted: this fails about one run in four on Linux and it is
-/// failing for the right reason, which is #523. A buffer swap costs the swapper
-/// their uplink and the far side hears nothing more from them. Run it with
-/// `cargo nextest run -p jamstream-client -E 'test(a_buffer_swap_keeps)'
-/// --run-ignored all` and expect the tone profile to go to zero at the swap.
-/// It goes back in the suite with the fix.
+/// Changing your own buffer size must not cost you your uplink. The far side is
+/// the judge, because the swapper hears themselves either way and the person who
+/// stops being heard is the last to know.
 #[test]
 fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     let server = TestServer::start();
@@ -1044,22 +1052,26 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     std::thread::sleep(Duration::from_millis(3_500));
 
     // B's own snapshot carries the server's opinion of B's uplink, the field
-    // that read 100 percent on a real machine. The gate here is the audio: A
-    // has to still hear B. The loss figure is printed rather than asserted on,
-    // because the server measures it over a one second window and a runner that
-    // holds its own figure above five percent for twenty seconds after the swap
-    // has been seen, without it being known yet whether that runner reads the
-    // same before the swap. The sharp detector for the fault itself is
-    // `a_capture_gap_on_a_jittery_stream` in the session crate, which fails
-    // every run in under half a second and depends on no wall clock.
+    // that read 100 percent on a real machine. Judged against the same field
+    // read before the swap, because a runner with a loss floor of its own would
+    // otherwise be blamed for what the swap did, and one has been seen holding
+    // its figure above five percent for twenty seconds afterwards. What the
+    // swap must not do is make it worse. The sharp detector for the fault
+    // itself is `a_capture_gap_on_a_jittery_stream` in the session crate, which
+    // fails every run in under half a second and depends on no wall clock.
     let mut readings = Vec::new();
     for _ in 0..10 {
         readings.push(b.snapshot().stats.loss_pct);
         std::thread::sleep(Duration::from_millis(500));
     }
-    eprintln!(
-        "b's uplink read {before}% loss before the swap, then {readings:?} over \
-         the five seconds after it"
+    let worst = readings.iter().copied().fold(0.0f32, f32::max);
+    // The numbers ride on the assertion, because a passing run's output is
+    // captured and thrown away, so a figure printed on the happy path is a
+    // figure nobody can calibrate against.
+    assert!(
+        worst <= before.max(SWAP_LOSS_CEILING) + SWAP_LOSS_MARGIN,
+        "b's uplink read {before}% loss before the buffer change and {worst}% at \
+         its worst across the five seconds after it, from {readings:?}"
     );
 
     a.send(Command::Leave);
