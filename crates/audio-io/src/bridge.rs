@@ -11,7 +11,10 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::types::DuplexHandler;
 
-#[derive(Debug, Default)]
+/// No render callback has run since the low water mark was last taken.
+const NO_LOW_WATER: u64 = u64::MAX;
+
+#[derive(Debug)]
 struct Counters {
     /// Playback callbacks that found fewer samples than they needed and
     /// padded with silence. Counted per callback, not per missing sample.
@@ -19,6 +22,19 @@ struct Counters {
     /// Capture callbacks that could not fit everything into the ring and
     /// dropped the tail. Counted per callback, not per dropped sample.
     overruns: AtomicU64,
+    /// Smallest playout fill in samples any render callback has found since
+    /// the engine side last took it, or [`NO_LOW_WATER`] when none has run.
+    playout_low_water: AtomicU64,
+}
+
+impl Default for Counters {
+    fn default() -> Counters {
+        Counters {
+            underruns: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
+            playout_low_water: AtomicU64::new(NO_LOW_WATER),
+        }
+    }
 }
 
 /// Constructor namespace for the device/engine ring pair.
@@ -66,6 +82,12 @@ fn push_capture(tx: &mut Producer<f32>, counters: &Counters, samples: &[f32]) {
 }
 
 fn pull_playout(rx: &mut Consumer<f32>, counters: &Counters, out: &mut [f32]) {
+    // Measured before the drain, so it is the audio banked when the device
+    // asked. `fetch_min` and not a compare-exchange loop of this function's
+    // own: one read-modify-write, with no retry a render callback sits in.
+    counters
+        .playout_low_water
+        .fetch_min(rx.slots() as u64, Ordering::Relaxed);
     let (_, rest) = rx.pop_partial_slice(out);
     if !rest.is_empty() {
         rest.fill(0.0);
@@ -140,5 +162,25 @@ impl EngineSide {
     #[must_use]
     pub fn overruns(&self) -> u64 {
         self.counters.overruns.load(Ordering::Relaxed)
+    }
+
+    /// Smallest playout fill in samples a render callback found since this was
+    /// last called, and `None` when no callback has run since. Below one
+    /// callback's worth of samples is an underrun, so the distance above it is
+    /// how much cushion the device had left.
+    ///
+    /// Taking the reading resets the window, which is what keeps a single bad
+    /// moment from pinning the figure for the rest of the stream: the caller's
+    /// polling interval is the window, and the callback side stays one atomic.
+    #[must_use]
+    pub fn take_playout_low_water(&self) -> Option<usize> {
+        match self
+            .counters
+            .playout_low_water
+            .swap(NO_LOW_WATER, Ordering::Relaxed)
+        {
+            NO_LOW_WATER => None,
+            samples => Some(samples as usize),
+        }
     }
 }
