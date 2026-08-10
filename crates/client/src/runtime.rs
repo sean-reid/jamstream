@@ -296,6 +296,10 @@ pub struct StatsView {
     /// read like connection state, not like a one-shot event that may
     /// already have scrolled past by the time somebody looks up.
     pub crackling: bool,
+    /// Closest the playout ring came to empty over the last second, in frames.
+    /// The ring's own capacity is the ceiling, and zero means it emptied and
+    /// the device played silence. `None` while no stream is rendering.
+    pub playout_low_frames: Option<usize>,
 }
 
 /// Linear levels in 0..1. dB conversion is the meter widget's job.

@@ -120,6 +120,11 @@ const RING_REPORT_MAX: Duration = Duration::from_secs(60);
 /// latching for the rest of the session.
 const CRACKLE_EPISODE_COUNT: u64 = 3;
 const CRACKLE_EPISODE_WINDOW: Duration = Duration::from_secs(90);
+/// Window the playout low water mark covers. The bridge tracks the minimum
+/// since it was last read and reading resets it, so this is how often it is
+/// read: long enough that a reading spans hundreds of device callbacks, short
+/// enough that one bad moment ages out of it.
+const PLAYOUT_LOW_WINDOW: Duration = Duration::from_secs(1);
 /// Floor under [`playout_stall_after`], so a ring only a frame or two deep does
 /// not read a scheduling hiccup as a device that has stopped rendering.
 const PLAYOUT_STALL_FLOOR: Duration = Duration::from_millis(40);
@@ -311,6 +316,9 @@ struct SharedState {
     /// from the ring's own counters and cleared the tick the run ends, so
     /// the UI reads it like connection state rather than a one-shot line.
     crackling: bool,
+    /// Closest the playout ring came to empty over the last window, in frames,
+    /// as [`RingWatch`] samples it.
+    playout_low_frames: Option<usize>,
 }
 
 impl SharedState {
@@ -348,6 +356,7 @@ impl SharedState {
             device_error: None,
             rate: None,
             crackling: false,
+            playout_low_frames: None,
         }
     }
 
@@ -762,12 +771,22 @@ impl PlayoutWatch {
 /// damage is at the other end of the session, so the log is where it has to be
 /// answerable. Each line carries the count since the last one and how long the
 /// stream has been up, so the shape reads off the timestamps.
+///
+/// It also samples the playout low water mark, which is the same question asked
+/// before the damage instead of after: the counters say the ring ran out, the
+/// water mark says how close it came. That one goes to the snapshot rather than
+/// the log, because a number that moves every second is not a log line.
 struct RingWatch {
     /// When the stream this watches opened; every line is dated from it.
     opened: Instant,
     overruns: CounterWatch,
     underruns: CounterWatch,
     crackling: CrackleEpisode,
+    /// The last closed window's low water mark in frames. `None` means no
+    /// render callback ran inside it.
+    low_water_frames: Option<usize>,
+    /// When the window now filling opened.
+    low_water_from: Instant,
 }
 
 /// One counter's reporting state.
@@ -808,12 +827,21 @@ impl RingWatch {
             overruns: CounterWatch::default(),
             underruns: CounterWatch::default(),
             crackling: CrackleEpisode::default(),
+            low_water_frames: None,
+            low_water_from: opened,
         }
     }
 
     /// One tick's worth of observation, against the ring the counters belong
     /// to. Returns whether the ring is in a crackling run as of this tick.
     fn observe(&mut self, now: Instant, engine: &EngineSide, ring_frames: u32) -> bool {
+        if now.duration_since(self.low_water_from) >= PLAYOUT_LOW_WINDOW {
+            self.low_water_from = now;
+            // The bridge counts interleaved samples; a frame is one per channel.
+            self.low_water_frames = engine
+                .take_playout_low_water()
+                .map(|samples| samples / usize::from(CHANNELS));
+        }
         let up_ms = now.duration_since(self.opened).as_millis();
         let overruns = engine.overruns();
         if let Some(dropped) = self.overruns.due(now, overruns) {
@@ -836,6 +864,17 @@ impl RingWatch {
             );
         }
         self.crackling.observe(now, underruns)
+    }
+
+    /// The last closed window's low water mark, in frames.
+    fn playout_low_frames(&self) -> Option<usize> {
+        self.low_water_frames
+    }
+
+    /// Drops the water mark without waiting for a window to close: the ring it
+    /// was measuring is gone, and the next stream's ring measures its own.
+    fn forget(&mut self) {
+        self.low_water_frames = None;
     }
 }
 
@@ -1134,6 +1173,7 @@ impl LiveRuntime {
                 },
                 rate: s.rate,
                 crackling: s.crackling,
+                playout_low_frames: s.playout_low_frames,
             },
             members,
             chat: s.chat.iter().cloned().collect(),
@@ -1955,7 +1995,12 @@ impl Worker {
             Some(engine) => self
                 .rings
                 .observe(Instant::now(), engine, self.device_frames),
-            None => false,
+            // A ring that is gone is not a ring keeping up, and a stale water
+            // mark is what a controller would act on.
+            None => {
+                self.rings.forget();
+                false
+            }
         };
         self.shared.lock().expect("live state").crackling = crackling;
     }
@@ -2147,6 +2192,7 @@ impl Worker {
                 + convert_ms
         });
         s.levels = self.levels;
+        s.playout_low_frames = self.rings.playout_low_frames();
     }
 
     /// Initial connect only: a timeout on one invite address moves on to
@@ -3201,5 +3247,114 @@ mod tests {
             watch.observe(start + TICK * tick, &engine, 120),
             "a second run of underruns must turn crackling on again"
         );
+    }
+    /// A playout bridge at the client's own ring size, filled the way
+    /// [`Driver::open`] fills it.
+    fn playout_ring(frames: u32) -> (jamstream_audio_io::DeviceSide, EngineSide) {
+        let (device, mut engine) =
+            CallbackBridge::new(capture_capacity(frames), playout_capacity(frames));
+        engine.push_playout(&vec![0.0; playout_capacity(frames)]);
+        (device, engine)
+    }
+
+    /// The steady state: a producer keeping the ring full reads as the whole
+    /// cushion, which is the figure every dip is measured against. In frames,
+    /// so the interleaved stereo capacity reads as half its samples.
+    #[test]
+    fn a_ring_that_is_never_late_reads_as_its_whole_cushion() {
+        const FRAMES: u32 = 120;
+        let start = Instant::now();
+        let (mut device, mut engine) = playout_ring(FRAMES);
+        let mut watch = RingWatch::new(start);
+        let mut out = vec![0.0f32; FRAMES as usize * usize::from(CHANNELS)];
+
+        // A callback per worker tick, topped straight back up, for a window.
+        for tick in 0..=(PLAYOUT_LOW_WINDOW.as_micros() / TICK.as_micros()) as u32 {
+            device.on_playback(&mut out);
+            while engine.push_playout(&out) > 0 {}
+            watch.observe(start + TICK * tick, &engine, FRAMES);
+        }
+
+        assert_eq!(watch.playout_low_frames(), Some(2 * FRAMES as usize));
+        assert_eq!(
+            playout_capacity(FRAMES),
+            2 * FRAMES as usize * usize::from(CHANNELS),
+            "the same cushion in samples is twice the frames"
+        );
+    }
+
+    /// The case underruns cannot see: the ring dipped to a fraction of its
+    /// cushion and served every callback anyway. The reading is in frames, so a
+    /// dip to 30 frames of stereo reads 30 and not the 60 samples it holds.
+    #[test]
+    fn a_dip_short_of_empty_reads_as_the_frames_that_were_left() {
+        const FRAMES: u32 = 120;
+        const LEFT: usize = 30;
+        let start = Instant::now();
+        let (mut device, engine) = playout_ring(FRAMES);
+        let mut watch = RingWatch::new(start);
+
+        // Drain to LEFT frames, then one callback that fits inside them.
+        let mut out = vec![0.0f32; playout_capacity(FRAMES) - LEFT * usize::from(CHANNELS)];
+        device.on_playback(&mut out);
+        device.on_playback(&mut vec![0.0f32; LEFT * usize::from(CHANNELS)]);
+        watch.observe(start + PLAYOUT_LOW_WINDOW, &engine, FRAMES);
+
+        assert_eq!(watch.playout_low_frames(), Some(LEFT));
+        assert_eq!(
+            engine.underruns(),
+            0,
+            "the ring came within {LEFT} frames of empty without running out, which is \
+             the whole point of the reading"
+        );
+    }
+
+    /// Each window reports its own worst moment. A minimum since the stream
+    /// opened would pin the figure to one bad second for the rest of the song,
+    /// so a ring that recovers has to read as recovered.
+    #[test]
+    fn each_window_reports_its_own_worst_moment() {
+        const FRAMES: u32 = 120;
+        let start = Instant::now();
+        let (mut device, mut engine) = playout_ring(FRAMES);
+        let mut watch = RingWatch::new(start);
+        let callback = FRAMES as usize * usize::from(CHANNELS);
+
+        // A window that dips: two callbacks with no top-up between them.
+        let mut out = vec![0.0f32; callback];
+        device.on_playback(&mut out);
+        device.on_playback(&mut out);
+        while engine.push_playout(&out) > 0 {}
+        watch.observe(start + PLAYOUT_LOW_WINDOW, &engine, FRAMES);
+        assert_eq!(watch.playout_low_frames(), Some(FRAMES as usize));
+
+        // A window that keeps up.
+        device.on_playback(&mut out);
+        while engine.push_playout(&out) > 0 {}
+        watch.observe(start + PLAYOUT_LOW_WINDOW * 2, &engine, FRAMES);
+        assert_eq!(watch.playout_low_frames(), Some(2 * FRAMES as usize));
+    }
+
+    /// A window with no render callback in it has no reading at all rather than
+    /// the last one's: a device that has stopped rendering is not a ring that is
+    /// keeping up, and a stale figure is what a controller would act on.
+    #[test]
+    fn a_window_without_a_callback_has_no_reading() {
+        const FRAMES: u32 = 120;
+        let start = Instant::now();
+        let (mut device, engine) = playout_ring(FRAMES);
+        let mut watch = RingWatch::new(start);
+
+        assert_eq!(
+            watch.playout_low_frames(),
+            None,
+            "the first window has not closed yet"
+        );
+        device.on_playback(&mut vec![0.0f32; FRAMES as usize * usize::from(CHANNELS)]);
+        watch.observe(start + PLAYOUT_LOW_WINDOW, &engine, FRAMES);
+        assert!(watch.playout_low_frames().is_some());
+
+        watch.observe(start + PLAYOUT_LOW_WINDOW * 2, &engine, FRAMES);
+        assert_eq!(watch.playout_low_frames(), None);
     }
 }

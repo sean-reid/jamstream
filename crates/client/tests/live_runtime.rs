@@ -613,6 +613,35 @@ fn join_reaches_joined_and_stats_populate() {
     assert!(snap.stats.mouth_to_ear_ms.is_some());
 }
 
+/// The playout low water mark, end to end: the render callback measures the
+/// fill, the worker samples it once a window, and it lands on the snapshot in
+/// frames. Nothing between them is faked, which is the only way this reads a
+/// real ring rather than a number the test wrote itself.
+///
+/// The figure is the claim: the cushion is two device buffers of frames, and the
+/// offline driver tops the ring up before every pump, so it reads exactly that.
+/// A reading in samples would be twice it, because the ring is interleaved
+/// stereo.
+#[test]
+fn the_playout_water_mark_lands_on_the_snapshot_in_frames() {
+    let server = TestServer::start();
+    let rt = join_silent(&server, 1, "solo");
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+
+    // The window is a second wide, so the first reading waits for one to close.
+    let snap = wait_for(&rt, "a water mark", Duration::from_secs(10), |s| {
+        s.stats.playout_low_frames.is_some()
+    });
+    let cushion = 2 * settings().buffer_frames as usize;
+    assert_eq!(
+        snap.stats.playout_low_frames,
+        Some(cushion),
+        "a worker that never missed a pump should read the whole {cushion}-frame \
+         cushion; {} would be the interleaved samples and not the frames",
+        cushion * 2
+    );
+}
+
 /// The frame loop asks for the connection state alone rather than pulling a
 /// snapshot to read one field off it (#382), and it leaves the session on
 /// what that answer says, so the two must never disagree: before the join
