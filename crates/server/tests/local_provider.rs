@@ -354,6 +354,102 @@ fn the_isolated_test_binaries_are_named_in_the_nextest_config() {
     );
 }
 
+/// The other direction for the overrides that name tests rather than binaries.
+/// Each suite checks that the config still names what that suite measures, and
+/// no check ran the other way, so an entry in the config was guarded by nobody:
+/// a filter that matches nothing is not an error to nextest, so a rename or a
+/// deletion on the Rust side leaves an override that quietly does nothing.
+///
+/// So every `test(=...)` in the config is resolved against the workspace's own
+/// sources: exactly one test binary declares the function, and the file that
+/// declares it also claims it in the pairing test that suite keeps.
+#[test]
+fn every_test_the_nextest_config_names_is_claimed_by_its_suite() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+    let sources = test_binaries();
+    let named = named_tests(CONFIG);
+    assert!(
+        named.len() > 10,
+        "found only {} named tests in .config/nextest.toml; the parse moved",
+        named.len()
+    );
+    for name in named {
+        let declaring: Vec<&str> = sources
+            .iter()
+            .filter(|(_, _, source)| declares(source, &name))
+            .map(|(_, binary, _)| binary.as_str())
+            .collect();
+        assert_eq!(
+            declaring.len(),
+            1,
+            ".config/nextest.toml names {name}, declared by {declaring:?}; a \
+             filter there is an exact match on one test, so a name with no \
+             function behind it is an override that does nothing"
+        );
+        let (_, binary, source) = sources
+            .iter()
+            .find(|(_, _, source)| declares(source, &name))
+            .expect("just counted one");
+        assert!(
+            claims(source, &name),
+            "{binary} declares {name} and .config/nextest.toml names it, but \
+             nothing in that suite pairs the two, so the next rename can drop \
+             the override without failing anything"
+        );
+    }
+}
+
+/// The exact test names the config's filters select. Comment lines are dropped
+/// first: the prose there explains the `test(=name)` form and would otherwise
+/// read as an entry.
+fn named_tests(config: &str) -> Vec<String> {
+    let filters: String = config
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    let mut names: Vec<String> = filters
+        .split("test(=")
+        .skip(1)
+        .map(|tail| {
+            tail.split(')')
+                .next()
+                .expect("a test( clause closes")
+                .to_owned()
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// True when `source` declares `name` as a top-level test function. rustfmt puts
+/// every item at its block's indentation, so a test function starts a line.
+fn declares(source: &str, name: &str) -> bool {
+    [
+        format!("\nfn {name}("),
+        format!("\nasync fn {name}("),
+        format!("\npub fn {name}("),
+    ]
+    .iter()
+    .any(|decl| source.contains(decl.as_str()))
+}
+
+/// True when `source` pairs `name` with the config the way the measuring suites
+/// do: either a `stringify!` on the identifier or an entry in a `named!` list.
+/// Both read the same identifier the function does, so a rename fails to compile
+/// rather than dropping an override.
+fn claims(source: &str, name: &str) -> bool {
+    if source.contains(&format!("stringify!({name})")) {
+        return true;
+    }
+    source.split("named![").skip(1).any(|tail| {
+        tail.split(']')
+            .next()
+            .is_some_and(|list| list.split(',').any(|entry| entry.trim() == name))
+    })
+}
+
 /// The `[[profile.default.overrides]]` block containing `marker`, panicking
 /// if no block does.
 fn section<'a>(config: &'a str, marker: &str) -> &'a str {
