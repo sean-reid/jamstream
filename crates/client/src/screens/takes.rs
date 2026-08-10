@@ -88,6 +88,10 @@ pub struct TakeFile {
     /// Still being written: a local take that has not been closed yet ends in
     /// `.part`, and nothing may offer it as a finished recording.
     pub partial: bool,
+    /// Here at a size nothing has confirmed. A file found by reading a download
+    /// folder has no listing to be measured against, so it may be a download
+    /// that stopped halfway and nothing may call it whole.
+    pub unchecked: bool,
 }
 
 /// The mix half or the stems half of one take. Kept apart because the decision
@@ -120,11 +124,28 @@ impl Part {
 
     /// The file to show in the file manager: every one of them is in the same
     /// folder, so the first is the one to select.
-    pub fn here(&self) -> Option<&Path> {
+    ///
+    /// Only once the whole part is on this computer. A half-fetched take is one
+    /// a player chokes on, so there is nothing to reveal until the rest of it
+    /// lands.
+    pub fn on_disk(&self) -> Option<&Path> {
         self.files
             .iter()
             .find_map(|f| f.local.as_deref())
-            .filter(|_| self.missing_bytes() == 0)
+            .filter(|_| self.missing_bytes() == 0 && !self.writing())
+    }
+
+    /// The same file, when something has said how big it should be and it is:
+    /// the bucket's own listing for a download, or the recorder closing a local
+    /// take.
+    pub fn here(&self) -> Option<&Path> {
+        self.on_disk().filter(|_| !self.unchecked())
+    }
+
+    /// True when a file of this part is here at a size nothing confirmed, which
+    /// is all a folder read on its own can know.
+    pub fn unchecked(&self) -> bool {
+        self.files.iter().any(|f| f.local.is_some() && f.unchecked)
     }
 
     /// The objects a download would fetch, in the CLI engine's own type.
@@ -211,7 +232,15 @@ impl SessionTakes {
     pub fn downloaded(&self) -> bool {
         self.takes
             .iter()
-            .any(|take| take.mix.here().is_some() || take.stems.here().is_some())
+            .any(|take| take.mix.on_disk().is_some() || take.stems.on_disk().is_some())
+    }
+
+    /// What the card says about the retention rule.
+    pub fn clock(&self) -> Option<Clock> {
+        if self.expired() && self.downloaded() {
+            return Some(Clock::Kept);
+        }
+        self.expires_in_days.map(Clock::Left)
     }
 
     /// The bucket details, for a session that recorded to one.
@@ -242,6 +271,17 @@ impl SessionTakes {
             length(self.secs)
         )
     }
+}
+
+/// What a session's card says about its retention rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clock {
+    /// Days until the rule deletes these takes, negative once the deadline is
+    /// behind.
+    Left(i64),
+    /// The take is on this computer, so the rule has nothing left to take away
+    /// and there is nothing to warn about.
+    Kept,
 }
 
 /// A take file found on this computer.
@@ -290,9 +330,11 @@ pub fn local_takes(dir: &Path) -> Vec<LocalTake> {
 /// the bucket sidecars beside them, and the take files on this disk.
 ///
 /// A session with no bucket and no local file left no take, so it is not here.
-/// Bucket rows arrive empty and are filled in when the listing job answers;
-/// a local session's takes are on this computer already, so they are complete
-/// from the start.
+/// A bucket row starts from its own download folder and the listing job fills
+/// in what the bucket still holds on top of that, because a file on this disk
+/// is a take whether or not the bucket can still be asked about it; a local
+/// session's takes are on this computer already, so they are complete from the
+/// start.
 ///
 /// Local takes are matched to the session that was running when they were
 /// written, because the recorder puts every local take in one folder and the
@@ -327,8 +369,9 @@ pub fn rows_from(
             // A session that recorded nowhere has nothing to show here.
             None => continue,
         };
+        let dir = downloads_dir.join(session.session_id_hex.chars().take(8).collect::<String>());
         let takes = match &place {
-            Place::Bucket(_) => Vec::new(),
+            Place::Bucket(_) => group(folder_files(&dir)),
             Place::Disk(_) => takes_from_disk(&mine),
         };
         let (expires_in_days, unenforced) = expiry(record.as_ref(), session.created_unix, now_unix);
@@ -347,7 +390,7 @@ pub fn rows_from(
             unenforced,
             error: None,
             listing: record.is_some(),
-            dir: downloads_dir.join(session.session_id_hex.chars().take(8).collect::<String>()),
+            dir,
         });
     }
     // Newest session first: the take a musician wants is nearly always from
@@ -356,7 +399,8 @@ pub fn rows_from(
     rows
 }
 
-/// Groups a bucket listing into takes. Called when the listing job answers.
+/// Groups a bucket listing into takes, together with whatever the session's
+/// download folder already holds. Called when the listing job answers.
 pub fn takes_from_objects(objects: &[Take], dir: &Path) -> Result<Vec<TakeRow>, CliError> {
     // The plan is what decides whether a take is already here, and it refuses
     // a key that would land outside the folder before any of this is drawn.
@@ -372,14 +416,46 @@ pub fn takes_from_objects(objects: &[Take], dir: &Path) -> Result<Vec<TakeRow>, 
                 Action::Fetch => None,
             },
             partial: false,
+            unchecked: false,
         });
+    }
+    // The listing is not the only witness to a take. What it does mention is
+    // already accounted for by name, so the folder only adds the files the
+    // bucket no longer has.
+    for file in folder_files(dir) {
+        if !files.iter().any(|listed| listed.name == file.name) {
+            files.push(file);
+        }
     }
     Ok(group(files))
 }
 
+/// The take files in one session's download folder, read from the folder rather
+/// than from a bucket.
+///
+/// A retention rule deletes the objects and leaves the files a download put
+/// here, and from that moment those files are the only copy. The sizes are the
+/// disk's own, with nothing left to measure them against, so every file found
+/// this way is unchecked.
+///
+/// Only names the recorder writes count, through the same reader a local
+/// session's folder goes through: a folder somebody else keeps music in does
+/// not turn that music into takes, and neither does a directory sharing a
+/// take's name.
+fn folder_files(dir: &Path) -> Vec<TakeFile> {
+    let found = local_takes(dir);
+    files_from_local(found.iter(), true)
+}
+
 fn takes_from_disk(local: &[&LocalTake]) -> Vec<TakeRow> {
-    let files = local
-        .iter()
+    group(files_from_local(local.iter().copied(), false))
+}
+
+fn files_from_local<'a>(
+    local: impl Iterator<Item = &'a LocalTake>,
+    unchecked: bool,
+) -> Vec<TakeFile> {
+    local
         .map(|take| {
             let name = take.path.file_name().unwrap_or_default().to_string_lossy();
             TakeFile {
@@ -388,10 +464,10 @@ fn takes_from_disk(local: &[&LocalTake]) -> Vec<TakeRow> {
                 object: None,
                 local: Some(take.path.clone()),
                 partial: name.ends_with(".part"),
+                unchecked,
             }
         })
-        .collect();
-    group(files)
+        .collect()
 }
 
 /// Sorts files into takes by the name they share, mix apart from stems.
@@ -1161,19 +1237,25 @@ fn session_card(
         if let Some(record) = row.record() {
             ui.label(theme::muted(ui, record.bucket.clone()));
         }
-        if let Some(days) = row.expires_in_days {
+        if let Some(clock) = row.clock() {
             let p = theme::palette_of(ui);
-            let text = if days <= 0 {
-                "expires today".to_owned()
-            } else if days == 1 {
-                "expires in 1 day".to_owned()
-            } else {
-                format!("expires in {days} days")
-            };
-            let color = if days <= EXPIRY_SOON_DAYS {
-                theme::danger_ink(p)
-            } else {
-                p.text_muted
+            let (text, color) = match clock {
+                Clock::Kept => ("kept on this computer".to_owned(), p.text_muted),
+                Clock::Left(days) => {
+                    let text = if days <= 0 {
+                        "expires today".to_owned()
+                    } else if days == 1 {
+                        "expires in 1 day".to_owned()
+                    } else {
+                        format!("expires in {days} days")
+                    };
+                    let color = if days <= EXPIRY_SOON_DAYS {
+                        theme::danger_ink(p)
+                    } else {
+                        p.text_muted
+                    };
+                    (text, color)
+                }
             };
             ui.label(RichText::new(text).color(color));
         }
@@ -1276,12 +1358,16 @@ fn part_row(
             ui.label(theme::muted(ui, "still being written"));
             return;
         }
-        match (part.here(), row.record()) {
+        match (part.on_disk(), row.record()) {
             (Some(path), _) => {
                 let path = path.to_owned();
-                let where_it_is = match &row.place {
-                    Place::Disk(_) => "on this computer".to_owned(),
-                    Place::Bucket(_) => format!("saved to {}", row.dir.display()),
+                // Saved is what a download that matched the bucket's own size
+                // did; found is all a folder read can say, and the two have to
+                // read differently because only one of them was measured.
+                let where_it_is = match (&row.place, part.unchecked()) {
+                    (Place::Disk(_), _) => "on this computer".to_owned(),
+                    (Place::Bucket(_), false) => format!("saved to {}", row.dir.display()),
+                    (Place::Bucket(_), true) => format!("found in {}", row.dir.display()),
                 };
                 // Truncated, not wrapped: a long folder must not push the one
                 // button on the row off the edge of the card.
@@ -1488,6 +1574,153 @@ mod tests {
         assert_eq!(expiry(Some(&forever), created, now), (None, None));
         // A local session has no bucket and no rule.
         assert_eq!(expiry(None, created, now), (None, None));
+    }
+
+    /// A scratch music folder with one session's download folder inside it.
+    fn scratch(what: &str) -> (PathBuf, PathBuf) {
+        let music =
+            std::env::temp_dir().join(format!("jamstream-takes-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&music);
+        let folder = music.join("5aed5593");
+        std::fs::create_dir_all(&folder).expect("create the download folder");
+        (music, folder)
+    }
+
+    /// A session a week past a 30 day rule, which is when a bucket really has
+    /// deleted its objects.
+    fn deleted_by_the_rule(music: &Path) -> Vec<SessionTakes> {
+        let created = 1_784_000_000;
+        let sessions = vec![(
+            session(
+                "5aed5593aaaa1111",
+                "digitalocean",
+                created,
+                Some(created + 2_820),
+            ),
+            Some(record(Some(RetentionApplied::ServerSide))),
+        )];
+        rows_from(
+            &sessions,
+            &[],
+            Path::new("/nowhere"),
+            music,
+            created + 37 * 86_400,
+        )
+    }
+
+    /// The case the expiry rule was written for: the objects are gone, the mix
+    /// is on this computer, and the row that reveals it has to survive a listing
+    /// that comes back empty.
+    #[test]
+    fn a_take_the_bucket_deleted_is_still_reachable_on_disk() {
+        let (music, folder) = scratch("deleted");
+        let mix = folder.join("jamstream-2026-07-29-1658-mix.flac");
+        std::fs::write(&mix, vec![7u8; 4_096]).expect("write the mix");
+
+        let mut rows = deleted_by_the_rule(&music);
+        let row = &mut rows[0];
+        assert!(row.expired(), "a week past the deadline");
+        assert!(row.downloaded(), "the row knows its own folder");
+        // And it still does once the listing job answers with what the rule
+        // left in the bucket, which is nothing.
+        row.takes = takes_from_objects(&[], &row.dir).expect("an empty listing");
+        assert_eq!(row.takes.len(), 1, "the folder holds one take");
+        let take = &row.takes[0];
+        assert_eq!(take.at(), "16:58 UTC");
+        assert_eq!(take.mix.bytes(), 4_096);
+        assert_eq!(take.mix.on_disk(), Some(mix.as_path()));
+        assert!(take.stems.files.is_empty());
+        assert!(row.downloaded(), "the mix is in this session's folder");
+        // The screen's own rule for what stays on screen.
+        assert!(!row.expired() || row.downloaded());
+        // And the card says where the take lives rather than counting down to a
+        // deletion that has already happened.
+        assert_eq!(row.clock(), Some(Clock::Kept));
+        std::fs::remove_dir_all(&music).expect("clean up");
+    }
+
+    /// Reading a folder says a file is here, never that it is whole: nothing
+    /// left in the bucket says how big it should have been.
+    #[test]
+    fn a_file_the_folder_alone_found_is_not_called_whole() {
+        let (music, folder) = scratch("unchecked");
+        let mix = folder.join("jamstream-2026-07-29-1658-mix.flac");
+        std::fs::write(&mix, vec![7u8; 4_096]).expect("write the mix");
+        let takes = takes_from_objects(&[], &folder).expect("read the folder");
+        let part = &takes[0].mix;
+        assert!(part.unchecked(), "nothing measured this file");
+        assert_eq!(part.here(), None, "a size nothing confirmed is not whole");
+        assert_eq!(
+            part.on_disk(),
+            Some(mix.as_path()),
+            "it is still revealable"
+        );
+
+        // A file still being written is not offered at all, whatever it is
+        // called.
+        std::fs::remove_file(&mix).expect("remove");
+        std::fs::write(format!("{}.part", mix.display()), b"ab").expect("write a part file");
+        let takes = takes_from_objects(&[], &folder).expect("read the folder");
+        let part = &takes[0].mix;
+        assert!(part.writing(), "a .part file is not a take yet");
+        assert_eq!(
+            part.on_disk(),
+            None,
+            "nothing to reveal while it is written"
+        );
+        assert_eq!(part.here(), None);
+        std::fs::remove_dir_all(&music).expect("clean up");
+    }
+
+    /// A listing and a folder that both know the same take produce one row for
+    /// it, and the file the bucket still lists is the measured one.
+    #[test]
+    fn a_take_both_the_bucket_and_the_disk_know_is_listed_once() {
+        let (music, folder) = scratch("both");
+        let mix = object("jamstream-2026-07-29-1658-mix.flac", 4_096);
+        let stem = object("jamstream-2026-07-29-1658-Ana.flac", 9_000);
+        std::fs::write(folder.join(&mix.name), vec![7u8; 4_096]).expect("write the mix");
+        // From an earlier session's download, and no longer in the bucket.
+        let older = folder.join("jamstream-2026-07-29-1102-mix.flac");
+        std::fs::write(&older, vec![7u8; 512]).expect("write the older mix");
+
+        let takes = takes_from_objects(&[mix.clone(), stem], &folder).expect("group");
+        assert_eq!(takes.len(), 2, "two takes, newest first");
+        assert_eq!(takes[0].base, "jamstream-2026-07-29-1658");
+        assert_eq!(takes[0].mix.files.len(), 1, "the mix is not counted twice");
+        assert_eq!(
+            takes[0].mix.here(),
+            Some(folder.join(&mix.name).as_path()),
+            "the bucket's own size measured this one"
+        );
+        // The stem is still only in the bucket, so nothing about this half is
+        // revealable however much of the mix is here.
+        assert_eq!(takes[0].stems.missing_bytes(), 9_000);
+        assert_eq!(takes[0].stems.on_disk(), None);
+        assert_eq!(takes[1].mix.on_disk(), Some(older.as_path()));
+        assert!(takes[1].mix.unchecked());
+        std::fs::remove_dir_all(&music).expect("clean up");
+    }
+
+    /// The folder is a folder on a musician's computer, so what is in it is not
+    /// a take just because it is there. Reading it directly goes around the
+    /// plan's own refusal, and this is the discipline that replaces it.
+    #[test]
+    fn a_stray_file_in_the_download_folder_is_not_a_take() {
+        let (music, folder) = scratch("stray");
+        std::fs::write(folder.join("notes.txt"), b"chords").expect("write");
+        std::fs::write(folder.join("mix.flac"), b"someone else's mix").expect("write");
+        std::fs::create_dir(folder.join("jamstream-2026-07-29-1658-mix.flac")).expect("mkdir");
+        assert!(
+            takes_from_objects(&[], &folder)
+                .expect("read the folder")
+                .is_empty(),
+            "only names the recorder writes are takes, and only files"
+        );
+        let rows = deleted_by_the_rule(&music);
+        assert!(rows[0].takes.is_empty());
+        assert!(!rows[0].downloaded());
+        std::fs::remove_dir_all(&music).expect("clean up");
     }
 
     /// The rows are built from what this machine knows: a bucket sidecar, or a
