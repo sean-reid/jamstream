@@ -587,12 +587,21 @@ const CUSHION_QUIET: Duration = CRACKLE_EPISODE_WINDOW;
 /// and that size would have bought a device callback twice as long, which the
 /// platform schedules better and which asks this loop for half as many wakeups.
 /// A machine still drying out there wants the buffer control, not a deeper ring.
+///
+/// Somebody who knows their machine can turn the whole of that off, which pins
+/// the depth at the floor: the buffer size is then the latency, exactly. A ring
+/// still coming close to empty at a pinned depth is reported rather than
+/// covered, because covering it is the thing that was turned off.
 pub(super) struct CushionControl {
     /// Depth the loop fills to, in interleaved samples.
     target: usize,
     /// The base cushion, which is the shallowest this ever asks for.
     floor: usize,
     ceiling: usize,
+    /// Whether the depth may move. False holds it at the floor, so the only
+    /// reading that changes anything is the one that says the floor is not
+    /// enough.
+    auto: bool,
     /// One device callback in interleaved samples, which is what one drain
     /// takes out of the ring.
     callback: usize,
@@ -607,14 +616,14 @@ pub(super) struct CushionControl {
     /// When the run of readings deep enough to give a frame back began; None
     /// whenever one broke it.
     quiet_since: Option<Instant>,
-    /// Whether the depth is at its ceiling with the ring still coming close to
-    /// empty, which is the state the Audio tab offers a longer device callback
-    /// from. Also what keeps the same warning to one line per run of it.
+    /// Whether the depth has nowhere left to go with the ring still coming close
+    /// to empty, which is the state the Audio tab acts from. Also what keeps the
+    /// same warning to one line per run of it.
     out_of_room: bool,
 }
 
 impl CushionControl {
-    pub(super) fn new(device_frames: u32) -> CushionControl {
+    pub(super) fn new(device_frames: u32, auto: bool) -> CushionControl {
         let floor = playout_target(device_frames);
         CushionControl {
             target: floor,
@@ -623,12 +632,32 @@ impl CushionControl {
             // PLAYOUT_CUSHION_MAX, so a device whose own period is past that
             // ceiling has no room and starts at it.
             ceiling: (2 * floor).min(playout_capacity(device_frames)),
+            auto,
             callback: device_frames as usize * usize::from(CHANNELS),
             read_at: None,
             catching_up: true,
             quiet_since: None,
             out_of_room: false,
         }
+    }
+
+    /// Frees the depth to move, or pins it at the floor.
+    ///
+    /// Pinning takes effect on this call rather than at the next stream: the
+    /// depth is latency somebody just asked to stop paying, and the ring drains
+    /// to the shallower target over the next few callbacks without a sample
+    /// being discarded or the device being reopened.
+    pub(super) fn set_auto(&mut self, auto: bool) {
+        if self.auto == auto {
+            return;
+        }
+        self.auto = auto;
+        self.target = self.floor;
+        self.quiet_since = None;
+        self.out_of_room = false;
+        // The window this lands in straddles two depths, so it is evidence
+        // about neither.
+        self.catching_up = true;
     }
 
     /// The depth [`Worker::top_up_playout`](super::Worker::top_up_playout)
@@ -646,6 +675,7 @@ impl CushionControl {
             base_frames: frames(self.floor),
             callback_frames: frames(self.callback),
             out_of_room: self.out_of_room,
+            auto: self.auto,
         }
     }
 
@@ -694,17 +724,8 @@ impl CushionControl {
     /// One frame deeper, or the line that says a deeper ring is the wrong
     /// answer now.
     fn grow(&mut self, low: usize) {
-        if self.target >= self.ceiling {
-            if !self.out_of_room {
-                self.out_of_room = true;
-                tracing::warn!(
-                    cushion_ms = as_ms(cushion_time(self.target)),
-                    low_frames = low / usize::from(CHANNELS),
-                    callback_frames = self.callback / usize::from(CHANNELS),
-                    "the playout ring keeps running close to empty at the deepest cushion \
-                     this buffer size allows; the device wants a bigger one"
-                );
-            }
+        if !self.auto || self.target >= self.ceiling {
+            self.report_out_of_room(low);
             return;
         }
         self.target = (self.target + CUSHION_STEP).min(self.ceiling);
@@ -743,6 +764,37 @@ impl CushionControl {
             quiet_ms = at.duration_since(since).as_millis(),
             "the playout ring has been keeping up; the cushion gave a frame back"
         );
+    }
+
+    /// The one line a depth with nowhere to go writes, once per run of it. Two
+    /// wordings, because the two things that stop a depth moving want two
+    /// different answers: a ceiling wants a longer device callback, and a pin
+    /// wants the box that set it.
+    fn report_out_of_room(&mut self, low: usize) {
+        if self.out_of_room {
+            return;
+        }
+        self.out_of_room = true;
+        let cushion_ms = as_ms(cushion_time(self.target));
+        let low_frames = low / usize::from(CHANNELS);
+        let callback_frames = self.callback / usize::from(CHANNELS);
+        if self.auto {
+            tracing::warn!(
+                cushion_ms,
+                low_frames,
+                callback_frames,
+                "the playout ring keeps running close to empty at the deepest cushion \
+                 this buffer size allows; the device wants a bigger one"
+            );
+        } else {
+            tracing::warn!(
+                cushion_ms,
+                low_frames,
+                callback_frames,
+                "the playout ring keeps running close to empty at a pinned cushion; \
+                 adjusting it automatically is what would deepen it"
+            );
+        }
     }
 }
 
@@ -1921,7 +1973,7 @@ mod tests {
                 out: Vec::new(),
                 silence: vec![0.0; playout_capacity(frames)],
                 rings: RingWatch::new(start),
-                cushion: CushionControl::new(frames),
+                cushion: CushionControl::new(frames, true),
                 at: start,
                 record: RecordView::default(),
                 stream: Vec::new(),
@@ -2208,6 +2260,91 @@ mod tests {
         }
     }
 
+    /// The box unticked: the depth stays at what the buffer size asks for
+    /// however far the ring runs down, and the reading that would have deepened
+    /// it says so once instead, because a machine that cannot feed its device at
+    /// the pick is worth knowing about even from somebody who asked for the pick.
+    ///
+    /// The teeth are the second rig: the same stall on the same clock grows the
+    /// depth with the box ticked, so what holds it here is the pin and not a
+    /// fixture nothing goes wrong in.
+    #[test]
+    fn a_pinned_cushion_stays_at_the_floor_and_still_says_the_ring_runs_dry() {
+        const FRAMES: u32 = 120;
+        let floor = playout_target(FRAMES);
+        let mut pinned = CushionRig::new(FRAMES, Instant::now());
+        pinned.cushion.set_auto(false);
+        let lines = captured(|| pinned.run(8, 3));
+
+        assert_eq!(
+            pinned.cushion.target(),
+            floor,
+            "a pinned depth moved for a machine that asked for the pick and nothing else"
+        );
+        let view = pinned.cushion.view();
+        assert!(
+            !view.auto,
+            "the tab has to be able to say which state this is"
+        );
+        assert!(
+            view.out_of_room,
+            "a pinned depth the ring keeps outrunning has to reach the tab"
+        );
+        let said: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("at a pinned cushion"))
+            .collect();
+        assert_eq!(said.len(), 1, "one line per run of it: {lines:#?}");
+        assert!(said[0].contains("WARN"), "{}", said[0]);
+        assert!(
+            !lines.iter().any(|l| l.contains("wants a bigger one")),
+            "a pinned depth never ran out of room to grow, so nothing may ask for a \
+             reopen on those grounds: {lines:#?}"
+        );
+
+        let mut free = CushionRig::new(FRAMES, Instant::now());
+        free.run(8, 3);
+        assert!(
+            free.cushion.target() > floor,
+            "the fixture's stall grows nothing, so the pin holds nothing"
+        );
+    }
+
+    /// Unticking the box hands a deepened cushion back on the click rather than
+    /// at the next stream: it is latency somebody just asked to stop paying, and
+    /// the ring drains to the shallower target with no device touched. Ticking it
+    /// again puts the same machine back on the depth it needs.
+    #[test]
+    fn the_box_hands_a_deepened_cushion_back_at_once_and_lets_it_return() {
+        const FRAMES: u32 = 120;
+        let floor = playout_target(FRAMES);
+        let mut rig = CushionRig::new(FRAMES, Instant::now());
+        rig.run(8, 3);
+        let grown = rig.cushion.target();
+        assert!(grown > floor, "the stall grew nothing to hand back");
+
+        rig.cushion.set_auto(false);
+        assert_eq!(
+            rig.cushion.target(),
+            floor,
+            "the depth waited for the next stream instead of the click"
+        );
+        rig.run(8, 3);
+        assert_eq!(
+            rig.cushion.target(),
+            floor,
+            "the same stall that grew this depth moved it again while pinned"
+        );
+
+        rig.cushion.set_auto(true);
+        rig.run(16, 3);
+        assert_eq!(
+            rig.cushion.target(),
+            grown,
+            "the depth this machine needs did not come back once it was allowed to"
+        );
+    }
+
     /// The bounds, at every buffer the Audio tab offers and at negotiated periods
     /// either side of them. The floor is what a machine keeping up pays today.
     /// The ceiling is one buffer size of latency above it and never deeper than
@@ -2215,7 +2352,7 @@ mod tests {
     #[test]
     fn the_cushion_bounds_cost_one_buffer_size_and_fit_the_ring() {
         for frames in [0u32, 32, 120, 240, 480, 960, 2_400] {
-            let control = CushionControl::new(frames);
+            let control = CushionControl::new(frames, true);
             assert_eq!(
                 control.target(),
                 playout_target(frames),
@@ -2234,7 +2371,7 @@ mod tests {
             );
         }
         for frames in crate::screens::devices::BUFFER_CHOICES {
-            let control = CushionControl::new(frames);
+            let control = CushionControl::new(frames, true);
             assert_eq!(
                 control.ceiling,
                 2 * control.floor,
@@ -2292,7 +2429,7 @@ mod tests {
         let start = Instant::now();
         let mut rings = RingWatch::new(start);
         let mut wake = WakeWatch::new(start);
-        let mut cushion = CushionControl::new(ring);
+        let mut cushion = CushionControl::new(ring, settings.auto_cushion);
         let mut out = Vec::new();
         let mut window = 1u32;
         let mut held = 0usize;

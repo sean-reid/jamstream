@@ -127,9 +127,10 @@ fn playout_target(buffer_frames: u32) -> usize {
 
 /// The cushion a stream at `buffer_frames` opens holding, for a caller with no
 /// ring of its own: the controller's own opening state, so nothing can draw a
-/// depth the app never opens at.
+/// depth the app never opens at. Adjusting itself, which is the default the app
+/// launches with.
 pub(crate) fn opening_cushion(buffer_frames: u32) -> CushionView {
-    CushionControl::new(buffer_frames).view()
+    CushionControl::new(buffer_frames, true).view()
 }
 
 /// A depth target as time, which is the audio the device drains while the
@@ -223,11 +224,15 @@ pub struct AudioSettings {
     /// rides [`StreamConfig::allow_exclusive`] to the backend on every open
     /// and reopen, so the toggle applies mid-session too.
     pub allow_exclusive: bool,
+    /// Whether the playout cushion may move itself past what `buffer_frames`
+    /// asks for. Off pins it there, which makes the pick the latency.
+    pub auto_cushion: bool,
 }
 
-/// Manual rather than derived so the flag defaults on: exclusive is the
+/// Manual rather than derived so the flags default on: exclusive is the
 /// latency the product exists for, and a derived `false` here would quietly
-/// contradict [`StreamConfig::default`].
+/// contradict [`StreamConfig::default`]; a cushion nothing adjusts is a
+/// dropout on every machine that needs the help.
 impl Default for AudioSettings {
     fn default() -> Self {
         AudioSettings {
@@ -235,7 +240,25 @@ impl Default for AudioSettings {
             playback_id: None,
             buffer_frames: 0,
             allow_exclusive: true,
+            auto_cushion: true,
         }
+    }
+}
+
+impl AudioSettings {
+    /// Whether moving from these settings to `next` needs the device shut and
+    /// reopened, which costs the band a few hundred milliseconds of capture.
+    /// Every field but the cushion answer is part of the device request; that
+    /// one is read by the depth controller on the worker's own thread.
+    ///
+    /// Written as one comparison of the whole struct so a field added later
+    /// counts as a device change until somebody says otherwise.
+    pub fn reopens_for(&self, next: &AudioSettings) -> bool {
+        *self
+            != AudioSettings {
+                auto_cushion: self.auto_cushion,
+                ..next.clone()
+            }
     }
 }
 
@@ -378,6 +401,10 @@ impl SharedState {
 enum ThreadMsg {
     Cmd(Command),
     Reconfigure(AudioSettings),
+    /// Whether the playout cushion may move itself. Its own message rather than
+    /// a [`ThreadMsg::Reconfigure`], because the depth controller reads it
+    /// without the device being touched.
+    AutoCushion(bool),
 }
 
 /// The audio stream in whichever shape the backend produced it. Real
@@ -662,7 +689,7 @@ impl LiveRuntime {
             driver,
             engine: Some(engine),
             device_frames,
-            cushion: CushionControl::new(device_frames),
+            cushion: CushionControl::new(device_frames, settings.auto_cushion),
             rings: RingWatch::new(Instant::now()),
             wake: WakeWatch::new(Instant::now()),
             playout: PlayoutWatch::default(),
@@ -713,6 +740,13 @@ impl LiveRuntime {
     /// worker's point of view (it is the only engine-side consumer).
     pub fn reconfigure_audio(&self, settings: AudioSettings) {
         let _ = self.tx.send(ThreadMsg::Reconfigure(settings));
+    }
+
+    /// Frees the playout cushion to move itself, or pins it at what the buffer
+    /// size asks for. The device is left alone: this is a depth the top-up loop
+    /// fills to, so pinning it drains the ring rather than reopening anything.
+    pub fn set_auto_cushion(&self, auto: bool) {
+        let _ = self.tx.send(ThreadMsg::AutoCushion(auto));
     }
 
     /// True once the network thread has exited (after a Leave).
@@ -1158,6 +1192,10 @@ impl Worker {
                 }
                 Ok(ThreadMsg::Cmd(cmd)) => self.apply_command(cmd),
                 Ok(ThreadMsg::Reconfigure(settings)) => self.reconfigure(settings),
+                Ok(ThreadMsg::AutoCushion(auto)) => {
+                    self.settings.auto_cushion = auto;
+                    self.cushion.set_auto(auto);
+                }
                 Err(_) => break,
             }
         }
@@ -1442,7 +1480,7 @@ impl Worker {
                 // A fresh ring at a fresh device size: the cushion this one
                 // settled on says nothing about the next one, and the first
                 // window of a stream holds the open itself.
-                self.cushion = CushionControl::new(device_frames);
+                self.cushion = CushionControl::new(device_frames, self.settings.auto_cushion);
                 self.rings = RingWatch::new(Instant::now());
                 self.carry_pos = 0;
                 self.carry_len = 0;
@@ -2219,6 +2257,60 @@ mod tests {
                 playout_capacity(frames) > playout_target(frames),
                 "{frames}-frame callbacks leave the cushion nowhere to grow into"
             );
+        }
+    }
+
+    /// Which settings changes cost a device reopen. Every field the backend is
+    /// handed does; the cushion answer does not, because it is a depth the
+    /// worker's own loop fills to and a reopen for it would take a few hundred
+    /// milliseconds of capture the whole band hears.
+    #[test]
+    fn only_the_device_half_of_the_settings_reopens_the_stream() {
+        let base = AudioSettings {
+            capture_id: Some("coreaudio:scarlett-in".to_owned()),
+            playback_id: Some("coreaudio:scarlett-out".to_owned()),
+            buffer_frames: 120,
+            allow_exclusive: true,
+            auto_cushion: true,
+        };
+        assert!(!base.reopens_for(&base), "nothing changed, nothing reopens");
+        for pinned in [false, true] {
+            assert!(
+                !base.reopens_for(&AudioSettings {
+                    auto_cushion: pinned,
+                    ..base.clone()
+                }),
+                "pinning the cushion may not reopen the device"
+            );
+        }
+        for changed in [
+            AudioSettings {
+                capture_id: None,
+                ..base.clone()
+            },
+            AudioSettings {
+                playback_id: None,
+                ..base.clone()
+            },
+            AudioSettings {
+                buffer_frames: 240,
+                ..base.clone()
+            },
+            AudioSettings {
+                allow_exclusive: false,
+                ..base.clone()
+            },
+        ] {
+            assert!(
+                base.reopens_for(&changed),
+                "the backend has to be handed {changed:?}"
+            );
+            // And the two changes together are still a reopen, so a cushion
+            // answer riding along cannot swallow a device pick.
+            assert!(base.reopens_for(&AudioSettings {
+                auto_cushion: false,
+                ..changed
+            }));
         }
     }
 

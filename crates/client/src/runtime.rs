@@ -288,7 +288,7 @@ impl RateOutcomesView {
 }
 
 /// What the device buffers cost mouth to ear, one figure per direction: the
-/// capture callback on the way in and the cushion the playout ring holds on the
+/// capture callback on the way in and the depth the playout ring holds on the
 /// way out. Both are terms in the headline figure, and they are the two a buffer
 /// size moves, so the hover names each rather than one lump a reader cannot act
 /// on.
@@ -303,14 +303,14 @@ pub struct DeviceBuffersView {
 }
 
 impl DeviceBuffersView {
-    /// Each direction's line, capture first, named so neither reads as the
-    /// other: one is audio waiting to be sent, one is audio waiting to be
-    /// heard.
+    /// Each direction's line, capture first. One noun for both, because both are
+    /// audio held to smooth the device out and the direction is the whole of the
+    /// difference: one is waiting to be sent, one is waiting to be heard.
     #[must_use]
     pub fn lines(&self) -> [String; 2] {
         [
             format!("capture buffer {:.1} ms", self.capture_ms),
-            format!("playout cushion {:.1} ms", self.playout_ms),
+            format!("playout buffer {:.1} ms", self.playout_ms),
         ]
     }
 }
@@ -332,10 +332,14 @@ pub struct CushionView {
     /// only thing left once the depth is out of room, and reaching it means
     /// moving the pick.
     pub callback_frames: usize,
-    /// Whether the depth is as deep as this buffer size allows while the ring
-    /// still keeps coming close to empty, which is the one case no depth this
-    /// buffer size can hold fixes.
+    /// Whether the depth is as deep as it is allowed to go while the ring still
+    /// keeps coming close to empty. With `auto` on that is the one case no depth
+    /// this buffer size can hold fixes; with it off the depth was never allowed
+    /// to move at all.
     pub out_of_room: bool,
+    /// Whether the depth is free to move. Off pins it at `base_frames`, which is
+    /// what the buffer size asks for, so the pick is the latency.
+    pub auto: bool,
 }
 
 impl CushionView {
@@ -343,6 +347,14 @@ impl CushionView {
     #[must_use]
     pub fn held_ms(&self) -> f32 {
         frames_ms(self.held_frames)
+    }
+
+    /// What the depth is holding past the buffer size, in milliseconds. Zero
+    /// whenever nothing has moved it, which is the case the tab says nothing
+    /// about at all.
+    #[must_use]
+    pub fn extra_ms(&self) -> f32 {
+        frames_ms(self.held_frames.saturating_sub(self.base_frames))
     }
 
     /// The device callback the depth is measured against, in milliseconds, which

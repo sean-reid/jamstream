@@ -90,8 +90,8 @@ impl RecordingPrefs {
 }
 
 /// The audio setup this computer uses, restored at the next launch: the
-/// selected devices by backend id (`None` is the System default entry), and
-/// the buffer size.
+/// selected devices by backend id (`None` is the System default entry), the
+/// buffer size, and whether the cushion under it may adjust itself.
 ///
 /// Nothing here records whether somebody is on headphones, and nothing asks:
 /// hearing yourself through the server is off until it is asked for on the
@@ -111,6 +111,11 @@ pub struct AppPrefs {
     /// setting existed, reads as the default: allowed.
     #[serde(default)]
     pub allow_exclusive: Option<bool>,
+    /// Whether the playout cushion may adjust itself past what `buffer_frames`
+    /// asks for. `None`, which is every file written without it, reads as the
+    /// default: it may, so nobody's latency changes for upgrading.
+    #[serde(default)]
+    pub auto_cushion: Option<bool>,
     /// The display name last joined with, pre-filling the join screen so a
     /// band member types who they are once, not once per session.
     #[serde(default)]
@@ -262,16 +267,19 @@ mod tests {
             playback_id: None,
             buffer_frames: Some(240),
             allow_exclusive: Some(false),
+            auto_cushion: Some(false),
             display_name: Some("Ana".to_owned()),
         };
         prefs.save_to(&path).expect("save");
         assert_eq!(AppPrefs::load_from(&path), prefs);
 
-        // A file from before the exclusive setting existed reads as None,
-        // which the app treats as the default: allowed.
+        // A file holding neither answer reads as None for both, which the app
+        // treats as their defaults: exclusive allowed, and the cushion free to
+        // adjust itself.
         let old: AppPrefs =
             serde_json::from_str("{\"buffer_frames\":240}").expect("an old file decodes");
         assert_eq!(old.allow_exclusive, None);
+        assert_eq!(old.auto_cushion, None);
 
         // Unlike the recording prefs, a broken settings file is defaults with
         // a log line, not a refusal: nothing here loses data silently.
@@ -290,6 +298,7 @@ mod tests {
             playback_id: Some("coreaudio:scarlett-out".to_owned()),
             buffer_frames: Some(120),
             allow_exclusive: Some(true),
+            auto_cushion: Some(true),
             display_name: Some("Ana".to_owned()),
         };
         let value = serde_json::to_value(&prefs).expect("encode");

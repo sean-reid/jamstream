@@ -562,14 +562,15 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
         // neither is ever what a short window scrolled away.
         //
         // What a musician reaches for mid session comes next, with nothing
-        // scrolled: the picks, and at a window the app can be opened at, the
-        // sentence under them, which is the one line on the tab that asks for a
-        // different pick. Below the app's own smallest window the body is
+        // scrolled: the picks, and at a window the app can be opened at, the box
+        // that decides whether anything is added on top of them. A healthy
+        // session says nothing under the choices, so the box is the last row
+        // there is to reach. Below the app's own smallest window the body is
         // shorter than any window gives it, and the panel scrolls for that.
         let openable = size.y >= smallest_room().y && size.x >= smallest_room().x;
         let pinned = ["Close", "Audio", "Broadcast", "Invites", "You"];
         let unscrolled = ["120 frames (2.5 ms)", "480 frames (10.0 ms)"];
-        let asks = ["Cushion: 5.0 ms, what this buffer size asks for"];
+        let asks = ["Add extra depth automatically"];
         for label in pinned
             .into_iter()
             .chain(unscrolled)
@@ -2340,62 +2341,57 @@ fn held_cushion(held_frames: usize, callback_frames: usize, out_of_room: bool) -
         base_frames: 2 * callback_frames,
         callback_frames,
         out_of_room,
+        auto: true,
     }
 }
 
 /// What the buffer control says about the depth under it, which is not always
-/// the depth the pick implies. Both answers matter: a machine that keeps up has
-/// to read as nothing overriding the pick, because that is the common case and a
-/// person who chose a size is entitled to know it is the one they are getting.
+/// the depth the pick implies. The common case is that it says nothing at all:
+/// the size is on the row above and the latency is under it, so a machine holding
+/// what its size asks for has nothing left to report.
 #[test]
-fn the_buffer_control_says_what_the_cushion_is_holding_and_whether_anything_moved_it() {
-    // Nothing pinned, which is the common case: an open stream holds what its
-    // buffer size asks for, off the app's own default pick and the controller
-    // that opens at it, so this is the sentence on the tab of every session
-    // rather than of the ones a fixture arranged for.
+fn the_buffer_control_says_nothing_until_the_depth_leaves_the_pick_behind() {
+    // An open stream at the pick holds exactly what its buffer size asks for,
+    // which is every healthy session, and says nothing about it.
     let mut harness = audio_tab_harness(None, |_| {});
     harness.run_steps(4);
     assert!(
-        harness
-            .query_by_label_contains("Cushion: 5.0 ms, what this buffer size asks for")
-            .is_some(),
-        "a cushion at the depth the pick asks for has to say the pick is what is running"
+        harness.query_by_label_contains("Holding").is_none(),
+        "a depth at what the pick asks for is the pick, and needs no sentence"
     );
     assert!(
         harness
-            .query_by_label_contains("Nothing is deepening it")
+            .query_by_role_and_label(AkRole::RadioButton, "120 frames (2.5 ms)")
             .is_some(),
-        "the half that says nothing is overriding the pick"
+        "the pick itself is still on screen, so the absence above is the sentence"
     );
 
-    // The same control with a deeper cushion under it: the depth, that something
-    // put it there, and that nobody has to undo it.
+    // A deeper one says how much more, over what, and why it went in.
     let mut harness = audio_tab_harness(None, |demo| {
         demo.set_cushion(held_cushion(360, 120, false));
     });
     harness.run_steps(4);
     assert!(
         harness
-            .query_by_label_contains("Cushion: 7.5 ms, deeper than this buffer size asks for")
+            .query_by_label_contains("Holding 2.5 ms more than 120 frames asks for")
             .is_some(),
-        "a cushion past the pick has to say how deep it is holding"
+        "a depth past the pick has to say how much of it nobody chose"
     );
     assert!(
         harness
-            .query_by_label_contains("comes back on its own")
+            .query_by_label_contains("the audio kept coming close to breaking up")
             .is_some(),
-        "and that it hands the latency back itself"
+        "and why, in what a musician hears rather than in a ring's counters"
     );
 
-    // And no stream is no cushion: a device that refused is a ring nobody is
-    // paying for, so nothing is said about a depth.
+    // And no stream is nothing held, so nothing is said and nothing is asked.
     let mut harness = audio_tab_harness(None, |demo| {
         demo.set_device_error(Some("wav device runs at 44100 Hz"));
     });
     harness.run_steps(4);
     assert!(
-        harness.query_by_label_contains("Cushion:").is_none(),
-        "a stream that is not open costs nobody a cushion"
+        harness.query_by_label_contains("Holding").is_none(),
+        "a stream that is not open costs nobody any depth"
     );
     assert!(
         harness
@@ -2405,13 +2401,13 @@ fn the_buffer_control_says_what_the_cushion_is_holding_and_whether_anything_move
     );
 }
 
-/// The one place the automatic depth hands back to the pick. A cushion out of
-/// room names the next size up, says what taking it costs, and takes it only
-/// when somebody clicks the row: the reopen it asks for is a few hundred
-/// milliseconds of capture the band hears as a hole, so nothing does it on their
-/// behalf. It speaks over the crackling notice, which asks for nothing now.
+/// The one place the automatic depth hands back to the pick. A depth out of room
+/// names the next size up, says what taking it costs, and takes it only when
+/// somebody clicks the row: the reopen it asks for is a few hundred milliseconds
+/// of capture the band hears as a hole, so nothing does it on their behalf. It
+/// speaks over the crackling notice, which asks for nothing now.
 #[test]
-fn a_cushion_out_of_room_offers_the_next_size_up_and_the_pick_is_what_takes_it() {
+fn a_depth_out_of_room_offers_the_next_size_up_and_the_pick_is_what_takes_it() {
     // A private subdirectory, not temp_dir() itself: the settings writer refuses
     // a world-writable parent, and Linux's /tmp is one.
     let dir = std::env::temp_dir().join(format!("jamstream-cushion-offer-{}", std::process::id()));
@@ -2431,7 +2427,7 @@ fn a_cushion_out_of_room_offers_the_next_size_up_and_the_pick_is_what_takes_it()
     harness.run_steps(4);
     assert!(
         harness
-            .query_by_label_contains("Cushion: 10.0 ms, as deep as this buffer size allows")
+            .query_by_label_contains("Still coming close to breaking up at the most this size")
             .is_some(),
         "the depth that has run out of room has to say it is out of room"
     );
@@ -3544,6 +3540,168 @@ fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cushion moves itself unless somebody says otherwise, and saying otherwise
+/// is a per-computer answer: on for a fresh install and for every settings file
+/// written without it, off from the click until it is clicked back.
+///
+/// Driven through the real drawer, so the checkbox, the write and the restore are
+/// the ones a musician gets. What the pin does to the depth is the controller's
+/// own test; this is the half that has to survive a relaunch.
+#[test]
+fn the_depth_adjusts_itself_until_the_box_is_unticked_and_that_answer_is_kept() {
+    use jamstream_client::app::JamApp;
+
+    // A private subdirectory, not temp_dir() itself: the settings writer refuses
+    // a world-writable parent, and Linux's /tmp is one.
+    let dir = std::env::temp_dir().join(format!("jamstream-pin-cushion-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    let path = dir.join("settings.json");
+
+    // A fresh install: nothing saved anywhere, and the depth is free to move.
+    assert!(
+        JamApp::in_memory().devices.auto_cushion,
+        "a fresh install has to leave the depth free to move"
+    );
+
+    let mut harness = audio_tab_harness(Some(path.clone()), |demo| {
+        demo.set_cushion(held_cushion(240, 120, false));
+    });
+    harness.run_steps(4);
+    let box_label = "Add extra depth automatically";
+    let ticked = harness
+        .get_by_role_and_label(AkRole::CheckBox, box_label)
+        .accesskit_node()
+        .toggled();
+    assert_eq!(
+        ticked,
+        Some(egui::accesskit::Toggled::True),
+        "the box a musician who never opens this tab gets has to be ticked"
+    );
+
+    harness
+        .get_by_role_and_label(AkRole::CheckBox, box_label)
+        .click_accesskit();
+    harness.run_steps(4);
+    let saved = std::fs::read_to_string(&path).expect("the click has to write settings.json");
+    assert!(
+        saved.contains("\"auto_cushion\": false"),
+        "the answer is per computer, so the click has to land in the file: {saved}"
+    );
+
+    // The next launch starts pinned, and one whose file predates the setting
+    // starts adjusting itself, which is what stops an upgrade changing anybody's
+    // latency.
+    let mut next = JamApp::in_memory();
+    next.settings_path = Some(path.clone());
+    next.restore_audio_prefs();
+    assert!(
+        !next.devices.auto_cushion,
+        "the pin has to survive the relaunch it was set for"
+    );
+    std::fs::write(&path, "{\"buffer_frames\":240}").expect("write an older file");
+    let mut upgraded = JamApp::in_memory();
+    upgraded.settings_path = Some(path.clone());
+    upgraded.restore_audio_prefs();
+    assert!(
+        upgraded.devices.auto_cushion,
+        "a file with no answer in it has to read as the default"
+    );
+    assert_eq!(
+        upgraded.devices.buffer_frames, 240,
+        "and the rest of that file still restores"
+    );
+
+    // Ticking it back on writes the other answer, so nothing is one-way.
+    let mut back = audio_tab_harness(Some(path.clone()), |demo| {
+        demo.set_cushion(held_cushion(240, 120, false));
+    });
+    back.run_steps(4);
+    back.get_by_role_and_label(AkRole::CheckBox, box_label)
+        .click_accesskit();
+    back.run_steps(4);
+    let saved = std::fs::read_to_string(&path).expect("settings.json");
+    assert!(
+        saved.contains("\"auto_cushion\": false"),
+        "unticking the box has to write the pin: {saved}"
+    );
+    back.get_by_role_and_label(AkRole::CheckBox, box_label)
+        .click_accesskit();
+    back.run_steps(4);
+    let saved = std::fs::read_to_string(&path).expect("settings.json");
+    assert!(
+        saved.contains("\"auto_cushion\": true"),
+        "ticking it again has to write that too: {saved}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a pinned depth says when the device still cannot keep up: the remedy that
+/// costs nobody a device reopen, which is the box right above it. The offer of a
+/// longer callback belongs to a depth that was allowed to grow and ran out of
+/// room, so it may not appear here. And the sizes stay pickable through all of
+/// it, because the app never moves the size itself.
+#[test]
+fn a_pinned_depth_that_keeps_running_dry_asks_for_the_box_and_not_for_a_reopen() {
+    let mut harness = audio_tab_harness(None, |demo| {
+        demo.set_cushion(CushionView {
+            auto: false,
+            ..held_cushion(240, 120, true)
+        });
+        demo.set_crackling(true);
+    });
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("Still coming close to breaking up at what this size asks for")
+            .is_some(),
+        "a pinned depth the ring keeps outrunning has to say so on the tab"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("Adding depth automatically is what would cover it")
+            .is_some(),
+        "and name the remedy that costs nothing"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("is the next size up")
+            .is_none(),
+        "a depth that was never allowed to grow may not ask for a device reopen"
+    );
+    // Pinned or not, the pick is still a pick: greying the sizes out would
+    // disable the control the ceiling sentence sends people to.
+    for frames in ["120 frames (2.5 ms)", "240 frames (5.0 ms)"] {
+        let row = harness.get_by_role_and_label(AkRole::RadioButton, frames);
+        assert!(
+            !row.accesskit_node().is_disabled(),
+            "{frames} is not clickable while the depth is pinned"
+        );
+    }
+
+    // With the ring keeping up, the same pinned depth says nothing at all: the
+    // size on the row above is the whole story.
+    let mut harness = audio_tab_harness(None, |demo| {
+        demo.set_cushion(CushionView {
+            auto: false,
+            ..held_cushion(240, 120, false)
+        });
+    });
+    harness.run_steps(4);
+    for line in ["Holding", "Still coming close"] {
+        assert!(
+            harness.query_by_label_contains(line).is_none(),
+            "a pinned depth nothing is outrunning has nothing to report: {line}"
+        );
+    }
 }
 
 /// A host never passes the join screen, so Settings, You is where they name
