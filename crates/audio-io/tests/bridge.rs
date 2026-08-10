@@ -1,6 +1,6 @@
 //! CallbackBridge: ordering across ring wrap, silence on underrun, drop on
-//! overrun, counters and the playout low water mark visible from the engine
-//! side, and the two rings sized apart from each other.
+//! overrun, counters, the playout depth and low water mark visible from the
+//! engine side, and the two rings sized apart from each other.
 
 use jamstream_audio_io::CallbackBridge;
 
@@ -109,6 +109,37 @@ fn the_two_rings_are_sized_apart() {
         4,
         "the playout ring holds four"
     );
+}
+
+/// The depth the engine side reads is the audio actually banked, against a
+/// device consuming on its own clock. A producer that holds a cushion shallower
+/// than the ring it was given has nothing else to steer by.
+#[test]
+fn the_playout_depth_is_what_the_device_has_left_to_play() {
+    const CAPACITY: usize = 240;
+    const CALLBACK: usize = 60;
+    const DEPTH: usize = 120;
+
+    let (mut device, mut engine) = CallbackBridge::new(CAPACITY, CAPACITY);
+    assert_eq!(engine.playout_depth(), 0, "a fresh ring holds nothing");
+
+    assert_eq!(engine.push_playout(&[1.0; DEPTH]), DEPTH);
+    assert_eq!(engine.playout_depth(), DEPTH);
+
+    let mut out = [0.0f32; CALLBACK];
+    device.on_playback(&mut out);
+    assert_eq!(
+        engine.playout_depth(),
+        DEPTH - CALLBACK,
+        "a callback the device took is a callback the depth has lost"
+    );
+
+    // Back to the same depth, from a producer that reads it rather than
+    // filling until the ring refuses.
+    let room = DEPTH - engine.playout_depth();
+    assert_eq!(engine.push_playout(&[1.0; CAPACITY][..room]), room);
+    assert_eq!(engine.playout_depth(), DEPTH);
+    assert!(engine.playout_depth() < CAPACITY, "the ring has room left");
 }
 
 /// Capture that arrives before the consumer's first drain is destroyed unless
