@@ -39,6 +39,10 @@ Check these in order of payoff:
    The cushion is not fixed. A machine that keeps letting the playout ring run low gets a deeper one, 2.5 ms at a time and never past twice the buffer, and hands it back once it is keeping up again. The hover and the headline number both follow it, so a deeper cushion than twice your buffer is that, not a fault.
 
    You are asked to move the size only when that runs out of room. The same line then names the next size up, and says what taking it costs: more latency, and a reopen the band hears as a few hundred milliseconds missing of you. A **crackling** tag before that means the cushion is still working on it.
+
+   "Adjust the cushion automatically", under the choices, is how you stop it. Unticking it pins the cushion at what your size asks for, from that moment and on every later session on this computer, so the size you pick is the latency you get.
+
+   If the ring keeps running low at a pinned cushion, the line says so and points back at the box: a deeper cushion is the one fix that costs no reopen.
 4. **Sample rate.** A direction JamStream's own converter carries costs about 3 ms, and says so with a muted **converting** tag naming both rates.
 
    The headline number already includes it and the hover breaks it out per direction. [Device problems](#device-problems) has the whole ladder.

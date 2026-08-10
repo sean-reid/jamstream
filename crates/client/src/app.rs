@@ -367,6 +367,9 @@ impl JamApp {
         if let Some(allow) = prefs.allow_exclusive {
             self.devices.allow_exclusive = allow;
         }
+        if let Some(auto) = prefs.auto_cushion {
+            self.devices.auto_cushion = auto;
+        }
     }
 
     /// Writes the audio setup where the next launch reads it. Failure is a
@@ -382,6 +385,7 @@ impl JamApp {
             playback_id: settings.playback_id,
             buffer_frames: Some(settings.buffer_frames),
             allow_exclusive: Some(settings.allow_exclusive),
+            auto_cushion: Some(settings.auto_cushion),
             display_name: (!name.is_empty()).then(|| name.to_owned()),
         };
         if let Err(err) = prefs.save_to(path) {
@@ -459,6 +463,7 @@ impl JamApp {
                 .and_then(|d| d.id.clone()),
             buffer_frames: self.devices.buffer_frames,
             allow_exclusive: self.devices.allow_exclusive,
+            auto_cushion: self.devices.auto_cushion,
         }
     }
 
@@ -821,12 +826,20 @@ impl JamApp {
         // Device picks apply immediately: mid-session the live runtime
         // reopens its stream, otherwise the selection just waits for the
         // next join. Compared by id, not picker index, so a rescan that only
-        // reordered the catalog does not reopen a healthy stream.
+        // reordered the catalog does not reopen a healthy stream. The cushion
+        // answer goes on its own: it is a depth the worker fills to, and
+        // reopening a working device for it would cost the band capture nobody
+        // asked to lose.
         let selected = self.audio_settings();
         if selected != self.applied_audio {
+            let reopen = self.applied_audio.reopens_for(&selected);
             self.applied_audio = selected.clone();
             if let Some(live) = &self.live {
-                live.reconfigure_audio(selected);
+                if reopen {
+                    live.reconfigure_audio(selected);
+                } else {
+                    live.set_auto_cushion(self.devices.auto_cushion);
+                }
             }
             self.persist_audio_prefs();
         }

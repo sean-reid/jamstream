@@ -165,6 +165,11 @@ pub struct DevicesScreen {
     /// but it mutes every other stream on the endpoint, so the setting and
     /// its cost are on the tab instead of being a silent policy.
     pub allow_exclusive: bool,
+    /// Whether the playout cushion may go deeper than the buffer size asks for.
+    /// On by default, because the machines that need the help cannot be told
+    /// apart from the ones that do not until the ring runs low. Off pins the
+    /// depth, so the pick is the latency and the tab says nothing is moving it.
+    pub auto_cushion: bool,
     /// Whether the platform's backend can open a device exclusively at all,
     /// which is WASAPI and nothing else. Set from the running platform, and a
     /// field rather than a `cfg!` at the draw site so a snapshot can render
@@ -184,6 +189,7 @@ impl Default for DevicesScreen {
             playback_idx: 0,
             buffer_frames: BUFFER_CHOICES[0],
             allow_exclusive: true,
+            auto_cushion: true,
             exclusive_offered: cfg!(windows),
             rescan_note: None,
         }
@@ -236,15 +242,20 @@ pub const CRACKLING_NOTICE: &str = "Crackling: this device is not keeping up. Th
 
 /// The single sentence under the buffer choices, and nothing stacked under it.
 ///
-/// A cushion out of room speaks over everything, because it is the only one of
-/// these that asks for something and the reopen it asks for is what ends the
-/// crackling it would otherwise sit beside. A crackling run comes next, since it
-/// is the same story as a deepening cushion told from what a musician can hear.
-/// Anything else is the cushion reporting its own depth, which every stream has
-/// and which nothing else on this tab says.
+/// A pinned depth the ring keeps outrunning speaks first, because the remedy is
+/// the box directly above and costs nothing, while every other remedy on this
+/// tab costs a device reopen. Then a cushion out of room, the only one of the
+/// rest that asks for something and the one whose reopen ends the crackling it
+/// would otherwise sit beside. Then a crackling run, which is the same story as
+/// a deepening cushion told from what a musician can hear. Anything else is the
+/// cushion reporting its own depth, which every stream has and which nothing
+/// else on this tab says.
 #[must_use]
 pub fn buffer_note(cushion: Option<CushionView>, crackling: bool) -> Option<BufferNote> {
     match (cushion, crackling) {
+        (Some(cushion), dry) if !cushion.auto && (cushion.out_of_room || dry) => {
+            Some(pinned_note(cushion))
+        }
         (Some(cushion), _) if cushion.out_of_room => Some(cushion_note(cushion)),
         (_, true) => Some(BufferNote {
             text: CRACKLING_NOTICE.to_owned(),
@@ -252,6 +263,24 @@ pub fn buffer_note(cushion: Option<CushionView>, crackling: bool) -> Option<Buff
         }),
         (Some(cushion), false) => Some(cushion_note(cushion)),
         (None, false) => None,
+    }
+}
+
+/// What a pinned depth says once the ring keeps outrunning it: the depth, that
+/// it is being held there, and the one remedy that costs nobody a reopen.
+///
+/// It names no buffer size, because the offer to pay for a longer device
+/// callback belongs after a cushion that was allowed to grow has run out of
+/// room, and this cushion was never allowed to grow. Somebody who ticks the box
+/// and still dries out at the ceiling gets that offer next.
+fn pinned_note(cushion: CushionView) -> BufferNote {
+    BufferNote {
+        text: format!(
+            "Cushion: {:.1} ms, pinned here and still coming close to empty. \
+             Adjusting it automatically is what would cover that.",
+            cushion.held_ms()
+        ),
+        asks: true,
     }
 }
 
@@ -451,10 +480,13 @@ impl DevicesScreen {
         let bounds = buffer_bounds(catalog, self.capture_idx, self.playback_idx);
         block.show(ui, |ui| {
             ui.label(theme::title(ui, "Buffer size"));
-            ui.label(theme::muted(
-                ui,
-                "Smaller buffers cut latency; pick the smallest that stays clean.",
-            ));
+            ui.label(
+                theme::muted(
+                    ui,
+                    "Smaller buffers cut latency; pick the smallest that stays clean.",
+                )
+                .small(),
+            );
             ui.add_space(theme::SPACE_XS);
             for frames in BUFFER_CHOICES {
                 let label = buffer_label(frames);
@@ -470,6 +502,11 @@ impl DevicesScreen {
                     self.buffer_frames = frames;
                 }
             }
+            // Under the choices and on the same rhythm as them, because it is
+            // about them: ticked, the depth below is free to leave the pick
+            // behind, and unticked the pick is the latency. The sentence under
+            // it already says which, so the control carries no line of its own.
+            ui.checkbox(&mut self.auto_cushion, "Adjust the cushion automatically");
             // Beside the choices they are about, for as long as each holds: the
             // status bar's tag says a fault exists, and this is the screen
             // somebody opens to act on it. One sentence at a time, because the
@@ -477,7 +514,6 @@ impl DevicesScreen {
             // longer callback are one story at three moments, and three
             // sentences of it under one control is worse than any of them.
             if let Some(note) = buffer_note(notes.cushion, notes.crackling) {
-                ui.add_space(theme::SPACE_SM);
                 if note.asks {
                     theme::reason(ui, note.text);
                 } else {
@@ -493,7 +529,6 @@ impl DevicesScreen {
             // and a placeholder would be an instrument reading a made-up
             // number, so the row is absent instead.
             if let Some(ms) = mouth_to_ear_ms {
-                ui.add_space(theme::SPACE_SM);
                 ui.horizontal(|ui| {
                     ui.label(theme::mono(ui, format!("{ms:.1} ms")));
                     ui.label(theme::muted(ui, "mouth to ear"));
@@ -754,6 +789,16 @@ mod tests {
             base_frames: 2 * callback,
             callback_frames: callback,
             out_of_room,
+            auto: true,
+        }
+    }
+
+    /// The same depth with the box unticked, which is the only way it can hold
+    /// the base cushion and be out of room at once.
+    fn pinned_cushion(callback: usize, out_of_room: bool) -> CushionView {
+        CushionView {
+            auto: false,
+            ..cushion(2 * callback, callback, out_of_room)
         }
     }
 
@@ -814,11 +859,52 @@ mod tests {
             "{}",
             deeper.text
         );
-        let pinned = buffer_note(Some(cushion(240, 120, false)), false).expect("a depth to report");
-        assert!(!pinned.asks);
+        let at_rest =
+            buffer_note(Some(cushion(240, 120, false)), false).expect("a depth to report");
+        assert!(!at_rest.asks);
         assert_eq!(
-            pinned.text,
+            at_rest.text,
             "Cushion: 5.0 ms, what this buffer size asks for. Nothing is deepening it."
+        );
+        // And a depth nothing is allowed to move reads as exactly that already,
+        // which is why the box needs no sentence of its own.
+        assert_eq!(
+            buffer_note(Some(pinned_cushion(120, false)), false).map(|n| n.text),
+            Some(at_rest.text)
+        );
+    }
+
+    /// A pinned depth the ring keeps outrunning, from a reading and from a run
+    /// somebody can hear. Both say the same thing, because the remedy is the
+    /// same: the box above, which costs nothing. Neither names a buffer size,
+    /// because paying for a device reopen is the answer after a cushion that was
+    /// allowed to grow has run out of room, and this one never grew.
+    #[test]
+    fn a_pinned_depth_the_ring_outruns_asks_for_the_box_and_not_for_a_reopen() {
+        for (what, crackling, out_of_room) in [
+            ("a reading", false, true),
+            ("a run somebody can hear", true, false),
+            ("both at once", true, true),
+        ] {
+            let note = buffer_note(Some(pinned_cushion(120, out_of_room)), crackling)
+                .unwrap_or_else(|| panic!("{what} under a pinned depth has to say something"));
+            assert!(note.asks, "{what}: this is a state that needs somebody");
+            assert_eq!(
+                note.text,
+                "Cushion: 5.0 ms, pinned here and still coming close to empty. \
+                 Adjusting it automatically is what would cover that.",
+                "{what}"
+            );
+        }
+        // The automatic cushion keeps the offer it had: the pinned sentence is a
+        // state of its own rather than a replacement.
+        let offered = buffer_note(Some(cushion(480, 120, true)), true).expect("the offer");
+        assert!(
+            offered
+                .text
+                .contains("240 frames (5.0 ms) is the next size up"),
+            "{}",
+            offered.text
         );
     }
 

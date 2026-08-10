@@ -2340,6 +2340,7 @@ fn held_cushion(held_frames: usize, callback_frames: usize, out_of_room: bool) -
         base_frames: 2 * callback_frames,
         callback_frames,
         out_of_room,
+        auto: true,
     }
 }
 
@@ -3544,6 +3545,160 @@ fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cushion moves itself unless somebody says otherwise, and saying otherwise
+/// is a per-computer answer: on for a fresh install and for every settings file
+/// written without it, off from the click until it is clicked back.
+///
+/// Driven through the real drawer, so the checkbox, the write and the restore are
+/// the ones a musician gets. What the pin does to the depth is the controller's
+/// own test; this is the half that has to survive a relaunch.
+#[test]
+fn the_cushion_adjusts_itself_until_the_box_is_unticked_and_that_answer_is_kept() {
+    use jamstream_client::app::JamApp;
+
+    // A private subdirectory, not temp_dir() itself: the settings writer refuses
+    // a world-writable parent, and Linux's /tmp is one.
+    let dir = std::env::temp_dir().join(format!("jamstream-pin-cushion-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    let path = dir.join("settings.json");
+
+    // A fresh install: nothing saved anywhere, and the cushion is free to move.
+    assert!(
+        JamApp::in_memory().devices.auto_cushion,
+        "a fresh install has to leave the cushion adjusting itself"
+    );
+
+    let mut harness = audio_tab_harness(Some(path.clone()), |demo| {
+        demo.set_cushion(held_cushion(240, 120, false));
+    });
+    harness.run_steps(4);
+    let box_label = "Adjust the cushion automatically";
+    let ticked = harness
+        .get_by_role_and_label(AkRole::CheckBox, box_label)
+        .accesskit_node()
+        .toggled();
+    assert_eq!(
+        ticked,
+        Some(egui::accesskit::Toggled::True),
+        "the box a musician who never opens this tab gets has to be ticked"
+    );
+
+    harness
+        .get_by_role_and_label(AkRole::CheckBox, box_label)
+        .click_accesskit();
+    harness.run_steps(4);
+    let saved = std::fs::read_to_string(&path).expect("the click has to write settings.json");
+    assert!(
+        saved.contains("\"auto_cushion\": false"),
+        "the answer is per computer, so the click has to land in the file: {saved}"
+    );
+
+    // The next launch starts pinned, and one whose file predates the setting
+    // starts adjusting itself, which is what stops an upgrade changing anybody's
+    // latency.
+    let mut next = JamApp::in_memory();
+    next.settings_path = Some(path.clone());
+    next.restore_audio_prefs();
+    assert!(
+        !next.devices.auto_cushion,
+        "the pin has to survive the relaunch it was set for"
+    );
+    std::fs::write(&path, "{\"buffer_frames\":240}").expect("write an older file");
+    let mut upgraded = JamApp::in_memory();
+    upgraded.settings_path = Some(path.clone());
+    upgraded.restore_audio_prefs();
+    assert!(
+        upgraded.devices.auto_cushion,
+        "a file with no answer in it has to read as the default"
+    );
+    assert_eq!(
+        upgraded.devices.buffer_frames, 240,
+        "and the rest of that file still restores"
+    );
+
+    // Ticking it back on writes the other answer, so nothing is one-way.
+    let mut back = audio_tab_harness(Some(path.clone()), |demo| {
+        demo.set_cushion(held_cushion(240, 120, false));
+    });
+    back.run_steps(4);
+    back.get_by_role_and_label(AkRole::CheckBox, box_label)
+        .click_accesskit();
+    back.run_steps(4);
+    let saved = std::fs::read_to_string(&path).expect("settings.json");
+    assert!(
+        saved.contains("\"auto_cushion\": false"),
+        "unticking the box has to write the pin: {saved}"
+    );
+    back.get_by_role_and_label(AkRole::CheckBox, box_label)
+        .click_accesskit();
+    back.run_steps(4);
+    let saved = std::fs::read_to_string(&path).expect("settings.json");
+    assert!(
+        saved.contains("\"auto_cushion\": true"),
+        "ticking it again has to write that too: {saved}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a pinned depth says when the device still cannot keep up: the remedy that
+/// costs nobody a device reopen, which is the box right above it. The offer of a
+/// longer callback belongs to a cushion that was allowed to grow and ran out of
+/// room, so it may not appear here.
+#[test]
+fn a_pinned_cushion_that_keeps_running_dry_asks_for_the_box_and_not_for_a_reopen() {
+    let mut harness = audio_tab_harness(None, |demo| {
+        demo.set_cushion(CushionView {
+            auto: false,
+            ..held_cushion(240, 120, true)
+        });
+        demo.set_crackling(true);
+    });
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("Cushion: 5.0 ms, pinned here and still coming close to empty")
+            .is_some(),
+        "a pinned depth the ring keeps outrunning has to say so on the tab"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("Adjusting it automatically is what would cover that")
+            .is_some(),
+        "and name the remedy that costs nothing"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("is the next size up")
+            .is_none(),
+        "a depth that was never allowed to grow may not ask for a device reopen"
+    );
+
+    // With the ring keeping up, the same pinned depth reads as the pick and
+    // nothing more, which is the wording a machine that keeps up already gets.
+    let mut harness = audio_tab_harness(None, |demo| {
+        demo.set_cushion(CushionView {
+            auto: false,
+            ..held_cushion(240, 120, false)
+        });
+    });
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains(
+                "Cushion: 5.0 ms, what this buffer size asks for. Nothing is deepening it."
+            )
+            .is_some(),
+        "a pinned depth nothing is outrunning needs no wording of its own"
+    );
 }
 
 /// A host never passes the join screen, so Settings, You is where they name

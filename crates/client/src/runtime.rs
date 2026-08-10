@@ -332,10 +332,14 @@ pub struct CushionView {
     /// only thing left once the depth is out of room, and reaching it means
     /// moving the pick.
     pub callback_frames: usize,
-    /// Whether the depth is as deep as this buffer size allows while the ring
-    /// still keeps coming close to empty, which is the one case no depth this
-    /// buffer size can hold fixes.
+    /// Whether the depth is as deep as it is allowed to go while the ring still
+    /// keeps coming close to empty. With `auto` on that is the one case no depth
+    /// this buffer size can hold fixes; with it off the depth was never allowed
+    /// to move at all.
     pub out_of_room: bool,
+    /// Whether the depth is free to move. Off pins it at `base_frames`, which is
+    /// what the buffer size asks for, so the pick is the latency.
+    pub auto: bool,
 }
 
 impl CushionView {

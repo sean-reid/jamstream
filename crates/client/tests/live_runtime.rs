@@ -1528,6 +1528,61 @@ fn settings_changes_never_read_as_a_device_cutting_out() {
     let _ = std::fs::remove_file(&sine);
 }
 
+/// The cushion answer reaches the depth controller without the device being
+/// touched. That is the whole reason it is not part of a reconfigure: a reopen
+/// costs the band a few hundred milliseconds of capture, and this is a depth the
+/// worker's own loop fills to. Measured against the backend's open count, so
+/// nothing between the click and the sound card is stood in for.
+#[test]
+fn pinning_the_cushion_reaches_the_controller_without_reopening_the_device() {
+    let server = TestServer::start();
+    let sine = sine_fixture("pin-cushion", 440.0, RATE);
+    let backend = WavBackend::new(Some(sine.clone()), None);
+    let device = backend.clone();
+    let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
+        .expect("join offline");
+    wait_for(&rt, "joined", Duration::from_secs(10), joined);
+    wait_for(&rt, "a cushion", Duration::from_secs(10), |s| {
+        s.stats.cushion.is_some()
+    });
+    let opens = device.opens();
+    let opening = rt.snapshot().stats.cushion.expect("a cushion");
+    assert!(opening.auto, "a stream opens on the app's own default");
+
+    rt.set_auto_cushion(false);
+    wait_for(&rt, "the pin", Duration::from_secs(10), |s| {
+        s.stats.cushion.is_some_and(|c| !c.auto)
+    });
+    let pinned = rt.snapshot().stats.cushion.expect("a cushion");
+    assert_eq!(
+        pinned.held_frames, pinned.base_frames,
+        "a pinned depth is what the buffer size asks for and nothing more"
+    );
+    assert_eq!(
+        device.opens(),
+        opens,
+        "pinning the cushion cost the band a device reopen"
+    );
+
+    // And back the other way, on the same message.
+    rt.set_auto_cushion(true);
+    wait_for(&rt, "the box ticked again", Duration::from_secs(10), |s| {
+        s.stats.cushion.is_some_and(|c| c.auto)
+    });
+    assert_eq!(
+        device.opens(),
+        opens,
+        "letting the cushion move again cost a device reopen"
+    );
+
+    rt.send(Command::Leave);
+    wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+        s.stats.state == ConnState::Idle
+    });
+    drop(rt);
+    let _ = std::fs::remove_file(&sine);
+}
+
 /// Finished takes under `dir`: `.flac` files, never `.part` leftovers.
 fn finished_takes(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {

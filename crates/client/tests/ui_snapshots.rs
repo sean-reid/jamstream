@@ -1290,7 +1290,10 @@ fn session_settings() {
     // session cannot be in, and this image is the one people read the product
     // off. The depth is what the smallest buffer size asks for, at the latency
     // measured over one local network with that cushion inside it.
-    let app = drawer_app(cushion_app(Theme::Dark, 240, false), SettingsTab::Audio);
+    let app = drawer_app(
+        cushion_app(Theme::Dark, held_cushion(240, false)),
+        SettingsTab::Audio,
+    );
     let mut harness = app_harness(app, WIDE);
     snapshot_for_docs(&mut harness, "session_settings");
 }
@@ -1384,22 +1387,48 @@ fn session_settings_crackling_clear() {
 /// The depth and the latency figure are one state, and the figure is summed from
 /// the depth pinned here, so the two on screen are the pair a session at this
 /// depth produces however deep the fixture holds it.
-fn cushion_app(theme: Theme, held_frames: usize, out_of_room: bool) -> JamApp {
+fn cushion_app(theme: Theme, cushion: CushionView) -> JamApp {
     let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
-    rt.set_cushion(CushionView {
+    rt.set_cushion(cushion);
+    session_app(rt, theme)
+}
+
+/// A depth the controller is holding at the app's default pick, free to move
+/// itself: the two figures the buffer control reads off it, the callback they are
+/// measured against, and whether it has run out of room to go deeper.
+fn held_cushion(held_frames: usize, out_of_room: bool) -> CushionView {
+    CushionView {
         held_frames,
         base_frames: 240,
         callback_frames: 120,
         out_of_room,
-    });
-    session_app(rt, theme)
+        auto: true,
+    }
+}
+
+/// The same tab with the box unticked, which is the pick and nothing else: the
+/// depth can only be the base cushion, and the control that says so is on this
+/// tab, so the screen's own answer is set to match the stream's.
+fn pinned_cushion_app(theme: Theme, out_of_room: bool) -> JamApp {
+    let mut app = cushion_app(
+        theme,
+        CushionView {
+            auto: false,
+            ..held_cushion(240, out_of_room)
+        },
+    );
+    app.devices.auto_cushion = false;
+    app
 }
 
 #[test]
 fn session_settings_cushion_deeper() {
     // A frame of latency somebody is paying that they did not pick, in the muted
     // step because the cushion is working rather than failing.
-    let app = drawer_app(cushion_app(Theme::Dark, 360, false), SettingsTab::Audio);
+    let app = drawer_app(
+        cushion_app(Theme::Dark, held_cushion(360, false)),
+        SettingsTab::Audio,
+    );
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_cushion_deeper");
 }
@@ -1408,7 +1437,10 @@ fn session_settings_cushion_deeper() {
 fn session_settings_cushion_out_of_room() {
     // The only place the automatic depth hands back to the pick: the offer names
     // the next size up and what the reopen costs, beside the rows that take it.
-    let app = drawer_app(cushion_app(Theme::Dark, 480, true), SettingsTab::Audio);
+    let app = drawer_app(
+        cushion_app(Theme::Dark, held_cushion(480, true)),
+        SettingsTab::Audio,
+    );
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_cushion_out_of_room");
 }
@@ -1417,9 +1449,32 @@ fn session_settings_cushion_out_of_room() {
 fn session_settings_cushion_out_of_room_narrow() {
     // The narrowest window, where the offer is the longest copy under any
     // control on this tab and the drawer's own scroll is what has to absorb it.
-    let app = drawer_app(cushion_app(Theme::Dark, 480, true), SettingsTab::Audio);
+    let app = drawer_app(
+        cushion_app(Theme::Dark, held_cushion(480, true)),
+        SettingsTab::Audio,
+    );
     let mut harness = app_harness(app, NARROW);
     snapshot(&mut harness, "session_settings_cushion_out_of_room_narrow");
+}
+
+#[test]
+fn session_settings_cushion_pinned() {
+    // The box unticked, which is the state the tab already had wording for: the
+    // depth is the pick and the sentence says nothing is moving it. What this
+    // renders is that the checkbox and the sentence agree.
+    let app = drawer_app(pinned_cushion_app(Theme::Dark, false), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_cushion_pinned");
+}
+
+#[test]
+fn session_settings_cushion_pinned_dry() {
+    // A machine that cannot feed its device at the pick, from somebody who told
+    // the app not to help: the danger ink, and the remedy is the box above rather
+    // than a size that costs a reopen.
+    let app = drawer_app(pinned_cushion_app(Theme::Dark, true), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_cushion_pinned_dry");
 }
 
 #[test]
