@@ -172,6 +172,12 @@ pub struct JamApp {
     /// taking it from `CARGO_PKG_VERSION` there made every release bump
     /// break four screenshots, which is how the 0.2.0 release found it.
     pub build_version: String,
+    /// The platform's own word for showing a file in its file manager, as
+    /// [`reveal::LABEL`] chose it. A field rather than that constant read at
+    /// the two places it is drawn, because the snapshot baselines render on
+    /// macOS alone: a `cfg!` at the draw site means the other two wordings
+    /// never reach an image on any machine.
+    pub reveal_label: &'static str,
     /// End-session teardown in flight; a progress sheet shows until the
     /// provider confirms the instance is gone.
     ending: Option<Job<Result<(), String>>>,
@@ -256,6 +262,7 @@ impl JamApp {
             log_reveal_error: None,
             announced_name: None,
             build_version: env!("CARGO_PKG_VERSION").to_owned(),
+            reveal_label: reveal::LABEL,
             ending: None,
             confirm_quit: false,
             allow_close: false,
@@ -751,7 +758,7 @@ impl JamApp {
                     }
                 }
             }
-            Screen::Takes => self.takes.ui(ui),
+            Screen::Takes => self.takes.ui(ui, self.reveal_label),
             Screen::HostWizard => {
                 // What this computer can record to, handed over as plain data
                 // every frame: a bucket saved in the Recording tab is armable
@@ -1127,7 +1134,7 @@ impl JamApp {
             if ui.button("Copy path").clicked() {
                 ui.ctx().copy_text(text);
             }
-            if ui.button(reveal::LABEL).clicked() {
+            if ui.button(self.reveal_label).clicked() {
                 // Never a dead button: a machine with no file manager says so
                 // where the path is already readable above.
                 self.log_reveal_error = reveal::show(&path).err();
@@ -1389,5 +1396,18 @@ impl eframe::App for JamApp {
         egui::CentralPanel::default_margins()
             .frame(Frame::new().fill(fill).inner_margin(egui::Margin::same(10)))
             .show(ui, |ui| self.root_ui(ui));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The platform names this button, and nothing in a running app decides
+    /// otherwise: only a fixture rendering another platform's wording sets it
+    /// by hand.
+    #[test]
+    fn the_reveal_button_reads_the_way_this_platform_says_it() {
+        assert_eq!(JamApp::in_memory().reveal_label, reveal::LABEL);
     }
 }

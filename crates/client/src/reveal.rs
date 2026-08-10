@@ -19,12 +19,17 @@ use std::process::Command;
 
 /// What the button that calls [`show`] is called on this platform.
 pub const LABEL: &str = if cfg!(target_os = "macos") {
-    "Reveal in Finder"
+    LABELS[0]
 } else if cfg!(target_os = "windows") {
-    "Show in File Explorer"
+    LABELS[1]
 } else {
-    "Show in Files"
+    LABELS[2]
 };
+
+/// Every wording the button can carry, macOS then Windows then the rest.
+/// [`LABEL`] is one of these, and a caller that has to lay out the longest of
+/// them, or draw all three from one machine, reads them here.
+pub const LABELS: [&str; 3] = ["Reveal in Finder", "Show in File Explorer", "Show in Files"];
 
 /// Opens the folder holding `path` with `path` selected.
 ///
@@ -120,13 +125,18 @@ fn run(command: &mut Command) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The label is the platform's own word for this, and never ours.
+    /// The label is the platform's own word for this, and never ours. Three
+    /// wordings, all different and none of them blank, because a snapshot
+    /// fixture renders one picture per wording and two that matched would
+    /// leave a platform with none.
     #[test]
     fn the_button_is_named_the_way_this_platform_names_it() {
-        assert!(
-            ["Reveal in Finder", "Show in File Explorer", "Show in Files"].contains(&LABEL),
-            "{LABEL}"
-        );
+        assert!(LABELS.contains(&LABEL), "{LABEL}");
+        assert!(LABELS.iter().all(|word| !word.is_empty()));
+        let mut distinct = LABELS.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), LABELS.len(), "{LABELS:?}");
     }
 
     /// The comma binds the path to /select: `explorer /select, C:\x` with a
