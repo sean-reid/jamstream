@@ -2810,8 +2810,6 @@ fn the_measured_tests_are_named_in_the_nextest_config() {
     for (name, _) in named![
         tick_cost_at_capacity,
         a_set_avatar_flood_is_not_an_egress_amplifier,
-        a_capture_gap_the_length_of_a_device_reopen,
-        a_capture_gap_on_a_jittery_stream,
     ] {
         assert!(
             CONFIG.contains(&format!("test(={name})")),

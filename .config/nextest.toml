@@ -104,8 +104,6 @@ filter = """
     or test(=driver_stall_reanchors_and_audio_returns)
     or test(=soak_ten_minutes_regional)
     or test(=a_set_avatar_flood_is_not_an_egress_amplifier)
-    or test(=a_capture_gap_the_length_of_a_device_reopen)
-    or test(=a_capture_gap_on_a_jittery_stream)
     or test(=full_session_frame_allocations)
 """
 success-output = "immediate"
