@@ -1190,11 +1190,12 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
     .on_hover_text(latency_hover(s));
 }
 
-/// The latency number's hover, line by line: the link's own figures, then
-/// what the device stream got from the OS. Which WASAPI mode won and how
-/// each direction reaches the session rate are the facts that move this
-/// number between days on the same machine; a platform that reports
-/// neither adds no line, because a made-up answer is worse than none.
+/// The latency number's hover, line by line: the link's own figures, what each
+/// direction's device buffer costs inside the number, then what the device
+/// stream got from the OS. Which WASAPI mode won and how each direction reaches
+/// the session rate are the facts that move this number between days on the same
+/// machine; a platform that reports neither adds no line, because a made-up
+/// answer is worse than none.
 fn latency_hover(s: &crate::runtime::StatsView) -> String {
     let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
     let mut text = format!(
@@ -1203,6 +1204,15 @@ fn latency_hover(s: &crate::runtime::StatsView) -> String {
         s.jitter_target,
         s.loss_lines().join("\n")
     );
+    // Per direction rather than one device figure: they answer different
+    // questions, the playout cushion is the larger of the two, and the Buffer
+    // size pick moves both.
+    if let Some(device) = s.device_buffers {
+        for line in device.lines() {
+            text.push('\n');
+            text.push_str(&line);
+        }
+    }
     match s.device_mode {
         Some(crate::runtime::DeviceModeView::Exclusive) => {
             text.push_str("\nexclusive mode device, about 10 ms");
@@ -1669,6 +1679,30 @@ mod tests {
             "{moved:?}"
         );
         assert!(!moved.contains("mode device"), "{moved:?}");
+    }
+
+    /// The device buffers are two terms of the number, one per direction, and
+    /// the larger of them is the playout cushion. The hover names each, because
+    /// "device buffer" as one figure cannot say which end of the path a musician
+    /// is paying for, and a Buffer size pick moves both.
+    #[test]
+    fn the_hover_prices_each_direction_of_the_device() {
+        use crate::runtime::DeviceBuffersView;
+
+        let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+        let mut s = rt.snapshot().stats;
+        assert!(
+            !latency_hover(&s).contains("cushion"),
+            "with no stream there are no buffers to price"
+        );
+
+        s.device_buffers = Some(DeviceBuffersView {
+            capture_ms: 10.0,
+            playout_ms: 20.0,
+        });
+        let hover = latency_hover(&s);
+        assert!(hover.contains("capture buffer 10.0 ms"), "{hover:?}");
+        assert!(hover.contains("playout cushion 20.0 ms"), "{hover:?}");
     }
 
     /// The two directions mean opposite things: uplink loss is audio the band

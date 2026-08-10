@@ -198,6 +198,14 @@ impl Drop for TestServer {
     }
 }
 
+/// What the device buffers cost mouth to ear for a stream whose negotiated
+/// callback is `frames` session-rate frames: the capture buffer, plus the
+/// playout cushion the top-up loop holds at two callbacks. Everything else in
+/// the figure is the link, and the snapshot reports each of those itself.
+fn device_buffers_ms(frames: f32) -> f32 {
+    frames / 48.0 + 2.0 * frames / 48.0
+}
+
 fn settings() -> AudioSettings {
     AudioSettings {
         capture_id: None,
@@ -652,6 +660,68 @@ fn the_playout_water_mark_lands_on_the_snapshot_in_frames() {
          cushion; {} would be the interleaved samples and not the frames",
         cushion * 2
     );
+}
+
+/// The playout cushion inside the headline figure, at the two buffer sizes
+/// furthest apart on the settings screen. The cushion is two device callbacks,
+/// so it costs twice what the capture buffer does and it moves with the pick:
+/// 5 ms at 120 frames and 20 ms at 480. Strip the link terms the same snapshot
+/// reports and what is left is three callbacks, and the hover's own two figures
+/// are the ones the sum was built from.
+///
+/// Both sizes, because a term the code got wrong by a constant would satisfy
+/// this at one of them.
+#[test]
+fn the_figure_and_its_hover_carry_the_playout_cushion() {
+    let server = TestServer::start();
+    for (member, frames) in [(1u16, 120u32), (2, 480)] {
+        let rt = LiveRuntime::join_offline(
+            &server.invite(member, "solo"),
+            AudioSettings {
+                buffer_frames: frames,
+                ..settings()
+            },
+            WavBackend::new(None, None),
+        )
+        .expect("join offline");
+        let snap = wait_for(&rt, "joined with stats", Duration::from_secs(10), |s| {
+            joined(s) && s.stats.mouth_to_ear_ms.is_some()
+        });
+
+        let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
+        let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
+        let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5;
+        let device_ms = device_buffers_ms(frames as f32);
+        assert!(
+            (m2e - link_ms - device_ms).abs() < 0.01,
+            "at {frames}-frame callbacks mouth to ear {m2e} ms must carry \
+             {device_ms} ms of device buffers over {link_ms} ms of link"
+        );
+
+        let device = snap
+            .stats
+            .device_buffers
+            .expect("a running stream prices both of its buffers");
+        assert_eq!(device.capture_ms, frames as f32 / 48.0);
+        assert_eq!(
+            device.playout_ms,
+            2.0 * frames as f32 / 48.0,
+            "the cushion is two callbacks, not the ring it sits in"
+        );
+        assert_eq!(
+            device.lines(),
+            [
+                format!("capture buffer {:.1} ms", device.capture_ms),
+                format!("playout cushion {:.1} ms", device.playout_ms),
+            ],
+            "each direction is named, or the two read as one another"
+        );
+
+        rt.send(Command::Leave);
+        wait_for(&rt, "idle", Duration::from_secs(5), |s| {
+            s.stats.state == ConnState::Idle
+        });
+    }
 }
 
 /// The frame loop asks for the connection state alone rather than pulling a
@@ -1783,13 +1853,13 @@ fn a_converting_stream_discloses_itself_and_prices_the_latency() {
     );
 
     // Mouth to ear grew by the disclosed amount: strip the link terms this
-    // same snapshot reports and the capture-buffer term, and what is left is
-    // the converter's own figure. The buffer term is the negotiated callback
-    // in session-rate frames: the 120-frame request on a 44.1 kHz device is
-    // ceil(120 * 160/147) = 131.
+    // same snapshot reports and the two device buffers, and what is left is
+    // the converter's own figure. Both buffers are sized from the negotiated
+    // callback in session-rate frames: the 120-frame request on a 44.1 kHz
+    // device is ceil(120 * 160/147) = 131.
     let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
     let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
-    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + 131.0 / 48.0;
+    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + device_buffers_ms(131.0);
     let disclosed = capture_ms + playback_ms;
     assert!(
         (m2e - link_ms - disclosed).abs() < 0.01,
@@ -2308,12 +2378,12 @@ fn a_stream_that_converts_one_direction_discloses_only_that_direction() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].starts_with("converting capture 44.1 kHz to 48 kHz"));
 
-    // And one direction's milliseconds. The buffer term is the negotiated
-    // callback in session-rate frames: the 120-frame request against a
-    // 44.1 kHz capture endpoint is ceil(120 * 160/147) = 131.
+    // And one direction's milliseconds. Both device buffers are sized from the
+    // negotiated callback in session-rate frames: the 120-frame request against
+    // a 44.1 kHz capture endpoint is ceil(120 * 160/147) = 131.
     let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
     let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
-    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + 131.0 / 48.0;
+    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + device_buffers_ms(131.0);
     assert!(
         (m2e - link_ms - capture_ms).abs() < 0.01,
         "mouth to ear {m2e} ms must carry the converted direction's \
@@ -2367,11 +2437,11 @@ fn a_moved_clock_and_an_os_converter_read_as_themselves() {
         "the copy per rung is not interchangeable"
     );
 
-    // No converter, so mouth to ear carries no converter term, and the
-    // buffer term is the plain 120-frame request.
+    // No converter, so mouth to ear carries no converter term, and both device
+    // buffers are sized from the plain 120-frame request.
     let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
     let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
-    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + 120.0 / 48.0;
+    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + device_buffers_ms(120.0);
     assert!((m2e - link_ms).abs() < 0.01, "mouth to ear {m2e} ms");
 
     rt.send(Command::Leave);

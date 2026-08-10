@@ -383,10 +383,11 @@ impl DevicesScreen {
                     "Crackling: this device is not keeping up. Try the next size up.",
                 );
             }
-            // The number the choice is being traded against. The capture
-            // buffer is one of the four terms in mouth to ear, so this moves
-            // with the pick, and the same figure in the same monospace is in
-            // the status bar. Outside a session nothing has been measured,
+            // The number the choice is being traded against. This pick sets
+            // two of the terms in mouth to ear, the capture buffer and the
+            // playout cushion at twice it, so the figure moves with the pick,
+            // and the same figure in the same monospace is in the status bar.
+            // Outside a session nothing has been measured,
             // and a placeholder would be an instrument reading a made-up
             // number, so the row is absent instead.
             if let Some(ms) = mouth_to_ear_ms {

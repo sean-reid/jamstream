@@ -1306,13 +1306,14 @@ fn session_settings_hear_self() {
 }
 
 /// A session far enough apart to have earned the offer, at the latency that
-/// earned it: measured mouth to ear across the country over DSL. The figure
-/// and the offer are one state, so a fixture that drew the offer over the
-/// demo's own 8 ms would be a picture of a session that cannot exist.
+/// earned it: measured mouth to ear across the country over DSL, playout
+/// cushion included as the figure on screen carries it. The figure and the
+/// offer are one state, so a fixture that drew the offer over the demo's own
+/// 8 ms would be a picture of a session that cannot exist.
 fn offered_rt() -> DemoRuntime {
     let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
     rt.set_offer_hear_self(true);
-    rt.set_mouth_to_ear_ms(Some(64.8));
+    rt.set_mouth_to_ear_ms(Some(69.8));
     rt
 }
 

@@ -36,9 +36,9 @@ use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 use crate::avatar;
 use crate::runtime::{
     AudioFaultView, AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState,
-    CostView, DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView,
-    RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView,
-    StreamView, WakeView,
+    CostView, DestinationView, DeviceBuffersView, FaderView, LevelsView, MemberId, MemberView,
+    MetronomeView, RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime,
+    Snapshot, StatsView, StreamView, WakeView,
 };
 use crate::screens::invites::TokenMap;
 
@@ -179,11 +179,12 @@ const SLOW_REOPEN: Duration = Duration::from_secs(1);
 /// offering, and how long the figure holds above it before the offer goes out.
 ///
 /// The threshold is where a band stops holding together by ear. Measured mouth
-/// to ear is 9.7 ms across one city and 19.3 ms across one region, which bands
-/// play through, and about 30 ms is the edge of feeling like one stage. It is
-/// also the conservative side of that edge today, because this figure leaves
-/// the playout cushion out: two device callbacks, 5 ms at the 120-frame
-/// default and 20 ms at 480, so a reading of 30 is a path of 35 to 50.
+/// to ear is 14.7 ms across one city and 24.3 ms across one region, which bands
+/// play through, and about 30 ms is the edge of feeling like one stage. Both
+/// figures and this threshold are the same path: capture to the last buffer this
+/// app hands the card, the playout cushion included. What the card holds after
+/// that is on the far side of the threshold as well as the figure, so a reading
+/// of 30 is a path of 30 plus whatever that is.
 ///
 /// The window is what keeps a spike out. Of the terms in the figure only the
 /// jitter buffer's depth moves on its own, and it walks its whole range back
@@ -347,6 +348,9 @@ struct SharedState {
     uplink_loss_pct: Option<f32>,
     downlink_loss_pct: Option<f32>,
     mouth_to_ear_ms: Option<f32>,
+    /// The two device terms inside that figure, for the hover to name each
+    /// direction. None while there is no stream, like [`SharedState::rate`].
+    device_buffers: Option<DeviceBuffersView>,
     roster: Vec<MemberInfo>,
     /// Monitor-mix values the UI set, merged over the roster; the server
     /// does not echo MixerSet back.
@@ -428,6 +432,7 @@ impl SharedState {
             uplink_loss_pct: None,
             downlink_loss_pct: None,
             mouth_to_ear_ms: None,
+            device_buffers: None,
             roster: Vec::new(),
             faders: HashMap::new(),
             broadcast_faders: HashMap::new(),
@@ -1525,6 +1530,7 @@ impl LiveRuntime {
                 uplink_loss_pct: s.uplink_loss_pct,
                 downlink_loss_pct: s.downlink_loss_pct,
                 mouth_to_ear_ms: s.mouth_to_ear_ms,
+                device_buffers: s.device_buffers,
                 // Straight off the backend's own report at read time: there
                 // is one device stream per process and it follows the last
                 // open, so no worker plumbing could say anything truer.
@@ -2631,22 +2637,37 @@ impl Worker {
         // machine is not playing.
         s.uplink_loss_pct = stats.uplink_loss_pct;
         s.downlink_loss_pct = downlink;
-        // Mouth to ear, capture to playout:
+        // Mouth to ear, capture to the last buffer this app hands the card:
         //   rtt / 2                      the downlink network leg
         // + jitter depth * 2.5 ms        playout buffering ahead of decode
         // + 2.5 ms                       one media frame of encode latency
-        // + device_frames / 48 ms        the capture device buffer, as the
+        // + capture buffer ms            the capture device buffer, as the
         //                                device negotiated it, not as asked
+        // + playout cushion ms           the depth the top-up loop holds in the
+        //                                playout ring, which every sample
+        //                                queues behind before the device plays
+        //                                it
         // + converter added ms           the boundary resampler's disclosed
         //                                figure, per converted direction
+        //
+        // What the card holds after the callback returns is beyond our sight
+        // and in none of these terms.
         let convert_ms = s.rate.map_or(0.0, |r| r.added_ms());
+        let device = DeviceBuffersView {
+            capture_ms: self.device_frames as f32 / 48.0,
+            playout_ms: (self.playout_target / usize::from(CHANNELS)) as f32 / 48.0,
+        };
         s.mouth_to_ear_ms = stats.rtt_ms_last.map(|rtt| {
             rtt / 2.0
                 + stats.jitter.depth_frames as f32 * 2.5
                 + 2.5
-                + self.device_frames as f32 / 48.0
+                + device.capture_ms
+                + device.playout_ms
                 + convert_ms
         });
+        // The same two figures the sum used, so the hover can never break the
+        // number down into terms it was not built from.
+        s.device_buffers = self.engine.is_some().then_some(device);
         s.levels = self.levels;
         s.playout_low_frames = self.rings.playout_low_frames();
         s.wake = self.wake.pacing().map(|pacing| WakeView {
@@ -3999,8 +4020,9 @@ mod tests {
 
     /// Measured mouth to ear across one region, which is a band that holds
     /// together, and across the country on DSL, which is one that does not.
-    const REGION_MS: f32 = 19.3;
-    const CROSS_COUNTRY_MS: f32 = 64.8;
+    /// Both carry the playout cushion, as the figure they are readings of does.
+    const REGION_MS: f32 = 24.3;
+    const CROSS_COUNTRY_MS: f32 = 69.8;
     /// Ticks in the window the offer waits out.
     const OFFER_TICKS: u32 = (HEAR_SELF_OFFER_WINDOW.as_micros() / TICK.as_micros()) as u32;
 
