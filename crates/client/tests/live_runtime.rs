@@ -766,18 +766,22 @@ fn the_figure_and_its_hover_carry_the_playout_cushion() {
 fn the_figure_charges_the_buffer_the_server_reports() {
     let server = TestServer::start();
     let rt = join_silent(&server, 1, "solo");
+    // The figure is absent until a round trip has been measured, which joining
+    // does not guarantee, so it is part of what this waits for rather than
+    // something to read the instant the buffer report lands.
     let snap = wait_for(
         &rt,
-        "the server's buffer report",
+        "the server's buffer report and a measured round trip",
         Duration::from_secs(10),
-        |s| joined(s) && s.stats.uplink_jitter_depth.is_some(),
+        |s| {
+            joined(s)
+                && s.stats.uplink_jitter_depth.is_some()
+                && s.stats.mouth_to_ear_ms().is_some()
+        },
     );
 
     let depth = snap.stats.uplink_jitter_depth.expect("the predicate held");
-    let m2e = snap
-        .stats
-        .mouth_to_ear_ms()
-        .expect("a joined session measures the figure");
+    let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
     let device_ms = device_buffers_ms(settings().buffer_frames as f32);
     assert!(
         (m2e - link_ms(&snap) - device_ms).abs() < 0.01,
