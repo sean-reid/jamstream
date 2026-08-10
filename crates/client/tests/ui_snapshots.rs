@@ -792,6 +792,67 @@ fn takes_with_expired_takes() {
     snapshot(&mut harness, "takes_with_expired_takes");
 }
 
+/// The state the expiry rule exists for, which no other fixture holds: the
+/// retention rule deleted this session's objects a week ago, and the mix a
+/// download left in the session's folder is the only copy there is. One row, so
+/// the wording is what the picture is of.
+///
+/// The file is declared here rather than written, because the folder on the card
+/// is a plausible home directory: a fixture that wrote into this machine's music
+/// folder would render a path no other machine has.
+fn takes_kept_app(theme: Theme) -> JamApp {
+    use jamstream_client::screens::takes::{Part, TakeFile, TakeRow};
+    let mut app = takes_app_with_expired(theme, 1);
+    app.takes
+        .rows
+        .retain(|row| row.short_id.starts_with("e0e0"));
+    let row = &mut app.takes.rows[0];
+    // The take's own name, as the recorder builds it from the clock: a few
+    // minutes into a session that ran on 21 June.
+    let name = "jamstream-2026-06-21-2025-mix.flac".to_owned();
+    row.takes = vec![TakeRow {
+        base: "jamstream-2026-06-21-2025".to_owned(),
+        mix: Part {
+            files: vec![TakeFile {
+                name: name.clone(),
+                bytes: 1_100_000_000,
+                object: None,
+                local: Some(row.dir.join(&name)),
+                partial: false,
+                unchecked: true,
+            }],
+        },
+        stems: Part::default(),
+    }];
+    app
+}
+
+#[test]
+fn takes_kept_on_this_computer() {
+    let mut harness = app_harness(takes_kept_app(Theme::Dark), WIDE);
+    harness.run_steps(4);
+    assert!(
+        harness
+            .get_all_by_label_contains("kept on this computer")
+            .next()
+            .is_some(),
+        "the card has to say the take lives here now"
+    );
+    assert!(
+        harness
+            .query_all_by_label_contains("expires")
+            .next()
+            .is_none(),
+        "a countdown to a deletion that has already happened"
+    );
+    assert_eq!(
+        harness.get_all_by_label(MACOS_REVEAL).count(),
+        1,
+        "the only copy of the take has to be reachable"
+    );
+    snapshot(&mut harness, "takes_kept_on_this_computer");
+}
+
 /// A take inside its window, or already on this computer, is one somebody can
 /// still play, so no window size may drop one. The expired ones with nothing
 /// here are the only rows the screen is allowed to leave out.
