@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use egui::{RichText, Ui};
 use jamstream_cli::CliError;
+use jamstream_cli::downloads::{self, LocalTake};
 use jamstream_cli::reason::{self, Attempt};
 use jamstream_cli::recordings::{self, Action, Take, TakeProgress};
 use jamstream_cli::state::{RecordingRecord, SessionState, SessionStatus};
@@ -284,48 +285,6 @@ pub enum Clock {
     Kept,
 }
 
-/// A take file found on this computer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalTake {
-    pub path: PathBuf,
-    pub bytes: u64,
-    /// When the file was last written, which for a finished take is when Stop
-    /// was pressed.
-    pub modified_unix: u64,
-}
-
-/// Reads the recordings folder. A folder that is not there is no takes rather
-/// than an error: it is created by the first local recording.
-pub fn local_takes(dir: &Path) -> Vec<LocalTake> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if !name.starts_with("jamstream-") {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let modified_unix = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        out.push(LocalTake {
-            path,
-            bytes: meta.len(),
-            modified_unix,
-        });
-    }
-    out
-}
-
 /// Builds the screen's rows from what this machine knows: the session records,
 /// the bucket sidecars beside them, and the take files on this disk.
 ///
@@ -369,7 +328,7 @@ pub fn rows_from(
             // A session that recorded nowhere has nothing to show here.
             None => continue,
         };
-        let dir = downloads_dir.join(session.session_id_hex.chars().take(8).collect::<String>());
+        let dir = downloads::session_dir(downloads_dir, &session.session_id_hex);
         let takes = match &place {
             Place::Bucket(_) => group(folder_files(&dir)),
             Place::Disk(_) => takes_from_disk(&mine),
@@ -443,7 +402,7 @@ pub fn takes_from_objects(objects: &[Take], dir: &Path) -> Result<Vec<TakeRow>, 
 /// not turn that music into takes, and neither does a directory sharing a
 /// take's name.
 fn folder_files(dir: &Path) -> Vec<TakeFile> {
-    let found = local_takes(dir);
+    let found = downloads::local_takes(dir);
     files_from_local(found.iter(), true)
 }
 
@@ -456,16 +415,13 @@ fn files_from_local<'a>(
     unchecked: bool,
 ) -> Vec<TakeFile> {
     local
-        .map(|take| {
-            let name = take.path.file_name().unwrap_or_default().to_string_lossy();
-            TakeFile {
-                name: name.trim_end_matches(".part").to_owned(),
-                bytes: take.bytes,
-                object: None,
-                local: Some(take.path.clone()),
-                partial: name.ends_with(".part"),
-                unchecked,
-            }
+        .map(|take| TakeFile {
+            name: take.name().trim_end_matches(".part").to_owned(),
+            bytes: take.bytes,
+            object: None,
+            local: Some(take.path.clone()),
+            partial: take.partial(),
+            unchecked,
         })
         .collect()
 }
@@ -765,9 +721,9 @@ impl TakesScreen {
                 let local_dir = jamstream_cli::state::recordings_dir().unwrap_or_default();
                 self.rows = rows_from(
                     &sessions,
-                    &local_takes(&local_dir),
+                    &downloads::local_takes(&local_dir),
                     &local_dir,
-                    &downloads_dir(),
+                    &downloads::dir(),
                     now_unix(),
                 );
             }
@@ -1029,33 +985,6 @@ fn read_sessions() -> Result<Vec<(SessionState, Option<RecordingRecord>)>, Strin
         out.push((session, record));
     }
     Ok(out)
-}
-
-/// Where a downloaded take lands: a JamStream folder in the platform's music
-/// directory, which is where music belongs and somewhere a DAW already looks.
-/// Each session gets its own folder under it, because two sessions can record
-/// takes a minute apart and the recorder names by clock time.
-pub fn downloads_dir() -> PathBuf {
-    resolve_downloads_dir(
-        dirs::audio_dir()
-            .or_else(dirs::download_dir)
-            .or_else(dirs::home_dir)
-            // The CLI's state dir refuses outright with no platform
-            // directory, because it holds keys. This is where downloads land
-            // and what the reveal button opens, so refusal would kill the
-            // feature; the current directory keeps the path absolute, where
-            // the bare name resolved against whatever the process started in
-            // (System32, from the Windows Start menu).
-            .or_else(|| std::env::current_dir().ok()),
-    )
-}
-
-/// The chosen base with our folder inside it; no base at all leaves the bare
-/// relative name, the honest floor when even the current directory is
-/// unknowable.
-fn resolve_downloads_dir(base: Option<PathBuf>) -> PathBuf {
-    base.map(|dir| dir.join("JamStream"))
-        .unwrap_or_else(|| PathBuf::from("JamStream"))
 }
 
 fn now_unix() -> u64 {
@@ -1912,25 +1841,5 @@ mod tests {
         for identifier in ["887762372032", "arn:", "Q0YMR4GFKCH1Y688", "EE3WMEND", "<"] {
             assert!(!shown.contains(identifier), "{identifier} leaked: {shown}");
         }
-    }
-
-    /// The folder is ours by name wherever it lands, and a machine that can
-    /// name any directory at all gets an absolute path: a relative one
-    /// resolves against whatever the process started in, which for a Start
-    /// menu launch on Windows is System32, and both the reveal button and
-    /// the "landed in" line would point there.
-    #[test]
-    fn the_downloads_dir_is_absolute_whenever_any_base_exists() {
-        let base = std::env::temp_dir();
-        assert_eq!(
-            resolve_downloads_dir(Some(base.clone())),
-            base.join("JamStream")
-        );
-        assert_eq!(resolve_downloads_dir(None), PathBuf::from("JamStream"));
-        // The live chain ends at current_dir, so on any machine where this
-        // test can run the real answer is absolute.
-        let dir = downloads_dir();
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(dir.ends_with("JamStream"), "{}", dir.display());
     }
 }

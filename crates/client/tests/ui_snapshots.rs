@@ -559,9 +559,10 @@ fn takes_app(theme: Theme) -> JamApp {
 /// behind the fixture's clock, none of them downloaded. They are what the
 /// screen is entitled to drop.
 fn takes_app_with_expired(theme: Theme, expired: usize) -> JamApp {
+    use jamstream_cli::downloads::LocalTake;
     use jamstream_cli::recordings::Take;
     use jamstream_cli::state::{RecordingRecord, RetentionApplied, SessionStatus};
-    use jamstream_client::screens::takes::{LocalTake, rows_from, takes_from_objects};
+    use jamstream_client::screens::takes::{rows_from, takes_from_objects};
 
     // 2026-07-28 20:20 UTC, ten minutes after the last take of the night.
     const NOW: u64 = 1_785_270_000;

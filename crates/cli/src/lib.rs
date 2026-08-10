@@ -4,6 +4,7 @@
 //! dispatches, so integration tests drive the exact code the binary runs.
 
 pub mod cli;
+pub mod downloads;
 pub mod end;
 pub mod host;
 pub mod join;
