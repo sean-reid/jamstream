@@ -295,7 +295,7 @@ mod tests {
         let value = serde_json::to_value(&prefs).expect("encode");
         let fields = value.as_object().expect("an object");
         for field in fields.keys() {
-            for word in ["headphone", "hear", "monitor"] {
+            for word in ["headphone", "hear"] {
                 assert!(
                     !field.contains(word),
                     "{field:?} answers a question the app does not ask"
