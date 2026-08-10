@@ -27,7 +27,7 @@ Once connected you are in the session screen:
 
 What you are looking at:
 
-- One mixer strip per musician: an avatar disc, a presence dot, name, fader, pan, dB readout, and a Mute button. This is your personal monitor mix; moving Ana's fader changes what you hear, not what anyone else hears.
+- One mixer strip per musician: an avatar disc, a presence dot, a name, a fader, its dB readout, a pan slider, and a Mute button. This is your personal monitor mix; moving Ana's fader changes what you hear, not what anyone else hears.
 - The avatar disc shows a member's picture if they set one, and their initials on a color hashed from their name if they have not. The same disc and color appear on the card the broadcast renders, so a member looks the same in the app and on a stream.
 - Your own strip is dimmed with a "you" tag and its controls do nothing: there is no separate gain for your own channel, because self monitoring is local. The Audio tab's **Hear yourself through the server** puts your own sound in the mix too, on the band's timeline instead of off it.
 - The host additionally sees a Revoke button on every other strip. Revoking ejects that member and kills their invite, with a confirmation step.
