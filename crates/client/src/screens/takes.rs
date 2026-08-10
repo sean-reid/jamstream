@@ -147,6 +147,14 @@ pub struct TakeRow {
 }
 
 impl TakeRow {
+    /// The mix or the stems, whichever `half` asks for.
+    pub fn part(&self, half: Half) -> &Part {
+        match half {
+            Half::Mix => &self.mix,
+            Half::Stems => &self.stems,
+        }
+    }
+
     /// The time of day the take started, read out of its own name rather than
     /// from a clock: the recorder put it there, in UTC, and it is the one thing
     /// that tells two takes of the same song apart.
@@ -830,11 +838,7 @@ impl TakesScreen {
         let Some(take) = row.takes.iter().find(|t| t.base == base) else {
             return false;
         };
-        let part = match half {
-            Half::Mix => &take.mix,
-            Half::Stems => &take.stems,
-        };
-        let wanted = part.wanted();
+        let wanted = take.part(half).wanted();
         if wanted.is_empty() {
             return false;
         }
@@ -988,7 +992,10 @@ fn now_unix() -> u64 {
 // Rendering.
 
 impl TakesScreen {
-    pub fn ui(&mut self, ui: &mut Ui) {
+    /// `reveal_label` is the platform's own word for the button on a take that
+    /// is already here; the app holds it so a fixture can render every
+    /// platform's wording.
+    pub fn ui(&mut self, ui: &mut Ui, reveal_label: &str) {
         self.poll();
         let room = ui.available_height();
         let mut refresh = false;
@@ -1070,7 +1077,9 @@ impl TakesScreen {
                             let mut card = |ui: &mut Ui, row: &SessionTakes| {
                                 theme::panel(ui).show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    if let Some(action) = session_card(ui, row, fetching) {
+                                    if let Some(action) =
+                                        session_card(ui, row, fetching, reveal_label)
+                                    {
                                         match action {
                                             CardAction::Reveal(path) => reveal = Some(path),
                                             CardAction::Download(base, half) => {
@@ -1129,6 +1138,7 @@ fn session_card(
     ui: &mut Ui,
     row: &SessionTakes,
     fetching: Option<&Fetching>,
+    reveal_label: &str,
 ) -> Option<CardAction> {
     let mut action = None;
     ui.horizontal(|ui| {
@@ -1193,11 +1203,11 @@ fn session_card(
     for take in &row.takes {
         ui.add_space(theme::SPACE_SM);
         ui.label(theme::mono_muted(ui, take.at()));
-        for (half, part) in [(Half::Mix, &take.mix), (Half::Stems, &take.stems)] {
-            if part.files.is_empty() {
+        for half in [Half::Mix, Half::Stems] {
+            if take.part(half).files.is_empty() {
                 continue;
             }
-            if let Some(clicked) = part_row(ui, row, take, half, part, fetching) {
+            if let Some(clicked) = part_row(ui, row, take, half, fetching, reveal_label) {
                 action = Some(clicked);
             }
         }
@@ -1228,10 +1238,11 @@ fn part_row(
     row: &SessionTakes,
     take: &TakeRow,
     half: Half,
-    part: &Part,
     fetching: Option<&Fetching>,
+    reveal_label: &str,
 ) -> Option<CardAction> {
     let mut action = None;
+    let part = take.part(half);
     let running = fetching
         .filter(|f| f.session_id == row.session_id && f.base == take.base && f.half == half);
     ui.horizontal(|ui| {
@@ -1276,7 +1287,7 @@ fn part_row(
                 // button on the row off the edge of the card.
                 ui.add(egui::Label::new(theme::muted(ui, where_it_is)).truncate());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(reveal::LABEL).clicked() {
+                    if ui.button(reveal_label).clicked() {
                         action = Some(CardAction::Reveal(path));
                     }
                 });

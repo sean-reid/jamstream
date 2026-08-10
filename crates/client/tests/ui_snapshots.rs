@@ -12,6 +12,7 @@ use jamstream_client::app::{JamApp, Screen};
 use jamstream_client::creds::{self, CredStore, EnvReader, MemStore};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
 use jamstream_client::exec::Executor;
+use jamstream_client::reveal;
 use jamstream_client::runtime::{
     AudioFaultView, BroadcastReadiness, DestinationState, RateOutcomeView, RateOutcomesView,
     RecordState, StreamPlatform,
@@ -191,8 +192,18 @@ fn test_app(theme: Theme) -> JamApp {
     // different layout on each. Pinned here, set by the fixtures that render
     // the other answer.
     app.devices.exclusive_offered = false;
+    // The same for the word on the reveal button: pinned to the macOS one,
+    // set by the fixtures that render the other two.
+    app.reveal_label = MACOS_REVEAL;
     app
 }
+
+/// The three wordings of the reveal button, in [`reveal::LABELS`] order. The
+/// macOS one is what every baseline that is not about the platform holds; the
+/// Windows one is the longest, which is what a row has to survive.
+const MACOS_REVEAL: &str = reveal::LABELS[0];
+const WINDOWS_REVEAL: &str = reveal::LABELS[1];
+const OTHER_REVEAL: &str = reveal::LABELS[2];
 
 /// The guard behind [`test_app`]. Every cloud provider must read "setup
 /// needed" in a fixture, on every machine, because the fixture has no
@@ -207,6 +218,11 @@ fn fixtures_cannot_see_the_machine_that_runs_them() {
         !app.devices.exclusive_offered,
         "the exclusive control has to be pinned, or a Windows render of the \
          Audio tab holds a control the baseline does not"
+    );
+    assert_eq!(
+        app.reveal_label, MACOS_REVEAL,
+        "the reveal wording has to be pinned, or every take row and the About \
+         tab read differently on a Linux render"
     );
     for row in &app.wizard.providers {
         let expected = if row.name == "local" {
@@ -815,6 +831,115 @@ fn a_take_still_worth_playing_is_never_dropped() {
                 .is_some(),
             "nothing said what was left out at {size:?}"
         );
+    }
+}
+
+/// The takes screen as Windows words the reveal button, which is the longest
+/// of the three wordings and so the one the row has to survive. Its pair is
+/// [`takes`], and the wording is the whole difference between them.
+///
+/// One window size, unlike the exclusive pair on the Audio tab: the column is
+/// capped at the screen's own width, which the smallest window the app opens
+/// still fits, so a narrow render moves this row sideways and changes nothing
+/// about it. `every_reveal_wording_fits_beside_what_it_stands_next_to` holds
+/// that, and covers the wordings at both sizes by measurement.
+#[test]
+fn takes_show_in_file_explorer() {
+    let mut app = takes_app(Theme::Dark);
+    app.reveal_label = WINDOWS_REVEAL;
+    let mut harness = app_harness(app, WIDE);
+    harness.run_steps(4);
+    assert_eq!(
+        harness.get_all_by_label(WINDOWS_REVEAL).count(),
+        2,
+        "both takes that are here have to offer the button, or the baseline \
+         locks in a row without one"
+    );
+    snapshot(&mut harness, "takes_show_in_file_explorer");
+}
+
+/// The same rows as every platform that is neither macOS nor Windows names the
+/// button, which is the last of the three wordings with no picture of its own.
+#[test]
+fn takes_show_in_files() {
+    let mut app = takes_app(Theme::Dark);
+    app.reveal_label = OTHER_REVEAL;
+    let mut harness = app_harness(app, WIDE);
+    harness.run_steps(4);
+    assert_eq!(harness.get_all_by_label(OTHER_REVEAL).count(), 2);
+    snapshot(&mut harness, "takes_show_in_files");
+}
+
+/// Every wording of the reveal button, in both places the app draws one, at
+/// both window sizes. The button is right-aligned and what sits to its left
+/// truncates, so the way a longer wording fails is by running off the edge or
+/// over its neighbour, and a baseline rendered on one platform can only ever
+/// show one of the three.
+#[test]
+fn every_reveal_wording_fits_beside_what_it_stands_next_to() {
+    for size in [WIDE, NARROW] {
+        let edge = size.x * PPP;
+        for word in reveal::LABELS {
+            let mut app = takes_app(Theme::Dark);
+            app.reveal_label = word;
+            let mut harness = app_harness(app, size);
+            harness.run_steps(4);
+            let neighbours: Vec<egui::Rect> = harness
+                .get_all_by_label_contains("on this computer")
+                .chain(harness.get_all_by_label_contains("saved to"))
+                .map(|node| node.rect())
+                .collect();
+            assert_eq!(neighbours.len(), 2, "the fixture's two revealable takes");
+            buttons_fit(&mut harness, word, size, edge, &neighbours);
+
+            let mut app = drawer_app(
+                session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
+                SettingsTab::You,
+            );
+            app.reveal_label = word;
+            app.log_path = Some(PathBuf::from(
+                "/Users/you/Library/Application Support/jamstream/logs/app.log",
+            ));
+            let mut harness = app_harness(app, size);
+            scroll_drawer(&mut harness, size);
+            let copy = vec![
+                harness
+                    .get_all_by_label("Copy path")
+                    .next()
+                    .expect("the log row copies its path")
+                    .rect(),
+            ];
+            buttons_fit(&mut harness, word, size, edge, &copy);
+        }
+    }
+}
+
+/// Asserts every button labelled `word` is whole inside the window and clear
+/// of whichever of `neighbours` shares a line with it.
+fn buttons_fit(
+    harness: &mut Harness<'_>,
+    word: &str,
+    size: egui::Vec2,
+    edge: f32,
+    neighbours: &[egui::Rect],
+) {
+    let buttons: Vec<egui::Rect> = harness.get_all_by_label(word).map(|n| n.rect()).collect();
+    assert!(!buttons.is_empty(), "{word:?} is not drawn at {size:?}");
+    for button in &buttons {
+        assert!(
+            button.left() >= 0.0 && button.right() <= edge,
+            "{word:?} runs off a {} point window at {button:?}",
+            size.x
+        );
+        for neighbour in neighbours {
+            if neighbour.top() >= button.bottom() || neighbour.bottom() <= button.top() {
+                continue;
+            }
+            assert!(
+                neighbour.right() <= button.left(),
+                "{word:?} at {button:?} overlaps {neighbour:?} at {size:?}"
+            );
+        }
     }
 }
 
