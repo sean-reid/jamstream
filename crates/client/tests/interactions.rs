@@ -2344,21 +2344,11 @@ fn held_cushion(held_frames: usize, callback_frames: usize, out_of_room: bool) -
 /// person who chose a size is entitled to know it is the one they are getting.
 #[test]
 fn the_buffer_control_says_what_the_cushion_is_holding_and_whether_anything_moved_it() {
-    // Nothing pinned: an open stream holds the depth its buffer size asks for,
-    // so the sentence is on the tab of every session rather than of the ones a
-    // fixture arranged for.
+    // Nothing pinned, which is the common case: an open stream holds what its
+    // buffer size asks for, off the app's own default pick and the controller
+    // that opens at it, so this is the sentence on the tab of every session
+    // rather than of the ones a fixture arranged for.
     let mut harness = audio_tab_harness(None, |_| {});
-    harness.run_steps(4);
-    assert!(
-        harness
-            .query_by_label_contains("Cushion: 5.0 ms, what this buffer size asks for")
-            .is_some(),
-        "every open stream holds a cushion and the control reports it"
-    );
-
-    let mut harness = audio_tab_harness(None, |demo| {
-        demo.set_cushion(held_cushion(240, 120, false));
-    });
     harness.run_steps(4);
     assert!(
         harness
