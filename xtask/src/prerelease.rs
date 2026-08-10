@@ -8,10 +8,12 @@
 //! reports, and a device producing on its own clock rather than being pumped by
 //! its own consumer.
 //!
-//! `cargo xtask prerelease` runs all four on the machine in front of you and
-//! says what each one needs first. The test at the bottom keeps the list
-//! honest: a fifth ignored test anywhere in the workspace fails it until it
-//! is named here.
+//! `cargo xtask prerelease` runs all four on the machine in front of you,
+//! says what each one needs before it starts, and says what a pass proved
+//! afterwards, because the value of a hand check is that a human read the
+//! result. CONTRIBUTING.md names it as a release step. The test at the bottom
+//! keeps the list honest: a fifth ignored test anywhere in the workspace fails
+//! it until it is named here.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -25,6 +27,8 @@ pub struct HandCheck {
     /// What the machine has to have, said before the run rather than after
     /// it fails.
     pub needs: &'static str,
+    /// What a pass establishes, so the person who ran it can say so.
+    pub proves: &'static str,
 }
 
 /// Every `#[ignore]`d test in the workspace, in the order to work through
@@ -35,12 +39,18 @@ pub const HAND_CHECKS: [HandCheck; 4] = [
         target: "lib",
         test: "probe::tests::probe_the_shipped_catalog",
         needs: "the open internet; it dials every region in the shipped catalog",
+        proves: "every region in the shipped catalog resolves and answers, at the \
+                 round trip printed beside it",
     },
     HandCheck {
         package: "jamstream-audio-io",
         target: "cpal_devices",
         test: "enumerate_and_open_default_duplex",
         needs: "a real capture and playback device, and Windows for the sharing mode",
+        proves: "the default devices open as one duplex stream and both callbacks \
+                 fire; on Windows, that the backend reports the sharing mode it \
+                 opened. It counts callbacks rather than reading them, so it passes \
+                 on a machine producing silence",
     },
     HandCheck {
         package: "jamstream-audio-io",
@@ -48,6 +58,10 @@ pub const HAND_CHECKS: [HandCheck; 4] = [
         test: "a_tone_survives_the_round_trip_through_real_hardware",
         needs: "a loopback device (BlackHole, VB-CABLE, or a null sink) selected as \
                 both the input and the output",
+        proves: "the 440 Hz tone comes back off a real device dominant over both \
+                 control frequencies, so the round trip preserves audio content. \
+                 Read the printed magnitude against its controls: the margin is \
+                 about six orders of magnitude, and 100x is all that is asserted",
     },
     HandCheck {
         package: "jamstream-client",
@@ -56,6 +70,10 @@ pub const HAND_CHECKS: [HandCheck; 4] = [
         needs: "a real capture and playback device, and a machine that is not \
                 otherwise busy; it counts dropped capture against the client's own \
                 ring sizes",
+        proves: "a device running on its own clock loses no capture while a session \
+                 comes up: zero overruns against the client's real ring sizes, and \
+                 the printed count of what was already waiting when the open \
+                 returned",
     },
 ];
 
@@ -84,34 +102,57 @@ impl HandCheck {
 /// device does not hide the rest, and reports at the end.
 pub fn run() -> ExitCode {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    println!(
+        "{} hand checks, none of which any CI runner can make. Each one says what \
+         it needs before it runs and what it proved after.",
+        HAND_CHECKS.len()
+    );
     let mut failed = Vec::new();
     for check in &HAND_CHECKS {
-        println!("\n=== {} needs {}", check.short_name(), check.needs);
+        println!("\n=== {}", check.short_name());
+        println!("    needs {}", check.needs);
+        println!("    cargo {}", check.args().join(" "));
         let status = Command::new(&cargo)
             .args(check.args())
             .current_dir(workspace_root())
             .status();
         match status {
-            Ok(status) if status.success() => println!("--- {} passed", check.short_name()),
+            Ok(status) if status.success() => {
+                println!("--- {} passed: {}", check.short_name(), check.proves);
+            }
             Ok(status) => {
-                println!("--- {} failed ({status})", check.short_name());
-                failed.push(check.short_name());
+                println!(
+                    "--- {} failed ({status}). It needs {}; a machine without that \
+                     fails here rather than skipping, so check that first.",
+                    check.short_name(),
+                    check.needs
+                );
+                failed.push(check);
             }
             Err(err) => {
                 println!("--- {} could not be started: {err}", check.short_name());
-                failed.push(check.short_name());
+                failed.push(check);
             }
         }
     }
     if failed.is_empty() {
-        println!("\nAll {} hand checks passed.", HAND_CHECKS.len());
+        println!(
+            "\nAll {} hand checks passed on this machine. The release can say so.",
+            HAND_CHECKS.len()
+        );
         return ExitCode::SUCCESS;
     }
     println!(
-        "\n{} of {} hand checks did not pass: {}",
+        "\n{} of {} hand checks did not pass:",
         failed.len(),
-        HAND_CHECKS.len(),
-        failed.join(", ")
+        HAND_CHECKS.len()
+    );
+    for check in &failed {
+        println!("  {} needs {}", check.short_name(), check.needs);
+    }
+    println!(
+        "A check whose machine has not got what it needs fails; it does not skip. \
+         Give it what it asks for and run it again."
     );
     ExitCode::FAILURE
 }
@@ -233,6 +274,33 @@ mod tests {
              task names one that has moved. Nothing in CI runs these, so the \
              task is the only place they run at all"
         );
+    }
+
+    /// A task nothing points at is a task nobody runs, so the two places that
+    /// point a release at it have to keep naming it: the contributor guide and
+    /// the header release-please puts on every release pull request.
+    #[test]
+    fn the_release_process_names_the_task() {
+        for path in ["CONTRIBUTING.md", "release-please-config.json"] {
+            let text = std::fs::read_to_string(workspace_root().join(path))
+                .unwrap_or_else(|err| panic!("{path} is readable: {err}"));
+            assert!(
+                text.contains("cargo xtask prerelease"),
+                "{path} does not name `cargo xtask prerelease`, so nothing points a \
+                 release at the checks no runner can make"
+            );
+        }
+    }
+
+    /// A pass is only worth something if the person who ran it can say what it
+    /// established, and a failure is only useful if it names the missing
+    /// precondition. Both are printed, so both have to be there.
+    #[test]
+    fn every_check_says_what_it_needs_and_proves() {
+        for check in &HAND_CHECKS {
+            assert!(!check.needs.is_empty(), "{} needs nothing?", check.test);
+            assert!(!check.proves.is_empty(), "{} proves nothing?", check.test);
+        }
     }
 
     /// The command has to name one test, in one target, and ask for the
