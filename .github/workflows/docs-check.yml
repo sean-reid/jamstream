@@ -15,6 +15,9 @@
 #   survive a real install, smoke, and uninstall on a runner of its own
 #   platform, against the newest release that has finished uploading its
 #   assets.
+# - prose: no paragraph or list item on the site runs past 320 characters
+#   and no list past 12 items. A wall of text is what stops somebody
+#   reading a reference page, and per-page word count does not measure it.
 # - site-fonts: the theme's fonts are copies of fonts/ at the root of the
 #   tree. A change to those must run site/copy-fonts.sh in the same change
 #   or this job fails, and a build of the book proves the fonts reach it.
@@ -85,6 +88,15 @@ jobs:
   # back with nothing reporting an error. The copies are what CI can see, so
   # this job proves they still match their source and that a real build ships
   # the bytes themselves rather than anything standing in for them.
+  prose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: python3 site/check-prose.py
+
   site-fonts:
     runs-on: ubuntu-latest
     timeout-minutes: 10

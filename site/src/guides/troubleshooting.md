@@ -27,15 +27,20 @@ Check these in order of payoff:
 1. **Bluetooth.** Bluetooth headphones or earbuds add more delay than JamStream's entire network path. Use wired headphones, always. This is the most common cause of "it feels wrong" with a good-looking number.
 2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. Hover the latency number for the `buffer` readout, which reads "buffer 3/4 frames": the depth it is holding against the depth it is aiming for, in 2.5 ms frames. If it sits high or climbs, plug in ethernet.
 3. **Buffer size.** On the Audio tab, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that stays clean. A **crackling** tag beside the latency number, or the line under the choices saying the device is not keeping up, means take the next size up.
-4. **Sample rate.** A direction JamStream's own converter has to carry costs about 3 ms, and says so with a muted **converting** tag beside the latency number naming both rates.
-   The headline number already includes that cost and the hover breaks it out per direction. [Device problems](#device-problems) has the whole ladder and how to get off it.
-5. **WASAPI mode, on Windows.** Exclusive mode adds about 10 ms; shared mode adds 20 to 30 ms. The latency number's hover names which one this session got.
-   JamStream asks for exclusive by default; the "Allow exclusive access" setting under Devices turns that off when another app needs the same device, at the shared-mode cost.
+4. **Sample rate.** A direction JamStream's own converter carries costs about 3 ms, and says so with a muted **converting** tag naming both rates.
+
+   The headline number already includes it and the hover breaks it out per direction. [Device problems](#device-problems) has the whole ladder.
+5. **WASAPI mode, on Windows.** Exclusive adds about 10 ms, shared 20 to 30. The latency number's hover names which one this session got.
+
+   JamStream asks for exclusive by default. The "Allow exclusive access" setting under Devices turns that off when another app needs the same device, at the shared-mode cost.
 
    Exclusive mode itself needs "Allow applications to take exclusive control of this device" ticked on the device's Advanced tab in the Sound dialog, for both input and output. Without it the session opens shared instead, and the hover is the only place that says so.
 6. **Region.** If the session's round trip (`rtt`, on the latency number's hover) is high for you specifically, the server is far from you. The host can pick a fairer region next time; see [Hosting a session](hosting.md#the-region-table).
-7. **Loss.** The same hover carries a percentage per direction, each one a rate over the last second, so a bad moment clears once it passes: `uplink loss` is what the band is missing of you, `downlink loss` is what you are missing of them. Both should sit near 0.0%. Sustained loss above 1% points at the local network: congested wifi, a saturated uplink, a bad cable.
-   An **uplink loss** tag beside the latency number means the band is missing enough of you to hear it. That is the one fault nothing you hear will tell you about, because your own monitoring, your meters, and the sound of the room are all downstream of it; the fix is the same local network, from your end.
+7. **Loss.** The same hover carries a rate per direction over the last second, so a bad moment clears once it passes. `uplink loss` is what the band is missing of you; `downlink loss` is what you are missing of them.
+
+   Both should sit near 0.0%. Above 1% sustained points at the local network: congested wifi, a saturated uplink, a bad cable.
+
+   An **uplink loss** tag beside the latency number means the band is missing enough of you to hear it. Nothing you hear will tell you, because your monitoring, your meters and the room are all downstream of it. Same fix, from your end.
 
 ## The band can't keep together
 
