@@ -1,19 +1,20 @@
 //! The checks no runner can make, as a step somebody works through.
 //!
-//! Four tests in this workspace are `#[ignore]`d because they need something a
+//! Six tests in this workspace are `#[ignore]`d because they need something a
 //! hosted runner has not got: a real audio endpoint, a loopback device, the
 //! open internet. No workflow passes `--run-ignored`, so none of them has ever
-//! run in CI, and three of them are the only coverage of what they cover:
+//! run in CI, and five of them are the only coverage of what they cover:
 //! audio content through a real device, the sharing mode the Windows backend
-//! reports, and a device producing on its own clock rather than being pumped by
-//! its own consumer.
+//! reports, a device producing on its own clock rather than being pumped by
+//! its own consumer, and the depth the playout cushion settles on against a
+//! clock this side cannot pace.
 //!
-//! `cargo xtask prerelease` runs all four on the machine in front of you,
+//! `cargo xtask prerelease` runs all six on the machine in front of you,
 //! says what each one needs before it starts, and says what a pass proved
 //! afterwards, because the value of a hand check is that a human read the
 //! result. CONTRIBUTING.md names it as a release step. The test at the bottom
-//! keeps the list honest: a fifth ignored test anywhere in the workspace fails
-//! it until it is named here.
+//! keeps the list honest: an ignored test anywhere in the workspace that is not
+//! named here fails it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -32,8 +33,9 @@ pub struct HandCheck {
 }
 
 /// Every `#[ignore]`d test in the workspace, in the order to work through
-/// them: the cheap network one first, then the two that want hardware.
-pub const HAND_CHECKS: [HandCheck; 4] = [
+/// them: the cheap network one first, then the ones that want hardware, and
+/// the two that want the machine to itself last.
+pub const HAND_CHECKS: [HandCheck; 6] = [
     HandCheck {
         package: "jamstream-cloud",
         target: "lib",
@@ -74,6 +76,37 @@ pub const HAND_CHECKS: [HandCheck; 4] = [
                  comes up: zero overruns against the client's real ring sizes, and \
                  the printed count of what was already waiting when the open \
                  returned",
+    },
+    HandCheck {
+        package: "jamstream-client",
+        target: "lib",
+        test: "live::watch::tests::a_real_device_that_keeps_up_never_deepens_the_cushion",
+        needs: "a real capture and playback device, and twenty seconds of a machine \
+                doing nothing else: no other audio app, no build, no video call. It \
+                measures how close a real device comes to running the playout ring \
+                dry, so anything else competing for the CPU reads as this machine's \
+                own answer",
+        proves: "a machine that keeps up pays no latency for the automatic cushion, \
+                 which is the calibration the rest of it rests on. Read the printed \
+                 windows: the whole 240-frame cushion left in the ring in every one \
+                 of twenty, a worst wakeup around 2.5 ms, no underruns, and a depth \
+                 that never moved off 480 samples. A window reading lower means this \
+                 machine has less headroom than the growth line assumes",
+    },
+    HandCheck {
+        package: "jamstream-client",
+        target: "lib",
+        test: "live::watch::tests::a_real_device_held_up_settles_on_a_deeper_cushion",
+        needs: "the same device, and the same machine to itself for eight seconds. \
+                This one starves the top-up loop on purpose, two ticks in every \
+                second, so any other stall lands on top of the one it injects and \
+                the cushion settles deeper than the figures below",
+        proves: "the cushion finds a depth that survives a worker missing 5 ms of \
+                 top-ups and then holds it, against a device clock this side cannot \
+                 pace. Read the printed walk: 480 samples to 720 to 960, a frame at \
+                 a time while the ring was still padding, then a depth that stops \
+                 moving with the stalls still coming. Two underruns on the way up \
+                 here, and none after it settled",
     },
 ];
 
