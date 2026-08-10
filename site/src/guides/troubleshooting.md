@@ -26,13 +26,13 @@ Check these in order of payoff:
 
 1. **Bluetooth.** Bluetooth headphones or earbuds add more delay than JamStream's entire network path. Use wired headphones, always. This is the most common cause of "it feels wrong" with a good-looking number.
 2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. Hover the latency number for the `buffer` readout, which reads "buffer 3/4 frames": the depth it is holding against the depth it is aiming for, in 2.5 ms frames. If it sits high or climbs, plug in ethernet.
-3. **Buffer size.** On the Audio tab, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that plays clean. If you hear crackling, or a **crackling** tag appears beside the latency number, go one step up. A choice below the device's own minimum is annotated with the size the device really delivers.
-4. **Sample rate.** A device that does not run at 48 kHz plays through a converter that adds about 3 ms per converted direction.
-   A muted tag beside the latency number names both rates ("converting 44.1 to 48 kHz"); the headline number already includes the cost, and the hover breaks out each direction's milliseconds. To remove it, set the device itself to 48 kHz in the system's sound settings; see [Device problems](#device-problems).
+3. **Buffer size.** On the Audio tab, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that stays clean. A **crackling** tag beside the latency number, or the line under the choices saying the device is not keeping up, means take the next size up.
+4. **Sample rate.** A device JamStream's own converter has to carry costs about 3 ms per converted direction and shows a muted **converting** tag beside the latency number, naming both rates.
+   The headline number already includes that cost and the hover breaks it out per direction. [Device problems](#device-problems) has the whole ladder and how to get off it.
 5. **WASAPI mode, on Windows.** Exclusive mode adds about 10 ms; shared mode adds 20 to 30 ms. The latency number's hover names which one this session got.
    JamStream asks for exclusive by default; the "Allow exclusive access" setting under Devices turns that off when another app needs the same device, at the shared-mode cost.
 
-   Exclusive mode itself needs "Allow applications to take exclusive control of this device" ticked on the device's Advanced tab in the Sound dialog, for both input and output.
+   Exclusive mode itself needs "Allow applications to take exclusive control of this device" ticked on the device's Advanced tab in the Sound dialog, for both input and output. Without it the session opens shared instead, and the hover is the only place that says so.
 6. **Region.** If the session's round trip (`rtt`, on the latency number's hover) is high for you specifically, the server is far from you. The host can pick a fairer region next time; see [Hosting a session](hosting.md#the-region-table).
 7. **Loss.** The same hover carries a percentage per direction, each one a rate over the last second, so a bad moment clears once it passes: `uplink loss` is what the band is missing of you, `downlink loss` is what you are missing of them. Both should sit near 0.0%. Sustained loss above 1% points at the local network: congested wifi, a saturated uplink, a bad cable.
    An **uplink loss** tag beside the latency number means the band is missing enough of you to hear it. That is the one fault nothing you hear will tell you about, because your own monitoring, your meters, and the sound of the room are all downstream of it; the fix is the same local network, from your end.
@@ -41,38 +41,45 @@ Check these in order of payoff:
 
 This is a different complaint from a high latency number: everyone sounds right alone, and only together does the tempo sag, worse the further apart the band is.
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| Timing holds up solo, and drags once the whole band plays, worse with distance | Each player hears their own instrument immediately and everyone else a full network path away, so the timing error every player feels is the mouth-to-ear number the [status bar](#latency-feels-high) already shows, and no two players carry the same number | Turn on the click. It's mixed into every player's personal mix on the server, so it reaches everyone on the same timeline and the band follows it instead of each other. It does not change the mouth-to-ear number, and it does not need to |
+Each player hears their own instrument immediately and everyone else a full network path away, so the error each one feels is their own [mouth to ear number](#latency-feels-high), and no two players carry the same one.
 
-Not every band plays to a click. The other fix: turn on **Hear yourself through the server**, on the Audio tab of Settings.
-Your own sound joins the mix, so the error you hear becomes the gap between two uplinks instead of the whole network path. It wants headphones, because playing that mix through speakers loops your own signal back into the microphone.
+Two fixes, and neither of them moves that number:
+
+- The host turns the click on, in the Metronome panel; each player chooses whether to hear it. The server mixes it into every personal mix, so it reaches everyone on one timeline and the band follows it instead of each other.
+- Turn on **Hear yourself through the server**, on the Audio tab. Your own sound joins the mix, so the gap you hear becomes the difference between two uplinks instead of the whole network path. Needs headphones: through speakers it loops your own signal back into the microphone.
 
 ## Device problems
 
-Input and output devices are picked on the Audio tab of Settings, under Devices: a Capture picker, a Playback picker, and an input level meter that should move when you play.
+Input and output devices are picked on the Audio tab of Settings, under Devices: a Capture picker, a Playback picker, and Rescan beside the heading. The Input level meter above them should move when you play.
 
 The lists come from the platform's audio backend (CoreAudio on macOS, WASAPI on Windows, PipeWire or ALSA on Linux). Each starts with a System default entry that follows the operating system when the default moves, with the concrete devices listed after it.
 
 A change mid-session reopens the stream on the new device without leaving the session.
 
+A stream that stops says so in three places: the device's own reason above the mixer strips, a **no audio** tag beside the latency number, and both the reason and what the reopen cadence is doing under the pickers.
+
 | Symptom | Cause | Fix |
 |---|---|---|
-| Input meter stays still | Wrong capture device selected, or the OS has not granted microphone access | Pick the right device; on macOS, grant microphone permission when prompted, otherwise capture is silence |
+| Input meter stays still | Wrong capture device selected, or the OS has not granted microphone access | Pick the right device; on macOS grant microphone permission when prompted, and on Windows allow desktop apps to access your microphone, or capture is silence |
 | New interface missing from a picker | Devices plugged in or enabled after launch are not listed | Press Rescan, next to the Devices heading |
 | "no devices found" in a picker | The platform reported nothing for that direction | Check the interface is connected and visible to other apps, then Rescan |
 | Selected device disappears mid-session | A rescan found the device gone | The picker falls back to System default and says so under the pickers |
-| A device pick does not take | The device refused to open | The pick stays selected, the app retries every half second, and the device's own reason sits under the pickers until an open succeeds; pick another device to get sound back sooner |
+| A device pick does not take | The device refused to open | The pick stays selected, the device's own reason sits under the pickers, and the app tries again six times on a widening wait; pick another device to get sound back sooner |
 | Sound stops, and a **no audio** tag appears beside the latency number | The stream stopped and is being reopened, or was reopened six times without staying open | The Audio tab says which; once it says the device did not stay open, nothing more is tried until you pick a device there |
 | Other apps go silent while you play (Windows) | Exclusive mode holds the device alone for the lowest latency | Untick "Allow exclusive access" under Devices to share the device, at the 10 to 20 ms shared-mode cost |
 
-Sessions run at 48 kHz, and JamStream carries a device at any other rate automatically:
+Sessions run at 48 kHz, and JamStream carries a device at any other rate automatically. A note under the pickers, per direction, names whichever of these it landed on:
 
-- A device that can run at 48 kHz is opened there. On macOS that moves the device's own clock, and a note under the pickers says so ("moved the capture device to 48 kHz (was 44.1)").
-- A device that cannot plays anyway through JamStream's converter: a tag beside the latency number names both rates, a note under the pickers names the conversion, and its few milliseconds are counted in the mouth-to-ear figure.
-- The worked example is BlackHole held at 44.1 kHz by GarageBand: joining moves BlackHole to 48 kHz and GarageBand keeps playing, because macOS resamples app output to the device's rate. If GarageBand takes the clock back mid-session, JamStream does not fight it: it stops touching that device's clock and converts instead, which both the tag and the note change to say.
+| What happened | The note | Cost |
+|---|---|---|
+| The device already runs at 48 kHz | Nothing is said | None |
+| macOS moved the device's own clock | "moved the capture device to 48 kHz (was 44.1)" | None |
+| Windows or PipeWire converts inside the platform | "the OS is converting capture to this device's 44.1 kHz" | Not measured, and no tag |
+| JamStream's own converter carries the direction | "converting capture 44.1 kHz to 48 kHz (+2.7 ms)" | About 3 ms, counted in mouth to ear, with a **converting** tag |
 
-The conversion is free to ignore. To shave its ~3 ms per direction, set the device to 48 kHz yourself:
+On macOS a device another app holds at 44.1 kHz, BlackHole under GarageBand say, is moved to 48 kHz and GarageBand keeps playing, because macOS resamples app output to the device's rate. An app that takes the clock back mid-session gets it: JamStream stops asking and converts instead.
+
+Only the last row costs milliseconds. Any of them goes away if you set the device to 48 kHz yourself:
 
 | Platform | Where |
 |---|---|

@@ -29,17 +29,16 @@ What you are looking at:
 
 - One mixer strip per musician: an avatar disc, a presence dot, name, fader, pan, dB readout, and a Mute button. This is your personal monitor mix; moving Ana's fader changes what you hear, not what anyone else hears.
 - The avatar disc shows a member's picture if they set one, and their initials on a color hashed from their name if they have not. The same disc and color appear on the card the broadcast renders, so a member looks the same in the app and on a stream.
-- Your own strip is dimmed with a "you" tag, with no fader on it: there is no separate gain for your own channel. Self monitoring is local by default; the Audio tab's **Hear yourself through the server** choice puts your own sound in the mix too, on the band's timeline instead of off it.
+- Your own strip is dimmed with a "you" tag and its controls do nothing: there is no separate gain for your own channel, because self monitoring is local. The Audio tab's **Hear yourself through the server** puts your own sound in the mix too, on the band's timeline instead of off it.
 - The host additionally sees a Revoke button on every other strip. Revoking ejects that member and kills their invite, with a confirmation step.
 - Chat, with timestamps. The metronome panel shows tempo, beats per bar, and click state; the host sets them, and "hear the click" is your own choice.
-- The **ON AIR** lamp, in the middle of the status bar, is absent until the host starts a broadcast and amber while one is running; hover it to see how many platforms are receiving it.
-- Only the host can start or stop a broadcast, but everyone sees the lamp, because everyone is in it. See [Streaming to Twitch and YouTube](streaming.md).
+- The **ON AIR** lamp is absent until the host starts a broadcast and lit while one is running; hover it to see how many destinations are receiving it. Only the host can start or stop one, but everyone sees the lamp, because everyone is in it. See [Streaming to Twitch and YouTube](streaming.md).
 
-The status bar sits in the same place every session: mouth to ear latency and your meters on the left, ON AIR and REC in the middle, the session id and Leave on the right.
+The status bar sits in the same place every session: mouth to ear latency and your meters on the left, the lamps that say what the session is doing in the middle, the session id and Leave on the right.
 
 Hover the latency number for `rtt`, `buffer`, and loss in each direction, which [Troubleshooting](troubleshooting.md#latency-feels-high) turns into actions. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
 
-A member who stops responding shows it in two stages. The dot beside their name turns amber after 2 seconds, which is 800 missed frames and far past anything a working client does. After 10 seconds the server gives up on them: the strip grays out and reads disconnected.
+A member who stops responding shows it in two stages. The dot beside their name goes amber after 2 seconds, which is 800 missed frames and far past anything a working client does; hovering it reads "gone quiet". After 10 seconds the server gives up on them: the strip grays out and reads disconnected.
 
 The dot stays nearly silent while somebody is playing, so the one to notice mid song is the one that changed. Their seat is held either way, and reconnecting with the same invite puts them back in it.
 
@@ -60,14 +59,14 @@ Settings in the top bar opens over the session without covering the strips or th
 ![The Audio tab of the Settings drawer beside the session: buffer size choices with the current mouth to ear figure, an input level meter, the Hear yourself through the server choice, and capture and playback pickers](../images/session_settings.png)
 *Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*
 
-- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that plays clean; crackles mean one step up. The mouth to ear figure under the choices moves with them, because the buffer is part of it.
+- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that stays clean; the app says when the device is not keeping up. The mouth to ear figure under the choices moves with them, because the buffer is part of it.
 - A choice outside what the selected device can deliver is annotated with the device's own minimum or maximum, because that is what you will really get.
 - The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.
-- **Hear yourself through the server** is off by default; turning it on puts your own sound in your mix too, on the band's timeline. See [The band can't keep together](troubleshooting.md#the-band-cant-keep-together) for why, and note it wants headphones.
+- **Hear yourself through the server** is off by default; turning it on puts your own sound in your mix too, on the band's timeline. Needs headphones. See [The band can't keep together](troubleshooting.md#the-band-cant-keep-together) for why you would.
 - **Capture** and **Playback** list a System default entry first, then your machine's real audio devices. Changing one mid-session reopens the audio stream on the new device without leaving the session, and Rescan picks up an interface plugged in after launch.
+- On Windows an **Allow exclusive access** checkbox sits under the pickers; [Troubleshooting](troubleshooting.md#latency-feels-high) has what it costs either way.
 - Device and buffer choices are remembered across launches; a remembered device that is not connected at startup falls back to the system default until it returns.
-- Any sample rate works. Sessions run at 48 kHz, and an interface at another rate (a 44.1 kHz deck, say) joins anyway: where the platform allows, JamStream sets the device to 48 kHz and notes it under the pickers.
-- Otherwise it converts at the device edge, names both rates beside the latency number, and counts the added few milliseconds in it. Notes under the pickers name whatever is going on; [Troubleshooting](troubleshooting.md#device-problems) has the details and how to avoid the conversion cost.
+- Any sample rate works. Sessions run at 48 kHz, and an interface at another rate joins anyway; a note under the pickers says how, per direction. [Troubleshooting](troubleshooting.md#device-problems) has the four ways that can go and which one costs milliseconds.
 - **Your avatar**, on the You tab, opens a file picker: pick a PNG or JPEG and everyone in the session gets the picture over the same encrypted link as the audio; a photo straight off a phone works as it is.
 - The avatar choice lasts for this run of the app; set it again after a restart. Remove drops it here and on your next join, though members already in the session keep the picture you sent them.
 
