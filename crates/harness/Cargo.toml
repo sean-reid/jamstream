@@ -17,3 +17,9 @@ jamstream-session.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# The source-text check in src/device.rs, which holds the playout cushion here
+# to the one the client fills to. A path dependency and not a workspace one, as
+# in crates/audio-io and crates/cli: nothing ships xtask.
+[dev-dependencies]
+xtask = { path = "../../xtask" }

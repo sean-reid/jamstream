@@ -15,14 +15,38 @@ use crate::scenario::{FRAME_SAMPLES, STEREO_FRAME};
 /// Interleaved stereo, matching the client's playout path.
 const CHANNELS: usize = 2;
 
+/// Interleaved stereo samples the top-up loop holds in the ring: two device
+/// callbacks, floored at one 2.5 ms frame. Every sample of it is latency.
+///
+/// This is `playout_target` in jamstream_client's live.rs, which is private to
+/// that file, so the two are one number written twice and the assertion below
+/// is what holds them together.
+fn cushion_samples(device_frames: u32) -> usize {
+    2 * (device_frames as usize).max(FRAME_SAMPLES) * CHANNELS
+}
+
+/// The body of the function [`cushion_samples`] has to agree with, read out of
+/// the client's own source. A latency this harness reports is only the client's
+/// if the two hold the same depth, and the shipped copy is the one that moves,
+/// because that is where the cushion is tuned.
+#[cfg(test)]
+const _: () = assert!(
+    xtask::source::lines_equal(
+        include_str!("../../client/src/live.rs"),
+        "2 * buffer_frames.max(FRAME_FRAMES as u32) as usize * usize::from(CHANNELS)",
+    ) == 1,
+    "playout_target in crates/client/src/live.rs no longer reads as two device \
+     callbacks floored at one frame. Work out the depth it holds now, put it in \
+     cushion_samples here, and re-measure the latency gates: they are named for a \
+     path that ends at the depth the client actually fills to."
+);
+
 /// One client's playout ring and the device callback that drains it, paced by
 /// the harness's master tick.
 pub struct PlayoutDevice {
     device: DeviceSide,
     engine: EngineSide,
-    /// Interleaved stereo samples the top-up loop holds in the ring: two
-    /// device callbacks, floored at one 2.5 ms frame, which is the depth the
-    /// client's worker fills to.
+    /// The depth [`cushion_samples`] sets, which the top-up loop holds.
     target: usize,
     /// Interleaved stereo samples one callback asks for.
     callback: usize,
@@ -47,7 +71,7 @@ impl PlayoutDevice {
     /// packet would arrive late.
     pub fn new(device_frames: u32) -> PlayoutDevice {
         let callback = device_frames as usize * CHANNELS;
-        let target = 2 * (device_frames as usize).max(FRAME_SAMPLES) * CHANNELS;
+        let target = cushion_samples(device_frames);
         let (device, mut engine) = CallbackBridge::new(target, 2 * target);
         engine.push_playout(&vec![0.0; target]);
         PlayoutDevice {
