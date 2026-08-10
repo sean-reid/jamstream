@@ -316,10 +316,10 @@ const CRACKLE_EPISODE_COUNT: u64 = 3;
 const CRACKLE_EPISODE_WINDOW: Duration = Duration::from_secs(90);
 /// Streams that stopped on their own inside this window for the device to read
 /// as cutting out, and the window they have to bunch up inside. Each stop is a
-/// hole in what everybody else hears, [`SLOW_REOPEN`] long or worse, and a
-/// machine coming out of sleep or handing a device between apps spends two of
-/// them; three inside three minutes is a hole a minute, which no device a band
-/// can play through produces. The same window without a stop closes the run
+/// hole in what everybody else hears, [`SLOW_REOPEN`](super::SLOW_REOPEN) long
+/// or worse, and a machine coming out of sleep or handing a device between apps
+/// spends two of them; three inside three minutes is a hole a minute, which no
+/// device a band can play through produces. The same window without a stop closes the run
 /// out again, so this reads as a device that is failing now rather than one
 /// that had a bad moment an hour ago.
 pub(super) const CUTTING_OUT_COUNT: u64 = 3;

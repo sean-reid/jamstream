@@ -542,15 +542,14 @@ impl Runtime for DemoRuntime {
                 .pinned_mouth_to_ear_ms
                 .or(Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32)),
             device_mode: s.device_mode,
-            // No ring is open here, so there are no device buffers to price;
-            // an invented pair would not add up to the figure above.
-            device_buffers: None,
             rate: s.rate,
             crackling: s.crackling,
-            playout_low_frames: None,
-            // Nothing fills a ring here, so there is no thread to time.
-            wake: None,
             cutting_out: s.cutting_out,
+            // No ring is open here and no thread fills one, so every figure a
+            // device produces is absent: the buffers inside the latency sum,
+            // the ring's water mark, the pacing of the thread filling it.
+            // Invented ones would not add up to the figure above.
+            ..StatsView::default()
         };
 
         let members = s

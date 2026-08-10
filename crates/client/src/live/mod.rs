@@ -253,16 +253,13 @@ impl std::error::Error for LiveError {
 
 /// Everything the worker thread publishes for the paint thread.
 struct SharedState {
-    conn: ConnState,
-    rtt_ms: Option<f32>,
-    jitter_depth: usize,
-    jitter_target: usize,
-    uplink_loss_pct: Option<f32>,
-    downlink_loss_pct: Option<f32>,
-    mouth_to_ear_ms: Option<f32>,
-    /// The two device terms inside that figure, for the hover to name each
-    /// direction. None while there is no stream, like [`SharedState::rate`].
-    device_buffers: Option<DeviceBuffersView>,
+    /// Every figure the snapshot carries, in the shape the UI reads it: one
+    /// value rather than a field per measurement mirroring the view, so a
+    /// figure is declared once and written where it is measured.
+    ///
+    /// [`StatsView::device_mode`] is the exception, read off the backend at
+    /// snapshot time and never published here.
+    stats: StatsView,
     roster: Vec<MemberInfo>,
     /// Monitor-mix values the UI set, merged over the roster; the server
     /// does not echo MixerSet back.
@@ -309,42 +306,20 @@ struct SharedState {
     /// on every failed open and cleared by the one that succeeds, so the UI
     /// reads it the way it reads the connection state.
     device_error: Option<String>,
-    /// How each direction of the running stream reaches the session rate,
-    /// from the backend's report at open; None while there is no
-    /// stream, so the UI never shows a dead stream's outcome.
-    rate: Option<RateOutcomesView>,
-    /// Whether the ring's underrun [`EpisodeWatch`] has a run open. Set every tick
-    /// from the ring's own counters and cleared the tick the run ends, so
-    /// the UI reads it like connection state rather than a one-shot line.
-    crackling: bool,
-    /// Closest the playout ring came to empty over the last window, in frames,
-    /// as [`RingWatch`] samples it.
-    playout_low_frames: Option<usize>,
     /// What the reopen cadence has to say about the audio stream, rewritten
     /// every tick from the worker's own state. The UI reads it the way it
     /// reads the connection state.
     audio_fault: Option<AudioFaultView>,
-    /// How the worker thread is being scheduled, as [`WakeWatch`] last read it.
-    wake: Option<WakeView>,
-    /// Streams this device has lost on its own, while they are bunched up
-    /// densely enough to call it unreliable; None while it is holding. A fault
-    /// that heals inside a tick is on screen nowhere else, and twenty of them
-    /// in a minute is twenty gaps the band heard.
-    cutting_out: Option<u64>,
 }
 
 impl SharedState {
     fn new(invite: &Invite, server_addr: SocketAddr) -> Self {
         let session_short = HEXLOWER.encode(&invite.session_id.0[..4]);
         SharedState {
-            conn: ConnState::Connecting,
-            rtt_ms: None,
-            jitter_depth: 0,
-            jitter_target: 0,
-            uplink_loss_pct: None,
-            downlink_loss_pct: None,
-            mouth_to_ear_ms: None,
-            device_buffers: None,
+            stats: StatsView {
+                state: ConnState::Connecting,
+                ..StatsView::default()
+            },
             roster: Vec::new(),
             faders: HashMap::new(),
             broadcast_faders: HashMap::new(),
@@ -369,12 +344,7 @@ impl SharedState {
             server_addr: server_addr.to_string(),
             reopen_attempts: 0,
             device_error: None,
-            rate: None,
-            crackling: false,
-            playout_low_frames: None,
             audio_fault: None,
-            wake: None,
-            cutting_out: None,
         }
     }
 
@@ -656,7 +626,7 @@ impl LiveRuntime {
         // The rung each direction landed on, which the status bar's tag and
         // the Audio tab read for as long as the stream runs. Logged here as
         // well, so the file carries what the session started on.
-        state.rate = rate;
+        state.stats.rate = rate;
         if let Some(rate) = rate {
             for (side, outcome) in [("capture", rate.capture), ("playback", rate.playback)] {
                 log_rate_change(None, outcome, side);
@@ -740,7 +710,7 @@ impl LiveRuntime {
     /// [`Self::snapshot_now`] would copy the roster, the chat buffer, and
     /// the destinations to answer it.
     fn conn_now(&self) -> ConnState {
-        self.shared.lock().expect("live state").conn.clone()
+        self.shared.lock().expect("live state").stats.state.clone()
     }
 
     fn snapshot_now(&self) -> Snapshot {
@@ -795,14 +765,6 @@ impl LiveRuntime {
         });
         Snapshot {
             stats: StatsView {
-                state: s.conn.clone(),
-                rtt_ms: s.rtt_ms,
-                jitter_depth: s.jitter_depth,
-                jitter_target: s.jitter_target,
-                uplink_loss_pct: s.uplink_loss_pct,
-                downlink_loss_pct: s.downlink_loss_pct,
-                mouth_to_ear_ms: s.mouth_to_ear_ms,
-                device_buffers: s.device_buffers,
                 // Straight off the backend's own report at read time: there
                 // is one device stream per process and it follows the last
                 // open, so no worker plumbing could say anything truer.
@@ -815,11 +777,7 @@ impl LiveRuntime {
                     }
                     None => None,
                 },
-                rate: s.rate,
-                crackling: s.crackling,
-                playout_low_frames: s.playout_low_frames,
-                wake: s.wake,
-                cutting_out: s.cutting_out,
+                ..s.stats.clone()
             },
             members,
             chat: s.chat.iter().cloned().collect(),
@@ -1301,7 +1259,7 @@ impl Worker {
             self.send_datagram(&pkt);
         }
         self.driver.close();
-        self.shared.lock().expect("live state").conn = ConnState::Idle;
+        self.shared.lock().expect("live state").stats.state = ConnState::Idle;
     }
 
     /// Closes and reopens the audio stream with new settings; the network
@@ -1338,7 +1296,7 @@ impl Worker {
             self.engine = None;
             self.opened_at = None;
             // A dead stream has no rate outcome to show.
-            self.shared.lock().expect("live state").rate = None;
+            self.shared.lock().expect("live state").stats.rate = None;
             self.episode.faulted = true;
             // One stop, whether or not the reopen that follows heals it before
             // any screen could draw the fault: the gap was audible either way.
@@ -1418,7 +1376,7 @@ impl Worker {
         self.was_cutting_out = open;
         let stops = open.then_some(self.device_stops);
         let mut shared = self.shared.lock().expect("live state");
-        shared.cutting_out = stops;
+        shared.stats.cutting_out = stops;
     }
 
     /// One open attempt against the episode's budget. It sets the cadence
@@ -1490,7 +1448,7 @@ impl Worker {
                 let mut shared = self.shared.lock().expect("live state");
                 shared.reopen_attempts = self.reopen_attempts;
                 shared.device_error = None;
-                shared.rate = rate;
+                shared.stats.rate = rate;
                 drop(shared);
                 self.log_rate_changes(rate);
                 Ok(())
@@ -1503,7 +1461,7 @@ impl Worker {
                 // looking at mid-song.
                 let mut shared = self.shared.lock().expect("live state");
                 shared.device_error = Some(err.to_string());
-                shared.rate = None;
+                shared.stats.rate = None;
                 Err(err)
             }
         }
@@ -1730,7 +1688,7 @@ impl Worker {
                 false
             }
         };
-        self.shared.lock().expect("live state").crackling = crackling;
+        self.shared.lock().expect("live state").stats.crackling = crackling;
     }
 
     fn drain_events(&mut self, now_ms: u64) {
@@ -1897,32 +1855,32 @@ impl Worker {
             self.ever_joined = true;
         }
         // Idle is terminal (set by shutdown); never overwrite it.
-        if s.conn != ConnState::Idle {
-            s.conn = conn_state_with(&stats.state, stats.session_full);
+        if s.stats.state != ConnState::Idle {
+            s.stats.state = conn_state_with(&stats.state, stats.session_full);
         }
         s.me = self.core.member_id();
-        s.rtt_ms = stats.rtt_ms_last;
-        s.jitter_depth = stats.jitter.depth_frames;
-        s.jitter_target = stats.jitter.target_frames;
+        s.stats.rtt_ms = stats.rtt_ms_last;
+        s.stats.jitter_depth = stats.jitter.depth_frames;
+        s.stats.jitter_target = stats.jitter.target_frames;
         // Two directions, never one figure: the uplink is what the band is not
         // hearing and only the server can see it, the downlink is what this
         // machine is not playing.
-        s.uplink_loss_pct = stats.uplink_loss_pct;
-        s.downlink_loss_pct = downlink;
-        let convert_ms = s.rate.map_or(0.0, |r| r.added_ms());
+        s.stats.uplink_loss_pct = stats.uplink_loss_pct;
+        s.stats.downlink_loss_pct = downlink;
+        let convert_ms = s.stats.rate.map_or(0.0, |r| r.added_ms());
         let device = DeviceBuffersView {
             capture_ms: self.device_frames as f32 / 48.0,
             playout_ms: (self.playout_target / usize::from(CHANNELS)) as f32 / 48.0,
         };
-        s.mouth_to_ear_ms = stats
+        s.stats.mouth_to_ear_ms = stats
             .rtt_ms_last
             .map(|rtt| mouth_to_ear_ms(rtt, stats.jitter.depth_frames, device, convert_ms));
         // The same two figures the sum used, so the hover can never break the
         // number down into terms it was not built from.
-        s.device_buffers = self.engine.is_some().then_some(device);
+        s.stats.device_buffers = self.engine.is_some().then_some(device);
         s.levels = self.levels;
-        s.playout_low_frames = self.rings.playout_low_frames();
-        s.wake = self.wake.pacing().map(|pacing| WakeView {
+        s.stats.playout_low_frames = self.rings.playout_low_frames();
+        s.stats.wake = self.wake.pacing().map(|pacing| WakeView {
             p99_ms: as_ms(pacing.p99) as f32,
             max_ms: as_ms(pacing.max) as f32,
         });
@@ -1939,7 +1897,7 @@ impl Worker {
                 .roster
                 .iter()
                 .any(|m| m.connected && m.role == Role::Musician && Some(m.id) != s.me);
-            (s.mouth_to_ear_ms, s.hear_self, others)
+            (s.stats.mouth_to_ear_ms, s.hear_self, others)
         };
         let offer = self.hear_self_offer.observe(
             Instant::now(),
