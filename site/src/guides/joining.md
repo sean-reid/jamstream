@@ -56,10 +56,10 @@ Settings in the top bar opens over the session without covering the strips or th
 - **Recording**, for where takes go; a setting of this computer, present whatever the session is.
 - **You**, for your avatar and the theme.
 
-![The Audio tab of the Settings drawer beside the session: buffer size choices with the current mouth to ear figure, an input level meter, the Hear yourself through the server choice, and capture and playback pickers](../images/session_settings.png)
+![The Audio tab of the Settings drawer beside the session: buffer size choices with the cushion they are holding and the current mouth to ear figure under them, an input level meter, the Hear yourself through the server choice, and capture and playback pickers](../images/session_settings.png)
 *Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*
 
-- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that stays clean; the app says when the device is not keeping up. The mouth to ear figure under the choices moves by three times the pick, since the buffer is paid once going in and twice coming out.
+- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Start at the smallest: the line under the choices says what the cushion is holding, and asks for a bigger size only once it cannot hold more. The figure beside it moves by three times the pick, paid once going in and twice coming out.
 - A choice outside what the selected device can deliver is annotated with the device's own minimum or maximum, because that is what you will really get.
 - The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.
 - **Hear yourself through the server** puts your own sound in your mix, on the band's timeline. Off by default, needs headphones, and offered once above the control when mouth to ear sits above about 30 ms. See [The band can't keep together](troubleshooting.md#the-band-cant-keep-together).

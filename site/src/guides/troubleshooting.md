@@ -28,11 +28,13 @@ Check these in order of payoff:
 
 1. **Bluetooth.** Bluetooth headphones or earbuds add more delay than JamStream's entire network path. Use wired headphones, always. This is the most common cause of "it feels wrong" with a good-looking number.
 2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. Hover the latency number for the `buffer` readout, which reads "buffer 3/4 frames": the depth it is holding against the depth it is aiming for, in 2.5 ms frames. If it sits high or climbs, plug in ethernet.
-3. **Buffer size.** On the Audio tab, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that stays clean. A **crackling** tag beside the latency number, or the line under the choices saying the device is not keeping up, means take the next size up.
+3. **Buffer size.** On the Audio tab, under Buffer size, start at the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms). The line under the choices says what the playout cushion is holding and whether anything is deepening it, so the latency you are getting is on screen even when it is not the size you picked.
 
    Each step costs three times its own size in the number: the buffer is paid once going in and twice coming out. The hover names both, as `capture buffer` and `playout cushion`.
 
    The cushion is not fixed. A machine that keeps letting the playout ring run low gets a deeper one, 2.5 ms at a time and never past twice the buffer, and hands it back once it is keeping up again. The hover and the headline number both follow it, so a deeper cushion than twice your buffer is that, not a fault.
+
+   You are asked to move the size only when that runs out of room. The same line then names the next size up, and says what taking it costs: more latency, and a reopen the band hears as a few hundred milliseconds missing of you. A **crackling** tag before that means the cushion is still working on it.
 4. **Sample rate.** A direction JamStream's own converter carries costs about 3 ms, and says so with a muted **converting** tag naming both rates.
 
    The headline number already includes it and the hover breaks it out per direction. [Device problems](#device-problems) has the whole ladder.
