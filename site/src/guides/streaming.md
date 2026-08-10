@@ -9,7 +9,9 @@ Only the host can start or stop a broadcast. Everyone in the session sees the ON
 
 ## What goes out
 
-The broadcast mix, over a card showing everyone in the session. The host shapes that mix at the top of the **Broadcast** tab in Settings, and it is not the same as anyone's monitor mix: to hear exactly what the stream carries, switch on **audition stream mix** there.
+The broadcast mix, over a card of the musicians: an avatar or their initials, their name, and a level meter each, with the listeners as a count in the footer. The host shapes that mix at the top of the **Broadcast** tab in Settings, and it is not the same as anyone's monitor mix.
+
+To hear exactly what the stream carries, switch on **audition stream mix** there. It replaces the host's monitor mix with the stream's, own voice included, and lights an AUDITION lamp for as long as it is on.
 
 ## Getting a stream key
 
@@ -22,20 +24,20 @@ Both platforms give you a key that keeps working session after session.
 
 A YouTube channel needs live streaming enabled once before that key appears, which can take 24 hours on a new account. Do it before the band is waiting.
 
-**Add key** under Destinations shows these steps and opens the right page.
+**Add key** under Destinations shows these same steps, with a button that opens the platform's page.
 
 ## Going live
 
 **Settings**, then the **Broadcast** tab: the stream mix is at the top and Destinations under it.
 
-1. **Add key**, paste the key, **Save key**. The row reads `ready`.
+1. **Add key**, paste the key, **Save key**. The row reads `asking`, then `ready` once the server has it.
 2. Repeat for the second platform if you want both.
 3. **Go live**.
 
 ![The Broadcast tab with the Twitch key being entered: the field is masked and reads 24 characters under it, with a keychain checkbox and Go live still disabled](../images/session_destinations_key.png)
 *Adding a Twitch key. The field never shows the key back, so a paste is checked by the character count.*
 
-ON AIR lights for everyone in the session. You can add or drop a platform while you are on air; **Remove** stops that one and leaves the others streaming.
+ON AIR lights for everyone in the session once a platform is actually taking the broadcast, which is a few seconds after the press. You can add or drop a platform while you are on air; **Remove** stops that one and leaves the others streaming.
 
 Your key is treated as a credential. Leave **keep this key in this computer's keychain** on and the next session starts with **Use saved key** instead of a paste; **Forget key** deletes it again.
 
@@ -43,12 +45,14 @@ Your key is treated as a credential. Leave **keep this key in this computer's ke
 
 A broadcast goes out through a relay that runs on the session machine, alongside the server. It is downloaded when the session boots, and a session runs perfectly well without it: the band plays, listeners listen, takes record. Only the broadcast needs it.
 
-The **Broadcast** tab says so when it is missing, with the reason, and both **Add key** and **Go live** are off, because a key would have nowhere to go.
+The **Broadcast** tab says so when it is missing, with the reason, and every control that would send a key somewhere is off, because it would have nowhere to go.
 
 ![The Broadcast tab reading that this session cannot stream because the broadcast tooling could not be downloaded, with Add key and Go live both disabled](../images/session_destinations_unavailable.png)
 *Nothing on this computer can fix this one: the relay is on the session machine.*
 
-The session server checks the relay every few seconds for as long as the session lasts. This appears if the relay dies mid-session too, and clears if it comes back; nothing on your computer affects it, so to broadcast, start another session.
+The session server checks the relay every five seconds for as long as the session lasts. This appears if the relay dies mid-session too, and clears if it comes back; nothing on your computer affects it, so to broadcast, start another session.
+
+A relay that never answered at all is given three minutes before it is reported, so a fresh session says nothing about it either way for that long.
 
 A session hosted on your own machine is the other way round, because the session machine is yours.
 
@@ -70,7 +74,7 @@ Each row says what that platform is actually doing:
 | `live` | the platform is receiving the broadcast |
 | `failed` | it stopped, with the reason on the next line |
 
-Under the encode line are two frame counts. Both are one count for the whole broadcast, so every row shows the same pair, and each changes color as it rises:
+Under the rows, one line names the encode every destination shares: 1280x720 at 30 fps, 2628 kbps. Under that are two frame counts, also one pair for the whole broadcast, so every row shows the same two, and each changes color as it rises:
 
 | Term | What it counts | What it means |
 |---|---|---|
@@ -84,22 +88,20 @@ Repeats come first, and losses only once the machine is well past keeping up, so
 ![The Broadcast tab with Twitch live and YouTube Live failed, showing the reason, the repeated and dropped frame counts in amber, and STREAM FAILED lit in the status bar](../images/session_destinations_failed.png)
 *One platform's connection failed; the other kept streaming.*
 
-A stream that dies quietly is worse than one that never started, so a failure shows in three places: the row goes red with the reason under it, the tab counts the failures, and the status bar lights STREAM FAILED beside ON AIR even with Settings closed.
+A stream that dies quietly is worse than one that never started, so a failure shows in three places: the row goes red with the reason under it, the tab counts the failures, and the status bar lights STREAM FAILED even with Settings closed.
 
 A destination that stops is retried on its own, on a backoff that starts at 500 ms and doubles to 16 seconds: the row goes back to `connecting`, and to `live` once the platform is taking the broadcast again.
 
-> Expect a few seconds of `connecting` either way, most of it before the first byte leaves. `connecting` for five seconds is normal; `live` means the platform is receiving something.
+A key the platform rejects fails every time, and the reason says so. **Remove** that destination, then **Forget key** before **Add key**: while the key is still saved the row offers **Use saved key**, which sends the rejected one again.
 
-A key the platform rejects fails every time, and the reason says so: **Remove** that destination and add the key again.
-
-The reason is the line the encoder or the pusher printed, quoted, with the destination URL removed because a stream key is in it. Read the front of it first.
+The reason is what the encoder or the pusher printed, quoted, up to two lines of it. Read the front of it first.
 
 | Reason starts with | Where it broke |
 |---|---|
 | `push failed:` | sending the encode to the platform |
 | `encoder down:` | making the encode in the first place, before any platform is involved |
 
-Then read what follows. `Failed to connect to rtmps://<redacted>` with `Connection refused` or `authentication failed` is the platform saying no, so the key is wrong, was reset, or belongs to another channel.
+Then read what follows. `Failed to connect to rtmps://<redacted>` with `Connection refused` is the platform saying no, so the key is wrong, was reset, or belongs to another channel. Everything after the `://` is stripped, host included, because the key is in there.
 
 `Failed to connect to <local relay>` is the session machine failing to talk to itself, which no key change will fix; restart the session.
 
@@ -109,4 +111,4 @@ Then read what follows. `Failed to connect to rtmps://<redacted>` with `Connecti
 
 Broadcasting is the one part of a session that moves real traffic. Set **stream destinations** on the wizard's cost preview and the estimate counts it; [what egress is](cost.md#what-egress-is) has the numbers.
 
-Twitch and YouTube Live are the two platforms that hand out a key that keeps working, which is what lets a session be set up before the band arrives.
+Twitch and YouTube Live are the two platforms this build supports, because they are the two tested end to end. Both hand out a key that keeps working, which is what lets a session be set up before the band arrives.
