@@ -528,6 +528,12 @@ pub struct Snapshot {
     /// Whether your personal mix includes your own signal. Client-local
     /// optimistic state: the server sends no echo.
     pub hear_self: bool,
+    /// Whether the latency has sat far enough above the band an ensemble holds
+    /// together in, for long enough, that the other arrangement is worth
+    /// offering. A condition rather than an event, and it stands once it is
+    /// out: the person it is for is playing, not reading the screen. Off for
+    /// good once the control has been used either way.
+    pub offer_hear_self: bool,
     /// First 8 hex characters of the session id.
     pub session_short: String,
     pub server_addr: String,

@@ -251,7 +251,18 @@ pub struct SessionAudio {
     pub mouth_to_ear_ms: Option<f32>,
     /// Mirrors [`crate::runtime::Snapshot::hear_self`].
     pub hear_self: Option<bool>,
+    /// Mirrors [`crate::runtime::Snapshot::offer_hear_self`].
+    pub offer_hear_self: bool,
 }
+
+/// The offer, above the checkbox it is about, for as long as the session is
+/// that far apart. It names headphones itself rather than leaving that to the
+/// line under the checkbox, because this is the sentence somebody reads when
+/// they were not looking for the control, and hearing this mix on speakers is
+/// a loop into the microphone.
+pub const HEAR_SELF_OFFER: &str = "The band is far enough apart that keeping time by ear \
+     gets hard. On headphones, hearing yourself through the server puts you on the band's \
+     timeline instead. On speakers, leave it off.";
 
 /// What the Audio tab asks the app to do; the tab cannot reach the platform
 /// backend itself, which is what keeps every fixture off the real sound card.
@@ -323,7 +334,7 @@ impl DevicesScreen {
         input_level_ui(ui, block, levels);
         let hear_self_event = session.hear_self.and_then(|on| {
             ui.add_space(theme::SPACE_MD);
-            hear_self_ui(ui, block, on)
+            hear_self_ui(ui, block, on, session.offer_hear_self)
         });
         ui.add_space(theme::SPACE_MD);
         let devices_event = self.devices_ui(ui, block, catalog, notes);
@@ -510,10 +521,17 @@ const DEVICE_LABEL_W: f32 = 66.0;
 /// The checkbox that asks the server to fold your own signal into your
 /// personal mix. `Some` only when it changed this frame, carrying the value
 /// to send.
-fn hear_self_ui(ui: &mut Ui, block: Block, hear_self: bool) -> Option<bool> {
+fn hear_self_ui(ui: &mut Ui, block: Block, hear_self: bool, offer: bool) -> Option<bool> {
     let mut enabled = hear_self;
     let mut changed = false;
     block.show(ui, |ui| {
+        // Above the control, in the primary ink: the two lines below are
+        // standing facts about the control and are muted for it, and this is
+        // not one of those, nor is it the danger ink, which is for faults.
+        if offer {
+            ui.label(HEAR_SELF_OFFER);
+            ui.add_space(theme::SPACE_XS);
+        }
         changed = ui
             .checkbox(&mut enabled, "Hear yourself through the server")
             .changed();

@@ -123,6 +123,10 @@ struct DemoState {
     left: bool,
     audition: bool,
     hear_self: bool,
+    /// Whether the offer to hear yourself stands: the real runtime derives it
+    /// from a latency figure held above the threshold, which a fixture has no
+    /// way to hold, so it pins the answer instead.
+    offer_hear_self: bool,
     destinations: Vec<Destination>,
     /// Whether the session can broadcast at all. None is a session that has
     /// not been asked, which is every demo one; a fixture pins the answer.
@@ -311,6 +315,7 @@ impl DemoRuntime {
                 left: false,
                 audition: false,
                 hear_self: false,
+                offer_hear_self: false,
                 destinations: Vec::new(),
                 readiness: None,
                 record: RecordView::default(),
@@ -450,6 +455,13 @@ impl DemoRuntime {
     pub fn set_cutting_out(&self, stops: Option<u64>) {
         let mut s = self.state.lock().expect("demo state");
         s.cutting_out = stops;
+    }
+
+    /// Pins whether the offer to hear yourself stands, as the real runtime
+    /// derives it from the latency figure over a window.
+    pub fn set_offer_hear_self(&self, offer: bool) {
+        let mut s = self.state.lock().expect("demo state");
+        s.offer_hear_self = offer;
     }
 
     fn scripted_chat() -> Vec<ChatLine> {
@@ -596,6 +608,7 @@ impl Runtime for DemoRuntime {
                 elapsed_secs,
             }),
             hear_self: s.hear_self,
+            offer_hear_self: s.offer_hear_self,
             session_short: "a3f29c41".to_owned(),
             server_addr: "203.0.113.10:43210".to_owned(),
             is_host: self.is_host,
@@ -662,7 +675,13 @@ impl Runtime for DemoRuntime {
                 }
             }
             Command::SetBroadcastAudition(on) => s.audition = on,
-            Command::SetHearSelf(on) => s.hear_self = on,
+            // Using the control settles the offer, as it does on the real
+            // runtime: a fixture must not be able to draw a state a session
+            // cannot reach.
+            Command::SetHearSelf(on) => {
+                s.hear_self = on;
+                s.offer_hear_self = false;
+            }
             // The demo stands in for the runtime's decode step: raw file
             // bytes in, pixels on your own strip out, or the initials disc
             // back when they are dropped.

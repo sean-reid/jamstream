@@ -1051,6 +1051,7 @@ impl JamApp {
                 let session = SessionAudio {
                     mouth_to_ear_ms: m2e,
                     hear_self: snap.map(|s| s.hear_self),
+                    offer_hear_self: snap.is_some_and(|s| s.offer_hear_self),
                 };
                 let event =
                     self.devices
