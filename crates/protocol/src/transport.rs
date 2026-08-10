@@ -139,6 +139,12 @@ pub fn reject_key_for_init(
 }
 
 /// Client identity material carried in the first handshake message.
+///
+/// Both handshake payloads account for every byte of the Noise message they
+/// ride in: [`Responder::read_init`] and [`Initiator::finish`] refuse a
+/// remainder, so a payload that has grown a field is refused rather than read
+/// as the payload without it. An addition to either one moves
+/// `PROTOCOL_VERSION`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakePayload {
     pub token: Token,
@@ -269,11 +275,17 @@ impl Initiator {
         // Past here the response authenticated, so it came from the server
         // and the handshake state has advanced: nothing else can be read
         // with it, and the caller has no retry to make.
-        let welcome: Welcome =
-            postcard::from_bytes(&payload[..len]).map_err(|e| HandshakeRetry {
+        let (welcome, rest): (Welcome, &[u8]) = postcard::take_from_bytes(&payload[..len])
+            .map_err(|e| HandshakeRetry {
                 error: e.into(),
                 initiator: None,
             })?;
+        if !rest.is_empty() {
+            return Err(HandshakeRetry {
+                error: Error::Malformed,
+                initiator: None,
+            });
+        }
         let ts = self
             .hs
             .into_stateless_transport_mode()
@@ -296,6 +308,13 @@ pub struct Responder {
 }
 
 impl Responder {
+    /// Reads an init's Noise first message and takes the client's identity out
+    /// of it.
+    ///
+    /// The version comes first, before anything is read: a peer on another
+    /// version draws `VersionMismatch`, which is the one refusal here that an
+    /// authenticated reject answers. A payload this build cannot account for is
+    /// `Malformed`, which the caller drops in silence like any other garbage.
     pub fn read_init(
         server_private: &[u8],
         session_id: &SessionId,
@@ -314,7 +333,10 @@ impl Responder {
             .build_responder()?;
         let mut payload = vec![0u8; noise_msg.len()];
         let len = hs.read_message(noise_msg, &mut payload)?;
-        let hp: HandshakePayload = postcard::from_bytes(&payload[..len])?;
+        let (hp, rest): (HandshakePayload, &[u8]) = postcard::take_from_bytes(&payload[..len])?;
+        if !rest.is_empty() {
+            return Err(Error::Malformed);
+        }
         // IK carries the initiator's static in the first message, so a
         // successful read always has one.
         let remote_static: [u8; 32] = hs
@@ -470,6 +492,71 @@ mod tests {
         };
         let (client_session, got_welcome) = initiator.finish(noise).unwrap();
         (client_session, server_session, got_welcome)
+    }
+
+    /// A first flight whose payload is the real one with `tail` appended, which
+    /// is what a peer whose payload has grown a field puts on the wire: the
+    /// signature is the last thing a `HandshakePayload` encodes. Everything
+    /// else is `Initiator::claiming_version`, which builds its own payload and
+    /// leaves nothing to append to.
+    fn init_with_payload_tail(invite: &Invite, version: u16, tail: &[u8]) -> (Initiator, Vec<u8>) {
+        let local = Builder::new(NOISE_PATTERN.parse().expect("pattern"))
+            .generate_keypair()
+            .unwrap();
+        let reject_key = reject_key_from_dh(&local.private, &invite.server_pk);
+        let mut hs = Builder::new(NOISE_PATTERN.parse().expect("pattern"))
+            .local_private_key(&local.private)
+            .unwrap()
+            .remote_public_key(&invite.server_pk)
+            .unwrap()
+            .prologue(&prologue(version, &invite.session_id))
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut payload = postcard::to_stdvec(&HandshakePayload {
+            token: invite.token.clone(),
+            signature: invite.signature,
+        })
+        .unwrap();
+        payload.extend_from_slice(tail);
+        let mut msg = vec![0u8; payload.len() + 160];
+        let len = hs.write_message(&payload, &mut msg).unwrap();
+        (
+            Initiator {
+                hs: Box::new(hs),
+                reject_key,
+            },
+            wire::build_handshake_init(version, &msg[..len]),
+        )
+    }
+
+    /// The response to a read init, with `tail` appended to the welcome: what a
+    /// server whose welcome has grown a field sends, since `sample_clock` is
+    /// the last thing a `Welcome` encodes. `respond` encodes its own welcome.
+    fn resp_with_welcome_tail(
+        responder: &mut Responder,
+        welcome: &Welcome,
+        tail: &[u8],
+    ) -> Vec<u8> {
+        let mut payload = postcard::to_stdvec(welcome).unwrap();
+        payload.extend_from_slice(tail);
+        let mut msg = vec![0u8; payload.len() + 160];
+        let len = responder.hs.write_message(&payload, &mut msg).unwrap();
+        wire::build_handshake_resp(&msg[..len])
+    }
+
+    /// An init read by the server: the initiator that sent it, and the
+    /// responder holding the other half.
+    fn read_init_pair() -> (Initiator, Responder) {
+        let (_, server, invite) = setup();
+        let (initiator, init_packet) = Initiator::new(&invite).unwrap();
+        let wire::Packet::HandshakeInit { version, noise } = wire::parse(&init_packet).unwrap()
+        else {
+            panic!("expected init");
+        };
+        let (_, responder) =
+            Responder::read_init(&server.private, &invite.session_id, version, noise).unwrap();
+        (initiator, responder)
     }
 
     #[test]
@@ -817,6 +904,138 @@ mod tests {
         assert!(matches!(
             err,
             Err(Error::VersionMismatch { ours, theirs: t }) if ours == PROTOCOL_VERSION && t == theirs
+        ));
+    }
+
+    /// An init's payload has to account for every byte the Noise message
+    /// carries. postcard's decoder stops at the end of the type it was asked
+    /// for and says nothing about what follows, so without this a peer whose
+    /// payload has grown a field is admitted as the payload without it, from a
+    /// build claiming the version this one checked.
+    #[test]
+    fn read_init_refuses_a_payload_with_bytes_left_over() {
+        let (issuer, server, invite) = setup();
+        // The f32 is what a payload that grew a float field puts on the wire.
+        for tail in [
+            vec![0x00],
+            vec![0x00; 96],
+            postcard::to_stdvec(&0.5f32).unwrap(),
+        ] {
+            let (_, init_packet) = init_with_payload_tail(&invite, PROTOCOL_VERSION, &tail);
+            let wire::Packet::HandshakeInit { version, noise } = wire::parse(&init_packet).unwrap()
+            else {
+                panic!("expected init");
+            };
+            assert!(
+                matches!(
+                    Responder::read_init(&server.private, &invite.session_id, version, noise),
+                    Err(Error::Malformed)
+                ),
+                "read_init accepted {} bytes past the payload",
+                tail.len()
+            );
+        }
+
+        // And the same flight without the addition is the handshake it always
+        // was, all the way to a welcome, so the refusal is the added bytes and
+        // nothing else.
+        let (initiator, init_packet) = init_with_payload_tail(&invite, PROTOCOL_VERSION, &[]);
+        let wire::Packet::HandshakeInit { version, noise } = wire::parse(&init_packet).unwrap()
+        else {
+            panic!("expected init");
+        };
+        let (hp, responder) =
+            Responder::read_init(&server.private, &invite.session_id, version, noise)
+                .expect("the payload accounts for every byte");
+        verify_token(
+            &issuer.public_key(),
+            &invite.session_id,
+            &server.public,
+            &hp.token,
+            &hp.signature,
+            1_000,
+        )
+        .expect("the token the invite carries");
+        let welcome = Welcome {
+            member_id: hp.token.member_id,
+            sample_clock: 480_000,
+        };
+        let (_, resp_packet) = responder.respond(&welcome).unwrap();
+        let wire::Packet::HandshakeResp { noise } = wire::parse(&resp_packet).unwrap() else {
+            panic!("expected resp");
+        };
+        assert_eq!(initiator.finish(noise).expect("joins").1, welcome);
+    }
+
+    /// The same rule on the response, where the peer that grew a field is the
+    /// server. The response authenticated before the payload is read, so the
+    /// handshake state is spent and there is no retry to hand back: a client
+    /// that meets this resends its init and times out rather than joining a
+    /// session whose welcome it cannot account for.
+    #[test]
+    fn finish_refuses_a_welcome_with_bytes_left_over() {
+        let welcome = Welcome {
+            member_id: MemberId(2),
+            sample_clock: 480_000,
+        };
+        for tail in [
+            vec![0x00],
+            vec![0x00; 96],
+            postcard::to_stdvec(&0.5f32).unwrap(),
+        ] {
+            let (initiator, mut responder) = read_init_pair();
+            let resp_packet = resp_with_welcome_tail(&mut responder, &welcome, &tail);
+            let wire::Packet::HandshakeResp { noise } = wire::parse(&resp_packet).unwrap() else {
+                panic!("expected resp");
+            };
+            let Err(retry) = initiator.finish(noise) else {
+                panic!("finish accepted {} bytes past the welcome", tail.len());
+            };
+            assert!(matches!(retry.error, Error::Malformed));
+            assert!(retry.into_initiator().is_none());
+        }
+
+        // Without the addition the same flight is the welcome it always was.
+        let (initiator, mut responder) = read_init_pair();
+        let resp_packet = resp_with_welcome_tail(&mut responder, &welcome, &[]);
+        let wire::Packet::HandshakeResp { noise } = wire::parse(&resp_packet).unwrap() else {
+            panic!("expected resp");
+        };
+        assert_eq!(initiator.finish(noise).expect("joins").1, welcome);
+    }
+
+    /// Refusing leftovers must not cost a peer its version reject. The version
+    /// is checked before the payload is read, and the key that authenticates a
+    /// reject comes out of the Noise message rather than the payload, so a peer
+    /// on another version is told which version this build speaks whatever its
+    /// payload holds.
+    #[test]
+    fn a_wrong_version_init_draws_the_mismatch_whatever_its_payload_holds() {
+        let (_, server, invite) = setup();
+        let theirs = PROTOCOL_VERSION + 1;
+        let (initiator, init_packet) = init_with_payload_tail(&invite, theirs, &[0xAB, 0xCD]);
+        let wire::Packet::HandshakeInit { version, noise } = wire::parse(&init_packet).unwrap()
+        else {
+            panic!("expected init");
+        };
+        assert!(matches!(
+            Responder::read_init(&server.private, &invite.session_id, version, noise),
+            Err(Error::VersionMismatch { ours, theirs: t }) if ours == PROTOCOL_VERSION && t == theirs
+        ));
+
+        let key = reject_key_for_init(&server.private, &invite.session_id, version, noise)
+            .expect("the server derives a reject key from the init");
+        let reject = wire::build_version_reject(&key, PROTOCOL_VERSION, version, &init_packet);
+        let wire::Packet::VersionReject { ours, theirs, mac } = wire::parse(&reject).unwrap()
+        else {
+            panic!("expected reject");
+        };
+        assert!(wire::verify_version_reject(
+            initiator.reject_key().expect("client derives the key"),
+            ours,
+            theirs,
+            &mac,
+            &init_packet
         ));
     }
 }
