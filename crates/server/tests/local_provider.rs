@@ -11,7 +11,7 @@
 mod common;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::{BIND, ChildGuard, ReservedPort, budget, scratch_dir, server_binary};
@@ -157,6 +157,15 @@ fn command_line_of(pid: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// The spawned server's own log, which the provider keeps beside the session's
+/// other files. A failure message carrying it says whether the server told the
+/// members anything, instead of leaving the wire to be blamed for it.
+fn server_log(sentinel: &Path) -> String {
+    let path = sentinel.with_file_name("server.log");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| format!("({} is unreadable: {err})", path.display()))
+}
+
 /// What the provider actually passed for a flag, read off the live process so
 /// a test asserting on it restates nothing. The value runs to the next flag,
 /// so a temp path with a space in it survives.
@@ -262,11 +271,12 @@ async fn a_spawned_server_says_goodbye_when_the_sentinel_appears() {
         .await
         .expect("launch");
 
-    let (mut client, socket, start) = join_musician(&mat, "told-goodbye").await;
-    let now = || start.elapsed().as_millis() as u64;
-
-    // The sentinel path is the provider's own, off the command line of the
-    // process it spawned, so nothing here spells it a second time.
+    // Everything that reads the spawn happens before a member joins, because
+    // a joined member the test stops pumping goes silent, and a member silent
+    // for jamstream_session's DEFAULT_MEMBER_TIMEOUT_MS is reaped off the
+    // roster with nobody left for the shutdown to say goodbye to. Reading a
+    // command line costs a PowerShell startup on Windows, which is seconds
+    // against that ten.
     let cmdline = command_line_of(&instance.id);
     let sentinel = PathBuf::from(flag_value(&cmdline, "--shutdown-file"));
     let marker = shutdown_supported_path(&sentinel);
@@ -278,12 +288,22 @@ async fn a_spawned_server_says_goodbye_when_the_sentinel_appears() {
          jamstreamd waits for nothing, which on Windows is the entire grace \
          period"
     );
+    // Waited for rather than read once: the marker is written by the builder
+    // that runs after the server binds, while launch() returns on a readiness
+    // probe that only proves the process is alive.
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
+    while Instant::now() < deadline && !marker.is_file() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
         marker.is_file(),
         "the spawned server left no marker at {}, so the provider that \
          spawned it force-kills instead of asking",
         marker.display()
     );
+
+    let (mut client, socket, start) = join_musician(&mat, "told-goodbye").await;
+    let now = || start.elapsed().as_millis() as u64;
 
     // What destroy writes, without the SIGTERM it writes it beside.
     std::fs::write(&sentinel, b"requested_unix=0\n").unwrap();
@@ -312,9 +332,15 @@ async fn a_spawned_server_says_goodbye_when_the_sentinel_appears() {
             .iter()
             .any(|e| matches!(e, ClientEvent::Ejected { .. }));
     }
+    // The server says who it told and who it dropped, so the failure names
+    // which of the two happened rather than leaving it to be guessed at from
+    // another platform.
     assert!(
         told,
-        "the sentinel ended the session without telling the member"
+        "the member was never told the session ended, and is {:?}. \
+         jamstreamd's own log:\n{}",
+        client.state(),
+        server_log(&sentinel)
     );
 
     // And the process left on its own. Nothing in this test signals or kills
