@@ -203,6 +203,19 @@ async fn launch_join_destroy_end_to_end() {
     assert!(instance.public_ip.is_some(), "instance must carry an ip");
     assert_eq!(instance.session_id(), Some("e2e-session"));
 
+    // Read in the instant launch returns, with nothing waited for and nothing
+    // else in between: launch is finished only once the spawned server has
+    // left the marker that makes teardown an ask rather than a shot, so a
+    // destroy landing here is a destroy that can say goodbye.
+    let marker =
+        shutdown_supported_path(&dir.join("sessions").join("e2e-session").join("shutdown"));
+    assert!(
+        marker.is_file(),
+        "launch returned while {} did not exist, so a teardown in that window \
+         force-kills a server that would have gone politely",
+        marker.display()
+    );
+
     // The provider must forward both self-exit windows from the flat
     // config to the spawned server's command line (session_material sets
     // idle_shutdown_min = 10 and max_duration_min = 720).
@@ -288,13 +301,6 @@ async fn a_spawned_server_says_goodbye_when_the_sentinel_appears() {
          jamstreamd waits for nothing, which on Windows is the entire grace \
          period"
     );
-    // Waited for rather than read once: the marker is written by the builder
-    // that runs after the server binds, while launch() returns on a readiness
-    // probe that only proves the process is alive.
-    let deadline = Instant::now() + budget(Duration::from_secs(10));
-    while Instant::now() < deadline && !marker.is_file() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     assert!(
         marker.is_file(),
         "the spawned server left no marker at {}, so the provider that \

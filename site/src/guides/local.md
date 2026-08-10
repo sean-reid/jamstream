@@ -52,4 +52,6 @@ Unlike the app, the CLI does not bundle the server, so local mode needs a `jamst
 
 `host` fails before starting anything with an error naming every place it looked. On Linux the [install script's](../download.md) `--with-server` flag puts one in the second of those places.
 
+A session is only handed to you once the server it started can be asked to end cleanly, so a `jamstreamd` too old to answer that request is stopped again and the error says what it did not do. Use the server from the same release as the CLI.
+
 If a local server exits at startup, the first place to look is its `server.log`, in the session's own directory under your platform's data directory in `jamstream/sessions/`; on Windows that is `%LOCALAPPDATA%\jamstream\sessions\<id>\server.log`.
