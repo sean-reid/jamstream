@@ -596,11 +596,19 @@ impl ControlLink {
 
     /// Ingests one received control datagram (channel byte included) and
     /// returns any messages now deliverable in order.
+    ///
+    /// A datagram accounts for every byte in it: anything after the packet is
+    /// refused rather than ignored, so a peer whose encoding has grown a field
+    /// fails to be understood here instead of having its message read as the
+    /// one it sent before the addition.
     pub fn receive(&mut self, buf: &[u8]) -> Result<Vec<ControlMsg>, Error> {
         if buf.first() != Some(&CHANNEL_CONTROL) {
             return Err(Error::Malformed);
         }
-        let pkt: CtlPacket = postcard::from_bytes(&buf[1..])?;
+        let (pkt, rest): (CtlPacket, &[u8]) = postcard::take_from_bytes(&buf[1..])?;
+        if !rest.is_empty() {
+            return Err(Error::Malformed);
+        }
 
         // Their ack state clears our pending queue: everything below the
         // cumulative ack, plus whatever the selective bitmap covers. It also
@@ -2217,6 +2225,67 @@ mod tests {
             );
             assert_eq!(link.buffered(), 0);
         }
+    }
+
+    /// A datagram has to account for every byte in it. postcard's decoder stops
+    /// at the end of the type it was asked for and says nothing about what
+    /// follows, so without this the tail is dropped on the floor.
+    #[test]
+    fn receive_refuses_a_datagram_with_bytes_left_over() {
+        let exact = encode(&CtlPacket {
+            ack: 0,
+            ack_bits: 0,
+            frame: Some((0, chat(0))),
+        });
+        // A bare ack has a tail too: the frame Option's None tag ends it.
+        let bare_ack = encode(&CtlPacket {
+            ack: 1,
+            ack_bits: 0,
+            frame: None,
+        });
+        for good in [exact, bare_ack] {
+            assert!(ControlLink::new().receive(&good).is_ok());
+            for tail in [vec![0x00], vec![0x00; 96], vec![0xAB, 0xCD]] {
+                let mut padded = good.clone();
+                padded.extend_from_slice(&tail);
+                let mut link = ControlLink::new();
+                assert!(
+                    link.receive(&padded).is_err(),
+                    "receive accepted {} bytes past the packet",
+                    tail.len()
+                );
+                assert_eq!(link.buffered(), 0);
+                assert_eq!(link.pending_len(), 0);
+            }
+        }
+    }
+
+    /// The reverse of `member_info_trailing_fields_changed_the_roster_encoding`:
+    /// a peer whose encoding has grown a field sends bytes this build cannot
+    /// account for, and refusing them is what keeps the addition from being
+    /// read as the message without it. The bytes are built by appending the new
+    /// field to a real datagram, which is exactly what that peer would put on
+    /// the wire, because the message this frame carries is the last thing a
+    /// `CtlPacket` encodes.
+    #[test]
+    fn receive_refuses_a_frame_whose_encoding_grew_a_field() {
+        let grown_field = postcard::to_allocvec(&0.5f32).unwrap();
+        let mut dgram = encode(&CtlPacket {
+            ack: 0,
+            ack_bits: 0,
+            frame: Some((0, ControlMsg::HearSelf { enabled: true })),
+        });
+        dgram.extend_from_slice(&grown_field);
+        let mut link = ControlLink::new();
+        assert!(link.receive(&dgram).is_err());
+        assert_eq!(link.buffered(), 0);
+        // And the same datagram without the addition is the message it always
+        // was, so the refusal is the added field and nothing else.
+        let exact = &dgram[..dgram.len() - grown_field.len()];
+        assert_eq!(
+            ControlLink::new().receive(exact).unwrap(),
+            vec![ControlMsg::HearSelf { enabled: true }]
+        );
     }
 
     #[test]
