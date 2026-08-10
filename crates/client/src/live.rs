@@ -1240,7 +1240,7 @@ fn as_ms(d: Duration) -> f64 {
 
 /// Whether this session has been far enough apart, for long enough, that
 /// hearing yourself through the server is worth offering, the way
-/// [`CrackleEpisode`] holds for a run rather than firing on a sample. A
+/// [`EpisodeWatch`] holds for a run rather than firing on a sample. A
 /// reading over [`HEAR_SELF_OFFER_MS`] with somebody else playing starts a
 /// run and anything else ends it, so a spike buys nothing; a run that holds
 /// [`HEAR_SELF_OFFER_WINDOW`] puts the offer out, and it then stands, because
