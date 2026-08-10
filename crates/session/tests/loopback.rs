@@ -3886,6 +3886,12 @@ proptest! {
 /// percent loss on the uplink with an empty buffer while the client is sending
 /// 798 packets in every 2 seconds. This asks the two halves in one process,
 /// where the reason is readable instead of inferred.
+///
+/// A probe, not a gate. Arrivals here are regular, so the re-anchor watchdog
+/// collects its consecutive ticks either way and this passes even with the
+/// buffer's stuck flag cleared on every pull. The gate for that is
+/// [`a_capture_gap_on_a_jittery_stream`], which is the same gap on a stream
+/// with jitter, meaning every real one.
 #[test]
 fn a_capture_gap_the_length_of_a_device_reopen() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
