@@ -18,16 +18,34 @@ pub enum ThreadPriority {
     /// Above ordinary threads but not real time, which is the Windows
     /// consolation when MMCSS will not register the thread.
     Raised,
+    /// [`Self::Raised`] with the process timer resolution raised behind it, so a
+    /// thread paced by `thread::sleep` wakes when it asked to. Windows only, and
+    /// the pair is what a refused MMCSS registration falls back to rather than
+    /// something a granted one adds to.
+    RaisedWithTimer,
     /// Nothing was asked for, because this platform offers nothing that works
     /// without a privilege an installed app cannot count on having.
     Unchanged,
-    /// The platform refused. The thread keeps the priority it had, and the
-    /// refusal is in the log with the platform's own words in it.
+    /// No priority this asks for was granted. The thread keeps the one it had,
+    /// and the refusal is in the log with the platform's own words in it.
     Refused,
 }
 
+/// What the thread holds when MMCSS will not take it: the ordinary priority it
+/// did get, named together with the timer resolution when that was raised too.
+///
+/// Split out of the Windows code because it decides rather than does, so the
+/// pairing is tested on hosts that have no MMCSS to refuse.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn without_mmcss(raised: ThreadPriority, timer_raised: bool) -> ThreadPriority {
+    match (raised, timer_raised) {
+        (ThreadPriority::Raised, true) => ThreadPriority::RaisedWithTimer,
+        (granted, _) => granted,
+    }
+}
+
 /// The priority of the thread that took it, plus whatever the platform wants
-/// released afterwards, which on Windows includes process-wide timer
+/// released afterwards, which on Windows can include process-wide timer
 /// resolution. Dropping this puts all of it back.
 pub struct AudioPriority {
     granted: ThreadPriority,
@@ -80,7 +98,8 @@ mod imp {
     /// Timer resolution a loop paced by `thread::sleep` needs, in milliseconds.
     /// The default granularity is coarser than an audio tick, so a sleep of one
     /// tick returns whenever the next coarse tick comes around. Since Windows 10
-    /// 2004 this affects only the process that asks.
+    /// 2004 this affects only the process that asks, and it costs that process
+    /// power for as long as it holds it.
     const TIMER_MS: u32 = 1;
 
     pub(super) struct Held {
@@ -89,25 +108,39 @@ mod imp {
     }
 
     pub(super) fn hold(_period: Duration) -> (ThreadPriority, Held) {
-        // SAFETY: no preconditions; the period is a plain millisecond count and
-        // the matching timeEndPeriod is in `release`.
-        let timer = unsafe { timeBeginPeriod(TIMER_MS) };
-        if timer != TIMERR_NOERROR {
-            tracing::warn!(
-                code = timer,
-                "timeBeginPeriod failed; a sleeping thread wakes at the system granularity"
-            );
-        }
         // MMCSS "Pro Audio" at its own default priority, not the critical rung
         // the device threads take: this thread feeds them and does not race
         // them.
         let mmcss = MmcssGuard::promote(AVRT_PRIORITY_NORMAL);
         let granted = mmcss.granted();
+        // A finer timer is what a thread paced by sleep needs to wake on time,
+        // and MMCSS schedules the thread itself, so the two are alternatives:
+        // buying the timer's power cost for a whole session on top of a
+        // registration that was granted pays for nothing.
+        if granted == ThreadPriority::RealTime {
+            return (
+                granted,
+                Held {
+                    mmcss: Some(mmcss),
+                    timer_raised: false,
+                },
+            );
+        }
+        // SAFETY: no preconditions; the period is a plain millisecond count and
+        // the matching timeEndPeriod is in `release`.
+        let timer = unsafe { timeBeginPeriod(TIMER_MS) };
+        let timer_raised = timer == TIMERR_NOERROR;
+        if !timer_raised {
+            tracing::warn!(
+                code = timer,
+                "timeBeginPeriod failed; a sleeping thread wakes at the system granularity"
+            );
+        }
         (
-            granted,
+            super::without_mmcss(granted, timer_raised),
             Held {
                 mmcss: Some(mmcss),
-                timer_raised: timer == TIMERR_NOERROR,
+                timer_raised,
             },
         )
     }
@@ -331,10 +364,13 @@ mod tests {
             "macOS takes a mach time-constraint policy from any thread that asks"
         );
         // MMCSS registration can be refused by policy, and the fallback is a
-        // priority every thread may set, so the floor is Raised.
+        // priority every thread may set, so the floor is a raised one.
         #[cfg(target_os = "windows")]
         assert!(
-            matches!(granted, ThreadPriority::RealTime | ThreadPriority::Raised),
+            matches!(
+                granted,
+                ThreadPriority::RealTime | ThreadPriority::Raised | ThreadPriority::RaisedWithTimer
+            ),
             "Windows has both calls; {granted:?} means neither was made"
         );
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -355,5 +391,33 @@ mod tests {
         }
         let again = AudioPriority::raise_current_thread(Duration::from_micros(2_500));
         assert_ne!(again.granted(), ThreadPriority::Refused);
+    }
+
+    /// The fallback pair reads as one answer, so a Windows log separates a
+    /// thread MMCSS took from one it refused: which mechanism is running is the
+    /// whole question a report of choppy audio from Windows turns on. A raised
+    /// priority with no finer timer behind it, and a timer raised over a
+    /// priority that was itself refused, both have to keep saying what they are.
+    #[test]
+    fn a_refused_registration_names_the_timer_it_fell_back_to() {
+        assert_eq!(
+            without_mmcss(ThreadPriority::Raised, true),
+            ThreadPriority::RaisedWithTimer
+        );
+        assert_eq!(
+            without_mmcss(ThreadPriority::Raised, false),
+            ThreadPriority::Raised,
+            "a timer that would not move must not read as one that did"
+        );
+        assert_eq!(
+            without_mmcss(ThreadPriority::Refused, true),
+            ThreadPriority::Refused,
+            "a finer timer is not a priority; a refused thread stays refused"
+        );
+        assert_ne!(
+            ThreadPriority::RaisedWithTimer,
+            ThreadPriority::RealTime,
+            "the fallback and the mechanism it stands in for cannot read alike"
+        );
     }
 }
