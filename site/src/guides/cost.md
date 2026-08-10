@@ -71,11 +71,11 @@ A cloud session records to a bucket, which adds two charges: storage now, and do
 | A three hour take | Size |
 |---|---|
 | Mix only | about 1.2 GB |
-| With stems | about 6 GB |
+| With stems | about 6.2 GB |
 
 Storage is the small one:
 
-| Storage | Price | 30 days of stems, the default retention (~6 GB) |
+| Storage | Price | 30 days of stems, the default retention (~6.2 GB) |
 |---|---|---|
 | S3 | $0.023/GB-month | about $0.14 |
 | Cloud Storage | about $0.02/GB-month | about $0.12 |
@@ -87,11 +87,13 @@ Both lines are in the preview before you launch, in the wizard and in `jamstream
 
 **The egress lands on the download.** That is the one cost in JamStream that arrives after a session has finished pricing itself, which is why `jamstream recordings get` prints the figure and waits for a yes before it moves a byte.
 
-| Downloading 6 GB of stems | Cost |
+| Downloading 6.2 GB of stems | Cost |
 |---|---|
 | S3 | about $0.56 |
 | Cloud Storage | about $0.75 |
-| DigitalOcean Spaces | free, inside the 1 TB included |
+| DigitalOcean Spaces | about $0.06 |
+
+Those are list prices with no allowance taken off, which is what the app and the CLI quote too: a plan with included transfer draws on the same pool the session's own streaming does, so the figure is an upper bound rather than a guess.
 
 ## The guardrails
 

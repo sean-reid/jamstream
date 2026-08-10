@@ -8,7 +8,7 @@ Nothing is captured by surprise. Recording is armed at launch, and a take runs o
 
 A cloud session records to a bucket in your own account, because the machine deletes itself when the session ends and a take on its disk goes with it. Open **Settings**, then **Recording**:
 
-![The Recording tab in the settings drawer: provider rows, the bucket and its region, two masked key fields, and Check](../images/session_settings_recording.png)
+![The Recording tab in the settings drawer: one row per provider with its bucket or a setup status, then the bucket, its region, and two masked key fields](../images/session_settings_recording.png)
 *Set up once per computer. The key is masked and never shown again.*
 
 1. Pick the provider holding the bucket, and name the bucket and the region it is in. Host in that region and the upload costs nothing.
@@ -29,7 +29,7 @@ Whether a session can record, and whether stems are captured alongside the mix, 
 |---|---|---|
 | off | nothing; every launch starts here | none |
 | mix only | the stereo mix listeners hear | about 1.2 GB |
-| mix and stems | the mix, plus one stereo file per musician | about 6 GB |
+| mix and stems | the mix, plus one stereo file per musician | about 6.2 GB |
 
 The size sits beside each row in the wizard, and the estimate below moves as you pick, because that is the moment the difference matters.
 
@@ -113,7 +113,7 @@ Downloading is where recording costs money, because your cloud account bills egr
 
 ## Getting your takes
 
-**Takes**, on the Recent sessions card on Home, is every take this computer knows about, newest first.
+**Takes**, on the Recent sessions card on Home once a session is listed there, is every take this computer knows about, newest first.
 
 ![The Takes screen: one card per session with its day, its length and where it ran, and under each a take with its mix and its stems, their sizes, and a button to reveal or download each](../images/takes.png)
 *A row is one take. The mix is already on this computer here, so it offers Reveal; the stems are still in the bucket and carry their price.*

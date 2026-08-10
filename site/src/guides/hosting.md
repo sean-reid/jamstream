@@ -23,7 +23,9 @@ Before launching, JamStream measures the round trip from your machine to each of
 | hourly | The machine's current price per hour, fetched live where the provider offers it. |
 | egress | What the provider charges per GB of outbound audio. |
 
-Regions are sorted by worst round trip in 5 ms steps, with price breaking ties inside a step, best first. The top row is preselected if a probe answered for it; click another to override it (`--region` in the CLI). A region that did not answer reads `no probe` and sorts last, and if none answered, nothing is selected and Continue stays off.
+Regions are sorted by worst round trip in 5 ms steps, with price breaking ties inside a step, best first. The top row is preselected if a probe answered for it; click another to override it (`--region` in the CLI).
+
+A region that did not answer a probe reads `no probe` and sorts last. If none answered, nothing is preselected and Continue stays off until you pick one.
 
 A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable.
 
