@@ -291,6 +291,11 @@ pub struct StatsView {
     /// clock, a clock this app moved, an OS converter, or the boundary
     /// resampler with its cost. `None` while there is no stream.
     pub rate: Option<RateOutcomesView>,
+    /// Whether the playout ring is in a stretch dense enough with
+    /// underruns to have been heard, for as long as that stretch holds:
+    /// read like connection state, not like a one-shot event that may
+    /// already have scrolled past by the time somebody looks up.
+    pub crackling: bool,
 }
 
 /// Linear levels in 0..1. dB conversion is the meter widget's job.

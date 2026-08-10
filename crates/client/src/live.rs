@@ -111,6 +111,15 @@ const CAPTURE_RING: Duration = Duration::from_millis(40);
 /// still climbing.
 const RING_REPORT_AGAIN: Duration = Duration::from_secs(1);
 const RING_REPORT_MAX: Duration = Duration::from_secs(60);
+/// Underruns inside this window that mark a run as crackling, and the window
+/// a run of them has to hold inside. One underrun alone is what opening a
+/// stream costs; a floor of three sits above that and below the five a
+/// crackling run took in ninety seconds on real hardware. The same window
+/// closes a run out again: this long without a fresh underrun is a stretch
+/// of playing the ring kept up with, so the state clears rather than
+/// latching for the rest of the session.
+const CRACKLE_EPISODE_COUNT: u64 = 3;
+const CRACKLE_EPISODE_WINDOW: Duration = Duration::from_secs(90);
 /// Floor under [`playout_stall_after`], so a ring only a frame or two deep does
 /// not read a scheduling hiccup as a device that has stopped rendering.
 const PLAYOUT_STALL_FLOOR: Duration = Duration::from_millis(40);
@@ -298,6 +307,10 @@ struct SharedState {
     /// from the backend's report at open; None while there is no
     /// stream, so the UI never shows a dead stream's outcome.
     rate: Option<RateOutcomesView>,
+    /// Whether [`CrackleEpisode`] currently has a run open. Set every tick
+    /// from the ring's own counters and cleared the tick the run ends, so
+    /// the UI reads it like connection state rather than a one-shot line.
+    crackling: bool,
 }
 
 impl SharedState {
@@ -334,6 +347,7 @@ impl SharedState {
             reopen_attempts: 0,
             device_error: None,
             rate: None,
+            crackling: false,
         }
     }
 
@@ -753,6 +767,7 @@ struct RingWatch {
     opened: Instant,
     overruns: CounterWatch,
     underruns: CounterWatch,
+    crackling: CrackleEpisode,
 }
 
 /// One counter's reporting state.
@@ -764,17 +779,41 @@ struct CounterWatch {
     wait: Duration,
 }
 
+/// Whether the current stretch of underruns is dense enough for the person
+/// playing to have heard it, the way [`PlayoutWatch`]'s concealed-gap state
+/// holds for a run rather than firing on a sample. A window that reaches
+/// [`CRACKLE_EPISODE_COUNT`] fresh underruns turns the state on; a window
+/// that runs out first without reaching it restarts from where it ran out,
+/// so a slow drip that never bunches up inside one window never turns it on
+/// at all. Once on, the same window without a fresh underrun turns it back
+/// off, so the state reads as "is this ring dry right now" rather than
+/// "has it ever been".
+#[derive(Default)]
+struct CrackleEpisode {
+    prev: Option<u64>,
+    /// When the run building toward the floor started, and the total as it
+    /// stood then. `None` once the floor is reached; there is nothing left
+    /// to build toward while the state is already on.
+    since: Option<(Instant, u64)>,
+    /// The last tick a fresh underrun landed, which is what an active run
+    /// measures its own quiet against to decide when it is over.
+    last: Option<Instant>,
+    active: bool,
+}
+
 impl RingWatch {
     fn new(opened: Instant) -> RingWatch {
         RingWatch {
             opened,
             overruns: CounterWatch::default(),
             underruns: CounterWatch::default(),
+            crackling: CrackleEpisode::default(),
         }
     }
 
-    /// One tick's worth of observation, against the ring the counters belong to.
-    fn observe(&mut self, now: Instant, engine: &EngineSide, ring_frames: u32) {
+    /// One tick's worth of observation, against the ring the counters belong
+    /// to. Returns whether the ring is in a crackling run as of this tick.
+    fn observe(&mut self, now: Instant, engine: &EngineSide, ring_frames: u32) -> bool {
         let up_ms = now.duration_since(self.opened).as_millis();
         let overruns = engine.overruns();
         if let Some(dropped) = self.overruns.due(now, overruns) {
@@ -796,6 +835,7 @@ impl RingWatch {
                 "playout ring ran dry; the device padded silence"
             );
         }
+        self.crackling.observe(now, underruns)
     }
 }
 
@@ -818,6 +858,54 @@ impl CounterWatch {
             }
             Some(_) => None,
         }
+    }
+}
+
+impl CrackleEpisode {
+    /// Whether the ring is in a crackling run as of this tick.
+    fn observe(&mut self, now: Instant, total: u64) -> bool {
+        let prev = self.prev.replace(total);
+        if prev.is_some_and(|p| total < p) {
+            // The ring's own counter moved backward: a fresh stream, whose
+            // run starts empty rather than continuing the old one.
+            self.since = None;
+            self.last = None;
+            self.active = false;
+            return false;
+        }
+        let fresh = prev.is_some_and(|p| total > p);
+        if fresh {
+            self.last = Some(now);
+        }
+        if self.active {
+            if self
+                .last
+                .is_some_and(|t| now.duration_since(t) >= CRACKLE_EPISODE_WINDOW)
+            {
+                self.active = false;
+            }
+            return self.active;
+        }
+        if !fresh {
+            // No new underrun this tick: a window this stale never reached
+            // the floor and is not worth carrying forward.
+            if self
+                .since
+                .is_some_and(|(since, _)| now.duration_since(since) > CRACKLE_EPISODE_WINDOW)
+            {
+                self.since = None;
+            }
+            return false;
+        }
+        let base = self
+            .since
+            .get_or_insert((now, prev.expect("fresh implies a previous total")))
+            .1;
+        if total - base >= CRACKLE_EPISODE_COUNT {
+            self.active = true;
+            self.since = None;
+        }
+        self.active
     }
 }
 
@@ -1045,6 +1133,7 @@ impl LiveRuntime {
                     None => None,
                 },
                 rate: s.rate,
+                crackling: s.crackling,
             },
             members,
             chat: s.chat.iter().cloned().collect(),
@@ -1857,13 +1946,18 @@ impl Worker {
     /// The bridge counters, reported by [`RingWatch`]. Movement means a ring
     /// too shallow for what the device delivers or for what the worker is
     /// keeping up with; the log is the one place that class of defect shows
-    /// as something other than bad audio somebody else can hear.
+    /// as something other than bad audio somebody else can hear. Whether the
+    /// ring is in a crackling run reaches the snapshot too, so the status bar
+    /// and the Audio tab read it the way they read connection state: no
+    /// stream, no run in progress.
     fn watch_ring_health(&mut self) {
-        let Some(engine) = self.engine.as_ref() else {
-            return;
+        let crackling = match self.engine.as_ref() {
+            Some(engine) => self
+                .rings
+                .observe(Instant::now(), engine, self.device_frames),
+            None => false,
         };
-        self.rings
-            .observe(Instant::now(), engine, self.device_frames);
+        self.shared.lock().expect("live state").crackling = crackling;
     }
 
     fn drain_events(&mut self, now_ms: u64) {
@@ -2986,6 +3080,126 @@ mod tests {
             !lines[0].contains("capture ring"),
             "a dry playout ring is not a dropped capture: {:?}",
             lines[0]
+        );
+    }
+
+    /// One underrun anywhere in the window it opens with is what a stream
+    /// open costs, and must never turn the state on however long the
+    /// session runs afterward: the snapshot reads what to change, not a
+    /// count, so a single event a guitarist would never have heard cannot
+    /// earn it.
+    #[test]
+    fn a_single_underrun_never_turns_crackling_on() {
+        let start = Instant::now();
+        let (mut device, engine) = CallbackBridge::new(64, 64);
+        let mut watch = RingWatch::new(start);
+        // The window opens on the stream's first tick, before any underrun,
+        // exactly as the worker's own ring health check does from the
+        // moment the device opens.
+        watch.observe(start, &engine, 120);
+        let mut out = [0.0f32; 8];
+        device.on_playback(&mut out);
+        // Two windows and a half, so a stale attempt restarts at least once
+        // without a second underrun ever arriving to complete it.
+        let ticks = (CRACKLE_EPISODE_WINDOW.as_micros() * 5 / 2 / TICK.as_micros()) as u32;
+        for tick in 1..=ticks {
+            assert!(
+                !watch.observe(start + TICK * tick, &engine, 120),
+                "a single underrun must never turn crackling on"
+            );
+        }
+    }
+
+    /// Several underruns inside one window are the shape [`PlayoutWatch`]'s
+    /// concealed-gap state already holds for a run rather than firing on a
+    /// sample: the state turns on with the underrun that crosses
+    /// [`CRACKLE_EPISODE_COUNT`], not later, and holds on for as long as
+    /// the run keeps going. The floor sits above the one underrun a stream
+    /// open costs and below the five a crackling run took in ninety seconds
+    /// on real hardware.
+    #[test]
+    fn a_run_of_underruns_turns_crackling_on_and_holds_it() {
+        let start = Instant::now();
+        let (mut device, engine) = CallbackBridge::new(64, 64);
+        let mut watch = RingWatch::new(start);
+        watch.observe(start, &engine, 120);
+        let mut tick = 1u32;
+        let mut readings = Vec::new();
+        for _ in 0..CRACKLE_EPISODE_COUNT {
+            let mut out = [0.0f32; 8];
+            device.on_playback(&mut out);
+            readings.push(watch.observe(start + TICK * tick, &engine, 120));
+            tick += 1;
+            // A few seconds of quiet between each: still one stretch of
+            // playing, and nowhere near spending the whole window.
+            for _ in 0..1_000 {
+                readings.push(watch.observe(start + TICK * tick, &engine, 120));
+                tick += 1;
+            }
+        }
+        let turned_on = readings
+            .iter()
+            .position(|&on| on)
+            .expect("three underruns in one window must turn crackling on");
+        assert_eq!(
+            turned_on,
+            readings.len() - 1_001,
+            "must turn on with the third underrun, not later: {readings:?}"
+        );
+        assert!(
+            readings[turned_on..].iter().all(|&on| on),
+            "must hold on once turned on: {readings:?}"
+        );
+    }
+
+    /// The window running out under the floor is not the same as the state
+    /// having ever turned on. Once on, the same window without a fresh
+    /// underrun turns it back off, the stretch of playing the ring kept up
+    /// with; and a run that starts afterward turns the state on again
+    /// rather than finding it already spent, exactly as a second dropout is
+    /// its own episode in [`PlayoutWatch`].
+    #[test]
+    fn crackling_turns_off_after_a_quiet_stretch_and_a_new_run_turns_it_on_again() {
+        let start = Instant::now();
+        let (mut device, engine) = CallbackBridge::new(64, 64);
+        let mut watch = RingWatch::new(start);
+        watch.observe(start, &engine, 120);
+        let mut tick = 1u32;
+        for _ in 0..CRACKLE_EPISODE_COUNT {
+            let mut out = [0.0f32; 8];
+            device.on_playback(&mut out);
+            watch.observe(start + TICK * tick, &engine, 120);
+            tick += 1;
+        }
+
+        // Comfortably inside the window since the last fresh underrun.
+        let half_window = (CRACKLE_EPISODE_WINDOW.as_micros() / 2 / TICK.as_micros()) as u32;
+        tick += half_window;
+        assert!(
+            watch.observe(start + TICK * tick, &engine, 120),
+            "must still be on well inside the window"
+        );
+        tick += 1;
+
+        // Comfortably past a whole window with nothing fresh.
+        let past_window = (CRACKLE_EPISODE_WINDOW.as_micros() / TICK.as_micros()) as u32 + 10;
+        tick += past_window;
+        assert!(
+            !watch.observe(start + TICK * tick, &engine, 120),
+            "a whole window with nothing fresh must turn crackling off"
+        );
+        tick += 1;
+
+        // A second run turns it on again rather than finding it spent.
+        for _ in 0..CRACKLE_EPISODE_COUNT {
+            let mut out = [0.0f32; 8];
+            device.on_playback(&mut out);
+            watch.observe(start + TICK * tick, &engine, 120);
+            tick += 1;
+        }
+        assert!(
+            watch.observe(start + TICK * tick, &engine, 120),
+            "a second run of underruns must turn crackling on again"
         );
     }
 }

@@ -138,6 +138,10 @@ struct DemoState {
     /// no stream shows.
     device_mode: Option<DeviceModeView>,
     rate: Option<RateOutcomesView>,
+    /// Whether the playout ring is pinned as crackling: the real runtime
+    /// derives this from the ring's own counters, so a fixture pins the
+    /// answer instead.
+    crackling: bool,
     /// Your own display name, as [`Command::SetOwnName`] set it: the demo
     /// stands in for the roster fanout the real server answers with.
     own_name: Option<String>,
@@ -300,6 +304,7 @@ impl DemoRuntime {
                 device_error: None,
                 device_mode: None,
                 rate: None,
+                crackling: false,
                 own_name: None,
             }),
             is_host,
@@ -400,6 +405,13 @@ impl DemoRuntime {
         s.record = RecordView { state, stems };
     }
 
+    /// Pins whether the playout ring reads as crackling, as the real runtime
+    /// derives it from the ring's own underrun counters.
+    pub fn set_crackling(&self, crackling: bool) {
+        let mut s = self.state.lock().expect("demo state");
+        s.crackling = crackling;
+    }
+
     fn scripted_chat() -> Vec<ChatLine> {
         let line = |id: u16, name: &str, text: &str, at_ms: u64| ChatLine {
             from_name: name.to_owned(),
@@ -463,6 +475,7 @@ impl Runtime for DemoRuntime {
             mouth_to_ear_ms: Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32),
             device_mode: s.device_mode,
             rate: s.rate,
+            crackling: s.crackling,
         };
 
         let members = s
