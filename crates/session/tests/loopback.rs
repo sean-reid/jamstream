@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
 use blake2::{Blake2s256, Digest};
+use jamstream_engine::JitterBuffer;
 use jamstream_protocol::Error as ProtocolError;
 use jamstream_protocol::control::{
     AVATAR_CHUNK_BYTES, BroadcastReadiness, ControlLink, ControlMsg, DestinationState,
@@ -3885,13 +3886,13 @@ proptest! {
 /// real machine that is about 148 ms, and afterwards the server reports 100
 /// percent loss on the uplink with an empty buffer while the client is sending
 /// 798 packets in every 2 seconds. This asks the two halves in one process,
-/// where the reason is readable instead of inferred.
+/// where the reason is readable instead of inferred, and it asks the question
+/// the band asks: does a still hear b once the device is back.
 ///
-/// A probe, not a gate. Arrivals here are regular, so the re-anchor watchdog
-/// collects its consecutive ticks either way and this passes even with the
-/// buffer's stuck flag cleared on every pull. The gate for that is
-/// [`a_capture_gap_on_a_jittery_stream`], which is the same gap on a stream
-/// with jitter, meaning every real one.
+/// Arrivals here are regular, so the re-anchor collects its consecutive ticks
+/// even with the buffer's stuck flag cleared on every pull. The flag itself is
+/// held by [`a_capture_gap_on_a_jittery_stream`], which is the same gap on a
+/// stream with jitter, meaning every real one.
 #[test]
 fn a_capture_gap_the_length_of_a_device_reopen() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
@@ -3899,62 +3900,22 @@ fn a_capture_gap_the_length_of_a_device_reopen() {
     let inv_b = h.mint(1, Role::Musician);
     let a = h.add_client(&inv_a, Some(440.0));
     let b = h.add_client(&inv_b, Some(660.0));
-    for _ in 0..400 {
-        h.step();
-    }
-
-    let before = h.server.stats();
-    let b_before = before.iter().find(|m| m.id == MemberId(1)).cloned();
+    h.run(400);
+    let win = 48_000;
+    assert!(
+        tail_tone(&h, a, win, 660.0) > 0.1,
+        "a did not hear b before the gap: {}",
+        tail_tone(&h, a, win, 660.0)
+    );
 
     // The device is shut: nothing captured, while poll keeps the connection
     // alive exactly as it does on a real machine.
     h.clients[b].tone_hz = None;
-    for _ in 0..60 {
-        h.step();
-    }
+    h.run(60);
     h.clients[b].tone_hz = Some(660.0);
-    for _ in 0..800 {
-        h.step();
-    }
+    heal_then_listen(&mut h);
 
-    let after = h.server.stats();
-    for m in &after {
-        println!(
-            "PROBE member {}: refused={} late={} lost={} pulled={} depth={}",
-            m.id.0,
-            m.opens_refused,
-            m.jitter.late,
-            m.jitter.lost,
-            m.jitter.pulled,
-            m.jitter.depth_frames
-        );
-    }
-    let m = after
-        .iter()
-        .find(|m| m.id == MemberId(1))
-        .expect("b is still a member");
-    println!(
-        "PROBE after the gap: opens_refused={} late={} lost={} pulled={} depth={} reanchors={} violations={}",
-        m.opens_refused,
-        m.jitter.late,
-        m.jitter.lost,
-        m.jitter.pulled,
-        m.jitter.depth_frames,
-        m.jitter.reanchors,
-        m.violations
-    );
-    if let Some(b0) = b_before {
-        println!(
-            "PROBE before the gap: opens_refused={} late={} lost={} pulled={}",
-            b0.opens_refused, b0.jitter.late, b0.jitter.lost, b0.jitter.pulled
-        );
-    }
-    let _ = a;
-    assert_eq!(
-        m.opens_refused, 0,
-        "the server refused {} packets from b after the gap",
-        m.opens_refused
-    );
+    assert_tone_restored(&h, a, b);
 }
 
 /// The same gap, but on a stream the server has measured jitter on, which is
@@ -3966,50 +3927,81 @@ fn a_capture_gap_on_a_jittery_stream() {
     let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
     let inv_a = h.mint(0, Role::Musician);
     let inv_b = h.mint(1, Role::Musician);
-    let _a = h.add_client(&inv_a, Some(440.0));
+    let a = h.add_client(&inv_a, Some(440.0));
     let b = h.add_client(&inv_b, Some(660.0));
     // Deliver b's media unevenly so the server measures jitter on it and its
     // target is more than one frame, which is the case on any real path.
     h.clients[b].uplink_media_stutter = true;
-    for _ in 0..400 {
-        h.step();
-    }
+    h.run(400);
+    let win = 48_000;
+    assert!(
+        tail_tone(&h, a, win, 660.0) > 0.1,
+        "a did not hear b before the gap: {}",
+        tail_tone(&h, a, win, 660.0)
+    );
 
     h.clients[b].tone_hz = None;
-    for _ in 0..60 {
-        h.step();
-    }
+    h.run(60);
     h.clients[b].tone_hz = Some(660.0);
-    for _ in 0..4_000 {
-        h.step();
-    }
+    heal_then_listen(&mut h);
 
-    let after = h.server.stats();
-    let m = after
-        .iter()
-        .find(|m| m.id == MemberId(1))
+    assert_tone_restored(&h, a, b);
+}
+
+/// Capture resumes as many frames behind the server's playout position as the
+/// gap was long, so every packet arrives late until the buffer gives that
+/// position up and re-anchors. `JitterBuffer::HEAL_TICKS` is the buffer's own
+/// bound on that: the patience it spends deciding plus the deepest refill it
+/// can ask for. Nothing is audible inside it, so the window measured after it
+/// is where the tone has to be.
+fn heal_then_listen(h: &mut Harness) {
+    h.run(JitterBuffer::HEAL_TICKS as usize);
+    h.clear_playouts();
+    h.run_ms(1_000);
+}
+
+/// Both sides of the band after the gap: each musician hears the other, and
+/// neither hears themselves, which is what says the window holds a real mix
+/// rather than whatever the measurement would read off silence.
+fn assert_tone_restored(h: &Harness, a: usize, b: usize) {
+    let win = 48_000;
+    let b_id = h.clients[b].core.member_id().expect("b joined");
+    let m = h
+        .server
+        .stats()
+        .into_iter()
+        .find(|m| m.id == b_id)
         .expect("b is still a member");
-    let pulled_after = m.jitter.pulled;
-    println!(
-        "PROBE jittery: refused={} late={} lost={} recovered={} resurrected={} waiting={} pulled={} depth={} target={} reanchors={}",
-        m.opens_refused,
+    assert_eq!(
+        m.opens_refused, 0,
+        "the server refused {} packets from b after the gap",
+        m.opens_refused
+    );
+    assert!(
+        tail_tone(h, a, win, 660.0) > 0.1,
+        "a hears no tone from b after the gap: tone={} late={} lost={} \
+         waiting={} depth={} target={} reanchors={}",
+        tail_tone(h, a, win, 660.0),
         m.jitter.late,
         m.jitter.lost,
-        m.jitter.recovered,
-        m.jitter.resurrected,
         m.jitter.waiting,
-        pulled_after,
         m.jitter.depth_frames,
         m.jitter.target_frames,
         m.jitter.reanchors
     );
     assert!(
-        m.jitter.depth_frames > 0 || m.jitter.late < 100,
-        "ten seconds after the gap the server still holds nothing from b: \
-         late={} lost={} waiting={} target={}",
-        m.jitter.late,
-        m.jitter.lost,
-        m.jitter.waiting,
-        m.jitter.target_frames
+        tail_tone(h, a, win, 440.0) < 0.02,
+        "a's own tone reached a's mix: {}",
+        tail_tone(h, a, win, 440.0)
+    );
+    assert!(
+        tail_tone(h, b, win, 440.0) > 0.1,
+        "b hears no tone from a after the gap: {}",
+        tail_tone(h, b, win, 440.0)
+    );
+    assert!(
+        tail_tone(h, b, win, 660.0) < 0.02,
+        "b's own tone reached b's mix: {}",
+        tail_tone(h, b, win, 660.0)
     );
 }
