@@ -2795,7 +2795,7 @@ macro_rules! named {
     ($($f:ident),+ $(,)?) => { [$((stringify!($f), $f as fn())),+] };
 }
 
-/// Two tests in this file print a measurement, and `.config/nextest.toml` is
+/// Four tests in this file print a measurement, and `.config/nextest.toml` is
 /// what makes anyone able to read it: the default profile discards a passing
 /// test's stdout, so across this repo's history exactly one measurement line
 /// survives anywhere (#283). `tick_cost_at_capacity` additionally reads a wall
@@ -2810,6 +2810,8 @@ fn the_measured_tests_are_named_in_the_nextest_config() {
     for (name, _) in named![
         tick_cost_at_capacity,
         a_set_avatar_flood_is_not_an_egress_amplifier,
+        a_capture_gap_the_length_of_a_device_reopen,
+        a_capture_gap_on_a_jittery_stream,
     ] {
         assert!(
             CONFIG.contains(&format!("test(={name})")),

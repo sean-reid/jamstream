@@ -1051,6 +1051,7 @@ fn the_measured_tests_are_named_in_the_nextest_config() {
         latency_regional_fiber,
         latency_dsl,
         latency_at_capacity,
+        playout_cushion_is_in_the_latency,
         drift_200ppm_stays_bounded,
         drift_200ppm_with_resampler,
         driver_stall_reanchors_and_audio_returns,
