@@ -22,7 +22,7 @@ use jamstream_audio_io::{
     AudioBackend, AudioError, CallbackBridge, DuplexHandler, EngineSide, StreamConfig,
     StreamHandle, WavBackend, WavStream,
 };
-use jamstream_engine::{JitterBuffer, JitterStats};
+use jamstream_engine::{JitterBuffer, JitterStats, LossWindow};
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
 use jamstream_protocol::control::{RecordOp, RecordingState};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
@@ -95,6 +95,10 @@ const CONCEALED_GAP_AFTER: Duration = Duration::from_millis(250);
 /// frames refused cannot be that.
 const REFUSED_WINDOW: Duration = Duration::from_secs(1);
 const REFUSED_WINDOW_LIMIT: u64 = 200;
+/// Window the downlink's loss rate is measured over: the server's own Stats
+/// interval, because the bar shows the two directions side by side and rates
+/// over unequal windows would not be comparable.
+const DOWNLINK_LOSS_WINDOW: Duration = Duration::from_millis(jamstream_session::STATS_INTERVAL_MS);
 /// Audio the capture ring holds, which is how long the worker may be held up
 /// before captured audio is dropped rather than delayed. Forty milliseconds
 /// covers the session's own bring-up and a stalled tick, and a stall that long
@@ -292,7 +296,8 @@ struct SharedState {
     rtt_ms: Option<f32>,
     jitter_depth: usize,
     jitter_target: usize,
-    loss_pct: f32,
+    uplink_loss_pct: Option<f32>,
+    downlink_loss_pct: Option<f32>,
     mouth_to_ear_ms: Option<f32>,
     roster: Vec<MemberInfo>,
     /// Monitor-mix values the UI set, merged over the roster; the server
@@ -361,7 +366,8 @@ impl SharedState {
             rtt_ms: None,
             jitter_depth: 0,
             jitter_target: 0,
-            loss_pct: 0.0,
+            uplink_loss_pct: None,
+            downlink_loss_pct: None,
             mouth_to_ear_ms: None,
             roster: Vec::new(),
             faders: HashMap::new(),
@@ -790,6 +796,47 @@ impl PlayoutWatch {
     }
 }
 
+/// The downlink's loss as a rate over the last closed window, from the local
+/// jitter buffer's counters: the audio this machine did not play, next to the
+/// uplink figure the server sends for the audio the band did not hear.
+///
+/// A rate, not a ratio since joining. A lifetime ratio only comes down at the
+/// frame clock, so one bad moment early keeps the readout high for the rest of
+/// the session while the link is healthy, and a windowed figure beside a
+/// cumulative one is not one quantity.
+#[derive(Default)]
+struct DownlinkLoss {
+    /// When the window now filling opened, and the counters as they stood.
+    from: Option<(Instant, JitterStats)>,
+    /// The last closed window's rate. `None` until one closes, and again
+    /// whenever the buffer is rebuilt, which reads as no figure rather than a
+    /// figure for a window that never existed.
+    pct: Option<f32>,
+}
+
+impl DownlinkLoss {
+    /// One tick's worth of observation. Returns the rate to publish, which is
+    /// the last closed window's for as long as the next one is filling, the
+    /// same way the server's uplink figure stands until its next report.
+    /// `joined` is the gate: nothing is owed to a client that is not in a
+    /// session, so there is no rate to report either.
+    fn observe(&mut self, now: Instant, joined: bool, stats: JitterStats) -> Option<f32> {
+        if !joined {
+            *self = DownlinkLoss::default();
+            return None;
+        }
+        match self.from {
+            None => self.from = Some((now, stats)),
+            Some((since, prev)) if now.duration_since(since) >= DOWNLINK_LOSS_WINDOW => {
+                self.pct = LossWindow::between(&prev, &stats).map(|w| w.wire_loss_pct());
+                self.from = Some((now, stats));
+            }
+            Some(_) => {}
+        }
+        self.pct
+    }
+}
+
 /// Reports the bridge's dropped-capture and padded-playout counters as the log
 /// sees them: the first movement at once, then again on a doubling wait for as
 /// long as the count keeps climbing.
@@ -1069,6 +1116,7 @@ impl LiveRuntime {
             playout_target: playout_target(device_frames),
             rings: RingWatch::new(Instant::now()),
             playout: PlayoutWatch::default(),
+            downlink: DownlinkLoss::default(),
             settings,
             shared: Arc::clone(&shared),
             rx,
@@ -1185,7 +1233,8 @@ impl LiveRuntime {
                 rtt_ms: s.rtt_ms,
                 jitter_depth: s.jitter_depth,
                 jitter_target: s.jitter_target,
-                loss_pct: s.loss_pct,
+                uplink_loss_pct: s.uplink_loss_pct,
+                downlink_loss_pct: s.downlink_loss_pct,
                 mouth_to_ear_ms: s.mouth_to_ear_ms,
                 // Straight off the backend's own report at read time: there
                 // is one device stream per process and it follows the last
@@ -1443,6 +1492,9 @@ struct Worker {
     /// nothing else consumes the jitter buffer's counters, so without this
     /// neither would be said.
     playout: PlayoutWatch,
+    /// The downlink's own loss rate, which no control message carries: the
+    /// server reports the uplink and this side has to measure the other half.
+    downlink: DownlinkLoss,
     settings: AudioSettings,
     shared: Arc<Mutex<SharedState>>,
     rx: mpsc::Receiver<ThreadMsg>,
@@ -2203,8 +2255,10 @@ impl Worker {
     }
 
     fn publish_stats(&mut self, stats: &ClientStats) {
+        let joined = matches!(stats.state, ClientState::Joined);
+        let downlink = self.downlink.observe(Instant::now(), joined, stats.jitter);
         let mut s = self.shared.lock().expect("live state");
-        if matches!(stats.state, ClientState::Joined) {
+        if joined {
             self.ever_joined = true;
         }
         // Idle is terminal (set by shutdown); never overwrite it.
@@ -2215,7 +2269,11 @@ impl Worker {
         s.rtt_ms = stats.rtt_ms_last;
         s.jitter_depth = stats.jitter.depth_frames;
         s.jitter_target = stats.jitter.target_frames;
-        s.loss_pct = loss_pct(stats);
+        // Two directions, never one figure: the uplink is what the band is not
+        // hearing and only the server can see it, the downlink is what this
+        // machine is not playing.
+        s.uplink_loss_pct = stats.uplink_loss_pct;
+        s.downlink_loss_pct = downlink;
         // Mouth to ear, capture to playout:
         //   rtt / 2                      the downlink network leg
         // + jitter depth * 2.5 ms        playout buffering ahead of decode
@@ -2343,17 +2401,6 @@ fn conn_state(state: &ClientState) -> ConnState {
     }
 }
 
-/// Loss for the status bar: the worse of the downlink (local jitter buffer,
-/// cumulative) and the server's view of our uplink.
-fn loss_pct(stats: &ClientStats) -> f32 {
-    let down = if stats.jitter.pulled == 0 {
-        0.0
-    } else {
-        stats.jitter.lost as f32 * 100.0 / stats.jitter.pulled as f32
-    };
-    down.max(stats.uplink_loss_pct.unwrap_or(0.0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2378,6 +2425,105 @@ mod tests {
             "{FRAME_FRAMES} samples at {SAMPLE_RATE} Hz is not {TICK:?} of audio"
         );
         assert_eq!(CHUNK_STEREO, FRAME_FRAMES * usize::from(CHANNELS));
+    }
+
+    /// One tick of playout against the counters the jitter buffer would have
+    /// after it: `lossy` concealing a quarter of the frames, clean losing
+    /// none. Returns what the watch would publish on that tick.
+    fn play_a_tick(
+        watch: &mut DownlinkLoss,
+        stats: &mut JitterStats,
+        tick: &mut u32,
+        start: Instant,
+        lossy: bool,
+    ) -> Option<f32> {
+        stats.pulled += 1;
+        if lossy && stats.pulled % 4 == 0 {
+            stats.lost += 1;
+        }
+        *tick += 1;
+        watch.observe(start + TICK * *tick, true, *stats)
+    }
+
+    /// The reading has to come back down. A lifetime ratio only falls at the
+    /// frame clock, so one bad moment early in a session keeps the figure high
+    /// for as long as the session lasts: a Windows runner read 70 percent
+    /// decaying through 22 over five seconds with a healthy link. A window is a
+    /// rate over what happened inside it, so a bad second is gone from the
+    /// reading a second after it ends.
+    #[test]
+    fn the_downlink_reads_clean_again_once_the_bad_stretch_is_over() {
+        let start = Instant::now();
+        let ticks = (DOWNLINK_LOSS_WINDOW.as_micros() / TICK.as_micros()) as u32 + 1;
+        let mut watch = DownlinkLoss::default();
+        let mut stats = JitterStats::default();
+        let mut tick = 0u32;
+
+        // Nothing is claimed before a window has closed.
+        assert_eq!(watch.observe(start, true, stats), None);
+
+        let mut bad = None;
+        for _ in 0..ticks {
+            bad = play_a_tick(&mut watch, &mut stats, &mut tick, start, true);
+        }
+        let bad = bad.expect("a window closed");
+        assert!(
+            (bad - 25.0).abs() < 1.0,
+            "a quarter of a bad second concealed is 25%, not {bad}"
+        );
+
+        // A clean second, and the bad one is out of the reading.
+        let mut clean = None;
+        for _ in 0..ticks {
+            clean = play_a_tick(&mut watch, &mut stats, &mut tick, start, false);
+        }
+        assert_eq!(
+            clean,
+            Some(0.0),
+            "a clean window must read clean whatever came before it"
+        );
+        // And it stays down: a lifetime ratio would still be carrying the
+        // bad second here, at the frame clock's pace.
+        for _ in 0..ticks * 4 {
+            assert_eq!(
+                play_a_tick(&mut watch, &mut stats, &mut tick, start, false),
+                Some(0.0)
+            );
+        }
+        let lifetime = stats.lost as f32 * 100.0 / stats.pulled as f32;
+        assert!(
+            lifetime > 1.0,
+            "the cumulative figure is the one that cannot come down: {lifetime}"
+        );
+    }
+
+    /// Leaving ends the window. Nothing is owed to a client that is not in a
+    /// session, so there is no rate for one either, and the next session
+    /// measures its own rather than inheriting this one's.
+    #[test]
+    fn the_downlink_figure_goes_with_the_session() {
+        let start = Instant::now();
+        let ticks = (DOWNLINK_LOSS_WINDOW.as_micros() / TICK.as_micros()) as u32 + 1;
+        let mut watch = DownlinkLoss::default();
+        let mut stats = JitterStats::default();
+        let mut tick = 0u32;
+        for _ in 0..ticks {
+            play_a_tick(&mut watch, &mut stats, &mut tick, start, true);
+        }
+        assert!(watch.observe(start + TICK * tick, true, stats).is_some());
+        assert_eq!(watch.observe(start + TICK * tick, false, stats), None);
+
+        // A fresh buffer whose counters start again is not a window either.
+        let mut fresh = JitterStats::default();
+        let mut readings = Vec::new();
+        for _ in 0..ticks * 2 {
+            readings.push(play_a_tick(&mut watch, &mut fresh, &mut tick, start, false));
+        }
+        assert_eq!(
+            readings.last().copied().flatten(),
+            Some(0.0),
+            "the new session measures its own window: {readings:?}"
+        );
     }
 
     /// The sizing that matters: the rings must fit the callbacks the

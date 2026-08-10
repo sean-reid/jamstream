@@ -34,7 +34,8 @@ Check these in order of payoff:
 
    Exclusive mode itself needs "Allow applications to take exclusive control of this device" ticked on the device's Advanced tab in the Sound dialog, for both input and output.
 6. **Region.** If the session's round trip (`rtt`, on the latency number's hover) is high for you specifically, the server is far from you. The host can pick a fairer region next time; see [Hosting a session](hosting.md#the-region-table).
-7. **Loss.** The `loss` percentage, on the same hover, should sit near 0.0%. Sustained loss above 1% points at the local network: congested wifi, a saturated uplink, a bad cable.
+7. **Loss.** The same hover carries a percentage per direction, each one a rate over the last second, so a bad moment clears once it passes: `uplink loss` is what the band is missing of you, `downlink loss` is what you are missing of them. Both should sit near 0.0%. Sustained loss above 1% points at the local network: congested wifi, a saturated uplink, a bad cable.
+   An **uplink loss** tag beside the latency number means the band is missing enough of you to hear it. That is the one fault nothing you hear will tell you about, because your own monitoring, your meters, and the sound of the room are all downstream of it; the fix is the same local network, from your end.
 
 ## The band can't keep together
 

@@ -15,20 +15,24 @@
 
 use egui::{Sense, Stroke, Ui, WidgetInfo, vec2};
 
+use crate::runtime::{ConnState, StatsView};
 use crate::theme;
 
-const LOSSY_PCT: f32 = 2.0;
+/// Loss a person hears, in either direction: the dot's red, and the level the
+/// bar's own uplink tag appears at, so the two agree by construction.
+pub const LOSSY_PCT: f32 = 2.0;
 
-pub fn status_dot(ui: &mut Ui, connected: bool, rtt_ms: Option<f32>, loss_pct: f32) {
+pub fn status_dot(ui: &mut Ui, s: &StatsView) {
     let (rect, response) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
+    let connected = matches!(s.state, ConnState::Joined);
     let p = theme::palette_of(ui);
-    let color = match (connected, rtt_ms) {
+    let color = match (connected, s.rtt_ms) {
         (false, _) | (true, None) => p.text_muted,
         (true, Some(rtt)) => {
-            if loss_pct > LOSSY_PCT || rtt >= 40.0 {
+            if s.worst_loss_pct().is_some_and(|pct| pct > LOSSY_PCT) || rtt >= 40.0 {
                 p.meter_red
             } else if rtt >= 25.0 {
                 p.meter_amber
@@ -38,10 +42,10 @@ pub fn status_dot(ui: &mut Ui, connected: bool, rtt_ms: Option<f32>, loss_pct: f
         }
     };
     ui.painter().circle_filled(rect.center(), 4.0, color);
-    let hover = match (connected, rtt_ms) {
+    let hover = match (connected, s.rtt_ms) {
         (false, _) => "not connected".to_owned(),
         (true, None) => "no round trip sample yet".to_owned(),
-        (true, Some(rtt)) => format!("rtt {rtt:.1} ms, loss {loss_pct:.1}%"),
+        (true, Some(rtt)) => format!("rtt {rtt:.1} ms\n{}", s.loss_lines().join("\n")),
     };
     response.on_hover_text(hover);
 }

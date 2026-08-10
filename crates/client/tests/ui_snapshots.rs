@@ -1178,6 +1178,23 @@ fn session_crackling_narrow_clear() {
     snapshot(&mut harness, "session_crackling_narrow_clear");
 }
 
+/// A session whose uplink the server says is losing audio: the one fault a
+/// musician cannot hear for themselves, so the bar says the direction and the
+/// hover carries both rates.
+fn uplink_loss_app(theme: Theme) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_loss(6.0, 0.2);
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_uplink_loss_narrow() {
+    // The narrowest window, where the tag competes hardest with the meters
+    // and the two lamps for the bar's own room.
+    let mut harness = app_harness(uplink_loss_app(Theme::Dark), NARROW);
+    snapshot(&mut harness, "session_uplink_loss_narrow");
+}
+
 /// A session with no audio stream at all: the reopen cadence either working
 /// on it or done trying. The same pair of surfaces carries it, the bar for
 /// the glance and the Audio tab for the pick, because a musician who has gone
