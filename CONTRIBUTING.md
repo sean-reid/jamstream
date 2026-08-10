@@ -33,6 +33,25 @@ A few things the checks enforce that are easy to miss:
   `cargo test -p jamstream-client --test ui_snapshots` writes them to
   `target/ui-previews/`; set `UPDATE_SNAPSHOTS=1` to accept new ones.
 
+## Before a release
+
+```sh
+cargo xtask prerelease
+```
+
+That runs the four tests that stay `#[ignore]`d because no hosted runner has
+what they need: a real audio device, a loopback device, the open internet. It
+says what each one needs before it starts and what a pass proved after, and it
+fails rather than skipping when a device is missing. Three of the four are the
+only coverage of audio content through a real device, the sharing mode the
+Windows backend reports, and a device producing on its own clock, so run it on a
+machine with an interface plugged in and paste the output into the release pull
+request before merging it. That pull request is the record that the checks ran.
+
+The loopback check wants a device whose output feeds its own input: BlackHole on
+macOS, VB-CABLE on Windows, a null sink on Linux. Only a run on Windows
+exercises the sharing mode, so a release worth shipping there wants one.
+
 ## Documentation
 
 The user-facing guide lives in `site/` and is published to GitHub Pages. If a
