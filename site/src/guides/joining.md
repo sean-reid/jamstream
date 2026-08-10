@@ -22,7 +22,7 @@ Each invite admits one person to one seat in one session, signed by the host's k
 
 Once connected you are in the session screen:
 
-![Session screen with four mixer strips, chat on the right, and a status bar showing 7.9 ms mouth to ear](../images/session_demo.png)
+![Session screen with four mixer strips, chat on the right, and a status bar showing 28.0 ms mouth to ear](../images/session_demo.png)
 *A four piece session in the current build. One strip per musician; chat on the right; latency and meters on the left of the status bar.*
 
 What you are looking at:
@@ -36,7 +36,7 @@ What you are looking at:
 
 The status bar sits in the same place every session: mouth to ear latency and your meters on the left, the lamps that say what the session is doing in the middle, the session id and Leave on the right.
 
-Hover the latency number for `rtt`, `buffer`, what each device buffer costs, and loss in each direction, which [Troubleshooting](troubleshooting.md#latency-feels-high) turns into actions. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
+Hover the latency number for `rtt`, both jitter buffer depths, what each device buffer costs, and loss in each direction, which [Troubleshooting](troubleshooting.md#latency-feels-high) turns into actions. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
 
 A member who stops responding shows it in two stages. The dot beside their name goes amber after 2 seconds, which is 800 missed frames and far past anything a working client does; hovering it reads "gone quiet". After 10 seconds the server gives up on them: the strip grays out and reads disconnected.
 
