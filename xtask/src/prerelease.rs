@@ -5,9 +5,10 @@
 //! open internet. No workflow passes `--run-ignored`, so none of them has ever
 //! run in CI, and five of them are the only coverage of what they cover:
 //! audio content through a real device, the sharing mode the Windows backend
-//! reports, a device producing on its own clock rather than being pumped by
-//! its own consumer, and the depth the playout cushion settles on against a
-//! clock this side cannot pace.
+//! reports, the round trip from a saved device id back to the device it names,
+//! a device producing on its own clock rather than being pumped by its own
+//! consumer, and the depth the playout cushion settles on against a clock this
+//! side cannot pace.
 //!
 //! `cargo xtask prerelease` runs all six on the machine in front of you,
 //! says what each one needs before it starts, and says what a pass proved
@@ -52,7 +53,12 @@ pub const HAND_CHECKS: [HandCheck; 6] = [
         proves: "the default devices open as one duplex stream and both callbacks \
                  fire; on Windows, that the backend reports the sharing mode it \
                  opened. It counts callbacks rather than reading them, so it passes \
-                 on a machine producing silence",
+                 on a machine producing silence. It also closes the saved-selection \
+                 round trip: the id the backend minted for each default endpoint \
+                 still names that same device in a fresh enumeration, a stream \
+                 opened against those ids alone runs, and an id naming no device is \
+                 refused rather than falling back to the default. Read the printed \
+                 saved ids against the enumeration above them",
     },
     HandCheck {
         package: "jamstream-audio-io",
