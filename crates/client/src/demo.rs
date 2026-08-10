@@ -27,6 +27,14 @@ const HOURLY_MICROUSD: u64 = 16_800;
 /// Elapsed time the demo session pretends to have before frame zero.
 const BASE_ELAPSED_SECS: u64 = 47 * 60 + 12;
 
+/// The cushion a demo session holds, which every open stream holds: the depth
+/// the app's own default buffer size opens at, with nothing deepening it. Read
+/// off the controller that publishes it in a real session, so the sentence the
+/// buffer control draws here is the sentence a musician gets.
+fn demo_cushion() -> CushionView {
+    crate::live::fresh_cushion(crate::screens::devices::BUFFER_CHOICES[0])
+}
+
 /// Unity gain, centered, unmuted: the state every fader starts from.
 const FLAT: FaderView = FaderView {
     gain_db: 0.0,
@@ -150,10 +158,11 @@ struct DemoState {
     /// derives this from the ring's own counters, so a fixture pins the
     /// answer instead.
     crackling: bool,
-    /// What the playout cushion is holding: the real runtime's controller moves
-    /// it over minutes of readings from a ring no demo runs, so a fixture pins
-    /// the depth whose sentence it wants to look at.
-    cushion: Option<CushionView>,
+    /// What the playout cushion is holding. Every open stream holds one, so the
+    /// demo holds one too; the real runtime's controller moves it over minutes
+    /// of readings from a ring no demo runs, so a fixture pins the depth whose
+    /// sentence it wants to look at.
+    cushion: CushionView,
     /// Each direction's loss rate, pinned per direction because that is the
     /// whole point of them: a fixture holds one losing while the other is
     /// clean, which no single figure could express.
@@ -332,7 +341,7 @@ impl DemoRuntime {
                 device_mode: None,
                 rate: None,
                 crackling: false,
-                cushion: None,
+                cushion: demo_cushion(),
                 uplink_loss_pct: 0.0,
                 downlink_loss_pct: 0.2,
                 audio_fault: None,
@@ -460,9 +469,12 @@ impl DemoRuntime {
         s.crackling = crackling;
     }
 
-    /// Pins what the playout cushion is holding, as the real runtime's
-    /// controller settles on it over minutes of water-mark readings.
-    pub fn set_cushion(&self, cushion: Option<CushionView>) {
+    /// Pins the depth the playout cushion is holding, as the real runtime's
+    /// controller settles on it over minutes of water-mark readings. There is no
+    /// way to pin the absence of one: a stream that is not open is what costs
+    /// nobody a cushion, and that is [`Self::set_device_error`] and
+    /// [`Self::set_audio_fault`].
+    pub fn set_cushion(&self, cushion: CushionView) {
         let mut s = self.state.lock().expect("demo state");
         s.cushion = cushion;
     }
@@ -539,6 +551,10 @@ impl Runtime for DemoRuntime {
 
         let rtt = 14.0 + 1.6 * ((f as f64) * 0.027).sin() as f32;
         let elapsed_secs = BASE_ELAPSED_SECS + f / 60;
+        // The cushion belongs to the stream, so it is held exactly while there
+        // is one, as the live runtime holds it exactly while its engine is up: a
+        // device that refused and a stream being reopened are both no stream.
+        let stream_open = s.device_error.is_none() && s.audio_fault.is_none();
         let stats = StatsView {
             state: if s.left {
                 ConnState::Idle
@@ -556,7 +572,7 @@ impl Runtime for DemoRuntime {
             device_mode: s.device_mode,
             rate: s.rate,
             crackling: s.crackling,
-            cushion: s.cushion,
+            cushion: stream_open.then_some(s.cushion),
             cutting_out: s.cutting_out,
             // No ring is open here and no thread fills one, so every figure a
             // device produces is absent: the buffers inside the latency sum,

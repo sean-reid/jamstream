@@ -1387,12 +1387,12 @@ fn session_settings_crackling_clear() {
 /// session that cannot exist.
 fn cushion_app(theme: Theme, held_frames: usize, out_of_room: bool) -> JamApp {
     let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
-    rt.set_cushion(Some(CushionView {
+    rt.set_cushion(CushionView {
         held_frames,
         base_frames: 240,
         callback_frames: 120,
         out_of_room,
-    }));
+    });
     rt.set_mouth_to_ear_ms(Some(14.7));
     session_app(rt, theme)
 }
