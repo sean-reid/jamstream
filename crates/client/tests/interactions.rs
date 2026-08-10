@@ -2199,8 +2199,20 @@ fn held_cushion(held_frames: usize, callback_frames: usize, out_of_room: bool) -
 /// person who chose a size is entitled to know it is the one they are getting.
 #[test]
 fn the_buffer_control_says_what_the_cushion_is_holding_and_whether_anything_moved_it() {
+    // Nothing pinned: an open stream holds the depth its buffer size asks for,
+    // so the sentence is on the tab of every session rather than of the ones a
+    // fixture arranged for.
+    let mut harness = audio_tab_harness(None, |_| {});
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("Cushion: 5.0 ms, what this buffer size asks for")
+            .is_some(),
+        "every open stream holds a cushion and the control reports it"
+    );
+
     let mut harness = audio_tab_harness(None, |demo| {
-        demo.set_cushion(Some(held_cushion(240, 120, false)));
+        demo.set_cushion(held_cushion(240, 120, false));
     });
     harness.run_steps(4);
     assert!(
@@ -2219,7 +2231,7 @@ fn the_buffer_control_says_what_the_cushion_is_holding_and_whether_anything_move
     // The same control with a deeper cushion under it: the depth, that something
     // put it there, and that nobody has to undo it.
     let mut harness = audio_tab_harness(None, |demo| {
-        demo.set_cushion(Some(held_cushion(360, 120, false)));
+        demo.set_cushion(held_cushion(360, 120, false));
     });
     harness.run_steps(4);
     assert!(
@@ -2235,9 +2247,11 @@ fn the_buffer_control_says_what_the_cushion_is_holding_and_whether_anything_move
         "and that it hands the latency back itself"
     );
 
-    // And no stream is no cushion: nothing is being held, so nothing is said
-    // about a depth, and the tab is the same tab it always was.
-    let mut harness = audio_tab_harness(None, |_| {});
+    // And no stream is no cushion: a device that refused is a ring nobody is
+    // paying for, so nothing is said about a depth.
+    let mut harness = audio_tab_harness(None, |demo| {
+        demo.set_device_error(Some("wav device runs at 44100 Hz"));
+    });
     harness.run_steps(4);
     assert!(
         harness.query_by_label_contains("Cushion:").is_none(),
@@ -2271,7 +2285,7 @@ fn a_cushion_out_of_room_offers_the_next_size_up_and_the_pick_is_what_takes_it()
     let path = dir.join("settings.json");
 
     let mut harness = audio_tab_harness(Some(path.clone()), |demo| {
-        demo.set_cushion(Some(held_cushion(480, 120, true)));
+        demo.set_cushion(held_cushion(480, 120, true));
         demo.set_crackling(true);
     });
     harness.run_steps(4);
@@ -2313,7 +2327,7 @@ fn a_cushion_out_of_room_offers_the_next_size_up_and_the_pick_is_what_takes_it()
     // With room left, the same run says the cushion is covering it and asks for
     // nothing: the reopen is the last resort, not the first advice.
     let mut harness = audio_tab_harness(None, |demo| {
-        demo.set_cushion(Some(held_cushion(360, 120, false)));
+        demo.set_cushion(held_cushion(360, 120, false));
         demo.set_crackling(true);
     });
     harness.run_steps(4);
