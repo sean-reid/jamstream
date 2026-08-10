@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use crate::avatar::disc_color;
 use crate::runtime::{
     AudioFaultView, AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState,
-    CostView, DestinationId, DestinationState, DestinationView, DeviceModeView, FaderView,
-    LevelsView, MemberId, MemberView, MetronomeView, RateOutcomesView, RecordState, RecordView,
-    Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView, TokenId,
+    CostView, CushionView, DestinationId, DestinationState, DestinationView, DeviceModeView,
+    FaderView, LevelsView, MemberId, MemberView, MetronomeView, RateOutcomesView, RecordState,
+    RecordView, Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView, TokenId,
 };
 use crate::theme;
 
@@ -150,6 +150,10 @@ struct DemoState {
     /// derives this from the ring's own counters, so a fixture pins the
     /// answer instead.
     crackling: bool,
+    /// What the playout cushion is holding: the real runtime's controller moves
+    /// it over minutes of readings from a ring no demo runs, so a fixture pins
+    /// the depth whose sentence it wants to look at.
+    cushion: Option<CushionView>,
     /// Each direction's loss rate, pinned per direction because that is the
     /// whole point of them: a fixture holds one losing while the other is
     /// clean, which no single figure could express.
@@ -328,6 +332,7 @@ impl DemoRuntime {
                 device_mode: None,
                 rate: None,
                 crackling: false,
+                cushion: None,
                 uplink_loss_pct: 0.0,
                 downlink_loss_pct: 0.2,
                 audio_fault: None,
@@ -455,6 +460,13 @@ impl DemoRuntime {
         s.crackling = crackling;
     }
 
+    /// Pins what the playout cushion is holding, as the real runtime's
+    /// controller settles on it over minutes of water-mark readings.
+    pub fn set_cushion(&self, cushion: Option<CushionView>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.cushion = cushion;
+    }
+
     /// Pins the stops behind a device that reads as cutting out, as the real
     /// runtime counts them across the session.
     pub fn set_cutting_out(&self, stops: Option<u64>) {
@@ -544,6 +556,7 @@ impl Runtime for DemoRuntime {
             device_mode: s.device_mode,
             rate: s.rate,
             crackling: s.crackling,
+            cushion: s.cushion,
             cutting_out: s.cutting_out,
             // No ring is open here and no thread fills one, so every figure a
             // device produces is absent: the buffers inside the latency sum,

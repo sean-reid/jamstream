@@ -4,7 +4,7 @@
 
 use egui::{ComboBox, Ui, vec2};
 
-use crate::runtime::{AudioFaultView, LevelsView};
+use crate::runtime::{AudioFaultView, CushionView, LevelsView};
 use crate::theme;
 use crate::widgets::{Meter, meter, pick_row};
 
@@ -193,8 +193,9 @@ impl Default for DevicesScreen {
 /// What the stream has to say for itself under the pickers: the refusal
 /// reason while there is no stream, the rate disclosures while there is
 /// one, what the reopen cadence is doing, whether the device keeps losing the
-/// stream, and whether the playout ring is in a crackling run. All of them are
-/// consequences of the pick, so they render beside the controls that made it.
+/// stream, whether the playout ring is in a crackling run, and what depth the
+/// cushion is holding. All of them are consequences of the pick, so they render
+/// beside the controls that made it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamNotes<'a> {
     pub refusal: Option<&'a str>,
@@ -211,6 +212,102 @@ pub struct StreamNotes<'a> {
     /// holds, the fix is right here, so the notice sits beside Buffer size
     /// rather than only in the status bar's tag.
     pub crackling: bool,
+    /// What the playout cushion is holding under the buffer size, and whether
+    /// anything is holding it there. `None` while there is no stream, which is
+    /// also when nobody is paying for a cushion.
+    pub cushion: Option<CushionView>,
+}
+
+/// The one line the buffer choices get about the cushion under them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferNote {
+    pub text: String,
+    /// Whether it wants a pick: the danger ink for the state somebody has to
+    /// act on, the muted step for a cushion doing its job unaided.
+    pub asks: bool,
+}
+
+/// The notice a crackling run earns beside the choices. It asks for no size of
+/// its own: the cushion is already deepening, and the only reopen worth a
+/// musician mid-song is the one [`buffer_note`] asks for once that is out of
+/// room.
+pub const CRACKLING_NOTICE: &str = "Crackling: this device is not keeping up. The cushion is \
+     going deeper to cover it, and asks for a bigger size here if that is not enough.";
+
+/// The single sentence under the buffer choices, and nothing stacked under it.
+///
+/// A cushion out of room speaks over everything, because it is the only one of
+/// these that asks for something and the reopen it asks for is what ends the
+/// crackling it would otherwise sit beside. A crackling run comes next, since it
+/// is the same story as a deepening cushion told from what a musician can hear.
+/// Anything else is the cushion reporting its own depth, which every stream has
+/// and which nothing else on this tab says.
+#[must_use]
+pub fn buffer_note(cushion: Option<CushionView>, crackling: bool) -> Option<BufferNote> {
+    match (cushion, crackling) {
+        (Some(cushion), _) if cushion.out_of_room => Some(cushion_note(cushion)),
+        (_, true) => Some(BufferNote {
+            text: CRACKLING_NOTICE.to_owned(),
+            asks: true,
+        }),
+        (Some(cushion), false) => Some(cushion_note(cushion)),
+        (None, false) => None,
+    }
+}
+
+/// What the cushion has to say for itself, from the depth it is holding.
+///
+/// Three states, asking for three different things. A cushion at the depth the
+/// buffer size asks for says nothing is moving it, which is what somebody who
+/// pinned a size needs in order to trust the pick. A deeper one says how deep
+/// and that it hands the latency back itself, because the figure beside the
+/// choices is not the one the pick implies. A cushion out of room names
+/// the next size up and what taking it costs: every frame of cushion is
+/// latency, so past that depth a longer device callback is the better trade,
+/// and it reopens the device, which is a hole in what the band hears and never
+/// somebody else's call to make.
+fn cushion_note(cushion: CushionView) -> BufferNote {
+    let held = format!("{:.1} ms", cushion.held_ms());
+    if cushion.out_of_room {
+        let deepest = format!(
+            "Cushion: {held}, as deep as this buffer size allows and still coming close to empty."
+        );
+        return BufferNote {
+            text: match next_buffer_up(cushion.callback_frames) {
+                Some(frames) => format!(
+                    "{deepest} {} is the next size up: more latency, and the reopen costs \
+                     the band a few hundred milliseconds of you.",
+                    buffer_label(frames)
+                ),
+                None => format!(
+                    "{deepest} There is no larger size to move to, so this machine cannot \
+                     feed this device on time."
+                ),
+            },
+            asks: true,
+        };
+    }
+    BufferNote {
+        text: if cushion.deepened() {
+            format!(
+                "Cushion: {held}, deeper than this buffer size asks for: it kept coming \
+                 close to empty. It comes back on its own."
+            )
+        } else {
+            format!("Cushion: {held}, what this buffer size asks for. Nothing is deepening it.")
+        },
+        asks: false,
+    }
+}
+
+/// The buffer choice above `frames`, or `None` at the top of the ladder.
+/// Measured against the callback the device is delivering rather than the pick,
+/// so a device already delivering longer than it was asked for is never offered
+/// a size it is past.
+fn next_buffer_up(frames: usize) -> Option<u32> {
+    BUFFER_CHOICES
+        .into_iter()
+        .find(|choice| *choice as usize > frames)
 }
 
 /// The sentence a fault earns beside the pickers. A cadence still working
@@ -329,7 +426,7 @@ impl DevicesScreen {
         session: SessionAudio,
         notes: StreamNotes<'_>,
     ) -> Option<DevicesEvent> {
-        self.buffer_ui(ui, block, catalog, session.mouth_to_ear_ms, notes.crackling);
+        self.buffer_ui(ui, block, catalog, session.mouth_to_ear_ms, notes);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
         let hear_self_event = session.hear_self.and_then(|on| {
@@ -349,7 +446,7 @@ impl DevicesScreen {
         block: Block,
         catalog: &DeviceCatalog,
         mouth_to_ear_ms: Option<f32>,
-        crackling: bool,
+        notes: StreamNotes<'_>,
     ) {
         let bounds = buffer_bounds(catalog, self.capture_idx, self.playback_idx);
         block.show(ui, |ui| {
@@ -373,20 +470,25 @@ impl DevicesScreen {
                     self.buffer_frames = frames;
                 }
             }
-            // Beside the choices it names, for as long as the run holds: the
+            // Beside the choices they are about, for as long as each holds: the
             // status bar's tag says a fault exists, and this is the screen
-            // somebody opens to act on it.
-            if crackling {
+            // somebody opens to act on it. One sentence at a time, because the
+            // depth being held, a run somebody can hear, and the offer of a
+            // longer callback are one story at three moments, and three
+            // sentences of it under one control is worse than any of them.
+            if let Some(note) = buffer_note(notes.cushion, notes.crackling) {
                 ui.add_space(theme::SPACE_SM);
-                theme::reason(
-                    ui,
-                    "Crackling: this device is not keeping up. Try the next size up.",
-                );
+                if note.asks {
+                    theme::reason(ui, note.text);
+                } else {
+                    ui.label(theme::muted(ui, note.text));
+                }
             }
             // The number the choice is being traded against. This pick sets
             // two of the terms in mouth to ear, the capture buffer and the
-            // playout cushion at twice it, so the figure moves with the pick,
-            // and the same figure in the same monospace is in the status bar.
+            // cushion the line above reports, so the figure moves with the
+            // pick, and the same figure in the same monospace is in the status
+            // bar.
             // Outside a session nothing has been measured,
             // and a placeholder would be an instrument reading a made-up
             // number, so the row is absent instead.
@@ -644,6 +746,102 @@ mod tests {
             Some("device delivers 4800 maximum")
         );
         assert_eq!(buffer_choice_note(120, (None, None)), None);
+    }
+
+    fn cushion(held: usize, callback: usize, out_of_room: bool) -> CushionView {
+        CushionView {
+            held_frames: held,
+            base_frames: 2 * callback,
+            callback_frames: callback,
+            out_of_room,
+        }
+    }
+
+    /// One sentence under the choices, whatever is true at once. A cushion out
+    /// of room speaks over a crackling run, because the pick it asks for is what
+    /// ends that run; the run speaks over a depth report, which is the same
+    /// story before anybody could hear it.
+    #[test]
+    fn the_buffer_control_says_one_of_these_things_and_never_two() {
+        for crackling in [true, false] {
+            let note = buffer_note(Some(cushion(480, 120, true)), crackling)
+                .expect("a cushion out of room has to say so");
+            assert!(note.asks, "the one state that wants a pick asks for it");
+            assert!(
+                note.text
+                    .contains("240 frames (5.0 ms) is the next size up"),
+                "{}",
+                note.text
+            );
+            assert!(
+                !note.text.contains("Crackling"),
+                "two sentences at once: {}",
+                note.text
+            );
+        }
+        // A run somebody can hear, over a cushion still working on it.
+        for depth in [
+            Some(cushion(360, 120, false)),
+            Some(cushion(240, 120, false)),
+            None,
+        ] {
+            assert_eq!(
+                buffer_note(depth, true).map(|n| n.text).as_deref(),
+                Some(CRACKLING_NOTICE)
+            );
+        }
+        // And no stream is no cushion and nothing to say about one.
+        assert!(buffer_note(None, false).is_none());
+    }
+
+    /// The depth report, both ways round: a cushion somebody is paying extra
+    /// for says how much and that it hands it back, and one at the depth the
+    /// pick asks for says nothing is moving it, which is what makes a pinned
+    /// size trustworthy.
+    #[test]
+    fn the_depth_it_holds_reads_the_same_whether_or_not_anything_moved_it() {
+        let deeper = buffer_note(Some(cushion(360, 120, false)), false).expect("a depth to report");
+        assert!(!deeper.asks, "a working cushion is not a fault");
+        assert!(
+            deeper
+                .text
+                .starts_with("Cushion: 7.5 ms, deeper than this buffer size asks for"),
+            "{}",
+            deeper.text
+        );
+        assert!(
+            deeper.text.contains("comes back on its own"),
+            "{}",
+            deeper.text
+        );
+        let pinned = buffer_note(Some(cushion(240, 120, false)), false).expect("a depth to report");
+        assert!(!pinned.asks);
+        assert_eq!(
+            pinned.text,
+            "Cushion: 5.0 ms, what this buffer size asks for. Nothing is deepening it."
+        );
+    }
+
+    /// The size the offer names is the next one above the callback the device is
+    /// delivering, not above the pick: a device already handing over 480 frames
+    /// has nowhere left to go, and offering a size it is past would be a reopen
+    /// that changes nothing.
+    #[test]
+    fn the_offer_names_the_next_size_above_what_the_device_delivers() {
+        let note = buffer_note(Some(cushion(960, 240, true)), false).expect("an offer");
+        assert!(note.text.contains("480 frames (10.0 ms)"), "{}", note.text);
+        let top = buffer_note(Some(cushion(1920, 480, true)), false).expect("an offer");
+        assert!(top.asks, "the top of the ladder still wants somebody");
+        assert!(
+            top.text.contains("no larger size to move to"),
+            "{}",
+            top.text
+        );
+        assert!(
+            !top.text.contains("frames ("),
+            "no size to name, so none may be named: {}",
+            top.text
+        );
     }
 
     /// The platform decides whether the exclusive question gets asked, and a

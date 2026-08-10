@@ -14,8 +14,8 @@ use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
 use jamstream_client::exec::Executor;
 use jamstream_client::reveal;
 use jamstream_client::runtime::{
-    AudioFaultView, BroadcastReadiness, DestinationState, RateOutcomeView, RateOutcomesView,
-    RecordState, StreamPlatform,
+    AudioFaultView, BroadcastReadiness, CushionView, DestinationState, RateOutcomeView,
+    RateOutcomesView, RecordState, StreamPlatform,
 };
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
@@ -1284,10 +1284,13 @@ fn session_settings() {
     // readout visible. A plain musician's tab row is Audio and You: the two
     // session-scoped tabs are not rendered as dead slots, they are absent.
     // Sam has no picture, so the You tab would show the initials disc.
-    let app = drawer_app(
-        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
-        SettingsTab::Audio,
-    );
+    //
+    // The published picture of this tab, so it holds the cushion every open
+    // stream holds: a tab drawn with nothing under the choices is a tab a
+    // session cannot be in, and this image is the one people read the product
+    // off. The depth is what the smallest buffer size asks for, at the latency
+    // measured over one local network with that cushion inside it.
+    let app = drawer_app(cushion_app(Theme::Dark, 240, false), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
     snapshot_for_docs(&mut harness, "session_settings");
 }
@@ -1370,6 +1373,55 @@ fn session_settings_crackling_clear() {
     let app = drawer_app(crackling_app(Theme::Dark, false), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_crackling_clear");
+}
+
+/// A session whose playout cushion is holding a depth, which every open stream
+/// is doing: the depth is the buffer control's own consequence and not always
+/// the one the pick implies, so the control says which of the two it shows. The
+/// controller settles on a depth over minutes of water-mark readings, so a
+/// fixture pins the depth rather than a ring the demo does not run.
+///
+/// The latency figure is pinned with it, at the 14.7 ms measured over one local
+/// network with the playout cushion inside it. The depth and the figure are one
+/// state, so a cushion drawn over the demo's own 8 ms would be a picture of a
+/// session that cannot exist.
+fn cushion_app(theme: Theme, held_frames: usize, out_of_room: bool) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_cushion(Some(CushionView {
+        held_frames,
+        base_frames: 240,
+        callback_frames: 120,
+        out_of_room,
+    }));
+    rt.set_mouth_to_ear_ms(Some(14.7));
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_settings_cushion_deeper() {
+    // A frame of latency somebody is paying that they did not pick, in the muted
+    // step because the cushion is working rather than failing.
+    let app = drawer_app(cushion_app(Theme::Dark, 360, false), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_cushion_deeper");
+}
+
+#[test]
+fn session_settings_cushion_out_of_room() {
+    // The only place the automatic depth hands back to the pick: the offer names
+    // the next size up and what the reopen costs, beside the rows that take it.
+    let app = drawer_app(cushion_app(Theme::Dark, 480, true), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_cushion_out_of_room");
+}
+
+#[test]
+fn session_settings_cushion_out_of_room_narrow() {
+    // The narrowest window, where the offer is the longest copy under any
+    // control on this tab and the drawer's own scroll is what has to absorb it.
+    let app = drawer_app(cushion_app(Theme::Dark, 480, true), SettingsTab::Audio);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_settings_cushion_out_of_room_narrow");
 }
 
 #[test]

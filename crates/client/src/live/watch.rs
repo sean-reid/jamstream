@@ -13,7 +13,7 @@ use jamstream_audio_io::{EngineSide, ThreadPriority};
 use jamstream_engine::{JitterStats, LossWindow};
 
 use super::{CHANNELS, CHUNK_STEREO, TICK, cushion_time, playout_capacity, playout_target};
-use crate::runtime::MemberId;
+use crate::runtime::{CushionView, MemberId};
 
 /// Base backoff between attempts to reopen a lost or misconfigured stream.
 /// The first attempt of an episode is immediate; each one after it waits
@@ -607,8 +607,10 @@ pub(super) struct CushionControl {
     /// When the run of readings deep enough to give a frame back began; None
     /// whenever one broke it.
     quiet_since: Option<Instant>,
-    /// Whether the ceiling has been said for the run now sitting at it.
-    said: bool,
+    /// Whether the depth is at its ceiling with the ring still coming close to
+    /// empty, which is the state the Audio tab offers a longer device callback
+    /// from. Also what keeps the same warning to one line per run of it.
+    out_of_room: bool,
 }
 
 impl CushionControl {
@@ -625,7 +627,7 @@ impl CushionControl {
             read_at: None,
             catching_up: true,
             quiet_since: None,
-            said: false,
+            out_of_room: false,
         }
     }
 
@@ -633,6 +635,18 @@ impl CushionControl {
     /// fills to.
     pub(super) fn target(&self) -> usize {
         self.target
+    }
+
+    /// What the depth is doing, for the buffer control that has to say so. In
+    /// frames, because the buffer size the offer names is in frames too.
+    pub(super) fn view(&self) -> CushionView {
+        let frames = |samples: usize| samples / usize::from(CHANNELS);
+        CushionView {
+            held_frames: frames(self.target),
+            base_frames: frames(self.floor),
+            callback_frames: frames(self.callback),
+            out_of_room: self.out_of_room,
+        }
     }
 
     /// One window's reading: `low` is how close the ring came to empty over it
@@ -665,7 +679,7 @@ impl CushionControl {
             self.grow(low);
             return;
         }
-        self.said = false;
+        self.out_of_room = false;
         if held {
             // The quiet a frame back costs starts again once the take stops:
             // this reading is one the controller declined to act on, and
@@ -681,8 +695,8 @@ impl CushionControl {
     /// answer now.
     fn grow(&mut self, low: usize) {
         if self.target >= self.ceiling {
-            if !self.said {
-                self.said = true;
+            if !self.out_of_room {
+                self.out_of_room = true;
                 tracing::warn!(
                     cushion_ms = as_ms(cushion_time(self.target)),
                     low_frames = low / usize::from(CHANNELS),
