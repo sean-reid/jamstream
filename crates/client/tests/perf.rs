@@ -1,14 +1,17 @@
 //! Frame cost at the design maximum: a full session (10 musicians, 10
 //! listeners) with every meter animating. egui repaints the whole screen
-//! each frame, so this is the realistic worst case. The debug numbers are
-//! printed honestly; run with `--nocapture` to see them.
+//! each frame, so this is the realistic worst case. Both numbers below are
+//! published on every run through `.config/nextest.toml`.
+
+mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use common::{budget_scale, frame_budget_ms, frame_costs_ms};
 use egui::vec2;
 use egui_kittest::Harness;
 use jamstream_client::app::{JamApp, Screen};
@@ -148,8 +151,21 @@ fn app_harness(rt: CountingRuntime<DemoRuntime>, tab: SettingsTab) -> Harness<'s
         })
 }
 
+/// What one frame of the fullest session may cost on a quiet laptop, in
+/// milliseconds. 16 ms is the 60 fps frame, where the product stops being
+/// smooth; this is where a regression is worth hearing about, and the runner
+/// multiplier puts a shared runner back at 16.
+///
+/// Measured on a 14-core laptop, 25 runs quiet and 10 against 14 busy cores.
+/// Quiet: median 0.33 to 0.34 ms, p99 up to 0.61 ms. Saturated: median 0.46 to
+/// 0.54 ms, p99 up to 5.04 ms, max up to 9.91 ms. The median moved 1.6x and the
+/// tail moved 19x, so the gate is 7x above the worst median measured on a
+/// machine with no idle core.
+const LAPTOP_FRAME_MS: f64 = 4.0;
+
 #[test]
 fn full_session_frame_time() {
+    let budget_ms = frame_budget_ms(LAPTOP_FRAME_MS);
     // Animating (not frozen): the frame counter advances every snapshot,
     // so meters, cost, and stats all change per frame.
     let rt = Arc::new(DemoRuntime::full(0, true, false));
@@ -164,19 +180,28 @@ fn full_session_frame_time() {
 
     harness.run_steps(10);
     const FRAMES: u32 = 300;
-    let start = Instant::now();
+    let mut costs: Vec<Duration> = Vec::with_capacity(FRAMES as usize);
     for _ in 0..FRAMES {
+        let at = Instant::now();
         harness.step();
+        costs.push(at.elapsed());
     }
-    let elapsed = start.elapsed();
-    let per_frame_ms = elapsed.as_secs_f64() * 1000.0 / f64::from(FRAMES);
+    costs.sort_unstable();
+    let (median, p99, max) = frame_costs_ms(&costs);
     println!(
-        "session_full: {per_frame_ms:.2} ms/frame over {FRAMES} frames (debug build, layout + tessellation, no gpu)"
+        "session_full: median {median:.2} ms/frame, p99 {p99:.2} ms, max {max:.2} ms \
+         over {FRAMES} frames (layout + tessellation, no gpu); the median is \
+         {:.0}% of the {budget_ms:.1} ms budget on this machine",
+        100.0 * median / budget_ms
     );
-    // 60 fps equivalent with headroom, in an unoptimized debug build.
+    // The median and not the p99, because this test shares the machine with the
+    // rest of the suite: on a saturated 14-core laptop the median moves 1.6x
+    // while a single frame reaches 19x. The tail is published rather than gated,
+    // so a drift toward the wall is readable on a passing run.
     assert!(
-        per_frame_ms < 16.0,
-        "frame time {per_frame_ms:.2} ms exceeds the 16 ms budget in debug"
+        median < budget_ms,
+        "frame time {median:.2} ms at the median, over the {budget_ms:.1} ms budget \
+         (p99 {p99:.2} ms, max {max:.2} ms)"
     );
 }
 
@@ -258,9 +283,13 @@ fn an_open_drawer_repaints_only_with_a_session_behind_it() {
     );
 }
 
-/// What a frame of the busiest screen costs in allocations. The number is
-/// printed on every run, because a budget nobody can see the distance to
-/// cannot be calibrated.
+/// What a frame of the busiest screen costs in allocations. A count and not a
+/// timing, so it is the same number on any machine and takes no runner
+/// multiplier: 3961 on ten consecutive runs here, against a load average
+/// spanning 2 to 50. It is also the tightest gate in the workspace, at 79
+/// percent of its budget, which is why `.config/nextest.toml` publishes the
+/// number on every run: a budget nobody can see the distance to cannot be
+/// calibrated.
 #[test]
 fn full_session_frame_allocations() {
     let rt = CountingRuntime::new(busy_session());
@@ -275,14 +304,61 @@ fn full_session_frame_allocations() {
         }
     });
     let per_frame = allocs / u64::from(FRAMES);
+    // A pull of this session is worth about 1100 allocations, so the budget is
+    // set where a second one fails.
+    const BUDGET: u64 = 5_000;
     println!(
-        "session_drawer: {per_frame} allocations/frame over {FRAMES} frames (host, 20 in the room, 506 chat lines, drawer on Broadcast)"
+        "session_drawer: {per_frame} allocations/frame over {FRAMES} frames \
+         (host, 20 in the room, 506 chat lines, drawer on Broadcast); \
+         {:.0}% of the {BUDGET} budget",
+        100.0 * per_frame as f64 / BUDGET as f64
     );
-    // 3933 on the machine this was calibrated on. A pull of this session is
-    // worth about 1100 allocations, so the budget is set where a second one
-    // fails.
     assert!(
-        per_frame < 5000,
-        "{per_frame} allocations/frame is over the 5000 budget"
+        per_frame < BUDGET,
+        "{per_frame} allocations/frame is over the {BUDGET} budget"
     );
+}
+
+/// The runner is described once, by the variable every workflow sets, and a
+/// budget can only ever get longer from it. A missing or nonsense value has to
+/// leave the laptop budget alone rather than collapse to zero.
+#[test]
+fn a_frame_budget_scales_with_the_runner_and_never_shrinks() {
+    assert_eq!(budget_scale(None), 1.0, "unset is the laptop budget");
+    // What CI sets: 120 s against the harness's 30 s reference run.
+    assert_eq!(budget_scale(Some("120")), 4.0);
+    assert_eq!(budget_scale(Some("45")), 1.5);
+    for nonsense in ["0", "-30", "", "soon", "NaN", "inf"] {
+        assert_eq!(
+            budget_scale(Some(nonsense)),
+            1.0,
+            "{nonsense:?} must not shorten a budget"
+        );
+    }
+    assert!(frame_budget_ms(LAPTOP_FRAME_MS) >= LAPTOP_FRAME_MS);
+}
+
+/// Both measurements above only reach a log on a passing run because
+/// `.config/nextest.toml` names these tests for publishing, and filters there
+/// are exact matches: a rename has to land in both places or in neither. Same
+/// pairing the harness, session, server and broadcast suites keep.
+#[test]
+fn the_measured_tests_are_named_in_the_nextest_config() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+    for (name, _) in [
+        (
+            stringify!(full_session_frame_time),
+            full_session_frame_time as fn(),
+        ),
+        (
+            stringify!(full_session_frame_allocations),
+            full_session_frame_allocations as fn(),
+        ),
+    ] {
+        assert!(
+            CONFIG.contains(&format!("test(={name})")),
+            ".config/nextest.toml no longer names {name}, so what it measures is \
+             being printed into a void"
+        );
+    }
 }
