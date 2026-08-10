@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use egui::vec2;
 use egui_kittest::{Harness, kittest::Queryable};
+use jamstream_cli::state::RecordingRecord;
 use jamstream_client::app::{JamApp, Screen};
 use jamstream_client::creds::MemStore;
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
@@ -18,6 +19,7 @@ use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::host::LaunchOutcome;
 use jamstream_client::screens::session::SettingsTab;
 use jamstream_client::theme::{self, Theme};
+use jamstream_cloud::cloudinit::{RecordingStorage, StorageCredential};
 use jamstream_cloud::{
     MockStore, ObjectStore, ProviderKind, Retention, RetentionEnforcement, session_prefix,
 };
@@ -168,6 +170,81 @@ fn record_sheet_app(applied: Option<RetentionEnforcement>) -> JamApp {
     app
 }
 
+/// The session record a launch writes for a bucket that answered `applied`,
+/// built by the launch's own function so the row reads the fields the app
+/// really persists.
+fn record_for(retention: Retention, applied: &RetentionEnforcement) -> RecordingRecord {
+    let storage = RecordingStorage {
+        provider: ProviderKind::DigitalOcean,
+        bucket: "our-takes".to_owned(),
+        region: "sfo3".to_owned(),
+        retention,
+        credential: StorageCredential::KeyPair {
+            access_key_id: "DO00ID".to_owned(),
+            secret_access_key: "0000-fake-storage-secret".to_owned(),
+        },
+        stems: true,
+    };
+    jamstream_cli::host::recording_record(&storage, applied)
+}
+
+/// The Takes screen with one card per record, each session having left an
+/// hour's take of a four piece in its bucket: a mix and four stems, 1.1 GB
+/// apiece.
+///
+/// The rows come from the screen's own `rows_from` and `takes_from_objects`, so
+/// the sizes, the total and the price are the product's arithmetic. Only the
+/// objects a listing would have answered with are set here, the way the
+/// snapshot fixture sets them: a bucket cannot be reached from a test.
+fn takes_app(records: Vec<RecordingRecord>) -> JamApp {
+    use jamstream_cli::recordings::Take;
+    use jamstream_client::screens::takes::{rows_from, takes_from_objects};
+
+    // 2026-07-28 20:20 UTC, the clock the take names are written against.
+    const NOW: u64 = 1_785_270_000;
+    let sessions: Vec<(jamstream_cli::state::SessionState, Option<RecordingRecord>)> = records
+        .into_iter()
+        .enumerate()
+        .map(|(i, record)| {
+            let started = NOW - 86_400 - i as u64 * 3_600;
+            let state = jamstream_cli::state::SessionState {
+                session_id_hex: format!("{:016x}", 0xa3f2_9c41_dead_0000_u64 + i as u64),
+                created_unix: started,
+                ended_unix: Some(started + 3_600),
+                status: jamstream_cli::state::SessionStatus::Ended,
+                ..outcome_with(None).state
+            };
+            (state, Some(record))
+        })
+        .collect();
+    let mut rows = rows_from(
+        &sessions,
+        &[],
+        &std::path::PathBuf::from("/Users/you/recordings"),
+        &std::path::PathBuf::from("/Users/you/Music/JamStream"),
+        NOW,
+    );
+    for row in &mut rows {
+        let base = "jamstream-2026-07-27-2110";
+        let objects: Vec<Take> = ["mix", "Ana", "Ben", "Cass", "Dai"]
+            .iter()
+            .map(|part| Take {
+                key: format!("jamstream/recordings/x/{base}-{part}.flac"),
+                name: format!("{base}-{part}.flac"),
+                size: 1_100_000_000,
+                last_modified: None,
+            })
+            .collect();
+        row.takes = takes_from_objects(&objects, &row.dir).expect("group the listing");
+        row.listing = false;
+    }
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.screen = Screen::Takes;
+    app.takes.rows = rows;
+    app
+}
+
 fn launched_app(retention: Option<RetentionEnforcement>) -> JamApp {
     let mut app = JamApp::in_memory();
     app.recent = Vec::new();
@@ -269,6 +346,63 @@ async fn keep_forever_is_stated_without_being_a_problem() {
             "{theme:?} draws the note in something that is no longer the danger colour"
         );
     }
+}
+
+/// #611: the consequence was only ever on the card for one session, so a bucket
+/// that refused the rule billed for weeks with nothing saying how much. The
+/// total belongs at the top of the screen, in money, because the day count is
+/// not the problem and the bill is what grows.
+#[tokio::test]
+async fn the_takes_screen_totals_what_nothing_will_delete() {
+    let refused = applied(Retention::Days30, false).await;
+    let kept = applied(Retention::Days30, true).await;
+    let mut harness = app_harness(takes_app(vec![
+        record_for(Retention::Days30, &refused),
+        record_for(Retention::Days30, &kept),
+        record_for(Retention::Days30, &refused),
+    ]));
+    // Two of the three sessions, 5.5 GB apiece, in a Spaces bucket at $0.02 per
+    // GB-month.
+    shown_once(
+        &mut harness,
+        "the takes screen",
+        "2 sessions have takes nothing will delete: 11.00 GB, about $0.22 a month",
+    );
+}
+
+/// The other half: every bucket took its rule, so the screen says nothing. A
+/// warning that is always on is not a warning.
+#[tokio::test]
+async fn a_screen_of_takes_with_rules_says_nothing_about_deleting_them() {
+    let kept = applied(Retention::Days30, true).await;
+    let mut harness = app_harness(takes_app(vec![
+        record_for(Retention::Days30, &kept),
+        record_for(Retention::Days30, &kept),
+    ]));
+    assert!(
+        drawn_at(&mut harness, "nothing will delete").is_empty(),
+        "no session is billing past a deadline, so the top of the screen keeps quiet"
+    );
+}
+
+/// "Keep forever" asked for no deletion, so an unenforced rule is a fact and
+/// belongs on the card that already states it, not in a total of promises
+/// nobody is keeping.
+#[tokio::test]
+async fn takes_kept_forever_are_not_counted_as_a_broken_promise() {
+    let refused = applied(Retention::KeepForever, false).await;
+    let mut harness = app_harness(takes_app(vec![record_for(
+        Retention::KeepForever,
+        &refused,
+    )]));
+    assert!(
+        !drawn_at(&mut harness, &refused.describe()).is_empty(),
+        "the card still says what the bucket did"
+    );
+    assert!(
+        drawn_at(&mut harness, "session has takes nothing will delete").is_empty(),
+        "keeping a take forever is what was asked for"
+    );
 }
 
 /// A session that records nowhere has nothing to say about retention, and a

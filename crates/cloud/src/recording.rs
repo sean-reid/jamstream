@@ -234,6 +234,19 @@ impl StoragePrice {
     pub fn egress_display(&self) -> String {
         format!("{}/GB", format_microusd(self.egress_microusd_per_gb))
     }
+
+    /// What holding `bytes` costs for one month at this price.
+    ///
+    /// The gross figure, like [`EgressQuote`] and for the same reason: any
+    /// included storage is pooled across every bucket on the account, so
+    /// crediting it against one recording is a guess that reads as a
+    /// certainty. Callers say "about".
+    pub fn monthly_microusd(&self, bytes: u64) -> u64 {
+        div_round(
+            bytes as u128 * self.storage_microusd_per_gb_month as u128,
+            BYTES_PER_GB,
+        )
+    }
 }
 
 /// A recording's storage bill, itemized.
@@ -678,6 +691,21 @@ mod tests {
         assert_eq!(dop.included_storage_gb, 250);
         assert_eq!(dop.included_egress_gb, 1024);
         assert_eq!(dop.base_monthly_microusd, 5_000_000);
+    }
+
+    /// What a take costs to sit in a bucket for a month, which is the figure a
+    /// surface showing a recording nothing will delete has to say out loud.
+    #[test]
+    fn a_month_of_storage_is_priced_off_the_same_rate() {
+        // A four piece's take of an hour: the mix plus four stems, 5.5 GB.
+        assert_eq!(aws().monthly_microusd(5_500_000_000), 126_500);
+        let dop = storage_price(ProviderKind::DigitalOcean, &RegionId::new("sfo3")).unwrap();
+        assert_eq!(dop.monthly_microusd(5_500_000_000), 110_000);
+        // Gross, like the download figure beside it: the 250 GB a Spaces
+        // subscription includes is pooled across the account and is not
+        // credited to one take.
+        assert_eq!(dop.included_storage_gb, 250);
+        assert_eq!(dop.monthly_microusd(0), 0);
     }
 
     #[test]

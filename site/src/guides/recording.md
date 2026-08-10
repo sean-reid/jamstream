@@ -132,7 +132,7 @@ A take can be gigabytes, so a download takes a while. The row shows how much of 
 Takes outlive the session that made them: one from a session that ended weeks ago is still here.
 
 - Where the bucket is really deleting them on a schedule, the session's card counts down to that, in red for the last three days.
-- Where the retention choice could not be applied, the card says so rather than counting down to nothing.
+- Where the retention choice could not be applied, the card says so rather than counting down to nothing, and a line above the list counts those sessions and what a month of them costs.
 - A take that is still uploading is not in the bucket yet, so it appears here when it finishes and not before.
 - An expired take with no copy on this computer drops off the list once the window is full, and a line says how many.
 - Once the bucket has deleted a take you had already downloaded, the card says it is kept on this computer and the row still reveals the file in your music folder.

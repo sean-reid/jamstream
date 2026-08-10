@@ -350,6 +350,20 @@ pub fn quote_for(record: &RecordingRecord, bytes: u64) -> Result<EgressQuote, Cl
     )?)
 }
 
+/// What holding `bytes` in one session's bucket costs a month.
+///
+/// The charge nobody agreed to: a session prices its machine and its download,
+/// and storage keeps billing after both. A surface saying so needs the figure
+/// for the bucket the takes are really in, which is why the provider and the
+/// region come off the session's own record.
+pub fn monthly_storage_for(record: &RecordingRecord, bytes: u64) -> Result<u64, CliError> {
+    let price = jamstream_cloud::storage_price(
+        provider_kind(&record.provider)?,
+        &RegionId::new(record.region.clone()),
+    )?;
+    Ok(price.monthly_microusd(bytes))
+}
+
 /// Streams `takes` into `dir`, one at a time, and returns the bytes that
 /// landed.
 ///

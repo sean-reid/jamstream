@@ -227,6 +227,14 @@ impl SessionTakes {
         self.expires_in_days.is_some_and(|days| days < 0)
     }
 
+    /// Bytes this session left behind, across every take of it.
+    pub fn bytes(&self) -> u64 {
+        self.takes
+            .iter()
+            .map(|take| take.mix.bytes() + take.stems.bytes())
+            .sum()
+    }
+
     /// Any part of any take already on this computer, which is a file somebody
     /// can still play whatever the bucket does next.
     pub fn downloaded(&self) -> bool {
@@ -547,6 +555,65 @@ fn expiry(
         }
         None => (None, None),
     }
+}
+
+/// A session whose takes nothing is going to delete: the bucket refused the
+/// rule, a day count was asked for, and there are bytes in it to bill.
+///
+/// "Keep forever" asked for no deletion, so an unenforced rule there is a fact
+/// about abandoned uploads rather than a promise nobody is keeping, and the card
+/// states it. A bucket that has not answered yet is left out as well: a total
+/// short of a session's takes reads as the whole bill.
+fn nothing_will_delete(row: &SessionTakes) -> bool {
+    row.unenforced.is_some()
+        && row.bytes() > 0
+        && row.record().is_some_and(|record| {
+            record
+                .retention
+                .parse::<Retention>()
+                .is_ok_and(|retention| retention.days().is_some())
+        })
+}
+
+/// The screen's one line about takes with no expiry: how many sessions have
+/// them, how much that is, and what a month of it costs.
+///
+/// Once and at the top, because the card explains a single session and the
+/// screen is the only place the total exists. The money is the honest unit here:
+/// a day count is not the problem, and the bill is the thing that grows.
+///
+/// The figure is dropped rather than guessed when a bucket's provider has no
+/// bundled price, and when a month of it rounds below a cent.
+fn unenforced_line(rows: &[SessionTakes]) -> Option<String> {
+    let mine: Vec<&SessionTakes> = rows.iter().filter(|row| nothing_will_delete(row)).collect();
+    let count = mine.len();
+    if count == 0 {
+        return None;
+    }
+    let bytes: u64 = mine.iter().map(|row| row.bytes()).sum();
+    let money = mine
+        .iter()
+        .try_fold(0u64, |sum, row| {
+            let record = row.record()?;
+            Some(sum + recordings::monthly_storage_for(record, row.bytes()).ok()?)
+        })
+        .and_then(theme::microusd_nonzero);
+    let subject = if count == 1 {
+        "1 session has".to_owned()
+    } else {
+        format!("{count} sessions have")
+    };
+    let size = recordings::human_size(bytes);
+    Some(match money {
+        Some(money) => format!(
+            "{subject} takes nothing will delete: {size}, about {money} a month until you \
+             delete them."
+        ),
+        None => format!(
+            "{subject} takes nothing will delete: {size}, billed every month until you \
+             delete them."
+        ),
+    })
 }
 
 fn spent(hourly_microusd: u64, secs: u64) -> u64 {
@@ -1106,6 +1173,25 @@ impl TakesScreen {
                         "What your sessions recorded. A take in a bucket costs egress to \
                  download, and the price is on the button.",
                     ));
+                    // Above the list rather than in the cards: the per session
+                    // explanation is already on the card, and the total is the
+                    // part no card can say.
+                    //
+                    // Amber, not danger: nothing failed and no take is lost,
+                    // money is being spent. The wizard's line about untimed
+                    // regions argues the same case and picks the same colour.
+                    if let Some(line) = unenforced_line(&self.rows) {
+                        let p = theme::palette_of(ui);
+                        ui.add_space(theme::SPACE_SM);
+                        ui.add(
+                            egui::Label::new(RichText::new(line).color(theme::readable(
+                                p.meter_amber,
+                                p.surface0,
+                                p,
+                            )))
+                            .wrap(),
+                        );
+                    }
                     ui.add_space(theme::SPACE_MD);
                     if let Some(err) = self.error.clone() {
                         theme::reason(ui, err);
@@ -1721,6 +1807,67 @@ mod tests {
         assert!(rows[0].takes.is_empty());
         assert!(!rows[0].downloaded());
         std::fs::remove_dir_all(&music).expect("clean up");
+    }
+
+    /// The line above the list, and what it will not say. A refused day count
+    /// is counted; "keep forever" asked for no deletion, a bucket that has not
+    /// answered has no bytes to bill, and a provider with no bundled price
+    /// keeps the count and loses the figure.
+    #[test]
+    fn the_line_above_the_list_counts_refused_day_counts_only() {
+        let start = 1_784_000_000;
+        let note = || RetentionApplied::Unenforced {
+            note: "this bucket has no lifecycle API".to_owned(),
+        };
+        let forever = RecordingRecord {
+            retention: "forever".to_owned(),
+            ..record(Some(note()))
+        };
+        let sessions = vec![
+            (
+                session("aaaa1111", "digitalocean", start, Some(start + 3_600)),
+                Some(record(Some(note()))),
+            ),
+            (
+                session("bbbb2222", "digitalocean", start, Some(start + 3_600)),
+                Some(forever),
+            ),
+        ];
+        let mut rows = rows_from(
+            &sessions,
+            &[],
+            Path::new("/takes"),
+            Path::new("/music"),
+            start + 7_200,
+        );
+        assert_eq!(
+            unenforced_line(&rows),
+            None,
+            "no bucket has answered, so there is nothing to total"
+        );
+
+        for row in &mut rows {
+            row.takes = takes_from_objects(
+                &[object("jamstream-2026-07-28-1930-mix.flac", 5_500_000_000)],
+                &row.dir,
+            )
+            .expect("group the listing");
+            row.listing = false;
+        }
+        let line = unenforced_line(&rows).expect("one session's takes have no expiry");
+        assert!(line.starts_with("1 session has"), "{line}");
+        // 5.5 GB of Spaces Standard at $0.02 per GB-month.
+        assert!(line.contains("5.50 GB"), "{line}");
+        assert!(line.contains("about $0.11 a month"), "{line}");
+
+        rows[0].place = Place::Bucket(RecordingRecord {
+            provider: "somewhere-else".to_owned(),
+            ..record(Some(note()))
+        });
+        let line = unenforced_line(&rows).expect("the session is still unenforced");
+        assert!(line.starts_with("1 session has"), "{line}");
+        assert!(line.contains("5.50 GB"), "{line}");
+        assert!(!line.contains('$'), "a price may not be invented: {line}");
     }
 
     /// The rows are built from what this machine knows: a bucket sidecar, or a
