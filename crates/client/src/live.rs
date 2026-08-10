@@ -75,9 +75,6 @@ const STREAM_SETTLED_AFTER: Duration = Duration::from_secs(5);
 /// 512-frame (1.28 s) stream-restart threshold, so an abandoned backlog
 /// always trips it.
 const PUMP_REPLAY_MAX_SECS: u64 = 2;
-/// Synthetic sender id for system chat lines (device notices). Real member
-/// ids are assigned from zero, far below this.
-const SYSTEM_MEMBER: MemberId = MemberId(u16::MAX);
 /// How long playout may hand out nothing but zeros on a joined session before
 /// the log says so. The deepest legitimate refill is the buffer's own
 /// `MAX_TARGET` of 24 frames, 60 ms, so a second of it is not the buffer
@@ -306,8 +303,7 @@ struct SharedState {
     reopen_attempts: u64,
     /// Why the audio stream will not open, verbatim, while it will not. Set
     /// on every failed open and cleared by the one that succeeds, so the UI
-    /// reads it the way it reads the connection state rather than being told
-    /// once in a chat line it may already have scrolled past.
+    /// reads it the way it reads the connection state.
     device_error: Option<String>,
     /// How each direction of the running stream reaches the session rate,
     /// from the backend's report at open; None while there is no
@@ -579,19 +575,16 @@ impl Driver {
 /// The first attempt of an episode is immediate, so a genuine unplug is
 /// reopened on the next tick. Each attempt after it waits twice as long, and
 /// the budget stops the loop entirely. Without both, a device that opens and
-/// then latches before the next tick was closed and reopened every 2.5 ms:
-/// two chat lines a tick emptied the 500-line scrollback in about a second,
+/// then latches before the next tick was closed and reopened every 2.5 ms,
 /// and a real open costs 10-100 ms, so the rings went unserviced for the
 /// whole episode.
 #[derive(Debug, Default)]
 struct ReopenEpisode {
     attempts: u32,
-    /// Said once each per episode. A device that dies on every open would
-    /// otherwise alternate two distinct lines forever, which no per-line
-    /// dedupe can catch.
-    said_stopped: bool,
-    said_reopened: bool,
-    said_given_up: bool,
+    /// Whether this episode began with a stream that stopped on its own.
+    /// A reopen for a pick somebody just made is not a fault, and the UI
+    /// tells them apart by this.
+    faulted: bool,
 }
 
 impl ReopenEpisode {
@@ -1022,15 +1015,13 @@ impl LiveRuntime {
         let _ = socket.send(&init);
 
         let mut state = SharedState::new(invite, addr);
-        // The join-time rung disclosure: the worker announces changes on
-        // every later open, so the first open's outcome is told here or
-        // never.
+        // The rung each direction landed on, which the status bar's tag and
+        // the Audio tab read for as long as the stream runs. Logged here as
+        // well, so the file carries what the session started on.
         state.rate = rate;
         if let Some(rate) = rate {
             for (side, outcome) in [("capture", rate.capture), ("playback", rate.playback)] {
-                if let Some(line) = rate_change_line(None, outcome, side) {
-                    push_system_line(&mut state, 0, &line);
-                }
+                log_rate_change(None, outcome, side);
             }
         }
         let shared = Arc::new(Mutex::new(state));
@@ -1068,7 +1059,6 @@ impl LiveRuntime {
             last_reopen: None,
             opened_at: Some(Instant::now()),
             episode: ReopenEpisode::default(),
-            announced_failure: None,
             announced_rate: rate,
         };
         let handle = std::thread::Builder::new()
@@ -1460,11 +1450,8 @@ struct Worker {
     /// running one has already ended its episode.
     opened_at: Option<Instant>,
     episode: ReopenEpisode,
-    /// The failure line last put in chat, so the retry cadence announces each
-    /// distinct reason once instead of once per attempt.
-    announced_failure: Option<String>,
-    /// The rate outcomes last announced in chat, so a reopen on the same
-    /// rung says nothing and a rung change is said exactly once.
+    /// The rate outcomes last logged, so a reopen on the same rung writes
+    /// nothing and a rung change is written exactly once.
     announced_rate: Option<RateOutcomesView>,
 }
 
@@ -1631,8 +1618,8 @@ impl Worker {
     /// side never pauses. On failure the user's selection is kept and the
     /// reopen cadence keeps trying exactly it: rewriting the settings to the
     /// system default here would leave the Audio tab claiming a device the
-    /// stream does not run, with only a chat line to say otherwise. The
-    /// refusal itself stays on screen through `device_error`.
+    /// stream does not run. The refusal itself stays on screen through
+    /// `device_error`.
     fn reconfigure(&mut self, settings: AudioSettings) {
         self.shut_at = Some(Instant::now());
         // Drain what the old ring already captured so those samples reach
@@ -1645,18 +1632,16 @@ impl Worker {
         self.opened_at = None;
         self.settings = settings;
         // A device the user just picked is a fresh start: the budget the last
-        // one spent, and anything already said about it, do not carry over.
+        // one spent, and the fault it was in, do not carry over.
         self.episode = ReopenEpisode::default();
-        self.announced_failure = None;
         self.attempt_open();
     }
 
-    /// A dead stream is closed, announced for what is known about it, and
-    /// retried with the same settings on the episode's widening cadence. The
-    /// old line claimed "audio device disconnected" for every latched error,
-    /// but the exclusive path latches on any read or write hiccup, so a
-    /// driver stutter was reported as an unplug; the class is only knowable
-    /// from the reopen attempt, and the announcement waits for it.
+    /// A dead stream is closed and retried with the same settings on the
+    /// episode's widening cadence. What class of failure it was is only
+    /// knowable from the reopen attempt: the exclusive path latches on any
+    /// read or write hiccup, so nothing here may call a driver stutter an
+    /// unplug.
     fn check_stream(&mut self) {
         if self.driver.errored() {
             self.driver.close();
@@ -1664,10 +1649,7 @@ impl Worker {
             self.opened_at = None;
             // A dead stream has no rate outcome to show.
             self.shared.lock().expect("live state").rate = None;
-            if !self.episode.said_stopped {
-                self.episode.said_stopped = true;
-                self.system_line("the audio stream stopped; retrying");
-            }
+            self.episode.faulted = true;
         }
         if self
             .opened_at
@@ -1676,20 +1658,10 @@ impl Worker {
             self.opened_at = None;
             self.episode = ReopenEpisode::default();
         }
-        if self.engine.is_none() {
-            if self.episode.spent() {
-                if !self.episode.said_given_up {
-                    self.episode.said_given_up = true;
-                    self.system_line(&format!(
-                        "the audio device did not stay open after {REOPEN_ATTEMPTS_MAX} tries; \
-                         pick a device on the Audio tab to try again"
-                    ));
-                }
-            } else {
-                let backoff = self.episode.backoff();
-                if self.last_reopen.is_none_or(|t| t.elapsed() >= backoff) {
-                    self.attempt_open();
-                }
+        if self.engine.is_none() && !self.episode.spent() {
+            let backoff = self.episode.backoff();
+            if self.last_reopen.is_none_or(|t| t.elapsed() >= backoff) {
+                self.attempt_open();
             }
         }
         self.publish_fault();
@@ -1709,9 +1681,7 @@ impl Worker {
                 tries: self.episode.attempts,
             });
         }
-        self.episode
-            .said_stopped
-            .then_some(AudioFaultView::Retrying)
+        self.episode.faulted.then_some(AudioFaultView::Retrying)
     }
 
     /// The fault the UI reads, published every tick and logged only where it
@@ -1725,13 +1695,14 @@ impl Worker {
         }
         shared.audio_fault = fault;
         drop(shared);
+        // Every attempt logs itself, so a run of them needs nothing here. The
+        // end of the cadence does, because nothing after it reopens the
+        // stream, and so does the recovery that clears a fault.
         match fault {
-            Some(AudioFaultView::Retrying) => {
-                tracing::warn!("the audio stream stopped; retrying");
-            }
             Some(AudioFaultView::GaveUp { tries }) => {
                 tracing::warn!(tries, "the audio device did not stay open; giving up");
             }
+            Some(AudioFaultView::Retrying) => {}
             None => tracing::info!("the audio stream is running again"),
         }
     }
@@ -1760,29 +1731,10 @@ impl Worker {
                 "reopening audio stream"
             );
         }
-        match self.try_open() {
-            Ok(()) => {
-                if self.episode.said_stopped && !self.episode.said_reopened {
-                    self.episode.said_reopened = true;
-                    self.system_line("audio device reopened");
-                }
-            }
-            Err(err) => self.announce_open_failure(&err),
-        }
-    }
-
-    /// One chat line per distinct failure, in the device's own words, so the
-    /// retry cadence does not flood the conversation. Disconnection is
-    /// claimed only when the error class says the device is gone.
-    fn announce_open_failure(&mut self, err: &AudioError) {
-        let line = match err {
-            AudioError::DeviceGone => "audio device disconnected; retrying".to_owned(),
-            refused => format!("audio device refused: {}", refused.detail()),
-        };
-        if self.announced_failure.as_deref() != Some(line.as_str()) {
-            self.system_line(&line);
-            self.announced_failure = Some(line);
-        }
+        // What the device said about a refusal reaches the UI through
+        // `device_error`, and the cadence itself decides what happens next,
+        // so there is nothing to do with the answer here.
+        let _ = self.try_open();
     }
 
     fn try_open(&mut self) -> Result<(), AudioError> {
@@ -1825,8 +1777,7 @@ impl Worker {
                 shared.device_error = None;
                 shared.rate = rate;
                 drop(shared);
-                self.announced_failure = None;
-                self.announce_rate(rate);
+                self.log_rate_changes(rate);
                 Ok(())
             }
             Err(err) => {
@@ -1843,19 +1794,18 @@ impl Worker {
         }
     }
 
-    /// One chat line per direction whose rung changed at this open: rungs 2
-    /// and 3 are said once, never per reopen; rung 1 and the OS converter add
-    /// nothing here (the latency hover carries them).
-    fn announce_rate(&mut self, rate: Option<RateOutcomesView>) {
+    /// One log line per direction whose rung changed at this open. The rung
+    /// itself is on screen for as long as the stream runs, in the status
+    /// bar's tag and under the pickers on the Audio tab; what the file keeps
+    /// is when it changed, which no on-screen state can say.
+    fn log_rate_changes(&mut self, rate: Option<RateOutcomesView>) {
         let Some(rate) = rate else { return };
         let old = self.announced_rate;
         for (side, old, new) in [
             ("capture", old.map(|r| r.capture), rate.capture),
             ("playback", old.map(|r| r.playback), rate.playback),
         ] {
-            if let Some(line) = rate_change_line(old, new, side) {
-                self.system_line(&line);
-            }
+            log_rate_change(old, new, side);
         }
         self.announced_rate = Some(rate);
     }
@@ -2270,24 +2220,6 @@ impl Worker {
             Err(err) => tracing::warn!(%err, %addr, "socket for fallback address failed"),
         }
     }
-
-    fn system_line(&self, text: &str) {
-        let at_ms = self.now_ms();
-        push_system_line(&mut self.shared.lock().expect("live state"), at_ms, text);
-    }
-}
-
-/// A system chat line, logged and pushed: [`Worker::system_line`] plus the
-/// join-time rate disclosure in [`LiveRuntime::start`], which runs before a
-/// worker exists.
-fn push_system_line(state: &mut SharedState, at_ms: u64, text: &str) {
-    tracing::info!(text, "audio notice");
-    state.push_chat(ChatLine {
-        from_name: "system".to_owned(),
-        from_id: SYSTEM_MEMBER,
-        text: text.to_owned(),
-        at_ms,
-    });
 }
 
 /// The runtime's view of the backend's rate outcomes.
@@ -2308,12 +2240,20 @@ fn rate_view(outcomes: jamstream_audio_io::RateOutcomes) -> RateOutcomesView {
     }
 }
 
-/// The chat notice one direction's rung earns at an open, given the rung it
-/// was on before. Rung 1 is not news, the OS converter is hover-only, and an
-/// unchanged rung is silence, so the reopen cadence can never flood
-/// the room. A converter that replaces a clock this app had set names the
-/// contest: that is the one demotion a musician might otherwise chase into
-/// their other software's settings.
+/// The log line one direction's rung earns at an open, given the rung it was
+/// on before, or nothing when there is nothing to say. Rung 1 is not news, the
+/// OS converter is a hover detail, and an unchanged rung is silence, so the
+/// reopen cadence can never fill the file. A converter that replaces a clock
+/// this app had set names the contest: that is the one demotion a musician
+/// might otherwise chase into their other software's settings.
+fn log_rate_change(old: Option<RateOutcomeView>, new: RateOutcomeView, side: &str) {
+    if let Some(line) = rate_change_line(old, new, side) {
+        tracing::info!(line, "the audio stream's sample rate path changed");
+    }
+}
+
+/// The sentence a rung change earns, split out from [`log_rate_change`] so
+/// the copy per rung is one thing a test can hold.
 fn rate_change_line(
     old: Option<RateOutcomeView>,
     new: RateOutcomeView,
@@ -2529,13 +2469,13 @@ mod tests {
         );
     }
 
-    /// The chat copy per rung change, the rate-rung disclosure contract: rung
-    /// 2 and rung 3 are announced once, an unchanged rung and rung 1 say
-    /// nothing (so the reopen cadence cannot flood chat), the OS converter
-    /// stays hover-only, and a converter that replaced a clock this app set
-    /// names the contest instead of reading like a random downgrade.
+    /// The log copy per rung change, the rate-rung disclosure contract: rung
+    /// 2 and rung 3 are written once, an unchanged rung and rung 1 write
+    /// nothing (so the reopen cadence cannot fill the file), the OS converter
+    /// is a hover detail only, and a converter that replaced a clock this app
+    /// set names the contest instead of reading like a random downgrade.
     #[test]
-    fn rung_changes_earn_one_honest_chat_line() {
+    fn rung_changes_earn_one_honest_log_line() {
         let clock_set = RateOutcomeView::ClockSet { from: 44_100 };
         let resampled = RateOutcomeView::Resampled {
             device: 44_100,
@@ -2564,7 +2504,7 @@ mod tests {
         assert_eq!(
             rate_change_line(Some(resampled), RateOutcomeView::Native, "capture"),
             None,
-            "returning to native is visible in the tag, not the chat"
+            "returning to native is visible in the tag going away"
         );
         assert_eq!(
             rate_change_line(
