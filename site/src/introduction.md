@@ -4,7 +4,7 @@ JamStream is a desktop app that lets a band play together over the internet, wit
 
 - **One of you hosts.** The app starts a small server, on your own computer or in your own cloud account, that exists only for the length of the session.
 - **Everyone else joins with a link.** Paste a personal invite into the app; there are no accounts and no JamStream servers in the middle.
-- **Every packet is encrypted**, and the server shuts itself down the moment the music stops.
+- **Every packet is encrypted**, and the server shuts itself down ten minutes after the last musician leaves.
 - **The cost lands on you, not JamStream.** A cloud session runs a few cents on your own provider account; nobody else is paid anything.
 
 ![A four piece mid session: one mixer strip per musician with avatar, fader and mute, a chat column, the metronome, and a status bar reading 7.9 ms mouth to ear](images/session_demo.png)
@@ -12,11 +12,11 @@ JamStream is a desktop app that lets a band play together over the internet, wit
 
 ## What it costs
 
-Sessions hosted on your own computer cost nothing. A three hour cloud session with four musicians costs about $0.08 on DigitalOcean, paid to your provider by the second. The preview shown before every launch pulls current pricing and is the number to trust; see [Understanding cost](guides/cost.md).
+Sessions hosted on your own computer cost nothing. A three hour cloud session with four musicians costs about $0.08 on DigitalOcean, paid to your provider by the second. The preview shown before every launch is the number to trust; see [Understanding cost](guides/cost.md).
 
 ## Streaming
 
-The host can put a session on air to Twitch and YouTube Live, either one or both at once, and one platform dropping out never interrupts the other. Stream keys are masked, never shown back, and kept in your system keychain. See [Streaming to Twitch and YouTube](guides/streaming.md).
+The host can put a session on air to Twitch and YouTube Live, either one or both at once, and one platform dropping out never interrupts the other. Stream keys are masked, never shown back, and kept in this computer's keychain. See [Streaming to Twitch and YouTube](guides/streaming.md).
 
 ## Project status
 

@@ -8,13 +8,13 @@ Nothing is captured by surprise. Recording is armed at launch, and a take runs o
 
 A cloud session records to a bucket in your own account, because the machine deletes itself when the session ends and a take on its disk goes with it. Open **Settings**, then **Recording**:
 
-![The Recording tab in the settings drawer: provider rows, the bucket and its region, two masked key fields, and Check](../images/session_settings_recording.png)
+![The Recording tab in the settings drawer: one row per provider with its bucket or a setup status, then the bucket, its region, and two masked key fields](../images/session_settings_recording.png)
 *Set up once per computer. The key is masked and never shown again.*
 
 1. Pick the provider holding the bucket, and name the bucket and the region it is in. Host in that region and the upload costs nothing.
 2. Paste the storage key pair. **This is not the credential that launches machines.** Launching a recorded session writes this key into the session machine, so scope it to writing the recordings prefix of one bucket. The last section of your [provider's page](providers.md) makes exactly that key.
-3. Click **Check**. It writes one small object to the bucket and deletes it. A pass saves the key in your system keychain; a failure shows the bucket's own reason and saves nothing, so a wrong key fails while you are pasting rather than mid-song.
-4. **Keep takes for** sets the default retention for new sessions: 7, 30 or 90 days, or forever. The default is 30 days, and it is a rule on the bucket itself, so it keeps being enforced long after the machine is gone.
+3. Click **Check**. It writes one small object to the bucket and deletes it. A pass saves the key in this computer's keychain; a failure says what to change and saves nothing, so a wrong key fails while you are pasting rather than mid-song.
+4. **keep takes for** sets the default retention for new sessions: 7, 30 or 90 days, or forever. It saves as you pick it, unlike the bucket and the key, which save on a passing Check. The default is 30 days, and it is a rule on the bucket itself, so it keeps being enforced long after the machine is gone.
 
 A session on your own computer records to your own disk and needs none of this.
 
@@ -29,7 +29,7 @@ Whether a session can record, and whether stems are captured alongside the mix, 
 |---|---|---|
 | off | nothing; every launch starts here | none |
 | mix only | the stereo mix listeners hear | about 1.2 GB |
-| mix and stems | the mix, plus one stereo file per musician | about 6 GB |
+| mix and stems | the mix, plus one stereo file per musician | about 6.2 GB |
 
 The size sits beside each row in the wizard, and the estimate below moves as you pick, because that is the moment the difference matters.
 
@@ -62,9 +62,9 @@ A session launched without recording cannot be talked into it later. Press Recor
 
 **Record** in the session's status bar opens the Record sheet. Only the host has either.
 
-The sheet shows the take's state, a line saying whether stems are being captured, and one button: **Record** to start a take, **Stop** to end it. Closing the sheet does not stop a take, and neither does leaving the session; a take stops when the host presses Stop or when the session ends.
+The sheet shows the take's state, a line saying whether stems are being captured, **Record** to start a take, **Stop** to end it, and **Close**. Closing the sheet does not stop a take, and neither does leaving the session; a take stops when the host presses Stop or when the session ends.
 
-While a take runs, **REC** lights red in the middle of the bar for everyone in the session, beside ON AIR. Hover it and it says the session is being recorded. Nothing lights while the recorder is idle.
+While a take runs, **REC** lights in the middle of the bar for everyone in the session. Hover it and it reads "this session is being recorded". Nothing lights while the recorder is idle.
 
 ## Where takes land
 
@@ -113,15 +113,15 @@ Downloading is where recording costs money, because your cloud account bills egr
 
 ## Getting your takes
 
-**Takes**, on the Recent sessions card on Home, is every take this computer knows about, newest first.
+**Takes**, on the Recent sessions card on Home once a session is listed there, is every take this computer knows about, newest first.
 
-![The Takes screen: one card per session with its day, length and region, and under each a take with its mix and its stems, their sizes, and a button to reveal or download each](../images/takes.png)
+![The Takes screen: one card per session with its day, its length and where it ran, and under each a take with its mix and its stems, their sizes, and a button to reveal or download each](../images/takes.png)
 *A row is one take. The mix is already on this computer here, so it offers Reveal; the stems are still in the bucket and carry their price.*
 
 One row is one take, meaning one Record to Stop, so two takes of the same song are told apart by when they started and how big they are. The mix and the stems of a take are separate rows, because the stems are several times the bytes and pulling them is where the money is:
 
 - A take on this computer offers **Reveal in Finder** (Windows: **Show in File Explorer**, Linux: **Show in Files**), opening its folder with the file selected. A local session's takes are here from the moment you press Stop.
-- A take in a bucket has a Download button carrying its size and what the download will cost. Clicking it starts the transfer at that price; there is nothing further to confirm.
+- A take in a bucket has a button reading **Download mix · 1.10 GB · about $0.01**: the half, its size, and what your own account will bill for the egress. Clicking it starts the transfer; there is nothing further to confirm.
 - Downloaded takes land in a `JamStream` folder in your music folder, one folder per session. The row then offers Reveal instead.
 
 A take can be gigabytes, so a download takes a while. The row shows how much of it has arrived, and the other takes wait until it finishes:
@@ -131,9 +131,10 @@ A take can be gigabytes, so a download takes a while. The row shows how much of 
 
 Takes outlive the session that made them: one from a session that ended weeks ago is still here.
 
-- Where the bucket is really deleting them on a schedule, the row counts down to that, in red for the last three days.
-- Where the retention choice could not be applied, the row says so rather than counting down to nothing.
+- Where the bucket is really deleting them on a schedule, the session's card counts down to that, in red for the last three days.
+- Where the retention choice could not be applied, the card says so rather than counting down to nothing.
 - A take that is still uploading is not in the bucket yet, so it appears here when it finishes and not before.
+- An expired take with no copy on this computer drops off the list once the window is full, and a line says how many.
 
 ### From the terminal
 
@@ -150,9 +151,9 @@ Stems are stereo rather than mono, so a stem is the same size as the mix, which 
 | The sheet reads | The bar shows | What it means |
 |---|---|---|
 | `idle` | nothing | armed, with no take running |
-| `recording` | `REC` in red | a take is running |
-| `uploading` | `UPLOADING` in amber | the take ended and the last of it is still going to the bucket. Record comes back when it clears |
-| `failed` | `REC FAILED` in red | the take stopped, with the reason |
+| `recording` | `REC`, a filled lamp | a take is running |
+| `uploading` | `UPLOADING`, a hollow lamp | the take ended and the last of it is still going to the bucket. Record is disabled until it clears |
+| `failed` | `REC FAILED`, a hollow lamp | the take stopped, with the reason |
 
 A take on your own disk is finished the moment you press Stop, so it never reads `uploading`.
 

@@ -17,7 +17,7 @@ File issues at [github.com/sean-reid/jamstream/issues](https://github.com/sean-r
 - what you ran or clicked, and what happened instead of what you expected;
 - if the app never opens, the contents of `logs/app.log` in the [app's data directory](guides/troubleshooting.md#the-app-does-not-start), which is where a crash before the window lands;
 - your operating system and, for audio problems, your interface and buffer size;
-- for session problems, the status bar numbers (mouth to ear, rtt, buffer, uplink and downlink loss) and the first 8 characters of the session id;
+- for session problems, the mouth to ear figure with the `rtt`, `buffer`, `uplink loss` and `downlink loss` lines from its hover, and the session id from the status bar;
 - for provider problems, the provider name and the exact CLI output, which never contains your credentials.
 
 Documentation bugs are bugs. If this site disagrees with what the software does, file that too.

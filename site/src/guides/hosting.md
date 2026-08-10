@@ -8,7 +8,7 @@ Hosting does not have to involve a cloud at all: picking **local** in the wizard
 
 The first step lists where the server can run: local, then the three clouds, each with its status. A cloud with saved credentials reads `ready`; one without reads `setup needed`.
 
-Selecting an unset provider opens an inline pane that takes the credential, checks it with a real API call, and saves it to your keychain. [Provider setup](providers.md) walks each provider from zero.
+Selecting an unset provider opens an inline pane that takes the credential, checks it with a real API call, and saves it on this computer. [Provider setup](providers.md) walks each provider from zero.
 
 ## The region table
 
@@ -23,7 +23,9 @@ Before launching, JamStream measures the round trip from your machine to each of
 | hourly | The machine's current price per hour, fetched live where the provider offers it. |
 | egress | What the provider charges per GB of outbound audio. |
 
-Regions are sorted by worst round trip in 5 ms steps, with price breaking ties inside a step, best first. The top row is preselected; click another to override it (`--region` in the CLI).
+Regions are sorted by worst round trip in 5 ms steps, with price breaking ties inside a step, best first. The top row is preselected if a probe answered for it; click another to override it (`--region` in the CLI).
+
+A region that did not answer a probe reads `no probe` and sorts last. If none answered, nothing is preselected and Continue stays off until you pick one.
 
 A region under 30 ms from everyone keeps the network's share of latency in single digits each way, which is what makes the total playable.
 
@@ -39,10 +41,10 @@ Step 3 shows the expected hours, the seat counts, and the resulting estimate, al
 | Field | What it does |
 |---|---|
 | hours | Shapes the estimate only; the real bill is metered. Play longer and you pay for the time played. |
-| musicians | Playing seats, counting you: 4 means your own seat plus three invites to hand out. The cap is 10, which is also what the server admits. |
-| listeners | People who only hear the mix. |
-| stream destinations | How many platforms you expect to broadcast to; it is the number here that moves the estimate most. It configures nothing: platforms are set up in the session itself, in [Streaming to Twitch and YouTube](streaming.md). |
-| Recording | Off, the mix, or the mix and stems. It is the one choice here that is fixed for the session: a session launched with it off cannot record later. A cloud take needs a bucket, set up once in Settings; [Recording a session](recording.md) walks it. |
+| musicians, including you | Playing seats: 4 means your own seat plus three invites to hand out. The cap is 10, which is also what the server admits. |
+| listeners | People who only hear the mix, up to 20. |
+| stream destinations | How many platforms you expect to broadcast to, up to 2; it is the number here that moves the estimate most. It configures nothing: platforms are set up in the session itself, in [Streaming to Twitch and YouTube](streaming.md). |
+| Recording | `off`, `mix only`, or `mix and stems`. It is the one choice here that is fixed for the session: a session launched with it off cannot record later. A cloud take needs a bucket, set up once in Settings; [Recording a session](recording.md) walks it. |
 
 [Understanding cost](cost.md) explains every line of the estimate.
 
@@ -56,7 +58,7 @@ One invite per seat is minted up front, on your machine, and the wizard opens Se
 *Each link admits one person. Copy, revoke, or mint more, and end the session for everyone from here.*
 
 - Each row is one seat with a live status: `not joined`, `connected`, or `free`. **Copy link** puts that person's invite on the clipboard; send it to exactly one person over a channel you trust.
-- Revoking a seat frees it: the row keeps the name it had, greyed, and **New link** mints a replacement into the same chair.
+- Revoking a seat frees it: the status reads `free, was Ben` and **New link** mints a replacement into the same chair.
 - **Revoke** ejects that member and kills their invite, with a confirmation step. The host also sees a Revoke button on each mixer strip.
 - **Mint invite** adds a musician or listener seat mid-session, up to 10 musicians (you included) and 20 listeners. Unused invites cost nothing.
 - The **for** field names the next link you mint. The name rides inside the invite, so the roster and any recorded stems say "Ana" from that person's first packet instead of "musician 2".
@@ -64,7 +66,7 @@ One invite per seat is minted up front, on your machine, and the wizard opens Se
 
 See [Joining a session](joining.md) for how invites behave on the other end.
 
-The CLI mints its seats at launch and cannot add more to a running session; the app's panel can, even for sessions the CLI hosted.
+The panel belongs to the app that launched the session. A session hosted from the CLI cannot have seats added later, from either side, and joining it in the app is an ordinary join with no Invites tab.
 
 ## The safety knobs
 
@@ -85,7 +87,7 @@ There is no way to extend a running session; host a new one. The point of the ca
 
 The **Broadcast** tab of Settings holds both halves of streaming: **Stream mix** sets what the platforms and the listeners hear, and **Destinations** puts the session on air to Twitch and YouTube Live.
 
-**Record** is the one action in the bar itself, and [Recording a session](recording.md) covers takes.
+**Record** is the one performance action in the bar itself, and [Recording a session](recording.md) covers takes.
 
 Devices and buffer size can change mid-session from Settings in the top bar, and the change applies immediately; [Joining a session](joining.md#the-session-screen) walks the whole screen.
 
@@ -105,9 +107,9 @@ That file is where the reason a broadcast or a take failed is written down, and 
 
 Closing the app window while your session runs asks the same question rather than deciding for you:
 
-- end the session and quit
-- keep it running and quit; the band plays on, and the server stops itself 10 minutes after the last musician leaves, at its hard cap, or with `jamstream end`
-- cancel
+- **Cancel**
+- **Keep it running and quit**; the band plays on, and the server stops itself 10 minutes after the last musician leaves, at its hard cap, with **Stop strays** on the home screen, or with `jamstream end`
+- **End session and quit**
 
 No dialog appears when nothing you launched is running.
 

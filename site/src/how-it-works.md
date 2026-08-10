@@ -6,7 +6,7 @@ When you host, your computer asks a cloud provider for one small Linux VM, hands
 
 In [local mode](guides/local.md) there is no VM: the same server runs as a process on your own machine.
 
-Only the one UDP session port is reachable from outside. Nothing about a session persists in the cloud after it ends.
+Only the one UDP session port is reachable from outside. Nothing about a session persists in the cloud after it ends except a take you asked it to record, which lands in your own bucket.
 
 The machine destroys itself three ways:
 
@@ -22,7 +22,7 @@ GCP differs in one way worth knowing: an idle session stops serving but the mach
 
 There are no accounts and no JamStream servers. Identity is the invite.
 
-Hosting generates the session's keys on your computer and mints one invite per seat, each naming one person, one seat, and an expiry. Invites are revocable mid-session and all of them expire at the hard cap. Every packet is encrypted and authenticated from the first handshake byte. There is no plaintext mode.
+Hosting generates the session's keys on your computer and mints one invite per seat, each carrying one seat and an expiry. Invites are revocable mid-session and all of them expire at the hard cap. Every packet is encrypted and authenticated from the first handshake byte. There is no plaintext mode.
 
 What that buys you: strangers cannot join, listen in, or disrupt a session, a leaked invite is one revocation away from useless, and no third party, JamStream included, sits between your band and your machine.
 
@@ -32,8 +32,8 @@ The target is under 30 ms mouth to ear. Measured with real Opus and real encrypt
 
 | Round trip to the server | Mouth to ear |
 |---|---|
-| Same city | 9.7 ms |
-| Same region | 19.3 ms |
-| Cross country over DSL | 64.8 ms |
+| 1 ms, one local network | 9.7 ms |
+| 12 ms, same region | 19.3 ms |
+| 45 ms, cross country over DSL | 64.8 ms |
 
 The two network legs are the only parts that grow with distance, which is why [region choice](guides/hosting.md#the-region-table) is the decision that matters. Under about 30 ms it feels like standing on a stage together. At 65 ms it feels like a phone call.

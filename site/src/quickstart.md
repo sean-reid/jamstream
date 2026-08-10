@@ -23,7 +23,7 @@ Click **Host a session**. The wizard's first step asks where the session server 
 ![Wizard step 1 of 4 listing local, digitalocean, aws, and gcp with their setup status](images/wizard_provider.png)
 *Step 1 of 4. Local needs no account; a cloud shows ready once credentials are saved.*
 
-Pick **local** and click Continue. Local has no region to pick, so the wizard jumps to a "Before you start" step where you set the number of musician and listener seats and it confirms the session costs nothing. Click **Start the session**.
+Pick **local** and click Continue. Local has no region to pick, so the wizard jumps to a "Before you start" step where you set the seats and the timers, and it confirms the session costs nothing. Click **Start the session**.
 
 The app starts a real `jamstreamd` process on your machine, completes a full encrypted handshake with it before showing you anything, joins you automatically, and opens Settings on the Invites tab.
 
@@ -35,7 +35,7 @@ The app starts a real `jamstreamd` process on your machine, completes a full enc
 *The Invites tab, open the moment you are hosting. Each link admits one person.*
 
 - Each row is one seat. Click **Copy link** and send that link to exactly one person, over any channel you trust.
-- Rows read `not joined`, `connected`, or `revoked` as people come and go.
+- Rows read `not joined`, `connected`, or `free` as people come and go.
 - **Mint invite** adds seats mid-session. Details in [Hosting a session](guides/hosting.md).
 
 ## 4. Bandmates join
@@ -71,9 +71,9 @@ In the wizard's first step, pick **digitalocean**. With no saved credentials the
 
 1. Sign up at digitalocean.com and add a payment method. The [DigitalOcean setup page](guides/providers/digitalocean.md) has every step from zero, including the exact token scopes.
 2. Click **Open the token page** and generate a token scoped to droplet and tag operations only; copy it, it is shown once.
-3. Paste it into the API token field and click **Check credentials**. On success the pane says "Works. Saved to your keychain." and the row flips to `ready`.
+3. Paste it into the API token field and click **Check credentials**. On success the pane says "Works. Saved on this computer." and the row flips to `ready`.
 
-The token lands in your system keychain, so this is a one-time step; next session the row is `ready` from the start.
+The token is saved on this computer, so this is a one-time step; next session the row is `ready` from the start.
 
 ### Pick a region and launch
 
@@ -89,7 +89,7 @@ The meter is now running. The droplet bills by the second until you end the sess
 
 ### Share, check, end
 
-The Invites tab works exactly as in the local path; the links now work from anywhere. Cost so far sits in the status bar next to latency while the session runs.
+The Invites tab works exactly as in the local path; the links now work from anywhere. What you have spent so far sits at the right end of the status bar, beside the elapsed time and the session id.
 
 **End session for everyone** destroys the droplet and confirms with DigitalOcean that nothing tagged with the session is still listed. If you ever doubt everything is gone, [Understanding cost](guides/cost.md#the-guardrails) covers the sweeper.
 
@@ -118,8 +118,8 @@ musician 1   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiW...
 End the session with: jamstream end 3f2a9c01
 
 $ jamstream status
-SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
-3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.08037 at 3.0 h
+SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED TAKES
+3f2a9c01   digitalocean/nyc3    running  1 h 04 min    $0.028576 $0.08037 at 3.0 h -
 
 $ jamstream end 3f2a9c01
 Session 3f2a9c01 ended. Instance 512190713 is destroyed.
