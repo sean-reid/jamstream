@@ -32,8 +32,10 @@ The target is under 30 ms mouth to ear. Measured with real Opus and real encrypt
 
 | Round trip to the server | Mouth to ear |
 |---|---|
-| 1 ms, one local network | 9.7 ms |
-| 12 ms, same region | 19.3 ms |
-| 45 ms, cross country over DSL | 64.8 ms |
+| 1 ms, one local network | 14.7 ms |
+| 12 ms, same region | 24.3 ms |
+| 45 ms, cross country over DSL | 69.8 ms |
 
-The two network legs are the only parts that grow with distance, which is why [region choice](guides/hosting.md#the-region-table) is the decision that matters. Under about 30 ms it feels like standing on a stage together. At 65 ms it feels like a phone call.
+Each figure runs from sound entering the interface to the last buffer JamStream hands the sound card, playout cushion included, which is as far as a measurement from inside the app can see: what the card holds after that is beyond its reach.
+
+The two network legs are the only parts that grow with distance, which is why [region choice](guides/hosting.md#the-region-table) is the decision that matters. Under about 30 ms it feels like standing on a stage together. At 70 ms it feels like a phone call.
