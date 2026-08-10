@@ -1305,6 +1305,36 @@ fn session_settings_hear_self() {
     snapshot(&mut harness, "session_settings_hear_self");
 }
 
+/// A session far enough apart to have earned the offer, at the latency that
+/// earned it: measured mouth to ear across the country over DSL. The figure
+/// and the offer are one state, so a fixture that drew the offer over the
+/// demo's own 8 ms would be a picture of a session that cannot exist.
+fn offered_rt() -> DemoRuntime {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_offer_hear_self(true);
+    rt.set_mouth_to_ear_ms(Some(64.8));
+    rt
+}
+
+#[test]
+fn session_settings_hear_self_offered() {
+    // The offer above the checkbox, in the primary ink over the two muted
+    // lines that stand whatever the latency is: the sentence somebody reads
+    // when they came to this tab for the buffer size and not for this.
+    let app = drawer_app(session_app(offered_rt(), Theme::Dark), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_hear_self_offered");
+}
+
+#[test]
+fn session_settings_hear_self_offered_narrow() {
+    // The narrow drawer, where three sentences of copy in one block compete
+    // hardest with the blocks under them for the window's height.
+    let app = drawer_app(session_app(offered_rt(), Theme::Dark), SettingsTab::Audio);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_settings_hear_self_offered_narrow");
+}
+
 #[test]
 fn session_settings_device_refused() {
     // The other place the refusal has to be: with the drawer open it is over

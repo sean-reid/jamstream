@@ -2166,6 +2166,77 @@ fn device_harness(fault: Option<AudioFaultView>, cutting_out: Option<u64>) -> Ha
         })
 }
 
+/// The offer to hear yourself, from the one state on the snapshot: on the
+/// Audio tab, above the control it is about, never in the chat column, and
+/// with the headphone condition in its own words as well as in the line the
+/// control carries. Acting on it sends the command and takes the offer with
+/// it, because a decision that has been made is not a question.
+#[test]
+fn the_offer_to_hear_yourself_sits_with_the_control_and_goes_when_it_is_used() {
+    use jamstream_client::screens::devices::HEAR_SELF_OFFER;
+
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        false,
+    )));
+    rt.inner().set_offer_hear_self(true);
+    let mut harness = drawer_harness(rt.clone(), SettingsTab::Audio, vec2(1280.0, 800.0));
+    harness.run_steps(4);
+    assert!(
+        harness.query_by_label_contains(HEAR_SELF_OFFER).is_some(),
+        "the Audio tab must carry the offer beside the control it names"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("Needs headphones")
+            .is_some(),
+        "the offer leads to the requirement, so both are on screen"
+    );
+    // The band's column carries what the band said and nothing this machine
+    // worked out for itself, whatever the demo's scripted lines are.
+    assert!(
+        rt.snapshot()
+            .chat
+            .iter()
+            .all(|line| !line.text.contains("keeping time by ear")),
+        "the offer must not read as something said in the room: {:?}",
+        rt.snapshot().chat
+    );
+
+    harness
+        .get_by_label_contains("Hear yourself through the server")
+        .click();
+    harness.run_steps(4);
+    assert_eq!(
+        rt.commands()
+            .into_iter()
+            .filter(|c| matches!(c, Command::SetHearSelf(_)))
+            .collect::<Vec<_>>(),
+        vec![Command::SetHearSelf(true)],
+        "the control the offer points at sends the command once"
+    );
+    assert!(
+        harness.query_by_label_contains(HEAR_SELF_OFFER).is_none(),
+        "an offer that has been acted on has nothing left to ask"
+    );
+
+    // And it is the state that draws it: a session inside the range an
+    // ensemble holds together in says nothing here at all.
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        false,
+    )));
+    let mut harness = drawer_harness(rt, SettingsTab::Audio, vec2(1280.0, 800.0));
+    harness.run_steps(4);
+    assert!(harness.query_by_label_contains(HEAR_SELF_OFFER).is_none());
+    assert!(
+        harness
+            .query_by_label_contains("Hear yourself through the server")
+            .is_some(),
+        "the control is on the tab either way; only the offer comes and goes"
+    );
+}
+
 /// The one direction a musician cannot hear for themselves earns the bar's
 /// own tag, and the other direction never raises it. A downlink losing audio
 /// is something they are already hearing; an uplink losing it sounds perfect

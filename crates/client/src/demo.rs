@@ -127,6 +127,10 @@ struct DemoState {
     /// from a latency figure held above the threshold, which a fixture has no
     /// way to hold, so it pins the answer instead.
     offer_hear_self: bool,
+    /// A mouth-to-ear figure over the demo's own, so a fixture drawing a state
+    /// the runtime only reaches at a given latency draws that latency too.
+    /// None leaves the demo's figure alone.
+    pinned_mouth_to_ear_ms: Option<f32>,
     destinations: Vec<Destination>,
     /// Whether the session can broadcast at all. None is a session that has
     /// not been asked, which is every demo one; a fixture pins the answer.
@@ -316,6 +320,7 @@ impl DemoRuntime {
                 audition: false,
                 hear_self: false,
                 offer_hear_self: false,
+                pinned_mouth_to_ear_ms: None,
                 destinations: Vec::new(),
                 readiness: None,
                 record: RecordView::default(),
@@ -464,6 +469,14 @@ impl DemoRuntime {
         s.offer_hear_self = offer;
     }
 
+    /// Pins the mouth-to-ear figure, for a fixture whose state belongs to a
+    /// session at a particular latency: the number and the state on screen
+    /// have to be the pair a real session produces.
+    pub fn set_mouth_to_ear_ms(&self, ms: Option<f32>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.pinned_mouth_to_ear_ms = ms;
+    }
+
     fn scripted_chat() -> Vec<ChatLine> {
         let line = |id: u16, name: &str, text: &str, at_ms: u64| ChatLine {
             from_name: name.to_owned(),
@@ -525,7 +538,9 @@ impl Runtime for DemoRuntime {
             jitter_target: 4,
             uplink_loss_pct: Some(s.uplink_loss_pct),
             downlink_loss_pct: Some(s.downlink_loss_pct),
-            mouth_to_ear_ms: Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32),
+            mouth_to_ear_ms: s
+                .pinned_mouth_to_ear_ms
+                .or(Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32)),
             device_mode: s.device_mode,
             rate: s.rate,
             crackling: s.crackling,
