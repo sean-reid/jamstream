@@ -1386,12 +1386,12 @@ fn session_settings_crackling_clear() {
 /// depth produces however deep the fixture holds it.
 fn cushion_app(theme: Theme, held_frames: usize, out_of_room: bool) -> JamApp {
     let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
-    rt.set_cushion(Some(CushionView {
+    rt.set_cushion(CushionView {
         held_frames,
         base_frames: 240,
         callback_frames: 120,
         out_of_room,
-    }));
+    });
     session_app(rt, theme)
 }
 

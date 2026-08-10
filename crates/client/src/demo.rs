@@ -159,10 +159,11 @@ struct DemoState {
     /// derives this from the ring's own counters, so a fixture pins the
     /// answer instead.
     crackling: bool,
-    /// What the playout cushion is holding: the real runtime's controller moves
-    /// it over minutes of readings from a ring no demo runs, so a fixture pins
-    /// the depth whose sentence it wants to look at.
-    cushion: Option<CushionView>,
+    /// What the playout cushion is holding. Every open stream holds one, so a
+    /// demo session does too; the real runtime's controller moves it over
+    /// minutes of readings from a ring no demo runs, so a fixture pins the depth
+    /// whose sentence it wants to look at.
+    cushion: CushionView,
     /// Each direction's loss rate, pinned per direction because that is the
     /// whole point of them: a fixture holds one losing while the other is
     /// clean, which no single figure could express.
@@ -341,7 +342,7 @@ impl DemoRuntime {
                 device_mode: None,
                 rate: None,
                 crackling: false,
-                cushion: None,
+                cushion: demo_cushion(),
                 uplink_loss_pct: 0.0,
                 downlink_loss_pct: 0.2,
                 audio_fault: None,
@@ -469,9 +470,12 @@ impl DemoRuntime {
         s.crackling = crackling;
     }
 
-    /// Pins what the playout cushion is holding, as the real runtime's
-    /// controller settles on it over minutes of water-mark readings.
-    pub fn set_cushion(&self, cushion: Option<CushionView>) {
+    /// Pins the depth the playout cushion is holding, as the real runtime's
+    /// controller settles on it over minutes of water-mark readings. There is no
+    /// way to pin the absence of one: a stream that is not open is what costs
+    /// nobody a cushion, and that is [`Self::set_device_error`] and
+    /// [`Self::set_audio_fault`].
+    pub fn set_cushion(&self, cushion: CushionView) {
         let mut s = self.state.lock().expect("demo state");
         s.cushion = cushion;
     }
@@ -555,8 +559,7 @@ impl Runtime for DemoRuntime {
         // and a stream being reopened are both a session with no ring, which is
         // the one state the real runtime prices no device buffers in. The
         // latency figure is summed off this, so a pinned depth moves it.
-        let ring = (s.device_error.is_none() && s.audio_fault.is_none())
-            .then(|| s.cushion.unwrap_or_else(demo_cushion));
+        let ring = (s.device_error.is_none() && s.audio_fault.is_none()).then_some(s.cushion);
         let elapsed_secs = BASE_ELAPSED_SECS + f / 60;
         let stats = StatsView {
             state: if s.left {
@@ -578,9 +581,9 @@ impl Runtime for DemoRuntime {
             device_mode: s.device_mode,
             rate: s.rate,
             crackling: s.crackling,
-            // Reported only where a fixture asked for the sentence the buffer
-            // control draws from it; the figure charges the ring either way.
-            cushion: ring.and(s.cushion),
+            // The same ring the figure is summed off, so the sentence the buffer
+            // control draws and the figure beside it are one state.
+            cushion: ring,
             cutting_out: s.cutting_out,
             // Nothing fills a ring here, so the figures a running one produces
             // are absent: the water mark and the pacing of the thread behind it.
