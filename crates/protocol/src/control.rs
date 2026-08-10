@@ -755,6 +755,8 @@ mod tests {
     }
 
     use super::*;
+    use blake2::{Blake2s256, Digest};
+    use std::collections::BTreeSet;
 
     /// The reason `STREAM_REASON_BUDGET` is what it is. A session may fail on
     /// every destination at once, and all eight reasons travel in one
@@ -1128,38 +1130,350 @@ mod tests {
         assert_eq!(shuttle(&mut a, &mut b, 0, &[]), msgs);
     }
 
-    /// Exact wire bytes, pinned so a reordered field or shifted discriminant
-    /// cannot pass by encoding and decoding with the same wrong code.
-    #[test]
-    fn record_encodings_match_golden_bytes() {
-        let cases: &[(ControlMsg, &[u8])] = &[
+    /// Every `ControlMsg` variant with the exact bytes it must encode to,
+    /// written out from the postcard rules rather than captured from the
+    /// encoder, so the two have to agree for the golden test to pass. A round
+    /// trip through the same wrong code cannot tell a reordered field from a
+    /// correct one; these bytes can.
+    ///
+    /// Derivation, postcard: an enum is its variant index as a varint, a
+    /// newtype struct is its inner value, `u16`/`u32`/`u64` are LEB128
+    /// varints, `u8` and `bool` are one byte, `f32` is four bytes
+    /// little-endian, a `String` and a `Vec` are a varint length then their
+    /// contents, a fixed-size array has no length prefix at all, `Option` is a
+    /// 0x00 tag or 0x01 followed by the value, and struct fields go in
+    /// declaration order with no framing between them.
+    fn golden_control_wire() -> Vec<(ControlMsg, &'static str)> {
+        vec![
+            (
+                ControlMsg::Roster(vec![
+                    MemberInfo {
+                        id: MemberId(3),
+                        role: Role::Musician,
+                        name: "ana".into(),
+                        connected: true,
+                        avatar_hash: None,
+                        quiet: false,
+                    },
+                    MemberInfo {
+                        id: MemberId(300),
+                        role: Role::Listener,
+                        name: "bo".into(),
+                        connected: true,
+                        avatar_hash: Some([9u8; 32]),
+                        quiet: true,
+                    },
+                ]),
+                concat!(
+                    "00",       // Roster, variant 0
+                    "02",       // two members
+                    "03",       // MemberId(3)
+                    "00",       // Role::Musician
+                    "03616e61", // "ana"
+                    "01",       // connected
+                    "00",       // avatar_hash: None
+                    "00",       // quiet: false
+                    "ac02",     // MemberId(300): 300 = 0x2c | 0x80, then 0x02
+                    "01",       // Role::Listener
+                    "02626f",   // "bo"
+                    "01",       // connected
+                    "01",       // avatar_hash: Some
+                    "0909090909090909090909090909090909090909090909090909090909090909",
+                    "01", // quiet: true
+                ),
+            ),
+            (
+                ControlMsg::Chat {
+                    from: MemberId(300),
+                    text: "hey".into(),
+                },
+                concat!(
+                    "01",       // Chat, variant 1
+                    "ac02",     // MemberId(300)
+                    "03686579", // "hey"
+                ),
+            ),
+            (
+                ControlMsg::MixerSet {
+                    target: MemberId(7),
+                    gain_db: -6.0,
+                    pan: -1.0,
+                    muted: true,
+                },
+                concat!(
+                    "02",       // MixerSet, variant 2
+                    "07",       // MemberId(7)
+                    "0000c0c0", // gain_db -6.0: 0xc0c00000 little-endian
+                    "000080bf", // pan -1.0: 0xbf800000 little-endian
+                    "01",       // muted
+                ),
+            ),
+            (
+                ControlMsg::MetronomeSet {
+                    bpm: 128,
+                    beats_per_bar: 4,
+                    enabled: true,
+                },
+                concat!(
+                    "03",   // MetronomeSet, variant 3
+                    "8001", // bpm 128, the first value the varint spends two bytes on
+                    "04",   // beats_per_bar, a u8 and so never a varint
+                    "01",   // enabled
+                ),
+            ),
+            (
+                ControlMsg::ClickEnable { enabled: true },
+                concat!(
+                    "04", // ClickEnable, variant 4
+                    "01", // enabled
+                ),
+            ),
+            (
+                ControlMsg::Ping {
+                    nonce: 70_000,
+                    sent_ms: 1_000_000,
+                },
+                concat!(
+                    "05",     // Ping, variant 5
+                    "f0a204", // nonce 70000: 112 + 34 * 128 + 4 * 16384
+                    "c0843d", // sent_ms 1000000: 64 + 4 * 128 + 61 * 16384
+                ),
+            ),
+            (
+                // Same fields as Ping, so the discriminant is all that tells
+                // the two apart and swapping the pair fails here.
+                ControlMsg::Pong {
+                    nonce: 70_000,
+                    sent_ms: 1_000_000,
+                },
+                concat!(
+                    "06",     // Pong, variant 6
+                    "f0a204", // nonce 70000
+                    "c0843d", // sent_ms 1000000
+                ),
+            ),
+            (
+                ControlMsg::Revoke {
+                    jti: TokenId([0x5a; 16]),
+                },
+                concat!(
+                    "07",                               // Revoke, variant 7
+                    "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a", // jti, 16 bytes and no length
+                ),
+            ),
+            (
+                ControlMsg::Bye {
+                    reason: "kicked".into(),
+                },
+                concat!(
+                    "08",           // Bye, variant 8
+                    "06",           // six bytes of reason
+                    "6b69636b6564", // "kicked"
+                ),
+            ),
+            (
+                ControlMsg::Stats {
+                    uplink_loss_pct: 2.5,
+                    uplink_jitter_depth: 300,
+                    uplink_recovered_pct: 12.5,
+                },
+                concat!(
+                    "09",       // Stats, variant 9
+                    "00002040", // uplink_loss_pct 2.5: 0x40200000 little-endian
+                    "ac02",     // uplink_jitter_depth 300
+                    "00004841", // uplink_recovered_pct 12.5: 0x41480000 little-endian
+                ),
+            ),
+            (
+                ControlMsg::BroadcastMixSet {
+                    target: MemberId(300),
+                    gain_db: -3.5,
+                    pan: 0.5,
+                    muted: false,
+                },
+                concat!(
+                    "0a",       // BroadcastMixSet, variant 10
+                    "ac02",     // MemberId(300)
+                    "000060c0", // gain_db -3.5: 0xc0600000 little-endian
+                    "0000003f", // pan 0.5: 0x3f000000 little-endian
+                    "00",       // muted: false
+                ),
+            ),
+            (
+                ControlMsg::BroadcastAudition { enabled: true },
+                concat!(
+                    "0b", // BroadcastAudition, variant 11
+                    "01", // enabled
+                ),
+            ),
+            (
+                ControlMsg::SetAvatar {
+                    hash: [0xab; 32],
+                    len: 200_000,
+                },
+                concat!(
+                    "0c", // SetAvatar, variant 12
+                    "abababababababababababababababababababababababababababababababab",
+                    "c09a0c", // len 200000: 64 + 26 * 128 + 12 * 16384
+                ),
+            ),
+            (
+                ControlMsg::AvatarChunk {
+                    hash: [0xab; 32],
+                    index: 255,
+                    total: 256,
+                    data: vec![0x01, 0x02, 0x03],
+                },
+                concat!(
+                    "0d", // AvatarChunk, variant 13
+                    "abababababababababababababababababababababababababababababababab",
+                    "ff01",   // index 255
+                    "8002",   // total 256
+                    "03",     // three bytes of data
+                    "010203", // data
+                ),
+            ),
+            (
+                ControlMsg::AvatarRequest { hash: [0xab; 32] },
+                concat!(
+                    "0e", // AvatarRequest, variant 14
+                    "abababababababababababababababababababababababababababababababab",
+                ),
+            ),
+            (
+                ControlMsg::StreamCtl {
+                    op: StreamOp::AddDestination {
+                        id: DestinationId(2),
+                        platform: StreamPlatform::YouTube,
+                        key: StreamKey::new("live_key"),
+                    },
+                },
+                concat!(
+                    "0f",               // StreamCtl, variant 15
+                    "00",               // StreamOp::AddDestination
+                    "02",               // DestinationId(2)
+                    "01",               // StreamPlatform::YouTube
+                    "08",               // eight bytes of key
+                    "6c6976655f6b6579", // "live_key", transparent newtype
+                ),
+            ),
+            (
+                ControlMsg::StreamCtl {
+                    op: StreamOp::RemoveDestination {
+                        id: DestinationId(300),
+                    },
+                },
+                concat!(
+                    "0f",   // StreamCtl
+                    "01",   // StreamOp::RemoveDestination
+                    "ac02", // DestinationId(300)
+                ),
+            ),
+            (
+                ControlMsg::StreamCtl {
+                    op: StreamOp::Start,
+                },
+                concat!(
+                    "0f", // StreamCtl
+                    "02", // StreamOp::Start
+                ),
+            ),
+            (
+                ControlMsg::StreamCtl { op: StreamOp::Stop },
+                concat!(
+                    "0f", // StreamCtl
+                    "03", // StreamOp::Stop
+                ),
+            ),
+            (
+                ControlMsg::StreamStatus {
+                    destinations: vec![
+                        DestinationStatus {
+                            id: DestinationId(1),
+                            platform: StreamPlatform::Twitch,
+                            state: DestinationState::Live,
+                            bitrate_kbps: 2_628,
+                            dropped_frames: 0,
+                            repeated_frames: 5,
+                        },
+                        DestinationStatus {
+                            id: DestinationId(300),
+                            platform: StreamPlatform::YouTube,
+                            state: DestinationState::Failed {
+                                reason: "gone".into(),
+                            },
+                            bitrate_kbps: 2_628,
+                            dropped_frames: 7,
+                            repeated_frames: 300,
+                        },
+                    ],
+                },
+                concat!(
+                    "10",         // StreamStatus, variant 16
+                    "02",         // two destinations
+                    "01",         // DestinationId(1)
+                    "00",         // StreamPlatform::Twitch
+                    "02",         // DestinationState::Live
+                    "c414",       // bitrate_kbps 2628: 68 + 20 * 128
+                    "00",         // dropped_frames
+                    "05",         // repeated_frames
+                    "ac02",       // DestinationId(300)
+                    "01",         // StreamPlatform::YouTube
+                    "03",         // DestinationState::Failed
+                    "04676f6e65", // reason "gone"
+                    "c414",       // bitrate_kbps 2628
+                    "07",         // dropped_frames
+                    "ac02",       // repeated_frames 300
+                ),
+            ),
             (
                 ControlMsg::RecordCtl {
                     op: RecordOp::Start,
                 },
-                &[0x11, 0x00],
+                concat!(
+                    "11", // RecordCtl, variant 17
+                    "00", // RecordOp::Start
+                ),
             ),
-            (ControlMsg::RecordCtl { op: RecordOp::Stop }, &[0x11, 0x01]),
+            (
+                ControlMsg::RecordCtl { op: RecordOp::Stop },
+                concat!(
+                    "11", // RecordCtl
+                    "01", // RecordOp::Stop
+                ),
+            ),
             (
                 ControlMsg::RecordStatus {
                     state: RecordingState::Idle,
                     stems: false,
                 },
-                &[0x12, 0x00, 0x00],
+                concat!(
+                    "12", // RecordStatus, variant 18
+                    "00", // RecordingState::Idle
+                    "00", // stems: false
+                ),
             ),
             (
                 ControlMsg::RecordStatus {
                     state: RecordingState::Recording,
                     stems: true,
                 },
-                &[0x12, 0x01, 0x01],
+                concat!(
+                    "12", // RecordStatus
+                    "01", // RecordingState::Recording
+                    "01", // stems
+                ),
             ),
             (
                 ControlMsg::RecordStatus {
                     state: RecordingState::Uploading,
                     stems: true,
                 },
-                &[0x12, 0x02, 0x01],
+                concat!(
+                    "12", // RecordStatus
+                    "02", // RecordingState::Uploading
+                    "01", // stems
+                ),
             ),
             (
                 ControlMsg::RecordStatus {
@@ -1168,13 +1482,180 @@ mod tests {
                     },
                     stems: false,
                 },
-                &[0x12, 0x03, 0x03, b'd', b'r', b'y', 0x00],
+                concat!(
+                    "12",       // RecordStatus
+                    "03",       // RecordingState::Failed
+                    "03647279", // reason "dry"
+                    "00",       // stems: false
+                ),
             ),
-        ];
-        for (msg, bytes) in cases {
-            assert_eq!(&postcard::to_allocvec(msg).unwrap(), bytes, "{msg:?}");
-            assert_eq!(&postcard::from_bytes::<ControlMsg>(bytes).unwrap(), msg);
+            (
+                ControlMsg::SetName { name: "ana".into() },
+                concat!(
+                    "13",       // SetName, variant 19
+                    "03616e61", // "ana"
+                ),
+            ),
+            (
+                ControlMsg::BroadcastReadiness {
+                    state: BroadcastReadiness::Ready,
+                },
+                concat!(
+                    "14", // BroadcastReadiness, variant 20
+                    "00", // BroadcastReadiness::Ready
+                ),
+            ),
+            (
+                ControlMsg::BroadcastReadiness {
+                    state: BroadcastReadiness::Unavailable {
+                        reason: "no relay".into(),
+                    },
+                },
+                concat!(
+                    "14",               // BroadcastReadiness
+                    "01",               // BroadcastReadiness::Unavailable
+                    "08",               // eight bytes of reason
+                    "6e6f2072656c6179", // "no relay"
+                ),
+            ),
+            (
+                ControlMsg::ServerLog {
+                    line: "ffmpeg exited 1".into(),
+                },
+                concat!(
+                    "15",           // ServerLog, variant 21
+                    "0f",           // fifteen bytes of line
+                    "66666d706567", // "ffmpeg"
+                    "20",           // " "
+                    "657869746564", // "exited"
+                    "20",           // " "
+                    "31",           // "1"
+                ),
+            ),
+            (
+                ControlMsg::HearSelf { enabled: true },
+                concat!(
+                    "16", // HearSelf, variant 22
+                    "01", // enabled
+                ),
+            ),
+        ]
+    }
+
+    /// The golden bytes of the first message `pick` matches, so a test about
+    /// what a decoder refuses works from the same bytes the table pins.
+    fn golden_bytes(pick: impl Fn(&ControlMsg) -> bool) -> Vec<u8> {
+        let (_, golden) = golden_control_wire()
+            .into_iter()
+            .find(|(msg, _)| pick(msg))
+            .expect("no golden message matched");
+        data_encoding::HEXLOWER.decode(golden.as_bytes()).unwrap()
+    }
+
+    /// Exact wire bytes for every variant, so a reordered field or a shifted
+    /// discriminant cannot pass by encoding and decoding with the same wrong
+    /// code.
+    #[test]
+    fn every_control_encoding_matches_golden_bytes() {
+        for (msg, golden) in golden_control_wire() {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert_eq!(data_encoding::HEXLOWER.encode(&bytes), golden, "{msg:?}");
+            let decoded = data_encoding::HEXLOWER.decode(golden.as_bytes()).unwrap();
+            assert_eq!(postcard::from_bytes::<ControlMsg>(&decoded).unwrap(), msg);
         }
+    }
+
+    /// The table above is the whole wire, not a sample of it. postcard refuses
+    /// a discriminant `ControlMsg` does not have, so the first index that
+    /// fails to decode counts the variants, and a new message with no golden
+    /// bytes fails here.
+    #[test]
+    fn every_control_variant_has_golden_bytes() {
+        let mut variants = 0u8;
+        loop {
+            // Zero satisfies every field postcard can read: an empty string, an
+            // empty vec, the first variant of a nested enum. Only an unknown
+            // discriminant fails, unless a future variant needs more padding
+            // than this, which fails here too rather than quietly.
+            let mut probe = vec![variants];
+            probe.extend(std::iter::repeat_n(0u8, 256));
+            if postcard::from_bytes::<ControlMsg>(&probe).is_err() {
+                break;
+            }
+            variants += 1;
+        }
+        assert!(
+            variants < 0x80,
+            "past 127 variants the discriminant is a multi-byte varint, so the \
+             first golden byte holds only part of it"
+        );
+        let covered: BTreeSet<u8> = golden_control_wire()
+            .iter()
+            .map(|(_, golden)| data_encoding::HEXLOWER.decode(golden.as_bytes()).unwrap()[0])
+            .collect();
+        assert_eq!(
+            covered,
+            (0..variants).collect::<BTreeSet<u8>>(),
+            "every variant index needs a row in golden_control_wire"
+        );
+    }
+
+    /// One digest over every golden encoding above, taken together with
+    /// `PROTOCOL_VERSION`. One row per version, and a row is a record of what
+    /// that version speaks, so an existing row is never edited.
+    ///
+    /// A server admits exactly its own version, which means a released client
+    /// and a new build agree on the wire only for as long as the encodings
+    /// hold. Nothing else in the tree compares the two.
+    const CONTROL_WIRE_DIGESTS: &[(u16, &str)] = &[(
+        2,
+        "47d7b8fa104415ffddec7325917e62c0085265dd0b9c9f4fd3f622136c0e6943",
+    )];
+
+    /// Ties the table to the version that advertises it. The digest is taken
+    /// over the golden bytes themselves, not over the encoder, because
+    /// `every_control_encoding_matches_golden_bytes` is what holds the encoder
+    /// to the table: what this catches is the wrong answer to that failure,
+    /// editing the bytes to match a changed encoder and leaving the version
+    /// where it was.
+    ///
+    /// Two honest ways out of a failure here, and pasting the printed digest
+    /// into the row for the current version is neither: undo the encoding
+    /// change, or move `PROTOCOL_VERSION` and add a row for the new version,
+    /// leaving the old row as it is. Appending a variant is the one change
+    /// that moves the digest while every existing variant's bytes hold.
+    #[test]
+    fn control_wire_digest_is_tied_to_the_protocol_version() {
+        let mut h = Blake2s256::new();
+        h.update(crate::PROTOCOL_VERSION.to_le_bytes());
+        for (_, golden) in golden_control_wire() {
+            let bytes = data_encoding::HEXLOWER.decode(golden.as_bytes()).unwrap();
+            // Length framed, so no two tables of goldens can hash the same by
+            // shifting a byte from one message to the next.
+            h.update((bytes.len() as u32).to_le_bytes());
+            h.update(&bytes);
+        }
+        let digest = data_encoding::HEXLOWER.encode(&h.finalize());
+        let expected = CONTROL_WIRE_DIGESTS
+            .iter()
+            .find(|(version, _)| *version == crate::PROTOCOL_VERSION)
+            .map(|(_, digest)| *digest)
+            .expect("the version this build speaks has a row");
+        assert_eq!(
+            digest,
+            expected,
+            "the control encodings do not match protocol version {}. Undo the \
+             encoding change, or move PROTOCOL_VERSION and add a row for the new \
+             version. Overwriting the row for {} makes a released client read the \
+             wrong fields onto the wrong member, which is the failure this test \
+             exists to stop",
+            crate::PROTOCOL_VERSION,
+            crate::PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn record_status_decode_refuses_unknown_state_and_truncation() {
         // An unknown state discriminant is refused, not misread.
         assert!(postcard::from_bytes::<ControlMsg>(&[0x12, 0x04, 0x00]).is_err());
         // So is a truncated status.
@@ -1254,75 +1735,9 @@ mod tests {
         );
     }
 
-    /// Exact `StreamStatus` bytes, worked out from the encoding rules rather
-    /// than captured from the encoder, so the two have to agree for this to
-    /// pass. A field reordered, a state discriminant shifted, or
-    /// `repeated_frames` silently dropped cannot survive it, which is what a
-    /// round trip through the same wrong code lets through.
-    ///
-    /// Derivation, postcard: an enum is its variant index as a varint, a
-    /// newtype struct is its inner value, `u16`/`u32`/`u64` are LEB128
-    /// varints, a `String` and a `Vec` are a varint length then their
-    /// contents, and struct fields go in declaration order with no framing.
-    /// `ControlMsg::StreamStatus` is variant 16 and `DestinationState` runs
-    /// Idle, Connecting, Live, Failed.
-    ///
-    ///   10              ControlMsg::StreamStatus, variant 16
-    ///   02              two destinations
-    ///     01            DestinationId(1)
-    ///     00            StreamPlatform::Twitch
-    ///     02            DestinationState::Live
-    ///     c4 14         bitrate 2628: 20 * 128 + 68
-    ///     00            dropped_frames: 0
-    ///     05            repeated_frames: 5
-    ///     ac 02         DestinationId(300): 2 * 128 + 44
-    ///     01            StreamPlatform::YouTube
-    ///     03            DestinationState::Failed
-    ///     04 67 6f 6e 65  reason "gone"
-    ///     c4 14         bitrate 2628
-    ///     07            dropped_frames: 7
-    ///     ac 02         repeated_frames: 300
     #[test]
-    fn stream_status_encoding_is_pinned() {
-        const GOLDEN: &str = concat!(
-            "1002",
-            "010002",
-            "c414",
-            "00",
-            "05",
-            "ac02",
-            "01",
-            "0304676f6e65",
-            "c414",
-            "07",
-            "ac02",
-        );
-        let status = ControlMsg::StreamStatus {
-            destinations: vec![
-                DestinationStatus {
-                    id: DestinationId(1),
-                    platform: StreamPlatform::Twitch,
-                    state: DestinationState::Live,
-                    bitrate_kbps: 2_628,
-                    dropped_frames: 0,
-                    repeated_frames: 5,
-                },
-                DestinationStatus {
-                    id: DestinationId(300),
-                    platform: StreamPlatform::YouTube,
-                    state: DestinationState::Failed {
-                        reason: "gone".into(),
-                    },
-                    bitrate_kbps: 2_628,
-                    dropped_frames: 7,
-                    repeated_frames: 300,
-                },
-            ],
-        };
-        let bytes = postcard::to_allocvec(&status).unwrap();
-        assert_eq!(data_encoding::HEXLOWER.encode(&bytes), GOLDEN);
-        let golden = data_encoding::HEXLOWER.decode(GOLDEN.as_bytes()).unwrap();
-        assert_eq!(postcard::from_bytes::<ControlMsg>(&golden).unwrap(), status);
+    fn stream_status_decode_refuses_truncation_and_unknown_state() {
+        let golden = golden_bytes(|msg| matches!(msg, ControlMsg::StreamStatus { .. }));
         // One byte short is the second destination's repeat count cut in half:
         // refused, not read as a smaller number.
         assert!(postcard::from_bytes::<ControlMsg>(&golden[..golden.len() - 1]).is_err());
@@ -1567,67 +1982,9 @@ mod tests {
         assert_eq!(postcard::from_bytes::<MemberInfo>(&bytes).unwrap(), set);
     }
 
-    /// Exact roster bytes, worked out from the encoding rules rather than
-    /// captured from the encoder above, so the two have to agree for this to
-    /// pass. A field reordered, a discriminant shifted, or `quiet` silently
-    /// dropped cannot survive it, which is what a round trip through the same
-    /// wrong code would let through.
-    ///
-    /// Derivation, postcard: a newtype struct is its inner value, `u16` is a
-    /// LEB128 varint, an enum is its variant index as a varint, a `String` and
-    /// a `Vec` are a varint length then their contents, a fixed-size array has
-    /// no length prefix at all, `bool` is one byte, and `Option` is a 0x00 tag
-    /// or 0x01 followed by the value. Struct fields go in declaration order
-    /// with no framing between them.
-    ///
-    ///   00              ControlMsg::Roster, variant 0
-    ///   02              two members
-    ///     03            MemberId(3)
-    ///     00            Role::Musician
-    ///     03 61 6e 61   "ana"
-    ///     01            connected
-    ///     00            avatar_hash: None
-    ///     00            quiet: false
-    ///     ac 02         MemberId(300), varint: 300 = 0x2c | 0x80, 0x02
-    ///     01            Role::Listener
-    ///     02 62 6f      "bo"
-    ///     01            connected
-    ///     01 09 x32     avatar_hash: Some([9; 32])
-    ///     01            quiet: true
     #[test]
-    fn roster_encoding_is_pinned() {
-        const GOLDEN: &str = concat!(
-            "0002",
-            "030003616e610100",
-            "00",
-            "ac0201",
-            "02626f",
-            "0101",
-            "0909090909090909090909090909090909090909090909090909090909090909",
-            "01",
-        );
-        let roster = ControlMsg::Roster(vec![
-            MemberInfo {
-                id: MemberId(3),
-                role: Role::Musician,
-                name: "ana".into(),
-                connected: true,
-                avatar_hash: None,
-                quiet: false,
-            },
-            MemberInfo {
-                id: MemberId(300),
-                role: Role::Listener,
-                name: "bo".into(),
-                connected: true,
-                avatar_hash: Some([9u8; 32]),
-                quiet: true,
-            },
-        ]);
-        let bytes = postcard::to_allocvec(&roster).unwrap();
-        assert_eq!(data_encoding::HEXLOWER.encode(&bytes), GOLDEN);
-        let golden = data_encoding::HEXLOWER.decode(GOLDEN.as_bytes()).unwrap();
-        assert_eq!(postcard::from_bytes::<ControlMsg>(&golden).unwrap(), roster);
+    fn roster_decode_refuses_a_member_short_of_quiet() {
+        let golden = golden_bytes(|msg| matches!(msg, ControlMsg::Roster(_)));
         // One byte short is the second member with no quiet flag: refused,
         // not read as present-and-talking.
         assert!(postcard::from_bytes::<ControlMsg>(&golden[..golden.len() - 1]).is_err());
