@@ -2827,6 +2827,8 @@ dependencies = [
  "hound",
  "jamstream-engine",
  "jamstream-protocol",
+ "libc",
+ "mach2 0.6.0",
  "rtrb",
  "rubato",
  "thiserror 2.0.19",

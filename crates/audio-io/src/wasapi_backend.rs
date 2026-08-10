@@ -50,16 +50,12 @@ use wasapi::{
     Direction as WasapiDirection, Handle, SampleType, StreamMode, WasapiError, WaveFormat,
     deinitialize, initialize_mta,
 };
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::Threading::{
-    AVRT_PRIORITY_CRITICAL, AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
-    AvSetMmThreadPriority, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
-};
-use windows::core::w;
+use windows::Win32::System::Threading::AVRT_PRIORITY_CRITICAL;
 
 use crate::cpal_backend::CpalBackend;
 use crate::format::{self, FormatSpec, SampleFormat, StageLayout};
 use crate::mode::{DeviceMode, set_active_device_mode};
+use crate::priority::MmcssGuard;
 use crate::rate::{RateOutcome, RateOutcomes};
 use crate::types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,
@@ -604,7 +600,7 @@ fn capture_loop(
             return;
         }
     };
-    let _mmcss = MmcssGuard::promote();
+    let _mmcss = MmcssGuard::promote(AVRT_PRIORITY_CRITICAL);
     let prepared = match prepare(params) {
         Ok(prepared) => prepared,
         Err(report) => {
@@ -669,7 +665,7 @@ fn render_loop(
             return;
         }
     };
-    let _mmcss = MmcssGuard::promote();
+    let _mmcss = MmcssGuard::promote(AVRT_PRIORITY_CRITICAL);
     let prepared = match prepare(params) {
         Ok(prepared) => prepared,
         Err(report) => {
@@ -1128,64 +1124,6 @@ impl RenderStage {
             &mut stage.bytes[..bytes],
         );
         client.write_to_device(frames, &stage.bytes[..bytes], None)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Thread scheduling
-// ---------------------------------------------------------------------------
-
-/// MMCSS registration for the lifetime of a device thread.
-///
-/// "Pro Audio" is the MMCSS task Windows reserves for low-latency audio work;
-/// it is what lets a 5 ms callback survive alongside a browser. MMCSS can be
-/// unavailable (group policy, or a container without the scheduler), so a
-/// plain time-critical thread priority is the documented consolation prize.
-struct MmcssGuard {
-    handle: Option<HANDLE>,
-}
-
-impl MmcssGuard {
-    fn promote() -> Self {
-        let mut task_index = 0u32;
-        // SAFETY: the task name is a static null-terminated wide literal and
-        // `task_index` is a live local; both outlive the call, which is all
-        // AvSetMmThreadCharacteristicsW requires. It affects only the calling
-        // thread, and the handle it returns is reverted in `Drop`.
-        match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) } {
-            Ok(handle) => {
-                // SAFETY: `handle` is the live MMCSS registration just returned
-                // for this thread, and the priority is a valid AVRT_PRIORITY.
-                if let Err(err) = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL) } {
-                    tracing::warn!(%err, "AvSetMmThreadPriority failed; MMCSS default priority");
-                }
-                Self {
-                    handle: Some(handle),
-                }
-            }
-            Err(err) => {
-                tracing::warn!(%err, "MMCSS unavailable, falling back to thread priority");
-                // SAFETY: GetCurrentThread returns a pseudo-handle to this
-                // thread that needs no closing, and the priority constant is a
-                // valid THREAD_PRIORITY.
-                if let Err(err) =
-                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) }
-                {
-                    tracing::warn!(%err, "SetThreadPriority failed; audio thread runs at normal priority");
-                }
-                Self { handle: None }
-            }
-        }
-    }
-}
-
-impl Drop for MmcssGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            // SAFETY: `handle` came from AvSetMmThreadCharacteristicsW on this
-            // thread and is reverted exactly once, since `take` consumes it.
-            let _ = unsafe { AvRevertMmThreadCharacteristics(handle) };
-        }
     }
 }
 

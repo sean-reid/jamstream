@@ -9,6 +9,9 @@
 
 mod bridge;
 mod mode;
+/// Thread scheduling for both sides of the device boundary: the backends' own
+/// device threads and whatever thread a caller fills the rings from.
+mod priority;
 mod rate;
 mod types;
 mod wav;
@@ -45,6 +48,7 @@ mod wasapi_backend;
 
 pub use bridge::{CallbackBridge, DeviceSide, EngineSide};
 pub use mode::{DeviceMode, active_device_mode};
+pub use priority::{AudioPriority, ThreadPriority};
 pub use rate::{RateOutcome, RateOutcomes};
 pub use types::{
     AudioBackend, AudioError, DeviceInfo, Direction, DuplexHandler, FormFactor, Result,

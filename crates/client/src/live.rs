@@ -6,9 +6,11 @@
 //! with the network thread over the bridge's SPSC rings; the network thread
 //! owns the socket, the core, and the audio stream lifecycle, and publishes
 //! UI state into a `Mutex<SharedState>` the paint thread reads once per
-//! frame. Loop cadence is ~2.5 ms with sleep-until pacing; precision is
-//! forgiving because the raw capture/playout APIs are sample-count driven
-//! by the device clock, not the loop clock.
+//! frame. Loop cadence is ~2.5 ms with sleep-until pacing; the sample counts
+//! are driven by the device clock rather than the loop clock, so the cadence is
+//! forgiving up to the depth of the playout ring, and a wakeup later than that
+//! is silence the device padded. The thread asks the platform for the class the
+//! device callbacks already run at, and times itself against that ring.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
@@ -19,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use data_encoding::HEXLOWER;
 use jamstream_audio_io::{
-    AudioBackend, AudioError, CallbackBridge, DuplexHandler, EngineSide, StreamConfig,
-    StreamHandle, WavBackend, WavStream,
+    AudioBackend, AudioError, AudioPriority, CallbackBridge, DuplexHandler, EngineSide,
+    StreamConfig, StreamHandle, ThreadPriority, WavBackend, WavStream,
 };
 use jamstream_engine::{JitterBuffer, JitterStats};
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
@@ -36,7 +38,7 @@ use crate::runtime::{
     AudioFaultView, AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState,
     CostView, DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView,
     RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView,
-    StreamView,
+    StreamView, WakeView,
 };
 use crate::screens::invites::TokenMap;
 
@@ -132,6 +134,15 @@ const PLAYOUT_LOW_WINDOW: Duration = Duration::from_secs(1);
 const PLAYOUT_CUSHION_MAX: Duration = Duration::from_micros(
     FrameDuration::Ms2_5.micros() as u64 * JitterBuffer::MAX_TARGET_FRAMES as u64,
 );
+/// Window the worker's wakeup pacing is measured over. A second, so the 99th
+/// percentile of it is a few wakeups a second: that is the drip of padded
+/// silence a musician hears as crackling, rather than the one late wakeup any
+/// machine produces.
+const WAKE_WINDOW: Duration = Duration::from_secs(1);
+/// Buckets [`WakeWatch`] counts wakeup intervals in: one [`TICK`] wide each,
+/// with a last one for everything past the ladder, which the window's maximum
+/// reports exactly.
+const WAKE_BUCKETS: usize = 33;
 /// Floor under [`playout_stall_after`], so a ring only a frame or two deep does
 /// not read a scheduling hiccup as a device that has stopped rendering.
 const PLAYOUT_STALL_FLOOR: Duration = Duration::from_millis(40);
@@ -167,6 +178,15 @@ fn playout_capacity(buffer_frames: u32) -> usize {
 /// the ring it sits in.
 fn playout_target(buffer_frames: u32) -> usize {
     2 * buffer_frames.max(FRAME_FRAMES as u32) as usize * usize::from(CHANNELS)
+}
+
+/// The depth target as time, which is the audio the device drains while the
+/// worker filling it is asleep. The target and not the capacity: the ring is cut
+/// for the deepest cushion the app can ever hold, and what the device actually
+/// finds banked is the depth the loop fills to.
+fn playout_cushion(buffer_frames: u32) -> Duration {
+    let frames = playout_target(buffer_frames) / usize::from(CHANNELS);
+    Duration::from_micros(frames as u64 * 1_000_000 / u64::from(SAMPLE_RATE))
 }
 
 /// Capture ring capacity in samples: the playout cushion, or
@@ -351,6 +371,8 @@ struct SharedState {
     /// every tick from the worker's own state. The UI reads it the way it
     /// reads the connection state.
     audio_fault: Option<AudioFaultView>,
+    /// How the worker thread is being scheduled, as [`WakeWatch`] last read it.
+    wake: Option<WakeView>,
 }
 
 impl SharedState {
@@ -390,6 +412,7 @@ impl SharedState {
             crackling: false,
             playout_low_frames: None,
             audio_fault: None,
+            wake: None,
         }
     }
 
@@ -978,6 +1001,139 @@ impl CrackleEpisode {
     }
 }
 
+/// One window of the worker loop's wakeup pacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WakePacing {
+    /// The 99th percentile interval, as the top of the bucket it fell in.
+    p99: Duration,
+    /// The window's longest interval, which is exact.
+    max: Duration,
+}
+
+/// Times the worker loop's wakeups against the audio the playout ring holds.
+///
+/// The device side of playout runs on a clock of its own, so the interval
+/// between two wakeups of the thread filling that ring is audio the device has
+/// to have found there. An interval longer than the ring holds is silence the
+/// device padded, and nothing else in the client measures the interval at all.
+///
+/// Counts per bucket rather than intervals: an exact 99th percentile needs every
+/// interval a session ever produced. What the p99 here reports is the top of the
+/// tick-wide bucket the 99th of a hundred fell in, which reads high by up to one
+/// tick and is an estimate rather than a percentile.
+///
+/// One warning, on one condition: that the p99 is longer than the cushion. That
+/// is the case where the ring cannot survive a single late wakeup, and it is the
+/// only reading a person can act on, so a periodic report of the figure would
+/// cost the log file its promise to stay empty on a healthy run and say nothing
+/// in exchange.
+struct WakeWatch {
+    /// The previous wakeup, and `None` before the first one.
+    last: Option<Instant>,
+    /// When the window now filling opened.
+    from: Instant,
+    counts: [u32; WAKE_BUCKETS],
+    max: Duration,
+    /// The last closed window's reading, and `None` until one closes.
+    pacing: Option<WakePacing>,
+    /// Whether the warning has gone out for the episode now running, so a
+    /// machine that stays late says so once and one that recovers can say it
+    /// again.
+    said: bool,
+}
+
+impl WakeWatch {
+    fn new(from: Instant) -> WakeWatch {
+        WakeWatch {
+            last: None,
+            from,
+            counts: [0; WAKE_BUCKETS],
+            max: Duration::ZERO,
+            pacing: None,
+            said: false,
+        }
+    }
+
+    /// One wakeup, against the cushion it has to stay inside. `None` for a ring
+    /// nothing is draining on a clock of its own, which is measured all the same
+    /// and never warned about.
+    fn observe(&mut self, now: Instant, cushion: Option<Duration>, priority: ThreadPriority) {
+        if let Some(last) = self.last.replace(now) {
+            let gap = now.saturating_duration_since(last);
+            self.counts[wake_bucket(gap)] += 1;
+            self.max = self.max.max(gap);
+        }
+        if now.duration_since(self.from) < WAKE_WINDOW {
+            return;
+        }
+        self.from = now;
+        self.pacing = self.close();
+        let (Some(pacing), Some(cushion)) = (self.pacing, cushion) else {
+            return;
+        };
+        if pacing.p99 <= cushion {
+            self.said = false;
+            return;
+        }
+        if !self.said {
+            self.said = true;
+            tracing::warn!(
+                p99_ms = as_ms(pacing.p99),
+                max_ms = as_ms(pacing.max),
+                cushion_ms = as_ms(cushion),
+                priority = ?priority,
+                "the thread filling playout wakes later than the ring holds"
+            );
+        }
+    }
+
+    /// The window's reading, with the counts it was taken from reset for the
+    /// next one. `None` when no wakeup landed inside it.
+    fn close(&mut self) -> Option<WakePacing> {
+        let max = std::mem::replace(&mut self.max, Duration::ZERO);
+        let counts = std::mem::replace(&mut self.counts, [0; WAKE_BUCKETS]);
+        let counted = u64::from(counts.iter().sum::<u32>());
+        if counted == 0 {
+            return None;
+        }
+        let ninety_ninth = (counted * 99).div_ceil(100);
+        let bucket = counts
+            .iter()
+            .scan(0u64, |seen, count| {
+                *seen += u64::from(*count);
+                Some(*seen)
+            })
+            .position(|seen| seen >= ninety_ninth)
+            .unwrap_or(WAKE_BUCKETS - 1);
+        let p99 = if bucket + 1 == WAKE_BUCKETS {
+            max
+        } else {
+            TICK * (bucket as u32 + 1)
+        };
+        Some(WakePacing { p99, max })
+    }
+
+    /// The last closed window's reading.
+    fn pacing(&self) -> Option<WakePacing> {
+        self.pacing
+    }
+}
+
+/// The bucket a wakeup interval belongs to. One [`TICK`] wide each, with an
+/// interval on a bucket's top edge inside it, so a loop waking exactly on the
+/// tick reads as one tick rather than as two. Everything past the ladder lands
+/// in the last bucket, where the window's maximum is the figure to read.
+fn wake_bucket(gap: Duration) -> usize {
+    let ticks = gap.as_micros().div_ceil(TICK.as_micros()).max(1) as usize;
+    (ticks - 1).min(WAKE_BUCKETS - 1)
+}
+
+/// A duration as milliseconds for a log field or a readout. The tick is 2.5 of
+/// them, so whole milliseconds would round away the figure being reported.
+fn as_ms(d: Duration) -> f64 {
+    d.as_micros() as f64 / 1000.0
+}
+
 /// The production runtime. Construct with [`LiveRuntime::join`]; the UI
 /// consumes it as a `Box<dyn Runtime>` (an `Arc<LiveRuntime>` implements
 /// the trait too, so the app can keep a concrete handle for
@@ -1068,6 +1224,7 @@ impl LiveRuntime {
             device_frames,
             playout_target: playout_target(device_frames),
             rings: RingWatch::new(Instant::now()),
+            wake: WakeWatch::new(Instant::now()),
             playout: PlayoutWatch::default(),
             settings,
             shared: Arc::clone(&shared),
@@ -1092,6 +1249,7 @@ impl LiveRuntime {
             opened_at: Some(Instant::now()),
             episode: ReopenEpisode::default(),
             announced_rate: rate,
+            priority: ThreadPriority::Unchanged,
         };
         let handle = std::thread::Builder::new()
             .name("jamstream-net".into())
@@ -1202,6 +1360,7 @@ impl LiveRuntime {
                 rate: s.rate,
                 crackling: s.crackling,
                 playout_low_frames: s.playout_low_frames,
+                wake: s.wake,
             },
             members,
             chat: s.chat.iter().cloned().collect(),
@@ -1439,6 +1598,10 @@ struct Worker {
     /// them, so without this a ring the device outgrows is audible but
     /// invisible.
     rings: RingWatch,
+    /// This loop's own pacing against the ring it fills. The device side is
+    /// scheduled in real time and this side is not, so without this the margin
+    /// between them is unmeasured.
+    wake: WakeWatch,
     /// One warn per episode when playout goes silent or media is refused;
     /// nothing else consumes the jitter buffer's counters, so without this
     /// neither would be said.
@@ -1490,10 +1653,21 @@ struct Worker {
     /// The rate outcomes last logged, so a reopen on the same rung writes
     /// nothing and a rung change is written exactly once.
     announced_rate: Option<RateOutcomesView>,
+    /// What the platform granted this thread, set once it is running. The
+    /// pacing warning names it: a loop waking late at a real-time priority and
+    /// one waking late at a priority nobody raised are different faults.
+    priority: ThreadPriority,
 }
 
 impl Worker {
     fn run(mut self) {
+        // This thread fills a ring a real-time callback drains, so it asks for
+        // the same class the callback runs at. Held for the session and released
+        // when this returns: on Windows it carries process-wide timer
+        // resolution, which the app has no business keeping once its audio has
+        // stopped.
+        let priority = AudioPriority::raise_current_thread(TICK);
+        self.priority = priority.granted();
         let mut next = Instant::now() + TICK;
         loop {
             if !self.step() {
@@ -1519,6 +1693,7 @@ impl Worker {
     /// One loop iteration. Returns false when the session is over and the
     /// thread should exit.
     fn step(&mut self) -> bool {
+        self.watch_wakeup();
         let now_ms = self.now_ms();
 
         loop {
@@ -2024,6 +2199,16 @@ impl Worker {
         });
     }
 
+    /// This loop's pacing, timed where it wakes up, and the cushion it has to
+    /// stay inside. The cushion is only a deadline when something drains the
+    /// ring on a clock of its own: the offline driver pumps from this thread,
+    /// where a late wakeup delays playout instead of emptying it.
+    fn watch_wakeup(&mut self) {
+        let cushion = (self.engine.is_some() && matches!(self.driver, Driver::Real { .. }))
+            .then(|| playout_cushion(self.device_frames));
+        self.wake.observe(Instant::now(), cushion, self.priority);
+    }
+
     /// The bridge counters, reported by [`RingWatch`]. Movement means a ring
     /// too shallow for what the device delivers or for what the worker is
     /// keeping up with; the log is the one place that class of defect shows
@@ -2234,6 +2419,10 @@ impl Worker {
         });
         s.levels = self.levels;
         s.playout_low_frames = self.rings.playout_low_frames();
+        s.wake = self.wake.pacing().map(|pacing| WakeView {
+            p99_ms: as_ms(pacing.p99) as f32,
+            max_ms: as_ms(pacing.max) as f32,
+        });
     }
 
     /// Initial connect only: a timeout on one invite address moves on to
@@ -3211,6 +3400,36 @@ mod tests {
         }
     }
 
+    /// The cushion the worker's pacing is judged against is the depth the loop
+    /// fills to, as time, which is two device callbacks of audio. The ring is cut
+    /// deeper than that and the device never finds the difference, so a deadline
+    /// read off the capacity would be one nothing has to meet. A target set from
+    /// what the device negotiated rather than from what was asked for moves the
+    /// deadline with it, and the 480-frame WASAPI shared period is the case that
+    /// matters.
+    #[test]
+    fn the_cushion_is_two_device_callbacks_of_audio() {
+        assert_eq!(playout_cushion(120), Duration::from_millis(5));
+        assert_eq!(playout_cushion(480), Duration::from_millis(20));
+        for frames in [0u32, 32, 120, 240, 480, 960] {
+            let period = Duration::from_micros(
+                u64::from(frames.max(FRAME_FRAMES as u32)) * 1_000_000 / u64::from(SAMPLE_RATE),
+            );
+            assert_eq!(
+                playout_cushion(frames),
+                period * 2,
+                "{frames}-frame callbacks against a target of {} samples",
+                playout_target(frames)
+            );
+            assert!(
+                playout_cushion(frames)
+                    <= playout_capacity(frames) as u32 * TICK
+                        / (FRAME_FRAMES * usize::from(CHANNELS)) as u32,
+                "{frames}-frame callbacks: the cushion cannot outlast the ring holding it"
+            );
+        }
+    }
+
     /// Several underruns inside one window are the shape [`PlayoutWatch`]'s
     /// concealed-gap state already holds for a run rather than firing on a
     /// sample: the state turns on with the underrun that crosses
@@ -3484,5 +3703,176 @@ mod tests {
             "the water mark reads the cushion the loop holds"
         );
         assert_eq!(engine.underruns(), 0);
+    }
+
+    /// A window's worth of wakeups, every `late_every`th of them arriving after
+    /// `late` rather than after a tick. Driven on the clock the watch is handed,
+    /// so a stall costs the test no wall-clock time.
+    fn wake_for_a_window(
+        watch: &mut WakeWatch,
+        at: &mut Instant,
+        late_every: u32,
+        late: Duration,
+        cushion: Option<Duration>,
+    ) {
+        let closes_at = *at + WAKE_WINDOW;
+        let mut wakeup = 0u32;
+        while *at <= closes_at {
+            wakeup += 1;
+            *at += if wakeup % late_every == 0 { late } else { TICK };
+            watch.observe(*at, cushion, ThreadPriority::RealTime);
+        }
+    }
+
+    /// The direction that matters more: a loop keeping its own pace says nothing
+    /// at all, because the log file's first line promises that an empty file is a
+    /// healthy run and this reading moves every second.
+    #[test]
+    fn a_loop_that_keeps_its_pace_says_nothing() {
+        let start = Instant::now();
+        let mut watch = WakeWatch::new(start);
+        let mut at = start;
+        let lines = captured(|| {
+            // Never late: every wakeup lands one tick after the last.
+            wake_for_a_window(
+                &mut watch,
+                &mut at,
+                u32::MAX,
+                TICK,
+                Some(playout_cushion(120)),
+            );
+        });
+        assert!(lines.is_empty(), "{lines:#?}");
+        assert_eq!(
+            watch.pacing(),
+            Some(WakePacing {
+                p99: TICK,
+                max: TICK
+            }),
+            "a loop on the tick reads as one tick, not as two"
+        );
+    }
+
+    /// The fault itself: wakeups late enough, often enough, that the ring cannot
+    /// cover one of them. One line, and it carries both numbers, because the
+    /// comparison between them is the whole reading; a millisecond figure on its
+    /// own is one nobody can judge.
+    #[test]
+    fn wakeups_the_ring_cannot_cover_name_both_numbers() {
+        const STALL: Duration = Duration::from_millis(20);
+        let cushion = playout_cushion(120);
+        let start = Instant::now();
+        let mut watch = WakeWatch::new(start);
+        let mut at = start;
+        let lines = captured(|| {
+            wake_for_a_window(&mut watch, &mut at, 20, STALL, Some(cushion));
+        });
+
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        let line = &lines[0];
+        assert!(
+            line.contains("WARN"),
+            "not a warning, so the file never sees it: {line}"
+        );
+        assert!(line.contains("wakes later than the ring holds"), "{line}");
+        for field in ["p99_ms=20", "max_ms=20", "cushion_ms=5"] {
+            assert!(line.contains(field), "no {field} in {line}");
+        }
+        let pacing = watch.pacing().expect("a closed window");
+        assert!(
+            pacing.p99 > cushion,
+            "{:?} is inside the {cushion:?} the ring holds, so the warning was wrong",
+            pacing.p99
+        );
+    }
+
+    /// A machine that stays late says so once, and a machine that recovers can
+    /// say it again. One line per second of a bad session would fill the file
+    /// and one line per session would miss the second time.
+    #[test]
+    fn a_pace_that_recovers_can_say_it_again() {
+        const STALL: Duration = Duration::from_millis(20);
+        let cushion = Some(playout_cushion(120));
+        let start = Instant::now();
+        let mut watch = WakeWatch::new(start);
+        let mut at = start;
+        let lines = captured(|| {
+            wake_for_a_window(&mut watch, &mut at, 20, STALL, cushion);
+            wake_for_a_window(&mut watch, &mut at, 20, STALL, cushion);
+            wake_for_a_window(&mut watch, &mut at, u32::MAX, TICK, cushion);
+            wake_for_a_window(&mut watch, &mut at, 20, STALL, cushion);
+        });
+        assert_eq!(
+            lines.len(),
+            2,
+            "two late episodes with a recovery between them: {lines:#?}"
+        );
+    }
+
+    /// Nothing draining the ring on a clock of its own means no deadline to
+    /// miss, so the same stalls say nothing while the reading is taken all the
+    /// same. The offline driver pumps playout from this thread, and a test suite
+    /// that warned about its own scheduling would be noise.
+    #[test]
+    fn a_ring_nothing_drains_has_no_deadline_to_miss() {
+        const STALL: Duration = Duration::from_millis(80);
+        let start = Instant::now();
+        let mut watch = WakeWatch::new(start);
+        let mut at = start;
+        let lines = captured(|| {
+            wake_for_a_window(&mut watch, &mut at, 4, STALL, None);
+        });
+        assert!(lines.is_empty(), "{lines:#?}");
+        assert!(
+            watch.pacing().is_some_and(|p| p.max >= STALL),
+            "the pacing still has to be measured: {:?}",
+            watch.pacing()
+        );
+    }
+
+    /// What the p99 is: the top of the bucket the 99th of a hundred fell in,
+    /// which reads high by up to one tick. Two wakeups in a hundred at 6.1 ms
+    /// put the true 99th percentile at 6.1 ms and this figure at 7.5, while the
+    /// maximum beside it is the interval itself.
+    #[test]
+    fn the_p99_is_the_top_of_the_bucket_and_the_maximum_is_exact() {
+        const LATE: Duration = Duration::from_micros(6_100);
+        let start = Instant::now();
+        let mut watch = WakeWatch::new(start);
+        let mut at = start;
+        assert_eq!(watch.pacing(), None, "no window has closed yet");
+
+        wake_for_a_window(&mut watch, &mut at, 50, LATE, None);
+        let pacing = watch.pacing().expect("a closed window");
+        assert_eq!(
+            pacing.p99,
+            TICK * 3,
+            "6.1 ms sits in the 5 to 7.5 ms bucket"
+        );
+        assert_eq!(pacing.max, LATE, "the maximum is the interval itself");
+    }
+
+    /// Each window is its own reading. A maximum kept for the session would pin
+    /// the figure to one bad second for the rest of the song, and a machine that
+    /// settles has to read as settled.
+    #[test]
+    fn each_window_reports_its_own_pacing() {
+        const STALL: Duration = Duration::from_millis(40);
+        let start = Instant::now();
+        let mut watch = WakeWatch::new(start);
+        let mut at = start;
+        captured(|| {
+            wake_for_a_window(&mut watch, &mut at, 8, STALL, None);
+            assert!(watch.pacing().is_some_and(|p| p.max >= STALL));
+            wake_for_a_window(&mut watch, &mut at, u32::MAX, TICK, None);
+        });
+        assert_eq!(
+            watch.pacing(),
+            Some(WakePacing {
+                p99: TICK,
+                max: TICK
+            }),
+            "the window that kept up has to read as having kept up"
+        );
     }
 }
