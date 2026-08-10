@@ -81,13 +81,10 @@ jobs:
       - name: Check committed docs images against fresh previews
         run: site/copy-previews.sh --check
 
-  # The theme's fonts are copies of fonts/ at the root of the tree, which is
-  # the one set the app and the stream card also embed. They were symlinks
-  # until #425: a Windows clone writes those as text files holding the target
-  # path, mdBook copies them into the book as fonts, and the browser falls
-  # back with nothing reporting an error. The copies are what CI can see, so
-  # this job proves they still match their source and that a real build ships
-  # the bytes themselves rather than anything standing in for them.
+  # Two limits because a list fails two ways: each item against the character
+  # ceiling, and the list against a count, since thirty short entries is a wall
+  # however short each one is. Tables, code fences, headings and image alt text
+  # are exempt: none is read as prose.
   prose:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -97,6 +94,13 @@ jobs:
           persist-credentials: false
       - run: python3 site/check-prose.py
 
+  # The theme's fonts are copies of fonts/ at the root of the tree, which is
+  # the one set the app and the stream card also embed. They were symlinks
+  # until #425: a Windows clone writes those as text files holding the target
+  # path, mdBook copies them into the book as fonts, and the browser falls
+  # back with nothing reporting an error. The copies are what CI can see, so
+  # this job proves they still match their source and that a real build ships
+  # the bytes themselves rather than anything standing in for them.
   site-fonts:
     runs-on: ubuntu-latest
     timeout-minutes: 10
