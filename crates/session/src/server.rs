@@ -8,8 +8,8 @@ use std::net::{IpAddr, SocketAddr};
 use blake2::{Blake2s256, Digest};
 use ed25519_dalek::VerifyingKey;
 use jamstream_engine::{
-    Channels, Decoder, Encoder, Fader, JitterBuffer, JitterStats, Limiter, MediaPacket, Metronome,
-    Pull, mix_into,
+    Channels, Decoder, Encoder, Fader, JitterBuffer, JitterStats, Limiter, LossWindow, MediaPacket,
+    Metronome, Pull, mix_into,
 };
 use jamstream_protocol::PROTOCOL_VERSION;
 use jamstream_protocol::control::{
@@ -115,8 +115,12 @@ const CHALLENGE_MIN_INIT_BYTES: usize = 64;
 /// roster or a chat. A round trip's worth of chunks on a 45 ms path is about
 /// 36, so this also lets a transfer run at full speed on any real link.
 const AVATAR_FEED_HIGH_WATER: usize = 64;
-/// Uplink Stats reports go to each musician this often.
-const STATS_INTERVAL_MS: u64 = 1_000;
+/// Uplink Stats reports go to each musician this often, so it is also the
+/// window every figure in one is a rate over. A client measuring its own
+/// downlink measures it over this same window; two rates over different
+/// windows would not be comparable, and the client's readout puts them side
+/// by side.
+pub const STATS_INTERVAL_MS: u64 = 1_000;
 /// While anything is configured for broadcast, every member is told the
 /// on-air state at least this often. Transitions are sent immediately.
 const STREAM_STATUS_INTERVAL_MS: u64 = 1_000;
@@ -751,21 +755,12 @@ impl ServerCore {
                 }
                 let cur = m.jitter.stats();
                 let prev = std::mem::replace(&mut m.stats_prev, cur);
-                let pulled = cur.pulled.saturating_sub(prev.pulled);
-                let lost = cur.lost.saturating_sub(prev.lost);
-                let recovered = cur.recovered.saturating_sub(prev.recovered);
-                let pct = |n: u64| {
-                    if pulled == 0 {
-                        0.0
-                    } else {
-                        100.0 * n as f32 / pulled as f32
-                    }
-                };
+                let window = LossWindow::between(&prev, &cur).unwrap_or_default();
                 let _ = m.link.send(ControlMsg::Stats {
                     // Wire loss counts even when redundancy papered over it.
-                    uplink_loss_pct: pct(lost + recovered),
+                    uplink_loss_pct: window.wire_loss_pct(),
                     uplink_jitter_depth: cur.depth_frames.min(usize::from(u16::MAX)) as u16,
-                    uplink_recovered_pct: pct(recovered),
+                    uplink_recovered_pct: window.recovered_pct(),
                 });
             }
         }

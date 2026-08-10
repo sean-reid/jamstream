@@ -12,7 +12,7 @@ pub mod redundancy;
 
 pub use codec::{Channels, CodecError, Decoder, Encoder};
 pub use drift::DriftCompensator;
-pub use jitter::{JitterBuffer, JitterStats, MediaPacket, Pull};
+pub use jitter::{JitterBuffer, JitterStats, LossWindow, MediaPacket, Pull};
 pub use limiter::Limiter;
 pub use metronome::Metronome;
 pub use mixer::{Fader, db_to_lin, mix_into};
