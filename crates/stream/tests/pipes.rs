@@ -393,3 +393,30 @@ fn a_child_that_dies_before_opening_the_fifo_is_a_spawn_error() {
     // no writer thread still holding one.
     assert!(!rig.fifo().exists(), "the FIFO outlived a failed spawn");
 }
+
+/// The elapsed times the two adversarial-reader tests print only reach a log on
+/// a passing run because `.config/nextest.toml` names them for publishing, and
+/// filters there are exact matches: a rename has to land in both places or in
+/// neither. Both assert against a window an order of magnitude wider than what
+/// they measure, so the number is the only thing that tells a generous window
+/// from a nearly spent one.
+#[test]
+fn the_measured_tests_are_named_in_the_nextest_config() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+    for (name, _) in [
+        (
+            stringify!(a_child_that_never_reads_video_still_gets_every_byte_of_audio),
+            a_child_that_never_reads_video_still_gets_every_byte_of_audio as fn(),
+        ),
+        (
+            stringify!(a_child_that_never_reads_audio_keeps_taking_video_throughout),
+            a_child_that_never_reads_audio_keeps_taking_video_throughout as fn(),
+        ),
+    ] {
+        assert!(
+            CONFIG.contains(&format!("test(={name})")),
+            ".config/nextest.toml no longer names {name}, so what it measures is \
+             being printed into a void"
+        );
+    }
+}
