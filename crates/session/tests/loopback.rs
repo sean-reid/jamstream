@@ -2795,7 +2795,7 @@ macro_rules! named {
     ($($f:ident),+ $(,)?) => { [$((stringify!($f), $f as fn())),+] };
 }
 
-/// Two tests in this file print a measurement, and `.config/nextest.toml` is
+/// Four tests in this file print a measurement, and `.config/nextest.toml` is
 /// what makes anyone able to read it: the default profile discards a passing
 /// test's stdout, so across this repo's history exactly one measurement line
 /// survives anywhere (#283). `tick_cost_at_capacity` additionally reads a wall

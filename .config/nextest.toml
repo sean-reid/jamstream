@@ -4,10 +4,12 @@
 # false in the two that mattered.
 #
 # Everything here is per-test rather than profile-wide. `test(=name)` is an
-# exact match, so a rename silently drops the override; the tests
-# `the_measured_tests_are_named_in_the_nextest_config` in the harness suite, the
-# session suite, and the server's local_provider suite pair each name here with
-# the function it names and fail when they come apart.
+# exact match, so a rename silently drops the override, and a filter that
+# selects nothing is not an error to nextest. Two checks hold the pairing: each
+# measuring suite keeps a `the_measured_tests_are_named_in_the_nextest_config`
+# naming what it publishes, and the server's local_provider suite runs the other
+# way in `every_test_the_nextest_config_names_is_claimed_by_its_suite`, so a name
+# added here without a function behind it fails rather than doing nothing.
 
 # `priority` below needs 0.9.91 or newer. Without this line an older binary
 # refuses the key outright, which is fine, but the message names a toml field
@@ -73,10 +75,12 @@ threads-required = "num-test-threads"
 success-output = "immediate"
 
 [[profile.default.overrides]]
-# The measurements that are facts about the simulation rather than about the
-# machine: mouth-to-ear latency and buffer depth off the virtual clock, bytes
-# counted on the simulated network. Contention cannot move them, so they only
-# need publishing.
+# The measurements that are facts about the code rather than about the machine:
+# mouth-to-ear latency and buffer depth off the virtual clock, bytes counted on
+# the simulated network, jitter counters through a capture gap, and allocations
+# per frame off a counting allocator. Contention cannot move any of them, so
+# they only need publishing. The allocation count is the tightest gate in the
+# workspace at 79 percent of its budget and was the one being thrown away.
 #
 # Publishing is not the default because `success-output = "immediate"` prints
 # libtest's own six lines of preamble for every passing test whether it said
@@ -94,11 +98,46 @@ filter = """
     or test(=latency_regional_fiber)
     or test(=latency_dsl)
     or test(=latency_at_capacity)
+    or test(=playout_cushion_is_in_the_latency)
     or test(=drift_200ppm_stays_bounded)
     or test(=drift_200ppm_with_resampler)
     or test(=driver_stall_reanchors_and_audio_returns)
     or test(=soak_ten_minutes_regional)
     or test(=a_set_avatar_flood_is_not_an_egress_amplifier)
+    or test(=full_session_frame_allocations)
+"""
+success-output = "immediate"
+
+[[profile.default.overrides]]
+# The frame-cost gates, which measure the machine and are the only budgets in
+# the workspace with a wall-clock deadline that nothing else publishes. Each
+# prints median, p99 and max per frame plus what fraction of its budget the
+# median took, so the distance to the wall is a series and not a guess.
+#
+# They share the machine with the rest of their suites, so they gate the median
+# and publish the tail. Measured on a 14-core laptop against 14 busy cores, the
+# broadcast scene's median moves 1.7x while its worst frame moves 36x, and the
+# client session's median moves 1.6x while its worst frame moves 19x. That is
+# the same shape the tick gates above measure, so a gate on the tail here would
+# be a gate on the scheduler, and the number that says so has to be readable on
+# a passing run.
+filter = """
+    test(=ten_member_scene_meets_frame_budget)
+    or test(=full_session_frame_time)
+"""
+success-output = "immediate"
+
+[[profile.default.overrides]]
+# The two crates/stream suites that measure real time without a real encoder:
+# how long a submission to a child that never reads takes to come back, and how
+# long a pusher takes to be called live. Both assert against windows an order of
+# magnitude wider than what they measure, so the number is the only way to know
+# whether a window is still generous or nearly spent.
+filter = """
+    test(=a_child_that_never_reads_video_still_gets_every_byte_of_audio)
+    or test(=a_child_that_never_reads_audio_keeps_taking_video_throughout)
+    or test(=a_pusher_is_live_once_it_reports_a_push_and_not_before)
+    or test(=a_pusher_that_pushed_nothing_is_never_live_however_long_it_lives)
 """
 success-output = "immediate"
 

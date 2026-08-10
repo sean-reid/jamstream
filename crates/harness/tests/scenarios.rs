@@ -968,7 +968,10 @@ fn perf_budget_secs(laptop_secs: f64) -> f64 {
 }
 
 /// How much slower than the reference laptop the machine running this suite is
-/// declared to be. 1.0 unless `JAMSTREAM_PERF_BUDGET_SECS` says otherwise.
+/// declared to be. 1.0 unless `JAMSTREAM_PERF_BUDGET_SECS` says otherwise, and
+/// never below it: a value under the reference, or an unparseable one, has to
+/// leave the laptop budget alone rather than shorten a deadline. The server and
+/// cli suites clamp the same multiplier the same way.
 ///
 /// It describes throughput and nothing else. What it cannot describe is a
 /// machine with no idle core, where a timed region loses the cpu in the middle
@@ -976,10 +979,34 @@ fn perf_budget_secs(laptop_secs: f64) -> f64 {
 /// answer to that, not a bigger number: see
 /// [`the_measured_tests_are_named_in_the_nextest_config`].
 fn perf_scale() -> f64 {
-    std::env::var("JAMSTREAM_PERF_BUDGET_SECS")
-        .ok()
+    scale_of(std::env::var("JAMSTREAM_PERF_BUDGET_SECS").ok().as_deref())
+}
+
+fn scale_of(value: Option<&str>) -> f64 {
+    value
         .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
         .map_or(1.0, |v| v / REFERENCE_LAPTOP_SECS)
+        .max(1.0)
+}
+
+/// The runner is described once and a deadline can only ever get longer from
+/// it. A missing or nonsense value has to leave the laptop budget alone rather
+/// than collapse to zero.
+#[test]
+fn a_deadline_scales_with_the_runner_and_never_shrinks() {
+    assert_eq!(scale_of(None), 1.0, "unset is the laptop budget");
+    // What CI sets: 120 s against the 30 s reference run.
+    assert_eq!(scale_of(Some("120")), 4.0);
+    assert_eq!(scale_of(Some("45")), 1.5);
+    for nonsense in ["0", "-30", "", "soon", "NaN", "inf"] {
+        assert_eq!(
+            scale_of(Some(nonsense)),
+            1.0,
+            "{nonsense:?} must not shorten a deadline"
+        );
+    }
+    assert!(perf_budget_secs(30.0) >= 30.0);
 }
 
 /// Pairs a test name with the function that carries it, so the two cannot
@@ -1024,6 +1051,7 @@ fn the_measured_tests_are_named_in_the_nextest_config() {
         latency_regional_fiber,
         latency_dsl,
         latency_at_capacity,
+        playout_cushion_is_in_the_latency,
         drift_200ppm_stays_bounded,
         drift_200ppm_with_resampler,
         driver_stall_reanchors_and_audio_returns,

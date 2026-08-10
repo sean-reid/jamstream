@@ -286,3 +286,29 @@ fn a_pusher_is_live_once_it_reports_a_push_and_not_before() {
     drop(pipeline);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The two promotion timings above only reach a log on a passing run because
+/// `.config/nextest.toml` names these tests for publishing, and filters there
+/// are exact matches: a rename has to land in both places or in neither. Both
+/// windows are deliberately loose, so how much of one a loaded runner spends is
+/// a fact only the printed number carries.
+#[test]
+fn the_measured_tests_are_named_in_the_nextest_config() {
+    const CONFIG: &str = include_str!("../../../.config/nextest.toml");
+    for (name, _) in [
+        (
+            stringify!(a_pusher_is_live_once_it_reports_a_push_and_not_before),
+            a_pusher_is_live_once_it_reports_a_push_and_not_before as fn(),
+        ),
+        (
+            stringify!(a_pusher_that_pushed_nothing_is_never_live_however_long_it_lives),
+            a_pusher_that_pushed_nothing_is_never_live_however_long_it_lives as fn(),
+        ),
+    ] {
+        assert!(
+            CONFIG.contains(&format!("test(={name})")),
+            ".config/nextest.toml no longer names {name}, so what it measures is \
+             being printed into a void"
+        );
+    }
+}
