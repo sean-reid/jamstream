@@ -1036,7 +1036,7 @@ impl JamApp {
         match self.settings_tab {
             SettingsTab::Audio => {
                 let levels = snap.map(|s| s.levels).unwrap_or_default();
-                let m2e = snap.and_then(|s| s.stats.mouth_to_ear_ms);
+                let m2e = snap.and_then(|s| s.stats.mouth_to_ear_ms());
                 let rate_lines = snap
                     .and_then(|s| s.stats.rate)
                     .map(|r| r.lines())

@@ -1083,7 +1083,7 @@ fn status_readouts(ui: &mut Ui, snap: &Snapshot) {
 }
 
 /// Mouth to ear, the headline number, with everything else the link reports
-/// on its hover: rtt, buffer depth against target, and loss in each
+/// on its hover: rtt, each jitter buffer's depth, and loss in each
 /// direction. Those are what someone reads when the sound is wrong, and
 /// reading them is a deliberate act; carrying them permanently cost the bar
 /// the space its two lamps now use.
@@ -1091,7 +1091,7 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
     let s = &snap.stats;
     let p = theme::palette_of(ui);
     let m2e = s
-        .mouth_to_ear_ms
+        .mouth_to_ear_ms()
         .map_or("--.-".to_owned(), |v| format!("{v:>4.1}"));
     let group = ui.horizontal(|ui| {
         ui.label(
@@ -1199,10 +1199,8 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
 fn latency_hover(s: &crate::runtime::StatsView) -> String {
     let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
     let mut text = format!(
-        "rtt {rtt} ms, charged for both legs, low if somebody's link is worse\n\
-         buffer {}/{} frames\n{}",
-        s.jitter_depth,
-        s.jitter_target,
+        "rtt {rtt} ms, charged for both legs, low if somebody's link is worse\n{}\n{}",
+        s.jitter_lines().join("\n"),
         s.loss_lines().join("\n")
     );
     // Per direction rather than one device figure: they answer different
@@ -1696,6 +1694,7 @@ mod tests {
 
         let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
         let mut s = rt.snapshot().stats;
+        s.device_buffers = None;
         assert!(
             !latency_hover(&s).contains("cushion"),
             "with no stream there are no buffers to price"
