@@ -534,12 +534,23 @@ jobs:
       # and a 20084 us max through the full network simulation. Same value as
       # the harness job, so every scaled deadline in the repo agrees on one
       # number.
+      #
+      # The ffmpeg and mediamtx suites run only where those tools are installed,
+      # which is Linux. `require()` in crates/stream/tests/common returns None
+      # for a missing tool and the test body returns early, so nextest records a
+      # pass; the SKIP note goes to stderr, which it discards on success. Running
+      # them anywhere else buys two green ticks for work that did not happen, on
+      # the encoder-to-relay-to-pusher chain a live broadcast is.
       - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'macOS')
-        run: cargo nextest run --locked --workspace --exclude jamstream-harness
+        run: cargo nextest run --locked --workspace --exclude jamstream-harness -E 'not binary(real_ffmpeg) and not binary(relay_chain)'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
-      - if: needs.changes.outputs.docs-only != 'true' && (runner.os != 'macOS')
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         run: cargo nextest run --locked --workspace --exclude jamstream-harness -E 'not binary(ui_snapshots)'
+        env:
+          JAMSTREAM_PERF_BUDGET_SECS: "120"
+      - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Windows')
+        run: cargo nextest run --locked --workspace --exclude jamstream-harness -E 'not binary(ui_snapshots) and not binary(real_ffmpeg) and not binary(relay_chain)'
         env:
           JAMSTREAM_PERF_BUDGET_SECS: "120"
       # The compile surface nextest leaves dark is exactly the bench
