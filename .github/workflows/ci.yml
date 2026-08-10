@@ -433,6 +433,40 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         if: needs.changes.outputs.docs-only != 'true'
 
+  # The only gate that reads doc comments. An intra-doc link to an item that
+  # has been renamed still reads correctly to a human and compiles fine, so
+  # rustdoc is the one thing that can tell a live cross-reference from a dead
+  # one; the comments in this tree refer to each other constantly.
+  #
+  # --document-private-items because most modules here are private: without
+  # it rustdoc reads the public surface only, which in crates/audio-io is one
+  # file out of ten. What no linux runner can read either way is code it does
+  # not compile, which is the WASAPI backend, the cfg(windows) halves of
+  # cloud and client, and every cfg(test) module; a link into any of those is
+  # written as a plain name in code font instead.
+  rustdoc:
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        if: needs.changes.outputs.docs-only != 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2.9.1)
+        if: needs.changes.outputs.docs-only != 'true'
+      # Same libraries as lint: a doc build still compiles every dependency,
+      # so alsa-sys and the winit stack build scripts run here too.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
+        if: needs.changes.outputs.docs-only != 'true'
+      - run: cargo doc --locked --workspace --no-deps --document-private-items
+        if: needs.changes.outputs.docs-only != 'true'
+
   # Unit, property, integration, and E2E story tests, plus a production
   # build of every binary. The harness gate suite runs in its own job below
   # so this one is not serialized behind ~3 minutes of simulation.
@@ -1003,7 +1037,7 @@ jobs:
   # wave a run through exactly when a dependency did not finish.
   required:
     if: always()
-    needs: [pr-title, changes, hygiene, lint, test, release-build, harness, coverage, features, musl]
+    needs: [pr-title, changes, hygiene, lint, rustdoc, test, release-build, harness, coverage, features, musl]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

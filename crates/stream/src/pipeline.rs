@@ -3,7 +3,7 @@
 //!
 //! Time and processes are both inputs. `Pipeline` never reads a clock and
 //! never touches `std::process` directly, so the whole state machine is
-//! exercised deterministically against [`crate::proc::fake::FakeProcessHost`];
+//! exercised deterministically against `crate::proc::fake::FakeProcessHost`;
 //! [`crate::worker::StreamWorker`] is the thing that owns a thread and a
 //! clock.
 //!
@@ -138,7 +138,7 @@ pub struct StreamConfig {
 
 impl Default for StreamConfig {
     /// Encode settings from the bundled catalog, paths from whatever this
-    /// machine is. See [`StreamConfig::resolve`].
+    /// machine is. See `StreamConfig::resolve`.
     fn default() -> Self {
         StreamConfig::resolve(std::env::var_os(BROADCAST_DIR_ENV).as_deref())
     }

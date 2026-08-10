@@ -902,7 +902,7 @@ fn local_region_row() -> RegionRow {
 /// the provider's launch preflight, so a token that can price sessions but
 /// cannot launch them fails here rather than at step 4 of 4. A refusal comes
 /// back as a sentence naming the scope or the policy to fix; see
-/// [`machine_failure`].
+/// `machine_failure`.
 pub async fn check_provider(provider: Box<dyn Provider>) -> Result<(), String> {
     let kind = provider.kind();
     let regions = provider.regions();

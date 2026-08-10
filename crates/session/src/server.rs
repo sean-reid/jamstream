@@ -111,9 +111,10 @@ const REJECT_MIN_INIT_BYTES: usize = 48;
 /// is anywhere near either floor.
 const CHALLENGE_MIN_INIT_BYTES: usize = 64;
 /// Queue depth at which the avatar pacer stops feeding a link. Well clear of
-/// [`MAX_PENDING`], so the link's hard cap only ever refuses bulk, never a
-/// roster or a chat. A round trip's worth of chunks on a 45 ms path is about
-/// 36, so this also lets a transfer run at full speed on any real link.
+/// [`jamstream_protocol::control::MAX_PENDING`], so the link's hard cap only
+/// ever refuses bulk, never a roster or a chat. A round trip's worth of chunks
+/// on a 45 ms path is about 36, so this also lets a transfer run at full speed
+/// on any real link.
 const AVATAR_FEED_HIGH_WATER: usize = 64;
 /// Uplink Stats reports go to each musician this often, so it is also the
 /// window every figure in one is a rate over. A client measuring its own

@@ -4,7 +4,7 @@
 //! destinations, key handling, status derivation) is all about *when* it
 //! spawns and kills things, not about `std::process`. So every process
 //! interaction goes through [`ProcessHost`]: [`StdProcessHost`] is the real
-//! adapter, [`fake::FakeProcessHost`] is a scriptable double with a call log
+//! adapter, `fake::FakeProcessHost` is a scriptable double with a call log
 //! that tests assert against.
 //!
 //! The real adapter is not thin, and the reason is the one thing in this
@@ -166,7 +166,7 @@ pub trait ProcessHost {
 /// [`VIDEO_QUEUE_BYTES`] is dropped and reported as [`Feed::Dropped`] for the
 /// status to count. Audio is never dropped, because a hole in the master
 /// clock is worse than a restart, so its queue is allowed past
-/// [`AUDIO_QUEUE_BYTES`] and is bounded instead by [`STALL`]: either queue
+/// [`AUDIO_QUEUE_BYTES`] and is bounded instead by `STALL`: either queue
 /// over its cap for that long is a child that has stopped consuming, and a
 /// broken feed the supervisor restarts.
 ///
@@ -484,7 +484,7 @@ impl StderrTail {
 /// the line is logged against, not from the URL.
 ///
 /// One exception, and it is not a decision this function makes: a URL that
-/// matches `relay` exactly is replaced by [`RELAY`]. That string is our own
+/// matches `relay` exactly is replaced by `RELAY`. That string is our own
 /// loopback relay out of the pipeline's configuration, it never held a key,
 /// and telling the two refusals apart is the whole point. A URL that
 /// is not character-for-character that string is redacted, so the exception

@@ -259,7 +259,7 @@ impl GcpProvider {
 
     /// Overrides the `scheduling.maxRunDuration` hard cap for every launch,
     /// ahead of the session's own cap. Ordinarily the cap comes from the
-    /// launch spec: see [`GcpProvider::launch_body`].
+    /// launch spec: see `GcpProvider::launch_body`.
     pub fn with_max_run_seconds(mut self, seconds: u64) -> Self {
         self.max_run_seconds = Some(seconds);
         self

@@ -24,11 +24,11 @@
 //!
 //! Failed multipart uploads are not free. Parts already sent keep billing as
 //! storage, and they do not appear in `list`, so nobody finds them. The driver
-//! in [`drive_upload`] therefore guarantees that **any** error after the upload
+//! in `drive_upload` therefore guarantees that **any** error after the upload
 //! is opened, whether reading the source, sending a part, hitting the part cap
 //! or completing, is followed by an abort of that upload before the error is
 //! returned. A failed abort is logged and the original error is still what the
-//! caller sees. Backends implement [`MultipartBackend`] and get this for free,
+//! caller sees. Backends implement `MultipartBackend` and get this for free,
 //! so the guarantee is testable once rather than three times.
 //!
 //! Belt and braces: the lifecycle rule written by
@@ -41,7 +41,7 @@
 //! [`ObjectStore::get`] is the other direction, and it is a stream for the
 //! same reason: the caller writes each chunk into a [`ChunkSink`] as it
 //! arrives, so a 5 GB take never sits in memory. Every backend drains its
-//! response through [`drain_body`], which refuses a body that came up short
+//! response through `drain_body`, which refuses a body that came up short
 //! of the `content-length` the provider promised. A truncated take that
 //! reports success is the failure this path exists to prevent, and it is one
 //! guarantee in one place rather than three.
