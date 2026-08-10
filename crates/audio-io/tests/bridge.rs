@@ -1,6 +1,6 @@
 //! CallbackBridge: ordering across ring wrap, silence on underrun, drop on
-//! overrun, counters visible from the engine side, and the two rings sized
-//! apart from each other.
+//! overrun, counters and the playout low water mark visible from the engine
+//! side, and the two rings sized apart from each other.
 
 use jamstream_audio_io::CallbackBridge;
 
@@ -139,6 +139,98 @@ fn a_ring_holds_what_arrives_before_the_consumer_starts() {
              {BRING_UP} callbacks of {CALLBACK}, and the first drain took {got}"
         );
     }
+}
+
+/// The reading is the fill the callback found, not the fill it left behind:
+/// underruns only say the ring already emptied, and a ring arriving at every
+/// callback with one sample to spare is the case that needs a number.
+#[test]
+fn the_low_water_mark_is_the_fill_the_callback_found() {
+    let (mut device, mut engine) = CallbackBridge::new(16, 16);
+
+    assert_eq!(
+        engine.take_playout_low_water(),
+        None,
+        "no callback has run yet"
+    );
+
+    assert_eq!(engine.push_playout(&[1.0; 10]), 10);
+    let mut out = [0.0f32; 4];
+    device.on_playback(&mut out);
+    assert_eq!(engine.take_playout_low_water(), Some(10));
+}
+
+/// Every read closes a window and opens the next one, so the figure tracks a
+/// ring that recovers. A minimum since the stream opened would report the worst
+/// moment of the song forever.
+#[test]
+fn a_read_resets_the_window() {
+    let (mut device, mut engine) = CallbackBridge::new(16, 16);
+    let mut out = [0.0f32; 2];
+
+    assert_eq!(engine.push_playout(&[1.0; 3]), 3);
+    device.on_playback(&mut out);
+    assert_eq!(engine.take_playout_low_water(), Some(3));
+    assert_eq!(
+        engine.take_playout_low_water(),
+        None,
+        "no callback has run since the last read"
+    );
+
+    assert_eq!(engine.push_playout(&[1.0; 15]), 15);
+    device.on_playback(&mut out);
+    assert_eq!(
+        engine.take_playout_low_water(),
+        Some(16),
+        "the window that recovered reports what it recovered to"
+    );
+}
+
+/// The lowest fill of the window wins, so a producer that catches up inside the
+/// window cannot hide the dip that came before it.
+#[test]
+fn the_worst_dip_of_the_window_is_the_reading() {
+    let (mut device, mut engine) = CallbackBridge::new(16, 16);
+    let mut out = [0.0f32; 2];
+
+    assert_eq!(engine.push_playout(&[1.0; 12]), 12);
+    for _ in 0..6 {
+        device.on_playback(&mut out);
+    }
+    assert_eq!(engine.push_playout(&[1.0; 8]), 8);
+    device.on_playback(&mut out);
+
+    assert_eq!(engine.underruns(), 0, "the dip stopped short of empty");
+    assert_eq!(engine.take_playout_low_water(), Some(2));
+}
+
+/// A ring the callback found empty reads as zero, which is a different answer
+/// from no callback having run at all.
+#[test]
+fn an_empty_ring_reads_as_zero_rather_than_as_no_reading() {
+    let (mut device, engine) = CallbackBridge::new(16, 16);
+
+    let mut out = [0.0f32; 4];
+    device.on_playback(&mut out);
+    assert_eq!(engine.underruns(), 1);
+    assert_eq!(engine.take_playout_low_water(), Some(0));
+}
+
+/// A ring the producer keeps full reads as full, which is the baseline every
+/// dip is measured against.
+#[test]
+fn a_ring_that_never_dips_reads_as_full() {
+    const CAPACITY: usize = 240;
+    const CALLBACK: usize = 60;
+
+    let (mut device, mut engine) = CallbackBridge::new(CAPACITY, CAPACITY);
+    let mut out = [0.0f32; CALLBACK];
+    for _ in 0..100 {
+        while engine.push_playout(&[0.5; CALLBACK]) > 0 {}
+        device.on_playback(&mut out);
+    }
+    assert_eq!(engine.underruns(), 0);
+    assert_eq!(engine.take_playout_low_water(), Some(CAPACITY));
 }
 
 /// The DuplexHandler produced by into_handler shares the same rings and

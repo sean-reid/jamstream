@@ -476,6 +476,7 @@ impl Runtime for DemoRuntime {
             device_mode: s.device_mode,
             rate: s.rate,
             crackling: s.crackling,
+            playout_low_frames: None,
         };
 
         let members = s
