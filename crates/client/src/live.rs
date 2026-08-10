@@ -125,6 +125,15 @@ const CRACKLE_EPISODE_WINDOW: Duration = Duration::from_secs(90);
 /// read: long enough that a reading spans hundreds of device callbacks, short
 /// enough that one bad moment ages out of it.
 const PLAYOUT_LOW_WINDOW: Duration = Duration::from_secs(1);
+/// Deepest cushion the playout ring is cut to hold, which is what makes the
+/// cushion a number that moves while the stream stays open: a bigger one needs
+/// a bigger ring, and a bigger ring needs the device shut and reopened. The
+/// jitter buffer's own ceiling of `MAX_TARGET_FRAMES` sets the figure. Playout
+/// holding more audio than the network path ever asks for is latency spent
+/// where a bigger device callback is the answer instead.
+const PLAYOUT_CUSHION_MAX: Duration = Duration::from_micros(
+    FrameDuration::Ms2_5.micros() as u64 * JitterBuffer::MAX_TARGET_FRAMES as u64,
+);
 /// Floor under [`playout_stall_after`], so a ring only a frame or two deep does
 /// not read a scheduling hiccup as a device that has stopped rendering.
 const PLAYOUT_STALL_FLOOR: Duration = Duration::from_millis(40);
@@ -144,31 +153,53 @@ const PLAYOUT_DRAIN_MAX: Duration = Duration::from_millis(160);
 /// every platform measured; a whole second is something else going on.
 const SLOW_REOPEN: Duration = Duration::from_secs(1);
 
-/// Playout ring capacity in samples, which doubles as the playout depth
-/// target: the top-up loop keeps the ring full, so the device-side cushion
-/// sits at ~2x buffer_frames and every sample of it is latency. Floor of one
-/// 2.5 ms frame of slack.
+/// Playout ring capacity in samples: the deepest cushion the ring can ever be
+/// asked to hold, or the depth target itself where a device period is deeper
+/// than that. Capacity costs memory and depth costs latency, so the ring is cut
+/// once for the whole range and the cushion moves inside it with the stream
+/// open.
 fn playout_capacity(buffer_frames: u32) -> usize {
+    let deepest = PLAYOUT_CUSHION_MAX.as_millis() as usize * SAMPLE_RATE as usize / 1000;
+    playout_target(buffer_frames).max(deepest * usize::from(CHANNELS))
+}
+
+/// Playout depth in samples the top-up loop fills to, which is the cushion the
+/// device plays out of: ~2x buffer_frames, with a floor of one 2.5 ms frame of
+/// slack. Every sample of it is latency, which is why it is a target and not
+/// the ring it sits in.
+fn playout_target(buffer_frames: u32) -> usize {
     2 * buffer_frames.max(FRAME_FRAMES as u32) as usize * usize::from(CHANNELS)
 }
 
 /// Capture ring capacity in samples: the playout cushion, or
 /// [`CAPTURE_RING`] of audio, whichever is larger.
 ///
-/// Deeper than playout because capture depth is not latency: the worker drains
-/// this ring to empty every tick, so a sample waits for the next 2.5 ms drain
-/// and never for the capacity. Capacity only buys how long the worker may be
-/// held up before audio is destroyed, and the session's own bring-up outlasts
-/// two callbacks of it.
+/// Deeper than the playout cushion because capture depth is not latency: the
+/// worker drains this ring to empty every tick, so a sample waits for the next
+/// 2.5 ms drain and never for the capacity. Capacity only buys how long the
+/// worker may be held up before audio is destroyed, and the session's own
+/// bring-up outlasts two callbacks of it.
 fn capture_capacity(buffer_frames: u32) -> usize {
     let slack = CAPTURE_RING.as_millis() as usize * SAMPLE_RATE as usize / 1000;
-    playout_capacity(buffer_frames).max(slack * usize::from(CHANNELS))
+    playout_target(buffer_frames).max(slack * usize::from(CHANNELS))
+}
+
+/// Pushes toward `depth` samples banked in the playout ring and no further;
+/// returns how many of `samples` fit. The ring is cut for the deepest cushion
+/// the app can hold, so what the device plays out of, and pays for in latency,
+/// is this depth rather than the capacity.
+fn fill_playout_to(engine: &mut EngineSide, samples: &[f32], depth: usize) -> usize {
+    let room = depth.saturating_sub(engine.playout_depth());
+    if room == 0 {
+        return 0;
+    }
+    engine.push_playout(&samples[..room.min(samples.len())])
 }
 
 /// How long the playout ring may accept nothing before the device counts as
-/// having stopped rendering: four device callbacks, since the top-up loop keeps
-/// the ring full and a rendering device makes room for one callback on every
-/// callback. Clamped between [`PLAYOUT_STALL_FLOOR`] and
+/// having stopped rendering: four device callbacks, since the top-up loop holds
+/// the ring at its depth target and a rendering device makes room for one
+/// callback on every callback. Clamped between [`PLAYOUT_STALL_FLOOR`] and
 /// [`PLAYOUT_STALL_CEILING`].
 fn playout_stall_after(buffer_frames: u32) -> Duration {
     let period = Duration::from_micros(
@@ -401,13 +432,13 @@ impl Driver {
     /// when the stream then reports callbacks they cannot absorb, it is
     /// reopened once over rings that can.
     ///
-    /// The playout ring is filled with silence before the stream opens, so the
-    /// device's first callback finds it at its steady-state depth rather than
-    /// empty. Refilling it from the core instead would burst-pull several
-    /// frames in zero wall time, running the jitter consumer clock past the
-    /// sender; the buffer can step back at most one frame, so every later
-    /// packet would be dropped as late and playout would stay silent for the
-    /// rest of the session.
+    /// The playout ring is filled with silence to its depth target before the
+    /// stream opens, so the device's first callback finds it at its steady-state
+    /// depth rather than empty. Refilling it from the core instead would
+    /// burst-pull several frames in zero wall time, running the jitter consumer
+    /// clock past the sender; the buffer can step back at most one frame, so
+    /// every later packet would be dropped as late and playout would stay silent
+    /// for the rest of the session.
     fn open(
         &mut self,
         settings: &AudioSettings,
@@ -419,7 +450,7 @@ impl Driver {
         loop {
             let (device, mut engine) =
                 CallbackBridge::new(capture_capacity(frames), playout_capacity(frames));
-            engine.push_playout(&vec![0.0; playout_capacity(frames)]);
+            engine.push_playout(&vec![0.0; playout_target(frames)]);
             let (negotiated, rate) = self.open_stream(config, device.into_handler(), settings)?;
             let rate = rate.map(rate_view);
             let needed = ring_frames(requested, negotiated);
@@ -1038,6 +1069,7 @@ impl LiveRuntime {
             driver,
             engine: Some(engine),
             device_frames,
+            playout_target: playout_target(device_frames),
             rings: RingWatch::new(Instant::now()),
             playout: PlayoutWatch::default(),
             settings,
@@ -1401,6 +1433,11 @@ struct Worker {
     /// Frames the current ring was sized from: the settings' request, or the
     /// device's own callback size when the device negotiated a bigger one.
     device_frames: u32,
+    /// Samples [`Worker::top_up_playout`] holds in the playout ring, which is
+    /// the cushion the device plays out of and the latency it costs. The ring is
+    /// cut for [`PLAYOUT_CUSHION_MAX`] at open, so this is free to move without
+    /// the device.
+    playout_target: usize,
     /// The bridge counters as the log reports them; nothing else consumes
     /// them, so without this a ring the device outgrows is audible but
     /// invisible.
@@ -1748,11 +1785,12 @@ impl Worker {
                 self.engine = Some(engine);
                 self.opened_at = Some(Instant::now());
                 self.device_frames = device_frames;
+                self.playout_target = playout_target(device_frames);
                 self.rings = RingWatch::new(Instant::now());
                 self.carry_pos = 0;
                 self.carry_len = 0;
-                // The ring opens full of silence, so the first callback owes
-                // this stream nothing yet.
+                // The ring opens at its target depth of silence, so the first
+                // callback owes this stream nothing yet.
                 self.ring_took = Instant::now();
                 if let Some(shut) = self.shut_at.take() {
                     let shut_ms = shut.elapsed().as_millis() as u64;
@@ -1910,9 +1948,10 @@ impl Worker {
         self.levels.input_rms = inst_rms.max(self.levels.input_rms * LEVEL_DECAY);
     }
 
-    /// Keeps the playout ring full. Capacity is 2x the device buffer, so a
-    /// full ring is the target depth; the carry holds anything the ring
-    /// refused so no decoded audio is dropped.
+    /// Holds the playout ring at [`Worker::playout_target`] samples, which is
+    /// the cushion the device plays out of; the ring itself is cut deeper, so
+    /// that depth is a number and not a device size. The carry holds anything
+    /// the ring refused so no decoded audio is dropped.
     fn top_up_playout(&mut self) {
         let mut inst_peak = 0.0f32;
         let mut inst_sq = 0.0f32;
@@ -1921,11 +1960,15 @@ impl Worker {
         if let Some(engine) = self.engine.as_mut() {
             loop {
                 if self.carry_pos < self.carry_len {
-                    let pushed = engine.push_playout(&self.carry[self.carry_pos..self.carry_len]);
+                    let pushed = fill_playout_to(
+                        engine,
+                        &self.carry[self.carry_pos..self.carry_len],
+                        self.playout_target,
+                    );
                     took |= pushed > 0;
                     self.carry_pos += pushed;
                     if self.carry_pos < self.carry_len {
-                        break; // ring is full
+                        break; // the ring is at its target depth
                     }
                 }
                 self.core.pull_playout_raw(&mut self.carry);
@@ -2356,7 +2399,7 @@ mod tests {
         // WASAPI shared mode: 120 asked for, the ~10 ms device period given.
         assert_eq!(ring_frames(120, Some(480)), 480);
         assert_eq!(
-            playout_capacity(ring_frames(120, Some(480))),
+            playout_target(ring_frames(120, Some(480))),
             2 * 480 * usize::from(CHANNELS),
             "the 2x headroom applies to the negotiated size"
         );
@@ -2368,18 +2411,17 @@ mod tests {
         assert_eq!(ring_frames(240, Some(32)), 240);
     }
 
-    /// What the two capacities cost, which is why they are two. The
-    /// playout ring is held full, so its capacity is mouth-to-ear and stays at
-    /// the two callbacks of headroom the design settles on. The capture ring
-    /// is drained to empty, so its capacity is only stall tolerance and buys
-    /// 40 ms of it.
+    /// What the two depths cost, which is why they are separate numbers. The
+    /// playout cushion is held, so it is mouth-to-ear and stays at the two
+    /// callbacks of headroom the design settles on. The capture ring is drained
+    /// to empty, so its capacity is only stall tolerance and buys 40 ms of it.
     #[test]
     fn the_capture_ring_is_deeper_than_the_playout_cushion_and_costs_nothing() {
         let ms =
             |samples: usize| samples as f64 / f64::from(CHANNELS) / f64::from(SAMPLE_RATE) * 1000.0;
         for frames in [32u32, 120, 240] {
             assert_eq!(
-                ms(playout_capacity(frames)),
+                ms(playout_target(frames)),
                 2.0 * f64::from(frames.max(FRAME_FRAMES as u32)) / 48.0,
                 "the playout cushion is the latency and may not grow"
             );
@@ -2391,7 +2433,32 @@ mod tests {
         }
         // A device period past the floor takes the deeper of the two rather
         // than losing the two-callback slack the ring depends on.
-        assert_eq!(capture_capacity(2_400), playout_capacity(2_400));
+        assert_eq!(capture_capacity(2_400), playout_target(2_400));
+    }
+
+    /// The ring is cut for the deepest cushion the app can hold, so growing the
+    /// cushion never needs the device shut and reopened. Every buffer the Audio
+    /// tab offers, and negotiated periods past the largest of them, where the
+    /// period itself is deeper than the ceiling and the ring follows it.
+    #[test]
+    fn the_ring_holds_the_deepest_cushion_without_reopening_the_device() {
+        let deepest = PLAYOUT_CUSHION_MAX.as_millis() as usize * SAMPLE_RATE as usize / 1000
+            * usize::from(CHANNELS);
+        for frames in [0u32, 32, 120, 240, 480, 2_400] {
+            let capacity = playout_capacity(frames);
+            assert!(
+                capacity >= playout_target(frames),
+                "{frames}-frame callbacks: a ring of {capacity} cannot hold its own target"
+            );
+            assert_eq!(capacity, playout_target(frames).max(deepest));
+        }
+        // Every buffer the Audio tab offers has room above its own cushion.
+        for frames in [120u32, 240, 480] {
+            assert!(
+                playout_capacity(frames) > playout_target(frames),
+                "{frames}-frame callbacks leave the cushion nowhere to grow into"
+            );
+        }
     }
 
     /// The stall threshold sits between two things it must not collide with: the
@@ -3024,7 +3091,7 @@ mod tests {
         let config = stream_config(&settings);
         let (device, mut engine) =
             CallbackBridge::new(capture_capacity(FRAMES), playout_capacity(FRAMES));
-        engine.push_playout(&vec![0.0; playout_capacity(FRAMES)]);
+        engine.push_playout(&vec![0.0; playout_target(FRAMES)]);
 
         let backend = jamstream_audio_io::backend();
         let stream = backend
@@ -3038,14 +3105,14 @@ mod tests {
         println!("negotiated callback frames: {negotiated:?}");
 
         // The worker's own loop: drain the whole capture ring and refill
-        // playout once per 2.5 ms tick.
-        let silence = vec![0.0f32; playout_capacity(FRAMES)];
+        // playout to its target once per 2.5 ms tick.
+        let silence = vec![0.0f32; playout_target(FRAMES)];
         let mut pulled = early;
         let deadline = Instant::now() + RUN;
         let mut next = Instant::now() + TICK;
         while Instant::now() < deadline {
             pulled += engine.pull_captured(&mut capture_buf);
-            while engine.push_playout(&silence) > 0 {}
+            top_up(&mut engine, &silence, FRAMES);
             let now = Instant::now();
             if next > now {
                 std::thread::sleep(next - now);
@@ -3248,18 +3315,24 @@ mod tests {
             "a second run of underruns must turn crackling on again"
         );
     }
-    /// A playout bridge at the client's own ring size, filled the way
-    /// [`Driver::open`] fills it.
+    /// A playout bridge at the client's own ring size, filled to its own depth
+    /// target the way [`Driver::open`] fills it.
     fn playout_ring(frames: u32) -> (jamstream_audio_io::DeviceSide, EngineSide) {
         let (device, mut engine) =
             CallbackBridge::new(capture_capacity(frames), playout_capacity(frames));
-        engine.push_playout(&vec![0.0; playout_capacity(frames)]);
+        engine.push_playout(&vec![0.0; playout_target(frames)]);
         (device, engine)
     }
 
-    /// The steady state: a producer keeping the ring full reads as the whole
+    /// The worker's own top-up, against a ring a test drives by hand: fill to
+    /// the target and no further.
+    fn top_up(engine: &mut EngineSide, samples: &[f32], frames: u32) {
+        while fill_playout_to(engine, samples, playout_target(frames)) > 0 {}
+    }
+
+    /// The steady state: a producer holding the target reads as the whole
     /// cushion, which is the figure every dip is measured against. In frames,
-    /// so the interleaved stereo capacity reads as half its samples.
+    /// so the interleaved stereo cushion reads as half its samples.
     #[test]
     fn a_ring_that_is_never_late_reads_as_its_whole_cushion() {
         const FRAMES: u32 = 120;
@@ -3271,13 +3344,13 @@ mod tests {
         // A callback per worker tick, topped straight back up, for a window.
         for tick in 0..=(PLAYOUT_LOW_WINDOW.as_micros() / TICK.as_micros()) as u32 {
             device.on_playback(&mut out);
-            while engine.push_playout(&out) > 0 {}
+            top_up(&mut engine, &out, FRAMES);
             watch.observe(start + TICK * tick, &engine, FRAMES);
         }
 
         assert_eq!(watch.playout_low_frames(), Some(2 * FRAMES as usize));
         assert_eq!(
-            playout_capacity(FRAMES),
+            playout_target(FRAMES),
             2 * FRAMES as usize * usize::from(CHANNELS),
             "the same cushion in samples is twice the frames"
         );
@@ -3295,7 +3368,7 @@ mod tests {
         let mut watch = RingWatch::new(start);
 
         // Drain to LEFT frames, then one callback that fits inside them.
-        let mut out = vec![0.0f32; playout_capacity(FRAMES) - LEFT * usize::from(CHANNELS)];
+        let mut out = vec![0.0f32; playout_target(FRAMES) - LEFT * usize::from(CHANNELS)];
         device.on_playback(&mut out);
         device.on_playback(&mut vec![0.0f32; LEFT * usize::from(CHANNELS)]);
         watch.observe(start + PLAYOUT_LOW_WINDOW, &engine, FRAMES);
@@ -3324,13 +3397,13 @@ mod tests {
         let mut out = vec![0.0f32; callback];
         device.on_playback(&mut out);
         device.on_playback(&mut out);
-        while engine.push_playout(&out) > 0 {}
+        top_up(&mut engine, &out, FRAMES);
         watch.observe(start + PLAYOUT_LOW_WINDOW, &engine, FRAMES);
         assert_eq!(watch.playout_low_frames(), Some(FRAMES as usize));
 
         // A window that keeps up.
         device.on_playback(&mut out);
-        while engine.push_playout(&out) > 0 {}
+        top_up(&mut engine, &out, FRAMES);
         watch.observe(start + PLAYOUT_LOW_WINDOW * 2, &engine, FRAMES);
         assert_eq!(watch.playout_low_frames(), Some(2 * FRAMES as usize));
     }
@@ -3356,5 +3429,72 @@ mod tests {
 
         watch.observe(start + PLAYOUT_LOW_WINDOW * 2, &engine, FRAMES);
         assert_eq!(watch.playout_low_frames(), None);
+    }
+
+    /// The split an automatic cushion rests on: the ring is cut once for the
+    /// deepest cushion, and the depth the top-up loop holds is its own number.
+    /// Held at three callbacks, which no buffer size the app offers would give
+    /// at this device size, the ring holds three callbacks and a sample waits
+    /// three callbacks to be heard. Both follow the target; neither follows the
+    /// capacity, which is eight times deeper here.
+    #[test]
+    fn a_target_below_the_ring_is_the_depth_held_and_the_latency_paid() {
+        const FRAMES: u32 = 120;
+        let callback = FRAMES as usize * usize::from(CHANNELS);
+        let capacity = playout_capacity(FRAMES);
+        let target = 3 * callback;
+        assert!(
+            target > playout_target(FRAMES) && target < capacity,
+            "a cushion no device size expresses, inside a ring that fits it"
+        );
+
+        let start = Instant::now();
+        let (mut device, mut engine) = CallbackBridge::new(capture_capacity(FRAMES), capacity);
+        let mut watch = RingWatch::new(start);
+        let silence = vec![0.0f32; capacity];
+        let marked = vec![1.0f32; capacity];
+        fill_playout_to(&mut engine, &silence, target);
+        assert_eq!(
+            engine.playout_depth(),
+            target,
+            "the ring opens at the target, not at the capacity"
+        );
+
+        // The worker's loop against a device taking a callback per tick. The
+        // marked audio goes in behind the first top-up, and every callback
+        // after it is watched for the moment it comes out.
+        let mut out = vec![0.0f32; callback];
+        let mut heard = None;
+        for tick in 0..=(PLAYOUT_LOW_WINDOW.as_micros() / TICK.as_micros()) as u32 {
+            device.on_playback(&mut out);
+            if heard.is_none() && out.contains(&1.0) {
+                heard = Some(tick);
+            }
+            let source = if tick == 0 { &marked } else { &silence };
+            while fill_playout_to(&mut engine, source, target) > 0 {}
+            assert_eq!(
+                engine.playout_depth(),
+                target,
+                "tick {tick} left the ring off its target"
+            );
+            watch.observe(start + TICK * tick, &engine, FRAMES);
+        }
+
+        let waited = heard.expect("the marked audio reached the device") as usize;
+        assert_eq!(
+            waited * callback,
+            target,
+            "a sample waited {waited} callbacks against a {target} sample cushion"
+        );
+        assert!(
+            waited < capacity / callback,
+            "{waited} callbacks is the whole {capacity} sample ring, not the cushion"
+        );
+        assert_eq!(
+            watch.playout_low_frames(),
+            Some(target / usize::from(CHANNELS)),
+            "the water mark reads the cushion the loop holds"
+        );
+        assert_eq!(engine.underruns(), 0);
     }
 }
