@@ -37,6 +37,21 @@ impl Default for Counters {
     }
 }
 
+/// Interleaved samples the producer of a playout ring holds banked ahead of the
+/// device: two callbacks, so one is being drained while the next is already
+/// there, floored at `pull_samples`, the producer's own pull granularity, since a
+/// ring shallower than one pull cannot take a whole one.
+///
+/// Every sample of this is latency, which is why it is the depth a producer tops
+/// up to rather than the capacity the ring is cut at. It lives here because both
+/// the client's worker and the latency harness that measures it hold this depth,
+/// and a figure the harness reports is the client's only while the two are one
+/// number.
+#[must_use]
+pub fn playout_cushion_samples(callback_samples: usize, pull_samples: usize) -> usize {
+    2 * callback_samples.max(pull_samples)
+}
+
 /// Constructor namespace for the device/engine ring pair.
 #[derive(Debug)]
 pub struct CallbackBridge;

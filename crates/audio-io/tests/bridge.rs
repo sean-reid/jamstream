@@ -1,8 +1,9 @@
 //! CallbackBridge: ordering across ring wrap, silence on underrun, drop on
 //! overrun, counters, the playout depth and low water mark visible from the
-//! engine side, and the two rings sized apart from each other.
+//! engine side, the two rings sized apart from each other, and the cushion
+//! depth every producer of a playout ring holds.
 
-use jamstream_audio_io::CallbackBridge;
+use jamstream_audio_io::{CallbackBridge, playout_cushion_samples};
 
 /// Capture direction: device pushes chunks of 7, engine drains with a 5-wide
 /// buffer. Capacity 32 forces thousands of wraps; every sample must come out
@@ -262,6 +263,29 @@ fn a_ring_that_never_dips_reads_as_full() {
     }
     assert_eq!(engine.underruns(), 0);
     assert_eq!(engine.take_playout_low_water(), Some(CAPACITY));
+}
+
+/// The cushion depth every producer of a playout ring holds, and what it costs
+/// in milliseconds at 48 kHz stereo: two callbacks of the size the device
+/// negotiated, and one pull where the callback is smaller than that. The
+/// milliseconds are the point, since this depth is a term in the latency figure
+/// a musician reads and in the gates that measure the same path.
+#[test]
+fn the_cushion_is_two_callbacks_and_never_less_than_one_pull() {
+    const STEREO_PULL: usize = 240;
+    let ms = |samples: usize| samples as f32 / 2.0 / 48.0;
+
+    for (frames, want_ms) in [(120, 5.0), (240, 10.0), (480, 20.0)] {
+        let depth = playout_cushion_samples(frames * 2, STEREO_PULL);
+        assert_eq!(depth, 2 * frames * 2, "{frames} frames");
+        assert_eq!(ms(depth), want_ms, "{frames} frames");
+    }
+
+    // A callback shorter than one pull still leaves room for a whole one, so
+    // the worker never carries audio the ring refused into the next tick.
+    let depth = playout_cushion_samples(32 * 2, STEREO_PULL);
+    assert_eq!(depth, 2 * STEREO_PULL);
+    assert_eq!(ms(depth), 5.0);
 }
 
 /// The DuplexHandler produced by into_handler shares the same rings and

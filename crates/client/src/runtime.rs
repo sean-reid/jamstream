@@ -278,6 +278,34 @@ impl RateOutcomesView {
     }
 }
 
+/// What the device buffers cost mouth to ear, one figure per direction: the
+/// capture callback on the way in and the cushion the playout ring holds on the
+/// way out. Both are terms in the headline figure, and they are the two a buffer
+/// size moves, so the hover names each rather than one lump a reader cannot act
+/// on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeviceBuffersView {
+    /// The negotiated capture callback, as the device delivers it rather than as
+    /// it was asked for.
+    pub capture_ms: f32,
+    /// The depth the top-up loop holds in the playout ring, which every sample
+    /// queues behind before the device plays it.
+    pub playout_ms: f32,
+}
+
+impl DeviceBuffersView {
+    /// Each direction's line, capture first, named so neither reads as the
+    /// other: one is audio waiting to be sent, one is audio waiting to be
+    /// heard.
+    #[must_use]
+    pub fn lines(&self) -> [String; 2] {
+        [
+            format!("capture buffer {:.1} ms", self.capture_ms),
+            format!("playout cushion {:.1} ms", self.playout_ms),
+        ]
+    }
+}
+
 /// A sample rate in kHz for UI copy: 44100 reads "44.1", 48000 reads "48".
 #[must_use]
 pub fn khz(rate: u32) -> String {
@@ -299,9 +327,15 @@ pub struct StatsView {
     /// audio this machine is not playing. A rate, so it comes back down once
     /// the bad moment passes; `None` until the first window closes.
     pub downlink_loss_pct: Option<f32>,
-    /// The headline number: capture to playout, end to end. Includes what
-    /// the boundary converter discloses when a direction resamples.
+    /// The headline number: capture to the last buffer this app hands the sound
+    /// card, the playout cushion included. Carries what the boundary converter
+    /// discloses when a direction resamples. Whatever the card holds after that
+    /// is not knowable from here and is in no figure this app shows.
     pub mouth_to_ear_ms: Option<f32>,
+    /// The two device terms inside that figure, per direction. `None` while
+    /// there is no stream, like the rate outcomes: a ring that is not open is
+    /// not costing anybody a cushion.
+    pub device_buffers: Option<DeviceBuffersView>,
     /// Which sharing mode the device stream got. `None` before a stream
     /// opens and on platforms with no shared/exclusive split, which is why
     /// the readout says nothing rather than inventing an answer.
@@ -316,8 +350,9 @@ pub struct StatsView {
     /// already have scrolled past by the time somebody looks up.
     pub crackling: bool,
     /// Closest the playout ring came to empty over the last second, in frames.
-    /// The ring's own capacity is the ceiling, and zero means it emptied and
-    /// the device played silence. `None` while no stream is rendering.
+    /// The cushion the top-up loop holds is the ceiling, not the deeper ring it
+    /// sits in, and zero means the ring emptied and the device played silence.
+    /// `None` while no stream is rendering.
     pub playout_low_frames: Option<usize>,
     /// How the thread that fills the playout ring is being scheduled, over the
     /// last window. `None` until the first window closes.

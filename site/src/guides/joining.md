@@ -36,7 +36,7 @@ What you are looking at:
 
 The status bar sits in the same place every session: mouth to ear latency and your meters on the left, the lamps that say what the session is doing in the middle, the session id and Leave on the right.
 
-Hover the latency number for `rtt`, `buffer`, and loss in each direction, which [Troubleshooting](troubleshooting.md#latency-feels-high) turns into actions. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
+Hover the latency number for `rtt`, `buffer`, what each device buffer costs, and loss in each direction, which [Troubleshooting](troubleshooting.md#latency-feels-high) turns into actions. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
 
 A member who stops responding shows it in two stages. The dot beside their name goes amber after 2 seconds, which is 800 missed frames and far past anything a working client does; hovering it reads "gone quiet". After 10 seconds the server gives up on them: the strip grays out and reads disconnected.
 
@@ -59,7 +59,7 @@ Settings in the top bar opens over the session without covering the strips or th
 ![The Audio tab of the Settings drawer beside the session: buffer size choices with the current mouth to ear figure, an input level meter, the Hear yourself through the server choice, and capture and playback pickers](../images/session_settings.png)
 *Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*
 
-- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that stays clean; the app says when the device is not keeping up. The mouth to ear figure under the choices moves with them, because the buffer is part of it.
+- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Pick the smallest that stays clean; the app says when the device is not keeping up. The mouth to ear figure under the choices moves by three times the pick, since the buffer is paid once going in and twice coming out.
 - A choice outside what the selected device can deliver is annotated with the device's own minimum or maximum, because that is what you will really get.
 - The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.
 - **Hear yourself through the server** puts your own sound in your mix, on the band's timeline. Off by default, needs headphones, and offered once above the control when mouth to ear sits above about 30 ms. See [The band can't keep together](troubleshooting.md#the-band-cant-keep-together).

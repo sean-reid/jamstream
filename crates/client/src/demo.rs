@@ -542,6 +542,9 @@ impl Runtime for DemoRuntime {
                 .pinned_mouth_to_ear_ms
                 .or(Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32)),
             device_mode: s.device_mode,
+            // No ring is open here, so there are no device buffers to price;
+            // an invented pair would not add up to the figure above.
+            device_buffers: None,
             rate: s.rate,
             crackling: s.crackling,
             playout_low_frames: None,
