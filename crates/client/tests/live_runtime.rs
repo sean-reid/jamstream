@@ -1752,108 +1752,6 @@ fn longest_zero_run(samples: &[f32]) -> usize {
     longest
 }
 
-/// How often [`steady_state`] samples. The water mark and the wake pacing are
-/// each republished once a second and the reading stands until the next window
-/// closes, so a poll well inside a second cannot miss one.
-const PLAYOUT_POLL: Duration = Duration::from_millis(100);
-
-/// Why a silence run happened, from the snapshot figures behind it.
-///
-/// They answer the question in order. The jitter figures and the downlink loss
-/// say whether the media the ring wanted had arrived at all. The wake pacing
-/// says whether the thread that fills the ring was scheduled in time to move it.
-/// The water mark says whether the ring still had audio in it when the device
-/// asked, which is the one that separates a ring that emptied from a mix that
-/// was already silent: underrun padding is the only thing that writes zeros into
-/// a device buffer this app filled.
-///
-/// A cushion held deeper than its base is a reading in itself, because the
-/// top-up loop only deepens one that has been coming close to empty.
-#[derive(Clone, Copy, Default)]
-struct PlayoutLow {
-    /// Closest the ring came to empty, in frames, and the cushion and jitter
-    /// buffer the snapshot that read it carried.
-    low_frames: Option<usize>,
-    held_frames: Option<usize>,
-    base_frames: Option<usize>,
-    jitter_depth: usize,
-    jitter_target: usize,
-    /// Whether the ring was ever in a run of underruns dense enough to hear.
-    crackling: bool,
-    /// Longest gap between wakeups of the thread that fills the ring, and the
-    /// bucket the 99th percentile of those gaps fell in. The bucket is a tick
-    /// wide and rounds up, so it can read above an exact maximum.
-    wake_max_ms: f32,
-    wake_p99_ms: f32,
-    downlink_loss_pct: f32,
-}
-
-impl PlayoutLow {
-    fn fold(&mut self, snap: &Snapshot) {
-        let stats = &snap.stats;
-        if let Some(low) = stats.playout_low_frames
-            && self.low_frames.is_none_or(|worst| low < worst)
-        {
-            self.low_frames = Some(low);
-            self.held_frames = stats.cushion.map(|c| c.held_frames);
-            self.base_frames = stats.cushion.map(|c| c.base_frames);
-            self.jitter_depth = stats.jitter_depth;
-            self.jitter_target = stats.jitter_target;
-        }
-        self.crackling |= stats.crackling;
-        if let Some(wake) = stats.wake {
-            self.wake_max_ms = self.wake_max_ms.max(wake.max_ms);
-            self.wake_p99_ms = self.wake_p99_ms.max(wake.p99_ms);
-        }
-        self.downlink_loss_pct = self
-            .downlink_loss_pct
-            .max(stats.downlink_loss_pct.unwrap_or(0.0));
-    }
-}
-
-impl std::fmt::Display for PlayoutLow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let frames = |n: Option<usize>| n.map_or("--".to_owned(), |n| n.to_string());
-        write!(
-            f,
-            "the ring's low water mark was {} frames of the cushion's {} (base {}), \
-             with the jitter buffer {} frames deep of {}; crackling {}; wake max {:.1} ms \
-             and p99 bucket {:.1} ms; downlink loss {:.1}%",
-            frames(self.low_frames),
-            frames(self.held_frames),
-            frames(self.base_frames),
-            self.jitter_depth,
-            self.jitter_target,
-            if self.crackling { "yes" } else { "no" },
-            self.wake_max_ms,
-            self.wake_p99_ms,
-            self.downlink_loss_pct,
-        )
-    }
-}
-
-/// Holds a session for `how_long` of steady state and returns the worst playout
-/// reading each runtime given held over it.
-///
-/// Sampled as the session runs rather than read once it is over, because every
-/// figure in [`PlayoutLow`] covers the last window and the stream drops all of
-/// them when it closes: read after the leave, at the point the recording is
-/// judged, there is nothing left to read. The last window a stream opens never
-/// closes either, so what comes back is the worst of the closed ones.
-fn steady_state<const N: usize>(rts: [&LiveRuntime; N], how_long: Duration) -> [PlayoutLow; N] {
-    let deadline = Instant::now() + how_long;
-    let mut worst = [PlayoutLow::default(); N];
-    loop {
-        for (low, rt) in worst.iter_mut().zip(rts) {
-            low.fold(&rt.snapshot());
-        }
-        if Instant::now() >= deadline {
-            return worst;
-        }
-        std::thread::sleep(PLAYOUT_POLL);
-    }
-}
-
 /// WASAPI shared mode, end to end: the settings ask for 120-frame buffers,
 /// both devices ignore that and call back at a 480-frame period, and the
 /// audio still crosses intact. Before #323 the ring was sized from the
@@ -1885,7 +1783,7 @@ fn a_device_period_larger_than_the_request_still_carries_audio() {
         joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
     });
 
-    let [low] = steady_state([&b], Duration::from_millis(2_500));
+    std::thread::sleep(Duration::from_millis(2_500));
     b.send(Command::Leave);
     wait_for(&b, "b idle", Duration::from_secs(3), |s| {
         s.stats.state == ConnState::Idle
@@ -1907,7 +1805,10 @@ fn a_device_period_larger_than_the_request_still_carries_audio() {
     assert!(
         run < SILENCE_ALLOWANCE,
         "steady-state playout contains a {run}-sample silence run; the ring \
-         underran. While it ran, {low}"
+         underran. The second measured starts at frame {}, and the capture's \
+         own opening silence is {} samples",
+        heard.start,
+        heard.opening
     );
 
     for p in [&sine, &out_b] {
@@ -1949,7 +1850,7 @@ fn a_44_1_interface_carries_the_session_both_ways() {
         joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
     });
 
-    let [low] = steady_state([&b], Duration::from_millis(2_500));
+    std::thread::sleep(Duration::from_millis(2_500));
     b.send(Command::Leave);
     wait_for(&b, "b idle", Duration::from_secs(3), |s| {
         s.stats.state == ConnState::Idle
@@ -1967,8 +1868,11 @@ fn a_44_1_interface_carries_the_session_both_ways() {
     let run = longest_zero_run(&heard.window);
     assert!(
         run < SILENCE_ALLOWANCE,
-        "steady-state playout contains a {run}-sample silence run. While it ran, \
-         {low}"
+        "steady-state playout contains a {run}-sample silence run. The second \
+         measured starts at frame {}, and the capture's own opening silence is \
+         {} samples",
+        heard.start,
+        heard.opening
     );
     let hz = pitch_hz(&heard.window, heard.rate);
     assert!(
@@ -2030,7 +1934,7 @@ fn a_44_1_host_and_a_native_joiner_hear_each_other() {
         );
     }
 
-    let [host_low, joiner_low] = steady_state([&host, &joiner], Duration::from_millis(2_500));
+    std::thread::sleep(Duration::from_millis(2_500));
     // Neither side may be reported quiet: a quiet member is the server saying
     // it has heard nothing from them, which is a different fault from a mix
     // that drops what did arrive.
@@ -2055,9 +1959,9 @@ fn a_44_1_host_and_a_native_joiner_hear_each_other() {
     // Each side's playout must carry the other's tone and not its own: the
     // personal mix excludes self, so the wrong tone would mean a mix fault
     // rather than a transport one.
-    for (path, who, mine, theirs, device_rate, low) in [
-        (&out_host, "host", HOST_HZ, JOINER_HZ, 44_100, host_low),
-        (&out_joiner, "joiner", JOINER_HZ, HOST_HZ, RATE, joiner_low),
+    for (path, who, mine, theirs, device_rate) in [
+        (&out_host, "host", HOST_HZ, JOINER_HZ, 44_100),
+        (&out_joiner, "joiner", JOINER_HZ, HOST_HZ, RATE),
     ] {
         let heard = loudest(path, 1.0);
         let (rate, window) = (heard.rate, &heard.window);
@@ -2080,7 +1984,10 @@ fn a_44_1_host_and_a_native_joiner_hear_each_other() {
         assert!(
             run < SILENCE_ALLOWANCE,
             "{who}'s steady-state playout contains a {run}-sample silence run. \
-             While it ran, {low}"
+             The second measured starts at frame {}, and the capture's own \
+             opening silence is {} samples",
+            heard.start,
+            heard.opening
         );
     }
 
@@ -2448,7 +2355,7 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
 
     // Two seconds of the room through the swapped-in interface. The reopen
     // recreated the capture file, so everything in it is post-swap audio.
-    let [low] = steady_state([&b], Duration::from_millis(2_000));
+    std::thread::sleep(Duration::from_millis(2_000));
     let snap = b.snapshot();
     assert_eq!(
         snap.stats.state,
@@ -2519,8 +2426,10 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
     let run = longest_zero_run(&heard.window);
     assert!(
         run < SILENCE_ALLOWANCE,
-        "post-swap playout contains a {run}-sample silence run. While it ran, \
-         {low}"
+        "post-swap playout contains a {run}-sample silence run. The second \
+         measured starts at frame {} of the audio that followed the capture's \
+         {opening}-sample opening silence",
+        heard.start
     );
     let hz = pitch_hz(&heard.window, rate);
     assert!(
