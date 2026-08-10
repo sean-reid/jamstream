@@ -263,7 +263,7 @@ fn home_empty() {
 
 #[test]
 fn home_invalid_invite() {
-    // The exact error a failed Join produces; crackling itself is covered
+    // The exact error a failed Join produces; the press itself is covered
     // by the interaction tests.
     let bad = "jamstream://join/not-a-real-invite";
     let err = jamstream_protocol::invite::Invite::decode(bad)

@@ -1161,8 +1161,8 @@ impl JamApp {
         ));
         // On commit rather than per keystroke: a SetName per character would
         // put the roster through every prefix of the name. A singleline
-        // TextEdit reports lost_focus for Enter as well as for crackling
-        // away, so checking the key too would announce twice for one edit.
+        // TextEdit reports lost_focus for Enter as well as for a click away,
+        // so checking the key too would announce twice for one edit.
         if response.lost_focus() {
             self.announce_own_name();
             self.persist_audio_prefs();
