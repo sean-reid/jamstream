@@ -5,7 +5,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use jamstream_audio_io::{AudioError, DeviceRung, WavBackend};
@@ -14,6 +15,7 @@ use jamstream_client::runtime::{
     AudioFaultView, Command, ConnState, MemberId, RateOutcomeView, RecordState, Runtime, Snapshot,
 };
 use jamstream_engine::JitterBuffer;
+use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 use jamstream_protocol::transport::generate_keypair;
@@ -160,9 +162,19 @@ impl TestServer {
     }
 
     fn invite_hinted(&self, member: u16, name_hint: Option<String>) -> Invite {
+        self.invite_to(self.addr, member, name_hint)
+    }
+
+    /// An invite that dials somewhere other than the server's own port, for a
+    /// test that puts something in the path.
+    fn invite_via(&self, addr: SocketAddr, member: u16, name: &str) -> Invite {
+        self.invite_to(addr, member, Some(name.to_owned()))
+    }
+
+    fn invite_to(&self, addr: SocketAddr, member: u16, name_hint: Option<String>) -> Invite {
         self.issuer.mint(
             self.session_id,
-            vec![self.addr],
+            vec![addr],
             self.server_pk,
             Token {
                 member_id: MemberId(member),
@@ -808,6 +820,176 @@ fn hear_self_puts_your_own_tone_in_your_own_playout() {
 
     for p in [&sine_a, &sine_b, &out_a, &out_b] {
         let _ = std::fs::remove_file(p);
+    }
+}
+
+/// A UDP relay that holds every datagram for a fixed delay in both directions,
+/// so one client sits a real distance from the server while the rest of the
+/// room is on loopback. Transparent to the session: every packet is encrypted
+/// and authenticated end to end, and the server sees the relay as the peer.
+///
+/// One client per relay. The route back is the source address of whatever
+/// arrived that was not the server, and two clients through one relay would be
+/// one address with two members behind it.
+struct DelayRelay {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DelayRelay {
+    fn start(server: SocketAddr, one_way: Duration) -> Self {
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("relay socket");
+        let addr = socket.local_addr().expect("relay addr");
+        // Short enough that the queue is flushed on time whether or not
+        // anything is arriving, and the wait is the only thing this blocks on.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .expect("relay read timeout");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("jamstream-test-relay".into())
+            .spawn(move || {
+                let mut queue: std::collections::VecDeque<(Instant, Vec<u8>, SocketAddr)> =
+                    std::collections::VecDeque::new();
+                let mut client: Option<SocketAddr> = None;
+                let mut buf = [0u8; MAX_DATAGRAM_BYTES];
+                while !flag.load(Ordering::Relaxed) {
+                    if let Ok((len, from)) = socket.recv_from(&mut buf) {
+                        let to = if from == server {
+                            client
+                        } else {
+                            client = Some(from);
+                            Some(server)
+                        };
+                        if let Some(to) = to {
+                            queue.push_back((Instant::now() + one_way, buf[..len].to_vec(), to));
+                        }
+                    }
+                    let now = Instant::now();
+                    while queue.front().is_some_and(|(due, _, _)| *due <= now) {
+                        let (_, packet, to) = queue.pop_front().expect("the front is there");
+                        let _ = socket.send_to(&packet, to);
+                    }
+                }
+            })
+            .expect("relay thread");
+        DelayRelay {
+            addr,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for DelayRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The offer to hear yourself, against a real session over a link with a real
+/// delay in it. 40 ms each way puts mouth to ear where a cross-country band
+/// reads, well past the threshold, and the loopback member in the same room
+/// reads a tenth of it.
+///
+/// Three things this proves that the episode's own tests cannot: that the
+/// figure the offer is taken from is the one the worker publishes, that a
+/// healthy session reaches the same code and is offered nothing, and that a
+/// musician who has already asked to hear themselves is never asked about it.
+/// Every wait stops on its own condition; none of them is a measurement
+/// window.
+#[test]
+fn a_far_apart_session_is_offered_hearing_itself() {
+    const ONE_WAY: Duration = Duration::from_millis(40);
+    // The window the offer waits out is ten seconds of the figure holding, so
+    // this is that plus room for a join over a slow link on a loaded runner.
+    const OFFER_BUDGET: Duration = Duration::from_secs(40);
+
+    let server = TestServer::start();
+    let far_relay = DelayRelay::start(server.addr, ONE_WAY);
+    let settled_relay = DelayRelay::start(server.addr, ONE_WAY);
+
+    let far = LiveRuntime::join_offline(
+        &server.invite_via(far_relay.addr, 1, "far"),
+        settings(),
+        WavBackend::new(None, None),
+    )
+    .expect("join far");
+    // Same distance, and this one asks to hear itself before the window can
+    // ever close: the offer must never go out to somebody who has decided.
+    let settled = LiveRuntime::join_offline(
+        &server.invite_via(settled_relay.addr, 2, "settled"),
+        settings(),
+        WavBackend::new(None, None),
+    )
+    .expect("join settled");
+    // Nobody is out of time with themselves, so the room needs a band in it.
+    let near = join_silent(&server, 3, "near");
+
+    for (rt, who) in [(&far, "far"), (&settled, "settled"), (&near, "near")] {
+        wait_for(rt, who, Duration::from_secs(20), |s| {
+            joined(s) && s.members.iter().filter(|m| m.connected).count() == 3
+        });
+    }
+    settled.send(Command::SetHearSelf(true));
+
+    let snap = wait_for(&far, "the offer", OFFER_BUDGET, |s| s.offer_hear_self);
+    let far_ms = snap
+        .stats
+        .mouth_to_ear_ms
+        .expect("a joined session measures the figure the offer is taken from");
+    assert!(
+        far_ms > 30.0,
+        "the offer must only stand over a figure past the threshold, and this \
+         one reads {far_ms} ms"
+    );
+    assert!(
+        snap.chat.is_empty(),
+        "the band's column is for the band: {:?}",
+        snap.chat
+    );
+
+    // Nothing here is asserted about the other members' figures, and the delay
+    // is not what this proves. What the code promises is that a figure past the
+    // threshold earns the offer, not that the network is why the figure is past
+    // it, and on a contended runner it is not: one read 121 ms for the loopback
+    // member against 108.5 for the one carrying 40 ms each way, so the machine
+    // moves this number further than the leg does and the two are not
+    // comparable. That a figure under the threshold offers nothing is asserted
+    // in the unit tests, where the reading is ours to choose. What a real
+    // session adds is the wiring: a real server, a real delay, and the offer
+    // arriving on the figure the musician is shown.
+    let settled_snap = settled.snapshot();
+    assert!(
+        settled_snap.hear_self,
+        "the settled member asked to hear itself"
+    );
+    assert!(
+        !settled_snap.offer_hear_self,
+        "a musician already hearing themselves must stay unasked, and this one \
+         reads {:?} ms",
+        settled_snap.stats.mouth_to_ear_ms
+    );
+
+    // And the offer that is standing goes when it is acted on.
+    far.send(Command::SetHearSelf(true));
+    wait_for(&far, "the offer to go", Duration::from_secs(5), |s| {
+        !s.offer_hear_self
+    });
+
+    for rt in [&far, &settled, &near] {
+        rt.send(Command::Leave);
+    }
+    for (rt, who) in [(&far, "far"), (&settled, "settled"), (&near, "near")] {
+        wait_for(rt, who, Duration::from_secs(5), |s| {
+            s.stats.state == ConnState::Idle
+        });
     }
 }
 

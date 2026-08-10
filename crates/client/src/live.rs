@@ -175,6 +175,23 @@ const PLAYOUT_DRAIN_MAX: Duration = Duration::from_millis(160);
 /// reopened for a settings change costs a few hundred milliseconds of capture on
 /// every platform measured; a whole second is something else going on.
 const SLOW_REOPEN: Duration = Duration::from_secs(1);
+/// Mouth to ear at which hearing yourself through the server is worth
+/// offering, and how long the figure holds above it before the offer goes out.
+///
+/// The threshold is where a band stops holding together by ear. Measured mouth
+/// to ear is 9.7 ms across one city and 19.3 ms across one region, which bands
+/// play through, and about 30 ms is the edge of feeling like one stage. It is
+/// also the conservative side of that edge today, because this figure leaves
+/// the playout cushion out: two device callbacks, 5 ms at the 120-frame
+/// default and 20 ms at 480, so a reading of 30 is a path of 35 to 50.
+///
+/// The window is what keeps a spike out. Of the terms in the figure only the
+/// jitter buffer's depth moves on its own, and it walks its whole range back
+/// down in under a second (one frame per 40 ms of patience, across at most 24
+/// frames), so ten seconds is an order of magnitude clear of anything the
+/// buffer can do.
+const HEAR_SELF_OFFER_MS: f32 = 30.0;
+const HEAR_SELF_OFFER_WINDOW: Duration = Duration::from_secs(10);
 
 /// Playout ring capacity in samples: the deepest cushion the ring can ever be
 /// asked to hold, or the depth target itself where a device period is deeper
@@ -340,6 +357,10 @@ struct SharedState {
     audition: bool,
     /// Client-local optimistic hear-self state; the server sends no echo.
     hear_self: bool,
+    /// Whether [`HearSelfOffer`] has the offer standing. Rewritten every tick
+    /// from the latency figure, so the Audio tab reads it the way it reads a
+    /// crackling run.
+    offer_hear_self: bool,
     /// Last `StreamStatus` the server sent, verbatim. Unlike the faders
     /// there is no optimistic copy: the pipeline's own view is the only
     /// honest one, and a destination that failed to come up must not read as
@@ -411,6 +432,7 @@ impl SharedState {
             broadcast_faders: HashMap::new(),
             audition: false,
             hear_self: false,
+            offer_hear_self: false,
             stream: Vec::new(),
             readiness: None,
             record: RecordView::default(),
@@ -1216,6 +1238,75 @@ fn as_ms(d: Duration) -> f64 {
     d.as_micros() as f64 / 1000.0
 }
 
+/// Whether this session has been far enough apart, for long enough, that
+/// hearing yourself through the server is worth offering, the way
+/// [`CrackleEpisode`] holds for a run rather than firing on a sample. A
+/// reading over [`HEAR_SELF_OFFER_MS`] with somebody else playing starts a
+/// run and anything else ends it, so a spike buys nothing; a run that holds
+/// [`HEAR_SELF_OFFER_WINDOW`] puts the offer out, and it then stands, because
+/// the person it is for is holding an instrument and looks up when they look
+/// up.
+///
+/// Whoever has used the control has met the question and is never asked
+/// again: the offer would otherwise arrive at somebody who turned it off on
+/// purpose, and hearing yourself through speakers is a loop into the
+/// microphone.
+#[derive(Default)]
+struct HearSelfOffer {
+    /// When the run now building started; `None` between runs.
+    since: Option<Instant>,
+    state: Offer,
+}
+
+/// Where the offer stands for the rest of the session.
+#[derive(Default, PartialEq)]
+enum Offer {
+    /// Watching the figure, nothing said.
+    #[default]
+    Watching,
+    /// On the Audio tab, and staying there.
+    Standing,
+    /// The control has been used, so there is nothing left to offer.
+    Settled,
+}
+
+impl HearSelfOffer {
+    /// Whether the offer stands as of this tick. `mouth_to_ear_ms` is `None`
+    /// until a round trip has been measured, which is no evidence rather than
+    /// good news, so it ends the run without answering.
+    fn observe(
+        &mut self,
+        now: Instant,
+        mouth_to_ear_ms: Option<f32>,
+        hear_self: bool,
+        playing_with_others: bool,
+    ) -> bool {
+        if hear_self {
+            self.state = Offer::Settled;
+        }
+        match self.state {
+            Offer::Settled => {
+                self.since = None;
+                false
+            }
+            Offer::Standing => true,
+            Offer::Watching => {
+                let apart = playing_with_others
+                    && mouth_to_ear_ms.is_some_and(|ms| ms > HEAR_SELF_OFFER_MS);
+                if !apart {
+                    self.since = None;
+                    return false;
+                }
+                let since = *self.since.get_or_insert(now);
+                if now.duration_since(since) >= HEAR_SELF_OFFER_WINDOW {
+                    self.state = Offer::Standing;
+                }
+                self.state == Offer::Standing
+            }
+        }
+    }
+}
+
 /// The production runtime. Construct with [`LiveRuntime::join`]; the UI
 /// consumes it as a `Box<dyn Runtime>` (an `Arc<LiveRuntime>` implements
 /// the trait too, so the app can keep a concrete handle for
@@ -1336,6 +1427,7 @@ impl LiveRuntime {
             was_cutting_out: false,
             announced_rate: rate,
             priority: ThreadPriority::Unchanged,
+            hear_self_offer: HearSelfOffer::default(),
         };
         let handle = std::thread::Builder::new()
             .name("jamstream-net".into())
@@ -1464,6 +1556,7 @@ impl LiveRuntime {
             // sessions this app launched; plain joins have no meter.
             cost: None,
             hear_self: s.hear_self,
+            offer_hear_self: s.offer_hear_self,
             session_short: s.session_short.clone(),
             server_addr: s.server_addr.clone(),
             is_host,
@@ -1759,6 +1852,9 @@ struct Worker {
     /// pacing warning names it: a loop waking late at a real-time priority and
     /// one waking late at a priority nobody raised are different faults.
     priority: ThreadPriority,
+    /// Whether the session has been far enough apart for long enough to be
+    /// worth offering the other monitoring arrangement.
+    hear_self_offer: HearSelfOffer,
 }
 
 impl Worker {
@@ -1838,6 +1934,7 @@ impl Worker {
         let stats = self.core.stats();
         self.watch_playout(&stats);
         self.publish_stats(&stats);
+        self.watch_hear_self_offer();
         self.maybe_fail_over(now_ms);
         true
     }
@@ -2555,6 +2652,28 @@ impl Worker {
             p99_ms: as_ms(pacing.p99) as f32,
             max_ms: as_ms(pacing.max) as f32,
         });
+    }
+
+    /// Hands this tick's latency figure to [`HearSelfOffer`], with whether
+    /// there is anybody else playing to be out of time with. Reads the figure
+    /// back off the snapshot rather than recomputing it, so the offer is
+    /// always made against the number the musician is being shown.
+    fn watch_hear_self_offer(&mut self) {
+        let (mouth_to_ear_ms, hear_self, playing_with_others) = {
+            let s = self.shared.lock().expect("live state");
+            let others = s
+                .roster
+                .iter()
+                .any(|m| m.connected && m.role == Role::Musician && Some(m.id) != s.me);
+            (s.mouth_to_ear_ms, s.hear_self, others)
+        };
+        let offer = self.hear_self_offer.observe(
+            Instant::now(),
+            mouth_to_ear_ms,
+            hear_self,
+            playing_with_others,
+        );
+        self.shared.lock().expect("live state").offer_hear_self = offer;
     }
 
     /// Initial connect only: a timeout on one invite address moves on to
@@ -3875,6 +3994,148 @@ mod tests {
             assert!(!stops.stop());
         }
         assert!(stops.stop(), "a second run must say so again");
+    }
+
+    /// Measured mouth to ear across one region, which is a band that holds
+    /// together, and across the country on DSL, which is one that does not.
+    const REGION_MS: f32 = 19.3;
+    const CROSS_COUNTRY_MS: f32 = 64.8;
+    /// Ticks in the window the offer waits out.
+    const OFFER_TICKS: u32 = (HEAR_SELF_OFFER_WINDOW.as_micros() / TICK.as_micros()) as u32;
+
+    /// One reading per tick, band playing, nobody hearing themselves yet.
+    fn offer_readings(figures: impl Iterator<Item = f32>) -> Vec<bool> {
+        let start = Instant::now();
+        let mut offer = HearSelfOffer::default();
+        figures
+            .enumerate()
+            .map(|(tick, ms)| offer.observe(start + TICK * tick as u32, Some(ms), false, true))
+            .collect()
+    }
+
+    /// A band inside the range an ensemble holds together in is offered
+    /// nothing, however long it plays: the offer is worth having only where
+    /// the arrangement it names is worth the headphones it needs.
+    #[test]
+    fn a_session_that_holds_together_is_never_offered_anything() {
+        let readings = offer_readings(std::iter::repeat_n(REGION_MS, OFFER_TICKS as usize * 3));
+        assert!(
+            readings.iter().all(|&on| !on),
+            "a session reading {REGION_MS} ms must never be offered the other arrangement"
+        );
+    }
+
+    /// The reason this is an episode and not a threshold: the figure carries
+    /// the jitter buffer's depth, which grows on one bad moment and comes
+    /// back down, and a suggestion that arrives on that is noise. A reading
+    /// under the threshold ends the run, so the window has to be spent inside
+    /// one stretch of being far apart.
+    #[test]
+    fn a_spike_over_the_threshold_offers_nothing() {
+        // Most of the window over, then one reading under it, then the rest of
+        // the window over again: two runs, neither of them whole.
+        let spike = OFFER_TICKS - 10;
+        let readings = offer_readings(
+            std::iter::repeat_n(CROSS_COUNTRY_MS, spike as usize)
+                .chain(std::iter::once(REGION_MS))
+                .chain(std::iter::repeat_n(CROSS_COUNTRY_MS, spike as usize)),
+        );
+        assert!(
+            readings.iter().all(|&on| !on),
+            "two part windows are not one window"
+        );
+    }
+
+    /// A band far enough apart for the whole window is offered the other
+    /// arrangement, on the tick the window closes and not before, and the
+    /// offer then stands: it goes out exactly once, because somebody with an
+    /// instrument in their hands reads the screen when they read it.
+    #[test]
+    fn a_session_far_enough_apart_is_offered_it_once_and_the_offer_stands() {
+        let readings = offer_readings(std::iter::repeat_n(
+            CROSS_COUNTRY_MS,
+            OFFER_TICKS as usize * 2,
+        ));
+        let went_out = readings
+            .iter()
+            .position(|&on| on)
+            .expect("a whole window over the threshold must put the offer out");
+        assert_eq!(
+            went_out, OFFER_TICKS as usize,
+            "the offer waits out the window and no longer"
+        );
+        assert!(
+            readings[went_out..].iter().all(|&on| on),
+            "the offer stands once it is out"
+        );
+        assert_eq!(
+            readings.windows(2).filter(|w| w[0] != w[1]).count(),
+            1,
+            "the offer goes out once, so the state changes once"
+        );
+    }
+
+    /// Somebody already hearing themselves is not offered it, and neither is
+    /// anybody who has touched the control: the offer would then be arriving
+    /// at a decision that has been made, and it names headphones because the
+    /// wrong answer is a loop into the microphone.
+    #[test]
+    fn a_session_already_hearing_itself_is_offered_nothing() {
+        let start = Instant::now();
+        let mut offer = HearSelfOffer::default();
+        for tick in 0..OFFER_TICKS * 2 {
+            assert!(
+                !offer.observe(start + TICK * tick, Some(CROSS_COUNTRY_MS), true, true),
+                "a session already hearing itself must stay quiet"
+            );
+        }
+
+        // And the offer that is already out goes away when it is acted on,
+        // rather than standing over a control that now reads the other way.
+        let mut offer = HearSelfOffer::default();
+        for tick in 0..=OFFER_TICKS {
+            offer.observe(start + TICK * tick, Some(CROSS_COUNTRY_MS), false, true);
+        }
+        assert!(
+            !offer.observe(
+                start + TICK * (OFFER_TICKS + 1),
+                Some(CROSS_COUNTRY_MS),
+                true,
+                true
+            ),
+            "the offer must go once the control has been used"
+        );
+        assert!(
+            !offer.observe(
+                start + TICK * (OFFER_TICKS + 2),
+                Some(CROSS_COUNTRY_MS),
+                false,
+                true
+            ),
+            "and must not come back when it is turned off again"
+        );
+    }
+
+    /// Alone in a session there is nobody to be out of time with, so the
+    /// figure alone is not the condition: a soundcheck on a far server earns
+    /// nothing, and a figure nothing has measured yet earns nothing either.
+    #[test]
+    fn a_musician_with_nobody_to_play_with_is_offered_nothing() {
+        let start = Instant::now();
+        let mut offer = HearSelfOffer::default();
+        for tick in 0..OFFER_TICKS * 2 {
+            assert!(
+                !offer.observe(start + TICK * tick, Some(CROSS_COUNTRY_MS), false, false),
+                "nobody else is playing, so there is nothing to keep together with"
+            );
+        }
+        let mut offer = HearSelfOffer::default();
+        for tick in 0..OFFER_TICKS * 2 {
+            assert!(
+                !offer.observe(start + TICK * tick, None, false, true),
+                "no round trip has been measured, which is no evidence"
+            );
+        }
     }
 
     /// A playout bridge at the client's own ring size, filled to its own depth
