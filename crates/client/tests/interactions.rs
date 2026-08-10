@@ -473,45 +473,132 @@ fn the_drawer_leaves_no_chat_field_poking_out_below_it() {
     );
 }
 
+/// Every window the drawer has to hold up in: [`SIZES`], plus the room the app's
+/// own smallest window leaves. These fixtures call `root_ui` directly, so the
+/// margin the shell keeps around it is height a window of that size does not
+/// have, which makes 800x600 here 20 px more room than anybody can open.
+fn drawer_sizes() -> impl Iterator<Item = egui::Vec2> {
+    SIZES.into_iter().chain([smallest_room()])
+}
+
+/// What the app's smallest window leaves the shell, and so the floor under every
+/// claim about what fits with nothing scrolled.
+fn smallest_room() -> egui::Vec2 {
+    use jamstream_client::app::{MIN_WINDOW, SHELL_MARGIN};
+
+    MIN_WINDOW - egui::Vec2::splat(2.0 * f32::from(SHELL_MARGIN))
+}
+
+/// The drawer's body: the sheet less its own margin, which is the room the panel
+/// scrolls inside and so the only rect that makes a row in it visible.
+///
+/// A scrolling panel reports the rect a row would have if nothing clipped it, so
+/// a row measured against anything lower than this edge can be well past the
+/// fold and still read as on screen.
+fn drawer_body(harness: &Harness<'_>) -> egui::Rect {
+    drawer_sheet(harness).shrink(f32::from(theme::SHEET_PAD))
+}
+
+fn drawer_sheet(harness: &Harness<'_>) -> egui::Rect {
+    harness
+        .get_by_role_and_label(AkRole::Window, "Settings")
+        .rect()
+}
+
+/// The status bar's mouth-to-ear readout, which is the instrument the buffer
+/// picks are read against and the one thing the drawer may never cover. Taken
+/// from outside the sheet, because the Audio tab draws the same figure itself.
+fn bar_readouts(harness: &Harness<'_>, sheet: egui::Rect) -> egui::Rect {
+    harness
+        .get_all_by_label_contains("mouth to ear")
+        .map(|node| node.rect())
+        .find(|rect| rect.right() < sheet.left())
+        .expect("the status bar's mouth-to-ear readout")
+}
+
+/// The Audio tab's own copy of the mouth-to-ear figure, which is the last row of
+/// the block the buffer picks are in.
+fn drawer_figure(harness: &Harness<'_>, sheet: egui::Rect) -> egui::Rect {
+    harness
+        .get_all_by_label_contains("mouth to ear")
+        .map(|node| node.rect())
+        .find(|rect| rect.left() >= sheet.left())
+        .expect("the Audio tab's latency row")
+}
+
+/// The lowest row the open tab draws, found rather than named: the five panels
+/// end in different widgets and what has to hold is that the end of any of them
+/// comes into view. Taken off the sheet's own subtree, so nothing the drawer is
+/// drawn over can be mistaken for a row in it, and without the sheet node
+/// itself, whose rect is the frame rather than anything in it.
+fn lowest_row(harness: &Harness<'_>) -> egui::Rect {
+    harness
+        .get_by_role_and_label(AkRole::Window, "Settings")
+        .children_recursive()
+        .filter(|node| node.accesskit_node().has_bounds())
+        .map(|node| node.rect())
+        .max_by(|a, b| a.bottom().total_cmp(&b.bottom()))
+        .expect("the drawer draws something")
+}
+
 /// Buffer size and input level are adjusted while listening, against the
 /// mouth-to-ear readout and the meters in the status bar, so the drawer has to
-/// fit the window and stop above them. Every window size the app can be, both
-/// are on screen, and nothing in the drawer is drawn over the readouts.
+/// fit the window and stop above them. What is on screen is what is inside the
+/// drawer's body: the picks and the sentence under them with nothing scrolled,
+/// and the rest of the panel one scroll away.
 #[test]
 fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
-    for size in SIZES {
+    for size in drawer_sizes() {
         let mut harness = settings_harness_sized(size);
         harness.run_steps(4);
-        let readouts = harness
-            .get_all_by_label_contains("mouth to ear")
-            .next()
-            .expect("the mouth-to-ear readout")
-            .rect();
-        // What a musician reaches for mid session is on screen with nothing
-        // scrolled, along with the way out of the drawer and the way between
-        // its tabs. The tab row is pinned with Close for exactly this reason.
-        for label in [
-            "Close",
-            "Audio",
-            "Broadcast",
-            "Invites",
-            "You",
-            "120 frames (2.5 ms)",
-            "480 frames (10.0 ms)",
-            "speak or play to check the meter moves",
-        ] {
+        let sheet = drawer_sheet(&harness);
+        let body = drawer_body(&harness);
+        let readouts = bar_readouts(&harness, sheet);
+        assert!(
+            sheet.bottom() <= readouts.top(),
+            "the drawer at {sheet:?} reaches the readouts at {readouts:?}, window {size:?}"
+        );
+        // The way out and the way between tabs are pinned above the panel, so
+        // neither is ever what a short window scrolled away.
+        //
+        // What a musician reaches for mid session comes next, with nothing
+        // scrolled: the picks, and at a window the app can be opened at, the
+        // sentence under them, which is the one line on the tab that asks for a
+        // different pick. Below the app's own smallest window the body is
+        // shorter than any window gives it, and the panel scrolls for that.
+        let openable = size.y >= smallest_room().y && size.x >= smallest_room().x;
+        let pinned = ["Close", "Audio", "Broadcast", "Invites", "You"];
+        let unscrolled = ["120 frames (2.5 ms)", "480 frames (10.0 ms)"];
+        let asks = ["Cushion: 5.0 ms, what this buffer size asks for"];
+        for label in pinned
+            .into_iter()
+            .chain(unscrolled)
+            .chain(asks.into_iter().filter(|_| openable))
+        {
             let rect = harness
                 .get_all_by_label_contains(label)
                 .next()
                 .unwrap_or_else(|| panic!("{label} is not on screen at {size:?}"))
                 .rect();
             assert!(
-                rect.bottom() <= readouts.top(),
-                "{label} at {rect:?} reaches the readouts at {readouts:?}, window {size:?}"
+                rect.bottom() <= body.bottom(),
+                "{label} at {rect:?} is below the drawer's body at {body:?}, window {size:?}"
             );
             assert!(
                 rect.right() <= size.x && rect.top() >= 0.0,
                 "{label} at {rect:?} is outside the {size:?} window"
+            );
+        }
+        // And the whole of that block at a window the app can be opened at: the
+        // figure the pick is traded against is the last row of it, so anything
+        // added above the block pushes it past the fold rather than into the
+        // room between the fold and the readouts, where a rect means nothing.
+        if openable {
+            let figure = drawer_figure(&harness, sheet);
+            assert!(
+                figure.bottom() <= body.bottom(),
+                "the drawer's latency row at {figure:?} is below its body at {body:?}, \
+                 window {size:?}"
             );
         }
         // The end of the audio panel, which a short window has no room for,
@@ -519,16 +606,18 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
         // its own has no body to scroll: it grows to its content, past the
         // bottom edge, and this is what that leaves unreachable.
         scroll_drawer(&mut harness, size);
-        let last = harness
-            .get_all_by_label_contains("Playback")
-            .next()
-            .expect("the playback picker is the last thing in the audio panel")
-            .rect();
-        assert!(
-            last.top() >= 0.0 && last.bottom() <= readouts.top(),
-            "the end of the panel is at {last:?}, out of reach above the readouts at \
-             {readouts:?}, window {size:?}"
-        );
+        for label in ["speak or play to check the meter moves", "Playback"] {
+            let rect = harness
+                .get_all_by_label_contains(label)
+                .next()
+                .unwrap_or_else(|| panic!("{label} is not in the panel at {size:?}"))
+                .rect();
+            assert!(
+                body.contains_rect(rect),
+                "{label} at {rect:?} is out of reach in the drawer's body at {body:?}, \
+                 window {size:?}"
+            );
+        }
         // The tab row is still there after the scroll: only the panel moved.
         for label in ["Close", "Audio", "You"] {
             let rect = harness
@@ -537,8 +626,56 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
                 .unwrap_or_else(|| panic!("{label} scrolled away at {size:?}"))
                 .rect();
             assert!(
-                rect.top() >= 0.0 && rect.bottom() <= readouts.top(),
+                rect.top() >= 0.0 && rect.bottom() <= body.bottom(),
                 "{label} at {rect:?} left the drawer's header at {size:?}"
+            );
+        }
+    }
+}
+
+/// The same claim for every tab rather than for the one the gate above walks: at
+/// every window the sheet stops above the readouts, the way out and the way
+/// between tabs stay inside it, and the end of whatever the tab draws comes into
+/// view when the panel is scrolled.
+#[test]
+fn every_settings_tab_stays_inside_the_drawer_at_every_window_size() {
+    for size in drawer_sizes() {
+        for tab in [
+            SettingsTab::Audio,
+            SettingsTab::Broadcast,
+            SettingsTab::Invites,
+            SettingsTab::Recording,
+            SettingsTab::You,
+        ] {
+            let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+                FROZEN_FRAME,
+                true,
+            )));
+            let mut harness = drawer_harness(rt, tab, size);
+            harness.run_steps(4);
+            let sheet = drawer_sheet(&harness);
+            let body = drawer_body(&harness);
+            let readouts = bar_readouts(&harness, sheet);
+            let label = tab.label();
+            assert!(
+                sheet.bottom() <= readouts.top(),
+                "the drawer on {label} at {sheet:?} reaches the readouts at {readouts:?}, \
+                 window {size:?}"
+            );
+            for pinned in ["Close", label] {
+                let rect = harness.get_by_role_and_label(AkRole::Button, pinned).rect();
+                assert!(
+                    body.contains_rect(rect),
+                    "{pinned} at {rect:?} is outside the drawer's body at {body:?} on {label}, \
+                     window {size:?}"
+                );
+            }
+            scroll_drawer_to_end(&mut harness, size);
+            let last = lowest_row(&harness);
+            assert!(
+                last.bottom() <= body.bottom(),
+                "the end of the {label} panel at {last:?} is below the drawer's body at \
+                 {body:?}, window {size:?}"
             );
         }
     }
@@ -1358,7 +1495,15 @@ fn destinations_harness(
     (rt, harness)
 }
 
-/// Scrolls the drawer's panel to its end, the way a pointer over it does.
+/// Scrolls the drawer's panel until it stops moving, for the panels that are
+/// taller than one wheel event at the shortest windows.
+fn scroll_drawer_to_end(harness: &mut Harness<'_>, size: egui::Vec2) {
+    for _ in 0..6 {
+        scroll_drawer(harness, size);
+    }
+}
+
+/// Scrolls the drawer's panel down, the way a pointer over it does.
 fn scroll_drawer(harness: &mut Harness<'_>, size: egui::Vec2) {
     harness.event(Event::PointerMoved(egui::pos2(size.x - 100.0, 300.0)));
     harness.run_steps(1);
