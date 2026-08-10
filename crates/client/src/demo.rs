@@ -489,6 +489,8 @@ impl Runtime for DemoRuntime {
             rate: s.rate,
             crackling: s.crackling,
             playout_low_frames: None,
+            // Nothing fills a ring here, so there is no thread to time.
+            wake: None,
         };
 
         let members = s

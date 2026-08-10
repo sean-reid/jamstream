@@ -312,6 +312,23 @@ pub struct StatsView {
     /// The ring's own capacity is the ceiling, and zero means it emptied and
     /// the device played silence. `None` while no stream is rendering.
     pub playout_low_frames: Option<usize>,
+    /// How the thread that fills the playout ring is being scheduled, over the
+    /// last window. `None` until the first window closes.
+    pub wake: Option<WakeView>,
+}
+
+/// Wakeup-to-wakeup pacing of the thread that fills the playout ring, in
+/// milliseconds. The device drains that ring on a clock of its own, so an
+/// interval longer than the ring holds is silence the device padded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WakeView {
+    /// The 99th percentile interval, taken from tick-wide buckets rather than
+    /// from every interval the window held: it is the top of the bucket the
+    /// 99th of a hundred fell in, so it reads high by up to one tick and is an
+    /// estimate rather than an exact percentile.
+    pub p99_ms: f32,
+    /// The window's longest interval, which is exact.
+    pub max_ms: f32,
 }
 
 /// Linear levels in 0..1. dB conversion is the meter widget's job.
