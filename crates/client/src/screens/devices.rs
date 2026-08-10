@@ -457,20 +457,24 @@ fn hear_self_ui(ui: &mut Ui, block: Block, hear_self: bool) -> Option<bool> {
         changed = ui
             .checkbox(&mut enabled, "Hear yourself through the server")
             .changed();
+        // The requirement sits against the checkbox and the reason for wanting
+        // it comes after. Nothing asks whether these are headphones, so this
+        // line is the only warning there is, and the line somebody reads is the
+        // one nearest the control they just touched.
         ui.label(
             theme::muted(
                 ui,
-                "Your own sound joins the mix with everyone else's, so the gap you \
-                 hear becomes the difference between two uplinks instead of the \
-                 whole network path.",
+                "Needs headphones: playing this mix through speakers loops your \
+                 own signal straight back into the microphone.",
             )
             .small(),
         );
         ui.label(
             theme::muted(
                 ui,
-                "Needs headphones: playing this mix through speakers loops your \
-                 own signal straight back into the microphone.",
+                "Your own sound joins the mix with everyone else's, so the gap you \
+                 hear becomes the difference between two uplinks instead of the \
+                 whole network path.",
             )
             .small(),
         );
