@@ -1058,7 +1058,6 @@ impl JamApp {
         match self.settings_tab {
             SettingsTab::Audio => {
                 let levels = snap.map(|s| s.levels).unwrap_or_default();
-                let m2e = snap.and_then(|s| s.stats.mouth_to_ear_ms());
                 let rate_lines = snap
                     .and_then(|s| s.stats.rate)
                     .map(|r| r.lines())
@@ -1072,7 +1071,6 @@ impl JamApp {
                     cushion: snap.and_then(|s| s.stats.cushion),
                 };
                 let session = SessionAudio {
-                    mouth_to_ear_ms: m2e,
                     hear_self: snap.map(|s| s.hear_self),
                     offer_hear_self: snap.is_some_and(|s| s.offer_hear_self),
                 };

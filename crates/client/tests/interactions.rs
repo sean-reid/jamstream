@@ -484,9 +484,14 @@ fn drawer_sizes() -> impl Iterator<Item = egui::Vec2> {
 /// What the app's smallest window leaves the shell, and so the floor under every
 /// claim about what fits with nothing scrolled.
 fn smallest_room() -> egui::Vec2 {
-    use jamstream_client::app::{MIN_WINDOW, SHELL_MARGIN};
+    room(jamstream_client::app::MIN_WINDOW)
+}
 
-    MIN_WINDOW - egui::Vec2::splat(2.0 * f32::from(SHELL_MARGIN))
+/// What a window of this size leaves the shell, which is what these fixtures have
+/// to be given: they call `root_ui` directly, so the margin the shell keeps around
+/// it is height the window does not have.
+fn room(window: egui::Vec2) -> egui::Vec2 {
+    window - egui::Vec2::splat(2.0 * f32::from(jamstream_client::app::SHELL_MARGIN))
 }
 
 /// The drawer's body: the sheet less its own margin, which is the room the panel
@@ -506,24 +511,22 @@ fn drawer_sheet(harness: &Harness<'_>) -> egui::Rect {
 }
 
 /// The status bar's mouth-to-ear readout, which is the instrument the buffer
-/// picks are read against and the one thing the drawer may never cover. Taken
-/// from outside the sheet, because the Audio tab draws the same figure itself.
+/// picks are read against and the one thing the drawer may never cover. The bar
+/// is the only place the app draws the figure, so a second copy anywhere on
+/// screen fails here rather than being picked between.
 fn bar_readouts(harness: &Harness<'_>, sheet: egui::Rect) -> egui::Rect {
-    harness
+    let drawn: Vec<egui::Rect> = harness
         .get_all_by_label_contains("mouth to ear")
         .map(|node| node.rect())
-        .find(|rect| rect.right() < sheet.left())
-        .expect("the status bar's mouth-to-ear readout")
-}
-
-/// The Audio tab's own copy of the mouth-to-ear figure, which is the last row of
-/// the block the buffer picks are in.
-fn drawer_figure(harness: &Harness<'_>, sheet: egui::Rect) -> egui::Rect {
-    harness
-        .get_all_by_label_contains("mouth to ear")
-        .map(|node| node.rect())
-        .find(|rect| rect.left() >= sheet.left())
-        .expect("the Audio tab's latency row")
+        .collect();
+    let [readout] = drawn[..] else {
+        panic!("the figure is the status bar's alone and is drawn at {drawn:?}")
+    };
+    assert!(
+        readout.right() < sheet.left(),
+        "the readout at {readout:?} is not the status bar's, sheet {sheet:?}"
+    );
+    readout
 }
 
 /// The lowest row the open tab draws, found rather than named: the five panels
@@ -563,18 +566,23 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
         //
         // What a musician reaches for mid session comes next, with nothing
         // scrolled: the picks, and at a window the app can be opened at, the box
-        // that decides whether anything is added on top of them. A healthy
-        // session says nothing under the choices, so the box is the last row
-        // there is to reach. Below the app's own smallest window the body is
-        // shorter than any window gives it, and the panel scrolls for that.
+        // that decides whether anything is added on top of them and the line
+        // under the input meter. A healthy session says nothing under the
+        // choices, so the box is the last row of that block, and the line is the
+        // last row of the one after it. Below the app's own smallest window the
+        // body is shorter than any window gives it, and the panel scrolls for
+        // that.
         let openable = size.y >= smallest_room().y && size.x >= smallest_room().x;
         let pinned = ["Close", "Audio", "Broadcast", "Invites", "You"];
         let unscrolled = ["120 frames (2.5 ms)", "480 frames (10.0 ms)"];
-        let asks = ["Add extra depth automatically"];
+        let openable_only = [
+            "Add extra depth automatically",
+            "speak or play to check the meter moves",
+        ];
         for label in pinned
             .into_iter()
             .chain(unscrolled)
-            .chain(asks.into_iter().filter(|_| openable))
+            .chain(openable_only.into_iter().filter(|_| openable))
         {
             let rect = harness
                 .get_all_by_label_contains(label)
@@ -588,18 +596,6 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
             assert!(
                 rect.right() <= size.x && rect.top() >= 0.0,
                 "{label} at {rect:?} is outside the {size:?} window"
-            );
-        }
-        // And the whole of that block at a window the app can be opened at: the
-        // figure the pick is traded against is the last row of it, so anything
-        // added above the block pushes it past the fold rather than into the
-        // room between the fold and the readouts, where a rect means nothing.
-        if openable {
-            let figure = drawer_figure(&harness, sheet);
-            assert!(
-                figure.bottom() <= body.bottom(),
-                "the drawer's latency row at {figure:?} is below its body at {body:?}, \
-                 window {size:?}"
             );
         }
         // The end of the audio panel, which a short window has no room for,
@@ -637,6 +633,49 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
             );
         }
     }
+}
+
+/// The warning a device that keeps losing the stream earns is whole in the room
+/// the window the app opens at leaves. The Audio tab scrolls and the Devices
+/// block is deliberately last, so a panel ending mid row is the designed
+/// behaviour for the rows above it; this one wraps to two lines in red, and a red
+/// sentence with its second line cut across reads as a paint fault rather than as
+/// something to scroll to.
+#[test]
+fn a_device_warning_is_whole_at_the_window_the_app_opens_at() {
+    let stops = 7;
+    let size = room(vec2(1280.0, 800.0));
+    let mut harness = audio_tab_harness_sized(size, None, |demo| {
+        demo.set_cutting_out(Some(stops));
+    });
+    harness.run_steps(4);
+    let body = drawer_body(&harness);
+    let line = jamstream_client::screens::devices::cutting_out_line(stops);
+    let warning = harness
+        .get_all_by_label_contains(&line)
+        .next()
+        .expect("the cutting-out warning")
+        .rect();
+    // Two lines of it, or the claim is about a sentence that never wraps here and
+    // the row that was being cut is not the row under test.
+    assert!(
+        warning.height() > 16.0,
+        "the warning at {warning:?} fits one line at {size:?}"
+    );
+    // Whole, or entirely past the fold and reachable by scrolling. What a red
+    // warning must never be is straddling the edge: a sentence drawn to half its
+    // height reads as a paint fault rather than as something to scroll to, and
+    // this is the row somebody most needs to trust. Where the fold falls depends
+    // on how the text wraps, which depends on the platform's own metrics, so the
+    // claim is about the row's relationship to the edge and not about which side
+    // of it the row lands on.
+    let whole = warning.bottom() <= body.bottom();
+    let below = warning.top() >= body.bottom();
+    assert!(
+        whole || below,
+        "the warning at {warning:?} is cut through by the drawer's body at \
+         {body:?}, window {size:?}"
+    );
 }
 
 /// The same claim for every tab rather than for the one the gate above walks: at
@@ -2312,6 +2351,16 @@ fn audio_tab_harness(
     settings: Option<std::path::PathBuf>,
     pin: impl FnOnce(&DemoRuntime),
 ) -> Harness<'static> {
+    audio_tab_harness_sized(vec2(1280.0, 800.0), settings, pin)
+}
+
+/// The same tab in the room a window of a given size leaves, for the claims that
+/// are about what fits rather than about what a pick does.
+fn audio_tab_harness_sized(
+    size: egui::Vec2,
+    settings: Option<std::path::PathBuf>,
+    pin: impl FnOnce(&DemoRuntime),
+) -> Harness<'static> {
     use jamstream_client::app::{JamApp, Screen};
 
     let demo = DemoRuntime::frozen(FROZEN_FRAME, false);
@@ -2324,7 +2373,7 @@ fn audio_tab_harness(
     app.settings_tab = SettingsTab::Audio;
     app.settings_path = settings;
     Harness::builder()
-        .with_size(vec2(1280.0, 800.0))
+        .with_size(size)
         .with_step_dt(0.05)
         .build_ui(move |ui| {
             theme::apply(ui.ctx(), Theme::Dark);

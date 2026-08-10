@@ -56,10 +56,10 @@ Settings in the top bar opens over the session without covering the strips or th
 - **Recording**, for where takes go; a setting of this computer, present whatever the session is.
 - **You**, for your avatar and the theme.
 
-![The Audio tab of the Settings drawer beside the session: buffer size choices with the automatic depth checkbox and the current mouth to ear figure under them, an input level meter, the Hear yourself through the server choice, and capture and playback pickers](../images/session_settings.png)
+![The Audio tab of the Settings drawer beside the session: buffer size choices with the automatic depth checkbox under them, an input level meter, the Hear yourself through the server choice, and capture and playback pickers, with the status bar's mouth to ear figure visible under it all](../images/session_settings.png)
 *Settings mid-session: device and buffer changes apply immediately; the stream reopens in place.*
 
-- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Start at the smallest. The figure beside it moves by three times the pick, paid once going in and twice coming out.
+- **Buffer size** offers 120, 240, or 480 frames (2.5, 5, or 10 ms). Start at the smallest. The status bar's figure, which the drawer never covers, moves by three times the pick, paid once going in and twice coming out.
 - **Add extra depth automatically** lets a machine that keeps nearly breaking up hold a little more than the size asks for, and say how much. Untick it to get the size you picked and nothing else; the answer is kept for this computer.
 - A choice outside what the selected device can deliver is annotated with the device's own minimum or maximum, because that is what you will really get.
 - The **Input level** meter should move when you play. If it is still, the wrong capture device is selected or the operating system has not granted microphone access.

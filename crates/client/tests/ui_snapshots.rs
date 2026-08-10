@@ -1524,9 +1524,9 @@ fn session_settings_host_tabs() {
 #[test]
 fn session_settings_narrow() {
     // The drawer at the smallest window the app opens, over the busiest
-    // session there is: buffer size and input level are both on screen with
-    // the host bar under them, and the mouth-to-ear readout the buffer is
-    // traded against is visible in both places at once.
+    // session there is: buffer size and input level are both on screen, with
+    // the host bar and the mouth-to-ear readout the buffer is traded against
+    // uncovered under them.
     let app = drawer_app(
         host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark),
         SettingsTab::Audio,
