@@ -77,12 +77,19 @@
 //! cleanly. One mechanism, identical everywhere, no new dependency.
 //!
 //! The provider waits for the sentinel only when jamstreamd has left the
-//! marker [`shutdown_supported_path`] names to prove it polls. Without the
-//! marker, teardown falls back to SIGTERM on unix and an immediate forced
-//! kill on Windows, so an older binary costs nothing. The server half is
-//! shipped: `--shutdown-file` in `jamstream_server`'s `main`, the marker and
-//! the poll in its `runtime`, and the server crate's `local_provider` suite
-//! holds the two together over a real spawn.
+//! marker [`shutdown_supported_path`] names to prove it polls. That marker
+//! is also what launch waits for, so an instance that exists can always be
+//! asked: jamstreamd writes it once its socket is bound, which makes
+//! readiness here two facts at once, listening and stoppable. A server that
+//! never writes it fails the launch and is stopped again rather than handed
+//! back as a session only a forced kill can end.
+//!
+//! Teardown keeps the fallback for a session this provider did not launch
+//! (an entry an older build left, a marker deleted under it): SIGTERM on
+//! unix, an immediate forced kill on Windows. The server half is shipped:
+//! `--shutdown-file` in `jamstream_server`'s `main`, the marker and the poll
+//! in its `runtime`, and the server crate's `local_provider` suite holds the
+//! two together over a real spawn.
 //!
 //! # Platform notes
 //!
@@ -187,13 +194,11 @@ const BIN_NAME: &str = "jamstreamd.exe";
 #[cfg(not(windows))]
 const BIN_NAME: &str = "jamstreamd";
 
-/// How long launch waits for the spawned server to come up. The window
-/// destroy allows a polite exit is per-platform: [`process::term_grace`].
+/// How long launch waits for the spawned server to prove it can be asked to
+/// stop. The window destroy allows a polite exit is per-platform:
+/// [`process::term_grace`].
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const KILL_TIMEOUT: Duration = Duration::from_secs(2);
-/// Minimum uptime before launch trusts the spawn: a config error makes
-/// jamstreamd exit within milliseconds, well inside this window.
-const READY_GRACE: Duration = Duration::from_millis(300);
 const POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,11 +572,9 @@ impl Provider for LocalProvider {
             ProviderError::Other(format!("cannot write {}: {e}", config_path.display()))
         })?;
 
-        // The flat config is the source of truth; the port feeds the
-        // reachability probe, and idle_shutdown_min / max_duration_min
-        // become the spawned server's own dead man's switch and session
-        // cap (no external guard on a laptop).
-        let port = flat_config_value(&spec.user_data, "port").and_then(|v| v.parse::<u16>().ok());
+        // The flat config is the source of truth: idle_shutdown_min and
+        // max_duration_min become the spawned server's own dead man's switch
+        // and session cap (no external guard on a laptop).
         let idle_min = self_limit(
             &spec.user_data,
             "idle_shutdown_min",
@@ -663,10 +666,11 @@ impl Provider for LocalProvider {
             })
         })?;
 
-        // Readiness: the process must survive the grace window (a bad
-        // config kills jamstreamd immediately), plus a best-effort UDP send
-        // to the configured port. If the probe never confirms but the
-        // process lives, proceed; the client join surfaces real trouble.
+        // Readiness is the marker: jamstreamd writes it once it is polling
+        // the sentinel, and it writes it after binding, so a launch that
+        // returns is a session that is listening and can be asked to stop.
+        // Liveness is checked beside it because a bad config kills
+        // jamstreamd within milliseconds, before any marker.
         let started = Instant::now();
         loop {
             if !self.pid_alive(pid, spawned) {
@@ -676,15 +680,31 @@ impl Provider for LocalProvider {
                     dir.join("server.log").display()
                 )));
             }
-            if started.elapsed() >= READY_GRACE && udp_probe(port) {
+            if graceful_shutdown_supported(&dir) {
                 break;
             }
             if started.elapsed() >= READY_TIMEOUT {
-                tracing::warn!(
-                    pid,
-                    "local server alive but readiness probe never confirmed"
-                );
-                break;
+                // Only a forced kill could ever end this process, so it is
+                // stopped here rather than handed back as a session whose
+                // teardown shoots it mid-take with nobody told.
+                let marker = shutdown_supported_path(&shutdown_path(&dir));
+                let outcome = match self
+                    .destroy(&RegionId::new(REGION_ID), &pid.to_string())
+                    .await
+                {
+                    Ok(()) => "it has been stopped again".to_owned(),
+                    Err(err) => format!(
+                        "stopping it failed too ({err}); see {}",
+                        dir.join("server.log").display()
+                    ),
+                };
+                return Err(ProviderError::Other(format!(
+                    "{} started but left no {} within {READY_TIMEOUT:?}, so this \
+                     session could not be asked to stop and {outcome}; a \
+                     jamstreamd that predates the shutdown sentinel does this",
+                    binary.display(),
+                    marker.display(),
+                )));
             }
             tokio::time::sleep(POLL).await;
         }
@@ -1060,17 +1080,6 @@ fn find_on_path(bin: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
         .find(|candidate| candidate.is_file())
-}
-
-/// Best-effort "is anything listening" signal. A UDP send to a closed
-/// local port often succeeds anyway (the ICMP error arrives later), so
-/// this can only delay readiness, never veto it; process liveness through
-/// the grace window is the real check.
-fn udp_probe(port: Option<u16>) -> bool {
-    let Some(port) = port else { return true };
-    std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .and_then(|s| s.send_to(&[0], (Ipv4Addr::LOCALHOST, port)))
-        .is_ok()
 }
 
 /// Primary LAN address via the UDP-connect trick: connect() sends no
@@ -1684,7 +1693,23 @@ mod tests {
         format!("@echo off\r\n{prelude}\"{root}\\System32\\ping.exe\" -n 601 127.0.0.1 > nul\r\n")
     }
 
+    /// The one startup step launch will not return without: the marker that
+    /// says the sentinel has a reader. A stand-in finds its session
+    /// directory in the environment rather than in its own argv, because
+    /// that is where it arrives in one piece on both platforms.
+    #[cfg(unix)]
+    fn marker_prelude() -> String {
+        format!(": > \"${BROADCAST_DIR_ENV}/{SHUTDOWN_SUPPORTED_FILE}\"\n")
+    }
+
+    #[cfg(windows)]
+    fn marker_prelude() -> String {
+        format!("break > \"%{BROADCAST_DIR_ENV}%\\{SHUTDOWN_SUPPORTED_FILE}\"\r\n")
+    }
+
     /// A stand-in server: exec keeps the script's pid, SIGTERM kills it.
+    /// `prelude` lines run first, which is where a fake writes whatever the
+    /// test needs it to have written before launch returns.
     ///
     /// It execs `sleep` through a symlink of its own name because the
     /// liveness probe compares what is running to the image recorded at
@@ -1693,7 +1718,7 @@ mod tests {
     /// symlink rather than a copy: macOS kills a copy of a system binary
     /// for failing its code signature.
     #[cfg(unix)]
-    fn fake_server(dir: &Path) -> PathBuf {
+    fn stand_in(dir: &Path, prelude: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         const NAME: &str = "fake-jamstreamd";
         let sleep = ["/bin/sleep", "/usr/bin/sleep"]
@@ -1712,7 +1737,7 @@ mod tests {
         let path = dir.join(NAME);
         std::fs::write(
             &path,
-            format!("#!/bin/sh\nexec \"{}\" 600\n", image.display()),
+            format!("#!/bin/sh\n{prelude}exec \"{}\" 600\n", image.display()),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1727,29 +1752,35 @@ mod tests {
     /// probe is meant to find nothing to corroborate; the identity-sensitive
     /// sweeper tests stay unix.
     #[cfg(windows)]
-    fn fake_server(dir: &Path) -> PathBuf {
+    fn stand_in(dir: &Path, prelude: &str) -> PathBuf {
         let path = dir.join("fake-jamstreamd.cmd");
-        std::fs::write(&path, cmd_body("")).unwrap();
+        std::fs::write(&path, cmd_body(prelude)).unwrap();
         path
     }
 
+    /// A stand-in that a launch accepts: it leaves the marker.
+    fn fake_server(dir: &Path) -> PathBuf {
+        stand_in(dir, &marker_prelude())
+    }
+
+    /// A stand-in that leaves no marker, so nothing can ask it to stop.
+    /// Every jamstreamd older than the sentinel is this.
+    fn deaf_server(dir: &Path) -> PathBuf {
+        stand_in(dir, "")
+    }
+
     /// [`fake_server`] with one extra line: it writes the arguments it was
-    /// spawned with, one per line, before exec'ing. Everything else about
-    /// it, the symlinked image and why, is the same.
+    /// spawned with, one per line, before exec'ing.
     #[cfg(unix)]
     fn recording_server(dir: &Path, args_file: &Path) -> PathBuf {
-        let script = fake_server(dir);
-        let body = std::fs::read_to_string(&script).unwrap();
-        let exec = body.lines().last().unwrap().to_owned();
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n{exec}\n",
-                args_file.display()
+        stand_in(
+            dir,
+            &format!(
+                "printf '%s\\n' \"$@\" > \"{}\"\n{}",
+                args_file.display(),
+                marker_prelude()
             ),
         )
-        .unwrap();
-        script
     }
 
     /// [`fake_server`] that first writes its argv, one per line. `%~1`
@@ -1758,7 +1789,6 @@ mod tests {
     /// one move, or [`read_when_written`] could return a half-written file.
     #[cfg(windows)]
     fn recording_server(dir: &Path, args_file: &Path) -> PathBuf {
-        let path = dir.join("fake-jamstreamd.cmd");
         let tmp = args_file.with_extension("tmp");
         let prelude = format!(
             ":args\r\n\
@@ -1767,12 +1797,12 @@ mod tests {
              shift\r\n\
              goto args\r\n\
              :run\r\n\
-             move /y \"{tmp}\" \"{args}\" > nul\r\n",
+             move /y \"{tmp}\" \"{args}\" > nul\r\n{marker}",
             tmp = tmp.display(),
-            args = args_file.display()
+            args = args_file.display(),
+            marker = marker_prelude()
         );
-        std::fs::write(&path, cmd_body(&prelude)).unwrap();
-        path
+        stand_in(dir, &prelude)
     }
 
     /// Reads a file a spawned process is expected to write, waiting for it
@@ -2396,6 +2426,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The window this closes: a destroy that lands the instant a launch
+    /// returns has to find the marker, or it grants no grace and kills a
+    /// server that would have said goodbye. Read straight off the launch
+    /// with nothing waited for, because waiting is what hid it.
+    #[tokio::test]
+    async fn a_launched_session_can_be_asked_to_stop_at_once() {
+        let dir = temp_dir("askable");
+        let provider = LocalProvider::new(dir.join("state")).with_server_binary(fake_server(&dir));
+        let instance = provider
+            .launch(LaunchSpec {
+                region: LocalProvider::local_region(),
+                instance_class: InstanceClass::Small,
+                user_data: "port = 43210\n".to_owned(),
+                tags: vec![session_tag("askable")],
+            })
+            .await
+            .unwrap();
+        let session_dir = provider.session_dir("askable");
+        assert!(
+            graceful_shutdown_supported(&session_dir),
+            "launch returned a session that cannot be asked to stop; destroy \
+             would force-kill it"
+        );
+        assert_eq!(
+            process::term_grace(graceful_shutdown_supported(&session_dir)),
+            process::term_grace(true),
+            "the session gets the full polite window on this platform"
+        );
+        provider
+            .destroy(&RegionId::new(REGION_ID), &instance.id)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other side of the same rule: a server that never proves it polls
+    /// the sentinel is not a session. Launch says what was missing, stops it
+    /// again, and leaves nothing for the sweeper to find.
+    #[tokio::test]
+    async fn launch_refuses_a_server_that_cannot_hear_the_sentinel() {
+        let dir = temp_dir("deaf");
+        let state = dir.join("state");
+        let provider = LocalProvider::new(state.clone()).with_server_binary(deaf_server(&dir));
+        let err = provider
+            .launch(LaunchSpec {
+                region: LocalProvider::local_region(),
+                instance_class: InstanceClass::Small,
+                user_data: "port = 43210\n".to_owned(),
+                tags: vec![session_tag("deaf")],
+            })
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(SHUTDOWN_SUPPORTED_FILE) && message.contains("asked to stop"),
+            "the failure must name what was missing, said: {message}"
+        );
+        assert!(
+            provider
+                .list_tagged(None)
+                .await
+                .unwrap()
+                .instances
+                .is_empty(),
+            "a refused launch must leave no registry entry"
+        );
+        // destroy removes the session directory last, once the process is
+        // gone, so its absence is the spawn being cleaned up rather than
+        // left running with no session to belong to.
+        assert!(
+            !provider.session_dir("deaf").exists(),
+            "the refused spawn was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Unix must be unchanged: SIGTERM is delivered whether or not anything
     /// on disk claims support, so the full window is always spent. Windows
     /// only waits when the sentinel has a reader.
@@ -2695,16 +2801,20 @@ mod tests {
 
     /// A stand-in for a server that will not go politely: it ignores
     /// SIGTERM and loops. What destroy may do next depends on whether the
-    /// registry can still vouch for the pid. The `.ready` marker appears
-    /// only after the trap is armed, because a TERM delivered before that
-    /// line runs would end the process the default way and prove nothing.
+    /// registry can still vouch for the pid. The trap is armed before the
+    /// marker, and launch does not return without the marker, so a TERM can
+    /// never arrive early enough to end this the default way and prove
+    /// nothing.
     #[cfg(unix)]
     fn stubborn_server(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("fake-jamstreamd");
         std::fs::write(
             &path,
-            "#!/bin/sh\ntrap '' TERM\n: > \"$0.ready\"\nwhile :; do sleep 1; done\n",
+            format!(
+                "#!/bin/sh\ntrap '' TERM\n{}while :; do sleep 1; done\n",
+                marker_prelude()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2712,13 +2822,10 @@ mod tests {
     }
 
     /// On Windows every windowless console stand-in is already stubborn:
-    /// the polite step posts WM_CLOSE, which nothing here can see. The
-    /// `.ready` marker keeps the same spawn-completed shape as unix.
+    /// the polite step posts WM_CLOSE, which nothing here can see.
     #[cfg(windows)]
     fn stubborn_server(dir: &Path) -> PathBuf {
-        let path = dir.join("fake-jamstreamd.cmd");
-        std::fs::write(&path, cmd_body("break > \"%~f0.ready\"\r\n")).unwrap();
-        path
+        fake_server(dir)
     }
 
     /// The migration policy under real signals: an entry with nothing to
@@ -2729,9 +2836,7 @@ mod tests {
     async fn destroy_never_force_kills_a_pid_it_cannot_corroborate() {
         let dir = temp_dir("unverified");
         let state = dir.join("state");
-        let server = stubborn_server(&dir);
-        let ready = PathBuf::from(format!("{}.ready", server.display()));
-        let launcher = LocalProvider::new(state.clone()).with_server_binary(server);
+        let launcher = LocalProvider::new(state.clone()).with_server_binary(stubborn_server(&dir));
         let instance = launcher
             .launch(LaunchSpec {
                 region: LocalProvider::local_region(),
@@ -2742,17 +2847,6 @@ mod tests {
             .await
             .unwrap();
         let pid: u32 = instance.id.parse().unwrap();
-
-        // Only once the marker exists (on unix: once the trap is armed) is
-        // the polite step below guaranteed to be ignored rather than fatal.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ready.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "the stand-in never armed its trap"
-            );
-            std::thread::sleep(POLL);
-        }
 
         // Rewrite the entry as an older build would have left it: nothing
         // recorded beyond the pid and a believable start.
