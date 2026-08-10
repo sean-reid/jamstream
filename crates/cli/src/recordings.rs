@@ -17,6 +17,14 @@
 //! and a file that came up short is deleted rather than left looking like a
 //! recording.
 //!
+//! # A take outlives the objects it came from
+//!
+//! A retention rule deletes the objects and leaves behind whatever a download
+//! already put on this computer, so a listing is not the only witness to a
+//! take. [`list`] and [`get`] both read the session's own download folder
+//! ([`crate::downloads`]) before they say a session has nothing, because from
+//! that moment the files in it are the only copy.
+//!
 //! # One downloader, two surfaces
 //!
 //! The desktop app's Takes screen fetches takes too, and a second
@@ -38,6 +46,7 @@ use jamstream_cloud::{
 
 use crate::CliError;
 use crate::cli::{RecordingsGetArgs, RecordingsListArgs};
+use crate::downloads::{self, LocalTake};
 use crate::state::{self, RecordingRecord, SessionState};
 use crate::storage::{Stores, provider_kind, retention_label};
 
@@ -140,7 +149,24 @@ fn take_from(prefix: &str, meta: ObjectMeta) -> Take {
     }
 }
 
-/// Lists the takes of every session this machine recorded to a bucket.
+/// One session's place in the listing: what its bucket answered, and what its
+/// download folder on this computer already holds.
+struct Row {
+    session: SessionState,
+    record: RecordingRecord,
+    takes: Result<Vec<Take>, CliError>,
+    /// Where a download of this session's takes lands, and the ones already
+    /// there.
+    dir: PathBuf,
+    here: Vec<LocalTake>,
+}
+
+/// Lists the takes of every session this machine recorded to a bucket, and the
+/// ones already on this computer.
+///
+/// `downloads` is the folder the app downloads into, which is where a take a
+/// retention rule has deleted from its bucket still is: see
+/// [`crate::downloads`].
 ///
 /// One unreachable bucket does not hide the rest: the reason lands on that
 /// session's line, the other sessions still list, and the command still exits
@@ -148,18 +174,27 @@ fn take_from(prefix: &str, meta: ObjectMeta) -> Take {
 pub async fn list<W: Write>(
     args: &RecordingsListArgs,
     stores: &dyn Stores,
+    downloads: &Path,
     out: &mut W,
 ) -> Result<(), CliError> {
-    let mut rows: Vec<(SessionState, RecordingRecord, Result<Vec<Take>, CliError>)> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     for (session, record) in recorded_sessions()? {
         let takes = takes_for(&session, &record, stores).await;
-        rows.push((session, record, takes));
+        let dir = downloads::session_dir(downloads, &session.session_id_hex);
+        rows.push(Row {
+            here: downloads::takes_in(&dir),
+            session,
+            record,
+            takes,
+            dir,
+        });
     }
 
     if args.json {
         let value: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(session, record, takes)| {
+            .map(|row| {
+                let (session, record, takes) = (&row.session, &row.record, &row.takes);
                 serde_json::json!({
                     "session_id": session.session_id_hex,
                     "provider": record.provider,
@@ -182,6 +217,15 @@ pub async fn list<W: Write>(
                             }))
                             .collect::<Vec<_>>())
                         .unwrap_or_default(),
+                    // Names and nowhere else a size: a file read off this disk
+                    // has nothing left to be measured against.
+                    "on_disk": {
+                        "dir": row.dir.display().to_string(),
+                        "takes": row.here
+                            .iter()
+                            .map(|take| take.name().to_string())
+                            .collect::<Vec<_>>(),
+                    },
                 })
             })
             .collect();
@@ -200,7 +244,7 @@ pub async fn list<W: Write>(
 
     let any_takes = rows
         .iter()
-        .any(|(_, _, takes)| takes.as_ref().is_ok_and(|takes| !takes.is_empty()));
+        .any(|row| row.takes.as_ref().is_ok_and(|takes| !takes.is_empty()));
     if any_takes {
         writeln!(
             out,
@@ -208,10 +252,13 @@ pub async fn list<W: Write>(
             "SESSION", "TAKE", "SIZE"
         )?;
     }
-    for (session, record, takes) in &rows {
-        let short = short_id(session);
-        let bucket = format!("{} ({}/{})", record.bucket, record.provider, record.region);
-        match takes {
+    for row in &rows {
+        let short = short_id(&row.session);
+        let bucket = format!(
+            "{} ({}/{})",
+            row.record.bucket, row.record.provider, row.record.region
+        );
+        match &row.takes {
             // An empty table row would read as a take of unknown size.
             Ok(takes) if takes.is_empty() => {
                 writeln!(out, "{short} has no takes in {bucket}.")?;
@@ -230,6 +277,16 @@ pub async fn list<W: Write>(
             }
             Err(err) => writeln!(out, "{short} could not be listed in {bucket}: {err}")?,
         }
+        // Whatever the bucket said, including nothing and including a refusal.
+        // No size beside it: these are found, not measured.
+        if !row.here.is_empty() {
+            writeln!(
+                out,
+                "{short} has {} on this computer, found in {}.",
+                plural(row.here.len(), "take"),
+                row.dir.display()
+            )?;
+        }
     }
     if any_takes {
         writeln!(out)?;
@@ -243,31 +300,28 @@ pub async fn list<W: Write>(
 
 /// The first bucket that could not be listed, so an exit code follows the
 /// lines already printed.
-fn first_error(
-    rows: Vec<(SessionState, RecordingRecord, Result<Vec<Take>, CliError>)>,
-) -> Result<(), CliError> {
-    match rows.into_iter().find_map(|(_, _, takes)| takes.err()) {
+fn first_error(rows: Vec<Row>) -> Result<(), CliError> {
+    match rows.into_iter().find_map(|row| row.takes.err()) {
         Some(err) => Err(err),
         None => Ok(()),
     }
 }
 
 /// Downloads one session's takes into `--out` or the current directory.
+///
+/// `downloads` is the folder the app downloads into, read only to answer a
+/// session whose objects are gone: the takes still land where `--out` says.
 pub async fn get<W: Write + Send>(
     args: &RecordingsGetArgs,
     stores: &dyn Stores,
+    downloads: &Path,
     prompt: &mut Prompt<'_, W>,
     out: &mut W,
 ) -> Result<(), CliError> {
     let (session, record) = select(&args.session)?;
     let takes = takes_for(&session, &record, stores).await?;
     if takes.is_empty() {
-        return Err(CliError::Failed(format!(
-            "session {} recorded to {} but the bucket holds no takes under {}",
-            short_id(&session),
-            record.bucket,
-            session_prefix(&session.session_id_hex)
-        )));
+        return Err(nothing_to_fetch(&session, &record, downloads));
     }
 
     let dir = args.out.clone().unwrap_or_else(|| PathBuf::from("."));
@@ -529,6 +583,35 @@ fn no_match(prefix: &str) -> CliError {
     }
     CliError::Usage(format!(
         "no recorded session matches {prefix:?}; run jamstream recordings to list them"
+    ))
+}
+
+/// There is nothing to download, which is not the same as there being nothing
+/// left of the session: a retention rule deletes the objects and leaves the
+/// files a download already put on this computer. Still a failure, because
+/// nothing was fetched, but one that says where the copies are.
+fn nothing_to_fetch(
+    session: &SessionState,
+    record: &RecordingRecord,
+    downloads: &Path,
+) -> CliError {
+    let dir = downloads::session_dir(downloads, &session.session_id_hex);
+    let here = downloads::takes_in(&dir);
+    let already = if here.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} from it {} on this computer, found in {}",
+            plural(here.len(), "take"),
+            if here.len() == 1 { "is" } else { "are" },
+            dir.display()
+        )
+    };
+    CliError::Failed(format!(
+        "session {} recorded to {} but the bucket holds no takes under {}{already}",
+        short_id(session),
+        record.bucket,
+        session_prefix(&session.session_id_hex)
     ))
 }
 

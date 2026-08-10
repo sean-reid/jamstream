@@ -102,6 +102,23 @@ impl Machine {
     fn enter(&self) {
         unsafe { std::env::set_var(state::STATE_DIR_ENV, &self.dir) };
     }
+
+    /// This machine's music folder, which the app downloads into. A path of
+    /// this test's own rather than the real one, so nothing reads or writes the
+    /// takes of whoever is running the suite.
+    fn downloads(&self) -> PathBuf {
+        self.dir.join("JamStream")
+    }
+
+    /// Puts a file in the session's own download folder, where the app and
+    /// `--out` both leave one.
+    fn already_downloaded(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = jamstream_cli::downloads::session_dir(&self.downloads(), SESSION);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
 }
 
 impl Drop for Machine {
@@ -180,11 +197,16 @@ fn real_sizes(objects: &[Object]) -> Vec<u64> {
     objects.iter().map(|o| o.body.len() as u64).collect()
 }
 
-async fn list_output(stores: &dyn Stores, json: bool) -> String {
+async fn list_output(stores: &dyn Stores, machine: &Machine, json: bool) -> String {
     let mut out = Vec::new();
-    recordings::list(&RecordingsListArgs { json }, stores, &mut out)
-        .await
-        .unwrap();
+    recordings::list(
+        &RecordingsListArgs { json },
+        stores,
+        &machine.downloads(),
+        &mut out,
+    )
+    .await
+    .unwrap();
     String::from_utf8(out).unwrap()
 }
 
@@ -202,6 +224,7 @@ enum Answer {
 /// printed.
 async fn get_output(
     stores: &dyn Stores,
+    machine: &Machine,
     args: &RecordingsGetArgs,
     answer: Answer,
 ) -> Result<String, CliError> {
@@ -215,7 +238,7 @@ async fn get_output(
         terminal: false,
         confirm: &mut confirm,
     };
-    let outcome = recordings::get(args, stores, &mut prompt, &mut out).await;
+    let outcome = recordings::get(args, stores, &machine.downloads(), &mut prompt, &mut out).await;
     let text = String::from_utf8(out).unwrap();
     outcome.map(|()| text)
 }
@@ -238,7 +261,7 @@ async fn the_listing_names_every_take_with_its_size_and_time() {
     mount_bucket(&server, &objects, &real_sizes(&objects)).await;
     let stores = MockBucket { uri: server.uri() };
 
-    let text = list_output(&stores, false).await;
+    let text = list_output(&stores, &machine, false).await;
     assert!(text.contains("SESSION"), "{text}");
     assert!(text.contains("deadbeef"), "{text}");
     assert!(text.contains("mix.flac"), "{text}");
@@ -250,7 +273,7 @@ async fn the_listing_names_every_take_with_its_size_and_time() {
     assert!(text.contains("2026-07-28 19:30"), "{text}");
     assert!(text.contains("jamstream recordings get"), "{text}");
 
-    let json = list_output(&stores, true).await;
+    let json = list_output(&stores, &machine, true).await;
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value[0]["session_id"], SESSION);
     assert_eq!(value[0]["bucket"], BUCKET);
@@ -270,20 +293,86 @@ async fn a_session_with_nothing_in_the_bucket_says_so() {
     mount_bucket(&server, &[], &[]).await;
     let stores = MockBucket { uri: server.uri() };
 
-    let text = list_output(&stores, false).await;
+    // The download folder holds nothing this session recorded: somebody else's
+    // music, a note, and a take of ours that is still being written. None of
+    // the three is a take, so nothing may claim a copy is here.
+    machine.already_downloaded("mix.flac", b"someone else's mix");
+    machine.already_downloaded("notes.txt", b"chords");
+    machine.already_downloaded("jamstream-2026-07-28-1930-mix.flac.part", b"half");
+
+    let text = list_output(&stores, &machine, false).await;
     assert!(text.contains("no takes"), "{text}");
     assert!(
         !text.contains("SESSION"),
         "an empty table header reads as a take of unknown size: {text}"
     );
+    assert!(
+        !text.contains("on this computer"),
+        "a stray file is not a take: {text}"
+    );
 
     // And get refuses rather than pretending to download nothing.
     let dir = machine.dir.join("out");
-    let err = get_output(&stores, &get_args(&dir, true), Answer::Never)
+    let err = get_output(&stores, &machine, &get_args(&dir, true), Answer::Never)
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("no takes"), "{err}");
+    assert!(!err.contains("found in"), "{err}");
+}
+
+/// The case retention rules were written for: the objects are gone and the mix
+/// a download left behind is the only copy. Neither surface may answer as
+/// though the session recorded nothing.
+#[tokio::test]
+async fn a_take_the_bucket_forgot_is_still_on_this_computer() {
+    let _serial = SERIAL.lock().await;
+    let machine = Machine::new("deleted");
+    machine.enter();
+    let server = MockServer::start().await;
+    mount_bucket(&server, &[], &[]).await;
+    let stores = MockBucket { uri: server.uri() };
+    let mix = machine.already_downloaded("jamstream-2026-07-28-1930-mix.flac", &vec![7u8; 40_000]);
+    let folder = mix.parent().unwrap().to_path_buf();
+
+    let text = list_output(&stores, &machine, false).await;
+    assert!(
+        text.contains(&format!(
+            "1 take on this computer, found in {}",
+            folder.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains("40.0 KB"),
+        "nothing measured this file, so no size may stand beside it: {text}"
+    );
+
+    let json = list_output(&stores, &machine, true).await;
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value[0]["total_bytes"], 0, "the bucket holds nothing");
+    assert_eq!(value[0]["on_disk"]["dir"], folder.display().to_string());
+    assert_eq!(
+        value[0]["on_disk"]["takes"][0],
+        "jamstream-2026-07-28-1930-mix.flac"
+    );
+
+    // get still fails, because there is nothing to fetch, but it says where the
+    // copy it found is instead of stopping at a refusal.
+    let err = get_output(
+        &stores,
+        &machine,
+        &get_args(&machine.dir.join("out"), true),
+        Answer::Never,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("holds no takes"), "{err}");
+    assert!(
+        err.contains(&format!("found in {}", folder.display())),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -299,7 +388,7 @@ async fn get_prices_the_egress_and_writes_exactly_what_the_bucket_held() {
 
     // Answered at the prompt rather than with --yes, which is the path a
     // person takes.
-    let text = get_output(&stores, &get_args(&dir, false), Answer::Yes)
+    let text = get_output(&stores, &machine, &get_args(&dir, false), Answer::Yes)
         .await
         .unwrap();
     // The cost rule: the size, the rate, and where the charge falls, before
@@ -327,7 +416,7 @@ async fn get_prices_the_egress_and_writes_exactly_what_the_bucket_held() {
 
     // Running it again with --yes spends no egress and asks nothing: what is
     // already here is skipped.
-    let again = get_output(&stores, &get_args(&dir, true), Answer::Never)
+    let again = get_output(&stores, &machine, &get_args(&dir, true), Answer::Never)
         .await
         .unwrap();
     assert!(again.contains("already here"), "{again}");
@@ -345,7 +434,7 @@ async fn declining_the_cost_downloads_nothing() {
     let stores = MockBucket { uri: server.uri() };
     let dir = machine.dir.join("out");
 
-    let text = get_output(&stores, &get_args(&dir, false), Answer::No)
+    let text = get_output(&stores, &machine, &get_args(&dir, false), Answer::No)
         .await
         .unwrap();
     assert!(text.contains("Aborted. Nothing was downloaded."), "{text}");
@@ -380,7 +469,7 @@ async fn a_take_that_arrives_short_is_refused_and_the_partial_file_removed() {
     let stores = MockBucket { uri: server.uri() };
     let dir = machine.dir.join("out");
 
-    let err = get_output(&stores, &get_args(&dir, true), Answer::Never)
+    let err = get_output(&stores, &machine, &get_args(&dir, true), Answer::Never)
         .await
         .unwrap_err()
         .to_string();
@@ -423,6 +512,7 @@ async fn an_unknown_session_and_one_that_recorded_nowhere_read_differently() {
 
     let err = get_output(
         &stores,
+        &machine,
         &RecordingsGetArgs {
             session: "00001111".to_owned(),
             out: Some(dir.clone()),
@@ -437,6 +527,7 @@ async fn an_unknown_session_and_one_that_recorded_nowhere_read_differently() {
 
     let err = get_output(
         &stores,
+        &machine,
         &RecordingsGetArgs {
             session: "nosuchsession".to_owned(),
             out: Some(dir),
