@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.5.0](https://github.com/sean-reid/jamstream/compare/v0.4.2...v0.5.0) (2026-08-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **protocol:** let a musician ask to hear themselves in their mix ([#517](https://github.com/sean-reid/jamstream/issues/517))
+
+### Features
+
+* **client:** add a command and snapshot field to hear yourself ([#522](https://github.com/sean-reid/jamstream/issues/522)) ([b51d6bc](https://github.com/sean-reid/jamstream/commit/b51d6bc69ca83ca56921608d29a18d1caa88c1f3))
+* **client:** hold the playout cushion through a take ([#593](https://github.com/sean-reid/jamstream/issues/593)) ([9e7c1be](https://github.com/sean-reid/jamstream/commit/9e7c1be66efd19f13a4f6ed8fa3077a3fc57e3bc))
+* **client:** measure how close the playout ring came to empty ([#542](https://github.com/sean-reid/jamstream/issues/542)) ([73a1e1e](https://github.com/sean-reid/jamstream/commit/73a1e1e4c01a45b5f124b8403de01a8a69a7700f))
+* **client:** move the playout cushion from the water mark ([#592](https://github.com/sean-reid/jamstream/issues/592)) ([0ef3700](https://github.com/sean-reid/jamstream/commit/0ef3700c6237a12bb8619c7e93bbb14b8769f443))
+* **client:** offer hearing yourself through the server on the Audio tab ([#526](https://github.com/sean-reid/jamstream/issues/526)) ([dbe83ed](https://github.com/sean-reid/jamstream/commit/dbe83ed8f0fbad9fad1a5b2b672fa730f659ed0a))
+* **client:** offer hearing yourself when the latency says it would help ([#555](https://github.com/sean-reid/jamstream/issues/555)) ([da6028a](https://github.com/sean-reid/jamstream/commit/da6028afcb87c1500b13384449ea070a348d8cab))
+* **client:** pin the playout depth to the buffer size when asked ([#605](https://github.com/sean-reid/jamstream/issues/605)) ([6e066d0](https://github.com/sean-reid/jamstream/commit/6e066d0b2fb66f3cab0d5fea86cd0801f171dfbc))
+* **client:** say what the buffer is holding and ask for a size at the ceiling ([#594](https://github.com/sean-reid/jamstream/issues/594)) ([fbe7a09](https://github.com/sean-reid/jamstream/commit/fbe7a09e33fc641005c94c341285a504e6b4ac48))
+* **client:** say when a device keeps stopping and reopening ([#558](https://github.com/sean-reid/jamstream/issues/558)) ([0c7a66d](https://github.com/sean-reid/jamstream/commit/0c7a66d75840097fe65cd0512f165a7052c280d7))
+* **client:** say when the audio is crackling, where somebody can act on it ([#527](https://github.com/sean-reid/jamstream/issues/527)) ([0b196f4](https://github.com/sean-reid/jamstream/commit/0b196f403f527083a82324c972473afeff3a9da7))
+* **protocol:** let a musician ask to hear themselves in their mix ([#517](https://github.com/sean-reid/jamstream/issues/517)) ([5623992](https://github.com/sean-reid/jamstream/commit/5623992395c78eabdd3bf3d99ddb37c253801162))
+
+
+### Bug Fixes
+
+* **ci:** one release build per tag, and refuse a release that disagrees ([#519](https://github.com/sean-reid/jamstream/issues/519)) ([d1086a0](https://github.com/sean-reid/jamstream/commit/d1086a0c5d15b76d420926a9361e03f872c592d9))
+* **client:** carry the playout cushion in mouth to ear ([#584](https://github.com/sean-reid/jamstream/issues/584)) ([3fcc947](https://github.com/sean-reid/jamstream/commit/3fcc947a29a9cf058b34c0b8a369c2a704f2e83f))
+* **client:** charge both network legs in mouth to ear ([#588](https://github.com/sean-reid/jamstream/issues/588)) ([f5b1370](https://github.com/sean-reid/jamstream/commit/f5b137015ef5fce3e376cb19b98e307e25d00f25))
+* **client:** charge the server's jitter buffer and sum the figure from its terms ([#595](https://github.com/sean-reid/jamstream/issues/595)) ([176d4ac](https://github.com/sean-reid/jamstream/commit/176d4aceff6943ee81cdaa3b85f8e941122398c0))
+* **client:** hide the exclusive-access checkbox off Windows ([#538](https://github.com/sean-reid/jamstream/issues/538)) ([37c6093](https://github.com/sean-reid/jamstream/commit/37c6093997c068cbc777ad021f8314a04b6cb081))
+* **client:** hold a cushion in the demo and measure the drawer's own body ([#600](https://github.com/sean-reid/jamstream/issues/600)) ([dd9b2ec](https://github.com/sean-reid/jamstream/commit/dd9b2ec1d5d87e944775ef686019a417ffe4e70f))
+* **client:** one Back button when a launch fails ([#518](https://github.com/sean-reid/jamstream/issues/518)) ([f125b16](https://github.com/sean-reid/jamstream/commit/f125b16ce49e59b77b2e911061b3ae92a24c0532))
+* **client:** read loss per direction, as a rate ([#554](https://github.com/sean-reid/jamstream/issues/554)) ([3ca2ec4](https://github.com/sean-reid/jamstream/commit/3ca2ec43626e90f0678fcd67e57d9c2001f197ee))
+* **client:** stop the Audio tab cutting its own warning ([#608](https://github.com/sean-reid/jamstream/issues/608)) ([9b7674c](https://github.com/sean-reid/jamstream/commit/9b7674c0447f63b6159f9eb8061f3cc32e97bc86))
+* **cloud:** launch a local session only once it can be stopped ([#587](https://github.com/sean-reid/jamstream/issues/587)) ([2af5524](https://github.com/sean-reid/jamstream/commit/2af5524976eca13bacb30c6d37a803be89aca8cf))
+* **cloud:** spell the shutdown marker once, and assert the goodbye ([#573](https://github.com/sean-reid/jamstream/issues/573)) ([837b0c2](https://github.com/sean-reid/jamstream/commit/837b0c2b66ee675af107a602c6a4c503104bdaa3))
+* **engine:** stop a buffer change from silencing somebody for good ([#525](https://github.com/sean-reid/jamstream/issues/525)) ([16790ab](https://github.com/sean-reid/jamstream/commit/16790ab8622bd62926d277f2e9a5fbfa44b96709))
+* **protocol:** refuse a control datagram with bytes left over ([#582](https://github.com/sean-reid/jamstream/issues/582)) ([1602cea](https://github.com/sean-reid/jamstream/commit/1602cea168a9676997e9273f0ca5635ee85973a1))
+* **protocol:** refuse a handshake payload with bytes left over ([#586](https://github.com/sean-reid/jamstream/issues/586)) ([787e3e4](https://github.com/sean-reid/jamstream/commit/787e3e41b0990ea06fbc2a437e8826f606921251))
+
+
+### Performance Improvements
+
+* **client:** schedule and time the thread that fills playout ([#547](https://github.com/sean-reid/jamstream/issues/547)) ([4ea1064](https://github.com/sean-reid/jamstream/commit/4ea10640eb8d61e0c73acb6b6cba61b96cbee281))
+
 ## [0.4.2](https://github.com/sean-reid/jamstream/compare/v0.4.1...v0.4.2) (2026-08-09)
 
 
