@@ -996,12 +996,9 @@ fn leave_tears_down_and_shrinks_the_roster() {
     });
 }
 
-/// Parked, not deleted: this fails about one run in four on Linux and it is
-/// failing for the right reason, which is #523. A buffer swap costs the swapper
-/// their uplink and the far side hears nothing more from them. Run it with
-/// `cargo nextest run -p jamstream-client -E 'test(a_buffer_swap_keeps)'
-/// --run-ignored all` and expect the tone profile to go to zero at the swap.
-/// It goes back in the suite with the fix.
+/// Changing your own buffer size must not cost you your uplink. The far side is
+/// the judge, because the swapper hears themselves either way and the person who
+/// stops being heard is the last to know.
 #[test]
 fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     let server = TestServer::start();
@@ -1029,10 +1026,6 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     });
     std::thread::sleep(Duration::from_millis(1_000));
 
-    // The reading the swap has to be judged against. A platform with a steady
-    // loss floor of its own would otherwise be blamed for what the swap did.
-    let before = b.snapshot().stats.loss_pct;
-
     b.reconfigure_audio(AudioSettings {
         capture_id: None,
         playback_id: None,
@@ -1043,24 +1036,14 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     // audio on any machine rather than at one particular speed.
     std::thread::sleep(Duration::from_millis(3_500));
 
-    // B's own snapshot carries the server's opinion of B's uplink, the field
-    // that read 100 percent on a real machine. The gate here is the audio: A
-    // has to still hear B. The loss figure is printed rather than asserted on,
-    // because the server measures it over a one second window and a runner that
-    // holds its own figure above five percent for twenty seconds after the swap
-    // has been seen, without it being known yet whether that runner reads the
-    // same before the swap. The sharp detector for the fault itself is
-    // `a_capture_gap_on_a_jittery_stream` in the session crate, which fails
-    // every run in under half a second and depends on no wall clock.
-    let mut readings = Vec::new();
-    for _ in 0..10 {
-        readings.push(b.snapshot().stats.loss_pct);
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    eprintln!(
-        "b's uplink read {before}% loss before the swap, then {readings:?} over \
-         the five seconds after it"
-    );
+    // What A recorded is the whole assertion, and it is the right one: the
+    // question is whether the far side still hears B, and A's own file answers
+    // it without going through a counter. `stats.loss_pct` cannot: it is the
+    // worse of two unrelated directions, and its downlink half is cumulative
+    // since joining, so one bad moment keeps that figure high for the rest of
+    // the session no matter how well the uplink is doing. The sharp detector
+    // for the fault itself is `a_capture_gap_on_a_jittery_stream` in the
+    // session crate, which fails every run in under half a second.
 
     a.send(Command::Leave);
     wait_for(&a, "a idle", Duration::from_secs(3), |s| {
