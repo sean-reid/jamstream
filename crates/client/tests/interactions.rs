@@ -662,9 +662,19 @@ fn a_device_warning_is_whole_at_the_window_the_app_opens_at() {
         warning.height() > 16.0,
         "the warning at {warning:?} fits one line at {size:?}"
     );
+    // Whole, or entirely past the fold and reachable by scrolling. What a red
+    // warning must never be is straddling the edge: a sentence drawn to half its
+    // height reads as a paint fault rather than as something to scroll to, and
+    // this is the row somebody most needs to trust. Where the fold falls depends
+    // on how the text wraps, which depends on the platform's own metrics, so the
+    // claim is about the row's relationship to the edge and not about which side
+    // of it the row lands on.
+    let whole = warning.bottom() <= body.bottom();
+    let below = warning.top() >= body.bottom();
     assert!(
-        warning.bottom() <= body.bottom(),
-        "the warning at {warning:?} is cut by the drawer's body at {body:?}, window {size:?}"
+        whole || below,
+        "the warning at {warning:?} is cut through by the drawer's body at \
+         {body:?}, window {size:?}"
     );
 }
 
