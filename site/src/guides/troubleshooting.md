@@ -48,6 +48,8 @@ Two fixes, and neither of them moves that number:
 - The host turns the click on, in the Metronome panel; each player chooses whether to hear it. The server mixes it into every personal mix, so it reaches everyone on one timeline and the band follows it instead of each other.
 - Turn on **Hear yourself through the server**, on the Audio tab. Your own sound joins the mix, so the gap you hear becomes the difference between two uplinks instead of the whole network path. Needs headphones: through speakers it loops your own signal back into the microphone.
 
+When mouth to ear holds above about 30 ms with somebody else in the room, the Audio tab offers it above that control, once per session. Read the headphone line under it before ticking anything, and leave it off if you are on speakers.
+
 ## Device problems
 
 Input and output devices are picked on the Audio tab of Settings, under Devices: a Capture picker, a Playback picker, and Rescan beside the heading. The Input level meter above them should move when you play.
