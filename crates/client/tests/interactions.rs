@@ -2987,10 +2987,8 @@ fn the_audio_setup_is_remembered_across_launches_while_its_device_exists() {
         .get_by_role_and_label(AkRole::RadioButton, "240 frames (5.0 ms)")
         .click_accesskit();
     harness.run_steps(4);
-    let checkbox = harness.query_by_role_and_label(
-        AkRole::CheckBox,
-        "Allow exclusive access (Windows, lowest latency)",
-    );
+    let checkbox = harness
+        .query_by_role_and_label(AkRole::CheckBox, "Allow exclusive access (lowest latency)");
     if cfg!(windows) {
         checkbox
             .expect("the checkbox is drawn on Windows")

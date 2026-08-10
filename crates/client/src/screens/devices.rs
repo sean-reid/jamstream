@@ -366,7 +366,7 @@ impl DevicesScreen {
                 ui.add_space(theme::SPACE_SM);
                 ui.checkbox(
                     &mut self.allow_exclusive,
-                    "Allow exclusive access (Windows, lowest latency)",
+                    "Allow exclusive access (lowest latency)",
                 );
                 ui.label(
                     theme::muted(
