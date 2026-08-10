@@ -18,7 +18,7 @@ A local session server that dies at startup is a different case with its own log
 
 ## Latency feels high
 
-Start with the number, not the feel. The headline figure in the session status bar is mouth to ear: the milliseconds from sound entering your interface to your bandmate's sound leaving theirs, measured, not estimated.
+Start with the number, not the feel. The headline figure in the session status bar is mouth to ear: the milliseconds from sound entering an interface to the last buffer JamStream hands your sound card, the playout cushion included. What the card holds after that is the one part no figure here can see.
 
 Two players in the same room stand about 3 ms apart per meter of air; a total under 30 ms feels like playing across a large stage, and most people stop noticing under 20 ms.
 
@@ -27,6 +27,8 @@ Check these in order of payoff:
 1. **Bluetooth.** Bluetooth headphones or earbuds add more delay than JamStream's entire network path. Use wired headphones, always. This is the most common cause of "it feels wrong" with a good-looking number.
 2. **Wifi.** Wifi adds jitter, which inflates the jitter buffers. Hover the latency number for the `buffer` readout, which reads "buffer 3/4 frames": the depth it is holding against the depth it is aiming for, in 2.5 ms frames. If it sits high or climbs, plug in ethernet.
 3. **Buffer size.** On the Audio tab, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that stays clean. A **crackling** tag beside the latency number, or the line under the choices saying the device is not keeping up, means take the next size up.
+
+   Each step costs three times its own size in the number: the buffer is paid once going in and twice coming out. The hover names both, as `capture buffer` and `playout cushion`.
 4. **Sample rate.** A direction JamStream's own converter carries costs about 3 ms, and says so with a muted **converting** tag naming both rates.
 
    The headline number already includes it and the hover breaks it out per direction. [Device problems](#device-problems) has the whole ladder.
