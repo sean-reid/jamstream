@@ -15,7 +15,7 @@ use crate::types::AudioError;
 /// `AUDCLNT_E_*` and `E_*` values we key decisions on.
 ///
 /// Sourced from `windows::Win32::Media::Audio` (0.62) and verified against it
-/// by [`tests::constants_match_the_windows_crate`] on Windows.
+/// by `tests::constants_match_the_windows_crate` on Windows.
 mod hr {
     pub(super) const AUDCLNT_E_NOT_INITIALIZED: i32 = 0x8889_0001_u32 as i32;
     pub(super) const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;

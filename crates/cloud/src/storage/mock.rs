@@ -1,6 +1,6 @@
 //! In-memory [`ObjectStore`] for server, CLI, and end-to-end tests.
 //!
-//! It goes through the same [`crate::storage::drive_upload`] driver the real
+//! It goes through the same `crate::storage::drive_upload` driver the real
 //! backends do, so a test that exercises `put_stream` against `MockStore`
 //! exercises the real escalation and abort logic, with only the transport
 //! faked. Failure injection ([`MockStore::fail_part`],

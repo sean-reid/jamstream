@@ -360,7 +360,7 @@ pub fn cookie_matches(key: &CookieKey, source: IpAddr, cookie: &[u8; COOKIE_BYTE
 ///   than any init the server answers.
 ///
 /// The nonce is the sender's to choose and opaque to the receiver. This
-/// server derives it deterministically (see [`challenge_nonce`]) so the core
+/// server derives it deterministically (see `challenge_nonce`) so the core
 /// stays clock-and-input driven under the harness; a random 24-byte nonce,
 /// which is what WireGuard uses, would interoperate identically.
 pub fn build_cookie_challenge(

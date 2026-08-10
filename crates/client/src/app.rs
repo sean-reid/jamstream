@@ -586,7 +586,7 @@ impl JamApp {
 
     /// The teardown's result, once it has one, and `None` while it is still
     /// running or was never started. Called once per frame by
-    /// [`JamApp::ending_progress`]; also how a test waits for an end to finish.
+    /// `JamApp::ending_progress`; also how a test waits for an end to finish.
     pub fn poll_ending(&mut self) -> Option<Result<(), String>> {
         let result = self.ending.as_mut()?.poll()?;
         self.ending = None;

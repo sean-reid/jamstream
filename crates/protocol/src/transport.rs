@@ -92,7 +92,7 @@ pub fn cookie_key(server_private: &[u8], epoch: u64) -> wire::CookieKey {
 const COOKIE_REPLY_KEY_DOMAIN: &[u8] = b"jamstream-cookie-reply-key-v1";
 
 /// The key a cookie challenge is encrypted under:
-/// Blake2s-256([`COOKIE_REPLY_KEY_DOMAIN`] || server static public key).
+/// Blake2s-256(`COOKIE_REPLY_KEY_DOMAIN` || server static public key).
 ///
 /// A pure function of the public key, so the client derives it from the
 /// `server_pk` its invite already carries and the server from its own key,

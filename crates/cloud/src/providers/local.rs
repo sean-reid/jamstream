@@ -32,7 +32,7 @@
 //! still finds and can destroy sessions an earlier process launched.
 //! Liveness is verified on every list and dead entries are pruned. The
 //! start token, the image name, and the start time are the pid-reuse
-//! guard: see [`Spawned`] and [`classify`].
+//! guard: see `Spawned` and `classify`.
 //!
 //! # Reachability
 //!
@@ -109,7 +109,7 @@
 //!
 //! On Windows the forced step is `taskkill /PID <pid> /T /F` and liveness
 //! is an exact-match `tasklist /FI "PID eq <pid>" /NH /FO CSV` parse
-//! ([`tasklist_probe`]) cross-checked against the image name, which is as
+//! (`tasklist_probe`) cross-checked against the image name, which is as
 //! much identity as the platform offers at probe cost (see the note on
 //! start times there); the match is also what corroborates a pid for the
 //! forced kill. The Windows path is exercised by the `cfg(windows)` tests
@@ -236,7 +236,7 @@ impl RegistryEntry {
 struct Spawned<'a> {
     image_name: Option<&'a str>,
     /// Wall-clock second the spawn was recorded, or 0 when unknown. Only
-    /// unix reconciles it; [`tasklist_probe`] explains why Windows cannot.
+    /// unix reconciles it; `tasklist_probe` explains why Windows cannot.
     #[cfg_attr(windows, allow(dead_code))]
     started_unix: u64,
     /// See [`RegistryEntry::proc_start`]. Windows records none, so the
@@ -1123,7 +1123,7 @@ enum PidProbe {
 /// extension the registry may not have recorded.
 ///
 /// Start times are the stronger check and unix reads them (see
-/// [`classify`]), but Windows has no cheap column for them: `wmic process
+/// `classify`), but Windows has no cheap column for them: `wmic process
 /// where processid=N get creationdate` is deprecated and gone from Windows
 /// 11 24H2, and `powershell -Command "Get-Process -Id N | Select-Object
 /// StartTime"` costs a PowerShell startup (a few hundred ms) on every

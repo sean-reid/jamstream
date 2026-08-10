@@ -16,7 +16,7 @@
 //! 3. The final chunk sends the now-known total instead of `*`
 //!    (`bytes {start}-{end}/{total}`) and GCS answers `200` with the finished
 //!    object's JSON. There is no separate commit call, so
-//!    [`MultipartBackend::finish`] sends nothing and returns the metadata the
+//!    `MultipartBackend::finish` sends nothing and returns the metadata the
 //!    last chunk already produced.
 //! 4. `DELETE` on the session URI cancels the upload and discards every byte
 //!    received. GCS answers `499`, which is also in the accept list.

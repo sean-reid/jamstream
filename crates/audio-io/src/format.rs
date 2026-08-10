@@ -5,7 +5,7 @@
 //! Windows exclusive backend cannot be exercised on macOS or Linux, but the
 //! negotiation order and every byte-level conversion it performs can.
 //!
-//! Everything here is allocation-free except [`format_candidates`], which
+//! Everything here is allocation-free except `format_candidates`, which
 //! runs once per stream open, never on a device thread.
 
 /// Interleaved sample layouts a WASAPI exclusive-mode device may accept.
