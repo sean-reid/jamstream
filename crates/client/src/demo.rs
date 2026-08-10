@@ -11,10 +11,18 @@ use crate::runtime::{
     FaderView, LevelsView, MemberId, MemberView, MetronomeView, RateOutcomesView, RecordState,
     RecordView, Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView, TokenId,
 };
+use crate::screens::devices::BUFFER_CHOICES;
 use crate::theme;
 
 /// The frame snapshot tests freeze at; chosen so meters sit mid-scale.
 pub const FROZEN_FRAME: u64 = 1234;
+
+/// The playout ring the demo session is running: the app's default buffer pick
+/// at the depth a stream opens holding, from the live runtime rather than a
+/// second copy of what a pick asks for.
+fn demo_cushion() -> CushionView {
+    crate::live::opening_cushion(BUFFER_CHOICES[0])
+}
 
 /// What the encoder is configured for, from the same catalog the server
 /// reads, so the demo's readout is the number a real session shows.
@@ -127,10 +135,11 @@ struct DemoState {
     /// from a latency figure held above the threshold, which a fixture has no
     /// way to hold, so it pins the answer instead.
     offer_hear_self: bool,
-    /// A mouth-to-ear figure over the demo's own, so a fixture drawing a state
-    /// the runtime only reaches at a given latency draws that latency too.
-    /// None leaves the demo's figure alone.
-    pinned_mouth_to_ear_ms: Option<f32>,
+    /// A round trip over the demo's own, for a fixture drawing a state the
+    /// runtime only reaches at a given latency: the mouth-to-ear figure is
+    /// derived from this, so pinning the link is how the figure moves. None
+    /// leaves the demo on its own round trip.
+    pinned_rtt_ms: Option<f32>,
     destinations: Vec<Destination>,
     /// Whether the session can broadcast at all. None is a session that has
     /// not been asked, which is every demo one; a fixture pins the answer.
@@ -324,7 +333,7 @@ impl DemoRuntime {
                 audition: false,
                 hear_self: false,
                 offer_hear_self: false,
-                pinned_mouth_to_ear_ms: None,
+                pinned_rtt_ms: None,
                 destinations: Vec::new(),
                 readiness: None,
                 record: RecordView::default(),
@@ -481,12 +490,13 @@ impl DemoRuntime {
         s.offer_hear_self = offer;
     }
 
-    /// Pins the mouth-to-ear figure, for a fixture whose state belongs to a
-    /// session at a particular latency: the number and the state on screen
-    /// have to be the pair a real session produces.
-    pub fn set_mouth_to_ear_ms(&self, ms: Option<f32>) {
+    /// Pins the round trip, for a fixture whose state belongs to a session at a
+    /// particular latency: the number and the state on screen have to be the
+    /// pair a real session produces, and the mouth-to-ear figure is derived from
+    /// this rather than pinned beside it.
+    pub fn set_rtt_ms(&self, ms: f32) {
         let mut s = self.state.lock().expect("demo state");
-        s.pinned_mouth_to_ear_ms = ms;
+        s.pinned_rtt_ms = Some(ms);
     }
 
     fn scripted_chat() -> Vec<ChatLine> {
@@ -537,7 +547,16 @@ impl Runtime for DemoRuntime {
             output_rms: output_peak * 0.6,
         };
 
-        let rtt = 14.0 + 1.6 * ((f as f64) * 0.027).sin() as f32;
+        let rtt = s
+            .pinned_rtt_ms
+            .unwrap_or_else(|| 14.0 + 1.6 * ((f as f64) * 0.027).sin() as f32);
+        // The ring this session is running: the depth a fixture pinned, or the
+        // one a stream at the default pick opens holding. A device that refused
+        // and a stream being reopened are both a session with no ring, which is
+        // the one state the real runtime prices no device buffers in. The
+        // latency figure is summed off this, so a pinned depth moves it.
+        let ring = (s.device_error.is_none() && s.audio_fault.is_none())
+            .then(|| s.cushion.unwrap_or_else(demo_cushion));
         let elapsed_secs = BASE_ELAPSED_SECS + f / 60;
         let stats = StatsView {
             state: if s.left {
@@ -546,22 +565,25 @@ impl Runtime for DemoRuntime {
                 ConnState::Joined
             },
             rtt_ms: Some(rtt),
-            jitter_depth: 3 + ((f / 240) % 2) as usize,
-            jitter_target: 4,
+            // A link clean enough to hold one frame against a one-frame target,
+            // at both ends of it, which is what the measured clean profiles
+            // read. The headline figure is the sum of these, so a fixture that
+            // invented any of them would draw a session no path can produce.
+            jitter_depth: ((f / 240) % 2) as usize,
+            jitter_target: 1,
+            uplink_jitter_depth: Some(0),
             uplink_loss_pct: Some(s.uplink_loss_pct),
             downlink_loss_pct: Some(s.downlink_loss_pct),
-            mouth_to_ear_ms: s
-                .pinned_mouth_to_ear_ms
-                .or(Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32)),
+            device_buffers: ring.map(crate::live::device_buffers),
             device_mode: s.device_mode,
             rate: s.rate,
             crackling: s.crackling,
-            cushion: s.cushion,
+            // Reported only where a fixture asked for the sentence the buffer
+            // control draws from it; the figure charges the ring either way.
+            cushion: ring.and(s.cushion),
             cutting_out: s.cutting_out,
-            // No ring is open here and no thread fills one, so every figure a
-            // device produces is absent: the buffers inside the latency sum,
-            // the ring's water mark, the pacing of the thread filling it.
-            // Invented ones would not add up to the figure above.
+            // Nothing fills a ring here, so the figures a running one produces
+            // are absent: the water mark and the pacing of the thread behind it.
             ..StatsView::default()
         };
 
@@ -852,6 +874,64 @@ mod tests {
         assert!(
             b.cost.expect("host cost").accrued_microusd
                 >= a.cost.expect("host cost").accrued_microusd
+        );
+    }
+
+    /// The demo's headline figure is derived from the demo's own link and
+    /// device, so it is arithmetic rather than a number a fixture chose. What a
+    /// fixture can still get wrong is the terms, and a session missing one reads
+    /// faster than any real path: this holds the figure against the fastest path
+    /// the scenario gates measure, one local network with a 1 ms round trip at
+    /// 14.67 ms, which nothing on any link beats.
+    #[test]
+    fn the_demo_session_reads_a_latency_a_real_path_can_reach() {
+        const FASTEST_MEASURED_MS: f32 = 14.67;
+        let snap = DemoRuntime::frozen(FROZEN_FRAME, false).snapshot();
+        let s = &snap.stats;
+        let m2e = s
+            .mouth_to_ear_ms()
+            .expect("the demo session measures a round trip");
+        let rtt = s.rtt_ms.expect("the demo session measures a round trip");
+
+        assert!(
+            m2e >= FASTEST_MEASURED_MS,
+            "the demo reads {m2e} ms mouth to ear, under the {FASTEST_MEASURED_MS} ms \
+             the fastest measured path takes"
+        );
+        assert!(
+            m2e > rtt,
+            "a session cannot cost less than the round trip inside it, and this \
+             one reads {m2e} ms over {rtt} ms"
+        );
+        assert!(
+            s.uplink_jitter_depth.is_some() && s.device_buffers.is_some(),
+            "every term the figure charges has a figure behind it, or the hover \
+             cannot break the number down into what built it"
+        );
+    }
+
+    /// A fixture pins the link, and the figure follows it: the latency on screen
+    /// and the state drawn beside it are one pair, which is the whole reason a
+    /// fixture pins anything here.
+    #[test]
+    fn a_pinned_round_trip_moves_the_figure_with_it() {
+        let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+        let near = rt
+            .snapshot()
+            .stats
+            .mouth_to_ear_ms()
+            .expect("the demo session measures a round trip");
+        rt.set_rtt_ms(45.0);
+        let far = rt.snapshot();
+        assert_eq!(far.stats.rtt_ms, Some(45.0));
+        let far_ms = far
+            .stats
+            .mouth_to_ear_ms()
+            .expect("the demo session measures a round trip");
+        assert!(
+            far_ms > near + 25.0,
+            "a round trip across the country reads {far_ms} ms against {near} ms \
+             on the demo's own link"
         );
     }
 

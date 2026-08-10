@@ -1308,15 +1308,15 @@ fn session_settings_hear_self() {
     snapshot(&mut harness, "session_settings_hear_self");
 }
 
-/// A session far enough apart to have earned the offer, at the latency that
-/// earned it: measured mouth to ear across the country over DSL, playout
-/// cushion included as the figure on screen carries it. The figure and the
-/// offer are one state, so a fixture that drew the offer over the demo's own
-/// 8 ms would be a picture of a session that cannot exist.
+/// A session far enough apart to have earned the offer, on the link that earned
+/// it: the round trip the published table measures across the country over DSL.
+/// The figure and the offer are one state, and the figure is derived from the
+/// link, so no fixture can draw the offer over a latency that would not have
+/// made it.
 fn offered_rt() -> DemoRuntime {
     let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
     rt.set_offer_hear_self(true);
-    rt.set_mouth_to_ear_ms(Some(69.8));
+    rt.set_rtt_ms(45.0);
     rt
 }
 
@@ -1381,10 +1381,9 @@ fn session_settings_crackling_clear() {
 /// controller settles on a depth over minutes of water-mark readings, so a
 /// fixture pins the depth rather than a ring the demo does not run.
 ///
-/// The latency figure is pinned with it, at the 14.7 ms measured over one local
-/// network with the playout cushion inside it. The depth and the figure are one
-/// state, so a cushion drawn over the demo's own 8 ms would be a picture of a
-/// session that cannot exist.
+/// The depth and the latency figure are one state, and the figure is summed from
+/// the depth pinned here, so the two on screen are the pair a session at this
+/// depth produces however deep the fixture holds it.
 fn cushion_app(theme: Theme, held_frames: usize, out_of_room: bool) -> JamApp {
     let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
     rt.set_cushion(Some(CushionView {
@@ -1393,7 +1392,6 @@ fn cushion_app(theme: Theme, held_frames: usize, out_of_room: bool) -> JamApp {
         callback_frames: 120,
         out_of_room,
     }));
-    rt.set_mouth_to_ear_ms(Some(14.7));
     session_app(rt, theme)
 }
 

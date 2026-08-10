@@ -14,6 +14,13 @@ pub use jamstream_protocol::control::{
     BroadcastReadiness, DestinationState, StreamKey, StreamPlatform,
 };
 pub use jamstream_protocol::ids::{DestinationId, MemberId, Role, TokenId};
+use jamstream_protocol::media::FrameDuration;
+
+/// One media frame in milliseconds: the unit both jitter buffers count their
+/// depth in, and one frame of it is what the encoder holds. From the wire's own
+/// frame rather than a copy of 2.5, so a protocol that moved cannot leave the
+/// latency figure priced at the old frame.
+const FRAME_MS: f32 = FrameDuration::Ms2_5.micros() as f32 / 1000.0;
 
 /// One member's avatar, decoded. The UI needs pixels, not a file: the
 /// runtime decodes each content hash exactly once and hands out clones of
@@ -338,6 +345,13 @@ impl CushionView {
         frames_ms(self.held_frames)
     }
 
+    /// The device callback the depth is measured against, in milliseconds, which
+    /// is also what audio waits in on the way to being sent.
+    #[must_use]
+    pub fn callback_ms(&self) -> f32 {
+        frames_ms(self.callback_frames)
+    }
+
     /// Whether anything is holding the depth past what the buffer size asks
     /// for. False is the answer a healthy machine gives, and it is the one that
     /// says a pinned buffer size is the latency somebody is getting.
@@ -375,18 +389,18 @@ pub struct StatsView {
     /// it: the audio the band is not hearing, and the direction nothing on
     /// this machine can see. `None` until the first report arrives.
     pub uplink_loss_pct: Option<f32>,
+    /// How deep the server's jitter buffer on this client's uplink is holding,
+    /// in the same 2.5 ms frames, as the server's own report gives it. `None`
+    /// until that report arrives, which is also every listener: the server
+    /// reports to the members it buffers.
+    pub uplink_jitter_depth: Option<usize>,
     /// The local jitter buffer's loss over a window of the same length: the
     /// audio this machine is not playing. A rate, so it comes back down once
     /// the bad moment passes; `None` until the first window closes.
     pub downlink_loss_pct: Option<f32>,
-    /// The headline number: capture to the last buffer this app hands the sound
-    /// card, the playout cushion included. Carries what the boundary converter
-    /// discloses when a direction resamples. Whatever the card holds after that
-    /// is not knowable from here and is in no figure this app shows.
-    pub mouth_to_ear_ms: Option<f32>,
-    /// The two device terms inside that figure, per direction. `None` while
-    /// there is no stream, like the rate outcomes: a ring that is not open is
-    /// not costing anybody a cushion.
+    /// The two device terms inside the headline figure, per direction. `None`
+    /// while there is no stream, like the rate outcomes: a ring that is not
+    /// open is not costing anybody a cushion.
     pub device_buffers: Option<DeviceBuffersView>,
     /// What the playout cushion is holding and whether anything is holding it
     /// there, for the buffer control that sets where the depth starts and not
@@ -436,6 +450,42 @@ pub struct WakeView {
 }
 
 impl StatsView {
+    /// Mouth to ear, capture to the last buffer this app hands the sound card,
+    /// or `None` until the round trip has a sample. Summed here from the
+    /// figures beside it rather than carried as one of them, so the headline
+    /// number is every term the hover names and nothing else, and so a
+    /// runtime cannot publish a figure its own stats do not add up to:
+    ///
+    /// * `rtt`, for both network legs: the player's uplink and the listener's
+    ///   downlink, each charged at this client's own round trip, which is the
+    ///   only one it can measure. Right when the band's links are alike, short
+    ///   by the difference when they are not.
+    /// * `uplink_jitter_depth` frames, the server's buffer ahead of the mix.
+    ///   The one that delays what a listener hears belongs to whoever is
+    ///   playing, and the server reports each member only their own, so this
+    ///   client's stands in for the band's on the same terms as the round trip.
+    /// * `jitter_depth` frames, this client's own buffering ahead of decode.
+    /// * one frame, the encoder's.
+    /// * both device buffers: the capture callback as the device negotiated it,
+    ///   and the cushion the top-up loop holds in the playout ring.
+    /// * whatever a resampled direction discloses.
+    ///
+    /// What the card holds after the callback returns is beyond this app's
+    /// sight and in none of these terms.
+    #[must_use]
+    pub fn mouth_to_ear_ms(&self) -> Option<f32> {
+        let rtt = self.rtt_ms?;
+        let buffered = self.jitter_depth + self.uplink_jitter_depth.unwrap_or(0);
+        let device = self
+            .device_buffers
+            .map_or(0.0, |d| d.capture_ms + d.playout_ms);
+        Some(
+            rtt + (buffered + 1) as f32 * FRAME_MS
+                + device
+                + self.rate.map_or(0.0, |r| r.added_ms()),
+        )
+    }
+
     /// The worse of the two directions, for anything showing a level rather
     /// than a direction. Both are rates over the same window, so the larger of
     /// them is a quantity; `None` while neither direction has a figure yet.
@@ -445,6 +495,21 @@ impl StatsView {
             (Some(up), Some(down)) => Some(up.max(down)),
             (up, down) => up.or(down),
         }
+    }
+
+    /// Both jitter buffers in the figure, this client's own first: the depth it
+    /// holds against the depth it aims for, then the server's on this client's
+    /// uplink. Named for whose it is, because a reader who takes the second for
+    /// their own would go looking on this machine for a depth their link set.
+    #[must_use]
+    pub fn jitter_lines(&self) -> [String; 2] {
+        let server = self
+            .uplink_jitter_depth
+            .map_or("--".to_owned(), |d| d.to_string());
+        [
+            format!("buffer {}/{} frames", self.jitter_depth, self.jitter_target),
+            format!("server buffer {server} frames, yours standing in for the band's"),
+        ]
     }
 
     /// Each direction's loss, uplink first, in the words that say whose sound
@@ -668,5 +733,96 @@ pub trait Runtime: Send {
     /// frame and the answer is one enum.
     fn conn_state(&self) -> ConnState {
         self.snapshot().stats.state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats() -> StatsView {
+        StatsView {
+            rtt_ms: Some(45.0),
+            jitter_depth: 3,
+            jitter_target: 4,
+            uplink_jitter_depth: Some(2),
+            device_buffers: Some(DeviceBuffersView {
+                capture_ms: 3.0,
+                playout_ms: 6.0,
+            }),
+            ..StatsView::default()
+        }
+    }
+
+    /// Every term the figure names, each at a different value, so a sum that
+    /// dropped one or counted one twice cannot land on the same number. The
+    /// network term is the whole round trip because mouth to ear crosses the
+    /// player's uplink and the listener's downlink, and both jitter buffers are
+    /// in it. Pinned here rather than against a live session, whose round trip
+    /// is measured in whole milliseconds and rounds to 0 or 1 over loopback: at
+    /// 0, one leg and two are the same number.
+    #[test]
+    fn the_figure_sums_every_term_it_names() {
+        assert_eq!(
+            stats().mouth_to_ear_ms(),
+            Some(45.0 + 7.5 + 5.0 + 2.5 + 3.0 + 6.0)
+        );
+        assert_eq!(
+            StatsView {
+                rtt_ms: None,
+                ..stats()
+            }
+            .mouth_to_ear_ms(),
+            None,
+            "a session with no round trip sample has no figure to show"
+        );
+    }
+
+    /// The server's buffer is read per snapshot like this client's own, because
+    /// it moves with the link the same way. A report is charged at the depth it
+    /// carries; no report yet charges nothing, rather than withholding the whole
+    /// figure over one of its terms.
+    #[test]
+    fn the_figure_follows_the_server_buffer_it_is_told_about() {
+        let at = |depth| {
+            StatsView {
+                uplink_jitter_depth: depth,
+                ..stats()
+            }
+            .mouth_to_ear_ms()
+            .expect("the round trip is sampled")
+        };
+        assert_eq!(at(None), at(Some(0)));
+        assert_eq!(at(Some(3)) - at(Some(0)), 3.0 * FRAME_MS);
+    }
+
+    /// A resampled direction costs its disclosed figure and nothing else, and a
+    /// device that never opened costs neither buffer: the figure is the terms
+    /// the hover names, so a term with nothing behind it is absent from both.
+    #[test]
+    fn the_figure_carries_the_disclosures_beside_it() {
+        let base = stats()
+            .mouth_to_ear_ms()
+            .expect("the round trip is sampled");
+        let converted = StatsView {
+            rate: Some(RateOutcomesView {
+                capture: RateOutcomeView::Resampled {
+                    device: 44_100,
+                    added_ms: 3.5,
+                },
+                playback: RateOutcomeView::Native,
+            }),
+            ..stats()
+        };
+        assert_eq!(
+            converted.mouth_to_ear_ms(),
+            Some(base + 3.5),
+            "a converted direction costs its disclosed figure and nothing else"
+        );
+        let no_stream = StatsView {
+            device_buffers: None,
+            ..stats()
+        };
+        assert_eq!(no_stream.mouth_to_ear_ms(), Some(base - 9.0));
     }
 }

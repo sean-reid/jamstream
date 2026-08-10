@@ -36,9 +36,9 @@ use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 use crate::avatar;
 use crate::runtime::{
     AudioFaultView, AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState,
-    CostView, DestinationView, DeviceBuffersView, FaderView, LevelsView, MemberId, MemberView,
-    MetronomeView, RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime,
-    Snapshot, StatsView, StreamView, WakeView, recording_or_on_air,
+    CostView, CushionView, DestinationView, DeviceBuffersView, FaderView, LevelsView, MemberId,
+    MemberView, MetronomeView, RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role,
+    Runtime, Snapshot, StatsView, StreamView, WakeView, recording_or_on_air,
 };
 use crate::screens::invites::TokenMap;
 
@@ -125,6 +125,13 @@ fn playout_target(buffer_frames: u32) -> usize {
     playout_cushion_samples(buffer_frames as usize * usize::from(CHANNELS), CHUNK_STEREO)
 }
 
+/// The cushion a stream at `buffer_frames` opens holding, for a caller with no
+/// ring of its own: the controller's own opening state, so nothing can draw a
+/// depth the app never opens at.
+pub(crate) fn opening_cushion(buffer_frames: u32) -> CushionView {
+    CushionControl::new(buffer_frames).view()
+}
+
 /// A depth target as time, which is the audio the device drains while the
 /// worker filling it is asleep. Takes the target rather than a device size,
 /// because [`CushionControl`] moves the target while the stream stays open and
@@ -134,14 +141,15 @@ fn cushion_time(target: usize) -> Duration {
     Duration::from_micros(frames as u64 * 1_000_000 / u64::from(SAMPLE_RATE))
 }
 
-/// The two device terms in the latency figure. The capture buffer is the size
-/// the device negotiated; the playout term is the depth the top-up loop is
-/// filling to as of now, which is what a sample queues behind, so a cushion
-/// that moves moves the figure with it.
-fn device_buffers(device_frames: u32, target: usize) -> DeviceBuffersView {
+/// The two device terms in the latency figure, priced off the cushion the buffer
+/// control reports: the callback the device negotiated on the way in, and the
+/// depth the top-up loop is filling to as of now on the way out, which is what a
+/// sample queues behind. One source for both views, so the depth under the
+/// buffer choices and the figure beside them can never be two numbers.
+pub(crate) fn device_buffers(cushion: CushionView) -> DeviceBuffersView {
     DeviceBuffersView {
-        capture_ms: device_frames as f32 / 48.0,
-        playout_ms: (target / usize::from(CHANNELS)) as f32 / 48.0,
+        capture_ms: cushion.callback_ms(),
+        playout_ms: cushion.held_ms(),
     }
 }
 
@@ -1891,18 +1899,15 @@ impl Worker {
         // machine is not playing.
         s.stats.uplink_loss_pct = stats.uplink_loss_pct;
         s.stats.downlink_loss_pct = downlink;
-        let convert_ms = s.stats.rate.map_or(0.0, |r| r.added_ms());
-        let device = device_buffers(self.device_frames, self.cushion.target());
-        s.stats.mouth_to_ear_ms = stats
-            .rtt_ms_last
-            .map(|rtt| mouth_to_ear_ms(rtt, stats.jitter.depth_frames, device, convert_ms));
-        // The same two figures the sum used, so the hover can never break the
-        // number down into terms it was not built from.
-        s.stats.device_buffers = self.engine.is_some().then_some(device);
-        // The depth inside that playout term, and what is holding it: a buffer
+        // The server's buffer on our uplink is a term in the latency figure and
+        // only the server can see it, so the figure has it or it has nothing.
+        s.stats.uplink_jitter_depth = stats.uplink_jitter_depth.map(usize::from);
+        // The depth inside the playout term, and what is holding it: a buffer
         // size sets where the depth starts and not where it stays, so the
         // control that picks one has to be able to say which it is showing.
-        s.stats.cushion = self.engine.is_some().then(|| self.cushion.view());
+        let cushion = self.cushion.view();
+        s.stats.cushion = self.engine.is_some().then_some(cushion);
+        s.stats.device_buffers = self.engine.is_some().then(|| device_buffers(cushion));
         s.levels = self.levels;
         s.stats.playout_low_frames = self.rings.playout_low_frames();
         s.stats.wake = self.wake.pacing().map(|pacing| WakeView {
@@ -1922,7 +1927,7 @@ impl Worker {
                 .roster
                 .iter()
                 .any(|m| m.connected && m.role == Role::Musician && Some(m.id) != s.me);
-            (s.stats.mouth_to_ear_ms, s.hear_self, others)
+            (s.stats.mouth_to_ear_ms(), s.hear_self, others)
         };
         let offer = self.hear_self_offer.observe(
             Instant::now(),
@@ -2016,39 +2021,6 @@ fn rate_change_line(
     }
 }
 
-// Mouth to ear, capture to the last buffer this app hands the card:
-//   rtt                          both network legs, the player's uplink and the
-//                                listener's downlink, each charged at this
-//                                client's own round trip, which is the only one
-//                                it can measure: right when the band's links are
-//                                alike, short by the difference when they are
-//                                not
-// + jitter depth * 2.5 ms        playout buffering ahead of decode
-// + 2.5 ms                       one media frame of encode latency
-// + capture buffer ms            the capture device buffer, as the device
-//                                negotiated it, not as asked
-// + playout cushion ms           the depth the top-up loop holds in the playout
-//                                ring, which every sample queues behind before
-//                                the device plays it
-// + converter added ms           the boundary resampler's disclosed figure, per
-//                                converted direction
-//
-// What the card holds after the callback returns is beyond our sight and in
-// none of these terms.
-fn mouth_to_ear_ms(
-    rtt_ms: f32,
-    jitter_depth_frames: usize,
-    device: DeviceBuffersView,
-    convert_ms: f32,
-) -> f32 {
-    rtt_ms
-        + jitter_depth_frames as f32 * 2.5
-        + 2.5
-        + device.capture_ms
-        + device.playout_ms
-        + convert_ms
-}
-
 /// `session_full` rides on [`ClientStats`] rather than on the client state,
 /// because the core stays in `Connecting` while it retries a full session.
 /// So the stat decides, and only while nothing better has happened.
@@ -2102,41 +2074,29 @@ mod tests {
         assert_eq!(CHUNK_STEREO, FRAME_FRAMES * usize::from(CHANNELS));
     }
 
-    /// The network term is the whole round trip, because mouth to ear crosses
-    /// the player's uplink and the listener's downlink. Pinned here rather than
-    /// in `live_runtime.rs`, whose round trip is measured in whole milliseconds
-    /// and rounds to 0 or 1 over loopback: at 0, one leg and two are the same
-    /// number.
-    ///
-    /// Every term a different value, so a sum that dropped one or counted
-    /// another twice cannot land on the same figure.
-    #[test]
-    fn the_figure_charges_the_round_trip_for_both_network_legs() {
-        let device = DeviceBuffersView {
-            capture_ms: 3.0,
-            playout_ms: 6.0,
-        };
-        assert_eq!(
-            mouth_to_ear_ms(45.0, 3, device, 0.0),
-            45.0 + 7.5 + 2.5 + 3.0 + 6.0
-        );
-        assert_eq!(
-            mouth_to_ear_ms(45.0, 3, device, 3.5) - mouth_to_ear_ms(45.0, 3, device, 0.0),
-            3.5,
-            "a converted direction costs its disclosed figure and nothing else"
-        );
-    }
-
     /// The figure a musician reads is the depth the loop fills to, so a cushion
     /// that moves moves it, live: the term follows the target and nothing else
     /// in the sum does.
     #[test]
     fn the_latency_figure_follows_the_cushion_that_is_held() {
         const FRAMES: u32 = 120;
-        let floor = playout_target(FRAMES);
-        let base = device_buffers(FRAMES, floor);
-        let deeper = device_buffers(FRAMES, floor + CUSHION_STEP);
+        let opening = opening_cushion(FRAMES);
+        let base = device_buffers(opening);
+        let deeper = device_buffers(CushionView {
+            held_frames: opening.held_frames + CUSHION_STEP / usize::from(CHANNELS),
+            ..opening
+        });
         let step_ms = as_ms(TICK) as f32;
+        let figure = |device| {
+            StatsView {
+                rtt_ms: Some(45.0),
+                jitter_depth: 3,
+                device_buffers: Some(device),
+                ..StatsView::default()
+            }
+            .mouth_to_ear_ms()
+            .expect("the round trip is sampled")
+        };
 
         assert_eq!(
             base.capture_ms, deeper.capture_ms,
@@ -2144,7 +2104,7 @@ mod tests {
         );
         assert_eq!(deeper.playout_ms - base.playout_ms, step_ms);
         assert_eq!(
-            mouth_to_ear_ms(45.0, 3, deeper, 0.0) - mouth_to_ear_ms(45.0, 3, base, 0.0),
+            figure(deeper) - figure(base),
             step_ms,
             "the headline figure moved by the frame the cushion moved and nothing else"
         );

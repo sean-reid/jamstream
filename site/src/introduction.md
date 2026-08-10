@@ -7,7 +7,7 @@ JamStream is a desktop app that lets a band play together over the internet, wit
 - **Every packet is encrypted**, and the server shuts itself down ten minutes after the last musician leaves.
 - **The cost lands on you, not JamStream.** A cloud session runs a few cents on your own provider account; nobody else is paid anything.
 
-![A four piece mid session: one mixer strip per musician with avatar, fader and mute, a chat column, the metronome, and a status bar reading 7.9 ms mouth to ear](images/session_demo.png)
+![A four piece mid session: one mixer strip per musician with avatar, fader and mute, a chat column, the metronome, and a status bar reading 28.0 ms mouth to ear](images/session_demo.png)
 *A four piece playing. One strip per musician, the click, and the latency in the bar.*
 
 ## What it costs

@@ -207,11 +207,12 @@ fn device_buffers_ms(frames: f32) -> f32 {
 }
 
 /// What the link costs mouth to ear, from the figures the snapshot reports
-/// beside it: the round trip charged for both network legs, the playout buffer
-/// at the depth it is holding, and one media frame of encode latency.
+/// beside it: the round trip charged for both network legs, both jitter buffers
+/// at the depth each is holding, and one media frame of encode latency.
 fn link_ms(snap: &Snapshot) -> f32 {
     let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
-    rtt + snap.stats.jitter_depth as f32 * 2.5 + 2.5
+    let buffered = snap.stats.jitter_depth + snap.stats.uplink_jitter_depth.unwrap_or(0);
+    rtt + buffered as f32 * 2.5 + 2.5
 }
 
 fn settings() -> AudioSettings {
@@ -638,7 +639,7 @@ fn join_reaches_joined_and_stats_populate() {
     let snap = wait_for(&rt, "rtt sample", Duration::from_secs(3), |s| {
         s.stats.rtt_ms.is_some()
     });
-    assert!(snap.stats.mouth_to_ear_ms.is_some());
+    assert!(snap.stats.mouth_to_ear_ms().is_some());
 }
 
 /// The playout low water mark, end to end: the render callback measures the
@@ -694,10 +695,10 @@ fn the_figure_and_its_hover_carry_the_playout_cushion() {
         )
         .expect("join offline");
         let snap = wait_for(&rt, "joined with stats", Duration::from_secs(10), |s| {
-            joined(s) && s.stats.mouth_to_ear_ms.is_some()
+            joined(s) && s.stats.mouth_to_ear_ms().is_some()
         });
 
-        let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
+        let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
         let link = link_ms(&snap);
         let device_ms = device_buffers_ms(frames as f32);
         assert!(
@@ -748,6 +749,51 @@ fn the_figure_and_its_hover_carry_the_playout_cushion() {
             s.stats.state == ConnState::Idle
         });
     }
+}
+
+/// The server's own jitter buffer inside the headline figure. It holds this
+/// client's uplink ahead of the mix, so it delays what the band hears the same
+/// way the local buffer delays what this machine plays, and only the server can
+/// see it: the depth arrives in its Stats report once a second.
+///
+/// Nothing here is faked: a real `ServerCore` buffers a real uplink and reports
+/// the depth it settled on. What that report is worth is the wiring, since a
+/// loopback link buffers nothing and reads 0; the term's price is pinned in the
+/// unit tests, where the depth is ours to choose. The reports start a second
+/// after the join, so the figure picks the term up while the session runs rather
+/// than at the join.
+#[test]
+fn the_figure_charges_the_buffer_the_server_reports() {
+    let server = TestServer::start();
+    let rt = join_silent(&server, 1, "solo");
+    // The figure is absent until a round trip has been measured, which joining
+    // does not guarantee, so it is part of what this waits for rather than
+    // something to read the instant the buffer report lands.
+    let snap = wait_for(
+        &rt,
+        "the server's buffer report and a measured round trip",
+        Duration::from_secs(10),
+        |s| {
+            joined(s)
+                && s.stats.uplink_jitter_depth.is_some()
+                && s.stats.mouth_to_ear_ms().is_some()
+        },
+    );
+
+    let depth = snap.stats.uplink_jitter_depth.expect("the predicate held");
+    let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
+    let device_ms = device_buffers_ms(settings().buffer_frames as f32);
+    assert!(
+        (m2e - link_ms(&snap) - device_ms).abs() < 0.01,
+        "mouth to ear {m2e} ms must be the terms beside it, the server's \
+         {depth}-frame buffer included"
+    );
+    assert_eq!(
+        snap.stats.jitter_lines()[1],
+        format!("server buffer {depth} frames, yours standing in for the band's"),
+        "the hover names the term the figure charges, or the number cannot be \
+         broken down into what built it"
+    );
 }
 
 /// The frame loop asks for the connection state alone rather than pulling a
@@ -1038,7 +1084,7 @@ fn a_far_apart_session_is_offered_hearing_itself() {
     let snap = wait_for(&far, "the offer", OFFER_BUDGET, |s| s.offer_hear_self);
     let far_ms = snap
         .stats
-        .mouth_to_ear_ms
+        .mouth_to_ear_ms()
         .expect("a joined session measures the figure the offer is taken from");
     assert!(
         far_ms > 30.0,
@@ -1070,7 +1116,7 @@ fn a_far_apart_session_is_offered_hearing_itself() {
         !settled_snap.offer_hear_self,
         "a musician already hearing themselves must stay unasked, and this one \
          reads {:?} ms",
-        settled_snap.stats.mouth_to_ear_ms
+        settled_snap.stats.mouth_to_ear_ms()
     );
 
     // And the offer that is standing goes when it is acted on.
@@ -1841,7 +1887,7 @@ fn a_converting_stream_discloses_itself_and_prices_the_latency() {
     )
     .expect("join offline");
     let snap = wait_for(&rt, "joined with stats", Duration::from_secs(10), |s| {
-        joined(s) && s.stats.mouth_to_ear_ms.is_some()
+        joined(s) && s.stats.mouth_to_ear_ms().is_some()
     });
 
     let rate = snap.stats.rate.expect("a running stream reports its rungs");
@@ -1883,7 +1929,7 @@ fn a_converting_stream_discloses_itself_and_prices_the_latency() {
     // the converter's own figure. Both buffers are sized from the negotiated
     // callback in session-rate frames: the 120-frame request on a 44.1 kHz
     // device is ceil(120 * 160/147) = 131.
-    let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
+    let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
     let link = link_ms(&snap) + device_buffers_ms(131.0);
     let disclosed = capture_ms + playback_ms;
     assert!(
@@ -2381,7 +2427,7 @@ fn a_stream_that_converts_one_direction_discloses_only_that_direction() {
     let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
         .expect("join offline");
     let snap = wait_for(&rt, "joined with stats", Duration::from_secs(10), |s| {
-        joined(s) && s.stats.mouth_to_ear_ms.is_some()
+        joined(s) && s.stats.mouth_to_ear_ms().is_some()
     });
 
     let rate = snap.stats.rate.expect("a running stream reports its rungs");
@@ -2406,7 +2452,7 @@ fn a_stream_that_converts_one_direction_discloses_only_that_direction() {
     // And one direction's milliseconds. Both device buffers are sized from the
     // negotiated callback in session-rate frames: the 120-frame request against
     // a 44.1 kHz capture endpoint is ceil(120 * 160/147) = 131.
-    let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
+    let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
     let link = link_ms(&snap) + device_buffers_ms(131.0);
     assert!(
         (m2e - link - capture_ms).abs() < 0.01,
@@ -2436,7 +2482,7 @@ fn a_moved_clock_and_an_os_converter_read_as_themselves() {
     let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
         .expect("join offline");
     let snap = wait_for(&rt, "joined with stats", Duration::from_secs(10), |s| {
-        joined(s) && s.stats.mouth_to_ear_ms.is_some()
+        joined(s) && s.stats.mouth_to_ear_ms().is_some()
     });
 
     let rate = snap.stats.rate.expect("a running stream reports its rungs");
@@ -2463,7 +2509,7 @@ fn a_moved_clock_and_an_os_converter_read_as_themselves() {
 
     // No converter, so mouth to ear carries no converter term, and both device
     // buffers are sized from the plain 120-frame request.
-    let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
+    let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
     let link = link_ms(&snap) + device_buffers_ms(120.0);
     assert!((m2e - link).abs() < 0.01, "mouth to ear {m2e} ms");
 
