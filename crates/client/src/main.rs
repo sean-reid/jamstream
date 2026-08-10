@@ -8,7 +8,7 @@
 // a console per launch or pops one per spawned process.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use jamstream_client::app::JamApp;
+use jamstream_client::app::{JamApp, MIN_WINDOW};
 
 /// The committed 512px render of the app icon (source of record:
 /// assets/icon/jamstream.svg; regenerate with scripts/render-icon.sh).
@@ -26,7 +26,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([800.0, 600.0])
+            .with_min_inner_size(MIN_WINDOW)
             .with_title("jamstream")
             .with_icon(icon),
         ..Default::default()
