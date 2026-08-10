@@ -1655,9 +1655,9 @@ fn a_device_lost_mid_session_is_reopened_without_dropping_the_session() {
 /// is the proof the worker kept servicing the loop rather than drowning in
 /// device opens.
 ///
-/// This is also the harshest case for the column the band talks in, and it
-/// stays empty through all of it. The whole episode used to write three lines
-/// into it that nobody but this machine could see.
+/// This is also the harshest case for the column the band talks in: no
+/// episode produces more device events than one that opens and dies six
+/// times. It stays empty through all of it.
 #[test]
 fn a_device_that_will_not_stay_open_is_retried_a_few_times_and_then_left_alone() {
     let server = TestServer::start();

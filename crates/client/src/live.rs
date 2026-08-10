@@ -1684,7 +1684,7 @@ impl Worker {
         self.episode.faulted.then_some(AudioFaultView::Retrying)
     }
 
-    /// The fault the UI reads, published every tick and logged only where it
+    /// The fault the UI reads, published every tick and logged only when it
     /// changes: at a tick every 2.5 ms, a line per tick would fill the file
     /// in seconds.
     fn publish_fault(&mut self) {
