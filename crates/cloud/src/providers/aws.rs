@@ -1150,16 +1150,16 @@ fn parse_tags(chunk: &str) -> Vec<(String, String)> {
 /// Two entry points, deliberately layered so the EC2 and SSM callers cannot
 /// be broken by S3's extra requirements:
 ///
-/// * [`authorization`] signs the fixed-shape `POST /` this module's own
-///   provider makes (EC2 Query form posts and SSM JSON posts). Its signed
-///   header set and canonical request are unchanged.
-/// * [`authorization_for`] signs an arbitrary method, canonical URI, query
-///   string, and header set against a caller-supplied payload hash. S3
+/// * [`sigv4::authorization`] signs the fixed-shape `POST /` this module's
+///   own provider makes (EC2 Query form posts and SSM JSON posts). Its
+///   signed header set and canonical request are unchanged.
+/// * [`sigv4::authorization_for`] signs an arbitrary method, canonical URI,
+///   query string, and header set against a caller-supplied payload hash. S3
 ///   needs all four: it addresses objects by path, uses PUT/HEAD/DELETE,
 ///   passes options in the query string (`?uploads`, `?uploadId=`,
 ///   `?lifecycle`), and requires the payload hash to travel in a signed
-///   `x-amz-content-sha256` header. [`authorization`] is implemented in
-///   terms of it, so the exact-string tests below cover both.
+///   `x-amz-content-sha256` header. [`sigv4::authorization`] is implemented
+///   in terms of it, so the exact-string tests below cover both.
 ///
 /// Public so the integration tests can re-derive a signature from the request
 /// a wiremock fake received and compare it to the one that arrived. Checking

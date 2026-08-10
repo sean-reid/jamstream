@@ -152,7 +152,7 @@ pub struct RecordingPanel {
     /// What the last launch's retention call actually did, and the one copy
     /// of that answer in the app. `None` until a session is launched with a
     /// bucket; the record sheet reads its note through
-    /// [`RecordingPanel::unenforced_note`] rather than keeping a second one.
+    /// [`RecordingPanel::retention_note`] rather than keeping a second one.
     pub applied: Option<RetentionEnforcement>,
     /// What the last check said, verbatim on failure.
     pub check_result: Option<Result<(), String>>,
