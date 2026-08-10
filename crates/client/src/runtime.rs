@@ -183,6 +183,18 @@ pub enum DeviceModeView {
     Shared,
 }
 
+/// What is wrong with this computer's audio stream. A stream that is open is
+/// no fault and neither is a reopen for a pick somebody just made, so both
+/// read as `None`: only a stream that stopped on its own earns one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioFaultView {
+    /// The stream stopped and the reopen cadence is still working on it.
+    Retrying,
+    /// The cadence spent its budget, so nothing reopens without a pick.
+    /// `tries` is how many attempts it really made.
+    GaveUp { tries: u32 },
+}
+
 /// How one direction of the device stream reached the 48 kHz session rate.
 /// The runtime's copy of `jamstream_audio_io::RateOutcome`, for the same
 /// reason as [`DeviceModeView`]: the UI contract stays free of the audio
@@ -461,6 +473,11 @@ pub struct Snapshot {
     /// the session up and the musician silent, so the reason belongs on
     /// screen rather than only in the log.
     pub device_error: Option<String>,
+    /// What the audio stream is doing wrong, for as long as it is: a state
+    /// the status bar and the Audio tab read like the connection state, not
+    /// an event, because somebody playing an instrument is not looking at the
+    /// screen at the moment their device dies.
+    pub audio_fault: Option<AudioFaultView>,
 }
 
 /// One snapshot pull per frame, commands fire and forget. Implementations

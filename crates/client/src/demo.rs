@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::avatar::disc_color;
 use crate::runtime::{
-    AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState, CostView,
-    DestinationId, DestinationState, DestinationView, DeviceModeView, FaderView, LevelsView,
-    MemberId, MemberView, MetronomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime,
-    Snapshot, StatsView, StreamPlatform, StreamView, TokenId,
+    AudioFaultView, AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState,
+    CostView, DestinationId, DestinationState, DestinationView, DeviceModeView, FaderView,
+    LevelsView, MemberId, MemberView, MetronomeView, RateOutcomesView, RecordState, RecordView,
+    Role, Runtime, Snapshot, StatsView, StreamPlatform, StreamView, TokenId,
 };
 use crate::theme;
 
@@ -142,6 +142,10 @@ struct DemoState {
     /// derives this from the ring's own counters, so a fixture pins the
     /// answer instead.
     crackling: bool,
+    /// What the audio stream is doing wrong: the real runtime derives it from
+    /// the reopen cadence, which a fixture has no way to run, so it pins the
+    /// answer instead.
+    audio_fault: Option<AudioFaultView>,
     /// Your own display name, as [`Command::SetOwnName`] set it: the demo
     /// stands in for the roster fanout the real server answers with.
     own_name: Option<String>,
@@ -305,6 +309,7 @@ impl DemoRuntime {
                 device_mode: None,
                 rate: None,
                 crackling: false,
+                audio_fault: None,
                 own_name: None,
             }),
             is_host,
@@ -373,6 +378,13 @@ impl DemoRuntime {
     pub fn set_device_error(&self, reason: Option<&str>) {
         let mut s = self.state.lock().expect("demo state");
         s.device_error = reason.map(str::to_owned);
+    }
+
+    /// Pins what the audio stream is doing wrong, as the real runtime derives
+    /// it from the reopen cadence.
+    pub fn set_audio_fault(&self, fault: Option<AudioFaultView>) {
+        let mut s = self.state.lock().expect("demo state");
+        s.audio_fault = fault;
     }
 
     /// Pins the sharing mode, as the real runtime reads it off the audio
@@ -556,6 +568,7 @@ impl Runtime for DemoRuntime {
             server_addr: "203.0.113.10:43210".to_owned(),
             is_host: self.is_host,
             device_error: s.device_error.clone(),
+            audio_fault: s.audio_fault,
         }
     }
 

@@ -33,9 +33,10 @@ use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 
 use crate::avatar;
 use crate::runtime::{
-    AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState, CostView,
-    DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView, RateOutcomeView,
-    RateOutcomesView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView, StreamView,
+    AudioFaultView, AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState,
+    CostView, DestinationView, FaderView, LevelsView, MemberId, MemberView, MetronomeView,
+    RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime, Snapshot, StatsView,
+    StreamView,
 };
 use crate::screens::invites::TokenMap;
 
@@ -319,6 +320,10 @@ struct SharedState {
     /// Closest the playout ring came to empty over the last window, in frames,
     /// as [`RingWatch`] samples it.
     playout_low_frames: Option<usize>,
+    /// What the reopen cadence has to say about the audio stream, rewritten
+    /// every tick from the worker's own state. The UI reads it the way it
+    /// reads the connection state.
+    audio_fault: Option<AudioFaultView>,
 }
 
 impl SharedState {
@@ -357,6 +362,7 @@ impl SharedState {
             rate: None,
             crackling: false,
             playout_low_frames: None,
+            audio_fault: None,
         }
     }
 
@@ -1193,6 +1199,7 @@ impl LiveRuntime {
             server_addr: s.server_addr.clone(),
             is_host,
             device_error: s.device_error.clone(),
+            audio_fault: s.audio_fault,
         }
     }
 
@@ -1669,22 +1676,63 @@ impl Worker {
             self.opened_at = None;
             self.episode = ReopenEpisode::default();
         }
+        if self.engine.is_none() {
+            if self.episode.spent() {
+                if !self.episode.said_given_up {
+                    self.episode.said_given_up = true;
+                    self.system_line(&format!(
+                        "the audio device did not stay open after {REOPEN_ATTEMPTS_MAX} tries; \
+                         pick a device on the Audio tab to try again"
+                    ));
+                }
+            } else {
+                let backoff = self.episode.backoff();
+                if self.last_reopen.is_none_or(|t| t.elapsed() >= backoff) {
+                    self.attempt_open();
+                }
+            }
+        }
+        self.publish_fault();
+    }
+
+    /// What the stream is doing wrong, as the status bar and the Audio tab
+    /// read it. A budget that is spent while a stream runs is a stream that
+    /// came back on the last attempt, so the engine decides first; and a
+    /// reopen for a pick somebody just made is not a fault, which is what
+    /// keeps a buffer change from flashing the bar.
+    fn audio_fault(&self) -> Option<AudioFaultView> {
         if self.engine.is_some() {
-            return;
+            return None;
         }
         if self.episode.spent() {
-            if !self.episode.said_given_up {
-                self.episode.said_given_up = true;
-                self.system_line(&format!(
-                    "the audio device did not stay open after {REOPEN_ATTEMPTS_MAX} tries; \
-                     pick a device on the Audio tab to try again"
-                ));
-            }
+            return Some(AudioFaultView::GaveUp {
+                tries: self.episode.attempts,
+            });
+        }
+        self.episode
+            .said_stopped
+            .then_some(AudioFaultView::Retrying)
+    }
+
+    /// The fault the UI reads, published every tick and logged only where it
+    /// changes: at a tick every 2.5 ms, a line per tick would fill the file
+    /// in seconds.
+    fn publish_fault(&mut self) {
+        let fault = self.audio_fault();
+        let mut shared = self.shared.lock().expect("live state");
+        if shared.audio_fault == fault {
             return;
         }
-        let backoff = self.episode.backoff();
-        if self.last_reopen.is_none_or(|t| t.elapsed() >= backoff) {
-            self.attempt_open();
+        shared.audio_fault = fault;
+        drop(shared);
+        match fault {
+            Some(AudioFaultView::Retrying) => {
+                tracing::warn!("the audio stream stopped; retrying");
+            }
+            Some(AudioFaultView::GaveUp { tries }) => {
+                tracing::warn!(tries, "the audio device did not stay open; giving up");
+            }
+            None => tracing::info!("the audio stream is running again"),
         }
     }
 

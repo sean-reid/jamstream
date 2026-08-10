@@ -13,8 +13,8 @@ use jamstream_client::creds::{self, CredStore, EnvReader, MemStore};
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME};
 use jamstream_client::exec::Executor;
 use jamstream_client::runtime::{
-    BroadcastReadiness, DestinationState, RateOutcomeView, RateOutcomesView, RecordState,
-    StreamPlatform,
+    AudioFaultView, BroadcastReadiness, DestinationState, RateOutcomeView, RateOutcomesView,
+    RecordState, StreamPlatform,
 };
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::home::RecentSession;
@@ -1043,6 +1043,26 @@ fn session_crackling_narrow_clear() {
     snapshot(&mut harness, "session_crackling_narrow_clear");
 }
 
+/// A session with no audio stream at all: the reopen cadence either working
+/// on it or done trying. The same pair of surfaces carries it, the bar for
+/// the glance and the Audio tab for the pick, because a musician who has gone
+/// silent in both directions finds out from the screen they are looking at.
+fn no_audio_app(theme: Theme, fault: AudioFaultView) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_audio_fault(Some(fault));
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_no_audio_narrow() {
+    // The narrowest window, where the tag competes hardest with the meters
+    // and the two lamps for the bar's own room. Both faults read the same
+    // here: what differs between them is the sentence on the tab.
+    let app = no_audio_app(Theme::Dark, AudioFaultView::Retrying);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_no_audio_narrow");
+}
+
 /// The drawer open on one tab. Every settings fixture goes through here, so
 /// the tab row in each of them is the one the app really builds for that
 /// role and screen.
@@ -1137,6 +1157,30 @@ fn session_settings_crackling_clear() {
     let app = drawer_app(crackling_app(Theme::Dark, false), SettingsTab::Audio);
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_crackling_clear");
+}
+
+#[test]
+fn session_settings_no_audio() {
+    // Under the pickers, because that is where the pick is: the cadence is
+    // still working on it, so this one asks for nothing.
+    let app = drawer_app(
+        no_audio_app(Theme::Dark, AudioFaultView::Retrying),
+        SettingsTab::Audio,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_no_audio");
+}
+
+#[test]
+fn session_settings_no_audio_gave_up() {
+    // The end of the cadence, which is the one state that needs somebody:
+    // nothing reopens the stream now except a pick on this tab.
+    let app = drawer_app(
+        no_audio_app(Theme::Dark, AudioFaultView::GaveUp { tries: 6 }),
+        SettingsTab::Audio,
+    );
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_no_audio_gave_up");
 }
 
 #[test]
