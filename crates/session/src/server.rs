@@ -283,6 +283,9 @@ pub struct MemberStats {
     pub rtt_ms_last: Option<f32>,
     pub jitter: JitterStats,
     pub violations: u64,
+    /// Packets from this member that would not authenticate. A stream that
+    /// arrives and never opens looks exactly like one that never arrived.
+    pub opens_refused: u64,
 }
 
 /// Cached handshake response for idempotent retry: if the client's
@@ -314,6 +317,9 @@ struct Member {
     /// This member asked their personal mix to include their own signal.
     /// Survives disconnect and rejoin like the fader table and the click.
     hear_self: bool,
+    /// Packets from this member that failed to authenticate. Reported at
+    /// powers of two so a broken stream says so without one line per packet.
+    opens_refused: u64,
     connected: bool,
     last_heard_ms: u64,
     /// Published on the roster: silent for longer than
@@ -1087,6 +1093,7 @@ impl ServerCore {
                 rtt_ms_last: m.rtt_ms_last,
                 jitter: m.jitter.stats(),
                 violations: m.violations,
+                opens_refused: m.opens_refused,
             })
             .collect()
     }
@@ -1484,6 +1491,7 @@ impl ServerCore {
                 role: token.role,
                 name: name.clone(),
                 jti: token.jti,
+                opens_refused: 0,
                 addr: Some(src),
                 session: Some(session),
                 resp_cache: Some(RespCache {
@@ -1570,8 +1578,26 @@ impl ServerCore {
             let Some(session) = m.session.as_mut() else {
                 return;
             };
-            let Ok(plain) = session.open(counter, ciphertext) else {
-                return;
+            let plain = match session.open(counter, ciphertext) {
+                Ok(plain) => plain,
+                Err(err) => {
+                    // Counted and named. Both failures are silent drops, and a
+                    // stream that authenticates and then stops looks identical
+                    // to one that never arrived: 100 percent loss and an empty
+                    // buffer, with nothing saying which. Decrypt and Replay
+                    // mean different faults, so they are reported apart.
+                    m.opens_refused = m.opens_refused.saturating_add(1);
+                    if m.opens_refused.is_power_of_two() {
+                        tracing::warn!(
+                            member = member.0,
+                            counter,
+                            refused = m.opens_refused,
+                            %err,
+                            "a media or control packet would not open"
+                        );
+                    }
+                    return;
+                }
             };
             // Authenticated packet from a new address: NAT rebind.
             if m.addr != Some(src) {

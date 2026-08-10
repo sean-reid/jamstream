@@ -3879,3 +3879,137 @@ proptest! {
         client.poll(1);
     }
 }
+
+/// What a device reopen looks like from the core's side: capture stops for as
+/// long as the platform takes to shut and reopen a stream, then resumes. On a
+/// real machine that is about 148 ms, and afterwards the server reports 100
+/// percent loss on the uplink with an empty buffer while the client is sending
+/// 798 packets in every 2 seconds. This asks the two halves in one process,
+/// where the reason is readable instead of inferred.
+///
+/// A probe, not a gate. Arrivals here are regular, so the re-anchor watchdog
+/// collects its consecutive ticks either way and this passes even with the
+/// buffer's stuck flag cleared on every pull. The gate for that is
+/// [`a_capture_gap_on_a_jittery_stream`], which is the same gap on a stream
+/// with jitter, meaning every real one.
+#[test]
+fn a_capture_gap_the_length_of_a_device_reopen() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    for _ in 0..400 {
+        h.step();
+    }
+
+    let before = h.server.stats();
+    let b_before = before.iter().find(|m| m.id == MemberId(1)).cloned();
+
+    // The device is shut: nothing captured, while poll keeps the connection
+    // alive exactly as it does on a real machine.
+    h.clients[b].tone_hz = None;
+    for _ in 0..60 {
+        h.step();
+    }
+    h.clients[b].tone_hz = Some(660.0);
+    for _ in 0..800 {
+        h.step();
+    }
+
+    let after = h.server.stats();
+    for m in &after {
+        println!(
+            "PROBE member {}: refused={} late={} lost={} pulled={} depth={}",
+            m.id.0,
+            m.opens_refused,
+            m.jitter.late,
+            m.jitter.lost,
+            m.jitter.pulled,
+            m.jitter.depth_frames
+        );
+    }
+    let m = after
+        .iter()
+        .find(|m| m.id == MemberId(1))
+        .expect("b is still a member");
+    println!(
+        "PROBE after the gap: opens_refused={} late={} lost={} pulled={} depth={} reanchors={} violations={}",
+        m.opens_refused,
+        m.jitter.late,
+        m.jitter.lost,
+        m.jitter.pulled,
+        m.jitter.depth_frames,
+        m.jitter.reanchors,
+        m.violations
+    );
+    if let Some(b0) = b_before {
+        println!(
+            "PROBE before the gap: opens_refused={} late={} lost={} pulled={}",
+            b0.opens_refused, b0.jitter.late, b0.jitter.lost, b0.jitter.pulled
+        );
+    }
+    let _ = a;
+    assert_eq!(
+        m.opens_refused, 0,
+        "the server refused {} packets from b after the gap",
+        m.opens_refused
+    );
+}
+
+/// The same gap, but on a stream the server has measured jitter on, which is
+/// every real one. `reset` keeps the jitter estimate by design, and the gap
+/// inflates it, so the re-anchor asks for a target the stream cannot reach when
+/// arrivals and pulls both run at one frame per tick.
+#[test]
+fn a_capture_gap_on_a_jittery_stream() {
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let _a = h.add_client(&inv_a, Some(440.0));
+    let b = h.add_client(&inv_b, Some(660.0));
+    // Deliver b's media unevenly so the server measures jitter on it and its
+    // target is more than one frame, which is the case on any real path.
+    h.clients[b].uplink_media_stutter = true;
+    for _ in 0..400 {
+        h.step();
+    }
+
+    h.clients[b].tone_hz = None;
+    for _ in 0..60 {
+        h.step();
+    }
+    h.clients[b].tone_hz = Some(660.0);
+    for _ in 0..4_000 {
+        h.step();
+    }
+
+    let after = h.server.stats();
+    let m = after
+        .iter()
+        .find(|m| m.id == MemberId(1))
+        .expect("b is still a member");
+    let pulled_after = m.jitter.pulled;
+    println!(
+        "PROBE jittery: refused={} late={} lost={} recovered={} resurrected={} waiting={} pulled={} depth={} target={} reanchors={}",
+        m.opens_refused,
+        m.jitter.late,
+        m.jitter.lost,
+        m.jitter.recovered,
+        m.jitter.resurrected,
+        m.jitter.waiting,
+        pulled_after,
+        m.jitter.depth_frames,
+        m.jitter.target_frames,
+        m.jitter.reanchors
+    );
+    assert!(
+        m.jitter.depth_frames > 0 || m.jitter.late < 100,
+        "ten seconds after the gap the server still holds nothing from b: \
+         late={} lost={} waiting={} target={}",
+        m.jitter.late,
+        m.jitter.lost,
+        m.jitter.waiting,
+        m.jitter.target_frames
+    );
+}

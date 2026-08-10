@@ -125,6 +125,10 @@ const PLAYOUT_STALL_CEILING: Duration = Duration::from_micros(
 /// abandons the gap: the jitter buffer treats a hole this size as a restart
 /// anyway.
 const PLAYOUT_DRAIN_MAX: Duration = Duration::from_millis(160);
+/// A reopen slower than this is worth a warning of its own. A device shut and
+/// reopened for a settings change costs a few hundred milliseconds of capture on
+/// every platform measured; a whole second is something else going on.
+const SLOW_REOPEN: Duration = Duration::from_secs(1);
 
 /// Playout ring capacity in samples, which doubles as the playout depth
 /// target: the top-up loop keeps the ring full, so the device-side cushion
@@ -916,6 +920,10 @@ impl LiveRuntime {
             epoch: Instant::now(),
             capture_buf: vec![0.0; capture_capacity(device_frames)],
             mono_buf: Vec::new(),
+            shut_at: None,
+            moved_since_reopen: None,
+            sent_since_reopen: None,
+            send_errors: 0,
             carry: [0.0; CHUNK_STEREO],
             carry_pos: 0,
             carry_len: 0,
@@ -1281,6 +1289,19 @@ struct Worker {
     epoch: Instant,
     capture_buf: Vec<f32>,
     mono_buf: Vec<f32>,
+    /// When a settings change closed the device, so the reopen can say how
+    /// long nothing was captured. A real device takes real time here and the
+    /// fake takes none, which is the difference no offline test can see.
+    shut_at: Option<Instant>,
+    /// Capture samples moved since a reopen, counted until the first report.
+    /// Zero means the device came back and the microphone did not.
+    moved_since_reopen: Option<usize>,
+    /// Packets the uplink produced since a reopen. Samples reaching the core
+    /// prove capture; only this proves anything left the machine.
+    sent_since_reopen: Option<usize>,
+    /// Sends the socket refused. Producing a packet and sending one are not
+    /// the same event, and the error was thrown away at all four call sites.
+    send_errors: u64,
     /// Playout staged toward the ring: pulled from the core but not yet
     /// accepted, so a full ring never discards decoded audio.
     carry: [f32; CHUNK_STEREO],
@@ -1374,7 +1395,7 @@ impl Worker {
 
         let now_ms = self.now_ms();
         for pkt in self.core.poll(now_ms) {
-            let _ = self.socket.send(&pkt);
+            self.send_datagram(&pkt);
         }
         self.drain_events(now_ms);
         let stats = self.core.stats();
@@ -1464,7 +1485,7 @@ impl Worker {
         // One poll flushes the queued Bye; delivery is best effort, the
         // server also ejects on silence.
         for pkt in self.core.poll(now_ms) {
-            let _ = self.socket.send(&pkt);
+            self.send_datagram(&pkt);
         }
         self.driver.close();
         self.shared.lock().expect("live state").conn = ConnState::Idle;
@@ -1477,6 +1498,7 @@ impl Worker {
     /// stream does not run, with only a chat line to say otherwise. The
     /// refusal itself stays on screen through `device_error`.
     fn reconfigure(&mut self, settings: AudioSettings) {
+        self.shut_at = Some(Instant::now());
         // Drain what the old ring already captured so those samples reach
         // the core before the endpoints are dropped; orphaning them would
         // shift our uplink frame clock behind the server's.
@@ -1545,11 +1567,22 @@ impl Worker {
         self.last_reopen = Some(Instant::now());
         self.reopen_attempts += 1;
         self.episode.attempts += 1;
-        tracing::warn!(
-            attempt = self.reopen_attempts,
-            in_episode = self.episode.attempts,
-            "reopening audio stream"
-        );
+        // A first attempt at a reopen somebody asked for is not a fault, and the
+        // log file promises to stay empty on a healthy run. A retry is a fault
+        // whatever started the episode, and so is any reopen nobody asked for.
+        let asked_for = self.shut_at.is_some() && self.episode.attempts == 1;
+        if asked_for {
+            tracing::debug!(
+                attempt = self.reopen_attempts,
+                "reopening the audio stream for a settings change"
+            );
+        } else {
+            tracing::warn!(
+                attempt = self.reopen_attempts,
+                in_episode = self.episode.attempts,
+                "reopening audio stream"
+            );
+        }
         match self.try_open() {
             Ok(()) => {
                 if self.episode.said_stopped && !self.episode.said_reopened {
@@ -1592,6 +1625,24 @@ impl Worker {
                 // The ring opens full of silence, so the first callback owes
                 // this stream nothing yet.
                 self.ring_took = Instant::now();
+                if let Some(shut) = self.shut_at.take() {
+                    let shut_ms = shut.elapsed().as_millis() as u64;
+                    // Nothing is captured while the device is shut, so the gap is
+                    // a hole in what everybody else hears. A few hundred
+                    // milliseconds is what a reopen costs; a second is a device
+                    // taking far longer than one, and worth saying out loud.
+                    if shut_ms >= SLOW_REOPEN.as_millis() as u64 {
+                        tracing::warn!(
+                            shut_ms,
+                            device_frames,
+                            "the audio device took a long time to reopen, and captured nothing while it was shut"
+                        );
+                    } else {
+                        tracing::debug!(shut_ms, device_frames, "audio reopened");
+                    }
+                    self.moved_since_reopen = Some(0);
+                    self.sent_since_reopen = Some(0);
+                }
                 let mut shared = self.shared.lock().expect("live state");
                 shared.reopen_attempts = self.reopen_attempts;
                 shared.device_error = None;
@@ -1642,13 +1693,30 @@ impl Worker {
             };
             let now_ms = self.now_ms();
             for pkt in self.core.handle_datagram(now_ms, &self.rx_buf[..len]) {
-                let _ = self.socket.send(&pkt);
+                self.send_datagram(&pkt);
             }
         }
     }
 
     /// Device-paced capture: whatever arrived in the ring goes through the
     /// raw path, which emits zero or more sealed frames.
+    /// Sends one datagram, counting a refusal instead of discarding it. A
+    /// socket that stops accepting looks exactly like a server that stopped
+    /// listening, and both were invisible here.
+    fn send_datagram(&mut self, pkt: &[u8]) {
+        if let Err(err) = self.socket.send(pkt) {
+            self.send_errors = self.send_errors.saturating_add(1);
+            if self.send_errors.is_power_of_two() {
+                tracing::warn!(
+                    refused = self.send_errors,
+                    bytes = pkt.len(),
+                    %err,
+                    "the socket would not send a packet"
+                );
+            }
+        }
+    }
+
     fn move_capture(&mut self, now_ms: u64) {
         let mut inst_peak = 0.0f32;
         let mut inst_sq = 0.0f32;
@@ -1665,8 +1733,43 @@ impl Worker {
                 inst_sq += s * s;
             }
             n = self.mono_buf.len();
+            if let Some(moved) = self.moved_since_reopen.as_mut() {
+                *moved += n;
+                // Ten seconds of a 48 kHz mono uplink, read once, and only
+                // reported if it has something to complain about. The server's
+                // loss figure covers the second before it was sent, so a sample
+                // taken right after a reopen can report the gap itself and read
+                // as permanent. Ten seconds is long enough for the window to
+                // have caught up. A settings change is a thing somebody asked
+                // for, so a healthy one leaves this file empty, which is what
+                // its first line promises the reader.
+                if *moved >= SAMPLE_RATE as usize * 10 {
+                    let moved = *moved;
+                    let sent = self.sent_since_reopen.take().unwrap_or(0);
+                    self.moved_since_reopen = None;
+                    let st = self.core.stats();
+                    let recovered = st.uplink_loss_pct.is_some_and(|pct| pct < 5.0)
+                        && moved > 0
+                        && self.send_errors == 0;
+                    if !recovered {
+                        tracing::warn!(
+                            moved,
+                            sent,
+                            server_says_loss_pct = ?st.uplink_loss_pct,
+                            server_says_depth = ?st.uplink_jitter_depth,
+                            own_late = st.jitter.late,
+                            own_reanchors = st.jitter.reanchors,
+                            send_errors = self.send_errors,
+                            "ten seconds after the reopen the uplink has not come back"
+                        );
+                    }
+                }
+            }
             for pkt in self.core.push_capture_raw(now_ms, &self.mono_buf) {
-                let _ = self.socket.send(&pkt);
+                if let Some(sent) = self.sent_since_reopen.as_mut() {
+                    *sent += 1;
+                }
+                self.send_datagram(&pkt);
             }
         }
         let inst_rms = if n == 0 {

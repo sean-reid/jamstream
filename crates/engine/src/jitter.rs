@@ -271,8 +271,15 @@ impl JitterBuffer {
         // or a brief stall, so treat it as a stream restart and re-anchor on
         // the newest arrivals. The mirror case, playout behind the stream, is
         // caught in `push` by the depth itself.
+        // The flag survives until audio actually plays, rather than being
+        // cleared by the next pull. Arrivals are bursty on any real path: a
+        // tick with no arrival used to leave it false, the streak went back to
+        // zero, and a counter needing REANCHOR_PATIENCE consecutive ticks never
+        // got there. Only playing a frame means the position is reconcilable.
         let stuck = matches!(result, Pull::Missing) && self.dropped_since_pull;
-        self.dropped_since_pull = false;
+        if matches!(result, Pull::Frame(_) | Pull::Recovered(_)) {
+            self.dropped_since_pull = false;
+        }
         if stuck {
             self.stuck_ticks += 1;
             if self.stuck_ticks >= REANCHOR_PATIENCE {
@@ -282,7 +289,7 @@ impl JitterBuffer {
                 self.reset();
                 self.reanchors += 1;
             }
-        } else {
+        } else if matches!(result, Pull::Frame(_) | Pull::Recovered(_)) {
             self.stuck_ticks = 0;
         }
         result
