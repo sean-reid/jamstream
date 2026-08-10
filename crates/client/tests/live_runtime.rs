@@ -955,32 +955,16 @@ fn a_far_apart_session_is_offered_hearing_itself() {
         snap.chat
     );
 
-    // The other two, at the moment the far one has been offered it. Same
-    // build, same worker, same code path.
-    let near_snap = near.snapshot();
-    let near_ms = near_snap
-        .stats
-        .mouth_to_ear_ms
-        .expect("the loopback member measures a figure too");
-    // The delay is what this session can prove, and it proves it as a
-    // difference: the far member carries the added leg and the loopback member
-    // does not. What the loopback figure reads in absolute terms is a fact about
-    // the machine, and a contended runner has read 98 ms on a session with no
-    // delay in it at all. On that machine every member is genuinely far apart,
-    // so there is no healthy case here to compare against and asserting one
-    // would be asserting the runner is fast. A figure under the threshold
-    // offering nothing is a unit test's job, on a reading we choose.
-    // The figure carries half the round trip, so the added leg shows up as one
-    // way of it. Half of that is the floor, because the two members hold their
-    // own jitter buffers and the deeper one closes some of the gap: 49 against
-    // 14 on this machine, a difference of 35 where the leg is 40.
-    let carried = ONE_WAY.as_millis() as f32 / 2.0;
-    assert!(
-        far_ms > near_ms + carried,
-        "the far member has {} ms each way on top of the loopback member, so its \
-         figure has to carry at least {carried} of it: {far_ms} against {near_ms}",
-        ONE_WAY.as_millis()
-    );
+    // Nothing here is asserted about the other members' figures, and the delay
+    // is not what this proves. What the code promises is that a figure past the
+    // threshold earns the offer, not that the network is why the figure is past
+    // it, and on a contended runner it is not: one read 121 ms for the loopback
+    // member against 108.5 for the one carrying 40 ms each way, so the machine
+    // moves this number further than the leg does and the two are not
+    // comparable. That a figure under the threshold offers nothing is asserted
+    // in the unit tests, where the reading is ours to choose. What a real
+    // session adds is the wiring: a real server, a real delay, and the offer
+    // arriving on the figure the musician is shown.
     let settled_snap = settled.snapshot();
     assert!(
         settled_snap.hear_self,
