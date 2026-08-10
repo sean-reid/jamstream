@@ -47,11 +47,12 @@ impl CallbackBridge {
     /// samples.
     ///
     /// The two are separate because they cost different things. The playout
-    /// ring is kept full by its producer, so its capacity is the cushion the
-    /// device plays out of and every sample of it is latency. The capture ring
-    /// is drained to empty by its consumer, so its capacity is only how long
-    /// that consumer may be held up before audio is lost, and costs nothing
-    /// while the consumer keeps up.
+    /// ring is topped up by its producer to whatever depth it chooses, and that
+    /// depth is the cushion the device plays out of, so the capacity is only the
+    /// deepest cushion the producer may ask for and the depth is what costs
+    /// latency. The capture ring is drained to empty by its consumer, so its
+    /// capacity is only how long that consumer may be held up before audio is
+    /// lost, and costs nothing while the consumer keeps up.
     // The two halves are the product; CallbackBridge itself is never held.
     #[allow(clippy::new_ret_no_self)]
     #[must_use]
@@ -152,6 +153,15 @@ impl EngineSide {
     pub fn push_playout(&mut self, samples: &[f32]) -> usize {
         let (pushed, _) = self.playout_tx.push_partial_slice(samples);
         pushed.len()
+    }
+
+    /// Samples banked in the playout ring, which is the cushion the device is
+    /// playing out of right now. A producer holding a depth below the capacity
+    /// reads it before every push, so the depth it holds is its own choice and
+    /// not the size the ring was cut at.
+    #[must_use]
+    pub fn playout_depth(&self) -> usize {
+        self.playout_tx.buffer().capacity() - self.playout_tx.slots()
     }
 
     #[must_use]
