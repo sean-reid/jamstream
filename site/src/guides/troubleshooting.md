@@ -18,7 +18,7 @@ A local session server that dies at startup is a different case with its own log
 
 ## Latency feels high
 
-Start with the number, not the feel. The headline figure in the session status bar is mouth to ear: the milliseconds from sound entering an interface to the last buffer JamStream hands your sound card, the playout cushion included. What the card holds after that is the one part no figure here can see.
+Start with the number, not the feel. The headline figure in the session status bar is mouth to ear: the milliseconds from sound entering an interface to the last buffer JamStream hands your sound card, the playout buffer included. What the card holds after that is the one part no figure here can see.
 
 The network is in that figure twice, because your sound crosses to the server and out again to the player hearing it, and your own round trip is charged for both crossings. That is right when the band's connections are alike, and low by the difference when somebody's is worse than yours.
 
@@ -32,17 +32,19 @@ Check these in order of payoff:
    There are two of them and the number carries both. `buffer` is your own; `server buffer` under it is the one the session server holds on your uplink, which your link sets and only the server can see.
 
    Yours stands in for the buffer under whoever you are listening to, the same way your round trip stands in for theirs.
-3. **Buffer size.** On the Audio tab, under Buffer size, start at the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms). The line under the choices says what the playout cushion is holding and whether anything is deepening it, so the latency you are getting is on screen even when it is not the size you picked.
+3. **Buffer size.** On the Audio tab, under Buffer size, start at the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms).
 
-   Each step costs three times its own size in the number: the buffer is paid once going in and twice coming out. The hover names both, as `capture buffer` and `playout cushion`.
+   Each step costs three times its own size in the number: the buffer is paid once going in and twice coming out. The hover names both directions, as `capture buffer` and `playout buffer`.
 
-   The cushion is not fixed. A machine that keeps letting the playout ring run low gets a deeper one, 2.5 ms at a time and never past twice the buffer, and hands it back once it is keeping up again. The hover and the headline number both follow it, so a deeper cushion than twice your buffer is that, not a fault.
+   The playout side is not fixed. A machine whose audio keeps coming close to breaking up holds a little more than the size asks for, 2.5 ms at a time and never more than the size again, and gives it back once it is keeping up.
 
-   You are asked to move the size only when that runs out of room. The same line then names the next size up, and says what taking it costs: more latency, and a reopen the band hears as a few hundred milliseconds missing of you. A **crackling** tag before that means the cushion is still working on it.
+   A line under the choices says how much and why, so the latency you are getting is on screen even when it is not the size you picked. Nothing appears there while the size is all you are paying.
 
-   "Adjust the cushion automatically", under the choices, is how you stop it. Unticking it pins the cushion at what your size asks for, from that moment and on every later session on this computer, so the size you pick is the latency you get.
+   You are asked to move the size only when that runs out of room. The same line then names the next size up, and says what taking it costs: more latency, and a reopen the band hears as a few hundred milliseconds missing of you. A **crackling** tag before that means the extra depth is still working on it.
 
-   If the ring keeps running low at a pinned cushion, the line says so and points back at the box: a deeper cushion is the one fix that costs no reopen.
+   **Add extra depth automatically**, under the choices, is how you stop it. Untick it and you get the size you picked and nothing else, on this session and every later one on this computer.
+
+   If the audio still comes close to breaking up with the box unticked, the line says so and points back at it: extra depth is the one fix that costs no reopen. The sizes stay pickable either way, because nothing in the app ever moves the size for you.
 4. **Sample rate.** A direction JamStream's own converter carries costs about 3 ms, and says so with a muted **converting** tag naming both rates.
 
    The headline number already includes it and the hover breaks it out per direction. [Device problems](#device-problems) has the whole ladder.

@@ -721,7 +721,7 @@ fn the_figure_and_its_hover_carry_the_playout_cushion() {
             device.lines(),
             [
                 format!("capture buffer {:.1} ms", device.capture_ms),
-                format!("playout cushion {:.1} ms", device.playout_ms),
+                format!("playout buffer {:.1} ms", device.playout_ms),
             ],
             "each direction is named, or the two read as one another"
         );

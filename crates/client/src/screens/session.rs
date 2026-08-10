@@ -1685,9 +1685,10 @@ mod tests {
     }
 
     /// The device buffers are two terms of the number, one per direction, and
-    /// the larger of them is the playout cushion. The hover names each, because
+    /// the playout one is the deeper. The hover names each by direction, because
     /// "device buffer" as one figure cannot say which end of the path a musician
-    /// is paying for, and a Buffer size pick moves both.
+    /// is paying for, and a Buffer size pick moves both. One noun for the pair,
+    /// because a second word for held audio reads as a second kind of thing.
     #[test]
     fn the_hover_prices_each_direction_of_the_device() {
         use crate::runtime::DeviceBuffersView;
@@ -1696,7 +1697,7 @@ mod tests {
         let mut s = rt.snapshot().stats;
         s.device_buffers = None;
         assert!(
-            !latency_hover(&s).contains("cushion"),
+            !latency_hover(&s).contains("playout buffer"),
             "with no stream there are no buffers to price"
         );
 
@@ -1706,7 +1707,7 @@ mod tests {
         });
         let hover = latency_hover(&s);
         assert!(hover.contains("capture buffer 10.0 ms"), "{hover:?}");
-        assert!(hover.contains("playout cushion 20.0 ms"), "{hover:?}");
+        assert!(hover.contains("playout buffer 20.0 ms"), "{hover:?}");
     }
 
     /// The two directions mean opposite things: uplink loss is audio the band
