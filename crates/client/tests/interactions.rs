@@ -562,14 +562,15 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
         // neither is ever what a short window scrolled away.
         //
         // What a musician reaches for mid session comes next, with nothing
-        // scrolled: the picks, and at a window the app can be opened at, the
-        // sentence under them, which is the one line on the tab that asks for a
-        // different pick. Below the app's own smallest window the body is
+        // scrolled: the picks, and at a window the app can be opened at, the box
+        // that decides whether anything is added on top of them. A healthy
+        // session says nothing under the choices, so the box is the last row
+        // there is to reach. Below the app's own smallest window the body is
         // shorter than any window gives it, and the panel scrolls for that.
         let openable = size.y >= smallest_room().y && size.x >= smallest_room().x;
         let pinned = ["Close", "Audio", "Broadcast", "Invites", "You"];
         let unscrolled = ["120 frames (2.5 ms)", "480 frames (10.0 ms)"];
-        let asks = ["Cushion: 5.0 ms, what this buffer size asks for"];
+        let asks = ["Add extra depth automatically"];
         for label in pinned
             .into_iter()
             .chain(unscrolled)
