@@ -10,7 +10,8 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use jamstream_client::creds::MemStore;
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME, RecordingRuntime};
 use jamstream_client::runtime::{
-    BroadcastReadiness, Command, DestinationState, MemberId, RecordState, Runtime, Snapshot,
+    AudioFaultView, BroadcastReadiness, Command, DestinationState, MemberId, RecordState, Runtime,
+    Snapshot,
 };
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::session::{SessionScreen, SettingsTab};
@@ -2080,6 +2081,55 @@ fn a_refused_device_puts_the_reason_over_the_strips() {
         harness.query_by_label(reason).is_none(),
         "a working device must say nothing"
     );
+}
+
+/// The two surfaces a dead audio stream reaches, from the one state on the
+/// snapshot: the tag beside the latency number, which is what somebody with
+/// an instrument in their hands sees without reading anything, and the
+/// sentence under the pickers on the Audio tab, which is the screen the pick
+/// that fixes it lives on. Neither of them is chat, and neither of them
+/// scrolls away while the stream is still down.
+#[test]
+fn a_dead_audio_stream_shows_in_the_bar_and_on_the_audio_tab() {
+    let fault = AudioFaultView::GaveUp { tries: 6 };
+    let mut harness = fault_harness(Some(fault));
+    harness.run_steps(4);
+    assert!(
+        harness.query_by_label("no audio").is_some(),
+        "the bar must carry the state beside the latency number"
+    );
+    let line = jamstream_client::screens::devices::fault_line(fault);
+    assert!(
+        harness.query_by_label_contains(&line).is_some(),
+        "the Audio tab must carry the sentence with the pick in it: {line}"
+    );
+
+    // And it is the state that draws them: a running stream says neither.
+    let mut harness = fault_harness(None);
+    harness.run_steps(4);
+    assert!(harness.query_by_label("no audio").is_none());
+    assert!(harness.query_by_label_contains("No audio:").is_none());
+}
+
+/// The session shell with the drawer open on the Audio tab and one audio
+/// fault pinned, which is the only pair of surfaces that has to agree.
+fn fault_harness(fault: Option<AudioFaultView>) -> Harness<'static> {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let demo = DemoRuntime::frozen(FROZEN_FRAME, false);
+    demo.set_audio_fault(fault);
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(demo));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    app.settings_tab = SettingsTab::Audio;
+    Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        })
 }
 
 /// The chat alignment invariant: message text starts at one x for every

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use jamstream_audio_io::{AudioError, DeviceRung, WavBackend};
 use jamstream_client::live::{AudioSettings, LiveRuntime};
 use jamstream_client::runtime::{
-    Command, ConnState, MemberId, RateOutcomeView, RecordState, Runtime, Snapshot,
+    AudioFaultView, Command, ConnState, MemberId, RateOutcomeView, RecordState, Runtime, Snapshot,
 };
 use jamstream_engine::JitterBuffer;
 use jamstream_protocol::ids::{HOST_MEMBER_ID, Role, SessionId, TokenId};
@@ -1509,8 +1509,9 @@ fn a_44_1_host_and_a_native_joiner_hear_each_other() {
 
 /// The disclosure that rides with rung 3 (#347): a member on a 44.1 kHz
 /// interface sees the Resampled outcome in the snapshot with the converter's
-/// own added milliseconds, one chat line per converted direction at join,
-/// and a mouth-to-ear figure that grew by exactly the disclosed amount.
+/// own added milliseconds, one line per converted direction for the status
+/// bar and the Audio tab to render for as long as the stream runs, and a
+/// mouth-to-ear figure that grew by exactly the disclosed amount.
 #[test]
 fn a_converting_stream_discloses_itself_and_prices_the_latency() {
     let server = TestServer::start();
@@ -1540,16 +1541,23 @@ fn a_converting_stream_discloses_itself_and_prices_the_latency() {
     };
     assert!(capture_ms > 0.0 && playback_ms > 0.0);
 
-    // Said once per direction, at join, in the state chat carries.
+    // One disclosure per direction, in the state the Audio tab renders under
+    // the pickers and the latency hover repeats. Standing facts about the
+    // device, so they hold for as long as the stream does.
+    let lines = rate.lines();
     for side in ["capture", "playback"] {
-        let line = format!("converting {side} 44.1 kHz to 48 kHz");
+        let want = format!("converting {side} 44.1 kHz to 48 kHz");
         assert_eq!(
-            snap.chat.iter().filter(|l| l.text.contains(&line)).count(),
+            lines.iter().filter(|l| l.contains(&want)).count(),
             1,
-            "{side} notice: {:?}",
-            snap.chat
+            "{side} disclosure: {lines:?}"
         );
     }
+    assert!(
+        snap.chat.is_empty(),
+        "the band's column is for the band: {:?}",
+        snap.chat
+    );
 
     // Mouth to ear grew by the disclosed amount: strip the link terms this
     // same snapshot reports and the capture-buffer term, and what is left is
@@ -1571,9 +1579,9 @@ fn a_converting_stream_discloses_itself_and_prices_the_latency() {
     });
 }
 
-/// A device lost mid-session: the stream is closed, the room is told the
-/// stream stopped, and the runtime reopens with the same settings without
-/// losing the session.
+/// A device lost mid-session: the stream is closed and reopened with the same
+/// settings, on the first attempt of the episode, without losing the session
+/// and without leaving a mark on any surface once it is back.
 ///
 /// This is the test the offline backend existed for and could not run.
 /// `Driver::errored` answered a flat `false` for the offline arm, so
@@ -1583,58 +1591,46 @@ fn a_converting_stream_discloses_itself_and_prices_the_latency() {
 /// Both halves of the fix are in the same change, which is the point:
 /// `with_device_loss_after` on the backend, and reading it here.
 ///
-/// The wording is part of the contract. A latched stream error carries no
-/// class, and the exclusive Windows path latches on any read or write hiccup,
-/// so this line may not claim a disconnection it cannot know about (#327).
+/// One open for the join and one for the reopen is the promptness the backoff
+/// must not cost: a device that was fine until it was pulled comes back on the
+/// attempt whose wait is zero, not after the wait a flapping device earns.
 #[test]
-fn a_device_lost_mid_session_is_announced_and_reopened() {
+fn a_device_lost_mid_session_is_reopened_without_dropping_the_session() {
     let server = TestServer::start();
     let sine = sine_fixture("device-loss", 440.0, RATE);
     // Two hundred frames is half a second of pumping at 2.5 ms, so the loss
     // lands well after the join and well inside the test's own patience.
     let backend = WavBackend::new(Some(sine.clone()), None).with_device_loss_after(200);
+    let device = backend.clone();
     let rt = LiveRuntime::join_offline(&server.invite(1, "solo"), settings(), backend)
         .expect("join offline");
     wait_for(&rt, "joined", Duration::from_secs(10), joined);
 
-    // The notice goes to everyone on this client's own chat, which is where the
-    // app puts a device problem: nothing else on screen would say why the
-    // meters went quiet.
-    let snap = wait_for(&rt, "the device notice", Duration::from_secs(10), |s| {
-        s.chat
-            .iter()
-            .any(|l| l.text.contains("the audio stream stopped; retrying"))
+    let snap = wait_for(&rt, "the reopen", Duration::from_secs(10), |_| {
+        device.opens() >= 2
     });
-    assert!(
-        !snap.chat.iter().any(|l| l.text.contains("disconnected")),
-        "a classless stream error must not be reported as an unplug: {:?}",
-        snap.chat
+    assert_eq!(
+        device.opens(),
+        2,
+        "the loss must be answered by one open, on the attempt that waits none"
     );
-
-    // And it comes back. The modelled unplug is spent, so the replacement
-    // stream keeps running and the session was never dropped.
-    let snap = wait_for(&rt, "the reopen", Duration::from_secs(10), |s| {
-        s.chat
-            .iter()
-            .any(|l| l.text.contains("audio device reopened"))
-    });
     assert_eq!(
         snap.stats.state,
         ConnState::Joined,
         "losing a device must not drop the session"
     );
-    // Promptly, which is the property the backoff must not cost: a device
-    // that was fine until it was pulled is retried on the next tick, not
-    // after the wait a flapping device earns.
-    let at = |text: &str| {
+
+    // Nothing is left saying so, because there is nothing left to say: the
+    // stream a musician is playing through is the one that came back.
+    std::thread::sleep(Duration::from_millis(200));
+    let snap = rt.snapshot();
+    assert_eq!(snap.audio_fault, None, "the fault is over");
+    assert_eq!(snap.device_error, None, "nothing refused");
+    assert!(
+        snap.chat.is_empty(),
+        "a device is not something the app says in the room: {:?}",
         snap.chat
-            .iter()
-            .find(|l| l.text.contains(text))
-            .unwrap_or_else(|| panic!("{text} is in chat: {:?}", snap.chat))
-            .at_ms
-    };
-    let gap = at("audio device reopened") - at("the audio stream stopped; retrying");
-    assert!(gap < 100, "the reopen waited {gap} ms after the loss");
+    );
 
     rt.send(Command::Leave);
     wait_for(&rt, "idle", Duration::from_secs(5), |s| {
@@ -1647,19 +1643,21 @@ fn a_device_lost_mid_session_is_announced_and_reopened() {
 /// The device that will not stay open, which is where the reopen loop used
 /// to come apart. It opens every time and latches before the next 2.5 ms
 /// tick, so the loop got a fresh success on every attempt and never consulted
-/// its own interval: a close and an open every tick, two chat lines a tick
-/// (neither deduped, because they alternate), the 500-line scrollback emptied
-/// of the band's conversation in about a second, and `Worker::step` running
-/// far past the tick, so the rings were not serviced for the whole episode.
-/// A WASAPI exclusive endpoint another process takes, a half-present USB
-/// interface, and a PipeWire graph refusing the rate all arrive in this
+/// its own interval: a close and an open every tick, and `Worker::step`
+/// running far past the tick, so the rings were not serviced for the whole
+/// episode. A WASAPI exclusive endpoint another process takes, a half-present
+/// USB interface, and a PipeWire graph refusing the rate all arrive in this
 /// shape.
 ///
 /// What must hold instead: a handful of attempts over a widening backoff, a
-/// bounded number of chat lines, a plain sentence when the loop gives up that
-/// agrees with how many times it really tried, and a session that is still
-/// joined at the end of it, which is the proof the worker kept servicing the
-/// loop rather than drowning in device opens.
+/// state that says the loop has stopped and agrees with how many times it
+/// really tried, and a session that is still joined at the end of it, which
+/// is the proof the worker kept servicing the loop rather than drowning in
+/// device opens.
+///
+/// This is also the harshest case for the column the band talks in: no
+/// episode produces more device events than one that opens and dies six
+/// times. It stays empty through all of it.
 #[test]
 fn a_device_that_will_not_stay_open_is_retried_a_few_times_and_then_left_alone() {
     let server = TestServer::start();
@@ -1679,55 +1677,23 @@ fn a_device_that_will_not_stay_open_is_retried_a_few_times_and_then_left_alone()
         early <= 6,
         "{early} device opens in 2.5 s; the backoff is not holding"
     );
-    let snap = rt.snapshot();
-    assert!(
-        snap.chat.len() <= 3,
-        "the retry loop is flooding chat: {:?}",
-        snap.chat
-    );
 
-    // And it stops, saying so in a sentence a musician can act on.
+    // And it stops, in a state that stays on the Audio tab with the pick that
+    // ends it, rather than a line that has scrolled by the time anybody looks.
     let snap = wait_for(&rt, "the loop to give up", Duration::from_secs(30), |s| {
-        s.chat.iter().any(|l| l.text.contains("did not stay open"))
+        matches!(s.audio_fault, Some(AudioFaultView::GaveUp { .. }))
     });
-    let given_up = snap
-        .chat
-        .iter()
-        .find(|l| l.text.contains("did not stay open"))
-        .expect("the predicate above matched");
-    assert!(
-        given_up.text.contains("pick a device"),
-        "the give-up line must say what to do: {:?}",
-        given_up.text
-    );
-    // The claim in that line and the number of opens the fake counted are the
-    // same story: one open for the join, then the tries it says it made.
-    let tries: u32 = given_up
-        .text
-        .split_whitespace()
-        .find_map(|w| w.parse().ok())
-        .expect("the line names how many tries it made");
+    let Some(AudioFaultView::GaveUp { tries }) = snap.audio_fault else {
+        unreachable!("the predicate above matched GaveUp")
+    };
+    // The count the state claims and the number of opens the fake counted are
+    // the same story: one open for the join, then the tries it says it made.
     assert_eq!(
         device.opens(),
         tries + 1,
-        "the line claims {tries} tries: {:?}",
-        given_up.text
+        "the state claims {tries} tries after {} opens",
+        device.opens()
     );
-
-    // Three lines for the whole episode: stopped, reopened, gave up.
-    assert_eq!(snap.chat.len(), 3, "{:?}", snap.chat);
-    for text in [
-        "the audio stream stopped; retrying",
-        "audio device reopened",
-        "did not stay open",
-    ] {
-        assert_eq!(
-            snap.chat.iter().filter(|l| l.text.contains(text)).count(),
-            1,
-            "{text}: {:?}",
-            snap.chat
-        );
-    }
 
     // Nothing more is tried, and the session is still up: the network side
     // kept its tick the whole time the device was failing.
@@ -1736,7 +1702,16 @@ fn a_device_that_will_not_stay_open_is_retried_a_few_times_and_then_left_alone()
     let snap = rt.snapshot();
     assert_eq!(snap.stats.state, ConnState::Joined);
     assert!(snap.stats.rtt_ms.is_some(), "pings kept flowing");
-    assert_eq!(snap.chat.len(), 3, "{:?}", snap.chat);
+    assert_eq!(
+        snap.audio_fault,
+        Some(AudioFaultView::GaveUp { tries }),
+        "the state holds while the stream is down"
+    );
+    assert!(
+        snap.chat.is_empty(),
+        "the band's column carries what people type and nothing else: {:?}",
+        snap.chat
+    );
 
     rt.send(Command::Leave);
     wait_for(&rt, "idle", Duration::from_secs(5), |s| {
@@ -1840,8 +1815,8 @@ fn a_stream_away_for_a_few_seconds_keeps_the_jitter_buffer_moving() {
 /// 44.1 kHz, and the music keeps playing through the boundary converter
 /// (#347 rung 3) where it used to be refused. What arrives on the swapped-in
 /// interface must still be the room's audio: at level, at pitch, and free of
-/// underrun padding; and the swap is disclosed, in chat once and in the
-/// snapshot's rate outcome for as long as the converter runs.
+/// underrun padding; and the swap is disclosed in the snapshot's rate outcome
+/// for as long as the converter runs.
 #[test]
 fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
     let server = TestServer::start();
@@ -1870,9 +1845,12 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
         joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
     });
     wait_for(&b, "the reopen", Duration::from_secs(10), |s| {
-        s.chat
-            .iter()
-            .any(|l| l.text.contains("audio device reopened"))
+        s.stats.rate.is_some_and(|r| {
+            matches!(
+                r.playback,
+                RateOutcomeView::Resampled { device: 44_100, .. }
+            )
+        })
     });
 
     // Two seconds of the room through the swapped-in interface. The reopen
@@ -1889,8 +1867,8 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
         "nothing was refused: {:?}",
         snap.device_error
     );
-    // The swap is disclosed: the snapshot carries the converting outcome and
-    // chat was told once, not once per reopen-cadence tick.
+    // The swap is disclosed: the snapshot carries the converting outcome for
+    // as long as the converter runs, which is what both surfaces read.
     let rate = snap
         .stats
         .rate
@@ -1903,14 +1881,15 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
         "the swapped-in interface converts: {rate:?}"
     );
     assert_eq!(
-        snap.chat
+        rate.lines()
             .iter()
-            .filter(|l| l.text.contains("converting playback 44.1 kHz to 48 kHz"))
+            .filter(|l| l.contains("converting playback 44.1 kHz to 48 kHz"))
             .count(),
         1,
-        "one disclosure line for the swap: {:?}",
-        snap.chat
+        "one disclosure for the swapped-in direction: {:?}",
+        rate.lines()
     );
+    assert_eq!(snap.audio_fault, None, "the stream is back");
     b.send(Command::Leave);
     wait_for(&b, "b idle", Duration::from_secs(3), |s| {
         s.stats.state == ConnState::Idle
@@ -1999,27 +1978,15 @@ fn a_device_the_reopen_cannot_open_says_so_in_the_snapshot() {
         "a refused device must not drop the session"
     );
     // A refusal is not an unplug and no fallback happened, so neither may be
-    // claimed: both were, before #327.
+    // claimed: both were, before #327. The device's own words are the whole
+    // of it, and nothing about it reaches the band's column.
     assert!(
-        !snap
-            .chat
-            .iter()
-            .any(|l| l.text.contains("disconnected") || l.text.contains("system default")),
-        "a refusal must not read as an unplug or a fallback: {:?}",
-        snap.chat
+        !reason.contains("disconnected") && !reason.contains("system default"),
+        "a refusal must not read as an unplug or a fallback: {reason}"
     );
-    let snap = wait_for(&rt, "the chat notice", Duration::from_secs(10), |s| {
-        s.chat
-            .iter()
-            .any(|l| l.text.contains("audio device refused"))
-    });
-    assert_eq!(
-        snap.chat
-            .iter()
-            .filter(|l| l.text == format!("audio device refused: {REFUSAL}"))
-            .count(),
-        1,
-        "said once, in the device's words: {:?}",
+    assert!(
+        snap.chat.is_empty(),
+        "a refusal is not something the app says in the room: {:?}",
         snap.chat
     );
 
@@ -2047,30 +2014,20 @@ fn a_reopen_that_finds_nothing_is_the_one_case_called_a_disconnection() {
     wait_for(&rt, "joined", Duration::from_secs(10), joined);
 
     let snap = wait_for(&rt, "the disconnection", Duration::from_secs(10), |s| {
-        s.chat
-            .iter()
-            .any(|l| l.text == "audio device disconnected; retrying")
+        s.device_error.is_some()
     });
     assert_eq!(
         snap.device_error.as_deref(),
-        Some("audio device is gone or was never present")
+        Some("audio device is gone or was never present"),
+        "a device that is gone is not a device that refused"
     );
-    assert!(
-        !snap.chat.iter().any(|l| l.text.contains("refused")),
-        "a device that is gone is not a device that refused: {:?}",
-        snap.chat
-    );
-    // Said once however many times the cadence retries it.
+    // The same words however many times the cadence retries it, because the
+    // state is the last failed open's own reason rather than a running tally.
     std::thread::sleep(Duration::from_millis(1_500));
     let snap = rt.snapshot();
     assert_eq!(
-        snap.chat
-            .iter()
-            .filter(|l| l.text.contains("disconnected"))
-            .count(),
-        1,
-        "{:?}",
-        snap.chat
+        snap.device_error.as_deref(),
+        Some("audio device is gone or was never present")
     );
 
     rt.send(Command::Leave);
@@ -2111,15 +2068,10 @@ fn a_stream_that_converts_one_direction_discloses_only_that_direction() {
         "the monitors are already at the session rate"
     );
 
-    // One line, for the direction that earned it.
-    let notices: Vec<&str> = snap
-        .chat
-        .iter()
-        .filter(|l| l.text.contains("converting"))
-        .map(|l| l.text.as_str())
-        .collect();
-    assert_eq!(notices.len(), 1, "{notices:?}");
-    assert!(notices[0].starts_with("converting capture 44.1 kHz to 48 kHz"));
+    // One disclosure, for the direction that earned it.
+    let lines = rate.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("converting capture 44.1 kHz to 48 kHz"));
 
     // And one direction's milliseconds. The buffer term is the negotiated
     // callback in session-rate frames: the 120-frame request against a
@@ -2144,7 +2096,7 @@ fn a_stream_that_converts_one_direction_discloses_only_that_direction() {
 /// rate, beside one that is carrying playback over its own. Neither costs the
 /// converter's latency, and the copy is not interchangeable, so what a
 /// musician reads about their machine depends on this pair surviving the whole
-/// way from the backend to chat.
+/// way from the backend to the Audio tab.
 #[test]
 fn a_moved_clock_and_an_os_converter_read_as_themselves() {
     let server = TestServer::start();
@@ -2166,22 +2118,18 @@ fn a_moved_clock_and_an_os_converter_read_as_themselves() {
     );
     assert_eq!(rate.added_ms(), 0.0, "neither rung runs a converter");
 
-    // The moved clock is announced, once: it is the one rung with a
-    // consequence outside this app, since every other program on that device
-    // is now hearing 48 kHz. The OS converter is hover-only.
+    // Both rungs are disclosed under the pickers in their own words: the moved
+    // clock has a consequence outside this app, since every other program on
+    // that device is now hearing 48 kHz, and the OS converter is the device's
+    // own rate winning.
+    let lines = rate.lines();
     assert_eq!(
-        snap.chat
-            .iter()
-            .filter(|l| l.text == "moved the capture device to 48 kHz (was 44.1)")
-            .count(),
-        1,
-        "{:?}",
-        snap.chat
-    );
-    assert!(
-        !snap.chat.iter().any(|l| l.text.contains("the OS is")),
-        "the OS converter belongs on the hover, not in the room: {:?}",
-        snap.chat
+        lines,
+        vec![
+            "moved the capture device to 48 kHz (was 44.1)".to_owned(),
+            "the OS is converting playback to this device's 44.1 kHz".to_owned(),
+        ],
+        "the copy per rung is not interchangeable"
     );
 
     // No converter, so mouth to ear carries no converter term, and the
@@ -2245,10 +2193,10 @@ fn a_name_set_after_join_reaches_every_roster() {
 
 /// The repro on #327, made honest: a mid-session device pick is refused. The
 /// runtime keeps the selection it was handed and retries exactly it, the
-/// refusal lands in chat once in the device's own words, and nothing claims
-/// the fallback the old code silently made. Before this, `applied_audio` and
-/// the pickers said the new device while the system default ran, for the rest
-/// of the session.
+/// refusal stands under the pickers in the device's own words for as long as it
+/// holds, and nothing claims the fallback the old code silently made. Before
+/// this, `applied_audio` and the pickers said the new device while the system
+/// default ran, for the rest of the session.
 #[test]
 fn a_refused_reconfigure_keeps_the_selection_and_says_why() {
     const REFUSAL: &str = "playback device runs at 44100 Hz and will not open at 48000 Hz \
@@ -2279,31 +2227,22 @@ fn a_refused_reconfigure_keeps_the_selection_and_says_why() {
         format!("unsupported audio configuration: {REFUSAL}"),
         "the refusal must carry the device's own words"
     );
-    let snap = wait_for(&rt, "the chat notice", Duration::from_secs(10), |s| {
-        s.chat
-            .iter()
-            .any(|l| l.text == format!("audio device refused: {REFUSAL}"))
-    });
     assert!(
-        !snap
-            .chat
-            .iter()
-            .any(|l| l.text.contains("disconnected") || l.text.contains("system default")),
-        "a refused pick must not be reported as an unplug or a fallback: {:?}",
-        snap.chat
+        !reason.contains("disconnected") && !reason.contains("system default"),
+        "a refused pick must not be reported as an unplug or a fallback: {reason}"
     );
 
-    // The cadence keeps retrying the same refused device; each distinct
-    // reason is said once, not once per attempt.
+    // The cadence keeps retrying the same refused device, and the reason on
+    // screen is the last failed open's own rather than one line per attempt.
     std::thread::sleep(Duration::from_millis(1_500));
     let snap = rt.snapshot();
     assert_eq!(
-        snap.chat
-            .iter()
-            .filter(|l| l.text.contains("audio device refused"))
-            .count(),
-        1,
-        "the retry cadence must not flood chat: {:?}",
+        snap.device_error.as_deref(),
+        Some(format!("unsupported audio configuration: {REFUSAL}").as_str())
+    );
+    assert!(
+        snap.chat.is_empty(),
+        "the retry cadence must leave the band's column alone: {:?}",
         snap.chat
     );
     assert_eq!(

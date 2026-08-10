@@ -1133,6 +1133,17 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
                 );
             });
         }
+        // Persists for as long as this computer has no audio stream, in the
+        // same danger ink for the same reason: nobody can hear a musician
+        // whose device is down. Whether the cadence is still trying and what
+        // to do about it are on the Audio tab, beside the pickers.
+        if snap.audio_fault.is_some() {
+            ui.label(
+                RichText::new("no audio")
+                    .size(9.5)
+                    .color(theme::danger_ink(p)),
+            );
+        }
         // Persists for as long as the playout ring is in a crackling run: in
         // danger ink rather than converting's muted one, because this is a
         // fault. The fix is a Buffer size pick, not something to say here, so

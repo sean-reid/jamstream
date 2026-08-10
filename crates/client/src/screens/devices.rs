@@ -4,7 +4,7 @@
 
 use egui::{ComboBox, Ui, vec2};
 
-use crate::runtime::LevelsView;
+use crate::runtime::{AudioFaultView, LevelsView};
 use crate::theme;
 use crate::widgets::{Meter, meter, pick_row};
 
@@ -192,17 +192,38 @@ impl Default for DevicesScreen {
 
 /// What the stream has to say for itself under the pickers: the refusal
 /// reason while there is no stream, the rate disclosures while there is
-/// one, and whether the playout ring is in a crackling run. All three are
-/// consequences of the pick, so they render beside the controls that made
-/// it.
+/// one, what the reopen cadence is doing, and whether the playout ring is in
+/// a crackling run. All four are consequences of the pick, so they render
+/// beside the controls that made it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamNotes<'a> {
     pub refusal: Option<&'a str>,
     pub rate_lines: &'a [String],
+    /// What the audio stream is doing wrong, while it is: the status bar's
+    /// tag says there is no audio, and this is the screen with the pick that
+    /// gets it back.
+    pub fault: Option<AudioFaultView>,
     /// Whether the playout ring is currently in a crackling run: while it
     /// holds, the fix is right here, so the notice sits beside Buffer size
     /// rather than only in the status bar's tag.
     pub crackling: bool,
+}
+
+/// The sentence a fault earns beside the pickers. A cadence still working
+/// asks for nothing; a cadence that has stopped asks for the one thing that
+/// starts it again, and says how many tries it took so a musician can tell a
+/// flapping device from a one-off.
+#[must_use]
+pub fn fault_line(fault: AudioFaultView) -> String {
+    match fault {
+        AudioFaultView::Retrying => {
+            "No audio: the stream stopped and is being reopened.".to_owned()
+        }
+        AudioFaultView::GaveUp { tries } => format!(
+            "No audio: the device did not stay open after {tries} tries. \
+             Pick a device to try again."
+        ),
+    }
 }
 
 /// What only exists once you have joined something: the mouth-to-ear figure
@@ -444,6 +465,15 @@ impl DevicesScreen {
             if let Some(reason) = notes.refusal {
                 ui.add_space(theme::SPACE_XS);
                 theme::reason(ui, reason);
+            }
+            // Under the refusal, because a device that gave a reason has
+            // already given it: what is left to say is whether anything is
+            // still being tried, and the pick that ends the wait is here.
+            // Opens with the word the status bar's tag carries, so the tag
+            // and the sentence read as one thing.
+            if let Some(fault) = notes.fault {
+                ui.add_space(theme::SPACE_XS);
+                theme::reason(ui, fault_line(fault));
             }
         });
         event
