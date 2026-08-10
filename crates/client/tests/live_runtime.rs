@@ -198,12 +198,36 @@ impl Drop for TestServer {
     }
 }
 
-/// What the device buffers cost mouth to ear for a stream whose negotiated
-/// callback is `frames` session-rate frames: the capture buffer, plus the
-/// playout cushion the top-up loop holds at two callbacks. Everything else in
-/// the figure is the link, priced by [`link_ms`] from the same snapshot.
-fn device_buffers_ms(frames: f32) -> f32 {
-    frames / 48.0 + 2.0 * frames / 48.0
+/// What the two device buffers cost mouth to ear, read off the same snapshot
+/// rather than derived from a callback size. The depth the top-up loop holds
+/// moves while the stream is open, so a figure computed from the callback is
+/// only right while nothing has deepened it. Everything else in the figure is
+/// the link, priced by [`link_ms`] from that snapshot.
+fn device_buffers_ms(snap: &Snapshot) -> f32 {
+    let device = snap
+        .stats
+        .device_buffers
+        .expect("a stream reports what its two device buffers cost");
+    // Pinned against the frames the control reports rather than taken on trust,
+    // because the figure and this breakdown are built from one pair: read alone
+    // it would agree with the sum whatever either said.
+    let cushion = snap
+        .stats
+        .cushion
+        .expect("a stream reports the depth it is holding");
+    assert!(
+        (device.capture_ms - cushion.callback_frames as f32 / 48.0).abs() < 0.01,
+        "the capture buffer reads {} ms against a {}-frame callback",
+        device.capture_ms,
+        cushion.callback_frames
+    );
+    assert!(
+        (device.playout_ms - cushion.held_frames as f32 / 48.0).abs() < 0.01,
+        "the playout buffer reads {} ms against {} frames held",
+        device.playout_ms,
+        cushion.held_frames
+    );
+    device.capture_ms + device.playout_ms
 }
 
 /// What the link costs mouth to ear, from the figures the snapshot reports
@@ -303,36 +327,90 @@ fn tail_rms(path: &Path, secs: f64) -> f64 {
     rms(&tail(path, secs).1)
 }
 
-/// The loudest `secs` window anywhere in a stereo capture file, with the
-/// file's rate: where a measurement of the session goes.
+/// Longest run of exact zeros a window may hold and still be the audio: under
+/// one device period, since padding fills a whole callback. Both the bound the
+/// session tests assert and the one [`loudest_of`] refuses a candidate by, which
+/// have to be the same number for a refused candidate to be the failing one.
+const SILENCE_ALLOWANCE: usize = 240;
+
+/// A window measured out of a capture, with the two counts that separate a gap
+/// in the audio from the silence the capture opens with.
+struct Measured {
+    /// The clock the capture was written on, which is the device's own.
+    rate: u32,
+    /// First frame of the window in the samples it was measured over.
+    start: usize,
+    /// Exact-zero samples those samples open with: the playout ring's prefill
+    /// and the jitter buffer's first fill, and nothing that played.
+    opening: usize,
+    window: Vec<f32>,
+}
+
+/// The loudest `secs` window anywhere in a stereo capture file: where a
+/// measurement of the session goes.
 ///
 /// A capture file spans from before the join to after the leave, so both ends
 /// hold silence the backend wrote while nothing played, and on a slow host that
 /// padding is longer than the window: measured 1.75 s at the front and 0.75 s
 /// at the back on a loaded Windows runner. Candidates step by a quarter window
 /// so one can land clear of the padding rather than straddling it, which a
-/// zero-run reading would not survive.
-fn loudest(path: &Path, secs: f64) -> (u32, Vec<f32>) {
+/// zero-run reading would not survive, and [`loudest_of`] refuses the ones that
+/// do straddle it.
+fn loudest(path: &Path, secs: f64) -> Measured {
     let (rate, samples) = rate_and_samples(path);
     assert!(samples.len() >= 2, "no samples to measure in {path:?}");
-    (rate, loudest_of(&samples, rate, secs))
+    loudest_of(&samples, rate, secs)
 }
 
-/// The loudest `secs` window of samples a caller already holds, for a
-/// measurement that has to start somewhere other than the top of the file.
-fn loudest_of(samples: &[f32], rate: u32, secs: f64) -> Vec<f32> {
+/// The same reading over samples a caller already holds, for a measurement that
+/// has to start somewhere other than the top of the file.
+///
+/// The loudest candidate that opens and closes on audio, and the loudest of all
+/// only when no candidate does, so a file of nothing but padding still reads as
+/// what it is. Stepping is not enough on its own: a healthy capture opens with a
+/// few tens of milliseconds of silence, under one percent of a one second
+/// window, so the window at the top of the file loses a fraction of a percent of
+/// level to it and wins whenever the audio elsewhere dips by as much.
+fn loudest_of(samples: &[f32], rate: u32, secs: f64) -> Measured {
     let frames = samples.len() / 2;
     let win = ((secs * f64::from(rate)) as usize).max(1);
+    let opening = leading_silence(samples);
     if frames <= win {
-        return samples.to_vec();
+        return Measured {
+            rate,
+            start: 0,
+            opening,
+            window: samples.to_vec(),
+        };
     }
     let start = (0..=frames - win)
         .step_by((win / 4).max(1))
-        .map(|f| (f, rms(&samples[f * 2..(f + win) * 2])))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|f| {
+            let window = &samples[f * 2..(f + win) * 2];
+            (f, opens_and_closes_on_audio(window), rms(window))
+        })
+        .max_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)))
         .expect("at least one window")
         .0;
-    samples[start * 2..(start + win) * 2].to_vec()
+    Measured {
+        rate,
+        start,
+        opening,
+        window: samples[start * 2..(start + win) * 2].to_vec(),
+    }
+}
+
+/// Whether a window holds padding at either end. A run at an edge is padding the
+/// window straddled; a run in the middle is a gap in the audio, which is what
+/// the session tests are asking about.
+fn opens_and_closes_on_audio(window: &[f32]) -> bool {
+    leading_silence(window) < SILENCE_ALLOWANCE
+        && window.iter().rev().take_while(|v| **v == 0.0).count() < SILENCE_ALLOWANCE
+}
+
+/// Exact-zero samples at the front of a buffer.
+fn leading_silence(samples: &[f32]) -> usize {
+    samples.iter().take_while(|v| **v == 0.0).count()
 }
 
 /// Samples from the first one that is not silent, and how many were skipped.
@@ -342,13 +420,13 @@ fn loudest_of(samples: &[f32], rate: u32, secs: f64) -> Vec<f32> {
 /// starting rather than a gap in it. Callers bound what they skip, because a
 /// long opening silence is a fault and must not be trimmed away.
 fn after_opening_silence(samples: &[f32]) -> (&[f32], usize) {
-    let skipped = samples.iter().take_while(|v| **v == 0.0).count();
+    let skipped = leading_silence(samples);
     (&samples[skipped..], skipped)
 }
 
 /// RMS of the loudest `secs` window anywhere in a capture file.
 fn loudest_rms(path: &Path, secs: f64) -> f64 {
-    rms(&loudest(path, secs).1)
+    rms(&loudest(path, secs).window)
 }
 
 /// Energy at one frequency, by Goertzel. Cheaper than a transform when the
@@ -436,6 +514,14 @@ fn pitch_hz(stereo: &[f32], rate: u32) -> f64 {
 /// 440 Hz tone with `front` and `back` seconds of the silence the backend
 /// writes while nothing is playing.
 fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
+    eased_fixture(label, front, back, 0.0)
+}
+
+/// The same file with the tone's level falling by `ease` of itself across the
+/// two seconds. A real capture's level drifts by a few percent between one
+/// second and the next, which is what lets the window at the top of a file
+/// outread the windows clear of its opening silence.
+fn eased_fixture(label: &str, front: f64, back: f64, ease: f64) -> PathBuf {
     let path = temp_path("padding", &format!("{label}.wav"));
     let mut writer = hound::WavWriter::create(
         &path,
@@ -451,7 +537,8 @@ fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
     for i in 0..quiet.0 + quiet.1 + (back * f64::from(RATE)) as usize {
         let s = match i.checked_sub(quiet.0) {
             Some(t) if t < quiet.1 => {
-                (t as f32 / RATE as f32 * 440.0 * std::f32::consts::TAU).sin() * 0.5
+                let level = 0.5 * (1.0 - ease as f32 * t as f32 / quiet.1 as f32);
+                (t as f32 / RATE as f32 * 440.0 * std::f32::consts::TAU).sin() * level
             }
             _ => 0.0,
         };
@@ -463,17 +550,6 @@ fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
     path
 }
 
-/// What makes a loudest-window reading evidence rather than a substitution that
-/// happens to pass: the three readings the session tests take, on a file with
-/// the padding a loaded Windows runner profiled around its audio, 1.75 s at the
-/// front and 0.75 s at the back.
-///
-/// The tail of the same file is what the padding costs. At the padding as
-/// profiled it holds three quarters of a second of exact zeros, which is the
-/// silence-run assertion failing on a session that was healthy; one step slower
-/// than that and the window is padding outright, with no level in it and a
-/// pitch of nothing. That is the shape of the run in #464, which read 6 in its
-/// last second against 8290 in its loudest.
 /// The shape a loaded runner produced: nearly two seconds of silence while the
 /// reopen got media flowing, then unbroken music. The reading has to be of the
 /// music, and how long the machine took to start is not the test's business.
@@ -489,7 +565,7 @@ fn a_slow_start_still_reads_the_music_that_followed() {
         music.len() >= second,
         "a second of tone follows, and it is what gets measured"
     );
-    let window = loudest_of(music, rate, 1.0);
+    let window = loudest_of(music, rate, 1.0).window;
     assert!(rms(&window) > 0.02, "the window reads {}", rms(&window));
     assert_eq!(longest_zero_run(&window), 0, "the window holds the silence");
 
@@ -513,14 +589,13 @@ fn a_measurement_starts_after_the_period_a_device_open_costs() {
         "the fixture opens with one period, and the count read {opening}"
     );
     assert_eq!(
-        longest_zero_run(&loudest_of(music, rate, 1.0)),
+        longest_zero_run(&loudest_of(music, rate, 1.0).window),
         0,
         "the measured window still holds the silence the open wrote"
     );
 
-    // The window taken from the top of the file is what used to be measured,
-    // and it carries the whole opening period, so the bound the swap test
-    // applies really does depend on starting after it.
+    // A window taken from the top of the file carries the whole opening period,
+    // so the bound the swap test applies depends on starting after it.
     assert_eq!(
         longest_zero_run(&all[..period]),
         period,
@@ -541,18 +616,57 @@ fn a_measurement_starts_after_the_period_a_device_open_costs() {
     let _ = std::fs::remove_file(&slow);
 }
 
+/// What makes a loudest-window reading evidence rather than a substitution that
+/// happens to pass: the three readings the session tests take, over the openings
+/// a capture file really has.
+///
+/// Both ends as a loaded Windows runner profiled them, 1.75 s at the front and
+/// 0.75 s at the back, and the opening a session leaves on an idle machine, which
+/// is the playout ring's prefill plus the jitter buffer's first fill and measures
+/// 720 to 2160 samples in the tests below. The small opening is the case that
+/// decides the reading, because it costs the window at the top of the file well
+/// under one percent of its level.
+///
+/// The tone eases off across each file, which is what a real capture's level
+/// does between one second and the next. Against a flat tone every window clear
+/// of the opening reads higher than the one carrying it and no reading can be
+/// wrong, so a flat fixture would leave the small opening covered in name only.
+///
+/// The tail of the same file is what the padding costs. At the padding as
+/// profiled it holds three quarters of a second of exact zeros, which is the
+/// silence-run assertion failing on a session that was healthy; one step slower
+/// than that and the window is padding outright, with no level in it and a
+/// pitch of nothing. That is the shape of the run in #464, which read 6 in its
+/// last second against 8290 in its loudest.
 #[test]
 fn a_measurement_reads_the_audio_and_not_the_padding_around_it() {
-    for (label, back) in [("as-profiled", 0.75), ("a-slower-leave", 1.25)] {
-        let path = padded_fixture(label, 1.75, back);
+    for (label, front, back) in [
+        ("as-profiled", 1.75, 0.75),
+        ("a-slower-leave", 1.75, 1.25),
+        ("as-a-session-opens", 720.0 / 2.0 / f64::from(RATE), 0.75),
+    ] {
+        let path = eased_fixture(label, front, back, 0.2);
 
-        let (rate, window) = loudest(&path, 1.0);
-        assert_eq!(rate, RATE);
-        let level = rms(&window);
+        let heard = loudest(&path, 1.0);
+        assert_eq!(heard.rate, RATE);
+        // Where the reading landed, before what it holds: a window that starts
+        // at the top of a file whose opening is longer than the allowance is
+        // reading the opening, whatever else it also holds.
+        assert!(
+            heard.start * 2 + SILENCE_ALLOWANCE >= heard.opening,
+            "the loudest second starts at frame {} of a file whose opening \
+             silence runs {} samples",
+            heard.start,
+            heard.opening
+        );
+        let level = rms(&heard.window);
         assert!(level > 0.02, "the loudest second reads {level}");
-        let run = longest_zero_run(&window);
-        assert!(run < 240, "the loudest second straddles the padding: {run}");
-        let hz = pitch_hz(&window, rate);
+        let run = longest_zero_run(&heard.window);
+        assert!(
+            run < SILENCE_ALLOWANCE,
+            "the loudest second straddles the padding: {run}"
+        );
+        let hz = pitch_hz(&heard.window, heard.rate);
         assert!(
             (hz - 440.0).abs() < 20.0,
             "the loudest second reads {hz} Hz"
@@ -567,7 +681,7 @@ fn a_measurement_reads_the_audio_and_not_the_padding_around_it() {
         if back > 1.0 {
             let level = rms(&last);
             assert!(level < 0.001, "a tail of pure padding reads {level}");
-            let hz = pitch_hz(&last, rate);
+            let hz = pitch_hz(&last, heard.rate);
             assert!(
                 (hz - 440.0).abs() > 20.0,
                 "a tail of pure padding reads {hz} Hz, which would pass the bound"
@@ -700,7 +814,7 @@ fn the_figure_and_its_hover_carry_the_playout_cushion() {
 
         let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
         let link = link_ms(&snap);
-        let device_ms = device_buffers_ms(frames as f32);
+        let device_ms = device_buffers_ms(&snap);
         assert!(
             (m2e - link - device_ms).abs() < 0.01,
             "at {frames}-frame callbacks mouth to ear {m2e} ms must carry \
@@ -782,7 +896,7 @@ fn the_figure_charges_the_buffer_the_server_reports() {
 
     let depth = snap.stats.uplink_jitter_depth.expect("the predicate held");
     let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
-    let device_ms = device_buffers_ms(settings().buffer_frames as f32);
+    let device_ms = device_buffers_ms(&snap);
     assert!(
         (m2e - link_ms(&snap) - device_ms).abs() < 0.01,
         "mouth to ear {m2e} ms must be the terms beside it, the server's \
@@ -927,7 +1041,7 @@ fn hear_self_puts_your_own_tone_in_your_own_playout() {
     // effect and read A's own tone as absent.
     let (rate_a, all_a) = rate_and_samples(&out_a);
     let back_a = &all_a[(all_a.len() / 4) * 2..];
-    let window_a = loudest_of(back_a, rate_a, 1.0);
+    let window_a = loudest_of(back_a, rate_a, 1.0).window;
     let mono_a = left(&window_a);
     let own_in_a = tone_energy(&mono_a, rate_a, 440.0);
     let other_in_a = tone_energy(&mono_a, rate_a, 660.0);
@@ -944,7 +1058,7 @@ fn hear_self_puts_your_own_tone_in_your_own_playout() {
 
     let (rate_b, all_b) = rate_and_samples(&out_b);
     let back_b = &all_b[(all_b.len() / 4) * 2..];
-    let window_b = loudest_of(back_b, rate_b, 1.0);
+    let window_b = loudest_of(back_b, rate_b, 1.0).window;
     let mono_b = left(&window_b);
     let own_in_b = tone_energy(&mono_b, rate_b, 660.0);
     let other_in_b = tone_energy(&mono_b, rate_b, 440.0);
@@ -1408,7 +1522,7 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     // The back half only. The loudest second of the whole file would be the
     // second before the swap, so a lost uplink would read as a pass.
     let back = &all[(frames / 2) * 2..];
-    let window = loudest_of(back, rate, 1.0);
+    let window = loudest_of(back, rate, 1.0).window;
     let heard = tone_energy(left(&window).as_slice(), rate, 660.0);
     assert!(
         heard > TONE_FLOOR,
@@ -1696,108 +1810,6 @@ fn longest_zero_run(samples: &[f32]) -> usize {
     longest
 }
 
-/// How often [`steady_state`] samples. The water mark and the wake pacing are
-/// each republished once a second and the reading stands until the next window
-/// closes, so a poll well inside a second cannot miss one.
-const PLAYOUT_POLL: Duration = Duration::from_millis(100);
-
-/// Why a silence run happened, from the snapshot figures behind it.
-///
-/// They answer the question in order. The jitter figures and the downlink loss
-/// say whether the media the ring wanted had arrived at all. The wake pacing
-/// says whether the thread that fills the ring was scheduled in time to move it.
-/// The water mark says whether the ring still had audio in it when the device
-/// asked, which is the one that separates a ring that emptied from a mix that
-/// was already silent: underrun padding is the only thing that writes zeros into
-/// a device buffer this app filled.
-///
-/// A cushion held deeper than its base is a reading in itself, because the
-/// top-up loop only deepens one that has been coming close to empty.
-#[derive(Clone, Copy, Default)]
-struct PlayoutLow {
-    /// Closest the ring came to empty, in frames, and the cushion and jitter
-    /// buffer the snapshot that read it carried.
-    low_frames: Option<usize>,
-    held_frames: Option<usize>,
-    base_frames: Option<usize>,
-    jitter_depth: usize,
-    jitter_target: usize,
-    /// Whether the ring was ever in a run of underruns dense enough to hear.
-    crackling: bool,
-    /// Longest gap between wakeups of the thread that fills the ring, and the
-    /// bucket the 99th percentile of those gaps fell in. The bucket is a tick
-    /// wide and rounds up, so it can read above an exact maximum.
-    wake_max_ms: f32,
-    wake_p99_ms: f32,
-    downlink_loss_pct: f32,
-}
-
-impl PlayoutLow {
-    fn fold(&mut self, snap: &Snapshot) {
-        let stats = &snap.stats;
-        if let Some(low) = stats.playout_low_frames
-            && self.low_frames.is_none_or(|worst| low < worst)
-        {
-            self.low_frames = Some(low);
-            self.held_frames = stats.cushion.map(|c| c.held_frames);
-            self.base_frames = stats.cushion.map(|c| c.base_frames);
-            self.jitter_depth = stats.jitter_depth;
-            self.jitter_target = stats.jitter_target;
-        }
-        self.crackling |= stats.crackling;
-        if let Some(wake) = stats.wake {
-            self.wake_max_ms = self.wake_max_ms.max(wake.max_ms);
-            self.wake_p99_ms = self.wake_p99_ms.max(wake.p99_ms);
-        }
-        self.downlink_loss_pct = self
-            .downlink_loss_pct
-            .max(stats.downlink_loss_pct.unwrap_or(0.0));
-    }
-}
-
-impl std::fmt::Display for PlayoutLow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let frames = |n: Option<usize>| n.map_or("--".to_owned(), |n| n.to_string());
-        write!(
-            f,
-            "the ring's low water mark was {} frames of the cushion's {} (base {}), \
-             with the jitter buffer {} frames deep of {}; crackling {}; wake max {:.1} ms \
-             and p99 bucket {:.1} ms; downlink loss {:.1}%",
-            frames(self.low_frames),
-            frames(self.held_frames),
-            frames(self.base_frames),
-            self.jitter_depth,
-            self.jitter_target,
-            if self.crackling { "yes" } else { "no" },
-            self.wake_max_ms,
-            self.wake_p99_ms,
-            self.downlink_loss_pct,
-        )
-    }
-}
-
-/// Holds a session for `how_long` of steady state and returns the worst playout
-/// reading each runtime given held over it.
-///
-/// Sampled as the session runs rather than read once it is over, because every
-/// figure in [`PlayoutLow`] covers the last window and the stream drops all of
-/// them when it closes: read after the leave, at the point the recording is
-/// judged, there is nothing left to read. The last window a stream opens never
-/// closes either, so what comes back is the worst of the closed ones.
-fn steady_state<const N: usize>(rts: [&LiveRuntime; N], how_long: Duration) -> [PlayoutLow; N] {
-    let deadline = Instant::now() + how_long;
-    let mut worst = [PlayoutLow::default(); N];
-    loop {
-        for (low, rt) in worst.iter_mut().zip(rts) {
-            low.fold(&rt.snapshot());
-        }
-        if Instant::now() >= deadline {
-            return worst;
-        }
-        std::thread::sleep(PLAYOUT_POLL);
-    }
-}
-
 /// WASAPI shared mode, end to end: the settings ask for 120-frame buffers,
 /// both devices ignore that and call back at a 480-frame period, and the
 /// audio still crosses intact. Before #323 the ring was sized from the
@@ -1829,7 +1841,7 @@ fn a_device_period_larger_than_the_request_still_carries_audio() {
         joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
     });
 
-    let [low] = steady_state([&b], Duration::from_millis(2_500));
+    std::thread::sleep(Duration::from_millis(2_500));
     b.send(Command::Leave);
     wait_for(&b, "b idle", Duration::from_secs(3), |s| {
         s.stats.state == ConnState::Idle
@@ -1837,9 +1849,9 @@ fn a_device_period_larger_than_the_request_still_carries_audio() {
     drop(b);
     drop(a);
 
-    let (_, window) = loudest(&out_b, 1.0);
+    let heard = loudest(&out_b, 1.0);
     // A's sine arrived at all (capture side made it through the ring)...
-    let energy = rms(&window);
+    let energy = rms(&heard.window);
     assert!(
         energy > 0.02,
         "b's loudest second is near-silence (rms {energy}); a's audio never arrived"
@@ -1847,11 +1859,14 @@ fn a_device_period_larger_than_the_request_still_carries_audio() {
     // ...and B's render never went hungry: an undersized ring pads ~480
     // zeros per callback, so anything close to that run length is padding,
     // not music.
-    let run = longest_zero_run(&window);
+    let run = longest_zero_run(&heard.window);
     assert!(
-        run < 240,
+        run < SILENCE_ALLOWANCE,
         "steady-state playout contains a {run}-sample silence run; the ring \
-         underran. While it ran, {low}"
+         underran. The second measured starts at frame {}, and the capture's \
+         own opening silence is {} samples",
+        heard.start,
+        heard.opening
     );
 
     for p in [&sine, &out_b] {
@@ -1893,7 +1908,7 @@ fn a_44_1_interface_carries_the_session_both_ways() {
         joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
     });
 
-    let [low] = steady_state([&b], Duration::from_millis(2_500));
+    std::thread::sleep(Duration::from_millis(2_500));
     b.send(Command::Leave);
     wait_for(&b, "b idle", Duration::from_secs(3), |s| {
         s.stats.state == ConnState::Idle
@@ -1901,20 +1916,23 @@ fn a_44_1_interface_carries_the_session_both_ways() {
     drop(b);
     drop(a);
 
-    let (rate, window) = loudest(&out_b, 1.0);
-    assert_eq!(rate, 44_100, "b's device writes on its own clock");
-    let energy = rms(&window);
+    let heard = loudest(&out_b, 1.0);
+    assert_eq!(heard.rate, 44_100, "b's device writes on its own clock");
+    let energy = rms(&heard.window);
     assert!(
         energy > 0.02,
         "b's loudest second is near-silence (rms {energy}); a's audio never arrived"
     );
-    let run = longest_zero_run(&window);
+    let run = longest_zero_run(&heard.window);
     assert!(
-        run < 240,
-        "steady-state playout contains a {run}-sample silence run. While it ran, \
-         {low}"
+        run < SILENCE_ALLOWANCE,
+        "steady-state playout contains a {run}-sample silence run. The second \
+         measured starts at frame {}, and the capture's own opening silence is \
+         {} samples",
+        heard.start,
+        heard.opening
     );
-    let hz = pitch_hz(&window, rate);
+    let hz = pitch_hz(&heard.window, heard.rate);
     assert!(
         (hz - 440.0).abs() < 20.0,
         "the sine crossed two conversions off pitch: {hz:.1} Hz"
@@ -1974,7 +1992,7 @@ fn a_44_1_host_and_a_native_joiner_hear_each_other() {
         );
     }
 
-    let [host_low, joiner_low] = steady_state([&host, &joiner], Duration::from_millis(2_500));
+    std::thread::sleep(Duration::from_millis(2_500));
     // Neither side may be reported quiet: a quiet member is the server saying
     // it has heard nothing from them, which is a different fault from a mix
     // that drops what did arrive.
@@ -1999,19 +2017,20 @@ fn a_44_1_host_and_a_native_joiner_hear_each_other() {
     // Each side's playout must carry the other's tone and not its own: the
     // personal mix excludes self, so the wrong tone would mean a mix fault
     // rather than a transport one.
-    for (path, who, mine, theirs, device_rate, low) in [
-        (&out_host, "host", HOST_HZ, JOINER_HZ, 44_100, host_low),
-        (&out_joiner, "joiner", JOINER_HZ, HOST_HZ, RATE, joiner_low),
+    for (path, who, mine, theirs, device_rate) in [
+        (&out_host, "host", HOST_HZ, JOINER_HZ, 44_100),
+        (&out_joiner, "joiner", JOINER_HZ, HOST_HZ, RATE),
     ] {
-        let (rate, window) = loudest(path, 1.0);
+        let heard = loudest(path, 1.0);
+        let (rate, window) = (heard.rate, &heard.window);
         assert_eq!(rate, device_rate, "{who} writes on its own device clock");
-        let energy = rms(&window);
+        let energy = rms(window);
         assert!(
             energy > 0.02,
             "{who}'s loudest second is near-silence (rms {energy}); the other \
              member's audio never arrived"
         );
-        let mono = left(&window);
+        let mono = left(window);
         let wanted = tone_energy(&mono, rate, theirs);
         let leaked = tone_energy(&mono, rate, mine);
         assert!(
@@ -2019,11 +2038,14 @@ fn a_44_1_host_and_a_native_joiner_hear_each_other() {
             "{who} played {mine} Hz at {leaked:.1} against {theirs} Hz at {wanted:.1}: \
              that is its own signal, not the other member's"
         );
-        let run = longest_zero_run(&window);
+        let run = longest_zero_run(window);
         assert!(
-            run < 240,
+            run < SILENCE_ALLOWANCE,
             "{who}'s steady-state playout contains a {run}-sample silence run. \
-             While it ran, {low}"
+             The second measured starts at frame {}, and the capture's own \
+             opening silence is {} samples",
+            heard.start,
+            heard.opening
         );
     }
 
@@ -2090,7 +2112,7 @@ fn a_converting_stream_discloses_itself_and_prices_the_latency() {
     // callback in session-rate frames: the 120-frame request on a 44.1 kHz
     // device is ceil(120 * 160/147) = 131.
     let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
-    let link = link_ms(&snap) + device_buffers_ms(131.0);
+    let link = link_ms(&snap) + device_buffers_ms(&snap);
     let disclosed = capture_ms + playback_ms;
     assert!(
         (m2e - link - disclosed).abs() < 0.01,
@@ -2391,7 +2413,7 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
 
     // Two seconds of the room through the swapped-in interface. The reopen
     // recreated the capture file, so everything in it is post-swap audio.
-    let [low] = steady_state([&b], Duration::from_millis(2_000));
+    std::thread::sleep(Duration::from_millis(2_000));
     let snap = b.snapshot();
     assert_eq!(
         snap.stats.state,
@@ -2453,19 +2475,21 @@ fn a_44_1_interface_swapped_in_mid_song_keeps_the_music_playing() {
         opening as f64 / 2.0 / f64::from(rate),
         tone_profile(&out_b, 440.0)
     );
-    let window = loudest_of(music, rate, 1.0);
-    let energy = rms(&window);
+    let heard = loudest_of(music, rate, 1.0);
+    let energy = rms(&heard.window);
     assert!(
         energy > 0.02,
         "b's loudest second after the swap is near-silence (rms {energy})"
     );
-    let run = longest_zero_run(&window);
+    let run = longest_zero_run(&heard.window);
     assert!(
-        run < 240,
-        "post-swap playout contains a {run}-sample silence run. While it ran, \
-         {low}"
+        run < SILENCE_ALLOWANCE,
+        "post-swap playout contains a {run}-sample silence run. The second \
+         measured starts at frame {} of the audio that followed the capture's \
+         {opening}-sample opening silence",
+        heard.start
     );
-    let hz = pitch_hz(&window, rate);
+    let hz = pitch_hz(&heard.window, rate);
     assert!(
         (hz - 440.0).abs() < 20.0,
         "a's sine arrived off pitch: {hz:.1} Hz"
@@ -2614,7 +2638,7 @@ fn a_stream_that_converts_one_direction_discloses_only_that_direction() {
     // negotiated callback in session-rate frames: the 120-frame request against
     // a 44.1 kHz capture endpoint is ceil(120 * 160/147) = 131.
     let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
-    let link = link_ms(&snap) + device_buffers_ms(131.0);
+    let link = link_ms(&snap) + device_buffers_ms(&snap);
     assert!(
         (m2e - link - capture_ms).abs() < 0.01,
         "mouth to ear {m2e} ms must carry the converted direction's \
@@ -2671,7 +2695,7 @@ fn a_moved_clock_and_an_os_converter_read_as_themselves() {
     // No converter, so mouth to ear carries no converter term, and both device
     // buffers are sized from the plain 120-frame request.
     let m2e = snap.stats.mouth_to_ear_ms().expect("the predicate held");
-    let link = link_ms(&snap) + device_buffers_ms(120.0);
+    let link = link_ms(&snap) + device_buffers_ms(&snap);
     assert!((m2e - link).abs() < 0.01, "mouth to ear {m2e} ms");
 
     rt.send(Command::Leave);
@@ -2967,8 +2991,9 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
     // reason, so each side has to have heard the other's tone. The personal mix
     // excludes self, so the tone measured is the one that crossed the wire.
     for (out, theirs, mine) in [(&out_a, 660.0, 440.0), (&out_b, 440.0, 660.0)] {
-        let (rate, window) = loudest(out, 1.0);
-        let mono = left(&window);
+        let measured = loudest(out, 1.0);
+        let rate = measured.rate;
+        let mono = left(&measured.window);
         assert!(
             mono.len() >= rate as usize / 2,
             "{out:?} holds {} frames at {rate} Hz, under half a second, so there \
