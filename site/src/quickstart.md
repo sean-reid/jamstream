@@ -118,8 +118,8 @@ musician 1   jamstream://join/r6edH1LCtlT3vPPiILRRVAEACgAAAcrRAjiW...
 End the session with: jamstream end 3f2a9c01
 
 $ jamstream status
-SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED
-3f2a9c01   digitalocean/nyc3    running    1 h 04 min    $0.028576 $0.08037 at 3.0 h
+SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED TAKES
+3f2a9c01   digitalocean/nyc3    running  1 h 04 min    $0.028576 $0.08037 at 3.0 h -
 
 $ jamstream end 3f2a9c01
 Session 3f2a9c01 ended. Instance 512190713 is destroyed.

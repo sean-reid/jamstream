@@ -4,7 +4,7 @@ A session costs machine time plus network traffic, paid to your cloud provider. 
 
 This page covers how the preview is computed, what egress is, and the guardrails that keep a mistake from costing more than a coffee.
 
-Local sessions cost nothing: hosting on this computer (the wizard's local row, or `--provider local` in the CLI) rents no machine and meters no egress. The preview says so in one line.
+Local sessions cost nothing: hosting on this computer (the wizard's local row, or `--provider local` in the CLI) rents no machine and meters no egress, and the preview says so instead of pricing anything.
 
 The only guardrail a local session needs is the idle exit, since a forgotten process bills nobody. The rest of this page is about the cloud providers.
 
@@ -14,10 +14,10 @@ Before anything launches, the app's wizard and `jamstream host` show the same pr
 
 ```text
 Cost preview for digitalocean nyc3 over 3.0 hours:
-VM $0.02679/hr x 3.0 h                            $0.08037
-Egress estimate 1.62 GB at $0.01/GB                $0.0162
-Included egress credit (3000 GB free)             -$0.0162
-Total (estimate)                                  $0.08037
+VM $0.02679/hr x 3.0 h                           $0.08037
+Egress estimate 1.62 GB at $0.01/GB               $0.0162
+Included egress credit (3000 GB free)            -$0.0162
+Total (estimate)                                 $0.08037
 ```
 
 | Line | What it means |
@@ -30,7 +30,7 @@ Total (estimate)                                  $0.08037
 |---|---|
 | DigitalOcean droplets | thousands of GB |
 | AWS | 100 GB per month |
-| GCP | close to nothing |
+| GCP | none |
 
 Four musicians for three hours is about 1.6 GB; add a Twitch or YouTube destination and it is about 5.2 GB.
 
@@ -95,11 +95,11 @@ Both lines are in the preview before you launch, in the wizard and in `jamstream
 
 ## The guardrails
 
-Three, all on by default.
+Two timers set at launch, then a ticker and a sweeper.
 
 | Guardrail | Default | What it does |
 |---|---|---|
-| Idle timeout (`--idle-min`) | 10 minutes | Shuts the server down once no musicians are connected. |
+| Idle exit (`--idle-min`) | 10 minutes | Shuts the server down once no musicians are connected. |
 | Hard cap (`--max-hours`) | 12 hours | Destroys the server no matter what, enforced on the machine itself, not by your laptop. |
 
 GCP is the exception, and it costs money if you walk away. There the idle window stops the server but cannot delete the machine, so an abandoned session keeps billing until the hard cap.
@@ -125,8 +125,8 @@ Plus cents of egress.
 ```console
 $ jamstream status
 SESSION    PROVIDER/REGION      STATUS      ELAPSED      ACCRUED      PROJECTED TAKES
-3f2a9c01   digitalocean/nyc3    running   1 h 04 min    $0.028576 $0.08037 at 3.0 h our-jams +stems
-b7e5c9b6   local/local          ended     2 h 13 min        $0.00              - -
+3f2a9c01   digitalocean/nyc3    running  1 h 04 min    $0.028576 $0.08037 at 3.0 h our-jams +stems
+b7e5c9b6   local/local          ended    2 h 13 min        $0.00              - -
 ```
 
 Accrued is hourly rate times elapsed time; it stops when the session ends. TAKES is the bucket the session recorded to, if it recorded to one; a take on your own disk shows a dash and lives in the folder [Recording a session](recording.md#on-this-computer) names.
