@@ -10,8 +10,8 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use jamstream_client::creds::MemStore;
 use jamstream_client::demo::{DemoRuntime, FROZEN_FRAME, RecordingRuntime};
 use jamstream_client::runtime::{
-    AudioFaultView, BroadcastReadiness, Command, DestinationState, MemberId, RecordState, Runtime,
-    Snapshot,
+    AudioFaultView, BroadcastReadiness, Command, CushionView, DestinationState, MemberId,
+    RecordState, Runtime, Snapshot,
 };
 use jamstream_client::screens::destinations::DestinationsPanel;
 use jamstream_client::screens::session::{SessionScreen, SettingsTab};
@@ -2147,23 +2147,190 @@ fn a_device_that_keeps_cutting_out_shows_in_the_bar_and_on_the_audio_tab() {
 /// is doing pinned: the fault at this instant, and the stops behind a device
 /// that keeps losing the stream. Those are the surfaces that have to agree.
 fn device_harness(fault: Option<AudioFaultView>, cutting_out: Option<u64>) -> Harness<'static> {
+    audio_tab_harness(None, |demo| {
+        demo.set_audio_fault(fault);
+        demo.set_cutting_out(cutting_out);
+    })
+}
+
+/// The session shell with the drawer open on the Audio tab and one thing about
+/// the stream pinned, since every state this tab draws is one the real runtime
+/// derives from a device or a ring no fixture runs. `settings` is where the
+/// audio picks get written, for a test that asks whether a pick took.
+fn audio_tab_harness(
+    settings: Option<std::path::PathBuf>,
+    pin: impl FnOnce(&DemoRuntime),
+) -> Harness<'static> {
     use jamstream_client::app::{JamApp, Screen};
 
     let demo = DemoRuntime::frozen(FROZEN_FRAME, false);
-    demo.set_audio_fault(fault);
-    demo.set_cutting_out(cutting_out);
+    pin(&demo);
     let mut app = JamApp::in_memory();
     app.recent = Vec::new();
     app.runtime = Some(Box::new(demo));
     app.screen = Screen::Session;
     app.settings_open = true;
     app.settings_tab = SettingsTab::Audio;
+    app.settings_path = settings;
     Harness::builder()
         .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
         .build_ui(move |ui| {
             theme::apply(ui.ctx(), Theme::Dark);
             app.root_ui(ui);
         })
+}
+
+/// A cushion held at a depth, as the controller reports one: the depth now, the
+/// depth the buffer size asks for at twice the callback, and whether it has run
+/// out of room to go deeper.
+fn held_cushion(held_frames: usize, callback_frames: usize, out_of_room: bool) -> CushionView {
+    CushionView {
+        held_frames,
+        base_frames: 2 * callback_frames,
+        callback_frames,
+        out_of_room,
+    }
+}
+
+/// What the buffer control says about the depth under it, which is not always
+/// the depth the pick implies. Both answers matter: a machine that keeps up has
+/// to read as nothing overriding the pick, because that is the common case and a
+/// person who chose a size is entitled to know it is the one they are getting.
+#[test]
+fn the_buffer_control_says_what_the_cushion_is_holding_and_whether_anything_moved_it() {
+    let mut harness = audio_tab_harness(None, |demo| {
+        demo.set_cushion(Some(held_cushion(240, 120, false)));
+    });
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("Cushion: 5.0 ms, what this buffer size asks for")
+            .is_some(),
+        "a cushion at the depth the pick asks for has to say the pick is what is running"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("Nothing is deepening it")
+            .is_some(),
+        "the half that says nothing is overriding the pick"
+    );
+
+    // The same control with a deeper cushion under it: the depth, that something
+    // put it there, and that nobody has to undo it.
+    let mut harness = audio_tab_harness(None, |demo| {
+        demo.set_cushion(Some(held_cushion(360, 120, false)));
+    });
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("Cushion: 7.5 ms, deeper than this buffer size asks for")
+            .is_some(),
+        "a cushion past the pick has to say how deep it is holding"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("comes back on its own")
+            .is_some(),
+        "and that it hands the latency back itself"
+    );
+
+    // And no stream is no cushion: nothing is being held, so nothing is said
+    // about a depth, and the tab is the same tab it always was.
+    let mut harness = audio_tab_harness(None, |_| {});
+    harness.run_steps(4);
+    assert!(
+        harness.query_by_label_contains("Cushion:").is_none(),
+        "a stream that is not open costs nobody a cushion"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("is the next size up")
+            .is_none(),
+        "and nothing may ask for a device reopen on no evidence"
+    );
+}
+
+/// The one place the automatic depth hands back to the pick. A cushion out of
+/// room names the next size up, says what taking it costs, and takes it only
+/// when somebody clicks the row: the reopen it asks for is a few hundred
+/// milliseconds of capture the band hears as a hole, so nothing does it on their
+/// behalf. It speaks over the crackling notice, which asks for nothing now.
+#[test]
+fn a_cushion_out_of_room_offers_the_next_size_up_and_the_pick_is_what_takes_it() {
+    // A private subdirectory, not temp_dir() itself: the settings writer refuses
+    // a world-writable parent, and Linux's /tmp is one.
+    let dir = std::env::temp_dir().join(format!("jamstream-cushion-offer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    let path = dir.join("settings.json");
+
+    let mut harness = audio_tab_harness(Some(path.clone()), |demo| {
+        demo.set_cushion(Some(held_cushion(480, 120, true)));
+        demo.set_crackling(true);
+    });
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains("Cushion: 10.0 ms, as deep as this buffer size allows")
+            .is_some(),
+        "the depth that has run out of room has to say it is out of room"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("240 frames (5.0 ms) is the next size up")
+            .is_some(),
+        "the offer is the next size up, named"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("costs the band a few hundred milliseconds of you")
+            .is_some(),
+        "what the reopen costs is part of the offer, not a surprise after it"
+    );
+    assert!(
+        harness.query_by_label_contains("Crackling:").is_none(),
+        "one sentence under the control: the offer is where this run ends"
+    );
+
+    // Taken when they choose, on the control right above the sentence. Nothing
+    // reopened the device until this click.
+    harness
+        .get_by_role_and_label(AkRole::RadioButton, "240 frames (5.0 ms)")
+        .click_accesskit();
+    harness.run_steps(4);
+    let saved = std::fs::read_to_string(&path).expect("the pick has to write settings.json");
+    assert!(
+        saved.contains("\"buffer_frames\": 240"),
+        "the size the offer named is the size the click applies: {saved}"
+    );
+
+    // With room left, the same run says the cushion is covering it and asks for
+    // nothing: the reopen is the last resort, not the first advice.
+    let mut harness = audio_tab_harness(None, |demo| {
+        demo.set_cushion(Some(held_cushion(360, 120, false)));
+        demo.set_crackling(true);
+    });
+    harness.run_steps(4);
+    assert!(
+        harness
+            .query_by_label_contains(jamstream_client::screens::devices::CRACKLING_NOTICE)
+            .is_some(),
+        "a run somebody can hear is still worth saying"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("is the next size up")
+            .is_none(),
+        "a cushion with room left may not ask for a device reopen"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The offer to hear yourself, from the one state on the snapshot: on the

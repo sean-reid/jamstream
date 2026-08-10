@@ -1047,6 +1047,7 @@ impl JamApp {
                     fault: snap.and_then(|s| s.audio_fault),
                     cutting_out: snap.and_then(|s| s.stats.cutting_out),
                     crackling: snap.is_some_and(|s| s.stats.crackling),
+                    cushion: snap.and_then(|s| s.stats.cushion),
                 };
                 let session = SessionAudio {
                     mouth_to_ear_ms: m2e,
