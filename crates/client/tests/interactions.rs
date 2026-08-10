@@ -612,9 +612,14 @@ fn the_settings_drawer_fits_the_window_and_clears_the_readouts() {
                 .next()
                 .unwrap_or_else(|| panic!("{label} is not in the panel at {size:?}"))
                 .rect();
+            // Not below the fold, which is the reachable part. Above the body
+            // is a row the scroll went past, and a panel scrolled to its end
+            // always has some of those, so containment cannot hold for two rows
+            // at once and would only be asserting where the scroll stopped.
             assert!(
-                body.contains_rect(rect),
-                "{label} at {rect:?} is out of reach in the drawer's body at {body:?}, \
+                rect.bottom() <= body.bottom(),
+                "{label} at {rect:?} is still below the drawer's body at {body:?} \
+                 after the scroll, so the end of the panel cannot be reached, \
                  window {size:?}"
             );
         }
