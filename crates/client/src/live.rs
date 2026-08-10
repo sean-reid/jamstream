@@ -124,6 +124,16 @@ const RING_REPORT_MAX: Duration = Duration::from_secs(60);
 /// latching for the rest of the session.
 const CRACKLE_EPISODE_COUNT: u64 = 3;
 const CRACKLE_EPISODE_WINDOW: Duration = Duration::from_secs(90);
+/// Streams that stopped on their own inside this window for the device to read
+/// as cutting out, and the window they have to bunch up inside. Each stop is a
+/// hole in what everybody else hears, [`SLOW_REOPEN`] long or worse, and a
+/// machine coming out of sleep or handing a device between apps spends two of
+/// them; three inside three minutes is a hole a minute, which no device a band
+/// can play through produces. The same window without a stop closes the run
+/// out again, so this reads as a device that is failing now rather than one
+/// that had a bad moment an hour ago.
+const CUTTING_OUT_COUNT: u64 = 3;
+const CUTTING_OUT_WINDOW: Duration = Duration::from_secs(180);
 /// Window the playout low water mark covers. The bridge tracks the minimum
 /// since it was last read and reading resets it, so this is how often it is
 /// read: long enough that a reading spans hundreds of device callbacks, short
@@ -365,7 +375,7 @@ struct SharedState {
     /// from the backend's report at open; None while there is no
     /// stream, so the UI never shows a dead stream's outcome.
     rate: Option<RateOutcomesView>,
-    /// Whether [`CrackleEpisode`] currently has a run open. Set every tick
+    /// Whether the ring's underrun [`EpisodeWatch`] has a run open. Set every tick
     /// from the ring's own counters and cleared the tick the run ends, so
     /// the UI reads it like connection state rather than a one-shot line.
     crackling: bool,
@@ -378,6 +388,11 @@ struct SharedState {
     audio_fault: Option<AudioFaultView>,
     /// How the worker thread is being scheduled, as [`WakeWatch`] last read it.
     wake: Option<WakeView>,
+    /// Streams this device has lost on its own, while they are bunched up
+    /// densely enough to call it unreliable; None while it is holding. A fault
+    /// that heals inside a tick is on screen nowhere else, and twenty of them
+    /// in a minute is twenty gaps the band heard.
+    cutting_out: Option<u64>,
 }
 
 impl SharedState {
@@ -419,6 +434,7 @@ impl SharedState {
             playout_low_frames: None,
             audio_fault: None,
             wake: None,
+            cutting_out: None,
         }
     }
 
@@ -881,7 +897,7 @@ struct RingWatch {
     opened: Instant,
     overruns: CounterWatch,
     underruns: CounterWatch,
-    crackling: CrackleEpisode,
+    crackling: EpisodeWatch,
     /// The last closed window's low water mark in frames. `None` means no
     /// render callback ran inside it.
     low_water_frames: Option<usize>,
@@ -898,23 +914,30 @@ struct CounterWatch {
     wait: Duration,
 }
 
-/// Whether the current stretch of underruns is dense enough for the person
-/// playing to have heard it, the way [`PlayoutWatch`]'s concealed-gap state
-/// holds for a run rather than firing on a sample. A window that reaches
-/// [`CRACKLE_EPISODE_COUNT`] fresh underruns turns the state on; a window
-/// that runs out first without reaching it restarts from where it ran out,
-/// so a slow drip that never bunches up inside one window never turns it on
-/// at all. Once on, the same window without a fresh underrun turns it back
-/// off, so the state reads as "is this ring dry right now" rather than
-/// "has it ever been".
-#[derive(Default)]
-struct CrackleEpisode {
+/// Whether a counter is climbing densely enough for the person playing to
+/// have noticed, the way [`PlayoutWatch`]'s concealed-gap state holds for a
+/// run rather than firing on a sample. A window that reaches `count` fresh
+/// increments turns the state on; a window that runs out first without
+/// reaching it restarts from where it ran out, so a slow drip that never
+/// bunches up inside one window never turns it on at all. Once on, the same
+/// window without a fresh increment turns it back off, so the state reads as
+/// "is this happening now" rather than "has it ever".
+///
+/// Two conditions ride on it: the playout ring's underruns, whose counter
+/// belongs to a ring and starts again with each stream, and the device
+/// streams that stopped on their own, whose counter runs for the session.
+struct EpisodeWatch {
+    /// Fresh increments inside `window` that turn the state on.
+    count: u64,
+    /// Both the window a run has to bunch up inside and the quiet that ends
+    /// one.
+    window: Duration,
     prev: Option<u64>,
     /// When the run building toward the floor started, and the total as it
     /// stood then. `None` once the floor is reached; there is nothing left
     /// to build toward while the state is already on.
     since: Option<(Instant, u64)>,
-    /// The last tick a fresh underrun landed, which is what an active run
+    /// The last tick a fresh increment landed, which is what an active run
     /// measures its own quiet against to decide when it is over.
     last: Option<Instant>,
     active: bool,
@@ -926,7 +949,7 @@ impl RingWatch {
             opened,
             overruns: CounterWatch::default(),
             underruns: CounterWatch::default(),
-            crackling: CrackleEpisode::default(),
+            crackling: EpisodeWatch::new(CRACKLE_EPISODE_COUNT, CRACKLE_EPISODE_WINDOW),
             low_water_frames: None,
             low_water_from: opened,
         }
@@ -1000,13 +1023,25 @@ impl CounterWatch {
     }
 }
 
-impl CrackleEpisode {
-    /// Whether the ring is in a crackling run as of this tick.
+impl EpisodeWatch {
+    fn new(count: u64, window: Duration) -> EpisodeWatch {
+        EpisodeWatch {
+            count,
+            window,
+            prev: None,
+            since: None,
+            last: None,
+            active: false,
+        }
+    }
+
+    /// Whether the run is open as of this tick, against the counter's total
+    /// now.
     fn observe(&mut self, now: Instant, total: u64) -> bool {
         let prev = self.prev.replace(total);
         if prev.is_some_and(|p| total < p) {
-            // The ring's own counter moved backward: a fresh stream, whose
-            // run starts empty rather than continuing the old one.
+            // The counter moved backward: a fresh one, whose run starts empty
+            // rather than continuing the old one.
             self.since = None;
             self.last = None;
             self.active = false;
@@ -1019,18 +1054,18 @@ impl CrackleEpisode {
         if self.active {
             if self
                 .last
-                .is_some_and(|t| now.duration_since(t) >= CRACKLE_EPISODE_WINDOW)
+                .is_some_and(|t| now.duration_since(t) >= self.window)
             {
                 self.active = false;
             }
             return self.active;
         }
         if !fresh {
-            // No new underrun this tick: a window this stale never reached
-            // the floor and is not worth carrying forward.
+            // Nothing new this tick: a window this stale never reached the
+            // floor and is not worth carrying forward.
             if self
                 .since
-                .is_some_and(|(since, _)| now.duration_since(since) > CRACKLE_EPISODE_WINDOW)
+                .is_some_and(|(since, _)| now.duration_since(since) > self.window)
             {
                 self.since = None;
             }
@@ -1040,7 +1075,7 @@ impl CrackleEpisode {
             .since
             .get_or_insert((now, prev.expect("fresh implies a previous total")))
             .1;
-        if total - base >= CRACKLE_EPISODE_COUNT {
+        if total - base >= self.count {
             self.active = true;
             self.since = None;
         }
@@ -1296,6 +1331,9 @@ impl LiveRuntime {
             last_reopen: None,
             opened_at: Some(Instant::now()),
             episode: ReopenEpisode::default(),
+            device_stops: 0,
+            cutting_out: EpisodeWatch::new(CUTTING_OUT_COUNT, CUTTING_OUT_WINDOW),
+            was_cutting_out: false,
             announced_rate: rate,
             priority: ThreadPriority::Unchanged,
         };
@@ -1410,6 +1448,7 @@ impl LiveRuntime {
                 crackling: s.crackling,
                 playout_low_frames: s.playout_low_frames,
                 wake: s.wake,
+                cutting_out: s.cutting_out,
             },
             members,
             chat: s.chat.iter().cloned().collect(),
@@ -1702,6 +1741,17 @@ struct Worker {
     /// running one has already ended its episode.
     opened_at: Option<Instant>,
     episode: ReopenEpisode,
+    /// Streams that stopped on their own this session. A reopen somebody asked
+    /// for never reaches here, which is what keeps a buffer change out of the
+    /// cutting-out state and out of the log.
+    device_stops: u64,
+    /// Whether those stops are bunched up densely enough to call the device
+    /// unreliable, over a window the reopen cadence itself is far too short to
+    /// see: an episode ends five seconds after a stream that came back.
+    cutting_out: EpisodeWatch,
+    /// Whether the cutting-out run was open last tick, so the warning is one
+    /// line per run rather than one per 2.5 ms tick.
+    was_cutting_out: bool,
     /// The rate outcomes last logged, so a reopen on the same rung writes
     /// nothing and a rung change is written exactly once.
     announced_rate: Option<RateOutcomesView>,
@@ -1914,6 +1964,9 @@ impl Worker {
             // A dead stream has no rate outcome to show.
             self.shared.lock().expect("live state").rate = None;
             self.episode.faulted = true;
+            // One stop, whether or not the reopen that follows heals it before
+            // any screen could draw the fault: the gap was audible either way.
+            self.device_stops += 1;
         }
         if self
             .opened_at
@@ -1929,6 +1982,7 @@ impl Worker {
             }
         }
         self.publish_fault();
+        self.publish_cutting_out(Instant::now());
     }
 
     /// What the stream is doing wrong, as the status bar and the Audio tab
@@ -1969,6 +2023,26 @@ impl Worker {
             Some(AudioFaultView::Retrying) => {}
             None => tracing::info!("the audio stream is running again"),
         }
+    }
+
+    /// Whether the device is failing rather than down, which is the one thing
+    /// the fault itself cannot say: a stop the next tick reopens is over before
+    /// any frame draws it, so a device doing that twenty times a minute is
+    /// twenty gaps and nothing on screen. The run is warned once, because the
+    /// stops each already log a line and this is the conclusion drawn from
+    /// them, and a device that never stops writes nothing at all.
+    fn publish_cutting_out(&mut self, now: Instant) {
+        let open = self.cutting_out.observe(now, self.device_stops);
+        if open && !self.was_cutting_out {
+            tracing::warn!(
+                stops = self.device_stops,
+                "the audio device keeps stopping and reopening"
+            );
+        }
+        self.was_cutting_out = open;
+        let stops = open.then_some(self.device_stops);
+        let mut shared = self.shared.lock().expect("live state");
+        shared.cutting_out = stops;
     }
 
     /// One open attempt against the episode's budget. It sets the cadence
@@ -3668,6 +3742,141 @@ mod tests {
             "a second run of underruns must turn crackling on again"
         );
     }
+
+    /// The cutting-out watch as [`Worker`] holds it, driven by a counter the
+    /// test moves and a clock it advances: the window is read rather than
+    /// waited out, and the tick is the worker's own.
+    struct Stops {
+        watch: EpisodeWatch,
+        start: Instant,
+        tick: u32,
+        total: u64,
+    }
+
+    impl Stops {
+        /// Observing starts with the session, before any stop, exactly as
+        /// [`Worker::publish_cutting_out`] does from the first tick.
+        fn new() -> Stops {
+            let start = Instant::now();
+            let mut watch = EpisodeWatch::new(CUTTING_OUT_COUNT, CUTTING_OUT_WINDOW);
+            watch.observe(start, 0);
+            Stops {
+                watch,
+                start,
+                tick: 1,
+                total: 0,
+            }
+        }
+
+        /// One stream that stopped on its own, and the reading it lands on.
+        fn stop(&mut self) -> bool {
+            self.total += 1;
+            self.observe()
+        }
+
+        /// Ticks out `span` with the device up, asserting every tick in it
+        /// against `expect`, so a state that flickered inside the stretch
+        /// fails rather than reading right at the end of it.
+        fn holding(&mut self, span: Duration, expect: bool) -> bool {
+            for _ in 0..(span.as_micros() / TICK.as_micros()) {
+                assert_eq!(
+                    self.observe(),
+                    expect,
+                    "the state flickered inside the stretch"
+                );
+            }
+            expect
+        }
+
+        /// The same stretch across a change, so only the reading it ends on is
+        /// the test's business.
+        fn settling(&mut self, span: Duration) -> bool {
+            let mut last = false;
+            for _ in 0..(span.as_micros() / TICK.as_micros()) {
+                last = self.observe();
+            }
+            last
+        }
+
+        fn observe(&mut self) -> bool {
+            let on = self
+                .watch
+                .observe(self.start + TICK * self.tick, self.total);
+            self.tick += 1;
+            on
+        }
+    }
+
+    /// One stop is what a machine waking up or a device handed between apps
+    /// costs, and it must never say anything however long the session runs
+    /// afterward: the whole point of a state over a window is that a single
+    /// blip stays quiet.
+    #[test]
+    fn one_device_stop_never_reads_as_cutting_out() {
+        let mut stops = Stops::new();
+        assert!(!stops.stop());
+        // Two and a half windows, so a stale run restarts at least once
+        // without a second stop ever arriving to complete it.
+        stops.holding(CUTTING_OUT_WINDOW * 5 / 2, false);
+    }
+
+    /// Two stops five minutes apart are the machine that went to sleep twice,
+    /// and no window ever holds both of them, so this is the case the floor
+    /// and the window are chosen against.
+    #[test]
+    fn two_device_stops_five_minutes_apart_never_read_as_cutting_out() {
+        let mut stops = Stops::new();
+        assert!(!stops.stop());
+        stops.holding(Duration::from_secs(300), false);
+        assert!(!stops.stop());
+        stops.holding(Duration::from_secs(300), false);
+    }
+
+    /// A device that keeps losing the stream, which is the shape no fault can
+    /// carry: each of these stops is healed on the next tick, so nothing is
+    /// on screen for any of them until the state turns on. It turns on with
+    /// the stop that crosses the floor, not later, and holds through the
+    /// playing that follows.
+    #[test]
+    fn a_run_of_device_stops_reads_as_cutting_out() {
+        let mut stops = Stops::new();
+        for _ in 1..CUTTING_OUT_COUNT {
+            assert!(!stops.stop(), "under the floor must stay quiet");
+            // Half a minute of playing between them: three of these fit
+            // inside one window, and the device is up for all of it.
+            stops.holding(Duration::from_secs(30), false);
+        }
+        assert!(
+            stops.stop(),
+            "the stop that crosses the floor must turn the state on"
+        );
+        assert!(
+            stops.holding(CUTTING_OUT_WINDOW / 2, true),
+            "and it must hold while somebody is playing through it"
+        );
+    }
+
+    /// A whole window with the device holding is a device that recovered, so
+    /// the state clears rather than latching for the rest of the session; and
+    /// a run that starts afterward turns it on again rather than finding it
+    /// spent.
+    #[test]
+    fn cutting_out_clears_after_a_quiet_stretch_and_a_new_run_says_so_again() {
+        let mut stops = Stops::new();
+        for _ in 0..CUTTING_OUT_COUNT {
+            stops.stop();
+        }
+        // Still on well inside the window since the last stop, and off once a
+        // whole one of them has passed with the device up.
+        assert!(stops.holding(CUTTING_OUT_WINDOW / 2, true));
+        assert!(!stops.settling(CUTTING_OUT_WINDOW));
+
+        for _ in 1..CUTTING_OUT_COUNT {
+            assert!(!stops.stop());
+        }
+        assert!(stops.stop(), "a second run must say so again");
+    }
+
     /// A playout bridge at the client's own ring size, filled to its own depth
     /// target the way [`Driver::open`] fills it.
     fn playout_ring(frames: u32) -> (jamstream_audio_io::DeviceSide, EngineSide) {

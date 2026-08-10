@@ -1134,6 +1134,18 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
                 );
             });
         }
+        // A different question from the one below, and both answers can be
+        // true at once: that one is whether anybody can hear this musician
+        // right now, this one is whether the device will hold. It goes first
+        // of the two because "no audio cutting out" reads as one phrase that
+        // means the opposite of both of them.
+        if s.cutting_out.is_some() {
+            ui.label(
+                RichText::new("cutting out")
+                    .size(9.5)
+                    .color(theme::danger_ink(p)),
+            );
+        }
         // Persists for as long as this computer has no audio stream, in the
         // same danger ink for the same reason: nobody can hear a musician
         // whose device is down. Whether the cadence is still trying and what

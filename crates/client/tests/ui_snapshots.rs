@@ -1215,6 +1215,36 @@ fn session_no_audio_narrow() {
     snapshot(&mut harness, "session_no_audio_narrow");
 }
 
+/// A session whose device keeps losing the stream. The fault beside it is
+/// what the reopen cadence is doing at this instant, and the two are pinned
+/// apart because a device that will not hold and a stream that is down right
+/// now are different things to somebody deciding whether to keep playing.
+fn cutting_out_app(theme: Theme, stops: u64, fault: Option<AudioFaultView>) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.set_cutting_out(Some(stops));
+    rt.set_audio_fault(fault);
+    session_app(rt, theme)
+}
+
+#[test]
+fn session_cutting_out_narrow() {
+    // The narrowest window, where the tag competes hardest with the meters
+    // and the two lamps for the bar's own room.
+    let app = cutting_out_app(Theme::Dark, 7, None);
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_cutting_out_narrow");
+}
+
+#[test]
+fn session_cutting_out_no_audio_narrow() {
+    // Both at once, which is the widest the tag row ever gets: the stream is
+    // down at this instant and the device has been failing for minutes, and
+    // neither of those may push the readout out of the zone.
+    let app = cutting_out_app(Theme::Dark, 7, Some(AudioFaultView::Retrying));
+    let mut harness = app_harness(app, NARROW);
+    snapshot(&mut harness, "session_cutting_out_no_audio_narrow");
+}
+
 /// The drawer open on one tab. Every settings fixture goes through here, so
 /// the tab row in each of them is the one the app really builds for that
 /// role and screen.
@@ -1333,6 +1363,15 @@ fn session_settings_no_audio_gave_up() {
     );
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_settings_no_audio_gave_up");
+}
+
+#[test]
+fn session_settings_cutting_out() {
+    // Under the pickers, below where a fault would be: the count is the fact
+    // no other surface carries, and the pick that ends it is on this tab.
+    let app = drawer_app(cutting_out_app(Theme::Dark, 7, None), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_cutting_out");
 }
 
 #[test]

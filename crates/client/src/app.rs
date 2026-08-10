@@ -1045,6 +1045,7 @@ impl JamApp {
                     refusal: snap.and_then(|s| s.device_error.as_deref()),
                     rate_lines: &rate_lines,
                     fault: snap.and_then(|s| s.audio_fault),
+                    cutting_out: snap.and_then(|s| s.stats.cutting_out),
                     crackling: snap.is_some_and(|s| s.stats.crackling),
                 };
                 let session = SessionAudio {

@@ -322,6 +322,12 @@ pub struct StatsView {
     /// How the thread that fills the playout ring is being scheduled, over the
     /// last window. `None` until the first window closes.
     pub wake: Option<WakeView>,
+    /// How many times the audio stream has stopped on its own, while those
+    /// stops are close enough together to call the device unreliable; `None`
+    /// while it is holding. A stop the next tick reopens leaves
+    /// [`Snapshot::audio_fault`] clear before any frame draws it, so this is
+    /// the only place a device that keeps failing shows at all.
+    pub cutting_out: Option<u64>,
 }
 
 /// Wakeup-to-wakeup pacing of the thread that fills the playout ring, in

@@ -64,6 +64,7 @@ A change mid-session reopens the stream on the new device without leaving the se
 | Selected device disappears mid-session | A rescan found the device gone | The picker falls back to System default and says so under the pickers |
 | A device pick does not take | The device refused to open | The pick stays selected, the app retries every half second, and the device's own reason sits under the pickers until an open succeeds; pick another device to get sound back sooner |
 | Sound stops, and a **no audio** tag appears beside the latency number | The stream stopped and is being reopened, or was reopened six times without staying open | The Audio tab says which; once it says the device did not stay open, nothing more is tried until you pick a device there |
+| Short gaps the band hears, and a **cutting out** tag appears beside the latency number | The device has stopped and been reopened three or more times in the last few minutes. Each one is a gap, and each is reopened too fast to show as **no audio** | The Audio tab counts them under the pickers. Check the cable and the port first; on Windows, ticking off "Allow exclusive access" also helps, because an exclusive endpoint drops the stream on any hiccup |
 | Other apps go silent while you play (Windows) | Exclusive mode holds the device alone for the lowest latency | Untick "Allow exclusive access" under Devices to share the device, at the 10 to 20 ms shared-mode cost |
 
 Sessions run at 48 kHz, and JamStream carries a device at any other rate automatically:

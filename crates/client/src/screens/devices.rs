@@ -192,9 +192,9 @@ impl Default for DevicesScreen {
 
 /// What the stream has to say for itself under the pickers: the refusal
 /// reason while there is no stream, the rate disclosures while there is
-/// one, what the reopen cadence is doing, and whether the playout ring is in
-/// a crackling run. All four are consequences of the pick, so they render
-/// beside the controls that made it.
+/// one, what the reopen cadence is doing, whether the device keeps losing the
+/// stream, and whether the playout ring is in a crackling run. All of them are
+/// consequences of the pick, so they render beside the controls that made it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamNotes<'a> {
     pub refusal: Option<&'a str>,
@@ -203,6 +203,10 @@ pub struct StreamNotes<'a> {
     /// tag says there is no audio, and this is the screen with the pick that
     /// gets it back.
     pub fault: Option<AudioFaultView>,
+    /// Stops this device has run up while it reads as cutting out, which is a
+    /// different thing to know from a stream that is down right now: this one
+    /// says the next one is coming.
+    pub cutting_out: Option<u64>,
     /// Whether the playout ring is currently in a crackling run: while it
     /// holds, the fix is right here, so the notice sits beside Buffer size
     /// rather than only in the status bar's tag.
@@ -212,7 +216,7 @@ pub struct StreamNotes<'a> {
 /// The sentence a fault earns beside the pickers. A cadence still working
 /// asks for nothing; a cadence that has stopped asks for the one thing that
 /// starts it again, and says how many tries it took so a musician can tell a
-/// flapping device from a one-off.
+/// device that keeps failing from a one-off.
 #[must_use]
 pub fn fault_line(fault: AudioFaultView) -> String {
     match fault {
@@ -224,6 +228,19 @@ pub fn fault_line(fault: AudioFaultView) -> String {
              Pick a device to try again."
         ),
     }
+}
+
+/// The sentence a device that keeps losing the stream earns beside the pickers.
+/// The count is the fact nothing else on screen can carry: every one of those
+/// stops was a gap the band heard, and each was healed before a fault could be
+/// drawn. The cause is usually outside this app, so the sentence names where to
+/// look before the pick that is right here.
+#[must_use]
+pub fn cutting_out_line(stops: u64) -> String {
+    format!(
+        "Cutting out: the audio stream has stopped {stops} times. \
+         Check the cable, or pick another device."
+    )
 }
 
 /// What only exists once you have joined something: the mouth-to-ear figure
@@ -474,6 +491,13 @@ impl DevicesScreen {
             if let Some(fault) = notes.fault {
                 ui.add_space(theme::SPACE_XS);
                 theme::reason(ui, fault_line(fault));
+            }
+            // Last, because it is the only one of these that outlives the
+            // moment: the stream may be running as this is read, and what it
+            // says is that it will not keep running.
+            if let Some(stops) = notes.cutting_out {
+                ui.add_space(theme::SPACE_XS);
+                theme::reason(ui, cutting_out_line(stops));
             }
         });
         event
