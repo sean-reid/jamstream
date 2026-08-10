@@ -201,9 +201,17 @@ impl Drop for TestServer {
 /// What the device buffers cost mouth to ear for a stream whose negotiated
 /// callback is `frames` session-rate frames: the capture buffer, plus the
 /// playout cushion the top-up loop holds at two callbacks. Everything else in
-/// the figure is the link, and the snapshot reports each of those itself.
+/// the figure is the link, priced by [`link_ms`] from the same snapshot.
 fn device_buffers_ms(frames: f32) -> f32 {
     frames / 48.0 + 2.0 * frames / 48.0
+}
+
+/// What the link costs mouth to ear, from the figures the snapshot reports
+/// beside it: the round trip charged for both network legs, the playout buffer
+/// at the depth it is holding, and one media frame of encode latency.
+fn link_ms(snap: &Snapshot) -> f32 {
+    let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
+    rtt + snap.stats.jitter_depth as f32 * 2.5 + 2.5
 }
 
 fn settings() -> AudioSettings {
@@ -689,13 +697,12 @@ fn the_figure_and_its_hover_carry_the_playout_cushion() {
         });
 
         let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
-        let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
-        let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5;
+        let link = link_ms(&snap);
         let device_ms = device_buffers_ms(frames as f32);
         assert!(
-            (m2e - link_ms - device_ms).abs() < 0.01,
+            (m2e - link - device_ms).abs() < 0.01,
             "at {frames}-frame callbacks mouth to ear {m2e} ms must carry \
-             {device_ms} ms of device buffers over {link_ms} ms of link"
+             {device_ms} ms of device buffers over {link} ms of link"
         );
 
         let device = snap
@@ -1858,12 +1865,11 @@ fn a_converting_stream_discloses_itself_and_prices_the_latency() {
     // callback in session-rate frames: the 120-frame request on a 44.1 kHz
     // device is ceil(120 * 160/147) = 131.
     let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
-    let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
-    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + device_buffers_ms(131.0);
+    let link = link_ms(&snap) + device_buffers_ms(131.0);
     let disclosed = capture_ms + playback_ms;
     assert!(
-        (m2e - link_ms - disclosed).abs() < 0.01,
-        "mouth to ear {m2e} ms must carry the disclosed {disclosed} ms over {link_ms} ms of link"
+        (m2e - link - disclosed).abs() < 0.01,
+        "mouth to ear {m2e} ms must carry the disclosed {disclosed} ms over {link} ms of link"
     );
 
     rt.send(Command::Leave);
@@ -2382,12 +2388,11 @@ fn a_stream_that_converts_one_direction_discloses_only_that_direction() {
     // negotiated callback in session-rate frames: the 120-frame request against
     // a 44.1 kHz capture endpoint is ceil(120 * 160/147) = 131.
     let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
-    let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
-    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + device_buffers_ms(131.0);
+    let link = link_ms(&snap) + device_buffers_ms(131.0);
     assert!(
-        (m2e - link_ms - capture_ms).abs() < 0.01,
+        (m2e - link - capture_ms).abs() < 0.01,
         "mouth to ear {m2e} ms must carry the converted direction's \
-         {capture_ms} ms over {link_ms} ms of link"
+         {capture_ms} ms over {link} ms of link"
     );
 
     rt.send(Command::Leave);
@@ -2440,9 +2445,8 @@ fn a_moved_clock_and_an_os_converter_read_as_themselves() {
     // No converter, so mouth to ear carries no converter term, and both device
     // buffers are sized from the plain 120-frame request.
     let m2e = snap.stats.mouth_to_ear_ms.expect("the predicate held");
-    let rtt = snap.stats.rtt_ms.expect("joined sessions measure rtt");
-    let link_ms = rtt / 2.0 + snap.stats.jitter_depth as f32 * 2.5 + 2.5 + device_buffers_ms(120.0);
-    assert!((m2e - link_ms).abs() < 0.01, "mouth to ear {m2e} ms");
+    let link = link_ms(&snap) + device_buffers_ms(120.0);
+    assert!((m2e - link).abs() < 0.01, "mouth to ear {m2e} ms");
 
     rt.send(Command::Leave);
     wait_for(&rt, "idle", Duration::from_secs(5), |s| {
