@@ -16,7 +16,7 @@ use crate::reveal;
 use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
 use crate::screens::devices::{
-    Block, DeviceCatalog, DeviceInfo, DevicesEvent, DevicesScreen, StreamNotes,
+    Block, DeviceCatalog, DeviceInfo, DevicesEvent, DevicesScreen, SessionAudio, StreamNotes,
 };
 use crate::screens::home::{HomeAction, HomeScreen, RecentSession, SweepView};
 use crate::screens::host::{HostWizard, LaunchOutcome, WizardEvent};
@@ -1039,11 +1039,21 @@ impl JamApp {
                     rate_lines: &rate_lines,
                     crackling: snap.is_some_and(|s| s.stats.crackling),
                 };
+                let session = SessionAudio {
+                    mouth_to_ear_ms: m2e,
+                    hear_self: snap.map(|s| s.hear_self),
+                };
                 let event =
                     self.devices
-                        .audio_ui(ui, Block::Flat, &self.catalog, &levels, m2e, notes);
-                if let Some(DevicesEvent::Rescan) = event {
-                    self.rescan_devices();
+                        .audio_ui(ui, Block::Flat, &self.catalog, &levels, session, notes);
+                match event {
+                    Some(DevicesEvent::Rescan) => self.rescan_devices(),
+                    Some(DevicesEvent::SetHearSelf(on)) => {
+                        if let Some(rt) = self.runtime.as_deref() {
+                            rt.send(Command::SetHearSelf(on));
+                        }
+                    }
+                    None => {}
                 }
                 None
             }

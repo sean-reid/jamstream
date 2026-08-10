@@ -1091,6 +1091,19 @@ fn session_settings() {
 }
 
 #[test]
+fn session_settings_hear_self() {
+    // The other state of the same checkbox: on, with the two facts about it
+    // still on screen, since a control that reads the same either way is
+    // not a control.
+    use jamstream_client::runtime::{Command, Runtime};
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+    rt.send(Command::SetHearSelf(true));
+    let app = drawer_app(session_app(rt, Theme::Dark), SettingsTab::Audio);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_hear_self");
+}
+
+#[test]
 fn session_settings_device_refused() {
     // The other place the refusal has to be: with the drawer open it is over
     // the mixer's copy of it, and this tab is where the pick that failed gets
