@@ -1899,6 +1899,10 @@ impl Worker {
         // The same two figures the sum used, so the hover can never break the
         // number down into terms it was not built from.
         s.stats.device_buffers = self.engine.is_some().then_some(device);
+        // The depth inside that playout term, and what is holding it: a buffer
+        // size sets where the depth starts and not where it stays, so the
+        // control that picks one has to be able to say which it is showing.
+        s.stats.cushion = self.engine.is_some().then(|| self.cushion.view());
         s.levels = self.levels;
         s.stats.playout_low_frames = self.rings.playout_low_frames();
         s.stats.wake = self.wake.pacing().map(|pacing| WakeView {

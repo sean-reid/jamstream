@@ -675,7 +675,8 @@ fn the_playout_water_mark_lands_on_the_snapshot_in_frames() {
 /// so it costs twice what the capture buffer does and it moves with the pick:
 /// 5 ms at 120 frames and 20 ms at 480. Strip the link terms the same snapshot
 /// reports and what is left is three callbacks, and the hover's own two figures
-/// are the ones the sum was built from.
+/// are the ones the sum was built from, as is the depth the buffer control
+/// reports under the choices.
 ///
 /// Both sizes, because a term the code got wrong by a constant would satisfy
 /// this at one of them.
@@ -723,6 +724,24 @@ fn the_figure_and_its_hover_carry_the_playout_cushion() {
             ],
             "each direction is named, or the two read as one another"
         );
+
+        // What the buffer control says about that same term, off the same
+        // controller: the depth it reports and the depth the figure was priced
+        // from are one number, and this ring is never starved, so nothing is
+        // deepening it and nothing is out of room.
+        let cushion = snap
+            .stats
+            .cushion
+            .expect("a running stream is holding a depth");
+        assert_eq!(cushion.held_ms(), device.playout_ms);
+        assert_eq!(cushion.held_frames, 2 * frames as usize);
+        assert_eq!(cushion.base_frames, cushion.held_frames);
+        assert_eq!(cushion.callback_frames, frames as usize);
+        assert!(
+            !cushion.deepened(),
+            "an offline ring is topped up before every pump"
+        );
+        assert!(!cushion.out_of_room);
 
         rt.send(Command::Leave);
         wait_for(&rt, "idle", Duration::from_secs(5), |s| {

@@ -308,6 +308,53 @@ impl DeviceBuffersView {
     }
 }
 
+/// What the playout cushion is holding and whether anything is holding it
+/// there. The depth is the larger of the two figures in [`DeviceBuffersView`]
+/// and it moves while the stream stays open, so a buffer size sets where the
+/// depth starts rather than where it stays, and the control that picks one
+/// cannot read the latency off the pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CushionView {
+    /// The depth the top-up loop fills to now, in frames.
+    pub held_frames: usize,
+    /// The depth this buffer size asks for, which is what a machine keeping up
+    /// holds and the shallowest anything ever asks for.
+    pub base_frames: usize,
+    /// The device callback the depth is measured against, in frames, as the
+    /// device negotiated it rather than as it was picked. A longer one is the
+    /// only thing left once the depth is out of room, and reaching it means
+    /// moving the pick.
+    pub callback_frames: usize,
+    /// Whether the depth is as deep as this buffer size allows while the ring
+    /// still keeps coming close to empty, which is the one case no depth this
+    /// buffer size can hold fixes.
+    pub out_of_room: bool,
+}
+
+impl CushionView {
+    /// The depth held now, in milliseconds.
+    #[must_use]
+    pub fn held_ms(&self) -> f32 {
+        frames_ms(self.held_frames)
+    }
+
+    /// Whether anything is holding the depth past what the buffer size asks
+    /// for. False is the answer a healthy machine gives, and it is the one that
+    /// says a pinned buffer size is the latency somebody is getting.
+    #[must_use]
+    pub fn deepened(&self) -> bool {
+        self.held_frames > self.base_frames
+    }
+}
+
+/// Frames as milliseconds at the session rate. To one decimal, because the
+/// cushion moves in 2.5 ms frames and whole milliseconds would round the step
+/// it moves by out of every figure that carries it.
+#[must_use]
+fn frames_ms(frames: usize) -> f32 {
+    frames as f32 * 1000.0 / jamstream_protocol::SAMPLE_RATE as f32
+}
+
 /// A sample rate in kHz for UI copy: 44100 reads "44.1", 48000 reads "48".
 #[must_use]
 pub fn khz(rate: u32) -> String {
@@ -341,6 +388,10 @@ pub struct StatsView {
     /// there is no stream, like the rate outcomes: a ring that is not open is
     /// not costing anybody a cushion.
     pub device_buffers: Option<DeviceBuffersView>,
+    /// What the playout cushion is holding and whether anything is holding it
+    /// there, for the buffer control that sets where the depth starts and not
+    /// where it stays. `None` while there is no stream, for the same reason.
+    pub cushion: Option<CushionView>,
     /// Which sharing mode the device stream got. `None` before a stream
     /// opens and on platforms with no shared/exclusive split, which is why
     /// the readout says nothing rather than inventing an answer.
