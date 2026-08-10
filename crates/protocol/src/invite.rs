@@ -190,14 +190,21 @@ impl Invite {
         )
     }
 
+    /// The blob accounts for every byte in it, the same rule the handshake
+    /// payloads hold to: a string carrying anything after the invite is refused
+    /// rather than read as the invite without it. So one invite is one string,
+    /// and nothing rides along in a tail the issuer's signature does not cover.
     pub fn decode(text: &str) -> Result<Self, Error> {
         let raw = text.trim();
         let blob = raw.strip_prefix(URL_PREFIX).unwrap_or(raw);
         let bytes = data_encoding::BASE64URL_NOPAD
             .decode(blob.as_bytes())
             .map_err(|_| Error::Invite("has invalid encoding"))?;
-        let invite: Invite =
-            postcard::from_bytes(&bytes).map_err(|_| Error::Invite("is truncated or corrupt"))?;
+        let (invite, rest): (Invite, &[u8]) = postcard::take_from_bytes(&bytes)
+            .map_err(|_| Error::Invite("is truncated or corrupt"))?;
+        if !rest.is_empty() {
+            return Err(Error::Invite("is truncated or corrupt"));
+        }
         if invite.addresses.is_empty() {
             return Err(Error::Invite("has no server address"));
         }
@@ -364,6 +371,37 @@ mod tests {
         // 149, not 150: the signature is 64 bare bytes with no length prefix.
         assert_eq!(blob.len(), 149);
         assert_eq!(blob[blob.len() - 64..], invite.signature[..]);
+        assert_eq!(Invite::decode(&invite.encode()).unwrap(), invite);
+    }
+
+    /// The rule the handshake payloads hold to, for the invite string: a blob
+    /// with bytes past the invite is refused rather than read as the invite
+    /// without them. The tail is outside what the issuer signs, so tolerating
+    /// it would mean any holder of an invite can hand out a different string
+    /// that opens the same session.
+    #[test]
+    fn decode_refuses_a_blob_with_bytes_left_over() {
+        let invite = pinned_invite();
+        let blob = postcard::to_stdvec(&invite).expect("serialize");
+        // The f32 is what an invite that grew a float field would carry.
+        for tail in [
+            vec![0x00],
+            vec![0x00; 96],
+            postcard::to_stdvec(&0.5f32).unwrap(),
+        ] {
+            let mut padded = blob.clone();
+            padded.extend_from_slice(&tail);
+            let url = format!(
+                "{URL_PREFIX}{}",
+                data_encoding::BASE64URL_NOPAD.encode(&padded)
+            );
+            assert!(
+                Invite::decode(&url).is_err(),
+                "decode accepted {} bytes past the invite",
+                tail.len()
+            );
+        }
+        // And the same blob without the addition is the invite it always was.
         assert_eq!(Invite::decode(&invite.encode()).unwrap(), invite);
     }
 
