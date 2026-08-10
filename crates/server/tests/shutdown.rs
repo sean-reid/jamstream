@@ -18,6 +18,7 @@ use common::{Running, Session, budget, loopback, scratch_dir};
 // The signal half of this file is unix only, and so is everything it needs.
 #[cfg(unix)]
 use common::{BIND, ChildGuard, ReservedPort, server_binary};
+use jamstream_cloud::providers::local::shutdown_supported_path;
 use jamstream_protocol::ids::{Role, TokenId};
 use jamstream_protocol::invite::Invite;
 use jamstream_server::revocations::Revocations;
@@ -229,7 +230,7 @@ async fn the_shutdown_sentinel_exits_cleanly_and_advertises_itself() {
         .await
         .unwrap()
         .with_shutdown_file(sentinel.clone());
-    let marker = dir.join("shutdown.supported");
+    let marker = shutdown_supported_path(&sentinel);
     assert!(
         marker.is_file(),
         "the provider looks for {}",
