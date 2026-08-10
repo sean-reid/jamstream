@@ -490,6 +490,14 @@ fn pitch_hz(stereo: &[f32], rate: u32) -> f64 {
 /// 440 Hz tone with `front` and `back` seconds of the silence the backend
 /// writes while nothing is playing.
 fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
+    eased_fixture(label, front, back, 0.0)
+}
+
+/// The same file with the tone's level falling by `ease` of itself across the
+/// two seconds. A real capture's level drifts by a few percent between one
+/// second and the next, which is what lets the window at the top of a file
+/// outread the windows clear of its opening silence.
+fn eased_fixture(label: &str, front: f64, back: f64, ease: f64) -> PathBuf {
     let path = temp_path("padding", &format!("{label}.wav"));
     let mut writer = hound::WavWriter::create(
         &path,
@@ -505,7 +513,8 @@ fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
     for i in 0..quiet.0 + quiet.1 + (back * f64::from(RATE)) as usize {
         let s = match i.checked_sub(quiet.0) {
             Some(t) if t < quiet.1 => {
-                (t as f32 / RATE as f32 * 440.0 * std::f32::consts::TAU).sin() * 0.5
+                let level = 0.5 * (1.0 - ease as f32 * t as f32 / quiet.1 as f32);
+                (t as f32 / RATE as f32 * 440.0 * std::f32::consts::TAU).sin() * level
             }
             _ => 0.0,
         };
@@ -517,17 +526,6 @@ fn padded_fixture(label: &str, front: f64, back: f64) -> PathBuf {
     path
 }
 
-/// What makes a loudest-window reading evidence rather than a substitution that
-/// happens to pass: the three readings the session tests take, on a file with
-/// the padding a loaded Windows runner profiled around its audio, 1.75 s at the
-/// front and 0.75 s at the back.
-///
-/// The tail of the same file is what the padding costs. At the padding as
-/// profiled it holds three quarters of a second of exact zeros, which is the
-/// silence-run assertion failing on a session that was healthy; one step slower
-/// than that and the window is padding outright, with no level in it and a
-/// pitch of nothing. That is the shape of the run in #464, which read 6 in its
-/// last second against 8290 in its loudest.
 /// The shape a loaded runner produced: nearly two seconds of silence while the
 /// reopen got media flowing, then unbroken music. The reading has to be of the
 /// music, and how long the machine took to start is not the test's business.
@@ -594,13 +592,49 @@ fn a_measurement_starts_after_the_period_a_device_open_costs() {
     let _ = std::fs::remove_file(&slow);
 }
 
+/// What makes a loudest-window reading evidence rather than a substitution that
+/// happens to pass: the three readings the session tests take, over the openings
+/// a capture file really has.
+///
+/// Both ends as a loaded Windows runner profiled them, 1.75 s at the front and
+/// 0.75 s at the back, and the opening a session leaves on an idle machine, which
+/// is the playout ring's prefill plus the jitter buffer's first fill and measures
+/// 720 to 2160 samples in the tests below. The small opening is the case that
+/// decides the reading, because it costs the window at the top of the file well
+/// under one percent of its level.
+///
+/// The tone eases off across each file, which is what a real capture's level
+/// does between one second and the next. Against a flat tone every window clear
+/// of the opening reads higher than the one carrying it and no reading can be
+/// wrong, so a flat fixture would leave the small opening covered in name only.
+///
+/// The tail of the same file is what the padding costs. At the padding as
+/// profiled it holds three quarters of a second of exact zeros, which is the
+/// silence-run assertion failing on a session that was healthy; one step slower
+/// than that and the window is padding outright, with no level in it and a
+/// pitch of nothing. That is the shape of the run in #464, which read 6 in its
+/// last second against 8290 in its loudest.
 #[test]
 fn a_measurement_reads_the_audio_and_not_the_padding_around_it() {
-    for (label, back) in [("as-profiled", 0.75), ("a-slower-leave", 1.25)] {
-        let path = padded_fixture(label, 1.75, back);
+    for (label, front, back) in [
+        ("as-profiled", 1.75, 0.75),
+        ("a-slower-leave", 1.75, 1.25),
+        ("as-a-session-opens", 720.0 / 2.0 / f64::from(RATE), 0.75),
+    ] {
+        let path = eased_fixture(label, front, back, 0.2);
 
         let heard = loudest(&path, 1.0);
         assert_eq!(heard.rate, RATE);
+        // Where the reading landed, before what it holds: a window that starts
+        // at the top of a file whose opening is longer than the allowance is
+        // reading the opening, whatever else it also holds.
+        assert!(
+            heard.start * 2 + SILENCE_ALLOWANCE >= heard.opening,
+            "the loudest second starts at frame {} of a file whose opening \
+             silence runs {} samples",
+            heard.start,
+            heard.opening
+        );
         let level = rms(&heard.window);
         assert!(level > 0.02, "the loudest second reads {level}");
         let run = longest_zero_run(&heard.window);
