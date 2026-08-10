@@ -1067,12 +1067,10 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
 
     // What A recorded is the whole assertion, and it is the right one: the
     // question is whether the far side still hears B, and A's own file answers
-    // it without going through a counter. `stats.loss_pct` cannot: it is the
-    // worse of two unrelated directions, and its downlink half is cumulative
-    // since joining, so one bad moment keeps that figure high for the rest of
-    // the session no matter how well the uplink is doing. The sharp detector
-    // for the fault itself is `a_capture_gap_on_a_jittery_stream` in the
-    // session crate, which fails every run in under half a second.
+    // it without going through a counter on this side, which can only report
+    // B's uplink as the server last summarised it. The sharp detector for the
+    // fault itself is `a_capture_gap_on_a_jittery_stream` in the session
+    // crate, which fails every run in under half a second.
 
     a.send(Command::Leave);
     wait_for(&a, "a idle", Duration::from_secs(3), |s| {

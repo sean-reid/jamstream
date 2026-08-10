@@ -16,9 +16,11 @@
 //! having to tell two warm oranges apart.
 //!
 //! What the link is doing beyond the headline number, rtt and buffer depth
-//! and loss, is on that number's hover. It is diagnostic: worth reading when
-//! something sounds wrong, not worth a permanent five words in the one place
-//! a musician looks mid-song.
+//! and each direction's loss, is on that number's hover. It is diagnostic:
+//! worth reading when something sounds wrong, not worth a permanent five
+//! words in the one place a musician looks mid-song. The exception is an
+//! uplink the server says is losing audio, which earns a tag of its own,
+//! because that is the one fault a musician cannot hear.
 
 use egui::{
     Align, Align2, Button, FontFamily, FontId, Layout, RichText, ScrollArea, Sense, Stroke,
@@ -33,11 +35,16 @@ use crate::screens::invites::{InvitesEvent, InvitesPanel};
 use crate::screens::record::{record_sheet, record_state_lamp};
 use crate::theme;
 use crate::widgets::{
-    AVATAR_D_STRIP, LampShape, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter, pan_slider,
-    presence_dot, state_lamp, state_lamp_width, status_dot,
+    AVATAR_D_STRIP, LOSSY_PCT, LampShape, Meter, avatar_disc, db_drag, fader, lamp_toggle, meter,
+    pan_slider, presence_dot, state_lamp, state_lamp_width, status_dot,
 };
 
 const NARROW_BELOW_PX: f32 = 900.0;
+
+/// The bar's word for the one direction nothing on this machine can hear. It
+/// names the direction rather than the fault, because a musician whose sound
+/// is not reaching the room reads a healthy screen otherwise.
+pub const UPLINK_LOSS_TAG: &str = "uplink loss";
 
 /// What the pair of compact meters needs beside the readouts: two 52 px
 /// meters, their labels, the separator, and the gaps between them.
@@ -1047,13 +1054,7 @@ fn chat_line(ui: &mut Ui, line: &ChatLine) {
 /// The health zone: the connection dot, the one number worth a glance
 /// mid-song, and the input and output meters when there is room for them.
 fn status_readouts(ui: &mut Ui, snap: &Snapshot) {
-    let s = &snap.stats;
-    status_dot(
-        ui,
-        matches!(s.state, ConnState::Joined),
-        s.rtt_ms,
-        s.loss_pct,
-    );
+    status_dot(ui, &snap.stats);
     latency_readout(ui, snap);
     // The compact meters are the first thing to go when the bar gets tight.
     // What is left here is the room the zone was given, so this is the real
@@ -1082,10 +1083,10 @@ fn status_readouts(ui: &mut Ui, snap: &Snapshot) {
 }
 
 /// Mouth to ear, the headline number, with everything else the link reports
-/// on its hover: rtt, buffer depth against target, and loss. Those three are
-/// what someone reads when the sound is wrong, and reading them is a
-/// deliberate act; carrying them permanently cost the bar the space its two
-/// lamps now use.
+/// on its hover: rtt, buffer depth against target, and loss in each
+/// direction. Those are what someone reads when the sound is wrong, and
+/// reading them is a deliberate act; carrying them permanently cost the bar
+/// the space its two lamps now use.
 fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
     let s = &snap.stats;
     let p = theme::palette_of(ui);
@@ -1155,6 +1156,19 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
                     .color(theme::danger_ink(p)),
             );
         }
+        // Persists for as long as the server's last window says the band is
+        // losing this musician's audio, in danger ink because nothing they
+        // hear will tell them: their own monitoring, the meters and the
+        // downlink all read healthy while the room hears a broken instrument.
+        // The rate itself and the other direction are on the hover; a person
+        // mid-song needs the direction first.
+        if s.uplink_loss_pct.is_some_and(|pct| pct > LOSSY_PCT) {
+            ui.label(
+                RichText::new(UPLINK_LOSS_TAG)
+                    .size(9.5)
+                    .color(theme::danger_ink(p)),
+            );
+        }
     });
     ui.interact(
         group.response.rect,
@@ -1172,8 +1186,10 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
 fn latency_hover(s: &crate::runtime::StatsView) -> String {
     let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
     let mut text = format!(
-        "rtt {rtt} ms\nbuffer {}/{} frames\nloss {:.1}%",
-        s.jitter_depth, s.jitter_target, s.loss_pct
+        "rtt {rtt} ms\nbuffer {}/{} frames\n{}",
+        s.jitter_depth,
+        s.jitter_target,
+        s.loss_lines().join("\n")
     );
     match s.device_mode {
         Some(crate::runtime::DeviceModeView::Exclusive) => {
@@ -1641,6 +1657,50 @@ mod tests {
             "{moved:?}"
         );
         assert!(!moved.contains("mode device"), "{moved:?}");
+    }
+
+    /// The two directions mean opposite things: uplink loss is audio the band
+    /// is not hearing, downlink loss is audio this machine is not playing, and
+    /// the more urgent one is the one nothing on this side can hear. So the
+    /// hover names both and says whose sound each is. One figure, whichever
+    /// figure, cannot answer "can they hear me".
+    #[test]
+    fn the_hover_says_which_direction_is_losing() {
+        let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
+        let mut s = rt.snapshot().stats;
+        for (up, down) in [(7.5, 0.1), (0.1, 7.5)] {
+            s.uplink_loss_pct = Some(up);
+            s.downlink_loss_pct = Some(down);
+            let hover = latency_hover(&s);
+            let line = |direction: &str| {
+                hover
+                    .lines()
+                    .find(|l| l.starts_with(direction))
+                    .unwrap_or_else(|| panic!("no {direction} line in {hover:?}"))
+                    .to_owned()
+            };
+            let uplink = line("uplink loss");
+            let downlink = line("downlink loss");
+            assert!(
+                uplink.contains(&format!("{up:.1}%")) && !uplink.contains(&format!("{down:.1}%")),
+                "the uplink line must carry the uplink's own rate: {uplink:?}"
+            );
+            assert!(
+                downlink.contains(&format!("{down:.1}%"))
+                    && !downlink.contains(&format!("{up:.1}%")),
+                "the downlink line must carry the downlink's own rate: {downlink:?}"
+            );
+            assert!(
+                uplink.contains("band") && downlink.contains("you miss"),
+                "each line must say whose sound it is: {uplink:?} {downlink:?}"
+            );
+        }
+
+        // A direction with no figure yet says so rather than reading clean:
+        // "0.0%" from a report that never arrived is an invented reading.
+        s.uplink_loss_pct = None;
+        let quiet = latency_hover(&s);
+        assert!(quiet.contains("uplink loss --%"), "{quiet:?}");
     }
 
     /// Audition is a lamp in the cluster, not a dot in the health zone.

@@ -37,7 +37,7 @@ What you are looking at:
 
 The status bar sits in the same place every session: mouth to ear latency and your meters on the left, ON AIR and REC in the middle, the session id and Leave on the right.
 
-Hover the latency number for `rtt`, `buffer`, and `loss`, which [Troubleshooting](troubleshooting.md#latency-feels-high) turns into actions. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
+Hover the latency number for `rtt`, `buffer`, and loss in each direction, which [Troubleshooting](troubleshooting.md#latency-feels-high) turns into actions. Leave asks for a confirmation; leaving does not end the session, and your seat is kept.
 
 A member who stops responding shows it in two stages. The dot beside their name turns amber after 2 seconds, which is 800 missed frames and far past anything a working client does. After 10 seconds the server gives up on them: the strip grays out and reads disconnected.
 

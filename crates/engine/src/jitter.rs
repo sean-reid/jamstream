@@ -79,6 +79,55 @@ pub struct JitterStats {
     pub reanchors: u64,
 }
 
+/// The counters that moved between two samples of one buffer's [`JitterStats`],
+/// which is what a loss rate is a rate over. Both directions of a session are
+/// measured this way, the server for each musician's uplink and the client for
+/// its own downlink, so the two figures a person compares are one quantity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LossWindow {
+    pub pulled: u64,
+    pub lost: u64,
+    pub recovered: u64,
+}
+
+impl LossWindow {
+    /// The window between two samples of the same buffer. `None` when any
+    /// counter went backwards, which is a rebuilt buffer rather than a window:
+    /// a reconnect or a re-anchor starts its counters again, and differencing
+    /// across one measures nothing.
+    #[must_use]
+    pub fn between(prev: &JitterStats, now: &JitterStats) -> Option<LossWindow> {
+        Some(LossWindow {
+            pulled: now.pulled.checked_sub(prev.pulled)?,
+            lost: now.lost.checked_sub(prev.lost)?,
+            recovered: now.recovered.checked_sub(prev.recovered)?,
+        })
+    }
+
+    /// Wire loss as a percentage of the window's pulls: frames that did not
+    /// arrive, whether or not redundancy rebuilt them. A window that pulled
+    /// nothing reads zero, because no audio was owed inside it.
+    #[must_use]
+    pub fn wire_loss_pct(&self) -> f32 {
+        self.pct(self.lost + self.recovered)
+    }
+
+    /// The share of the same pulls redundancy rebuilt, so a caller can say how
+    /// much of the wire loss was paid for rather than heard.
+    #[must_use]
+    pub fn recovered_pct(&self) -> f32 {
+        self.pct(self.recovered)
+    }
+
+    fn pct(&self, n: u64) -> f32 {
+        if self.pulled == 0 {
+            0.0
+        } else {
+            100.0 * n as f32 / self.pulled as f32
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct JitterBuffer {
     frames: BTreeMap<u32, Vec<u8>>,
@@ -1093,5 +1142,74 @@ mod tests {
         let stats = jb.stats();
         assert_eq!(stats.reanchors, 2, "{stats:?}");
         assert!(stats.depth_frames <= MAX_BUFFERED);
+    }
+
+    /// A window is a rate over what happened inside it, which is the whole
+    /// point of measuring one: a buffer that lost frames and then ran clean
+    /// reads clean over the clean window, where the same counters as a
+    /// lifetime ratio would still be carrying the bad stretch.
+    #[test]
+    fn a_window_after_a_bad_one_reads_clean() {
+        let mut jb = JitterBuffer::new();
+        let mut seq = 0u32;
+        let start = jb.stats();
+        // Every other frame dropped on the wire, half of them covered by the
+        // next packet's redundant copy, so both halves of wire loss move.
+        jb.push(packet(seq, None));
+        jb.pull();
+        seq += 1;
+        for i in 0..20 {
+            let lost = seq;
+            seq += 1;
+            jb.push(packet(seq, (i % 2 == 0).then_some(lost)));
+            jb.pull();
+            jb.pull();
+            seq += 1;
+        }
+        let bad_end = jb.stats();
+        let bad = LossWindow::between(&start, &bad_end).expect("one buffer's own counters");
+        assert!(
+            bad.wire_loss_pct() > 20.0,
+            "half the wire gone must read as loss: {bad:?}"
+        );
+        assert!(
+            bad.recovered_pct() > 0.0 && bad.recovered_pct() < bad.wire_loss_pct(),
+            "redundancy paid for some of it, not all: {bad:?}"
+        );
+
+        // A clean stretch of the same length, every frame arriving.
+        for _ in 0..40 {
+            jb.push(packet(seq, None));
+            jb.pull();
+            seq += 1;
+        }
+        let clean = LossWindow::between(&bad_end, &jb.stats()).expect("one buffer's own counters");
+        assert!(clean.pulled > 0, "the clean window played nothing");
+        assert_eq!(
+            clean.wire_loss_pct(),
+            0.0,
+            "a clean window must read clean whatever came before it: {clean:?}"
+        );
+        let lifetime = LossWindow::between(&start, &jb.stats()).expect("one buffer's own counters");
+        assert!(
+            lifetime.wire_loss_pct() > 0.0,
+            "the lifetime figure is the one that cannot come down: {lifetime:?}"
+        );
+    }
+
+    /// Counters that went backwards are a rebuilt buffer, and differencing
+    /// across one would report a rate for a window that never existed.
+    #[test]
+    fn a_rebuilt_buffer_is_not_a_window() {
+        let mut jb = JitterBuffer::new();
+        for seq in 0..8 {
+            jb.push(packet(seq, None));
+            jb.pull();
+        }
+        let before = jb.stats();
+        assert_eq!(
+            LossWindow::between(&before, &JitterBuffer::new().stats()),
+            None
+        );
     }
 }

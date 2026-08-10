@@ -291,7 +291,14 @@ pub struct StatsView {
     /// Jitter buffer depth and target, in 2.5 ms frames.
     pub jitter_depth: usize,
     pub jitter_target: usize,
-    pub loss_pct: f32,
+    /// This client's uplink loss over the last second, as the server measures
+    /// it: the audio the band is not hearing, and the direction nothing on
+    /// this machine can see. `None` until the first report arrives.
+    pub uplink_loss_pct: Option<f32>,
+    /// The local jitter buffer's loss over a window of the same length: the
+    /// audio this machine is not playing. A rate, so it comes back down once
+    /// the bad moment passes; `None` until the first window closes.
+    pub downlink_loss_pct: Option<f32>,
     /// The headline number: capture to playout, end to end. Includes what
     /// the boundary converter discloses when a direction resamples.
     pub mouth_to_ear_ms: Option<f32>,
@@ -329,6 +336,40 @@ pub struct WakeView {
     pub p99_ms: f32,
     /// The window's longest interval, which is exact.
     pub max_ms: f32,
+}
+
+impl StatsView {
+    /// The worse of the two directions, for anything showing a level rather
+    /// than a direction. Both are rates over the same window, so the larger of
+    /// them is a quantity; `None` while neither direction has a figure yet.
+    #[must_use]
+    pub fn worst_loss_pct(&self) -> Option<f32> {
+        match (self.uplink_loss_pct, self.downlink_loss_pct) {
+            (Some(up), Some(down)) => Some(up.max(down)),
+            (up, down) => up.or(down),
+        }
+    }
+
+    /// Each direction's loss, uplink first, in the words that say whose sound
+    /// it is. Written once and read by every surface that carries the figures,
+    /// because the two directions mean opposite things and a reader who cannot
+    /// tell them apart cannot act on either.
+    #[must_use]
+    pub fn loss_lines(&self) -> [String; 2] {
+        [
+            loss_line(
+                self.uplink_loss_pct,
+                "uplink",
+                "what the band misses of you",
+            ),
+            loss_line(self.downlink_loss_pct, "downlink", "what you miss of them"),
+        ]
+    }
+}
+
+fn loss_line(pct: Option<f32>, direction: &str, whose: &str) -> String {
+    let figure = pct.map_or("--".to_owned(), |p| format!("{p:.1}"));
+    format!("{direction} loss {figure}%, {whose}")
 }
 
 /// Linear levels in 0..1. dB conversion is the meter widget's job.

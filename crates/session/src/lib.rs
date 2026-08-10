@@ -32,8 +32,8 @@ pub use limits::{
 };
 pub use logtail::{LOG_TAIL_LINES, LogTail};
 pub use server::{
-    BroadcastMember, BroadcastTick, MemberStats, ServerConfig, ServerCore, ServerEvent, Stem,
-    TICK_SAMPLES,
+    BroadcastMember, BroadcastTick, MemberStats, STATS_INTERVAL_MS, ServerConfig, ServerCore,
+    ServerEvent, Stem, TICK_SAMPLES,
 };
 
 /// Errors surfaced by client-side calls; the cores otherwise swallow bad

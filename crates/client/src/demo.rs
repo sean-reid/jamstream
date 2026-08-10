@@ -142,6 +142,11 @@ struct DemoState {
     /// derives this from the ring's own counters, so a fixture pins the
     /// answer instead.
     crackling: bool,
+    /// Each direction's loss rate, pinned per direction because that is the
+    /// whole point of them: a fixture holds one losing while the other is
+    /// clean, which no single figure could express.
+    uplink_loss_pct: f32,
+    downlink_loss_pct: f32,
     /// What the audio stream is doing wrong: the real runtime derives it from
     /// the reopen cadence, which a fixture has no way to run, so it pins the
     /// answer instead.
@@ -309,6 +314,8 @@ impl DemoRuntime {
                 device_mode: None,
                 rate: None,
                 crackling: false,
+                uplink_loss_pct: 0.0,
+                downlink_loss_pct: 0.2,
                 audio_fault: None,
                 own_name: None,
             }),
@@ -417,6 +424,15 @@ impl DemoRuntime {
         s.record = RecordView { state, stems };
     }
 
+    /// Pins each direction's loss rate: the uplink as the server's Stats
+    /// report gives it, the downlink as the local jitter buffer's own window
+    /// closes on it.
+    pub fn set_loss(&self, uplink_pct: f32, downlink_pct: f32) {
+        let mut s = self.state.lock().expect("demo state");
+        s.uplink_loss_pct = uplink_pct;
+        s.downlink_loss_pct = downlink_pct;
+    }
+
     /// Pins whether the playout ring reads as crackling, as the real runtime
     /// derives it from the ring's own underrun counters.
     pub fn set_crackling(&self, crackling: bool) {
@@ -483,7 +499,8 @@ impl Runtime for DemoRuntime {
             rtt_ms: Some(rtt),
             jitter_depth: 3 + ((f / 240) % 2) as usize,
             jitter_target: 4,
-            loss_pct: (0.2 + 0.15 * ((f as f64) * 0.011).sin() as f32).max(0.0),
+            uplink_loss_pct: Some(s.uplink_loss_pct),
+            downlink_loss_pct: Some(s.downlink_loss_pct),
             mouth_to_ear_ms: Some(8.4 + 0.5 * ((f as f64) * 0.019).sin() as f32),
             device_mode: s.device_mode,
             rate: s.rate,

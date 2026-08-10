@@ -2132,6 +2132,27 @@ fn fault_harness(fault: Option<AudioFaultView>) -> Harness<'static> {
         })
 }
 
+/// The one direction a musician cannot hear for themselves earns the bar's
+/// own tag, and the other direction never raises it. A downlink losing audio
+/// is something they are already hearing; an uplink losing it sounds perfect
+/// on this machine while the room hears a broken instrument, so the two
+/// figures cannot share one surface.
+#[test]
+fn only_a_losing_uplink_tags_the_bar() {
+    use jamstream_client::screens::session::UPLINK_LOSS_TAG;
+
+    for (uplink, downlink, tagged) in [(6.0, 0.2, true), (0.2, 6.0, false)] {
+        let (rt, mut harness) = session_harness(false);
+        rt.inner().set_loss(uplink, downlink);
+        harness.run_steps(4);
+        assert_eq!(
+            harness.query_by_label(UPLINK_LOSS_TAG).is_some(),
+            tagged,
+            "uplink {uplink}%, downlink {downlink}%: the bar must tag the uplink alone"
+        );
+    }
+}
+
 /// The chat alignment invariant: message text starts at one x for every
 /// line, whatever the name beside it is. The long-names demo carries a
 /// 64-character name and the short scripted ones together.
