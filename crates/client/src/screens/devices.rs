@@ -362,12 +362,11 @@ pub fn cutting_out_line(stops: u64) -> String {
     )
 }
 
-/// What only exists once you have joined something: the mouth-to-ear figure
-/// buffer size is traded against, and whether your own signal is in your
-/// personal mix. Both `None` outside a session.
+/// What only exists once you have joined something: whether your own signal is
+/// in your personal mix, and whether the link is far enough apart to be offered
+/// it. `None` outside a session.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionAudio {
-    pub mouth_to_ear_ms: Option<f32>,
     /// Mirrors [`crate::runtime::Snapshot::hear_self`].
     pub hear_self: Option<bool>,
     /// Mirrors [`crate::runtime::Snapshot::offer_hear_self`].
@@ -448,7 +447,7 @@ impl DevicesScreen {
         session: SessionAudio,
         notes: StreamNotes<'_>,
     ) -> Option<DevicesEvent> {
-        self.buffer_ui(ui, block, catalog, session.mouth_to_ear_ms, notes);
+        self.buffer_ui(ui, block, catalog, notes);
         ui.add_space(theme::SPACE_MD);
         input_level_ui(ui, block, levels);
         let hear_self_event = session.hear_self.and_then(|on| {
@@ -462,12 +461,15 @@ impl DevicesScreen {
             .or(devices_event)
     }
 
+    /// The picks, the box that decides whether anything is added on top of one,
+    /// and what the stream reports about the depth it is holding. The figure the
+    /// pick is traded against is the status bar's, which the drawer may never
+    /// cover, so the block carries no copy of it.
     fn buffer_ui(
         &mut self,
         ui: &mut Ui,
         block: Block,
         catalog: &DeviceCatalog,
-        mouth_to_ear_ms: Option<f32>,
         notes: StreamNotes<'_>,
     ) {
         let bounds = buffer_bounds(catalog, self.capture_idx, self.playback_idx);
@@ -511,20 +513,6 @@ impl DevicesScreen {
                 } else {
                     ui.label(theme::muted(ui, note.text));
                 }
-            }
-            // The number the choice is being traded against. This pick sets
-            // two of the terms in mouth to ear, the capture buffer and the
-            // playout depth, so the figure moves with the pick, and the same
-            // figure in the same monospace is in the status bar.
-            // Outside a session nothing has been measured,
-            // and a placeholder would be an instrument reading a made-up
-            // number, so the row is absent instead.
-            if let Some(ms) = mouth_to_ear_ms {
-                ui.add_space(theme::SPACE_SM);
-                ui.horizontal(|ui| {
-                    ui.label(theme::mono(ui, format!("{ms:.1} ms")));
-                    ui.label(theme::muted(ui, "mouth to ear"));
-                });
             }
         });
     }
@@ -832,13 +820,13 @@ mod tests {
     }
 
     /// A machine holding what its size asks for says nothing at all, ticked or
-    /// pinned: the size is on the row above and the latency is under it, and a
-    /// second noun for held audio beside a buffer size is what made somebody ask
-    /// whether the size was automatic too.
+    /// pinned: the size is on the row above, and a second noun for held audio
+    /// beside a buffer size is what made somebody ask whether the size was
+    /// automatic too.
     ///
     /// A depth past the pick says how much more and why, in the units already on
     /// the rows: milliseconds over frames, and never a figure for the total,
-    /// which the latency row under it carries.
+    /// which the status bar carries.
     #[test]
     fn nothing_is_said_until_the_depth_leaves_the_pick_behind() {
         for at_rest in [cushion(240, 120, false), pinned_cushion(120, false)] {
