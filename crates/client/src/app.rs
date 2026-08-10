@@ -32,6 +32,15 @@ use crate::widgets::{AVATAR_D_STRIP, avatar_disc, sweep_avatar_textures};
 /// drawer is this wide and no wider whatever the window does.
 const DRAWER_W: f32 = 340.0;
 
+/// The smallest window the app opens at, which the viewport is given as its
+/// minimum inner size. Layout that has to hold at every window size is measured
+/// against it.
+pub const MIN_WINDOW: egui::Vec2 = egui::vec2(800.0, 600.0);
+
+/// The margin the shell keeps between the window and everything drawn in it, so
+/// what [`JamApp::root_ui`] is given is the window less twice this on each axis.
+pub const SHELL_MARGIN: i8 = 10;
+
 /// How the app turns an invite into a live session.
 ///
 /// A parameter rather than a call to [`LiveRuntime::join`], because that opens
@@ -1397,7 +1406,11 @@ impl eframe::App for JamApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let fill = theme::palette(self.theme).surface0;
         egui::CentralPanel::default_margins()
-            .frame(Frame::new().fill(fill).inner_margin(egui::Margin::same(10)))
+            .frame(
+                Frame::new()
+                    .fill(fill)
+                    .inner_margin(egui::Margin::same(SHELL_MARGIN)),
+            )
             .show(ui, |ui| self.root_ui(ui));
     }
 }

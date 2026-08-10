@@ -36,9 +36,9 @@ use jamstream_session::client::{ClientCore, ClientState, ClientStats};
 use crate::avatar;
 use crate::runtime::{
     AudioFaultView, AvatarHandle, BroadcastReadiness, BroadcastView, ChatLine, Command, ConnState,
-    CostView, DestinationView, DeviceBuffersView, FaderView, LevelsView, MemberId, MemberView,
-    MetronomeView, RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role, Runtime,
-    Snapshot, StatsView, StreamView, WakeView, recording_or_on_air,
+    CostView, CushionView, DestinationView, DeviceBuffersView, FaderView, LevelsView, MemberId,
+    MemberView, MetronomeView, RateOutcomeView, RateOutcomesView, RecordState, RecordView, Role,
+    Runtime, Snapshot, StatsView, StreamView, WakeView, recording_or_on_air,
 };
 use crate::screens::invites::TokenMap;
 
@@ -123,6 +123,15 @@ fn playout_capacity(buffer_frames: u32) -> usize {
 /// while the two are one number.
 fn playout_target(buffer_frames: u32) -> usize {
     playout_cushion_samples(buffer_frames as usize * usize::from(CHANNELS), CHUNK_STEREO)
+}
+
+/// What the cushion reports the instant a stream opens at `buffer_frames`,
+/// before any water mark has moved it. The demo holds this so its sessions
+/// carry the depth a real one does, taken off the controller itself rather than
+/// as a second copy of the rule.
+#[must_use]
+pub fn fresh_cushion(buffer_frames: u32) -> CushionView {
+    CushionControl::new(buffer_frames).view()
 }
 
 /// A depth target as time, which is the audio the device drains while the
