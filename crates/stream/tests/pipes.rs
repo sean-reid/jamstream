@@ -399,7 +399,8 @@ fn a_child_that_dies_before_opening_the_fifo_is_a_spawn_error() {
 /// filters there are exact matches: a rename has to land in both places or in
 /// neither. Both assert against a window an order of magnitude wider than what
 /// they measure, so the number is the only thing that tells a generous window
-/// from a nearly spent one.
+/// from a nearly spent one. Every suite that publishes a measurement keeps this
+/// pairing.
 #[test]
 fn the_measured_tests_are_named_in_the_nextest_config() {
     const CONFIG: &str = include_str!("../../../.config/nextest.toml");

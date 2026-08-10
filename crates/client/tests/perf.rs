@@ -340,8 +340,8 @@ fn a_frame_budget_scales_with_the_runner_and_never_shrinks() {
 
 /// Both measurements above only reach a log on a passing run because
 /// `.config/nextest.toml` names these tests for publishing, and filters there
-/// are exact matches: a rename has to land in both places or in neither. Same
-/// pairing the harness, session, server and broadcast suites keep.
+/// are exact matches: a rename has to land in both places or in neither. Every
+/// suite that publishes a measurement keeps this pairing.
 #[test]
 fn the_measured_tests_are_named_in_the_nextest_config() {
     const CONFIG: &str = include_str!("../../../.config/nextest.toml");
