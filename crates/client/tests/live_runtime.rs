@@ -30,17 +30,6 @@ const RATE: u32 = 48_000;
 /// the loudest failure, so it answers only the question it is asked.
 const TONE_FLOOR: f64 = 100.0;
 
-/// Uplink loss a buffer change may leave behind, as a percentage the server
-/// reports over a one second window. Ten readings on this macOS box sat between
-/// 0 and 1.4 either side of the swap. The fault this defends against reads 100
-/// and stays there, so the ceiling only has to clear ordinary noise.
-const SWAP_LOSS_CEILING: f32 = 5.0;
-/// Allowed on top of whatever the machine already reported before the swap. A
-/// Windows runner has been seen holding its own figure above the ceiling for
-/// twenty seconds, so the comparison is against that machine rather than against
-/// a number picked here.
-const SWAP_LOSS_MARGIN: f32 = 5.0;
-
 /// Held for as long as any test in this binary has a session running, shared by
 /// all of them but one, and taken exclusively by the test whose subject is the
 /// log file.
@@ -1037,10 +1026,6 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     });
     std::thread::sleep(Duration::from_millis(1_000));
 
-    // The reading the swap has to be judged against. A platform with a steady
-    // loss floor of its own would otherwise be blamed for what the swap did.
-    let before = b.snapshot().stats.loss_pct;
-
     b.reconfigure_audio(AudioSettings {
         capture_id: None,
         playback_id: None,
@@ -1051,28 +1036,14 @@ fn a_buffer_swap_keeps_the_swapper_audible_to_everybody_else() {
     // audio on any machine rather than at one particular speed.
     std::thread::sleep(Duration::from_millis(3_500));
 
-    // B's own snapshot carries the server's opinion of B's uplink, the field
-    // that read 100 percent on a real machine. Judged against the same field
-    // read before the swap, because a runner with a loss floor of its own would
-    // otherwise be blamed for what the swap did, and one has been seen holding
-    // its figure above five percent for twenty seconds afterwards. What the
-    // swap must not do is make it worse. The sharp detector for the fault
-    // itself is `a_capture_gap_on_a_jittery_stream` in the session crate, which
-    // fails every run in under half a second and depends on no wall clock.
-    let mut readings = Vec::new();
-    for _ in 0..10 {
-        readings.push(b.snapshot().stats.loss_pct);
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let worst = readings.iter().copied().fold(0.0f32, f32::max);
-    // The numbers ride on the assertion, because a passing run's output is
-    // captured and thrown away, so a figure printed on the happy path is a
-    // figure nobody can calibrate against.
-    assert!(
-        worst <= before.max(SWAP_LOSS_CEILING) + SWAP_LOSS_MARGIN,
-        "b's uplink read {before}% loss before the buffer change and {worst}% at \
-         its worst across the five seconds after it, from {readings:?}"
-    );
+    // What A recorded is the whole assertion, and it is the right one: the
+    // question is whether the far side still hears B, and A's own file answers
+    // it without going through a counter. `stats.loss_pct` cannot: it is the
+    // worse of two unrelated directions, and its downlink half is cumulative
+    // since joining, so one bad moment keeps that figure high for the rest of
+    // the session no matter how well the uplink is doing. The sharp detector
+    // for the fault itself is `a_capture_gap_on_a_jittery_stream` in the
+    // session crate, which fails every run in under half a second.
 
     a.send(Command::Leave);
     wait_for(&a, "a idle", Duration::from_secs(3), |s| {
