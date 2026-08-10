@@ -4,11 +4,10 @@
 //! exchanges it at the key's `token_uri`, which has to be https, for an
 //! OAuth2 access token. No gcloud subprocess is involved.
 //!
-//! [`ServiceAccountTokenSource`] implements
-//! [`TokenSource`](super::gcp::TokenSource) and caches the minted token,
-//! refreshing once it is within five minutes of expiry. Tokens are
-//! secrets: they are never logged and the `Debug` impl redacts both the
-//! private key and any cached token.
+//! [`ServiceAccountTokenSource`] implements [`TokenSource`] and caches the
+//! minted token, refreshing once it is within five minutes of expiry.
+//! Tokens are secrets: they are never logged and the `Debug` impl redacts
+//! both the private key and any cached token.
 //!
 //! The `iat`/`exp` claims and the cache clock come from an injectable
 //! [`Clock`], and the token endpoint can be overridden, so tests are

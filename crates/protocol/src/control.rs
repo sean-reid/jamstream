@@ -177,8 +177,8 @@ pub enum StreamOp {
 }
 
 /// Per-destination lifecycle. `Failed` carries a reason a musician can act
-/// on ("push failed: Failed to connect to rtmps://<redacted> Connection
-/// refused"), never a stream key.
+/// on (`push failed: Failed to connect to rtmps://<redacted> Connection
+/// refused`), never a stream key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DestinationState {
     /// Configured, encoder not running.

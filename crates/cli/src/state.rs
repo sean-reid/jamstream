@@ -14,7 +14,7 @@ pub const STATE_DIR_ENV: &str = "JAMSTREAM_STATE_DIR";
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct InviteRecord {
-    /// "host", "musician <id>", or "listener <id>".
+    /// `host`, `musician <id>`, or `listener <id>`.
     pub role: String,
     pub invite: String,
 }

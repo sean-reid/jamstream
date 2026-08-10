@@ -1,5 +1,5 @@
 //! Credential storage for the host wizard. Secrets live in the platform
-//! keychain (service "jamstream", account "<provider>.<field>"); the same
+//! keychain (service `jamstream`, account `<provider>.<field>`); the same
 //! environment variables the CLI reads remain a silent fallback so a
 //! terminal-configured machine works in the app with no extra setup. A
 //! secret the keychain itself refuses as too long lands in a private file
