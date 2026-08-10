@@ -1889,12 +1889,40 @@ mod tests {
     }
 
     #[test]
-    fn raw_capture_accepts_odd_lengths_and_is_empty_until_joined() {
+    fn raw_capture_is_empty_until_joined() {
         let (mut core, _) = ClientCore::connect(&invite(Role::Musician), 0).unwrap();
         // Device-paced deliveries that straddle frame boundaries.
         assert!(core.push_capture_raw(0, &[0.0; 250]).is_empty());
         assert!(core.push_capture_raw(0, &[0.0; 119]).is_empty());
         assert!(core.push_capture_raw(0, &[0.0; 1]).is_empty());
+    }
+
+    /// A device hands over whatever its callback size is, which is never the
+    /// 2.5 ms frame, and every sample it hands over owes one datagram per
+    /// frame's worth. Joined, because unjoined the count is zero for any input
+    /// and says nothing about the pacing.
+    #[test]
+    fn raw_capture_paces_odd_lengths_onto_the_frame_clock() {
+        let (inv, server) = invite_and_server(Role::Musician);
+        let (mut core, init) = ClientCore::connect(&inv, 0).unwrap();
+        core.handle_datagram(1, &handshake_response(&server, &inv, &init));
+        assert_eq!(*core.state(), ClientState::Joined);
+
+        let mut pushed = 0usize;
+        let mut sent = 0usize;
+        for len in [250usize, 119, 1].iter().cycle().take(30) {
+            pushed += len;
+            let dgs = core.push_capture_raw(1, &vec![0.25; *len]);
+            assert!(dgs.iter().all(|d| !d.is_empty()), "an empty datagram");
+            sent += dgs.len();
+        }
+        // Exactly the completed frames: the remainder of the last push stays
+        // staged for the next one, and nothing in between is dropped.
+        assert_eq!(
+            sent,
+            pushed / TICK_SAMPLES as usize,
+            "{pushed} samples in odd-length pushes left as {sent} datagrams"
+        );
     }
 
     #[test]
