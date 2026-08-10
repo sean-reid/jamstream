@@ -76,12 +76,13 @@
 //! passed `--shutdown-file` at spawn, is expected to poll for it and exit
 //! cleanly. One mechanism, identical everywhere, no new dependency.
 //!
-//! The provider waits for the sentinel only when jamstreamd has left a
-//! `<session dir>/shutdown.supported` marker to prove it polls. Without the
+//! The provider waits for the sentinel only when jamstreamd has left the
+//! marker [`shutdown_supported_path`] names to prove it polls. Without the
 //! marker, teardown falls back to SIGTERM on unix and an immediate forced
 //! kill on Windows, so an older binary costs nothing. The server half is
 //! shipped: `--shutdown-file` in `jamstream_server`'s `main`, the marker and
-//! the poll in its `runtime`.
+//! the poll in its `runtime`, and the server crate's `local_provider` suite
+//! holds the two together over a real spawn.
 //!
 //! # Platform notes
 //!
@@ -934,6 +935,20 @@ fn shutdown_path(session_dir: &Path) -> PathBuf {
     session_dir.join(SHUTDOWN_FILE)
 }
 
+/// The marker beside the sentinel that proves the server polls it, derived
+/// from the sentinel path so both halves of the contract spell it once.
+///
+/// Public because the writer is `jamstream_server`'s `with_shutdown_file`,
+/// in another crate, and it is handed the sentinel path rather than this
+/// one. The two binaries are versioned independently, which is the whole
+/// reason the marker exists, so a second spelling is not a compile error
+/// anywhere: the provider simply never sees a marker, and on Windows, where
+/// the grace period is nothing but this file, teardown force-kills a server
+/// mid-upload with the members never told.
+pub fn shutdown_supported_path(shutdown_file: &Path) -> PathBuf {
+    shutdown_file.with_file_name(SHUTDOWN_SUPPORTED_FILE)
+}
+
 /// Asks the session server to exit cleanly by creating the sentinel file it
 /// polls. Returns whether the request actually reached the disk.
 ///
@@ -979,7 +994,7 @@ fn request_graceful_shutdown(session_dir: &Path) -> bool {
 /// sentinel. Absent marker means an older jamstreamd: skip the wait and go
 /// straight to the forced kill, which is what that build has always got.
 fn graceful_shutdown_supported(session_dir: &Path) -> bool {
-    session_dir.join(SHUTDOWN_SUPPORTED_FILE).exists()
+    shutdown_supported_path(&shutdown_path(session_dir)).exists()
 }
 
 /// Clears both shutdown files, for a session directory about to be reused.

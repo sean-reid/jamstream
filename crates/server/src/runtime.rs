@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
 use jamstream_cloud::cloudinit::RecordingStorage;
+use jamstream_cloud::providers::local::shutdown_supported_path;
 use jamstream_protocol::control::MAX_DATAGRAM_BYTES;
 use jamstream_protocol::control::{
     BroadcastReadiness, RecordOp, RecordingState as ProtoRecordingState, StreamOp,
@@ -765,15 +766,6 @@ fn record_status(state: RecordingState, stems_cfg: bool) -> (ProtoRecordingState
     }
 }
 
-/// The marker jamstreamd leaves beside its shutdown sentinel, telling whoever
-/// spawned it that the sentinel has a reader. The local provider skips the
-/// graceful wait when it is absent, which is what an older build gets.
-fn shutdown_supported_path(shutdown: &std::path::Path) -> PathBuf {
-    let mut name = shutdown.file_name().unwrap_or_default().to_owned();
-    name.push(".supported");
-    shutdown.with_file_name(name)
-}
-
 fn log_event(event: &ServerEvent) {
     match event {
         ServerEvent::MusicianCountChanged(n) => tracing::info!(musicians = n, "occupancy"),
@@ -815,9 +807,8 @@ fn touch(path: Option<&std::path::Path>) {
 mod tests {
     use super::{
         IdleExit, MaxDuration, ProtoRecordingState, RecordingState, guard, record_status,
-        session_elapsed, shutdown_supported_path,
+        session_elapsed,
     };
-    use std::path::Path;
     use std::time::Duration;
 
     /// Every recorder state reaches the wire. Uploading in particular: it was
@@ -870,16 +861,6 @@ mod tests {
         assert!(caught_string.is_none());
         // And the loop keeps working afterwards.
         assert_eq!(guard(|| 8), Some(8));
-    }
-
-    /// The local provider looks for this exact name beside the sentinel; a
-    /// mismatch means it silently skips the graceful wait forever.
-    #[test]
-    fn the_shutdown_marker_sits_beside_the_sentinel() {
-        assert_eq!(
-            shutdown_supported_path(Path::new("/tmp/session-abc/shutdown")),
-            Path::new("/tmp/session-abc/shutdown.supported")
-        );
     }
 
     fn secs(s: u64) -> Duration {
