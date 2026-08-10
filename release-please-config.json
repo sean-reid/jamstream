@@ -5,6 +5,7 @@
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": true,
   "prerelease": false,
+  "pull-request-header": "Before merging this, run `cargo xtask prerelease` on a machine with an audio interface plugged in and paste the output here. It runs the four tests that need real hardware or the open internet, no runner can make them, and this pull request is the only record that they ran. CONTRIBUTING.md has the detail.",
   "changelog-sections": [
     { "type": "security", "section": "Security" },
     { "type": "feat", "section": "Features" },
