@@ -2637,34 +2637,14 @@ impl Worker {
         // machine is not playing.
         s.uplink_loss_pct = stats.uplink_loss_pct;
         s.downlink_loss_pct = downlink;
-        // Mouth to ear, capture to the last buffer this app hands the card:
-        //   rtt / 2                      the downlink network leg
-        // + jitter depth * 2.5 ms        playout buffering ahead of decode
-        // + 2.5 ms                       one media frame of encode latency
-        // + capture buffer ms            the capture device buffer, as the
-        //                                device negotiated it, not as asked
-        // + playout cushion ms           the depth the top-up loop holds in the
-        //                                playout ring, which every sample
-        //                                queues behind before the device plays
-        //                                it
-        // + converter added ms           the boundary resampler's disclosed
-        //                                figure, per converted direction
-        //
-        // What the card holds after the callback returns is beyond our sight
-        // and in none of these terms.
         let convert_ms = s.rate.map_or(0.0, |r| r.added_ms());
         let device = DeviceBuffersView {
             capture_ms: self.device_frames as f32 / 48.0,
             playout_ms: (self.playout_target / usize::from(CHANNELS)) as f32 / 48.0,
         };
-        s.mouth_to_ear_ms = stats.rtt_ms_last.map(|rtt| {
-            rtt / 2.0
-                + stats.jitter.depth_frames as f32 * 2.5
-                + 2.5
-                + device.capture_ms
-                + device.playout_ms
-                + convert_ms
-        });
+        s.mouth_to_ear_ms = stats
+            .rtt_ms_last
+            .map(|rtt| mouth_to_ear_ms(rtt, stats.jitter.depth_frames, device, convert_ms));
         // The same two figures the sum used, so the hover can never break the
         // number down into terms it was not built from.
         s.device_buffers = self.engine.is_some().then_some(device);
@@ -2781,6 +2761,39 @@ fn rate_change_line(
     }
 }
 
+// Mouth to ear, capture to the last buffer this app hands the card:
+//   rtt                          both network legs, the player's uplink and the
+//                                listener's downlink, each charged at this
+//                                client's own round trip, which is the only one
+//                                it can measure: right when the band's links are
+//                                alike, short by the difference when they are
+//                                not
+// + jitter depth * 2.5 ms        playout buffering ahead of decode
+// + 2.5 ms                       one media frame of encode latency
+// + capture buffer ms            the capture device buffer, as the device
+//                                negotiated it, not as asked
+// + playout cushion ms           the depth the top-up loop holds in the playout
+//                                ring, which every sample queues behind before
+//                                the device plays it
+// + converter added ms           the boundary resampler's disclosed figure, per
+//                                converted direction
+//
+// What the card holds after the callback returns is beyond our sight and in
+// none of these terms.
+fn mouth_to_ear_ms(
+    rtt_ms: f32,
+    jitter_depth_frames: usize,
+    device: DeviceBuffersView,
+    convert_ms: f32,
+) -> f32 {
+    rtt_ms
+        + jitter_depth_frames as f32 * 2.5
+        + 2.5
+        + device.capture_ms
+        + device.playout_ms
+        + convert_ms
+}
+
 /// `session_full` rides on [`ClientStats`] rather than on the client state,
 /// because the core stays in `Connecting` while it retries a full session.
 /// So the stat decides, and only while nothing better has happened.
@@ -2829,6 +2842,31 @@ mod tests {
             "{FRAME_FRAMES} samples at {SAMPLE_RATE} Hz is not {TICK:?} of audio"
         );
         assert_eq!(CHUNK_STEREO, FRAME_FRAMES * usize::from(CHANNELS));
+    }
+
+    /// The network term is the whole round trip, because mouth to ear crosses
+    /// the player's uplink and the listener's downlink. Pinned here rather than
+    /// in `live_runtime.rs`, whose round trip is measured in whole milliseconds
+    /// and rounds to 0 or 1 over loopback: at 0, one leg and two are the same
+    /// number.
+    ///
+    /// Every term a different value, so a sum that dropped one or counted
+    /// another twice cannot land on the same figure.
+    #[test]
+    fn the_figure_charges_the_round_trip_for_both_network_legs() {
+        let device = DeviceBuffersView {
+            capture_ms: 3.0,
+            playout_ms: 6.0,
+        };
+        assert_eq!(
+            mouth_to_ear_ms(45.0, 3, device, 0.0),
+            45.0 + 7.5 + 2.5 + 3.0 + 6.0
+        );
+        assert_eq!(
+            mouth_to_ear_ms(45.0, 3, device, 3.5) - mouth_to_ear_ms(45.0, 3, device, 0.0),
+            3.5,
+            "a converted direction costs its disclosed figure and nothing else"
+        );
     }
 
     /// One tick of playout against the counters the jitter buffer would have

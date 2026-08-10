@@ -20,6 +20,8 @@ A local session server that dies at startup is a different case with its own log
 
 Start with the number, not the feel. The headline figure in the session status bar is mouth to ear: the milliseconds from sound entering an interface to the last buffer JamStream hands your sound card, the playout cushion included. What the card holds after that is the one part no figure here can see.
 
+The network is in that figure twice, because your sound crosses to the server and out again to the player hearing it, and your own round trip is charged for both crossings. That is right when the band's connections are alike, and low by the difference when somebody's is worse than yours.
+
 Two players in the same room stand about 3 ms apart per meter of air; a total under 30 ms feels like playing across a large stage, and most people stop noticing under 20 ms.
 
 Check these in order of payoff:

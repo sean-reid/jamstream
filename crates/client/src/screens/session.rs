@@ -1199,7 +1199,8 @@ fn latency_readout(ui: &mut Ui, snap: &Snapshot) {
 fn latency_hover(s: &crate::runtime::StatsView) -> String {
     let rtt = s.rtt_ms.map_or("--".to_owned(), |v| format!("{v:.1}"));
     let mut text = format!(
-        "rtt {rtt} ms\nbuffer {}/{} frames\n{}",
+        "rtt {rtt} ms, charged for both legs, low if somebody's link is worse\n\
+         buffer {}/{} frames\n{}",
         s.jitter_depth,
         s.jitter_target,
         s.loss_lines().join("\n")
@@ -1624,6 +1625,10 @@ mod tests {
         let rt = DemoRuntime::frozen(FROZEN_FRAME, false);
         let base = latency_hover(&rt.snapshot().stats);
         assert!(base.contains("rtt") && base.contains("buffer") && base.contains("loss"));
+        assert!(
+            base.contains("charged for both legs, low if somebody's link is worse"),
+            "the rtt line carries the assumption the figure is built on: {base:?}"
+        );
         assert!(
             !base.contains("mode") && !base.contains("converting"),
             "an unreported mode must add nothing: {base:?}"
