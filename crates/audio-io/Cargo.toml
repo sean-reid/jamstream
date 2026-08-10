@@ -44,17 +44,24 @@ test = false
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal.workspace = true
 tracing.workspace = true
+# mach2 and libc: the time-constraint scheduling policy that puts a ring-filling
+# thread on the same footing as the CoreAudio callback it feeds. Both are already
+# in the macOS graph under cpal, so this adds no crate to it.
+mach2 = "0.6"
+libc.workspace = true
 
 # wasapi: HEnquist's IAudioClient wrapper, the CamillaDSP precedent, used for
-# exclusive-mode streams. windows: MMCSS thread promotion and the AUDCLNT
-# HRESULT constants the fallback table keys on; the version matches the one
-# wasapi itself depends on so the graph stays single-version.
+# exclusive-mode streams. windows: MMCSS thread promotion, the process timer
+# resolution a sleeping thread needs, and the AUDCLNT HRESULT constants the
+# fallback table keys on; the version matches the one wasapi itself depends on so
+# the graph stays single-version.
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal.workspace = true
 tracing.workspace = true
 wasapi = "0.23"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Media",
     "Win32_Media_Audio",
     "Win32_System_Threading",
 ] }

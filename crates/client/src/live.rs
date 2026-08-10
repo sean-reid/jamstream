@@ -6,9 +6,11 @@
 //! with the network thread over the bridge's SPSC rings; the network thread
 //! owns the socket, the core, and the audio stream lifecycle, and publishes
 //! UI state into a `Mutex<SharedState>` the paint thread reads once per
-//! frame. Loop cadence is ~2.5 ms with sleep-until pacing; precision is
-//! forgiving because the raw capture/playout APIs are sample-count driven
-//! by the device clock, not the loop clock.
+//! frame. Loop cadence is ~2.5 ms with sleep-until pacing; the sample counts
+//! are driven by the device clock rather than the loop clock, so the cadence is
+//! forgiving up to the depth of the playout ring, and a wakeup later than that
+//! is silence the device padded. The thread asks the platform for the class the
+//! device callbacks already run at, and times itself against that ring.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
@@ -19,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use data_encoding::HEXLOWER;
 use jamstream_audio_io::{
-    AudioBackend, AudioError, CallbackBridge, DuplexHandler, EngineSide, StreamConfig,
-    StreamHandle, WavBackend, WavStream,
+    AudioBackend, AudioError, AudioPriority, CallbackBridge, DuplexHandler, EngineSide,
+    StreamConfig, StreamHandle, ThreadPriority, WavBackend, WavStream,
 };
 use jamstream_engine::{JitterBuffer, JitterStats};
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
@@ -1055,7 +1057,7 @@ impl WakeWatch {
     /// One wakeup, against the cushion it has to stay inside. `None` for a ring
     /// nothing is draining on a clock of its own, which is measured all the same
     /// and never warned about.
-    fn observe(&mut self, now: Instant, cushion: Option<Duration>) {
+    fn observe(&mut self, now: Instant, cushion: Option<Duration>, priority: ThreadPriority) {
         if let Some(last) = self.last.replace(now) {
             let gap = now.saturating_duration_since(last);
             self.counts[wake_bucket(gap)] += 1;
@@ -1079,6 +1081,7 @@ impl WakeWatch {
                 p99_ms = as_ms(pacing.p99),
                 max_ms = as_ms(pacing.max),
                 cushion_ms = as_ms(cushion),
+                priority = ?priority,
                 "the thread filling playout wakes later than the ring holds"
             );
         }
@@ -1246,6 +1249,7 @@ impl LiveRuntime {
             opened_at: Some(Instant::now()),
             episode: ReopenEpisode::default(),
             announced_rate: rate,
+            priority: ThreadPriority::Unchanged,
         };
         let handle = std::thread::Builder::new()
             .name("jamstream-net".into())
@@ -1649,10 +1653,21 @@ struct Worker {
     /// The rate outcomes last logged, so a reopen on the same rung writes
     /// nothing and a rung change is written exactly once.
     announced_rate: Option<RateOutcomesView>,
+    /// What the platform granted this thread, set once it is running. The
+    /// pacing warning names it: a loop waking late at a real-time priority and
+    /// one waking late at a priority nobody raised are different faults.
+    priority: ThreadPriority,
 }
 
 impl Worker {
     fn run(mut self) {
+        // This thread fills a ring a real-time callback drains, so it asks for
+        // the same class the callback runs at. Held for the session and released
+        // when this returns: on Windows it carries process-wide timer
+        // resolution, which the app has no business keeping once its audio has
+        // stopped.
+        let priority = AudioPriority::raise_current_thread(TICK);
+        self.priority = priority.granted();
         let mut next = Instant::now() + TICK;
         loop {
             if !self.step() {
@@ -2191,7 +2206,7 @@ impl Worker {
     fn watch_wakeup(&mut self) {
         let cushion = (self.engine.is_some() && matches!(self.driver, Driver::Real { .. }))
             .then(|| playout_cushion(self.device_frames));
-        self.wake.observe(Instant::now(), cushion);
+        self.wake.observe(Instant::now(), cushion, self.priority);
     }
 
     /// The bridge counters, reported by [`RingWatch`]. Movement means a ring
@@ -3705,7 +3720,7 @@ mod tests {
         while *at <= closes_at {
             wakeup += 1;
             *at += if wakeup % late_every == 0 { late } else { TICK };
-            watch.observe(*at, cushion);
+            watch.observe(*at, cushion, ThreadPriority::RealTime);
         }
     }
 
