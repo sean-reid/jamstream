@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use jamstream_audio_io::{EngineSide, ThreadPriority};
 use jamstream_engine::{JitterStats, LossWindow};
 
-use super::{CHANNELS, TICK};
+use super::{CHANNELS, CHUNK_STEREO, TICK, cushion_time, playout_capacity, playout_target};
 use crate::runtime::MemberId;
 
 /// Base backoff between attempts to reopen a lost or misconfigured stream.
@@ -448,6 +448,12 @@ impl RingWatch {
         self.low_water_frames
     }
 
+    /// When the window behind that reading closed, so a consumer that acts once
+    /// per reading can tell a fresh one from the one it has already acted on.
+    pub(super) fn low_water_at(&self) -> Instant {
+        self.low_water_from
+    }
+
     /// Drops the water mark without waiting for a window to close: the ring it
     /// was measuring is gone, and the next stream's ring measures its own.
     pub(super) fn forget(&mut self) {
@@ -534,6 +540,181 @@ impl EpisodeWatch {
             self.since = None;
         }
         self.active
+    }
+}
+
+/// The cushion moves one 2.5 ms frame at a time, in both directions. The
+/// jitter buffer sets the size: the top-up loop pulls from it, so a target that
+/// moved by more than a frame is pulled in the tick it moves and runs the
+/// buffer's playout position past the sender, which the buffer can step back at
+/// most one frame of. It is also what one top-up puts in, so nothing smaller
+/// changes what the ring survives.
+pub(super) const CUSHION_STEP: usize = CHUNK_STEREO;
+/// Quiet the cushion needs behind it before it hands a frame of latency back.
+/// The stretch that closes a crackling run out, for the measurement that set
+/// that stretch: a crackling run took five underruns in ninety seconds on real
+/// hardware, so anything shorter gives latency away between two underruns of
+/// one run and takes it back on the next.
+const CUSHION_QUIET: Duration = CRACKLE_EPISODE_WINDOW;
+
+/// Moves the depth the top-up loop fills to, from how close the playout ring
+/// came to empty over the last window.
+///
+/// Up on the reading that saw it, down only behind a long quiet stretch,
+/// because the two directions cost different things. A ring that came within
+/// one top-up of padding silence is one late wakeup from something a musician
+/// hears, and the frame that covers it costs 2.5 ms nobody can pick out. Coming
+/// down buys that latency back and nothing else, while getting it wrong is an
+/// audible dropout, so it takes [`CUSHION_QUIET`] of readings that would every
+/// one of them have survived the shallower depth, and gives back a frame rather
+/// than returning to the floor.
+///
+/// Nearly dry is one device callback, which is what the next drain takes, plus
+/// one [`CUSHION_STEP`], which is what one top-up puts back. A dip that leaves
+/// less than that served every callback and would not have served one more, so
+/// it is the last reading before the damage rather than the first one after it.
+/// The reading a machine keeping up gives is the whole cushion, measured over
+/// twenty seconds of 120-frame callbacks at real-time priority, so there is a
+/// whole frame of daylight between a healthy machine and this line.
+///
+/// Both bounds are latency. The floor is the base cushion of two callbacks, so
+/// a machine that keeps up pays exactly what it pays today. The ceiling is
+/// twice the floor rather than the
+/// [`PLAYOUT_CUSHION_MAX`](super::PLAYOUT_CUSHION_MAX) the ring is cut for: at
+/// twice the floor the cushion has spent the latency of the next buffer size up,
+/// and that size would have bought a device callback twice as long, which the
+/// platform schedules better and which asks this loop for half as many wakeups.
+/// A machine still drying out there wants the buffer control, not a deeper ring.
+pub(super) struct CushionControl {
+    /// Depth the loop fills to, in interleaved samples.
+    target: usize,
+    /// The base cushion, which is the shallowest this ever asks for.
+    floor: usize,
+    ceiling: usize,
+    /// One device callback in interleaved samples, which is what one drain
+    /// takes out of the ring.
+    callback: usize,
+    /// The window this last acted on, so one reading moves the depth once.
+    read_at: Option<Instant>,
+    /// Whether the ring spent part of the window now closing reaching a depth it
+    /// had just been given, which makes that reading evidence about the depth
+    /// before it and grows the cushion twice for one dip. True at the open as
+    /// well: the device renders ahead of this loop's first tick, so the window a
+    /// stream opens in holds a dip nothing could have prevented.
+    catching_up: bool,
+    /// When the run of readings deep enough to give a frame back began; None
+    /// whenever one broke it.
+    quiet_since: Option<Instant>,
+    /// Whether the ceiling has been said for the run now sitting at it.
+    said: bool,
+}
+
+impl CushionControl {
+    pub(super) fn new(device_frames: u32) -> CushionControl {
+        let floor = playout_target(device_frames);
+        CushionControl {
+            target: floor,
+            floor,
+            // The ring is cut for the deeper of the base cushion and
+            // PLAYOUT_CUSHION_MAX, so a device whose own period is past that
+            // ceiling has no room and starts at it.
+            ceiling: (2 * floor).min(playout_capacity(device_frames)),
+            callback: device_frames as usize * usize::from(CHANNELS),
+            read_at: None,
+            catching_up: true,
+            quiet_since: None,
+            said: false,
+        }
+    }
+
+    /// The depth [`Worker::top_up_playout`](super::Worker::top_up_playout)
+    /// fills to.
+    pub(super) fn target(&self) -> usize {
+        self.target
+    }
+
+    /// One window's reading: `low` is how close the ring came to empty over it
+    /// in frames, and `at` is when the window closed. A window already acted
+    /// on moves nothing, and a window no render callback ran in is no evidence
+    /// in either direction.
+    pub(super) fn observe(&mut self, at: Instant, low: Option<usize>) {
+        if self.read_at == Some(at) {
+            return;
+        }
+        self.read_at = Some(at);
+        let Some(low) = low else {
+            self.quiet_since = None;
+            return;
+        };
+        // The bridge counts frames; the target and the callback are
+        // interleaved.
+        let low = low * usize::from(CHANNELS);
+        if self.catching_up {
+            self.catching_up = false;
+            self.quiet_since = None;
+            return;
+        }
+        if low < self.callback + CUSHION_STEP {
+            self.quiet_since = None;
+            self.grow(low);
+            return;
+        }
+        self.said = false;
+        self.give_back(at, low);
+    }
+
+    /// One frame deeper, or the line that says a deeper ring is the wrong
+    /// answer now.
+    fn grow(&mut self, low: usize) {
+        if self.target >= self.ceiling {
+            if !self.said {
+                self.said = true;
+                tracing::warn!(
+                    cushion_ms = as_ms(cushion_time(self.target)),
+                    low_frames = low / usize::from(CHANNELS),
+                    callback_frames = self.callback / usize::from(CHANNELS),
+                    "the playout ring keeps running close to empty at the deepest cushion \
+                     this buffer size allows; the device wants a bigger one"
+                );
+            }
+            return;
+        }
+        self.target = (self.target + CUSHION_STEP).min(self.ceiling);
+        self.catching_up = true;
+        tracing::info!(
+            cushion_ms = as_ms(cushion_time(self.target)),
+            low_frames = low / usize::from(CHANNELS),
+            "the playout ring came close to empty; the cushion is a frame deeper"
+        );
+    }
+
+    /// One frame back, once the readings behind it have earned it. A frame given
+    /// back has to leave this window's dip above the line the cushion grows on,
+    /// or the next reading takes it straight back and the cushion oscillates
+    /// around a depth instead of settling on one.
+    fn give_back(&mut self, at: Instant, low: usize) {
+        if self.target <= self.floor {
+            self.quiet_since = None;
+            return;
+        }
+        let step = CUSHION_STEP.min(self.target - self.floor);
+        if low < self.callback + CUSHION_STEP + step {
+            self.quiet_since = None;
+            return;
+        }
+        let since = *self.quiet_since.get_or_insert(at);
+        if at.duration_since(since) < CUSHION_QUIET {
+            return;
+        }
+        self.target -= step;
+        self.quiet_since = Some(at);
+        self.catching_up = true;
+        tracing::info!(
+            cushion_ms = as_ms(cushion_time(self.target)),
+            low_frames = low / usize::from(CHANNELS),
+            quiet_ms = at.duration_since(since).as_millis(),
+            "the playout ring has been keeping up; the cushion gave a frame back"
+        );
     }
 }
 
@@ -783,8 +964,7 @@ mod tests {
     use super::*;
     use crate::live::tests::top_up;
     use crate::live::{
-        FRAME_FRAMES, capture_capacity, fill_playout_to, playout_capacity, playout_cushion,
-        playout_target,
+        FRAME_FRAMES, capture_capacity, fill_playout_to, playout_capacity, playout_target,
     };
 
     /// The cadence a device that keeps dying is retried on: the first loss at
@@ -1668,6 +1848,422 @@ mod tests {
         assert_eq!(engine.underruns(), 0);
     }
 
+    /// The device side of playout against the worker's top-up loop, on a clock
+    /// the test drives: a real ring at the client's own sizes, a device draining
+    /// its own callbacks on its own clock, and [`CushionControl`] deciding from
+    /// the water mark the two of them leave behind. Holding the worker up runs
+    /// the ring down for real, so nothing here stands in for the controller's
+    /// own inputs.
+    struct CushionRig {
+        device: jamstream_audio_io::DeviceSide,
+        engine: EngineSide,
+        frames: u32,
+        /// Interleaved samples one device callback asks for.
+        callback: usize,
+        /// Interleaved samples the device clock has earned and not yet asked
+        /// for, so a callback longer than a tick fires every few ticks.
+        earned: usize,
+        out: Vec<f32>,
+        silence: Vec<f32>,
+        rings: RingWatch,
+        cushion: CushionControl,
+        at: Instant,
+    }
+
+    impl CushionRig {
+        fn new(frames: u32, start: Instant) -> CushionRig {
+            let (device, mut engine) =
+                CallbackBridge::new(capture_capacity(frames), playout_capacity(frames));
+            engine.push_playout(&vec![0.0; playout_target(frames)]);
+            CushionRig {
+                device,
+                engine,
+                frames,
+                callback: frames as usize * usize::from(CHANNELS),
+                earned: 0,
+                out: Vec::new(),
+                silence: vec![0.0; playout_capacity(frames)],
+                rings: RingWatch::new(start),
+                cushion: CushionControl::new(frames),
+                at: start,
+            }
+        }
+
+        /// One worker tick: the device drains what its own clock earned, then the
+        /// worker tops the ring back up and reads the mark it left, unless it is
+        /// held up, in which case the device drains alone.
+        fn tick(&mut self, held_up: bool) {
+            self.at += TICK;
+            self.earned += CHUNK_STEREO;
+            while self.earned >= self.callback {
+                self.earned -= self.callback;
+                self.out.clear();
+                self.out.resize(self.callback, 0.0);
+                self.device.on_playback(&mut self.out);
+            }
+            if held_up {
+                return;
+            }
+            while fill_playout_to(&mut self.engine, &self.silence, self.cushion.target()) > 0 {}
+            self.rings.observe(self.at, &self.engine, self.frames);
+            self.cushion
+                .observe(self.rings.low_water_at(), self.rings.playout_low_frames());
+        }
+
+        /// `windows` water-mark windows of worker time, with the worker held up
+        /// for `stall` ticks at the start of each one.
+        fn run(&mut self, windows: usize, stall: usize) {
+            let per_window = (PLAYOUT_LOW_WINDOW.as_micros() / TICK.as_micros()) as usize;
+            for _ in 0..windows {
+                for tick in 0..per_window {
+                    self.tick(tick < stall);
+                }
+            }
+        }
+
+        /// Windows in a [`CUSHION_QUIET`] stretch, plus the window a move costs
+        /// while the ring reaches its new depth and the window that opens the
+        /// stretch.
+        fn quiet_windows() -> usize {
+            (CUSHION_QUIET.as_micros() / PLAYOUT_LOW_WINDOW.as_micros()) as usize + 2
+        }
+    }
+
+    /// The cushion a machine keeping up pays is the one it pays today. Two
+    /// [`CUSHION_QUIET`] stretches of a worker that never misses a top-up, which
+    /// is every window a controller would need to drift in either direction.
+    #[test]
+    fn a_cushion_the_machine_keeps_up_with_never_moves() {
+        const FRAMES: u32 = 120;
+        let mut rig = CushionRig::new(FRAMES, Instant::now());
+        rig.run(2 * CushionRig::quiet_windows(), 0);
+
+        assert_eq!(
+            rig.cushion.target(),
+            playout_target(FRAMES),
+            "a ring nothing went wrong with paid latency for it"
+        );
+        assert_eq!(rig.engine.underruns(), 0);
+    }
+
+    /// The fault the cushion exists for: a worker held up long enough that the
+    /// ring runs down under it. It grows until the stall costs nothing, and then
+    /// it stops, which is the whole claim. Asserted as settling rather than as a
+    /// count of steps, so the step size is free to move.
+    ///
+    /// Three lengths, because the shortest is one the base cushion already
+    /// survives and only the water mark can see, and the others are ones it does
+    /// not.
+    #[test]
+    fn a_cushion_grows_until_the_stall_costs_nothing_and_then_stops() {
+        const FRAMES: u32 = 120;
+        for stall in 1..=3 {
+            let mut rig = CushionRig::new(FRAMES, Instant::now());
+            rig.run(8, stall);
+            let settled = rig.cushion.target();
+            let padded = rig.engine.underruns();
+
+            assert!(
+                settled > playout_target(FRAMES),
+                "a {stall}-tick stall left the cushion at its floor of {}",
+                playout_target(FRAMES)
+            );
+            rig.run(8, stall);
+            assert_eq!(
+                rig.cushion.target(),
+                settled,
+                "a {stall}-tick stall is still moving the cushion at {settled} samples"
+            );
+            assert_eq!(
+                rig.engine.underruns(),
+                padded,
+                "the ring is still padding silence at a cushion it settled on"
+            );
+        }
+    }
+
+    /// The other half: a machine that had a rough patch and then settled gets
+    /// its latency back, a frame at a time and only behind a whole
+    /// [`CUSHION_QUIET`] stretch. A cushion that returned to the floor in one
+    /// move would give the whole of it back on the strength of one quiet window.
+    #[test]
+    fn a_machine_that_goes_quiet_gets_its_latency_back() {
+        const FRAMES: u32 = 120;
+        let floor = playout_target(FRAMES);
+        let mut rig = CushionRig::new(FRAMES, Instant::now());
+        rig.run(8, 2);
+        let grown = rig.cushion.target();
+        assert!(grown >= floor + CUSHION_STEP, "the stall grew nothing");
+
+        rig.run(CushionRig::quiet_windows(), 0);
+        assert_eq!(
+            rig.cushion.target(),
+            grown - CUSHION_STEP,
+            "one quiet stretch is worth one frame, not the whole cushion"
+        );
+        while rig.cushion.target() > floor {
+            let before = rig.cushion.target();
+            rig.run(CushionRig::quiet_windows(), 0);
+            assert!(
+                rig.cushion.target() < before,
+                "the cushion stopped coming down at {before} samples"
+            );
+        }
+        rig.run(2 * CushionRig::quiet_windows(), 0);
+        assert_eq!(
+            rig.cushion.target(),
+            floor,
+            "the floor is the shallowest cushion, however quiet the machine gets"
+        );
+    }
+
+    /// The depth a machine still missing top-ups settled on is one it keeps. A
+    /// cushion that hands a frame back on the strength of a quiet stretch this
+    /// machine never has would take it again on the next reading, and a cushion
+    /// oscillating around a depth is worse than one fixed at it: every step down
+    /// is a chance to pad silence.
+    #[test]
+    fn a_cushion_that_settled_under_a_stall_never_hands_it_back() {
+        const FRAMES: u32 = 120;
+        let mut rig = CushionRig::new(FRAMES, Instant::now());
+        rig.run(8, 1);
+        let settled = rig.cushion.target();
+        assert!(settled > playout_target(FRAMES), "the stall grew nothing");
+
+        rig.run(3 * CushionRig::quiet_windows(), 1);
+        assert_eq!(
+            rig.cushion.target(),
+            settled,
+            "the cushion moved on a machine whose stall never went away"
+        );
+    }
+
+    /// A machine no cushion this ring can hold would fix. The depth stops at the
+    /// ceiling and says so once, because past there the answer is a device
+    /// callback twice the size and that is a question for whoever is playing.
+    #[test]
+    fn a_cushion_at_its_ceiling_says_so_instead_of_growing() {
+        const FRAMES: u32 = 120;
+        let mut rig = CushionRig::new(FRAMES, Instant::now());
+        let ceiling = rig.cushion.ceiling;
+        let lines = captured(|| rig.run(8, 6));
+
+        assert_eq!(
+            rig.cushion.target(),
+            ceiling,
+            "the cushion grew past the ceiling the ring was cut for"
+        );
+        let asked: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("wants a bigger one"))
+            .collect();
+        assert_eq!(
+            asked.len(),
+            1,
+            "one line per run at the ceiling: {lines:#?}"
+        );
+        assert!(asked[0].contains("WARN"), "{}", asked[0]);
+        for field in ["cushion_ms=10", "callback_frames=120"] {
+            assert!(asked[0].contains(field), "no {field} in {}", asked[0]);
+        }
+    }
+
+    /// The bounds, at every buffer the Audio tab offers and at negotiated periods
+    /// either side of them. The floor is what a machine keeping up pays today.
+    /// The ceiling is one buffer size of latency above it and never deeper than
+    /// the ring, so no depth this asks for could need the device reopened.
+    #[test]
+    fn the_cushion_bounds_cost_one_buffer_size_and_fit_the_ring() {
+        for frames in [0u32, 32, 120, 240, 480, 960, 2_400] {
+            let control = CushionControl::new(frames);
+            assert_eq!(
+                control.target(),
+                playout_target(frames),
+                "{frames}-frame callbacks: a stream opens on the base cushion"
+            );
+            assert_eq!(control.floor, playout_target(frames));
+            assert!(
+                control.ceiling <= playout_capacity(frames),
+                "{frames}-frame callbacks: a ceiling of {} outgrows the {} sample ring",
+                control.ceiling,
+                playout_capacity(frames)
+            );
+            assert!(
+                control.ceiling <= 2 * control.floor,
+                "{frames}-frame callbacks: the ceiling costs more than the next buffer size up"
+            );
+        }
+        for frames in crate::screens::devices::BUFFER_CHOICES {
+            let control = CushionControl::new(frames);
+            assert_eq!(
+                control.ceiling,
+                2 * control.floor,
+                "{frames}-frame callbacks: the ring leaves the cushion nowhere to grow"
+            );
+        }
+    }
+
+    /// One water-mark window's reading, the pacing behind it, and the cushion as
+    /// it stood when the window closed.
+    #[derive(Debug)]
+    struct RealWindow {
+        low_frames: Option<usize>,
+        pacing: Option<WakePacing>,
+        target: usize,
+    }
+
+    /// The client's playout loop against a real device, on the real device's own
+    /// clock, with the top-up held up for `stall` ticks at the start of every
+    /// water-mark window. Returns one entry per window, and the counters the run
+    /// ended on.
+    ///
+    /// A device clock of its own is the whole point: the only backend a test can
+    /// drive pumps playout from this side, so it tops the ring up before every
+    /// bite it plays and its water mark cannot dip at all.
+    fn real_device_windows(
+        frames: u32,
+        windows: usize,
+        stall: usize,
+    ) -> (Vec<RealWindow>, CushionControl, u64) {
+        let settings = crate::live::AudioSettings {
+            buffer_frames: frames,
+            ..crate::live::AudioSettings::default()
+        };
+        let config = crate::live::stream_config(&settings);
+        let (device, mut engine) =
+            CallbackBridge::new(capture_capacity(frames), playout_capacity(frames));
+        engine.push_playout(&vec![0.0; playout_target(frames)]);
+        let backend = jamstream_audio_io::backend();
+        let stream = backend
+            .open_duplex(None, None, config, device.into_handler())
+            .expect("the default capture and playback devices open");
+        let negotiated = stream.buffer_frames();
+        let ring = crate::live::ring_frames(frames, negotiated);
+        let priority = jamstream_audio_io::AudioPriority::raise_current_thread(TICK);
+        println!(
+            "{frames} frames asked, {negotiated:?} negotiated, ring {ring}, \
+             cushion {} samples, priority {:?}",
+            playout_target(ring),
+            priority.granted()
+        );
+
+        let mut capture_buf = vec![0.0f32; capture_capacity(ring)];
+        let silence = vec![0.0f32; playout_capacity(ring)];
+        let start = Instant::now();
+        let mut rings = RingWatch::new(start);
+        let mut wake = WakeWatch::new(start);
+        let mut cushion = CushionControl::new(ring);
+        let mut out = Vec::new();
+        let mut window = 1u32;
+        let mut held = 0usize;
+        let mut next = start + TICK;
+        while out.len() < windows {
+            let now = Instant::now();
+            wake.observe(
+                now,
+                Some(cushion_time(cushion.target())),
+                priority.granted(),
+            );
+            engine.pull_captured(&mut capture_buf);
+            if held < stall {
+                held += 1;
+            } else {
+                while fill_playout_to(&mut engine, &silence, cushion.target()) > 0 {}
+                rings.observe(now, &engine, ring);
+                cushion.observe(rings.low_water_at(), rings.playout_low_frames());
+            }
+            if now >= start + PLAYOUT_LOW_WINDOW * window {
+                out.push(RealWindow {
+                    low_frames: rings.playout_low_frames(),
+                    pacing: wake.pacing(),
+                    target: cushion.target(),
+                });
+                window += 1;
+                held = 0;
+            }
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            }
+            next += TICK;
+            if next < Instant::now() {
+                next = Instant::now() + TICK;
+            }
+        }
+        let underruns = engine.underruns();
+        stream.close();
+        for (i, w) in out.iter().enumerate() {
+            println!("  window {i}: {w:?}");
+        }
+        println!(
+            "underruns {underruns}, cushion {} samples",
+            cushion.target()
+        );
+        (out, cushion, underruns)
+    }
+
+    /// The calibration the cushion's trigger rests on, which only a device
+    /// running on its own clock can give: a machine keeping up leaves the whole
+    /// cushion in the ring, every window, so the line [`CushionControl`] grows on
+    /// sits a frame below anything a healthy machine produces and a healthy
+    /// machine never pays for the controller. Measured at 240 frames in every one
+    /// of twenty windows on the machine this was written on, with no underruns
+    /// and a worst wakeup of 2.56 ms.
+    #[test]
+    #[ignore = "requires a real capture and playback device"]
+    fn a_real_device_that_keeps_up_never_deepens_the_cushion() {
+        const FRAMES: u32 = 120;
+        let (windows, cushion, underruns) = real_device_windows(FRAMES, 20, 0);
+
+        assert_eq!(
+            cushion.target(),
+            playout_target(FRAMES),
+            "a machine keeping up paid latency for the cushion"
+        );
+        assert_eq!(underruns, 0, "the ring ran dry on a run nothing held up");
+        for (i, w) in windows.iter().enumerate() {
+            assert_eq!(
+                w.low_frames,
+                Some(playout_target(FRAMES) / usize::from(CHANNELS)),
+                "window {i} came off the whole cushion: {windows:#?}"
+            );
+            assert_eq!(w.target, playout_target(FRAMES));
+            assert!(
+                w.pacing.is_some_and(|p| p.p99 <= cushion_time(w.target)),
+                "window {i} woke later than the cushion it was holding: {windows:#?}"
+            );
+        }
+    }
+
+    /// The same loop, held up on purpose for two ticks a second, which is a
+    /// machine whose worker misses 5 ms of top-ups: deeper than the base cushion
+    /// holds. The cushion finds a depth that survives it and the ring stops
+    /// padding, against a real device clock rather than a stepped one.
+    #[test]
+    #[ignore = "requires a real capture and playback device"]
+    fn a_real_device_held_up_settles_on_a_deeper_cushion() {
+        const FRAMES: u32 = 120;
+        let (windows, cushion, _) = real_device_windows(FRAMES, 8, 2);
+
+        assert!(
+            cushion.target() > playout_target(FRAMES),
+            "a worker missing two ticks a second left the cushion at its floor"
+        );
+        let settled = windows
+            .last()
+            .expect("eight windows")
+            .low_frames
+            .expect("a device that rendered");
+        assert!(
+            settled * usize::from(CHANNELS) >= cushion.callback + CUSHION_STEP,
+            "the depth it settled on still runs the ring close to empty: {windows:#?}"
+        );
+        assert!(
+            windows.iter().all(|w| w.target <= cushion.target()),
+            "the cushion handed depth back while the stalls were still coming: {windows:#?}"
+        );
+    }
+
     /// The cutting-out watch as [`Worker`] holds it, driven by a counter the
     /// test moves and a clock it advances: the window is read rather than
     /// waited out, and the tick is the worker's own.
@@ -1836,7 +2432,7 @@ mod tests {
                 &mut at,
                 u32::MAX,
                 TICK,
-                Some(playout_cushion(120)),
+                Some(cushion_time(playout_target(120))),
             );
         });
         assert!(lines.is_empty(), "{lines:#?}");
@@ -1857,7 +2453,7 @@ mod tests {
     #[test]
     fn wakeups_the_ring_cannot_cover_name_both_numbers() {
         const STALL: Duration = Duration::from_millis(20);
-        let cushion = playout_cushion(120);
+        let cushion = cushion_time(playout_target(120));
         let start = Instant::now();
         let mut watch = WakeWatch::new(start);
         let mut at = start;
@@ -1889,7 +2485,7 @@ mod tests {
     #[test]
     fn a_pace_that_recovers_can_say_it_again() {
         const STALL: Duration = Duration::from_millis(20);
-        let cushion = Some(playout_cushion(120));
+        let cushion = Some(cushion_time(playout_target(120)));
         let start = Instant::now();
         let mut watch = WakeWatch::new(start);
         let mut at = start;
@@ -1903,6 +2499,40 @@ mod tests {
             lines.len(),
             2,
             "two late episodes with a recovery between them: {lines:#?}"
+        );
+    }
+
+    /// The deadline is the depth the loop is filling to now, so a cushion that
+    /// grew to cover a machine's wakeups stops the warning that asked for it. A
+    /// deadline read off the device size would keep warning about pacing the ring
+    /// already survives.
+    #[test]
+    fn the_pacing_deadline_follows_the_cushion_that_is_held() {
+        const LATE: Duration = Duration::from_millis(6);
+        let floor = playout_target(120);
+        let start = Instant::now();
+
+        let mut watch = WakeWatch::new(start);
+        let mut at = start;
+        let lines = captured(|| {
+            wake_for_a_window(&mut watch, &mut at, 20, LATE, Some(cushion_time(floor)));
+        });
+        assert_eq!(lines.len(), 1, "the base cushion cannot cover {LATE:?}");
+
+        let mut watch = WakeWatch::new(start);
+        let mut at = start;
+        let lines = captured(|| {
+            wake_for_a_window(
+                &mut watch,
+                &mut at,
+                20,
+                LATE,
+                Some(cushion_time(floor + CUSHION_STEP)),
+            );
+        });
+        assert!(
+            lines.is_empty(),
+            "a cushion a frame deeper covers the same wakeups: {lines:#?}"
         );
     }
 

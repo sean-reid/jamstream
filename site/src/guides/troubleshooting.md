@@ -31,6 +31,8 @@ Check these in order of payoff:
 3. **Buffer size.** On the Audio tab, under Buffer size, pick the smallest of 120, 240, or 480 frames (2.5, 5, or 10 ms) that stays clean. A **crackling** tag beside the latency number, or the line under the choices saying the device is not keeping up, means take the next size up.
 
    Each step costs three times its own size in the number: the buffer is paid once going in and twice coming out. The hover names both, as `capture buffer` and `playout cushion`.
+
+   The cushion is not fixed. A machine that keeps letting the playout ring run low gets a deeper one, 2.5 ms at a time and never past twice the buffer, and hands it back once it is keeping up again. The hover and the headline number both follow it, so a deeper cushion than twice your buffer is that, not a fault.
 4. **Sample rate.** A direction JamStream's own converter carries costs about 3 ms, and says so with a muted **converting** tag naming both rates.
 
    The headline number already includes it and the hover breaks it out per direction. [Device problems](#device-problems) has the whole ladder.

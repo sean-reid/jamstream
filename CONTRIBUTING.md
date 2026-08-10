@@ -39,14 +39,19 @@ A few things the checks enforce that are easy to miss:
 cargo xtask prerelease
 ```
 
-That runs the four tests that stay `#[ignore]`d because no hosted runner has
-what they need: a real audio device, a loopback device, the open internet. It
-says what each one needs before it starts and what a pass proved after, and it
-fails rather than skipping when a device is missing. Three of the four are the
-only coverage of audio content through a real device, the sharing mode the
-Windows backend reports, and a device producing on its own clock, so run it on a
-machine with an interface plugged in and paste the output into the release pull
-request before merging it. That pull request is the record that the checks ran.
+That runs every test that stays `#[ignore]`d because no hosted runner has what
+it needs: a real audio device, a loopback device, the open internet. It says
+what each one needs before it starts and what a pass proved after, and it fails
+rather than skipping when a device is missing. All but one are the only coverage
+of audio content through a real device, the sharing mode the Windows backend
+reports, a device producing on its own clock, and the depth the playout cushion
+settles on, so run it on a machine with an interface plugged in and paste the
+output into the release pull request before merging it. That pull request is the
+record that the checks ran.
+
+Two of them measure how a machine schedules the thread filling playout, and one
+of those starves it on purpose, so give that run the machine to itself: no other
+audio app, no build, no video call.
 
 The loopback check wants a device whose output feeds its own input: BlackHole on
 macOS, VB-CABLE on Windows, a null sink on Linux. Only a run on Windows
