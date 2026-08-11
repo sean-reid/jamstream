@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use jamstream_audio_io::{CallbackBridge, Direction, StreamConfig, backend};
+use jamstream_audio_io::{CallbackBridge, DeviceInfo, Direction, StreamConfig, backend};
 use jamstream_engine::{Channels, Decoder, Encoder};
 use jamstream_protocol::media::FrameDuration;
 
@@ -54,22 +54,11 @@ fn a_tone_survives_the_round_trip_through_real_hardware() {
     let backend = backend();
     let devices = backend.devices().expect("device enumeration");
 
-    // A usable loopback reports the same id in both directions, so one duplex
-    // stream can play into it and record what comes back.
-    let loopback = devices
-        .iter()
-        .filter(|d| d.direction == Direction::Capture)
-        .filter(|d| is_loopback(&d.name))
-        .find(|c| {
-            devices
-                .iter()
-                .any(|p| p.direction == Direction::Playback && p.id == c.id)
-        });
-    let Some(loopback) = loopback else {
+    let Some((capture, playback)) = loopback_pair(&devices) else {
         panic!(
-            "no loopback device among {} endpoints, so nothing was tested. Install \
-             BlackHole (macOS), VB-CABLE (Windows), or create a null sink (Linux). \
-             A loopback reports the same id in both directions; these do not: {}",
+            "no loopback endpoint among {}, so nothing was tested. Install \
+             BlackHole (macOS), VB-CABLE (Windows), or create a null sink (Linux), \
+             and select it as both the input and the output: {}",
             devices.len(),
             devices
                 .iter()
@@ -78,7 +67,8 @@ fn a_tone_survives_the_round_trip_through_real_hardware() {
                 .join(", ")
         );
     };
-    println!("loopback device: {:?} id={}", loopback.name, loopback.id);
+    println!("loopback capture: {:?} id={}", capture.name, capture.id);
+    println!("loopback playback: {:?} id={}", playback.name, playback.id);
 
     let config = StreamConfig::default();
     let channels = config.channels as usize;
@@ -98,8 +88,8 @@ fn a_tone_survives_the_round_trip_through_real_hardware() {
 
     let stream = backend
         .open_duplex(
-            Some(&loopback.id),
-            Some(&loopback.id),
+            Some(&capture.id),
+            Some(&playback.id),
             config,
             device.into_handler(),
         )
@@ -352,6 +342,32 @@ fn the_generated_tone_survives_the_codec() {
 fn is_loopback(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     LOOPBACK_NAMES.iter().any(|n| lower.contains(n))
+}
+
+/// The two ends of a loopback, which may be one endpoint or two.
+///
+/// CoreAudio and PulseAudio present a single device that reports the same id in
+/// both directions. WASAPI cannot: the id encodes the direction, so VB-CABLE
+/// arrives as a pair, capture "CABLE Output" against playback "CABLE Input".
+/// Pairing two endpoints by name cannot prove they are wired together, so the
+/// tone is the proof; a pair that carries nothing fails the analysis below with
+/// the accounting that separates a silent loopback from an unconsumed playout.
+fn loopback_pair(devices: &[DeviceInfo]) -> Option<(&DeviceInfo, &DeviceInfo)> {
+    let of = |dir: Direction| {
+        devices
+            .iter()
+            .filter(move |d| d.direction == dir && is_loopback(&d.name))
+    };
+    let one_endpoint = of(Direction::Capture).find_map(|c| {
+        of(Direction::Playback)
+            .find(|p| p.id == c.id)
+            .map(|p| (c, p))
+    });
+    if one_endpoint.is_some() {
+        return one_endpoint;
+    }
+    let pick = |dir: Direction| of(dir).find(|d| d.is_default).or_else(|| of(dir).next());
+    Some((pick(Direction::Capture)?, pick(Direction::Playback)?))
 }
 
 /// Magnitude of `freq` in `samples`, scaled so a pure sine of amplitude A
