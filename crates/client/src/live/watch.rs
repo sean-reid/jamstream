@@ -2487,25 +2487,35 @@ mod tests {
     /// machine never pays for the controller. Measured at 240 frames in every one
     /// of twenty windows on the machine this was written on, with no underruns
     /// and a worst wakeup of 2.56 ms.
+    ///
+    /// The depth is read against the floor the controller chose, not against
+    /// `playout_target(FRAMES)`: a device is free to decline the size asked of
+    /// it, and a WASAPI endpoint opened in exclusive mode routinely does, so the
+    /// requested size names a depth nothing in the run ever held.
     #[test]
     #[ignore = "requires a real capture and playback device"]
     fn a_real_device_that_keeps_up_never_deepens_the_cushion() {
         const FRAMES: u32 = 120;
         let (windows, cushion, underruns) = real_device_windows(FRAMES, 20, 0);
 
+        let view = cushion.view();
+        let floor = view.base_frames * usize::from(CHANNELS);
         assert_eq!(
             cushion.target(),
-            playout_target(FRAMES),
-            "a machine keeping up paid latency for the cushion"
+            floor,
+            "a machine keeping up paid latency for the cushion: {} frames asked, \
+             {} negotiated",
+            FRAMES,
+            view.callback_frames
         );
         assert_eq!(underruns, 0, "the ring ran dry on a run nothing held up");
         for (i, w) in windows.iter().enumerate() {
             assert_eq!(
                 w.low_frames,
-                Some(playout_target(FRAMES) / usize::from(CHANNELS)),
+                Some(view.base_frames),
                 "window {i} came off the whole cushion: {windows:#?}"
             );
-            assert_eq!(w.target, playout_target(FRAMES));
+            assert_eq!(w.target, floor);
             assert!(
                 w.pacing.is_some_and(|p| p.p99 <= cushion_time(w.target)),
                 "window {i} woke later than the cushion it was holding: {windows:#?}"
