@@ -329,6 +329,13 @@ pub(super) const CUTTING_OUT_WINDOW: Duration = Duration::from_secs(180);
 /// read: long enough that a reading spans hundreds of device callbacks, short
 /// enough that one bad moment ages out of it.
 const PLAYOUT_LOW_WINDOW: Duration = Duration::from_secs(1);
+/// The first window of a stream, which is shorter because it is the one the
+/// controller has no depth history for. A stream that opened too shallow pads
+/// from its first callbacks, and a musician hears that inside the second a full
+/// window would spend measuring it. Long enough to span tens of device
+/// callbacks at the shortest period the app offers, so the reading is still a
+/// distribution and not one bad moment.
+const PLAYOUT_FIRST_WINDOW: Duration = Duration::from_millis(100);
 
 /// Reports the bridge's dropped-capture and padded-playout counters as the log
 /// sees them: the first movement at once, then again on a doubling wait for as
@@ -357,6 +364,8 @@ pub(super) struct RingWatch {
     low_water_frames: Option<usize>,
     /// When the window now filling opened.
     low_water_from: Instant,
+    /// Whether the window now filling is the stream's first, which closes early.
+    first_window: bool,
 }
 
 /// One counter's reporting state.
@@ -406,13 +415,20 @@ impl RingWatch {
             crackling: EpisodeWatch::new(CRACKLE_EPISODE_COUNT, CRACKLE_EPISODE_WINDOW),
             low_water_frames: None,
             low_water_from: opened,
+            first_window: true,
         }
     }
 
     /// One tick's worth of observation, against the ring the counters belong
     /// to. Returns whether the ring is in a crackling run as of this tick.
     pub(super) fn observe(&mut self, now: Instant, engine: &EngineSide, ring_frames: u32) -> bool {
-        if now.duration_since(self.low_water_from) >= PLAYOUT_LOW_WINDOW {
+        let window = if self.first_window {
+            PLAYOUT_FIRST_WINDOW
+        } else {
+            PLAYOUT_LOW_WINDOW
+        };
+        if now.duration_since(self.low_water_from) >= window {
+            self.first_window = false;
             self.low_water_from = now;
             // The bridge counts interleaved samples; a frame is one per channel.
             self.low_water_frames = engine
@@ -595,6 +611,9 @@ const CUSHION_QUIET: Duration = CRACKLE_EPISODE_WINDOW;
 pub(super) struct CushionControl {
     /// Depth the loop fills to, in interleaved samples.
     target: usize,
+    /// Depth the last reading asked for, which `target` walks to a frame per
+    /// tick. The two are the same except while a move is in flight.
+    wanted: usize,
     /// The base cushion, which is the shallowest this ever asks for.
     floor: usize,
     ceiling: usize,
@@ -627,6 +646,7 @@ impl CushionControl {
         let floor = playout_target(device_frames);
         CushionControl {
             target: floor,
+            wanted: floor,
             floor,
             // The ring is cut for the deeper of the base cushion and
             // PLAYOUT_CUSHION_MAX, so a device whose own period is past that
@@ -653,6 +673,7 @@ impl CushionControl {
         }
         self.auto = auto;
         self.target = self.floor;
+        self.wanted = self.floor;
         self.quiet_since = None;
         self.out_of_room = false;
         // The window this lands in straddles two depths, so it is evidence
@@ -687,7 +708,11 @@ impl CushionControl {
     /// `held` is a take being recorded or a broadcast on air, either of which
     /// makes a step down a dropout in audio nobody can play again. Growing
     /// still happens, because the alternative there is the dropout.
+    ///
+    /// Called every tick, because a depth the last reading asked for is walked
+    /// to a frame at a time rather than jumped to.
     pub(super) fn observe(&mut self, at: Instant, low: Option<usize>, held: bool) {
+        self.advance();
         if self.read_at == Some(at) {
             return;
         }
@@ -721,19 +746,51 @@ impl CushionControl {
         self.give_back(at, low);
     }
 
-    /// One frame deeper, or the line that says a deeper ring is the wrong
-    /// answer now.
+    /// One tick of the walk to [`Self::wanted`].
+    ///
+    /// A frame at a time however far there is to go, because the top-up loop
+    /// pulls the whole of a move in the tick it happens and the jitter buffer can
+    /// step its playout position back at most one frame. A depth still moving is
+    /// a depth no reading is evidence about, so a window a move lands in is
+    /// skipped the way the window after a step is.
+    fn advance(&mut self) {
+        if self.target == self.wanted {
+            return;
+        }
+        self.target = if self.target < self.wanted {
+            (self.target + CUSHION_STEP).min(self.wanted)
+        } else {
+            self.target.saturating_sub(CUSHION_STEP).max(self.wanted)
+        };
+        self.catching_up = true;
+    }
+
+    /// Deep enough that this window's dip would have cleared the line, or the
+    /// line that says a deeper ring is the wrong answer now.
+    ///
+    /// Deep enough rather than one frame deeper: a ring padding tens of times a
+    /// second is audible, while a frame a window climbs for seconds, and the dip
+    /// this reading measured is what says how far there is to climb. The walk is
+    /// still a frame per tick, so the whole move costs a few ticks instead of a
+    /// few windows.
     fn grow(&mut self, low: usize) {
         if !self.auto || self.target >= self.ceiling {
             self.report_out_of_room(low);
             return;
         }
-        self.target = (self.target + CUSHION_STEP).min(self.ceiling);
-        self.catching_up = true;
+        let dip = self.target.saturating_sub(low);
+        let need = self.callback + CUSHION_STEP + dip;
+        let steps = need
+            .saturating_sub(self.target)
+            .div_ceil(CUSHION_STEP)
+            .max(1);
+        self.wanted = (self.target + steps * CUSHION_STEP).min(self.ceiling);
+        self.advance();
         tracing::info!(
-            cushion_ms = as_ms(cushion_time(self.target)),
+            cushion_ms = as_ms(cushion_time(self.wanted)),
             low_frames = low / usize::from(CHANNELS),
-            "the playout ring came close to empty; the cushion is a frame deeper"
+            frames = steps,
+            "the playout ring came close to empty; the cushion is deeper"
         );
     }
 
@@ -755,9 +812,9 @@ impl CushionControl {
         if at.duration_since(since) < CUSHION_QUIET {
             return;
         }
-        self.target -= step;
+        self.wanted = self.target - step;
+        self.advance();
         self.quiet_since = Some(at);
-        self.catching_up = true;
         tracing::info!(
             cushion_ms = as_ms(cushion_time(self.target)),
             low_frames = low / usize::from(CHANNELS),
@@ -1789,6 +1846,50 @@ mod tests {
         );
     }
 
+    /// The first window closes early, because it is the one the controller has no
+    /// history for: a stream that opened too shallow pads from its first
+    /// callbacks, and a full window of measuring that is a second of it a
+    /// musician hears. The windows after it are the long ones, so one bad moment
+    /// still ages out.
+    ///
+    /// Read against [`PLAYOUT_LOW_WINDOW`] rather than against the short window's
+    /// own constant, so the claim is that the first reading arrives sooner than a
+    /// later one would and not merely that it arrives when it says it will.
+    #[test]
+    fn the_first_window_of_a_stream_closes_early() {
+        const FRAMES: u32 = 120;
+        let start = Instant::now();
+        let (mut device, engine) = playout_ring(FRAMES);
+        let mut watch = RingWatch::new(start);
+        let mut out = vec![0.0f32; FRAMES as usize * usize::from(CHANNELS)];
+        let half = PLAYOUT_LOW_WINDOW / 2;
+        assert!(
+            PLAYOUT_FIRST_WINDOW < half,
+            "the first window is not short enough for this to prove anything"
+        );
+
+        device.on_playback(&mut out);
+        watch.observe(start + half, &engine, FRAMES);
+        let first = watch.playout_low_frames();
+        assert!(
+            first.is_some(),
+            "no reading half of a long window in, so the stream measured its \
+             opening depth for a whole one"
+        );
+
+        // The windows after it are the long ones: the same elapsed time again is
+        // not enough to close the second.
+        device.on_playback(&mut out);
+        watch.observe(start + half + half, &engine, FRAMES);
+        assert_eq!(
+            watch.playout_low_frames(),
+            first,
+            "the second window closed on the first window's length"
+        );
+        watch.observe(start + half + PLAYOUT_LOW_WINDOW, &engine, FRAMES);
+        assert!(watch.playout_low_frames().is_some());
+    }
+
     /// The case underruns cannot see: the ring dipped to a fraction of its
     /// cushion and served every callback anyway. The reading is in frames, so a
     /// dip to 30 frames of stereo reads 30 and not the 60 samples it holds.
@@ -2051,6 +2152,39 @@ mod tests {
             "a ring nothing went wrong with paid latency for it"
         );
         assert_eq!(rig.engine.underruns(), 0);
+    }
+
+    /// How long the depth takes to get where the reading asked for, which is the
+    /// difference between a cushion that fixes itself and one a musician hears
+    /// fixing itself. The dip a window measures says how far there is to climb, so
+    /// a climb of several frames is one decision walked out over the ticks after
+    /// it, not one frame per window with a window skipped between each.
+    ///
+    /// Asserted against the depth the same stall settles on given four times as
+    /// long, so nothing here depends on the step size or on how deep this
+    /// particular stall turns out to want.
+    #[test]
+    fn a_depth_several_frames_short_is_reached_inside_one_window() {
+        const FRAMES: u32 = 120;
+        const STALL: usize = 3;
+        let mut slow = CushionRig::new(FRAMES, Instant::now());
+        slow.run(12, STALL);
+        let settled = slow.cushion.target();
+        assert!(
+            settled >= playout_target(FRAMES) + 2 * CUSHION_STEP,
+            "a {STALL}-tick stall wanted {} samples, which is not a climb of several \
+             frames and so proves nothing about walking one",
+            settled - playout_target(FRAMES)
+        );
+
+        let mut rig = CushionRig::new(FRAMES, Instant::now());
+        rig.run(3, STALL);
+        assert_eq!(
+            rig.cushion.target(),
+            settled,
+            "the depth was still climbing three windows in, at {} of {settled} samples",
+            rig.cushion.target()
+        );
     }
 
     /// The fault the cushion exists for: a worker held up long enough that the
@@ -2480,42 +2614,50 @@ mod tests {
         (out, cushion, underruns)
     }
 
-    /// The calibration the cushion's trigger rests on, which only a device
-    /// running on its own clock can give: a machine keeping up leaves the whole
-    /// cushion in the ring, every window, so the line [`CushionControl`] grows on
-    /// sits a frame below anything a healthy machine produces and a healthy
-    /// machine never pays for the controller. Measured at 240 frames in every one
-    /// of twenty windows on the machine this was written on, with no underruns
-    /// and a worst wakeup of 2.56 ms.
+    /// The calibration the cushion's trigger rests on, which only a device running
+    /// on its own clock can give: a machine keeping up settles at the floor, or at
+    /// most a frame above it, and then holds there without the ring running dry.
     ///
-    /// The depth is read against the floor the controller chose, not against
-    /// `playout_target(FRAMES)`: a device is free to decline the size asked of
-    /// it, and a WASAPI endpoint opened in exclusive mode routinely does, so the
-    /// requested size names a depth nothing in the run ever held.
+    /// Not equality with the floor, because a device chooses its own period and
+    /// the depth is denominated in it. A WASAPI endpoint in exclusive mode
+    /// declines the size asked of it, and at a shorter period than the one asked
+    /// for the floor of two callbacks sits closer to the line the controller grows
+    /// on than one top-up gap, so a machine that is keeping up buys a single frame
+    /// and stops. Measured on macOS at a granted 120 frames as the whole cushion
+    /// in every one of twenty windows, and on Windows in exclusive mode at a
+    /// negotiated 192 as one frame above a floor of 384.
+    ///
+    /// What would be a fault is a depth that keeps climbing, or one that settles
+    /// with the ring still padding, so those are what this asserts.
     #[test]
     #[ignore = "requires a real capture and playback device"]
-    fn a_real_device_that_keeps_up_never_deepens_the_cushion() {
+    fn a_real_device_that_keeps_up_settles_within_a_frame_of_the_floor() {
         const FRAMES: u32 = 120;
         let (windows, cushion, underruns) = real_device_windows(FRAMES, 20, 0);
 
         let view = cushion.view();
         let floor = view.base_frames * usize::from(CHANNELS);
-        assert_eq!(
-            cushion.target(),
-            floor,
-            "a machine keeping up paid latency for the cushion: {} frames asked, \
-             {} negotiated",
-            FRAMES,
+        assert!(
+            (floor..=floor + CUSHION_STEP).contains(&cushion.target()),
+            "a machine keeping up bought {} samples of latency over a floor of \
+             {floor}: {FRAMES} frames asked, {} negotiated",
+            cushion.target() - floor.min(cushion.target()),
             view.callback_frames
         );
         assert_eq!(underruns, 0, "the ring ran dry on a run nothing held up");
-        for (i, w) in windows.iter().enumerate() {
+
+        // Settled, not still climbing: the depth the last window held is the depth
+        // the run ended on, and the second half of the run never moved it.
+        let settled = cushion.target();
+        for (i, w) in windows.iter().enumerate().skip(windows.len() / 2) {
             assert_eq!(
-                w.low_frames,
-                Some(view.base_frames),
-                "window {i} came off the whole cushion: {windows:#?}"
+                w.target,
+                settled,
+                "window {i} of {} was still moving the depth: {windows:#?}",
+                windows.len()
             );
-            assert_eq!(w.target, floor);
+        }
+        for (i, w) in windows.iter().enumerate() {
             assert!(
                 w.pacing.is_some_and(|p| p.p99 <= cushion_time(w.target)),
                 "window {i} woke later than the cushion it was holding: {windows:#?}"
