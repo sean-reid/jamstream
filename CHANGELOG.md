@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/sean-reid/jamstream/compare/v0.5.1...v0.5.2) (2026-08-11)
+
+
+### Bug Fixes
+
+* **client:** react to a shallow playout ring in ticks, not seconds ([#618](https://github.com/sean-reid/jamstream/issues/618)) ([c1d48fb](https://github.com/sean-reid/jamstream/commit/c1d48fb3b95f2f360b7ecef1429e119f8a41f6d1))
+
 ## [0.5.1](https://github.com/sean-reid/jamstream/compare/v0.5.0...v0.5.1) (2026-08-11)
 
 
