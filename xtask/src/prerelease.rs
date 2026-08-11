@@ -86,18 +86,21 @@ pub const HAND_CHECKS: [HandCheck; 6] = [
     HandCheck {
         package: "jamstream-client",
         target: "lib",
-        test: "live::watch::tests::a_real_device_that_keeps_up_never_deepens_the_cushion",
+        test: "live::watch::tests::a_real_device_that_keeps_up_settles_within_a_frame_of_the_floor",
         needs: "a real capture and playback device, and twenty seconds of a machine \
                 doing nothing else: no other audio app, no build, no video call. It \
                 measures how close a real device comes to running the playout ring \
                 dry, so anything else competing for the CPU reads as this machine's \
                 own answer",
-        proves: "a machine that keeps up pays no latency for the automatic cushion, \
-                 which is the calibration the rest of it rests on. Read the printed \
-                 windows: the whole 240-frame cushion left in the ring in every one \
-                 of twenty, a worst wakeup around 2.5 ms, no underruns, and a depth \
-                 that never moved off 480 samples. A window reading lower means this \
-                 machine has less headroom than the growth line assumes",
+        proves: "a machine that keeps up settles at the base cushion or a frame \
+                 above it and then holds, which is the calibration the rest of it \
+                 rests on. Read the printed windows: a worst wakeup around the \
+                 cushion being held, no underruns, and a depth that stops moving \
+                 well before the run ends. A device that declined the size asked of \
+                 it prints both, and a floor of two of its callbacks can sit close \
+                 enough to the growth line that one frame is bought; a depth still \
+                 climbing at the end, or one that settled with the ring padding, is \
+                 the fault",
     },
     HandCheck {
         package: "jamstream-client",
