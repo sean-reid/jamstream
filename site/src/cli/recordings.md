@@ -35,6 +35,8 @@ SESSION    TAKE                                           SIZE  MODIFIED
 3f2a9c01   jamstream-2026-07-28-1930-mix.flac          1.38 GB  2026-07-28 19:30
 3f2a9c01   jamstream-2026-07-28-1930-Ana.flac         691.2 MB  2026-07-28 19:30
 3f2a9c01   jamstream-2026-07-28-1930-Bo.flac          691.2 MB  2026-07-28 19:31
+5aed5593 has no takes in my-jams (aws/eu-west-1).
+5aed5593 has 1 take on this computer, found in /Users/you/Music/JamStream/5aed5593.
 
 Fetch a session's takes with: jamstream recordings get <session>
 ```
@@ -42,6 +44,10 @@ Fetch a session's takes with: jamstream recordings get <session>
 A take is named for the minute it started, in UTC: `jamstream-YYYY-MM-DD-HHMM-mix.flac` for the mix, and one `jamstream-YYYY-MM-DD-HHMM-<name>.flac` per musician when the session recorded stems. They all sit side by side under the session's own prefix; there is no stems folder.
 
 A session that recorded nothing says so on its own line rather than showing an empty table.
+
+The last line is the app's own download folder, a `JamStream` folder in your music directory with one folder per session, which this command reads as well as the bucket. So a take the retention rule has already deleted still shows as being here.
+
+Nothing is left to check those files against, so no size stands beside them.
 
 ## Fetching, and what it costs
 
@@ -91,7 +97,8 @@ The key is never written to disk: only the bucket, region, and retention are kep
 
 ## Notes
 
-- Takes outlive the session. A session ended weeks ago still lists, until the bucket's retention rule deletes the objects.
+- Takes outlive the session. A session ended weeks ago still lists, until the bucket's retention rule deletes the objects, and a copy already on this computer outlives those too.
+- `get` on a session the rule has emptied still fails, because there is nothing left to fetch, but it names the folder the copies it found are in.
 - What lands is checked against the size the bucket listed, and a file that arrives short is deleted rather than left looking like a recording.
 - A take already in the output directory at the right size is skipped and costs no egress. One at a different size stops the download instead of being overwritten.
 - If a bucket cannot be reached, that session's line says why and the other sessions still list, but the command exits nonzero.

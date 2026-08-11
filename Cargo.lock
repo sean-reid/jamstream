@@ -2880,7 +2880,6 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "data-encoding",
- "dirs",
  "eframe",
  "egui",
  "egui_kittest",
