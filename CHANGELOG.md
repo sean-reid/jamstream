@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.1](https://github.com/sean-reid/jamstream/compare/v0.5.0...v0.5.1) (2026-08-11)
+
+
+### Features
+
+* **client:** total the takes nothing is going to delete ([#614](https://github.com/sean-reid/jamstream/issues/614)) ([a8dfd00](https://github.com/sean-reid/jamstream/commit/a8dfd0065debb212a5328e8ef6b06768fa20659f))
+
+
+### Bug Fixes
+
+* **client:** read a take off the disk, not off the listing ([#612](https://github.com/sean-reid/jamstream/issues/612)) ([4eb1548](https://github.com/sean-reid/jamstream/commit/4eb1548f052ae4282931ce2104b9cc3bf581adea))
+* **cli:** read a take off this disk before saying a session has none ([#616](https://github.com/sean-reid/jamstream/issues/616)) ([a596c1b](https://github.com/sean-reid/jamstream/commit/a596c1bf6b60a0054275d4dcf5801ee38163bf5c))
+
 ## [0.5.0](https://github.com/sean-reid/jamstream/compare/v0.4.2...v0.5.0) (2026-08-10)
 
 
