@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/sean-reid/jamstream/compare/v0.5.2...v0.5.3) (2026-08-14)
+
+
+### Bug Fixes
+
+* **ci:** count the month's last day without cal ([#620](https://github.com/sean-reid/jamstream/issues/620)) ([684604c](https://github.com/sean-reid/jamstream/commit/684604cea947d38727bd479163147ecfe0487661))
+
 ## [0.5.2](https://github.com/sean-reid/jamstream/compare/v0.5.1...v0.5.2) (2026-08-11)
 
 
