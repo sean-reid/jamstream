@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.4](https://github.com/sean-reid/jamstream/compare/v0.5.3...v0.5.4) (2026-09-25)
+
+
+### Security
+
+* **deps:** move h2, rustls, rtrb and chacha20 past open advisories ([#627](https://github.com/sean-reid/jamstream/issues/627)) ([a1f998b](https://github.com/sean-reid/jamstream/commit/a1f998b6cb0a251b5b46a414401b53c6999fee5a))
+
 ## [0.5.3](https://github.com/sean-reid/jamstream/compare/v0.5.2...v0.5.3) (2026-08-14)
 
 
