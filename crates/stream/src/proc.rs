@@ -801,7 +801,7 @@ impl ProcessHost for StdProcessHost {
         // Closing the queues lets each writer finish its backlog and then drop
         // its end of the pipe, which is the end of stream a fed child needs to
         // flush its muxer and exit cleanly.
-        let mut feeders: Vec<Feeder> = live.fifos.drain(..).collect();
+        let mut feeders: Vec<Feeder> = std::mem::take(&mut live.fifos);
         feeders.extend(live.stdin.take());
         for feeder in &feeders {
             feeder.close();
