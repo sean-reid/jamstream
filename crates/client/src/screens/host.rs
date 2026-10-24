@@ -175,6 +175,10 @@ pub struct LaunchOutcome {
     /// and the host has to be told before they record something they think
     /// will be deleted for them.
     pub retention: Option<RetentionEnforcement>,
+    /// Whether the launch armed recording at all, to disk or to a bucket.
+    /// The wire cannot say: an armed recorder that has not started a take
+    /// reports the same idle as a session that cannot record.
+    pub armed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,6 +717,7 @@ impl HostWizard {
                 "DIGITALOCEAN_TOKEN",
             ),
             recording,
+            armed: self.recording.is_on(),
         };
         *self.launch_phase.lock().expect("launch phase") = LaunchPhase::Launching;
         self.launch_error = None;
@@ -1005,6 +1010,9 @@ struct LaunchParams {
     /// The bucket a cloud take goes to, absent when the host left recording off
     /// and when the session runs on this computer.
     recording: Option<jamstream_cloud::RecordingStorage>,
+    /// Recording armed, including a local session's disk recorder, which
+    /// goes through the provider's spawn flags rather than `recording`.
+    armed: bool,
 }
 
 /// The launch itself, mirroring `jamstream host`: boot config, flat config
@@ -1159,6 +1167,7 @@ async fn launch_session(
         state,
         state_path,
         retention,
+        armed: params.armed,
     })
 }
 

@@ -41,6 +41,12 @@ use crate::widgets::{
 
 const NARROW_BELOW_PX: f32 = 900.0;
 
+/// Under the roster while recording is armed and no take has happened. The
+/// wizard's price beside the recording rows reads as the session being saved,
+/// and nothing else on this screen says it is not.
+const NO_TAKE_YET: &str =
+    "Recording is armed. Press Record to start a take; nothing is captured until you do.";
+
 /// The bar's word for the one direction nothing on this machine can hear. It
 /// names the direction rather than the fault, because a musician whose sound
 /// is not reaching the room reads a healthy screen otherwise.
@@ -149,6 +155,12 @@ impl SettingsTab {
 pub struct SessionScreen {
     pub chat_input: String,
     pub confirm_leave: bool,
+    /// The launch armed recording. Known only to the host that launched it:
+    /// the wire reports an armed idle recorder and no recorder the same way.
+    pub recording_armed: bool,
+    /// The recorder has reported a take since this screen opened, so the
+    /// nudge to press Record has done its job.
+    pub took_a_take: bool,
     /// Member pending revoke confirmation, with the display name.
     pub confirm_revoke: Option<(crate::runtime::MemberId, String)>,
     /// Narrow layout only: chat shown instead of the mixer.
@@ -191,6 +203,11 @@ impl SessionScreen {
     pub fn ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) -> Option<SessionEvent> {
         let mut event = None;
         let narrow = ui.available_width() < NARROW_BELOW_PX;
+        // Any state but idle means a take exists or existed, failed included:
+        // the nudge is about pressing Record at all, not about a good take.
+        if !matches!(snap.record.state, crate::runtime::RecordState::Idle) {
+            self.took_a_take = true;
+        }
 
         // Escape always steps back out of the innermost entered state, so
         // nothing on this screen can trap the user.
@@ -335,10 +352,20 @@ impl SessionScreen {
         snap: &Snapshot,
         rt: &dyn Runtime,
     ) -> Option<SessionEvent> {
+        let no_take_yet = self.no_take_yet(snap);
         let panel = self.invites.as_mut()?;
+        panel.no_take_yet = no_take_yet;
         panel
             .ui(ui, snap, rt)
             .map(|InvitesEvent::EndSession| SessionEvent::EndSession)
+    }
+
+    /// Recording was armed at launch and no take has happened. The one state
+    /// in which a host ends up with an empty bucket and no idea why.
+    pub fn no_take_yet(&self, snap: &Snapshot) -> bool {
+        self.recording_armed
+            && !self.took_a_take
+            && matches!(snap.record.state, crate::runtime::RecordState::Idle)
     }
 
     fn mixer_ui(&mut self, ui: &mut Ui, snap: &Snapshot, rt: &dyn Runtime) {
@@ -443,6 +470,9 @@ impl SessionScreen {
                 let response = ui.add(egui::Label::new(theme::muted(ui, line)).truncate());
                 if listeners.len() > 1 {
                     response.on_hover_text(names);
+                }
+                if self.no_take_yet(snap) {
+                    ui.add(egui::Label::new(theme::muted(ui, NO_TAKE_YET)).wrap());
                 }
                 ui.add_space(theme::SPACE_SM);
                 self.metronome_ui(ui, snap, rt, lower_w);

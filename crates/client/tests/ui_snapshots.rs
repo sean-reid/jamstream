@@ -2863,3 +2863,22 @@ fn session_quit_confirm_recording() {
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_quit_confirm_recording");
 }
+
+// Recording armed and no take yet: the one line under the roster, and the
+// End confirmation saying nothing was recorded.
+
+#[test]
+fn session_armed_no_take() {
+    let mut app = host_app(DemoRuntime::frozen(FROZEN_FRAME, true), Theme::Dark);
+    app.session.recording_armed = true;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_armed_no_take");
+}
+
+#[test]
+fn session_end_confirm_no_take() {
+    let mut app = end_confirm_app(Theme::Dark, RecordState::Idle);
+    app.session.recording_armed = true;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_end_confirm_no_take");
+}
