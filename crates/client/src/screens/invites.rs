@@ -35,7 +35,7 @@ use jamstream_cloud::{Provider, ProviderError, RegionId, Sleeper};
 use jamstream_protocol::ids::{HOST_MEMBER_ID, MemberId, Role, SessionId, TokenId};
 use jamstream_protocol::invite::{Invite, Issuer, Token};
 
-use crate::runtime::{Command, Runtime, Snapshot};
+use crate::runtime::{Command, RecordState, Runtime, Snapshot};
 use crate::screens::host::{base64_decode, unix_now};
 use crate::theme;
 use crate::widgets::{AVATAR_D_ROW, avatar_disc, row_cell};
@@ -114,6 +114,10 @@ pub struct InvitesPanel {
     pub error: Option<String>,
     pub confirm_revoke: Option<(TokenId, String)>,
     pub confirm_end: bool,
+    /// The host chose to end once the take in flight is safe. The end fires
+    /// on the first frame the recorder reports neither recording nor
+    /// uploading; Cancel in the waiting dialog clears it.
+    pub end_when_safe: bool,
     expires_unix: u64,
 }
 
@@ -157,10 +161,25 @@ impl InvitesPanel {
             error: None,
             confirm_revoke: None,
             confirm_end: false,
+            end_when_safe: false,
             expires_unix,
         };
         panel.publish_tokens();
         panel
+    }
+
+    /// Whether one of this panel's confirmations is on screen, so the
+    /// session screen can route Escape to it and treat it as an overlay.
+    pub fn confirming(&self) -> bool {
+        self.confirm_revoke.is_some() || self.confirm_end || self.end_when_safe
+    }
+
+    /// Closes every confirmation, the Escape answer. A pending end is
+    /// cancelled too: the host stays in the session with the take intact.
+    pub fn dismiss_confirm(&mut self) {
+        self.confirm_revoke = None;
+        self.confirm_end = false;
+        self.end_when_safe = false;
     }
 
     /// The live member-to-token map, shared rather than copied: minting into
@@ -496,7 +515,7 @@ impl InvitesPanel {
             self.confirm_end = true;
         }
         ui.label(theme::muted(ui, "Destroys the server; the cost meter stops.").small());
-        self.confirm_windows(ui, rt, &mut event);
+        self.confirm_windows(ui, snap, rt, &mut event);
         event
     }
 
@@ -629,7 +648,13 @@ impl InvitesPanel {
         }
     }
 
-    fn confirm_windows(&mut self, ui: &mut Ui, rt: &dyn Runtime, event: &mut Option<InvitesEvent>) {
+    fn confirm_windows(
+        &mut self,
+        ui: &mut Ui,
+        snap: &Snapshot,
+        rt: &dyn Runtime,
+        event: &mut Option<InvitesEvent>,
+    ) {
         if let Some((token, label)) = self.confirm_revoke.clone() {
             egui::Window::new("Revoke invite")
                 .collapsible(false)
@@ -668,27 +693,128 @@ impl InvitesPanel {
                 });
         }
         if self.confirm_end {
-            egui::Window::new("End session")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                .show(ui.ctx(), |ui| {
-                    ui.label(
-                        "End the session for everyone? The server is destroyed and \
-                         every invite stops working.",
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_end = false;
-                        }
-                        let p = theme::palette_of(ui);
-                        if ui.add(theme::danger_button(p, "End session")).clicked() {
-                            self.confirm_end = false;
-                            *event = Some(InvitesEvent::EndSession);
-                        }
-                    });
-                });
+            self.confirm_end_window(ui, &snap.record.state, rt, event);
         }
+        if self.end_when_safe {
+            self.end_when_safe_window(ui, &snap.record.state, event);
+        }
+    }
+
+    /// The End confirmation. Destroying the server kills a take in flight
+    /// with it, and the dead man's switch on the machine only defers its own
+    /// exits, so a take that is recording or uploading gets a way to end
+    /// after it is safe, and the plain destroy is relabelled as the loss it
+    /// is.
+    fn confirm_end_window(
+        &mut self,
+        ui: &mut Ui,
+        record: &RecordState,
+        rt: &dyn Runtime,
+        event: &mut Option<InvitesEvent>,
+    ) {
+        egui::Window::new("End session")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(380.0);
+                let p = theme::palette_of(ui);
+                match record {
+                    RecordState::Recording => {
+                        ui.label("A take is recording. Ending now loses it.");
+                        ui.add_space(theme::SPACE_SM);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                self.confirm_end = false;
+                            }
+                            if ui.button("Stop the take, then end").clicked() {
+                                rt.send(Command::StopRecord);
+                                self.confirm_end = false;
+                                self.end_when_safe = true;
+                            }
+                            if ui.add(theme::danger_button(p, "End anyway")).clicked() {
+                                self.confirm_end = false;
+                                *event = Some(InvitesEvent::EndSession);
+                            }
+                        });
+                    }
+                    RecordState::Uploading => {
+                        ui.label(
+                            "The last take is still on its way to storage. Ending now \
+                             loses it.",
+                        );
+                        ui.add_space(theme::SPACE_SM);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                self.confirm_end = false;
+                            }
+                            if ui.button("End once it has landed").clicked() {
+                                self.confirm_end = false;
+                                self.end_when_safe = true;
+                            }
+                            if ui.add(theme::danger_button(p, "End anyway")).clicked() {
+                                self.confirm_end = false;
+                                *event = Some(InvitesEvent::EndSession);
+                            }
+                        });
+                    }
+                    RecordState::Idle | RecordState::Failed { .. } => {
+                        ui.label(
+                            "End the session for everyone? The server is destroyed and \
+                             every invite stops working.",
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                self.confirm_end = false;
+                            }
+                            if ui.add(theme::danger_button(p, "End session")).clicked() {
+                                self.confirm_end = false;
+                                *event = Some(InvitesEvent::EndSession);
+                            }
+                        });
+                    }
+                }
+            });
+    }
+
+    /// The wait between choosing to end after the take and the recorder
+    /// reporting it safe. Ends on the first frame the state is neither
+    /// recording nor uploading; a failed take is already lost, so it ends
+    /// then too.
+    fn end_when_safe_window(
+        &mut self,
+        ui: &mut Ui,
+        record: &RecordState,
+        event: &mut Option<InvitesEvent>,
+    ) {
+        if !matches!(record, RecordState::Recording | RecordState::Uploading) {
+            self.end_when_safe = false;
+            *event = Some(InvitesEvent::EndSession);
+            return;
+        }
+        egui::Window::new("Ending after the take")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(380.0);
+                let waiting = match record {
+                    RecordState::Recording => "Stopping the take.",
+                    _ => "Waiting for the take to land in storage.",
+                };
+                ui.label(format!("{waiting} The session ends when it is safe."));
+                ui.add_space(theme::SPACE_SM);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.end_when_safe = false;
+                    }
+                    let p = theme::palette_of(ui);
+                    if ui.add(theme::danger_button(p, "End anyway")).clicked() {
+                        self.end_when_safe = false;
+                        *event = Some(InvitesEvent::EndSession);
+                    }
+                });
+            });
     }
 }
 
