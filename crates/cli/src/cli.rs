@@ -211,6 +211,11 @@ pub struct EndArgs {
     /// End the most recently created running session.
     #[arg(long)]
     pub last: bool,
+
+    /// End even if a take is recording or uploading, losing it, or when the
+    /// host is connected from the app and the take state cannot be checked.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]

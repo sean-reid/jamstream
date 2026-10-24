@@ -9,6 +9,7 @@ use jamstream_cloud::{Provider, ProviderError, RegionId};
 
 use crate::CliError;
 use crate::cli::EndArgs;
+use crate::inflight::{self, InFlight};
 use crate::providers;
 use crate::state::{self, SessionState, SessionStatus};
 
@@ -53,6 +54,70 @@ pub fn resolve_provider(session: &SessionState) -> Result<Box<dyn Provider>, Cli
              this session left running."
         ))
     })
+}
+
+/// Why ending is refused for what the probe learned, or None to go ahead.
+/// `--force` overrides every refusal; an unreachable server is never one,
+/// because the machine that does not answer is usually already gone.
+pub fn refusal(inflight: &InFlight, force: bool) -> Option<String> {
+    if force {
+        return None;
+    }
+    match inflight {
+        InFlight::Recording => Some(
+            "a take is recording, and ending now would lose it. Press Stop in the app and wait \
+             for UPLOADING to clear, then run this again; or pass --force to end anyway and \
+             lose the take"
+                .to_owned(),
+        ),
+        InFlight::Uploading => Some(
+            "the last take is still uploading, and ending now would lose it. Wait for \
+             UPLOADING to clear in the app, then run this again; or pass --force to end anyway \
+             and lose the take"
+                .to_owned(),
+        ),
+        InFlight::HostConnected => Some(
+            "the host is connected from the app, so this terminal cannot tell whether a take is \
+             in flight. End the session from the app, which checks; or pass --force"
+                .to_owned(),
+        ),
+        InFlight::Nothing | InFlight::Unknown(_) => None,
+    }
+}
+
+/// [`run`], after asking the server whether a take is in flight. This is
+/// what `jamstream end` calls; `run` alone is the destroy for callers that
+/// have already decided.
+pub async fn guarded_run<W: Write>(
+    args: &EndArgs,
+    path: &Path,
+    session: SessionState,
+    provider: &dyn Provider,
+    out: &mut W,
+) -> Result<(), CliError> {
+    let inflight = inflight::probe(&session).await;
+    if let Some(why) = refusal(&inflight, args.force) {
+        return Err(CliError::Usage(why));
+    }
+    match &inflight {
+        InFlight::Recording | InFlight::Uploading => {
+            writeln!(out, "Ending anyway; the take in flight is lost.")?;
+        }
+        InFlight::HostConnected => {
+            writeln!(
+                out,
+                "Ending anyway; the host's app may have a take in flight."
+            )?;
+        }
+        InFlight::Unknown(why) => {
+            writeln!(
+                out,
+                "Could not check for a take in flight ({why}); ending anyway."
+            )?;
+        }
+        InFlight::Nothing => {}
+    }
+    run(path, session, provider, out).await
 }
 
 pub async fn run<W: Write>(
@@ -134,4 +199,39 @@ pub async fn run<W: Write>(
         writeln!(out, "The session server's log is at {}.", log.display())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_take_in_flight_refuses_and_names_the_override() {
+        for inflight in [InFlight::Recording, InFlight::Uploading] {
+            let why = refusal(&inflight, false).expect("a take in flight refuses");
+            assert!(why.contains("lose"), "{why}");
+            assert!(why.contains("--force"), "{why}");
+            assert_eq!(refusal(&inflight, true), None, "--force overrides");
+        }
+    }
+
+    #[test]
+    fn an_occupied_host_seat_refuses_and_points_at_the_app() {
+        let why = refusal(&InFlight::HostConnected, false).unwrap();
+        assert!(why.contains("from the app"), "{why}");
+        assert!(why.contains("--force"), "{why}");
+        assert_eq!(refusal(&InFlight::HostConnected, true), None);
+    }
+
+    /// A server that does not answer is usually a machine that is already
+    /// gone, and `end` exists to close those out; refusing here would strand
+    /// every crashed session behind --force.
+    #[test]
+    fn nothing_in_flight_and_no_answer_both_go_ahead() {
+        assert_eq!(refusal(&InFlight::Nothing, false), None);
+        assert_eq!(
+            refusal(&InFlight::Unknown("no answer".to_owned()), false),
+            None
+        );
+    }
 }

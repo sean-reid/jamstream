@@ -205,20 +205,84 @@ async fn a_recorded_local_host_puts_the_take_where_it_said_it_would() {
         "without --record-stems the one file is the mix: {name}"
     );
 
-    // Ending the session removes the server and its directory, and the
-    // take survives it: a recording outlives the session that made it.
+    // A second take, left running with the host gone: `jamstream end` asks
+    // the server through the host's own seat before it destroys anything,
+    // and refuses while the take is recording. Nothing is torn down by the
+    // refusal, so the host can come back and stop it.
+    let mut wire = Wire::connect(&invite, now()).await;
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
+    while *wire.core.state() != ClientState::Joined {
+        assert!(Instant::now() < deadline, "the host never rejoined");
+        wire.pump(now()).await;
+    }
+    wire.core.record_ctl(RecordOp::Start).unwrap();
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
+    while wire.last_record_state != Some(RecordingState::Recording) {
+        assert!(Instant::now() < deadline, "the second take never started");
+        wire.pump(now()).await;
+    }
+    let _ = wire.core.leave("host steps out mid-take");
+    wire.pump(now()).await;
+    drop(wire);
+
     let session_id = json["session_id"].as_str().unwrap();
-    let (path, session) = end::select(&EndArgs {
+    let end_args = EndArgs {
         session: Some(session_id[..8].to_owned()),
         last: false,
-    })
-    .unwrap();
+        force: false,
+    };
+    let (path, session) = end::select(&end_args).unwrap();
     let end_provider = end::resolve_provider(&session).unwrap();
     let mut out = Vec::new();
-    end::run(&path, session, end_provider.as_ref(), &mut out)
+    let refused = end::guarded_run(&end_args, &path, session, end_provider.as_ref(), &mut out)
+        .await
+        .expect_err("end must refuse while a take is recording");
+    assert!(
+        refused.to_string().contains("a take is recording"),
+        "the refusal names the take: {refused}"
+    );
+    assert!(
+        refused.to_string().contains("--force"),
+        "the refusal names the override: {refused}"
+    );
+    let (_, still) = end::select(&end_args).expect("the session is still running");
+    assert_eq!(still.session_id_hex, session_id);
+
+    // The host comes back, finds the take still running, and stops it.
+    let mut wire = Wire::connect(&invite, now()).await;
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
+    while wire.last_record_state != Some(RecordingState::Recording) {
+        assert!(
+            Instant::now() < deadline,
+            "a rejoining host is told about the running take; saw {:?}",
+            wire.last_record_state
+        );
+        wire.pump(now()).await;
+    }
+    wire.core.record_ctl(RecordOp::Stop).unwrap();
+    let deadline = Instant::now() + budget(Duration::from_secs(10));
+    while wire.last_record_state != Some(RecordingState::Idle) {
+        assert!(Instant::now() < deadline, "the second take never ended");
+        wire.pump(now()).await;
+    }
+    let _ = wire.core.leave("recording story done");
+    wire.pump(now()).await;
+    drop(wire);
+
+    // Ending the session removes the server and its directory, and the
+    // take survives it: a recording outlives the session that made it. The
+    // same guard runs and finds nothing in flight.
+    let (path, session) = end::select(&end_args).unwrap();
+    let mut out = Vec::new();
+    end::guarded_run(&end_args, &path, session, end_provider.as_ref(), &mut out)
         .await
         .unwrap();
-    assert!(String::from_utf8(out).unwrap().contains("ended"));
+    let ended = String::from_utf8(out).unwrap();
+    assert!(ended.contains("ended"), "{ended}");
+    assert!(
+        !ended.contains("Could not check"),
+        "a live idle server answers the probe: {ended}"
+    );
     guard.disarm();
     assert!(
         take.is_file(),

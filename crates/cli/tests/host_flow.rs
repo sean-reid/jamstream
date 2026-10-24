@@ -123,6 +123,7 @@ async fn host_end_and_sweep_flow() {
     let end_args = EndArgs {
         session: Some(session_id[..8].to_owned()),
         last: false,
+        force: false,
     };
     let (found_path, found_session) = end::select(&end_args).unwrap();
     assert_eq!(found_path, path);
@@ -159,6 +160,7 @@ async fn host_end_and_sweep_flow() {
         end::select(&EndArgs {
             session: None,
             last: true,
+            force: false,
         })
         .is_err()
     );

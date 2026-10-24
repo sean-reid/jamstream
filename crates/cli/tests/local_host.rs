@@ -196,6 +196,7 @@ async fn local_host_join_and_end_story() {
     let (path, session) = end::select(&EndArgs {
         session: Some(session_id[..8].to_owned()),
         last: false,
+        force: false,
     })
     .unwrap();
     let end_provider = end::resolve_provider(&session).unwrap();
