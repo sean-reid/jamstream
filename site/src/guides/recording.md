@@ -107,7 +107,11 @@ A take still being written ends in `.part` and is renamed when it finishes, so a
 
 The take uploads while you play, so ending the session waits only for the last of it.
 
-> Let the `UPLOADING` lamp clear before you end the session. The machine holds on for ten minutes to finish an upload and then shuts down regardless, and a take still in flight at that point is lost.
+Ending the session destroys the machine, and a take still recording or uploading goes with it. So **End session** checks first: over a running take it offers to stop the take and end once it has landed, over an upload it offers to end once it has landed, and the plain destroy is relabelled **End anyway**.
+
+Closing the window while a take is in flight says so too; **Keep it running and quit** lets the upload finish on its own. From a terminal, [`jamstream end`](../cli/end.md) asks the server the same question and refuses without `--force`.
+
+> The machine's own exits are gentler: when the last musician leaves or the hard cap hits, it holds on for up to ten minutes to finish an upload, then shuts down regardless. A take still in flight at that point is lost.
 
 Downloading is where recording costs money, because your cloud account bills egress on the way out and nothing on the way in.
 
