@@ -1845,6 +1845,12 @@ impl HostWizard {
         }
     }
 
+    /// Said beside every armed choice, because the price next to the rows reads
+    /// as "the session will be saved" and the session itself captures nothing
+    /// until the host presses Record.
+    const ARMS_RECORDING: &str =
+        "This arms recording; a take starts only when you press Record in the session.";
+
     /// The recording choice for this launch: off, the mix, or the mix and
     /// stems. Fixed for the session once it starts, which is why it is here and
     /// not in the session's own Record sheet.
@@ -1892,7 +1898,13 @@ impl HostWizard {
                 let dir = jamstream_cli::state::recordings_dir()
                     .map(|d| d.display().to_string())
                     .unwrap_or_else(|_| "this computer's recordings folder".to_owned());
-                ui.add(egui::Label::new(theme::muted(ui, format!("Takes land in {dir}."))).wrap());
+                ui.add(
+                    egui::Label::new(theme::muted(
+                        ui,
+                        format!("{} Takes land in {dir}.", Self::ARMS_RECORDING),
+                    ))
+                    .wrap(),
+                );
             }
             (None, true) => {
                 if let Some(bucket) = &self.recording_setup.bucket {
@@ -1900,7 +1912,8 @@ impl HostWizard {
                         egui::Label::new(theme::muted(
                             ui,
                             format!(
-                                "Takes go to {} in {}, {}.",
+                                "{} Takes go to {} in {}, {}.",
+                                Self::ARMS_RECORDING,
                                 bucket.name,
                                 bucket.region,
                                 self.recording_setup.retention.label().to_lowercase()
@@ -1913,7 +1926,8 @@ impl HostWizard {
             (None, false) => {
                 ui.label(theme::muted(
                     ui,
-                    "Nothing is captured unless you turn this on.",
+                    "Nothing is captured unless you turn this on, and a take starts only \
+                     when you press Record in the session.",
                 ));
             }
         }
