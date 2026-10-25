@@ -37,6 +37,8 @@ With no bucket set up, the two recording rows are disabled and say so, pointing 
 
 Launching proves the key can write this session's own prefix, and sets the retention rule before the machine is paid for.
 
+Arming is not recording. Until the first take, a line under the roster says so and points at Record, and End session says nothing was recorded, because that is the last moment it can still be fixed.
+
 > Setting retention needs a key that can also **read** the bucket's existing rules, not just write to it.
 >
 > Without that permission the session still records, but retention can't be set: takes are kept indefinitely and go on costing storage until you delete them yourself. `jamstream host` says so in the line it prints after the bucket check.

@@ -4059,3 +4059,108 @@ fn quitting_with_a_take_in_flight_relabels_the_destructive_answer() {
         "keeping it running is the answer that saves the take"
     );
 }
+
+// Recording armed, no take. The wizard's price beside the recording rows reads
+// as the session being saved, so the session screen says a take still has to
+// be started, and End says nothing was recorded, until the first take.
+
+/// A host on the app shell with recording armed at launch and the recorder
+/// pinned to `state`, the Invites drawer open.
+fn armed_harness(
+    state: RecordState,
+    label: &str,
+) -> (Recorder, Harness<'static, jamstream_client::app::JamApp>) {
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    rt.inner().set_record(state, false);
+    let mut app = jamstream_client::app::JamApp::in_memory();
+    app.recent = Vec::new();
+    app.session.invites = Some(invite_book(Vec::new(), label));
+    app.session.recording_armed = true;
+    app.runtime = Some(Box::new(rt.clone()));
+    app.screen = jamstream_client::app::Screen::Session;
+    app.settings_open = true;
+    app.settings_tab = SettingsTab::Invites;
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui_state(
+            |ui, app: &mut jamstream_client::app::JamApp| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+            },
+            app,
+        );
+    harness.run_steps(2);
+    (rt, harness)
+}
+
+#[test]
+fn an_armed_session_says_a_take_still_has_to_be_started_until_one_is() {
+    let (rt, mut harness) = armed_harness(RecordState::Idle, "armed-nudge");
+    assert!(
+        harness
+            .query_by_label_contains("Press Record to start a take")
+            .is_some(),
+        "armed with no take, the screen has to say so"
+    );
+
+    // The first take, and the nudge goes; it stays gone once the take ends,
+    // because its job was the first press.
+    rt.inner().set_record(RecordState::Recording, false);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Press Record to start a take")
+            .is_none(),
+        "a running take is not nudged"
+    );
+    rt.inner().set_record(RecordState::Idle, false);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Press Record to start a take")
+            .is_none(),
+        "once a take has happened the nudge is done"
+    );
+}
+
+#[test]
+fn a_session_that_cannot_record_is_not_nudged() {
+    let (_rt, harness) = end_harness(RecordState::Idle, "unarmed-nudge");
+    assert!(
+        harness
+            .query_by_label_contains("Press Record to start a take")
+            .is_none(),
+        "no recorder, no nudge"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("nothing was recorded")
+            .is_none()
+    );
+}
+
+#[test]
+fn ending_an_armed_session_with_no_take_says_nothing_was_recorded() {
+    let (_rt, mut harness) = armed_harness(RecordState::Idle, "armed-end");
+    harness
+        .get_by_role_and_label(AkRole::Button, "End session for everyone")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("nothing was recorded")
+            .is_some(),
+        "the last moment it can be fixed has to say so"
+    );
+    // Still the plain destroy: there is no take to protect.
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "End session")
+            .is_some()
+    );
+    assert!(harness.state().runtime.is_some(), "saying so is not ending");
+}

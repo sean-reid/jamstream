@@ -77,6 +77,7 @@ fn outcome_with(retention: Option<RetentionEnforcement>) -> LaunchOutcome {
     LaunchOutcome {
         state,
         state_path: dir.join("state.json"),
+        armed: retention.is_some(),
         retention,
     }
 }

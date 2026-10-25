@@ -506,6 +506,7 @@ impl JamApp {
                 );
                 self.runtime = Some(Box::new(costed));
                 self.session = SessionScreen::default();
+                self.session.recording_armed = outcome.armed;
                 self.session.invites = Some(panel);
                 // A session with nobody in it: open the drawer on the tab
                 // holding the links, because sharing them is the next act.

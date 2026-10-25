@@ -118,6 +118,9 @@ pub struct InvitesPanel {
     /// on the first frame the recorder reports neither recording nor
     /// uploading; Cancel in the waiting dialog clears it.
     pub end_when_safe: bool,
+    /// Recording was armed and no take has happened, as the session screen
+    /// knows it; set before each draw so the End confirmation can say so.
+    pub no_take_yet: bool,
     expires_unix: u64,
 }
 
@@ -162,6 +165,7 @@ impl InvitesPanel {
             confirm_revoke: None,
             confirm_end: false,
             end_when_safe: false,
+            no_take_yet: false,
             expires_unix,
         };
         panel.publish_tokens();
@@ -759,6 +763,13 @@ impl InvitesPanel {
                         });
                     }
                     RecordState::Idle | RecordState::Failed { .. } => {
+                        if self.no_take_yet {
+                            ui.label(
+                                "Recording was armed for this session and nothing was \
+                                 recorded. Press Record to start a take before ending.",
+                            );
+                            ui.add_space(theme::SPACE_SM);
+                        }
                         ui.label(
                             "End the session for everyone? The server is destroyed and \
                              every invite stops working.",
