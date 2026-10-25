@@ -3842,3 +3842,220 @@ fn the_you_tab_names_a_host_and_remembers_it() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Ending with a take in flight. Destroying the server kills the take with
+// it, and the machine's own upload deferral covers only its own exits, so the
+// End confirmation has to know the recorder's state and offer a way to end
+// after the take is safe.
+
+/// A host with the Invites drawer open over a recorder pinned to `state`,
+/// on the app shell so End reaches `end_session`. The fixture's record is a
+/// local provider with an unregistered pid, so an End that fires resolves to
+/// not-found and marks the record ended without touching a process.
+fn end_harness(
+    state: RecordState,
+    label: &str,
+) -> (Recorder, Harness<'static, jamstream_client::app::JamApp>) {
+    let rt: Recorder = Arc::new(RecordingRuntime::new(DemoRuntime::frozen(
+        FROZEN_FRAME,
+        true,
+    )));
+    rt.inner().set_record(state, false);
+    let mut app = jamstream_client::app::JamApp::in_memory();
+    app.recent = Vec::new();
+    app.session.invites = Some(invite_book(Vec::new(), label));
+    app.runtime = Some(Box::new(rt.clone()));
+    app.screen = jamstream_client::app::Screen::Session;
+    app.settings_open = true;
+    app.settings_tab = SettingsTab::Invites;
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui_state(
+            |ui, app: &mut jamstream_client::app::JamApp| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+            },
+            app,
+        );
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(AkRole::Button, "End session for everyone")
+        .click();
+    harness.run_steps(2);
+    (rt, harness)
+}
+
+#[test]
+fn an_idle_recorder_keeps_the_plain_end_confirmation() {
+    let (_rt, harness) = end_harness(RecordState::Idle, "end-idle");
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "End session")
+            .is_some(),
+        "with nothing in flight the confirmation is the plain one"
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "End anyway")
+            .is_none()
+    );
+    assert!(harness.state().runtime.is_some(), "nothing ended yet");
+}
+
+#[test]
+fn ending_with_a_take_recording_offers_to_stop_it_first() {
+    let (rt, mut harness) = end_harness(RecordState::Recording, "end-recording");
+    assert!(
+        harness
+            .query_by_label_contains("A take is recording")
+            .is_some(),
+        "the dialog has to name the take"
+    );
+    for label in ["Stop the take, then end", "End anyway", "Cancel"] {
+        assert!(
+            harness
+                .query_by_role_and_label(AkRole::Button, label)
+                .is_some(),
+            "{label} is missing from the confirmation"
+        );
+    }
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "End session")
+            .is_none(),
+        "the plain destroy must not be offered over a recording take"
+    );
+    assert!(harness.state().runtime.is_some());
+
+    // Stop first: the stop goes to the server, and the end fires only once
+    // the recorder reports the take safe. The demo recorder flips to idle on
+    // the stop, so that is the next frame.
+    harness
+        .get_by_role_and_label(AkRole::Button, "Stop the take, then end")
+        .click();
+    harness.run_steps(3);
+    assert!(
+        rt.commands().contains(&Command::StopRecord),
+        "stopping first has to send the stop"
+    );
+    assert!(
+        harness.state().runtime.is_none(),
+        "once the take is safe the end goes through"
+    );
+}
+
+#[test]
+fn ending_with_a_take_uploading_waits_until_it_lands() {
+    let (rt, mut harness) = end_harness(RecordState::Uploading, "end-uploading");
+    assert!(
+        harness
+            .query_by_label_contains("still on its way to storage")
+            .is_some()
+    );
+    harness
+        .get_by_role_and_label(AkRole::Button, "End once it has landed")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Waiting for the take to land")
+            .is_some(),
+        "the wait has to be on screen while the upload runs"
+    );
+    assert!(
+        harness.state().runtime.is_some(),
+        "the session must not end while the take is uploading"
+    );
+    assert!(
+        !rt.commands().contains(&Command::StopRecord),
+        "an uploading take has already stopped; nothing to send"
+    );
+
+    // The server reports the take landed: the end fires on its own.
+    rt.inner().set_record(RecordState::Idle, false);
+    harness.run_steps(2);
+    assert!(harness.state().runtime.is_none());
+}
+
+#[test]
+fn escape_cancels_a_pending_end_and_the_take_lands_in_a_live_session() {
+    let (rt, mut harness) = end_harness(RecordState::Uploading, "end-escape");
+    harness
+        .get_by_role_and_label(AkRole::Button, "End once it has landed")
+        .click();
+    harness.run_steps(2);
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("Waiting for the take to land")
+            .is_none(),
+        "Escape has to step out of the wait"
+    );
+    rt.inner().set_record(RecordState::Idle, false);
+    harness.run_steps(2);
+    assert!(
+        harness.state().runtime.is_some(),
+        "a cancelled end must not fire when the take lands"
+    );
+}
+
+#[test]
+fn end_anyway_destroys_with_the_take_in_flight() {
+    let (rt, mut harness) = end_harness(RecordState::Recording, "end-anyway");
+    harness
+        .get_by_role_and_label(AkRole::Button, "End anyway")
+        .click();
+    harness.run_steps(2);
+    assert!(harness.state().runtime.is_none(), "End anyway ends");
+    assert!(
+        !rt.commands().contains(&Command::StopRecord),
+        "End anyway is the destroy, not a stop"
+    );
+}
+
+#[test]
+fn quitting_with_a_take_in_flight_relabels_the_destructive_answer() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_record(RecordState::Uploading, false);
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(rt));
+    app.screen = Screen::Session;
+    app.session.invites = Some(empty_invites());
+    app.confirm_quit = true;
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(0.05)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), Theme::Dark);
+            app.root_ui(ui);
+        });
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label_contains("still on its way to storage")
+            .is_some(),
+        "the quit dialog has to name the take in flight"
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "End anyway and quit")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "End session and quit")
+            .is_none(),
+        "the plain label must not be offered over a take in flight"
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(AkRole::Button, "Keep it running and quit")
+            .is_some(),
+        "keeping it running is the answer that saves the take"
+    );
+}

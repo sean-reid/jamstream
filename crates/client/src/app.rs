@@ -13,7 +13,7 @@ use crate::exec::{Executor, Job};
 use crate::live::{AudioSettings, CostedRuntime, LiveError, LiveRuntime};
 use crate::picker::{Pick, Picked};
 use crate::reveal;
-use crate::runtime::{AvatarHandle, Command, ConnState, Runtime, Snapshot};
+use crate::runtime::{AvatarHandle, Command, ConnState, RecordState, Runtime, Snapshot};
 use crate::screens::destinations::DestinationsPanel;
 use crate::screens::devices::{
     Block, DeviceCatalog, DeviceInfo, DevicesEvent, DevicesScreen, SessionAudio, StreamNotes,
@@ -865,6 +865,14 @@ impl JamApp {
         if !self.confirm_quit {
             return;
         }
+        // Destroying the server destroys a take in flight with it, and this
+        // dialog is one of the two places that can do it.
+        let take_in_flight = self.runtime.as_deref().map(|rt| rt.snapshot().record.state);
+        let take_in_flight = match take_in_flight {
+            Some(RecordState::Recording) => Some("A take is recording."),
+            Some(RecordState::Uploading) => Some("The last take is still on its way to storage."),
+            _ => None,
+        };
         egui::Window::new("Quit while hosting")
             .collapsible(false)
             .resizable(false)
@@ -881,6 +889,12 @@ impl JamApp {
                      press Stop strays on the home screen; jamstream end does \
                      the same from a terminal.",
                 ));
+                if let Some(what) = take_in_flight {
+                    ui.add_space(theme::SPACE_SM);
+                    ui.label(format!(
+                        "{what} Ending now loses it; kept running, it finishes on its own."
+                    ));
+                }
                 ui.add_space(theme::SPACE_SM);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
@@ -892,10 +906,12 @@ impl JamApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     let p = theme::palette_of(ui);
-                    if ui
-                        .add(theme::danger_button(p, "End session and quit"))
-                        .clicked()
-                    {
+                    let end_label = if take_in_flight.is_some() {
+                        "End anyway and quit"
+                    } else {
+                        "End session and quit"
+                    };
+                    if ui.add(theme::danger_button(p, end_label)).clicked() {
                         self.confirm_quit = false;
                         self.quit_after_ending = true;
                         self.end_session();

@@ -2820,3 +2820,46 @@ fn session_invites_narrow() {
     let mut harness = app_harness(session_invites_app(Theme::Dark), NARROW);
     snapshot(&mut harness, "session_invites_narrow");
 }
+
+// The End confirmation over a take in flight. Destroying the server kills the
+// take with it, so the dialog names the loss and offers to end after the take
+// is safe instead.
+
+/// The host's Invites drawer with End pressed and the recorder pinned to
+/// `state`, stems on, the way the record sheet's fixtures pin it.
+fn end_confirm_app(theme: Theme, state: RecordState) -> JamApp {
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_record(state, true);
+    let (session, path) = invites_state();
+    let mut panel = InvitesPanel::new(session, path);
+    panel.confirm_end = true;
+    let mut app = host_app(rt, theme);
+    app.session.invites = Some(panel);
+    drawer_app(app, SettingsTab::Invites)
+}
+
+#[test]
+fn session_end_confirm_recording() {
+    let app = end_confirm_app(Theme::Dark, RecordState::Recording);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_end_confirm_recording");
+}
+
+#[test]
+fn session_end_confirm_uploading() {
+    let app = end_confirm_app(Theme::Dark, RecordState::Uploading);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_end_confirm_uploading");
+}
+
+#[test]
+fn session_quit_confirm_recording() {
+    // The window's close button pressed while a take runs: the same three
+    // ways out, with the take named and the destructive one relabelled.
+    let rt = DemoRuntime::frozen(FROZEN_FRAME, true);
+    rt.set_record(RecordState::Recording, false);
+    let mut app = host_app(rt, Theme::Dark);
+    app.confirm_quit = true;
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_quit_confirm_recording");
+}

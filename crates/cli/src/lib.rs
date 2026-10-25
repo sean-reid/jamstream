@@ -7,6 +7,7 @@ pub mod cli;
 pub mod downloads;
 pub mod end;
 pub mod host;
+pub mod inflight;
 pub mod join;
 pub mod launch;
 pub mod logging;

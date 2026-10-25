@@ -196,18 +196,14 @@ impl SessionScreen {
         // nothing on this screen can trap the user.
         let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if escape {
-            let panel_confirming = self
-                .invites
-                .as_ref()
-                .is_some_and(|p| p.confirm_revoke.is_some() || p.confirm_end);
+            let panel_confirming = self.invites.as_ref().is_some_and(InvitesPanel::confirming);
             if self.confirm_leave {
                 self.confirm_leave = false;
             } else if self.confirm_revoke.is_some() {
                 self.confirm_revoke = None;
             } else if panel_confirming {
                 if let Some(panel) = &mut self.invites {
-                    panel.confirm_revoke = None;
-                    panel.confirm_end = false;
+                    panel.dismiss_confirm();
                 }
             } else if self
                 .destinations
@@ -290,10 +286,7 @@ impl SessionScreen {
     pub fn has_inner_overlay(&self) -> bool {
         self.confirm_leave
             || self.confirm_revoke.is_some()
-            || self
-                .invites
-                .as_ref()
-                .is_some_and(|p| p.confirm_revoke.is_some() || p.confirm_end)
+            || self.invites.as_ref().is_some_and(InvitesPanel::confirming)
             || self
                 .destinations
                 .as_ref()

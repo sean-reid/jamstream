@@ -44,7 +44,7 @@ async fn dispatch<W: Write + Send>(cli: Cli, out: &mut W) -> Result<(), CliError
         Command::End(args) => {
             let (path, session) = end::select(&args)?;
             let provider = end::resolve_provider(&session)?;
-            end::run(&path, session, provider.as_ref(), out).await
+            end::guarded_run(&args, &path, session, provider.as_ref(), out).await
         }
         Command::Sweep(args) => {
             let providers = match &args.provider {
