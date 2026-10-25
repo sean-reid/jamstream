@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.5](https://github.com/sean-reid/jamstream/compare/v0.5.4...v0.5.5) (2026-10-25)
+
+
+### Security
+
+* **deps:** move past the October advisories ([#637](https://github.com/sean-reid/jamstream/issues/637)) ([7023127](https://github.com/sean-reid/jamstream/commit/702312718c90570fbb5fa72de06ddab8597f87a7))
+
+
+### Features
+
+* **client:** say that recording is armed until the first take ([#638](https://github.com/sean-reid/jamstream/issues/638)) ([f3f618f](https://github.com/sean-reid/jamstream/commit/f3f618f5ee884c4bc813f0e8904e2676913e1333))
+
+
+### Bug Fixes
+
+* **client:** say in the wizard that arming is not recording ([#636](https://github.com/sean-reid/jamstream/issues/636)) ([d024010](https://github.com/sean-reid/jamstream/commit/d024010da98d634fb4ac0ce9cbcb9dd25a3becfe))
+* end a session only after a take in flight is safe ([#635](https://github.com/sean-reid/jamstream/issues/635)) ([9274343](https://github.com/sean-reid/jamstream/commit/9274343bc9ce0f02a710d2c5267f936a1b500b33))
+
 ## [0.5.4](https://github.com/sean-reid/jamstream/compare/v0.5.3...v0.5.4) (2026-09-25)
 
 
