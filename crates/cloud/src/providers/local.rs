@@ -1711,33 +1711,40 @@ mod tests {
     /// `prelude` lines run first, which is where a fake writes whatever the
     /// test needs it to have written before launch returns.
     ///
-    /// It execs `sleep` through a symlink of its own name because the
+    /// It execs `sh` through a symlink of its own name because the
     /// liveness probe compares what is running to the image recorded at
     /// launch, and what runs after an exec is the exec'd image, not the
     /// script. A real jamstreamd is a binary of that name; so is this. A
     /// symlink rather than a copy: macOS kills a copy of a system binary
-    /// for failing its code signature.
+    /// for failing its code signature. `sh` rather than `sleep`: on Ubuntu
+    /// 26.04 `sleep` is a uutils multicall applet that dispatches on
+    /// argv[0], so run under this name it exits at once instead of
+    /// sleeping. The shell keeps the pid and loops over short sleeps, so
+    /// SIGTERM to it leaves at most a one-second orphan.
     #[cfg(unix)]
     fn stand_in(dir: &Path, prelude: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         const NAME: &str = "fake-jamstreamd";
-        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        let sh = ["/bin/sh", "/usr/bin/sh"]
             .into_iter()
             .map(PathBuf::from)
             .find(|p| p.is_file())
-            .or_else(|| find_on_path("sleep"))
-            .expect("no sleep binary to stand in for jamstreamd");
+            .or_else(|| find_on_path("sh"))
+            .expect("no sh binary to stand in for jamstreamd");
         let image_dir = dir.join("image");
         std::fs::create_dir_all(&image_dir).unwrap();
         let image = image_dir.join(NAME);
         let _ = std::fs::remove_file(&image);
-        std::os::unix::fs::symlink(&sleep, &image).unwrap();
+        std::os::unix::fs::symlink(&sh, &image).unwrap();
 
         // Quoted: the temp path carries a thread id in parentheses.
         let path = dir.join(NAME);
         std::fs::write(
             &path,
-            format!("#!/bin/sh\n{prelude}exec \"{}\" 600\n", image.display()),
+            format!(
+                "#!/bin/sh\n{prelude}exec \"{}\" -c 'while :; do sleep 1; done'\n",
+                image.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();

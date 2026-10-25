@@ -191,7 +191,7 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-          CFLAGS_aarch64_unknown_linux_musl: -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+          CFLAGS_aarch64_unknown_linux_musl: -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -std=gnu17
       # Each binary must be fully static AND actually built for the
       # architecture its asset name claims; #139 was a machine downloading
       # a binary of the wrong architecture.

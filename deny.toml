@@ -77,6 +77,25 @@ ignore = [
     # the case where the compile-time-only argument stops holding.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # zvariant (0370), zbus_names (0371) and zvariant_derive (0372) are
+    # unmaintained as separate crates: zbus 6 folded them in as modules, and
+    # the advisories say so rather than naming a defect. They arrive through
+    # the same Linux AT-SPI accessibility stack as quick-xml above, atspi
+    # -> accesskit_unix -> accesskit_winit, under the desktop client only;
+    # jamstreamd's closure has none of them on any target.
+    #
+    # Accepted because nothing else resolves them: accesskit_unix 0.21 pins
+    # atspi 0.29, which pins zbus 5, and there is no zbus 6 release of that
+    # chain to move to.
+    #
+    # Triggers: this clears when accesskit's atspi stack moves to zbus 6,
+    # which drops all three crates from the lock and makes cargo-deny fail
+    # on the unused ignores. The zbus [[bans.deny]] entry below fails the
+    # build if any crate other than atspi's pulls them in, which is the case
+    # where the accessibility-only argument stops holding.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
@@ -138,6 +157,30 @@ wrappers = ["owned_ttf_parser"]
 [[bans.deny]]
 name = "ab_glyph"
 wrappers = ["jamstream-broadcast", "sctk-adwaita"]
+
+# The unmaintained zbus 5 companion crates are accepted only inside the AT-SPI
+# accessibility stack. Any other crate reaching them is a new D-Bus consumer
+# and the accessibility-only argument above no longer covers it.
+[[bans.deny]]
+name = "zbus_names"
+wrappers = ["atspi-common", "zbus", "zbus_macros", "zbus_xml"]
+
+[[bans.deny]]
+name = "zvariant"
+wrappers = [
+    "accesskit_atspi_common",
+    "atspi-common",
+    "zbus",
+    "zbus-lockstep",
+    "zbus-lockstep-macros",
+    "zbus_macros",
+    "zbus_names",
+    "zbus_xml",
+]
+
+[[bans.deny]]
+name = "zvariant_derive"
+wrappers = ["zvariant"]
 
 [sources]
 unknown-registry = "deny"
