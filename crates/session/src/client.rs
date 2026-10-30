@@ -31,6 +31,16 @@ use crate::limits::TokenBucket;
 /// copy of it: the two halves of one session count the same samples.
 const TICK_SAMPLES: u64 = crate::server::TICK_SAMPLES as u64;
 const UPLINK_BITRATE: u32 = 128_000;
+/// A stereo uplink gets the personal mix's rate: the same 2.5 ms stereo CELT
+/// configuration, already judged by ear on the way down.
+const UPLINK_BITRATE_STEREO: u32 = 192_000;
+
+fn uplink_bitrate(channels: Channels) -> u32 {
+    match channels {
+        Channels::Mono => UPLINK_BITRATE,
+        Channels::Stereo => UPLINK_BITRATE_STEREO,
+    }
+}
 const CONNECTION_TIMEOUT_MS: u64 = 10_000;
 const PING_INTERVAL_MS: u64 = 1_000;
 /// First init resend after 500 ms, doubling to the cap while Connecting.
@@ -220,8 +230,12 @@ pub struct ClientCore {
     welcome: Option<Welcome>,
     link: ControlLink,
     jitter: JitterBuffer,
-    /// Mono capture encoder; musicians only.
+    /// Capture encoder; musicians only. Mono unless
+    /// [`ClientCore::set_uplink_channels`] asked for stereo.
     encoder: Option<Encoder>,
+    /// What the capture encoder is built for, and what `push_capture` expects
+    /// per frame: 120 samples mono or 240 interleaved stereo.
+    uplink: Channels,
     /// Stereo downlink decoder: Ms2_5 personal mix or Ms20 broadcast.
     decoder: Decoder,
     /// Listener decode scratch (one 20 ms stereo frame).
@@ -338,7 +352,7 @@ impl ClientCore {
     /// must go on the wire; `poll` resends it until the server answers.
     pub fn connect(invite: &Invite, now_ms: u64) -> Result<(Self, Vec<u8>), SessionError> {
         let (initiator, init_packet) = Initiator::new(invite)?;
-        let (encoder, decoder, decode_len) = Self::media_state(invite.token.role)?;
+        let (encoder, decoder, decode_len) = Self::media_state(invite.token.role, Channels::Mono)?;
         let reject_key = initiator.reject_key().cloned();
         let core = Self {
             invite: invite.clone(),
@@ -355,6 +369,7 @@ impl ClientCore {
             link: ControlLink::new(),
             jitter: JitterBuffer::new(),
             encoder,
+            uplink: Channels::Mono,
             decoder,
             decode_buf: vec![0.0; decode_len],
             fifo: VecDeque::new(),
@@ -392,7 +407,8 @@ impl ClientCore {
     /// server-side disconnect. Stream state resets; the token is reused.
     pub fn reconnect(&mut self, now_ms: u64) -> Result<Vec<u8>, SessionError> {
         let (initiator, init_packet) = Initiator::new(&self.invite)?;
-        let (encoder, decoder, decode_len) = Self::media_state(self.invite.token.role)?;
+        let (encoder, decoder, decode_len) =
+            Self::media_state(self.invite.token.role, self.uplink)?;
         self.state = ClientState::Connecting;
         self.reject_key = initiator.reject_key().cloned();
         self.session_full = false;
@@ -614,9 +630,10 @@ impl ClientCore {
         out
     }
 
-    /// One 2.5 ms mono capture frame in, sealed media datagrams out.
+    /// One 2.5 ms capture frame in, sealed media datagrams out: 120 samples
+    /// mono, or 240 interleaved stereo after [`ClientCore::set_uplink_channels`].
     /// Empty unless Joined as a musician.
-    pub fn push_capture(&mut self, _now_ms: u64, pcm_mono_120: &[f32]) -> Vec<Vec<u8>> {
+    pub fn push_capture(&mut self, _now_ms: u64, pcm_frame: &[f32]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         if self.state != ClientState::Joined {
             return out;
@@ -624,7 +641,7 @@ impl ClientCore {
         let (Some(encoder), Some(welcome)) = (self.encoder.as_mut(), self.welcome.as_ref()) else {
             return out;
         };
-        if encoder.encode(pcm_mono_120, &mut self.pkt_buf).is_err() {
+        if encoder.encode(pcm_frame, &mut self.pkt_buf).is_err() {
             tracing::warn!("capture encode failed");
             return out;
         }
@@ -637,7 +654,7 @@ impl ClientCore {
             seq: self.frames_sent as u32,
             timestamp: welcome.sample_clock + self.frames_sent * TICK_SAMPLES,
             duration: FrameDuration::Ms2_5,
-            stereo: false,
+            stereo: self.uplink == Channels::Stereo,
             payload: &self.pkt_buf,
             redundant,
         }
@@ -694,22 +711,24 @@ impl ClientCore {
         }
     }
 
-    /// Device-paced capture: arbitrary-length mono samples in, one sealed
-    /// media datagram out per completed 2.5 ms frame (zero or several per
-    /// call). A capture `DriftCompensator`, steered from the server's view
+    /// Device-paced capture: arbitrary-length samples in, mono or interleaved
+    /// stereo per [`ClientCore::set_uplink_channels`], one sealed media
+    /// datagram out per completed 2.5 ms frame (zero or several per call). A capture `DriftCompensator`, steered from the server's view
     /// of our uplink, repaces the device clock onto the frame clock so
     /// sustained drift never reaches the server's jitter buffer.
     pub fn push_capture_raw(&mut self, now_ms: u64, samples: &[f32]) -> Vec<Vec<u8>> {
+        let channels = self.uplink.count();
         let mut comp = self
             .capture_comp
             .take()
-            .unwrap_or_else(|| DriftCompensator::new(TICK_SAMPLES as usize, 1));
+            .unwrap_or_else(|| DriftCompensator::new(TICK_SAMPLES as usize, channels));
         comp.steer(self.capture_steer.steer_ppm);
         comp.push(samples);
         let mut out = Vec::new();
-        let mut frame = [0.0f32; TICK_SAMPLES as usize];
-        while comp.pull_frame(&mut frame) {
-            out.append(&mut self.push_capture(now_ms, &frame));
+        let mut frame = [0.0f32; TICK_SAMPLES as usize * 2];
+        let frame = &mut frame[..TICK_SAMPLES as usize * channels];
+        while comp.pull_frame(frame) {
+            out.append(&mut self.push_capture(now_ms, frame));
         }
         self.capture_comp = Some(comp);
         out
@@ -1073,13 +1092,41 @@ impl ClientCore {
         Ok(())
     }
 
-    fn media_state(role: Role) -> Result<(Option<Encoder>, Decoder, usize), CodecError> {
+    /// Switches the capture encoder between mono and stereo. The frame the
+    /// next `push_capture` expects changes size with it, and the raw path's
+    /// pacing restarts at the new channel count. The server decodes either
+    /// without being told: Opus carries the layout in every packet.
+    pub fn set_uplink_channels(&mut self, channels: Channels) -> Result<(), CodecError> {
+        if channels == self.uplink {
+            return Ok(());
+        }
+        if self.encoder.is_some() {
+            self.encoder = Some(Encoder::new(
+                channels,
+                FrameDuration::Ms2_5,
+                uplink_bitrate(channels),
+            )?);
+        }
+        self.uplink = channels;
+        self.capture_comp = None;
+        self.prev_payload = None;
+        Ok(())
+    }
+
+    pub fn uplink_channels(&self) -> Channels {
+        self.uplink
+    }
+
+    fn media_state(
+        role: Role,
+        uplink: Channels,
+    ) -> Result<(Option<Encoder>, Decoder, usize), CodecError> {
         match role {
             Role::Musician => Ok((
                 Some(Encoder::new(
-                    Channels::Mono,
+                    uplink,
                     FrameDuration::Ms2_5,
-                    UPLINK_BITRATE,
+                    uplink_bitrate(uplink),
                 )?),
                 Decoder::new(Channels::Stereo, FrameDuration::Ms2_5)?,
                 FrameDuration::Ms2_5.samples() as usize * 2,
