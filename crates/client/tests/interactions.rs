@@ -4222,7 +4222,7 @@ fn the_input_pick_persists_and_restores_by_token() {
     assert_eq!(next.devices.input_source, InputSource::Left);
 
     // A token from some other build: the default, not a guess.
-    std::fs::write(&path, saved.replace("input-1", "stereo")).unwrap();
+    std::fs::write(&path, saved.replace("input-1", "quad")).unwrap();
     let mut unknown = JamApp::in_memory();
     unknown.settings_path = Some(path);
     unknown.restore_audio_prefs();
