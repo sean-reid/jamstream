@@ -17,9 +17,9 @@
 //! roster, and the avatar feed, which breaks out of its loop on the first
 //! look at an empty queue.
 //!
-//! Calibration on an M4 Max, 10 musicians and 20 listeners: 277 us ordinary,
-//! 610 us broadcast, 326 us amortized, against 285 / 607 / 339 from a real
-//! `ServerCore` in the harness. While this file stopped at the mix path it
+//! Calibration on an M4 Max with every uplink decoded stereo, 10 musicians and
+//! 20 listeners: 289 us ordinary, 724 us broadcast, 332 us amortized, against
+//! 307 / 585 / 353 from a real `ServerCore` in the harness. While this file stopped at the mix path it
 //! read 274 us ordinary and had no capacity row at all, so the table
 //! understated the tick and there was nothing to compare it against. The four
 //! additions themselves are worth about 2 us of that: they belong here for
