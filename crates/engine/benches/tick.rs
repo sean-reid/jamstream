@@ -158,7 +158,7 @@ struct Rig {
     bcast_pkt: Vec<u8>,
     limiter: Limiter,
     metronome: Metronome,
-    decoded: Vec<(MemberId, [f32; TICK_SAMPLES])>,
+    decoded: Vec<(MemberId, [f32; MIX_LEN])>,
     mix_buf: Vec<f32>,
     pkt_buf: Vec<u8>,
     /// Encoded mono uplink frames, cycled so no decoder ever sees the same
@@ -209,7 +209,7 @@ impl Rig {
                 .map(|&id| Musician {
                     id,
                     jitter: JitterBuffer::new(),
-                    decoder: Decoder::new(Channels::Mono, FrameDuration::Ms2_5).expect("decoder"),
+                    decoder: Decoder::new(Channels::Stereo, FrameDuration::Ms2_5).expect("decoder"),
                     encoder: Encoder::new(
                         Channels::Stereo,
                         FrameDuration::Ms2_5,
@@ -300,7 +300,7 @@ impl Rig {
 
         self.decoded.clear();
         for m in self.musicians.iter_mut() {
-            let mut pcm = [0.0f32; TICK_SAMPLES];
+            let mut pcm = [0.0f32; MIX_LEN];
             let pulled = m.jitter.pull();
             let result = match &pulled {
                 Pull::Frame(p) | Pull::Recovered(p) => m.decoder.decode(Some(p), &mut pcm, false),
@@ -308,7 +308,7 @@ impl Rig {
                 Pull::Waiting => Ok(()),
             };
             if result.is_err() {
-                pcm = [0.0; TICK_SAMPLES];
+                pcm = [0.0; MIX_LEN];
             }
             if self.bcast_tap {
                 let mut peak = 0.0f32;
@@ -317,7 +317,7 @@ impl Rig {
                     peak = peak.max(s.abs());
                     sum_sq += s * s;
                 }
-                let rms = (sum_sq / TICK_SAMPLES as f32).sqrt();
+                let rms = (sum_sq / MIX_LEN as f32).sqrt();
                 m.level_peak = peak.max(m.level_peak * BCAST_LEVEL_DECAY);
                 m.level_rms = rms.max(m.level_rms * BCAST_LEVEL_DECAY);
             }

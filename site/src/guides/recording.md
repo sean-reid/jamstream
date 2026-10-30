@@ -151,7 +151,7 @@ Takes outlive the session that made them: one from a session that ended weeks ag
 
 Without stems, a take is one stereo file. With stems it is one stereo file per musician as well, each carrying that player's own signal. The sheet reads back which of the two you launched with.
 
-Stems are stereo rather than mono, so a stem is the same size as the mix, which is why mix-and-stems costs about five times mix-only for a four piece. Every file in a take starts at the same zero, so they line up when you import them.
+Stems are stereo rather than mono, so a stem is the same size as the mix, which is why mix-and-stems costs about five times mix-only for a four piece. A musician sending stereo has both sides in their stem. Every file in a take starts at the same zero, so they line up when you import them.
 
 ## What the room sees
 

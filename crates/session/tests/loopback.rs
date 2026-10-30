@@ -47,6 +47,9 @@ struct TestClient {
     role: Role,
     /// Some(hz): push a sine at this frequency every step (0.0 = silence).
     tone_hz: Option<f32>,
+    /// Some((left, right)): push a stereo frame with one sine per side every
+    /// step; the core has to have been switched to a stereo uplink first.
+    stereo_tones: Option<(f32, f32)>,
     frames_pushed: u64,
     playout: Vec<f32>,
     blocked: bool,
@@ -176,6 +179,7 @@ impl Harness {
             core,
             role: invite.token.role,
             tone_hz,
+            stereo_tones: None,
             frames_pushed: 0,
             playout: Vec::new(),
             blocked: false,
@@ -225,6 +229,19 @@ impl Harness {
                 if c.stutter_step % 2 == 0 {
                     dgs.append(&mut c.stutter_queue);
                 }
+            }
+            if c.role == Role::Musician
+                && let Some((left, right)) = c.stereo_tones
+            {
+                let mut pcm = [0.0f32; 240];
+                for (j, pair) in pcm.chunks_exact_mut(2).enumerate() {
+                    let n = (c.frames_pushed * 120 + j as u64) as f32;
+                    let t = std::f32::consts::TAU * n / 48_000.0;
+                    pair[0] = (t * left).sin() * 0.5;
+                    pair[1] = (t * right).sin() * 0.5;
+                }
+                c.frames_pushed += 1;
+                dgs.extend(c.core.push_capture(now, &pcm));
             }
             dgs.extend(c.core.poll(now));
             let (addr, blocked) = (c.addr, c.blocked);
@@ -424,6 +441,28 @@ fn tone_amp(stereo: &[f32], hz: f32) -> f32 {
     }
     let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
     2.0 * power.sqrt() / n as f32
+}
+
+/// Goertzel amplitude of one tone on one side (0 left, 1 right) of an
+/// interleaved stereo window, for the tests that care which side a tone is on.
+fn side_tone_amp(stereo: &[f32], side: usize, hz: f32) -> f32 {
+    let n = stereo.len() / 2;
+    assert!(n > 0, "empty tone window");
+    let w = std::f32::consts::TAU * hz / 48_000.0;
+    let coeff = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for pair in stereo.chunks_exact(2) {
+        let s0 = pair[side] + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
+    2.0 * power.sqrt() / n as f32
+}
+
+fn tail_side_tone(h: &Harness, i: usize, samples: usize, side: usize, hz: f32) -> f32 {
+    let p = &h.clients[i].playout;
+    side_tone_amp(&p[p.len().saturating_sub(samples)..], side, hz)
 }
 
 fn tail_tone(h: &Harness, i: usize, samples: usize, hz: f32) -> f32 {
@@ -4003,5 +4042,69 @@ fn assert_tone_restored(h: &Harness, a: usize, b: usize) {
         tail_tone(h, b, win, 660.0) < 0.02,
         "b's own tone reached b's mix: {}",
         tail_tone(h, b, win, 660.0)
+    );
+}
+
+/// A musician who opted into a stereo uplink keeps their sides in everyone
+/// else's mix: at center each side carries its own tone and none of the
+/// other's, and the host panning them hard left leaves the right side empty.
+/// The server was never told about the switch; the packet layout did it.
+#[test]
+fn a_stereo_sender_keeps_its_sides_in_everyone_elses_mix() {
+    use jamstream_engine::Channels;
+
+    let mut h = Harness::new(MAX_MUSICIANS, MAX_LISTENERS);
+    let inv_a = h.mint(0, Role::Musician);
+    let inv_b = h.mint(1, Role::Musician);
+    let a = h.add_client(&inv_a, None);
+    let b = h.add_client(&inv_b, Some(0.0));
+    h.run_ms(250);
+    assert_eq!(*h.clients[a].core.state(), ClientState::Joined);
+    h.clients[a]
+        .core
+        .set_uplink_channels(Channels::Stereo)
+        .expect("a musician's core switches to stereo");
+    h.clients[a].stereo_tones = Some((440.0, 660.0));
+    h.run_ms(2_000);
+
+    // One second of b's playout: 440 Hz on the left at the center pan
+    // weight, 660 Hz on the right, and neither on the other side.
+    let window = 48_000 * 2;
+    let left_440 = tail_side_tone(&h, b, window, 0, 440.0);
+    let left_660 = tail_side_tone(&h, b, window, 0, 660.0);
+    let right_440 = tail_side_tone(&h, b, window, 1, 440.0);
+    let right_660 = tail_side_tone(&h, b, window, 1, 660.0);
+    assert!(
+        left_440 > 0.2,
+        "left side should carry the 440 Hz tone, reads {left_440}"
+    );
+    assert!(
+        right_660 > 0.2,
+        "right side should carry the 660 Hz tone, reads {right_660}"
+    );
+    assert!(
+        left_660 < 0.03,
+        "the right tone leaked onto the left side: {left_660}"
+    );
+    assert!(
+        right_440 < 0.03,
+        "the left tone leaked onto the right side: {right_440}"
+    );
+
+    // b pans a hard left: the pair leans, it does not swap.
+    h.clients[b]
+        .core
+        .set_fader(MemberId(0), 0.0, -1.0, false)
+        .unwrap();
+    h.run_ms(1_500);
+    let left_440 = tail_side_tone(&h, b, window, 0, 440.0);
+    let right_660 = tail_side_tone(&h, b, window, 1, 660.0);
+    assert!(
+        left_440 > 0.35,
+        "hard left should carry the left side at unity, reads {left_440}"
+    );
+    assert!(
+        right_660 < 0.03,
+        "hard left should empty the right side, reads {right_660}"
     );
 }

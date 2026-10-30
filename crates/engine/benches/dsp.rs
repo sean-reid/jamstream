@@ -135,7 +135,9 @@ fn mixer(c: &mut Criterion) {
         muted: false,
     };
     for n in [1usize, 4, 10, 20] {
-        let buffers: Vec<Vec<f32>> = (0..n).map(|i| signal(TICK_SAMPLES, i as u32 + 1)).collect();
+        let buffers: Vec<Vec<f32>> = (0..n)
+            .map(|i| signal(TICK_SAMPLES * 2, i as u32 + 1))
+            .collect();
         let sources: Vec<(MemberId, &[f32])> = buffers
             .iter()
             .enumerate()

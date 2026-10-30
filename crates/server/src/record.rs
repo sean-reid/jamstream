@@ -111,7 +111,8 @@ pub struct RecordPayload {
     pub stem_len: usize,
     pub stem_ids: [MemberId; MAX_MUSICIANS],
     pub stem_faders: [Fader; MAX_MUSICIANS],
-    pub stem_pcm: [[f32; TICK_SAMPLES]; MAX_MUSICIANS],
+    /// Interleaved stereo per stem, as the server's decoder hands it over.
+    pub stem_pcm: [[f32; TICK_STEREO_SAMPLES]; MAX_MUSICIANS],
 }
 
 impl Default for RecordPayload {
@@ -121,13 +122,13 @@ impl Default for RecordPayload {
             stem_len: 0,
             stem_ids: [MemberId(0); MAX_MUSICIANS],
             stem_faders: [Fader::default(); MAX_MUSICIANS],
-            stem_pcm: [[0.0; TICK_SAMPLES]; MAX_MUSICIANS],
+            stem_pcm: [[0.0; TICK_STEREO_SAMPLES]; MAX_MUSICIANS],
         }
     }
 }
 
 impl RecordPayload {
-    pub fn push_stem(&mut self, id: MemberId, fader: Fader, pcm: &[f32; TICK_SAMPLES]) {
+    pub fn push_stem(&mut self, id: MemberId, fader: Fader, pcm: &[f32; TICK_STEREO_SAMPLES]) {
         if self.stem_len < MAX_MUSICIANS {
             self.stem_ids[self.stem_len] = id;
             self.stem_faders[self.stem_len] = fader;
@@ -733,9 +734,9 @@ mod tests {
             *s = (std::f32::consts::TAU * 300.0 * n / 96_000.0).sin() * 0.6;
         }
         if let Some((id, fader)) = stem {
-            let mut pcm = [0.0f32; TICK_SAMPLES];
+            let mut pcm = [0.0f32; TICK_STEREO_SAMPLES];
             for (i, s) in pcm.iter_mut().enumerate() {
-                let n = (tick as usize * TICK_SAMPLES + i) as f32;
+                let n = (tick as usize * TICK_SAMPLES + i / 2) as f32;
                 *s = (std::f32::consts::TAU * 220.0 * n / 48_000.0).sin() * 0.4;
             }
             p.push_stem(id, fader, &pcm);
@@ -1023,7 +1024,7 @@ mod tests {
         // A silent take: the backfill's cost is the same either way, and this
         // keeps 45 minutes of ticks affordable in a test.
         let mut quiet = RecordPayload::default();
-        quiet.push_stem(MemberId(0), Fader::default(), &[0.0; TICK_SAMPLES]);
+        quiet.push_stem(MemberId(0), Fader::default(), &[0.0; TICK_STEREO_SAMPLES]);
         // The queue the mix tick submits into, modelled: the recorder owes the
         // mix clock a tick every 2.5 ms, and QUEUE_TICKS in flight is all the
         // slack there is before submit_tick starts counting gaps.
@@ -1036,7 +1037,7 @@ mod tests {
             peak_backlog = peak_backlog.max(backlog);
         }
         let mut join = quiet;
-        join.push_stem(MemberId(1), Fader::default(), &[0.0; TICK_SAMPLES]);
+        join.push_stem(MemberId(1), Fader::default(), &[0.0; TICK_STEREO_SAMPLES]);
         let started = Instant::now();
         rec.tick(&join);
         let stall = started.elapsed();

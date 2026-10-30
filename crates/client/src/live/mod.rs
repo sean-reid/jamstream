@@ -24,7 +24,7 @@ use jamstream_audio_io::{
     AudioBackend, AudioError, AudioPriority, CallbackBridge, DuplexHandler, EngineSide,
     StreamConfig, StreamHandle, ThreadPriority, WavBackend, WavStream, playout_cushion_samples,
 };
-use jamstream_engine::JitterBuffer;
+use jamstream_engine::{Channels, JitterBuffer};
 use jamstream_protocol::control::{MAX_DATAGRAM_BYTES, MemberInfo, StreamOp};
 use jamstream_protocol::control::{RecordOp, RecordingState};
 use jamstream_protocol::ids::HOST_MEMBER_ID;
@@ -213,9 +213,10 @@ fn ring_frames(requested: u32, negotiated: Option<u32>) -> u32 {
     negotiated.unwrap_or(0).max(requested)
 }
 
-/// Which of the capture pair the mono uplink carries. The device always opens
-/// as a stereo pair, so this is a fold the worker applies per frame; it is
-/// read on the worker's thread and never touches the device.
+/// What the uplink carries from the capture pair. The device always opens as
+/// a stereo pair, so this is applied per frame on the worker's thread and
+/// never touches the device; the three mono picks fold the pair, stereo sends
+/// it as is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InputSource {
     /// `(L + R) / 2`: a stereo source in mono at unity, and a single
@@ -228,16 +229,35 @@ pub enum InputSource {
     Left,
     /// Input 2 alone, at unity.
     Right,
+    /// Both inputs as a stereo pair. Twice the uplink bits, and the host's
+    /// pan of this member becomes a balance.
+    Stereo,
 }
 
 impl InputSource {
-    pub const ALL: [InputSource; 3] = [InputSource::Summed, InputSource::Left, InputSource::Right];
+    pub const ALL: [InputSource; 4] = [
+        InputSource::Summed,
+        InputSource::Left,
+        InputSource::Right,
+        InputSource::Stereo,
+    ];
 
-    pub fn fold(self, left: f32, right: f32) -> f32 {
+    /// The channel layout the uplink encoder needs for this pick.
+    pub fn channels(self) -> Channels {
         match self {
-            InputSource::Summed => (left + right) * 0.5,
-            InputSource::Left => left,
-            InputSource::Right => right,
+            InputSource::Stereo => Channels::Stereo,
+            _ => Channels::Mono,
+        }
+    }
+
+    /// One captured frame (left, right) onto the uplink buffer: one sample
+    /// for the mono picks, both for stereo.
+    pub fn write(self, left: f32, right: f32, out: &mut Vec<f32>) {
+        match self {
+            InputSource::Summed => out.push((left + right) * 0.5),
+            InputSource::Left => out.push(left),
+            InputSource::Right => out.push(right),
+            InputSource::Stereo => out.extend([left, right]),
         }
     }
 
@@ -247,6 +267,7 @@ impl InputSource {
             InputSource::Summed => "Inputs 1 and 2, summed",
             InputSource::Left => "Input 1 only",
             InputSource::Right => "Input 2 only",
+            InputSource::Stereo => "Inputs 1 and 2, stereo",
         }
     }
 
@@ -256,6 +277,7 @@ impl InputSource {
             InputSource::Summed => "a stereo source in mono; a lone input arrives 6 dB down",
             InputSource::Left => "one instrument on input 1, at full level",
             InputSource::Right => "one instrument on input 2, at full level",
+            InputSource::Stereo => "both sides as played; pan in the host's mixer leans it",
         }
     }
 
@@ -265,6 +287,7 @@ impl InputSource {
             InputSource::Summed => "summed",
             InputSource::Left => "input-1",
             InputSource::Right => "input-2",
+            InputSource::Stereo => "stereo",
         }
     }
 
@@ -770,7 +793,7 @@ impl LiveRuntime {
             rx_buf: vec![0u8; MAX_DATAGRAM_BYTES].into_boxed_slice(),
             epoch: Instant::now(),
             capture_buf: vec![0.0; capture_capacity(device_frames)],
-            mono_buf: Vec::new(),
+            uplink_buf: Vec::new(),
             shut_at: None,
             moved_since_reopen: None,
             sent_since_reopen: None,
@@ -1164,7 +1187,7 @@ struct Worker {
     rx_buf: Box<[u8]>,
     epoch: Instant,
     capture_buf: Vec<f32>,
-    mono_buf: Vec<f32>,
+    uplink_buf: Vec<f32>,
     /// When a settings change closed the device, so the reopen can say how
     /// long nothing was captured. A real device takes real time here and the
     /// fake takes none, which is the difference no offline test can see.
@@ -1660,17 +1683,24 @@ impl Worker {
         let mut n = 0usize;
         if let Some(engine) = self.engine.as_mut() {
             let got = engine.pull_captured(&mut self.capture_buf);
-            self.mono_buf.clear();
-            // The stream is interleaved stereo on both sides; the uplink
-            // is mono, so fold the pair down the way the Audio tab asked.
+            self.uplink_buf.clear();
+            // The stream is interleaved stereo on both sides; the Audio tab
+            // decides what of it the uplink carries. The encoder follows the
+            // pick here rather than at the pick, so a frame never meets an
+            // encoder built for the other layout.
             let source = self.settings.input_source;
-            for frame in self.capture_buf[..got].chunks_exact(2) {
-                let s = source.fold(frame[0], frame[1]);
-                self.mono_buf.push(s);
-                inst_peak = inst_peak.max(s.abs());
-                inst_sq += s * s;
+            if let Err(err) = self.core.set_uplink_channels(source.channels()) {
+                tracing::warn!(%err, "the uplink encoder would not switch layout");
             }
-            n = self.mono_buf.len();
+            for frame in self.capture_buf[..got].chunks_exact(2) {
+                let before = self.uplink_buf.len();
+                source.write(frame[0], frame[1], &mut self.uplink_buf);
+                for &s in &self.uplink_buf[before..] {
+                    inst_peak = inst_peak.max(s.abs());
+                    inst_sq += s * s;
+                }
+            }
+            n = self.uplink_buf.len();
             if let Some(moved) = self.moved_since_reopen.as_mut() {
                 *moved += n;
                 // Ten seconds of a 48 kHz mono uplink, read once, and only
@@ -1703,7 +1733,7 @@ impl Worker {
                     }
                 }
             }
-            for pkt in self.core.push_capture_raw(now_ms, &self.mono_buf) {
+            for pkt in self.core.push_capture_raw(now_ms, &self.uplink_buf) {
                 if let Some(sent) = self.sent_since_reopen.as_mut() {
                     *sent += 1;
                 }
@@ -2691,17 +2721,33 @@ mod tests {
 
 #[cfg(test)]
 mod input_source_tests {
-    use super::InputSource;
+    use super::{Channels, InputSource};
 
     /// The sum halves a lone input, which is the 6 dB the Audio tab warns
     /// about; a single-input pick carries that input at unity and nothing of
-    /// the other.
+    /// the other; stereo carries both and asks the encoder for two channels.
     #[test]
-    fn each_pick_folds_the_pair_the_way_its_note_says() {
-        assert_eq!(InputSource::Summed.fold(0.8, 0.0), 0.4);
-        assert_eq!(InputSource::Summed.fold(0.6, 0.6), 0.6);
-        assert_eq!(InputSource::Left.fold(0.8, -0.3), 0.8);
-        assert_eq!(InputSource::Right.fold(0.8, -0.3), -0.3);
+    fn each_pick_writes_the_pair_the_way_its_note_says() {
+        let written = |source: InputSource, l: f32, r: f32| {
+            let mut out = Vec::new();
+            source.write(l, r, &mut out);
+            out
+        };
+        assert_eq!(written(InputSource::Summed, 0.8, 0.0), [0.4]);
+        assert_eq!(written(InputSource::Summed, 0.6, 0.6), [0.6]);
+        assert_eq!(written(InputSource::Left, 0.8, -0.3), [0.8]);
+        assert_eq!(written(InputSource::Right, 0.8, -0.3), [-0.3]);
+        assert_eq!(written(InputSource::Stereo, 0.8, -0.3), [0.8, -0.3]);
+        for source in InputSource::ALL {
+            assert_eq!(
+                source.channels(),
+                if source == InputSource::Stereo {
+                    Channels::Stereo
+                } else {
+                    Channels::Mono
+                }
+            );
+        }
     }
 
     #[test]
@@ -2709,7 +2755,7 @@ mod input_source_tests {
         for source in InputSource::ALL {
             assert_eq!(InputSource::parse(source.as_str()), Some(source));
         }
-        assert_eq!(InputSource::parse("stereo"), None);
+        assert_eq!(InputSource::parse("quad"), None);
         assert_eq!(InputSource::default(), InputSource::Summed);
     }
 }
