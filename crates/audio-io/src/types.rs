@@ -47,6 +47,9 @@ pub struct DeviceInfo {
     /// Supported buffer size bounds in frames, when the backend can report them.
     pub min_buffer_frames: Option<u32>,
     pub max_buffer_frames: Option<u32>,
+    /// Inputs the device captures, when the backend can say. None for
+    /// playback devices and for backends with no answer.
+    pub input_channels: Option<u16>,
 }
 
 /// Requested stream parameters. Everything above the device layer sees
@@ -67,6 +70,10 @@ pub struct StreamConfig {
     /// Channel count the handler sees, on both the capture and playback
     /// side. Backends convert to and from the device's native layout.
     pub channels: u16,
+    /// The device input the handler's capture channel 0 reads; the handler's
+    /// later channels read the inputs after it. A device with fewer inputs
+    /// repeats its last one, as a mono device fans out.
+    pub capture_offset: u16,
     /// Whether the open may take the device exclusively. Only the Windows
     /// backend has the choice: exclusive costs about 10 ms and mutes every
     /// other stream on the endpoint, shared costs 20-30 ms and coexists.
@@ -82,6 +89,7 @@ impl Default for StreamConfig {
             sample_rate: 48_000,
             buffer_frames: 240,
             channels: 2,
+            capture_offset: 0,
             allow_exclusive: true,
         }
     }

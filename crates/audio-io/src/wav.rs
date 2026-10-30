@@ -282,7 +282,7 @@ impl WavBackend {
         }
 
         let input = match &self.input_wav {
-            Some(path) => read_input(path, config.channels, capture_rate)?,
+            Some(path) => read_input(path, config.channels, config.capture_offset, capture_rate)?,
             None => Vec::new(),
         };
 
@@ -375,6 +375,7 @@ impl AudioBackend for WavBackend {
                 form_factor: self.form_factor,
                 min_buffer_frames: None,
                 max_buffer_frames: None,
+                input_channels: None,
             },
             DeviceInfo {
                 id: WAV_PLAYBACK_ID.into(),
@@ -384,6 +385,7 @@ impl AudioBackend for WavBackend {
                 form_factor: self.form_factor,
                 min_buffer_frames: None,
                 max_buffer_frames: None,
+                input_channels: None,
             },
         ])
     }
@@ -582,7 +584,12 @@ fn wav_err(e: hound::Error) -> AudioError {
 /// Read the whole input file, asserting the device's rate, and convert to
 /// `channels`: matching layouts copy through, mono fans out to every channel,
 /// and a wider source contributes its first `channels` channels.
-fn read_input(path: &PathBuf, channels: u16, sample_rate: u32) -> Result<Vec<f32>> {
+fn read_input(
+    path: &PathBuf,
+    channels: u16,
+    capture_offset: u16,
+    sample_rate: u32,
+) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(path).map_err(wav_err)?;
     let spec = reader.spec();
     if spec.sample_rate != sample_rate {
@@ -614,14 +621,15 @@ fn read_input(path: &PathBuf, channels: u16, sample_rate: u32) -> Result<Vec<f32
 
     let src_ch = usize::from(spec.channels.max(1));
     let dst_ch = usize::from(channels);
-    if src_ch == dst_ch {
+    let offset = usize::from(capture_offset);
+    if src_ch == dst_ch && offset == 0 {
         return Ok(raw);
     }
     let frames = raw.len() / src_ch;
     let mut out = Vec::with_capacity(frames * dst_ch);
     for frame in raw.chunks_exact(src_ch) {
         for ch in 0..dst_ch {
-            out.push(frame[ch.min(src_ch - 1)]);
+            out.push(frame[(offset + ch).min(src_ch - 1)]);
         }
     }
     Ok(out)

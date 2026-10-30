@@ -2882,3 +2882,19 @@ fn session_end_confirm_no_take() {
     let mut harness = app_harness(app, WIDE);
     snapshot(&mut harness, "session_end_confirm_no_take");
 }
+
+#[test]
+fn session_settings_inputs() {
+    // An interface with more inputs than the pair Send reads: the Inputs
+    // picker appears under Capture, on the second pair, and the Send labels
+    // carry those input numbers.
+    let mut app = drawer_app(
+        session_app(DemoRuntime::frozen(FROZEN_FRAME, false), Theme::Dark),
+        SettingsTab::Audio,
+    );
+    app.devices.capture_idx = 3;
+    app.input_offsets
+        .insert("demo:Scarlett 18i20 input".to_owned(), 2);
+    let mut harness = app_harness(app, WIDE);
+    snapshot(&mut harness, "session_settings_inputs");
+}

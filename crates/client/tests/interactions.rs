@@ -3444,6 +3444,7 @@ fn rescan_keeps_the_selection_by_id_and_a_lost_device_falls_back_visibly() {
             id: Some("demo:USB DAC".to_owned()),
             min_buffer_frames: None,
             max_buffer_frames: None,
+            input_channels: None,
         });
         Ok(catalog)
     });
@@ -4227,4 +4228,99 @@ fn the_input_pick_persists_and_restores_by_token() {
     unknown.settings_path = Some(path);
     unknown.restore_audio_prefs();
     assert_eq!(unknown.devices.input_source, InputSource::Summed);
+}
+
+/// The Inputs picker appears only for an interface with more than two
+/// inputs, and the pair it picks is remembered against that device: switch
+/// to a two-input interface and it is gone, switch back and the pair is
+/// still there, and the file carries it under the device id.
+#[test]
+fn the_inputs_pair_is_remembered_per_capture_device() {
+    use jamstream_client::app::{JamApp, Screen};
+
+    let dir = std::env::temp_dir().join(format!("jamstream-input-pairs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    let path = dir.join("settings.json");
+    const EIGHTEEN: usize = 3; // Scarlett 18i20 input in the demo catalog
+    const TWO: usize = 1; // Scarlett 2i2 input
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    app.settings_path = Some(path.clone());
+    app.devices.capture_idx = TWO;
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 900.0))
+        .with_step_dt(0.05)
+        .build_ui_state(
+            |ui, app: &mut JamApp| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+            },
+            app,
+        );
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Inputs").is_none(),
+        "a two-input interface has nothing to pick"
+    );
+
+    harness.state_mut().devices.capture_idx = EIGHTEEN;
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Inputs").is_some(),
+        "an 18-input interface gets the picker"
+    );
+    assert_eq!(harness.state().devices.input_offset, 0);
+    harness.state_mut().devices.input_offset = 2;
+    harness.run_steps(4);
+    assert_eq!(harness.state().devices.input_offset, 2, "the pick holds");
+    let saved = std::fs::read_to_string(&path).expect("the pick has to write settings.json");
+    assert!(
+        saved.contains("\"demo:Scarlett 18i20 input\": 2"),
+        "the pair persists under the device id: {saved}"
+    );
+
+    // Back to the two-input interface: no picker, first pair; and back
+    // again: the remembered pair, not the first.
+    harness.state_mut().devices.capture_idx = TWO;
+    harness.run_steps(2);
+    assert_eq!(harness.state().devices.input_offset, 0);
+    assert!(harness.query_by_label("Inputs").is_none());
+    harness.state_mut().devices.capture_idx = EIGHTEEN;
+    harness.run_steps(2);
+    assert_eq!(harness.state().devices.input_offset, 2);
+
+    // The next launch restores the 18-input interface and its pair; moving
+    // to a device the file never saw starts at the first pair.
+    let mut next = JamApp::in_memory();
+    next.recent = Vec::new();
+    next.settings_path = Some(path);
+    next.restore_audio_prefs();
+    assert_eq!(
+        next.devices.capture_idx, EIGHTEEN,
+        "the device restores too"
+    );
+    assert_eq!(next.devices.input_offset, 2);
+    next.devices.capture_idx = TWO;
+    let mut relaunched = Harness::builder()
+        .with_size(vec2(1280.0, 900.0))
+        .with_step_dt(0.05)
+        .build_ui_state(
+            |ui, app: &mut JamApp| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+            },
+            next,
+        );
+    relaunched.run_steps(2);
+    assert_eq!(relaunched.state().devices.input_offset, 0);
 }

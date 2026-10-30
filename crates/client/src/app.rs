@@ -112,6 +112,13 @@ pub struct JamApp {
     pub recent: Vec<RecentSession>,
     pub devices: DevicesScreen,
     pub catalog: DeviceCatalog,
+    /// The Inputs pair per capture device id, the system default entry under
+    /// the empty key, as the preferences file keeps it. The current pick is
+    /// `devices.input_offset`; this is the memory behind it.
+    pub input_offsets: std::collections::BTreeMap<String, u16>,
+    /// Which capture device `devices.input_offset` was loaded for, so a
+    /// device change loads that device's pair before anything reads it.
+    offset_loaded_for: Option<String>,
     pub wizard: HostWizard,
     /// The Recording tab: the bucket takes go to and the key that writes it.
     /// One per app rather than one per session, because it is a setting for this
@@ -245,6 +252,8 @@ impl JamApp {
             recent: RecentSession::load(),
             devices,
             catalog: DeviceCatalog::demo(),
+            input_offsets: Default::default(),
+            offset_loaded_for: None,
             wizard: HostWizard::new(Arc::clone(&creds), Arc::clone(&env), Arc::clone(&exec)),
             recording: RecordingPanel::new(
                 Arc::clone(&creds),
@@ -373,6 +382,9 @@ impl JamApp {
         if let Some(source) = prefs.input_source.as_deref().and_then(InputSource::parse) {
             self.devices.input_source = source;
         }
+        self.input_offsets = prefs.input_offsets;
+        self.offset_loaded_for = None;
+        self.sync_input_offset();
     }
 
     /// Writes the audio setup where the next launch reads it. Failure is a
@@ -390,6 +402,7 @@ impl JamApp {
             allow_exclusive: Some(settings.allow_exclusive),
             auto_cushion: Some(settings.auto_cushion),
             input_source: Some(settings.input_source.as_str().to_owned()),
+            input_offsets: self.input_offsets.clone(),
             display_name: (!name.is_empty()).then(|| name.to_owned()),
         };
         if let Err(err) = prefs.save_to(path) {
@@ -469,6 +482,42 @@ impl JamApp {
             allow_exclusive: self.devices.allow_exclusive,
             auto_cushion: self.devices.auto_cushion,
             input_source: self.devices.input_source,
+            capture_offset: self.devices.input_offset,
+        }
+    }
+
+    /// The preferences key for the selected capture device.
+    fn capture_key(&self) -> String {
+        self.catalog
+            .capture
+            .get(self.devices.capture_idx)
+            .and_then(|d| d.id.clone())
+            .unwrap_or_default()
+    }
+
+    /// Keeps `devices.input_offset` and the per-device memory in step: a
+    /// newly selected device gets its remembered pair, a pick is remembered,
+    /// and a pair the device cannot offer is pulled back to its last one.
+    fn sync_input_offset(&mut self) {
+        let key = self.capture_key();
+        if self.offset_loaded_for.as_deref() != Some(key.as_str()) {
+            self.devices.input_offset = self.input_offsets.get(&key).copied().unwrap_or(0);
+            self.offset_loaded_for = Some(key.clone());
+        }
+        let inputs = self
+            .catalog
+            .capture
+            .get(self.devices.capture_idx)
+            .and_then(|d| d.input_channels)
+            .unwrap_or(2);
+        let last = crate::screens::devices::input_pairs(inputs)
+            .last()
+            .unwrap_or(0);
+        if self.devices.input_offset > last {
+            self.devices.input_offset = last;
+        }
+        if self.input_offsets.get(&key).copied().unwrap_or(0) != self.devices.input_offset {
+            self.input_offsets.insert(key, self.devices.input_offset);
         }
     }
 
@@ -836,6 +885,7 @@ impl JamApp {
         // answer goes on its own: it is a depth the worker fills to, and
         // reopening a working device for it would cost the band capture nobody
         // asked to lose.
+        self.sync_input_offset();
         let selected = self.audio_settings();
         if selected != self.applied_audio {
             let reopen = self.applied_audio.reopens_for(&selected);

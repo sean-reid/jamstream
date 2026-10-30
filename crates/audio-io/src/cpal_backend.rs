@@ -28,7 +28,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::cpal_policy::{
     DirectionPlan, RateContext, plan_direction, rate_outcome, verifies_negotiated_rate,
 };
-use crate::format::map_frames;
+use crate::format::{map_frames, map_frames_from};
 use crate::rate::{RateOutcome, RateOutcomes, log_rate_outcomes};
 use crate::resample::{MAX_CHUNK_FRAMES, converting_capture, converting_playback, session_frames};
 use crate::types::{
@@ -126,6 +126,7 @@ impl AudioBackend for CpalBackend {
                     form_factor,
                     min_buffer_frames: min,
                     max_buffer_frames: max,
+                    input_channels: Some(config.channels()),
                 });
             }
             if let Ok(config) = device.default_output_config() {
@@ -138,6 +139,7 @@ impl AudioBackend for CpalBackend {
                     form_factor,
                     min_buffer_frames: min,
                     max_buffer_frames: max,
+                    input_channels: None,
                 });
             }
         }
@@ -640,6 +642,7 @@ fn build_input(
 ) -> Result<cpal::Stream> {
     let device_ch = usize::from(open.channels().max(1));
     let handler_ch = usize::from(config.channels);
+    let offset = usize::from(config.capture_offset);
     let mut scratch = vec![0.0f32; MAX_CHUNK_FRAMES * handler_ch];
 
     let stream_config = cpal::StreamConfig {
@@ -654,7 +657,7 @@ fn build_input(
                 for chunk in data.chunks(MAX_CHUNK_FRAMES * device_ch) {
                     let frames = chunk.len() / device_ch;
                     let dst = &mut scratch[..frames * handler_ch];
-                    map_frames(chunk, device_ch, dst, handler_ch);
+                    map_frames_from(chunk, device_ch, offset, dst, handler_ch);
                     on_capture(dst);
                 }
             },

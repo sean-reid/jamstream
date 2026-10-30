@@ -121,6 +121,11 @@ pub struct AppPrefs {
     /// default, summed, so nothing changes sound for upgrading.
     #[serde(default)]
     pub input_source: Option<String>,
+    /// The first input of the pair each capture device reads, zero-based,
+    /// keyed by device id; the system default entry is the empty key. A
+    /// device not listed starts at its first pair.
+    #[serde(default)]
+    pub input_offsets: BTreeMap<String, u16>,
     /// The display name last joined with, pre-filling the join screen so a
     /// band member types who they are once, not once per session.
     #[serde(default)]
@@ -274,6 +279,7 @@ mod tests {
             allow_exclusive: Some(false),
             auto_cushion: Some(false),
             input_source: Some("input-1".to_owned()),
+            input_offsets: BTreeMap::from([("coreaudio:scarlett-in".to_owned(), 2)]),
             display_name: Some("Ana".to_owned()),
         };
         prefs.save_to(&path).expect("save");
@@ -306,6 +312,7 @@ mod tests {
             allow_exclusive: Some(true),
             auto_cushion: Some(true),
             input_source: None,
+            input_offsets: BTreeMap::new(),
             display_name: Some("Ana".to_owned()),
         };
         let value = serde_json::to_value(&prefs).expect("encode");
