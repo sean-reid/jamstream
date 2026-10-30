@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.6](https://github.com/sean-reid/jamstream/compare/v0.5.5...v0.5.6) (2026-10-30)
+
+
+### Features
+
+* **client:** pick which input the uplink carries ([#646](https://github.com/sean-reid/jamstream/issues/646)) ([5c7a520](https://github.com/sean-reid/jamstream/commit/5c7a5208b88cd24535941e3b08f111d495896a7d))
+* stereo uplink as a per-musician opt-in ([#649](https://github.com/sean-reid/jamstream/issues/649)) ([f24cb45](https://github.com/sean-reid/jamstream/commit/f24cb45b9a916a1fb95e979ccc27d08c411cbf76))
+
 ## [0.5.5](https://github.com/sean-reid/jamstream/compare/v0.5.4...v0.5.5) (2026-10-25)
 
 
