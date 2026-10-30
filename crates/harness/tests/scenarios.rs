@@ -1225,25 +1225,27 @@ fn latency_at_capacity() {
 // 3. One broadcast encode per eight ticks, from `ServerCore::broadcast_encodes`.
 //    A count, not a timing, so it is deterministic on any machine.
 //
-// Measured on an M4 Max, 10 musicians and 20 listeners, 20 s of virtual time:
-// broadcast median 607 us, p99 704 us, ordinary 285 us, ratio 1.95, amortized
-// 339 us. With the pre-#78 per-listener broadcast encode restored: 4357 us and
-// 300 us, ratio 14.53. The ratio gate at 5 sits 2.5x above what the fanout
-// costs today and 2.9x below what one extra per-listener encode costs.
+// Measured on an M4 Max with every uplink decoded stereo, 10 musicians and 20
+// listeners, 20 s of virtual time: broadcast median 585 us, p99 622 us,
+// ordinary 307 us, ratio 1.91, amortized 353 us. With the pre-#78 per-listener
+// broadcast encode restored: 4357 us and 300 us, ratio 14.53. The ratio gate
+// at 5 sits 2.6x above what the fanout costs today and 2.9x below what one
+// extra per-listener encode costs.
 //
 // And on the ci runners, which is where the budget is actually checked. These
 // are the first numbers this gate ever published: a passing test's output went
 // nowhere until #276, which is how #239 came to calibrate against an estimate.
-// Runner multiplier 4, so a 10000 us budget. Three runs per platform, so the
-// spread below is run-to-run variation on an idle runner and not a
-// distribution:
+// Runner multiplier 4, so a 10000 us budget. One run per platform with every
+// uplink decoded stereo, beside the spread three runs of the mono path showed
+// on the same runners, so a number outside its spread is the stereo decode
+// and one inside it is the runner:
 //
-//   ubuntu-latest    median  675 to 825   p99  714 to  875    7 to  9% of budget
-//   macos-latest     median  681 to 744   p99  897 to 1663    9 to 17% of budget
-//   windows-latest   median  705 to 895   p99 1042 to 1092   10 to 11% of budget
+//   ubuntu-latest    median 752   p99  862    9% of budget   (mono p99  714 to  875)
+//   macos-latest     median 749   p99 1749   17% of budget   (mono p99  897 to 1663)
+//   windows-latest   median 855   p99 1165   12% of budget   (mono p99 1042 to 1092)
 //
-// macos is the loose one, up to 2.4x its own median even with the runner to
-// itself, and windows is now the steadiest of the three. If this gate ever
+// macos is the loose one, up to 2.3x its own median even with the runner to
+// itself, and windows is the steadiest of the three. If this gate ever
 // needs a per-platform allowance it will be for macos, which is not where
 // anybody was looking.
 //
