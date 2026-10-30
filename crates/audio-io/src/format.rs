@@ -194,9 +194,24 @@ pub(crate) fn format_candidates(
 /// Shared with the cpal path so both backends present the same channel
 /// semantics to the handler.
 pub(crate) fn map_frames(src: &[f32], src_ch: usize, dst: &mut [f32], dst_ch: usize) {
+    map_frames_from(src, src_ch, 0, dst, dst_ch);
+}
+
+/// [`map_frames`] starting at source channel `offset`: destination channel i
+/// takes source channel min(offset + i, src_channels - 1). This is how a
+/// capture stream reads inputs 3 and 4 of an interface that has eight, and
+/// an offset past the device's inputs repeats its last one rather than
+/// reading outside the frame.
+pub(crate) fn map_frames_from(
+    src: &[f32],
+    src_ch: usize,
+    offset: usize,
+    dst: &mut [f32],
+    dst_ch: usize,
+) {
     for (s, d) in src.chunks_exact(src_ch).zip(dst.chunks_exact_mut(dst_ch)) {
         for (i, slot) in d.iter_mut().enumerate() {
-            *slot = s[i.min(src_ch - 1)];
+            *slot = s[(offset + i).min(src_ch - 1)];
         }
     }
 }
@@ -448,6 +463,23 @@ mod tests {
         let mut down = [0.0; 2];
         map_frames(&quad, 4, &mut down, 2);
         assert_eq!(down, [1.0, 2.0]);
+    }
+
+    /// An offset reads later inputs, and one past the end repeats the last
+    /// input instead of reading outside the frame.
+    #[test]
+    fn map_frames_from_reads_later_inputs_and_clamps_at_the_last() {
+        let eight = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut pair = [0.0; 2];
+        map_frames_from(&eight, 8, 2, &mut pair, 2);
+        assert_eq!(pair, [3.0, 4.0]);
+        map_frames_from(&eight, 8, 6, &mut pair, 2);
+        assert_eq!(pair, [7.0, 8.0]);
+        map_frames_from(&eight, 8, 7, &mut pair, 2);
+        assert_eq!(pair, [8.0, 8.0]);
+        let mono = [9.0];
+        map_frames_from(&mono, 1, 4, &mut pair, 2);
+        assert_eq!(pair, [9.0, 9.0]);
     }
 
     #[test]

@@ -901,3 +901,35 @@ fn non_48k_input_is_rejected() {
     assert!(matches!(err, AudioError::Unsupported(_)));
     let _ = std::fs::remove_file(&input_path);
 }
+
+/// A capture offset reads later inputs of a wider file, and one past the
+/// last input repeats that input rather than reading outside the frame.
+#[test]
+fn a_capture_offset_reads_later_inputs() {
+    let input_path = temp_path("offset-in.wav");
+    let frames = 480;
+    let input = write_sine(&input_path, 4, frames, 48_000);
+    for (offset, want) in [(2u16, [2usize, 3usize]), (3, [3, 3])] {
+        let output_path = temp_path(&format!("offset-{offset}-out.wav"));
+        let backend = WavBackend::new(Some(input_path.clone()), Some(output_path.clone()));
+        let mut stream = backend
+            .open_offline(
+                StreamConfig {
+                    capture_offset: offset,
+                    ..config(2)
+                },
+                passthrough(),
+            )
+            .unwrap();
+        stream.pump(frames).unwrap();
+        stream.finish().unwrap();
+        let expected: Vec<f32> = input
+            .chunks_exact(4)
+            .flat_map(|frame| [frame[want[0]], frame[want[1]]])
+            .collect();
+        let (_, written) = read_all(&output_path);
+        assert_eq!(&written[..expected.len()], &expected[..], "offset {offset}");
+        let _ = std::fs::remove_file(&output_path);
+    }
+    let _ = std::fs::remove_file(&input_path);
+}

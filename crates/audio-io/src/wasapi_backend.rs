@@ -624,7 +624,11 @@ fn capture_loop(
         return;
     };
 
-    let mut stage = CaptureStage::new(&prepared, params.config.channels);
+    let mut stage = CaptureStage::new(
+        &prepared,
+        params.config.channels,
+        params.config.capture_offset,
+    );
     if let Err(e) = prepared.client.start_stream() {
         fail(params, "starting the capture stream", &e);
         return;
@@ -1034,11 +1038,18 @@ impl Stage {
     }
 }
 
-struct CaptureStage(Stage);
+struct CaptureStage {
+    stage: Stage,
+    /// The device input the handler's channel 0 reads.
+    offset: usize,
+}
 
 impl CaptureStage {
-    fn new(prepared: &Prepared, handler_channels: u16) -> Self {
-        Self(Stage::new(prepared, handler_channels, 2))
+    fn new(prepared: &Prepared, handler_channels: u16, capture_offset: u16) -> Self {
+        Self {
+            stage: Stage::new(prepared, handler_channels, 2),
+            offset: usize::from(capture_offset),
+        }
     }
 
     /// Read one packet and hand it to the handler. Returns the frames read; 0
@@ -1048,14 +1059,15 @@ impl CaptureStage {
         client: &AudioCaptureClient,
         on_capture: &mut CaptureFn,
     ) -> std::result::Result<u32, WasapiError> {
-        let stage = &mut self.0;
+        let offset = self.offset;
+        let stage = &mut self.stage;
         let (frames, info) = client.read_from_device(&mut stage.bytes)?;
         if frames == 0 {
             return Ok(0);
         }
         let frames_usize = frames as usize;
         let device_samples = frames_usize * stage.device_channels;
-        let same_layout = stage.same_layout();
+        let same_layout = stage.same_layout() && offset == 0;
         let decoded = &mut stage.device_floats[..device_samples];
         if info.flags.silent {
             decoded.fill(0.0);
@@ -1070,9 +1082,10 @@ impl CaptureStage {
             on_capture(decoded);
         } else {
             let mapped = &mut stage.handler_floats[..frames_usize * stage.handler_channels];
-            format::map_frames(
+            format::map_frames_from(
                 &stage.device_floats[..device_samples],
                 stage.device_channels,
+                offset,
                 mapped,
                 stage.handler_channels,
             );
@@ -1152,6 +1165,14 @@ fn enumerate() -> Result<Vec<DeviceInfo>> {
             let Ok(id) = device.get_id() else { continue };
             let name = device.get_friendlyname().unwrap_or_else(|_| id.clone());
             let (min_buffer_frames, max_buffer_frames) = exclusive_bounds(&device);
+            let input_channels = (direction == Direction::Capture)
+                .then(|| {
+                    device
+                        .get_device_format()
+                        .ok()
+                        .map(|wave| wave.get_nchannels())
+                })
+                .flatten();
             out.push(DeviceInfo {
                 is_default: default_id.as_ref() == Some(&id),
                 id,
@@ -1163,6 +1184,7 @@ fn enumerate() -> Result<Vec<DeviceInfo>> {
                 form_factor: FormFactor::Unknown,
                 min_buffer_frames,
                 max_buffer_frames,
+                input_channels,
             });
         }
     }
