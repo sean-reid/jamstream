@@ -116,6 +116,11 @@ pub struct AppPrefs {
     /// default: it may, so nobody's latency changes for upgrading.
     #[serde(default)]
     pub auto_cushion: Option<bool>,
+    /// Which of the capture pair the uplink carries, as the token
+    /// `InputSource::as_str` writes. `None` or an unknown token reads as the
+    /// default, summed, so nothing changes sound for upgrading.
+    #[serde(default)]
+    pub input_source: Option<String>,
     /// The display name last joined with, pre-filling the join screen so a
     /// band member types who they are once, not once per session.
     #[serde(default)]
@@ -268,6 +273,7 @@ mod tests {
             buffer_frames: Some(240),
             allow_exclusive: Some(false),
             auto_cushion: Some(false),
+            input_source: Some("input-1".to_owned()),
             display_name: Some("Ana".to_owned()),
         };
         prefs.save_to(&path).expect("save");
@@ -299,6 +305,7 @@ mod tests {
             buffer_frames: Some(120),
             allow_exclusive: Some(true),
             auto_cushion: Some(true),
+            input_source: None,
             display_name: Some("Ana".to_owned()),
         };
         let value = serde_json::to_value(&prefs).expect("encode");
