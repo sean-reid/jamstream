@@ -19,6 +19,9 @@ pub struct DeviceInfo {
     /// deliver its own period regardless.
     pub min_buffer_frames: Option<u32>,
     pub max_buffer_frames: Option<u32>,
+    /// Inputs a capture device offers, where the backend reports it. The
+    /// Inputs picker appears when it is more than the pair Send reads.
+    pub input_channels: Option<u16>,
 }
 
 /// The label of the `id: None` entry that heads both pickers. Following the
@@ -35,6 +38,7 @@ fn system_default_entry() -> DeviceInfo {
         // bounds can honestly be claimed for it.
         min_buffer_frames: None,
         max_buffer_frames: None,
+        input_channels: None,
     }
 }
 
@@ -46,22 +50,24 @@ pub struct DeviceCatalog {
 
 impl DeviceCatalog {
     pub fn demo() -> Self {
-        let dev = |name: &str| DeviceInfo {
+        let dev = |name: &str, inputs: Option<u16>| DeviceInfo {
             name: name.to_owned(),
             id: Some(format!("demo:{name}")),
             min_buffer_frames: None,
             max_buffer_frames: None,
+            input_channels: inputs,
         };
         DeviceCatalog {
             capture: vec![
                 system_default_entry(),
-                dev("Scarlett 2i2 input"),
-                dev("Built-in microphone"),
+                dev("Scarlett 2i2 input", Some(2)),
+                dev("Built-in microphone", Some(1)),
+                dev("Scarlett 18i20 input", Some(18)),
             ],
             playback: vec![
                 system_default_entry(),
-                dev("Scarlett 2i2 output"),
-                dev("Built-in speakers"),
+                dev("Scarlett 2i2 output", None),
+                dev("Built-in speakers", None),
             ],
         }
     }
@@ -82,6 +88,7 @@ impl DeviceCatalog {
                     id: Some(d.id.clone()),
                     min_buffer_frames: d.min_buffer_frames,
                     max_buffer_frames: d.max_buffer_frames,
+                    input_channels: d.input_channels,
                 }))
                 .collect()
         };
@@ -180,6 +187,10 @@ pub struct DevicesScreen {
     /// upgrade changes nobody's sound; the single-input picks are for one
     /// instrument on one input, which the sum halves.
     pub input_source: InputSource,
+    /// The first device input of the pair Send reads, zero-based and even:
+    /// 0 for inputs 1 and 2, 2 for 3 and 4. Remembered per capture device
+    /// by the app, which also keeps it inside the device's input count.
+    pub input_offset: u16,
     /// What the last rescan had to say for itself: a selection that fell back
     /// to the system default because its device is gone, or a scan that
     /// failed. Shown under the pickers until the next rescan; a fallback
@@ -197,8 +208,26 @@ impl Default for DevicesScreen {
             auto_cushion: true,
             exclusive_offered: cfg!(windows),
             input_source: InputSource::Summed,
+            input_offset: 0,
             rescan_note: None,
         }
+    }
+}
+
+/// The adjacent input pairs a device with `inputs` offers, as offsets: 0, 2,
+/// 4 and so on. A device with two or fewer has only the one, so no picker.
+pub fn input_pairs(inputs: u16) -> impl Iterator<Item = u16> {
+    (0..inputs.max(2)).step_by(2)
+}
+
+/// The Inputs picker's row for one pair; the last of an odd count is a
+/// single input.
+pub fn pair_label(offset: u16, inputs: u16) -> String {
+    let first = offset + 1;
+    if first + 1 > inputs {
+        format!("{first}")
+    } else {
+        format!("{first} and {}", first + 1)
     }
 }
 
@@ -576,14 +605,42 @@ impl DevicesScreen {
                         combo_w,
                     );
                     ui.end_row();
+                    // Only an interface with more inputs than the pair Send
+                    // reads gets the picker; everyone else has one answer.
+                    let inputs = catalog
+                        .capture
+                        .get(self.capture_idx)
+                        .and_then(|d| d.input_channels)
+                        .unwrap_or(2);
+                    if inputs > 2 {
+                        ui.label(theme::muted(ui, "Inputs"));
+                        ComboBox::from_id_salt("inputs")
+                            .width(combo_w)
+                            .selected_text(pair_label(self.input_offset, inputs))
+                            .show_ui(ui, |ui| {
+                                for offset in input_pairs(inputs) {
+                                    ui.selectable_value(
+                                        &mut self.input_offset,
+                                        offset,
+                                        pair_label(offset, inputs),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                    }
                     ui.label(theme::muted(ui, "Send"));
+                    let first = self.input_offset + 1;
                     ComboBox::from_id_salt("send")
                         .width(combo_w)
-                        .selected_text(self.input_source.label())
+                        .selected_text(self.input_source.label_for(first))
                         .show_ui(ui, |ui| {
                             for source in InputSource::ALL {
-                                ui.selectable_value(&mut self.input_source, source, source.label())
-                                    .on_hover_text(source.note());
+                                ui.selectable_value(
+                                    &mut self.input_source,
+                                    source,
+                                    source.label_for(first),
+                                )
+                                .on_hover_text(source.note_for(first));
                             }
                         });
                     ui.end_row();
@@ -749,6 +806,7 @@ mod tests {
             id: Some("dev".to_owned()),
             min_buffer_frames: min,
             max_buffer_frames: max,
+            input_channels: None,
         }
     }
 

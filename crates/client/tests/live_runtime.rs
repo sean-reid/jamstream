@@ -3285,3 +3285,88 @@ fn the_stereo_pick_keeps_both_sides_through_the_server() {
         "the left tone leaked onto the right side: {right_440} against {right_660}"
     );
 }
+
+/// A 30 s 16-bit file with `channels` channels and a sine on one of them,
+/// zero-based: an instrument plugged into one input of a wider interface.
+fn wide_fixture(test: &str, hz: f32, channels: u16, tone_channel: u16) -> PathBuf {
+    let path = temp_path(
+        test,
+        &format!("sine-{hz}-of-{channels}-on-{tone_channel}.wav"),
+    );
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate: RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&path, spec).expect("fixture wav");
+    for i in 0..(30 * RATE) {
+        let t = i as f32 / RATE as f32;
+        let s = ((t * hz * std::f32::consts::TAU).sin() * 0.5 * f32::from(i16::MAX)) as i16;
+        for ch in 0..channels {
+            writer
+                .write_sample(if ch == tone_channel { s } else { 0 })
+                .expect("fixture sample");
+        }
+    }
+    writer.finalize().expect("finalize fixture");
+    path
+}
+
+/// The Inputs pair reaches the device layer: with an instrument on input 3
+/// of a four-input interface, the pair starting at input 3 hears it and the
+/// pair starting at input 1 does not.
+#[test]
+fn the_inputs_pair_reads_later_inputs_of_a_wider_interface() {
+    use jamstream_client::live::InputSource;
+
+    let server = TestServer::start();
+    let mut runtimes = Vec::new();
+    let mut outs = Vec::new();
+    for (member, who, offset, hz) in [(1, "third", 2u16, 440.0f32), (2, "first", 0u16, 660.0)] {
+        let input = wide_fixture("input-pair", hz, 4, 2);
+        let out = temp_path("input-pair", &format!("out-{who}.wav"));
+        let rt = LiveRuntime::join_offline(
+            &server.invite(member, who),
+            AudioSettings {
+                input_source: InputSource::Left,
+                capture_offset: offset,
+                ..settings()
+            },
+            WavBackend::new(Some(input), Some(out.clone())),
+        )
+        .expect("join");
+        runtimes.push((rt, who));
+        outs.push((out, f64::from(hz)));
+    }
+    for (rt, who) in &runtimes {
+        wait_for(rt, who, Duration::from_secs(10), |s| {
+            joined(s) && s.members.iter().filter(|m| m.connected).count() == 2
+        });
+    }
+    std::thread::sleep(Duration::from_millis(1_500));
+    for (rt, _) in &runtimes {
+        rt.send(Command::SetHearSelf(true));
+    }
+    std::thread::sleep(Duration::from_millis(2_500));
+    for (rt, _) in &runtimes {
+        rt.send(Command::Leave);
+    }
+    for (rt, who) in &runtimes {
+        wait_for(rt, who, Duration::from_secs(3), |s| {
+            s.stats.state == ConnState::Idle
+        });
+    }
+    drop(runtimes);
+
+    let heard = own_tone_in_back_half(&outs[0].0, outs[0].1);
+    let missed = own_tone_in_back_half(&outs[1].0, outs[1].1);
+    assert!(
+        heard > TONE_FLOOR,
+        "the pair starting at input 3 should carry the instrument, reads {heard}"
+    );
+    assert!(
+        missed < heard * 0.15,
+        "the pair starting at input 1 should not hear input 3: {missed} against {heard}"
+    );
+}

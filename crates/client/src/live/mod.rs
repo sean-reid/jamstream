@@ -200,6 +200,7 @@ fn stream_config(settings: &AudioSettings) -> StreamConfig {
         sample_rate: SAMPLE_RATE,
         buffer_frames: settings.buffer_frames.max(32),
         channels: CHANNELS,
+        capture_offset: settings.capture_offset,
         allow_exclusive: settings.allow_exclusive,
     }
 }
@@ -261,23 +262,29 @@ impl InputSource {
         }
     }
 
-    /// The row label on the Audio tab.
-    pub fn label(self) -> &'static str {
+    /// The row label on the Audio tab for the pair starting at input `first`
+    /// (one-based, as the interface numbers them).
+    pub fn label_for(self, first: u16) -> String {
+        let second = first + 1;
         match self {
-            InputSource::Summed => "Inputs 1 and 2, summed",
-            InputSource::Left => "Input 1 only",
-            InputSource::Right => "Input 2 only",
-            InputSource::Stereo => "Inputs 1 and 2, stereo",
+            InputSource::Summed => format!("Inputs {first} and {second}, summed"),
+            InputSource::Left => format!("Input {first} only"),
+            InputSource::Right => format!("Input {second} only"),
+            InputSource::Stereo => format!("Inputs {first} and {second}, stereo"),
         }
     }
 
     /// The hover line on each choice: what the pick does to what arrives.
-    pub fn note(self) -> &'static str {
+    pub fn note_for(self, first: u16) -> String {
         match self {
-            InputSource::Summed => "a stereo source in mono; a lone input arrives 6 dB down",
-            InputSource::Left => "one instrument on input 1, at full level",
-            InputSource::Right => "one instrument on input 2, at full level",
-            InputSource::Stereo => "both sides as played; pan in the host's mixer leans it",
+            InputSource::Summed => {
+                "a stereo source in mono; a lone input arrives 6 dB down".to_owned()
+            }
+            InputSource::Left => format!("one instrument on input {first}, at full level"),
+            InputSource::Right => format!("one instrument on input {}, at full level", first + 1),
+            InputSource::Stereo => {
+                "both sides as played; pan in the host's mixer leans it".to_owned()
+            }
         }
     }
 
@@ -315,6 +322,9 @@ pub struct AudioSettings {
     /// Which of the capture pair the uplink carries; applied per frame on the
     /// worker, so it changes mid-session without a reopen.
     pub input_source: InputSource,
+    /// The first device input the capture pair reads, zero-based. Part of
+    /// the device request: the backends map channels in the device callback.
+    pub capture_offset: u16,
 }
 
 /// Manual rather than derived so the flags default on: exclusive is the
@@ -330,6 +340,7 @@ impl Default for AudioSettings {
             allow_exclusive: true,
             auto_cushion: true,
             input_source: InputSource::Summed,
+            capture_offset: 0,
         }
     }
 }
@@ -2381,6 +2392,7 @@ mod tests {
             allow_exclusive: true,
             auto_cushion: true,
             input_source: InputSource::Summed,
+            capture_offset: 0,
         };
         assert!(!base.reopens_for(&base), "nothing changed, nothing reopens");
         for source in InputSource::ALL {
@@ -2416,6 +2428,10 @@ mod tests {
             },
             AudioSettings {
                 allow_exclusive: false,
+                ..base.clone()
+            },
+            AudioSettings {
+                capture_offset: 2,
                 ..base.clone()
             },
         ] {
@@ -2748,6 +2764,20 @@ mod input_source_tests {
                 }
             );
         }
+    }
+
+    /// The Audio tab's labels carry the interface's own input numbers, so a
+    /// musician on inputs 3 and 4 reads 3 and 4, not 1 and 2.
+    #[test]
+    fn labels_follow_the_pair() {
+        assert_eq!(InputSource::Summed.label_for(3), "Inputs 3 and 4, summed");
+        assert_eq!(InputSource::Left.label_for(3), "Input 3 only");
+        assert_eq!(InputSource::Right.label_for(3), "Input 4 only");
+        assert_eq!(InputSource::Stereo.label_for(7), "Inputs 7 and 8, stereo");
+        assert_eq!(
+            InputSource::Right.note_for(5),
+            "one instrument on input 6, at full level"
+        );
     }
 
     #[test]
