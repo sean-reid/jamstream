@@ -3093,3 +3093,107 @@ fn a_healthy_session_leaves_the_log_holding_only_its_banner() {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// A 30 s 16-bit sine on one channel of a stereo file and silence on the
+/// other: the instrument plugged into one input of a two-input interface.
+fn one_sided_fixture(test: &str, hz: f32, left: bool) -> PathBuf {
+    let path = temp_path(
+        test,
+        &format!("sine-{hz}-{}.wav", if left { "l" } else { "r" }),
+    );
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&path, spec).expect("fixture wav");
+    for i in 0..(30 * RATE) {
+        let t = i as f32 / RATE as f32;
+        let s = ((t * hz * std::f32::consts::TAU).sin() * 0.5 * f32::from(i16::MAX)) as i16;
+        let (l, r) = if left { (s, 0) } else { (0, s) };
+        writer.write_sample(l).expect("fixture sample");
+        writer.write_sample(r).expect("fixture sample");
+    }
+    writer.finalize().expect("finalize fixture");
+    path
+}
+
+/// The energy of `hz` in the loudest second of the back half of `path`, the
+/// same window the hear-self test reads.
+fn own_tone_in_back_half(path: &Path, hz: f64) -> f64 {
+    let (rate, all) = rate_and_samples(path);
+    let back = &all[(all.len() / 4) * 2..];
+    let window = loudest_of(back, rate, 1.0).window;
+    tone_energy(&left(&window), rate, hz)
+}
+
+/// The Send pick decides what a one-input instrument sends. Three musicians
+/// each play a tone into input 1 only and hear themselves through the
+/// server: the one sending input 1 arrives at full level, the one summing
+/// the pair arrives at half the amplitude, and
+/// the one sending input 2 sends the silence that is there.
+#[test]
+fn the_input_pick_decides_what_a_one_input_instrument_sends() {
+    use jamstream_client::live::InputSource;
+
+    let server = TestServer::start();
+    let cases = [
+        (1, "left", InputSource::Left, 440.0),
+        (2, "summed", InputSource::Summed, 660.0),
+        (3, "right", InputSource::Right, 880.0),
+    ];
+    let mut runtimes = Vec::new();
+    let mut outs = Vec::new();
+    for (member, who, source, hz) in cases {
+        let input = one_sided_fixture("input-pick", hz, true);
+        let out = temp_path("input-pick", &format!("out-{who}.wav"));
+        let rt = LiveRuntime::join_offline(
+            &server.invite(member, who),
+            AudioSettings {
+                input_source: source,
+                ..settings()
+            },
+            WavBackend::new(Some(input), Some(out.clone())),
+        )
+        .expect("join");
+        runtimes.push((rt, who));
+        outs.push((out, f64::from(hz)));
+    }
+    for (rt, who) in &runtimes {
+        wait_for(rt, who, Duration::from_secs(10), |s| {
+            joined(s) && s.members.iter().filter(|m| m.connected).count() == 3
+        });
+    }
+    std::thread::sleep(Duration::from_millis(1_500));
+    for (rt, _) in &runtimes {
+        rt.send(Command::SetHearSelf(true));
+    }
+    std::thread::sleep(Duration::from_millis(2_500));
+    for (rt, _) in &runtimes {
+        rt.send(Command::Leave);
+    }
+    for (rt, who) in &runtimes {
+        wait_for(rt, who, Duration::from_secs(3), |s| {
+            s.stats.state == ConnState::Idle
+        });
+    }
+    drop(runtimes);
+
+    let full = own_tone_in_back_half(&outs[0].0, outs[0].1);
+    let summed = own_tone_in_back_half(&outs[1].0, outs[1].1);
+    let other_side = own_tone_in_back_half(&outs[2].0, outs[2].1);
+    assert!(
+        full > TONE_FLOOR,
+        "input 1 alone has to arrive at full level, reads {full} under the {TONE_FLOOR} floor"
+    );
+    assert!(
+        summed > TONE_FLOOR && summed < full * 0.65 && summed > full * 0.35,
+        "the sum halves a lone input, so its tone should read about half of the full \
+         one: summed {summed} against full {full}"
+    );
+    assert!(
+        other_side < TONE_FLOOR,
+        "input 2 is silent in this fixture, yet its pick reads {other_side}"
+    );
+}

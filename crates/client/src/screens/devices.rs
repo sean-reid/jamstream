@@ -4,6 +4,7 @@
 
 use egui::{ComboBox, Ui, vec2};
 
+use crate::live::InputSource;
 use crate::runtime::{AudioFaultView, CushionView, LevelsView};
 use crate::theme;
 use crate::widgets::{Meter, meter, pick_row};
@@ -175,6 +176,10 @@ pub struct DevicesScreen {
     /// field rather than a `cfg!` at the draw site so a snapshot can render
     /// both answers from one machine.
     pub exclusive_offered: bool,
+    /// Which of the capture pair the uplink carries. Summed by default, so an
+    /// upgrade changes nobody's sound; the single-input picks are for one
+    /// instrument on one input, which the sum halves.
+    pub input_source: InputSource,
     /// What the last rescan had to say for itself: a selection that fell back
     /// to the system default because its device is gone, or a scan that
     /// failed. Shown under the pickers until the next rescan; a fallback
@@ -191,6 +196,7 @@ impl Default for DevicesScreen {
             allow_exclusive: true,
             auto_cushion: true,
             exclusive_offered: cfg!(windows),
+            input_source: InputSource::Summed,
             rescan_note: None,
         }
     }
@@ -570,7 +576,28 @@ impl DevicesScreen {
                         combo_w,
                     );
                     ui.end_row();
+                    ui.label(theme::muted(ui, "Send"));
+                    ComboBox::from_id_salt("send")
+                        .width(combo_w)
+                        .selected_text(self.input_source.label())
+                        .show_ui(ui, |ui| {
+                            for source in InputSource::ALL {
+                                ui.selectable_value(&mut self.input_source, source, source.label())
+                                    .on_hover_text(source.note());
+                            }
+                        });
+                    ui.end_row();
                 });
+            // The sum halves one instrument on a single input, which is the
+            // one fact about the pick a musician cannot hear coming.
+            ui.add_space(theme::SPACE_XS);
+            ui.label(
+                theme::muted(
+                    ui,
+                    "Summed halves one instrument on a single input; send that input alone.",
+                )
+                .small(),
+            );
             // The WASAPI backend is the only reader of `allow_exclusive`; on
             // every other platform the question has no answer to give, so
             // the control is absent rather than a checkbox nothing reads.

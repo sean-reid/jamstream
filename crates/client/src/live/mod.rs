@@ -213,6 +213,68 @@ fn ring_frames(requested: u32, negotiated: Option<u32>) -> u32 {
     negotiated.unwrap_or(0).max(requested)
 }
 
+/// Which of the capture pair the mono uplink carries. The device always opens
+/// as a stereo pair, so this is a fold the worker applies per frame; it is
+/// read on the worker's thread and never touches the device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputSource {
+    /// `(L + R) / 2`: a stereo source in mono at unity, and a single
+    /// instrument on one input 6 dB down because the empty input is averaged
+    /// in. The default, because it is what every session before the choice
+    /// existed sent.
+    #[default]
+    Summed,
+    /// Input 1 alone, at unity.
+    Left,
+    /// Input 2 alone, at unity.
+    Right,
+}
+
+impl InputSource {
+    pub const ALL: [InputSource; 3] = [InputSource::Summed, InputSource::Left, InputSource::Right];
+
+    pub fn fold(self, left: f32, right: f32) -> f32 {
+        match self {
+            InputSource::Summed => (left + right) * 0.5,
+            InputSource::Left => left,
+            InputSource::Right => right,
+        }
+    }
+
+    /// The row label on the Audio tab.
+    pub fn label(self) -> &'static str {
+        match self {
+            InputSource::Summed => "Inputs 1 and 2, summed",
+            InputSource::Left => "Input 1 only",
+            InputSource::Right => "Input 2 only",
+        }
+    }
+
+    /// The hover line on each choice: what the pick does to what arrives.
+    pub fn note(self) -> &'static str {
+        match self {
+            InputSource::Summed => "a stereo source in mono; a lone input arrives 6 dB down",
+            InputSource::Left => "one instrument on input 1, at full level",
+            InputSource::Right => "one instrument on input 2, at full level",
+        }
+    }
+
+    /// The token the preferences file carries, stable across renames here.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InputSource::Summed => "summed",
+            InputSource::Left => "input-1",
+            InputSource::Right => "input-2",
+        }
+    }
+
+    /// The inverse of [`InputSource::as_str`]; anything else is None, so a
+    /// hand edit falls back to the default rather than guessing.
+    pub fn parse(token: &str) -> Option<InputSource> {
+        InputSource::ALL.into_iter().find(|s| s.as_str() == token)
+    }
+}
+
 /// Device selection plus buffer size, as picked on the settings screen.
 /// `None` device ids select the system default for that direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +289,9 @@ pub struct AudioSettings {
     /// Whether the playout cushion may move itself past what `buffer_frames`
     /// asks for. Off pins it there, which makes the pick the latency.
     pub auto_cushion: bool,
+    /// Which of the capture pair the uplink carries; applied per frame on the
+    /// worker, so it changes mid-session without a reopen.
+    pub input_source: InputSource,
 }
 
 /// Manual rather than derived so the flags default on: exclusive is the
@@ -241,6 +306,7 @@ impl Default for AudioSettings {
             buffer_frames: 0,
             allow_exclusive: true,
             auto_cushion: true,
+            input_source: InputSource::Summed,
         }
     }
 }
@@ -248,8 +314,8 @@ impl Default for AudioSettings {
 impl AudioSettings {
     /// Whether moving from these settings to `next` needs the device shut and
     /// reopened, which costs the band a few hundred milliseconds of capture.
-    /// Every field but the cushion answer is part of the device request; that
-    /// one is read by the depth controller on the worker's own thread.
+    /// Every field but the cushion answer and the input source is part of the
+    /// device request; those two are read on the worker's own thread.
     ///
     /// Written as one comparison of the whole struct so a field added later
     /// counts as a device change until somebody says otherwise.
@@ -257,6 +323,7 @@ impl AudioSettings {
         *self
             != AudioSettings {
                 auto_cushion: self.auto_cushion,
+                input_source: self.input_source,
                 ..next.clone()
             }
     }
@@ -405,6 +472,9 @@ enum ThreadMsg {
     /// a [`ThreadMsg::Reconfigure`], because the depth controller reads it
     /// without the device being touched.
     AutoCushion(bool),
+    /// Which of the capture pair to send. Same reasoning: a fold the capture
+    /// path applies per frame, so the device is left alone.
+    InputSource(InputSource),
 }
 
 /// The audio stream in whichever shape the backend produced it. Real
@@ -747,6 +817,12 @@ impl LiveRuntime {
     /// fills to, so pinning it drains the ring rather than reopening anything.
     pub fn set_auto_cushion(&self, auto: bool) {
         let _ = self.tx.send(ThreadMsg::AutoCushion(auto));
+    }
+
+    /// Changes which of the capture pair the uplink carries, from the next
+    /// frame the worker moves. The device is left alone.
+    pub fn set_input_source(&self, source: InputSource) {
+        let _ = self.tx.send(ThreadMsg::InputSource(source));
     }
 
     /// True once the network thread has exited (after a Leave).
@@ -1196,6 +1272,7 @@ impl Worker {
                     self.settings.auto_cushion = auto;
                     self.cushion.set_auto(auto);
                 }
+                Ok(ThreadMsg::InputSource(source)) => self.settings.input_source = source,
                 Err(_) => break,
             }
         }
@@ -1585,9 +1662,10 @@ impl Worker {
             let got = engine.pull_captured(&mut self.capture_buf);
             self.mono_buf.clear();
             // The stream is interleaved stereo on both sides; the uplink
-            // is mono, so fold the pair down.
+            // is mono, so fold the pair down the way the Audio tab asked.
+            let source = self.settings.input_source;
             for frame in self.capture_buf[..got].chunks_exact(2) {
-                let s = (frame[0] + frame[1]) * 0.5;
+                let s = source.fold(frame[0], frame[1]);
                 self.mono_buf.push(s);
                 inst_peak = inst_peak.max(s.abs());
                 inst_sq += s * s;
@@ -2272,8 +2350,18 @@ mod tests {
             buffer_frames: 120,
             allow_exclusive: true,
             auto_cushion: true,
+            input_source: InputSource::Summed,
         };
         assert!(!base.reopens_for(&base), "nothing changed, nothing reopens");
+        for source in InputSource::ALL {
+            assert!(
+                !base.reopens_for(&AudioSettings {
+                    input_source: source,
+                    ..base.clone()
+                }),
+                "picking an input may not reopen the device"
+            );
+        }
         for pinned in [false, true] {
             assert!(
                 !base.reopens_for(&AudioSettings {
@@ -2598,5 +2686,30 @@ mod tests {
     /// the target and no further.
     pub(super) fn top_up(engine: &mut EngineSide, samples: &[f32], frames: u32) {
         while fill_playout_to(engine, samples, playout_target(frames)) > 0 {}
+    }
+}
+
+#[cfg(test)]
+mod input_source_tests {
+    use super::InputSource;
+
+    /// The sum halves a lone input, which is the 6 dB the Audio tab warns
+    /// about; a single-input pick carries that input at unity and nothing of
+    /// the other.
+    #[test]
+    fn each_pick_folds_the_pair_the_way_its_note_says() {
+        assert_eq!(InputSource::Summed.fold(0.8, 0.0), 0.4);
+        assert_eq!(InputSource::Summed.fold(0.6, 0.6), 0.6);
+        assert_eq!(InputSource::Left.fold(0.8, -0.3), 0.8);
+        assert_eq!(InputSource::Right.fold(0.8, -0.3), -0.3);
+    }
+
+    #[test]
+    fn the_prefs_token_round_trips_and_an_unknown_one_is_refused() {
+        for source in InputSource::ALL {
+            assert_eq!(InputSource::parse(source.as_str()), Some(source));
+        }
+        assert_eq!(InputSource::parse("stereo"), None);
+        assert_eq!(InputSource::default(), InputSource::Summed);
     }
 }

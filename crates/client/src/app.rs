@@ -10,7 +10,7 @@ use crate::avatar;
 use crate::creds::{self, CredStore, EnvReader, KeyringStore};
 use crate::demo::DemoRuntime;
 use crate::exec::{Executor, Job};
-use crate::live::{AudioSettings, CostedRuntime, LiveError, LiveRuntime};
+use crate::live::{AudioSettings, CostedRuntime, InputSource, LiveError, LiveRuntime};
 use crate::picker::{Pick, Picked};
 use crate::reveal;
 use crate::runtime::{AvatarHandle, Command, ConnState, RecordState, Runtime, Snapshot};
@@ -370,6 +370,9 @@ impl JamApp {
         if let Some(auto) = prefs.auto_cushion {
             self.devices.auto_cushion = auto;
         }
+        if let Some(source) = prefs.input_source.as_deref().and_then(InputSource::parse) {
+            self.devices.input_source = source;
+        }
     }
 
     /// Writes the audio setup where the next launch reads it. Failure is a
@@ -386,6 +389,7 @@ impl JamApp {
             buffer_frames: Some(settings.buffer_frames),
             allow_exclusive: Some(settings.allow_exclusive),
             auto_cushion: Some(settings.auto_cushion),
+            input_source: Some(settings.input_source.as_str().to_owned()),
             display_name: (!name.is_empty()).then(|| name.to_owned()),
         };
         if let Err(err) = prefs.save_to(path) {
@@ -464,6 +468,7 @@ impl JamApp {
             buffer_frames: self.devices.buffer_frames,
             allow_exclusive: self.devices.allow_exclusive,
             auto_cushion: self.devices.auto_cushion,
+            input_source: self.devices.input_source,
         }
     }
 
@@ -840,6 +845,7 @@ impl JamApp {
                     live.reconfigure_audio(selected);
                 } else {
                     live.set_auto_cushion(self.devices.auto_cushion);
+                    live.set_input_source(self.devices.input_source);
                 }
             }
             self.persist_audio_prefs();

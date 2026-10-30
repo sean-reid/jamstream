@@ -4164,3 +4164,67 @@ fn ending_an_armed_session_with_no_take_says_nothing_was_recorded() {
     );
     assert!(harness.state().runtime.is_some(), "saying so is not ending");
 }
+
+/// The Send picker under the device pickers chooses which of the pair the
+/// uplink carries. The pick persists under its token and comes back on the next
+/// launch; a token no build knows reads as the default rather than a guess.
+#[test]
+fn the_input_pick_persists_and_restores_by_token() {
+    use jamstream_client::app::{JamApp, Screen};
+    use jamstream_client::live::InputSource;
+
+    let dir = std::env::temp_dir().join(format!("jamstream-input-prefs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture dir mode");
+    }
+    let path = dir.join("settings.json");
+
+    let mut app = JamApp::in_memory();
+    app.recent = Vec::new();
+    app.runtime = Some(Box::new(DemoRuntime::frozen(FROZEN_FRAME, false)));
+    app.screen = Screen::Session;
+    app.settings_open = true;
+    app.settings_path = Some(path.clone());
+    let mut harness = Harness::builder()
+        .with_size(vec2(1280.0, 900.0))
+        .with_step_dt(0.05)
+        .build_ui_state(
+            |ui, app: &mut JamApp| {
+                theme::apply(ui.ctx(), Theme::Dark);
+                app.root_ui(ui);
+            },
+            app,
+        );
+    harness.run_steps(2);
+    assert_eq!(harness.state().devices.input_source, InputSource::Summed);
+    assert!(
+        harness.query_by_label("Send").is_some(),
+        "the Send picker is missing from the Audio tab"
+    );
+
+    // The combo's options are painted, not queryable nodes, so the pick is
+    // made the way the combo makes it and the frame loop does the rest.
+    harness.state_mut().devices.input_source = InputSource::Left;
+    harness.run_steps(4);
+    let saved = std::fs::read_to_string(&path).expect("the click has to write settings.json");
+    assert!(
+        saved.contains("\"input_source\": \"input-1\""),
+        "the pick persists under its token: {saved}"
+    );
+
+    let mut next = JamApp::in_memory();
+    next.settings_path = Some(path.clone());
+    next.restore_audio_prefs();
+    assert_eq!(next.devices.input_source, InputSource::Left);
+
+    // A token from some other build: the default, not a guess.
+    std::fs::write(&path, saved.replace("input-1", "stereo")).unwrap();
+    let mut unknown = JamApp::in_memory();
+    unknown.settings_path = Some(path);
+    unknown.restore_audio_prefs();
+    assert_eq!(unknown.devices.input_source, InputSource::Summed);
+}
