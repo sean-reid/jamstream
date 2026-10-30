@@ -1,6 +1,8 @@
-//! Mono musician sources into an interleaved stereo bus with per-member
-//! fader, constant-power pan, and an optional excluded member for the
-//! personal mixes.
+//! Interleaved stereo musician sources into an interleaved stereo bus with
+//! per-member fader, constant-power pan applied per side, and an optional
+//! excluded member for the personal mixes. A mono sender arrives dual-mono
+//! from the decoder, so the per-side law pans it exactly as a mono source;
+//! a stereo sender keeps its sides and the same control reads as a balance.
 
 use jamstream_protocol::ids::MemberId;
 
@@ -26,9 +28,10 @@ pub fn db_to_lin(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
 }
 
-/// Sums mono `sources` into `out` (interleaved stereo, twice the source
-/// length), zeroing `out` first. Constant-power pan: left/right weights are
-/// cos/sin over the quarter circle, so panning moves energy, not level.
+/// Sums interleaved stereo `sources` into `out` (same length), zeroing `out`
+/// first. Constant-power pan: left/right weights are cos/sin over the quarter
+/// circle applied to each side, so panning a dual-mono source moves energy,
+/// not level, and panning a stereo source leans it.
 pub fn mix_into(
     sources: &[(MemberId, &[f32])],
     faders: impl Fn(MemberId) -> Fader,
@@ -37,9 +40,8 @@ pub fn mix_into(
 ) {
     assert!(out.len() % 2 == 0, "stereo bus length must be even");
     out.fill(0.0);
-    let frame = out.len() / 2;
     for &(member, source) in sources {
-        assert_eq!(source.len(), frame, "source length must match the bus");
+        assert_eq!(source.len(), out.len(), "source length must match the bus");
         if exclude == Some(member) {
             continue;
         }
@@ -51,9 +53,9 @@ pub fn mix_into(
         let angle = (fader.pan.clamp(-1.0, 1.0) + 1.0) * core::f32::consts::FRAC_PI_4;
         let left = angle.cos() * gain;
         let right = angle.sin() * gain;
-        for (pair, &sample) in out.chunks_exact_mut(2).zip(source) {
-            pair[0] += sample * left;
-            pair[1] += sample * right;
+        for (pair, src) in out.chunks_exact_mut(2).zip(source.chunks_exact(2)) {
+            pair[0] += src[0] * left;
+            pair[1] += src[1] * right;
         }
     }
 }
@@ -68,16 +70,39 @@ mod tests {
     fn id(n: u16) -> MemberId {
         MemberId(n)
     }
+    /// What a mono sender looks like after the server's stereo decoder.
+    fn dual_mono(mono: &[f32]) -> Vec<f32> {
+        mono.iter().flat_map(|&s| [s, s]).collect()
+    }
+    /// A stereo sender keeps its sides: at center each side carries the
+    /// pan weight and nothing of the other; hard left is the left side at
+    /// unity and the right side gone, which is a balance, not a swap.
+    #[test]
+    fn a_stereo_source_keeps_its_sides_and_pan_leans_it() {
+        let a = [1.0f32, 0.0, 0.0, 0.5];
+        let sources = [(id(1), &a[..])];
+        let mut out = [0.0f32; 4];
+        mix_into(&sources, |_| Fader::default(), None, &mut out);
+        assert!((out[0] - CENTER).abs() < 1e-6 && out[1] == 0.0);
+        assert!(out[2] == 0.0 && (out[3] - 0.5 * CENTER).abs() < 1e-6);
+        let hard_left = |_| Fader {
+            pan: -1.0,
+            ..Fader::default()
+        };
+        mix_into(&sources, hard_left, None, &mut out);
+        assert!((out[0] - 1.0).abs() < 1e-6 && out[1] == 0.0);
+        assert!(out[2] == 0.0 && out[3].abs() < 1e-6);
+    }
 
     #[test]
     fn unity_center_pan_sums_sources() {
-        let a = [0.5f32, -0.25, 1.0, 0.0];
-        let b = [0.1f32, 0.2, -0.3, 0.4];
+        let a = dual_mono(&[0.5f32, -0.25, 1.0, 0.0]);
+        let b = dual_mono(&[0.1f32, 0.2, -0.3, 0.4]);
         let sources = [(id(1), &a[..]), (id(2), &b[..])];
         let mut out = [f32::NAN; 8];
         mix_into(&sources, |_| Fader::default(), None, &mut out);
         for i in 0..4 {
-            let expected = (a[i] + b[i]) * CENTER;
+            let expected = (a[2 * i] + b[2 * i]) * CENTER;
             assert!((out[2 * i] - expected).abs() < 1e-6);
             assert!((out[2 * i + 1] - expected).abs() < 1e-6);
         }
@@ -85,8 +110,8 @@ mod tests {
 
     #[test]
     fn exclude_drops_that_member_only() {
-        let a = [1.0f32, 1.0];
-        let b = [0.5f32, 0.5];
+        let a = [1.0f32; 4];
+        let b = [0.5f32; 4];
         let sources = [(id(1), &a[..]), (id(2), &b[..])];
         let mut out = [0.0f32; 4];
         mix_into(&sources, |_| Fader::default(), Some(id(1)), &mut out);
@@ -98,7 +123,7 @@ mod tests {
 
     #[test]
     fn mute_silences_a_member() {
-        let a = [1.0f32; 4];
+        let a = [1.0f32; 8];
         let sources = [(id(7), &a[..])];
         let mut out = [1.0f32; 8];
         let faders = |_| Fader {
@@ -111,7 +136,7 @@ mod tests {
 
     #[test]
     fn gain_applies_in_db() {
-        let a = [1.0f32];
+        let a = [1.0f32; 2];
         let sources = [(id(1), &a[..])];
         let mut out = [0.0f32; 2];
         let faders = |_| Fader {
@@ -125,7 +150,7 @@ mod tests {
 
     #[test]
     fn constant_power_pan_preserves_energy() {
-        let a = [1.0f32];
+        let a = [1.0f32; 2];
         let sources = [(id(1), &a[..])];
         let mut pan = -1.0f32;
         while pan <= 1.0 {
@@ -153,7 +178,7 @@ mod tests {
                     n,
                 ),
                 prop::collection::vec(
-                    prop::collection::vec(-1.0f32..1.0, 32),
+                    prop::collection::vec(-1.0f32..1.0, 64),
                     n,
                 ),
             ))

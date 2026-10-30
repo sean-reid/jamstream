@@ -274,8 +274,9 @@ pub struct BroadcastTick<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Stem<'a> {
     pub id: MemberId,
-    /// Decoded mono uplink for this tick.
-    pub pcm: &'a [f32; TICK_SAMPLES],
+    /// Decoded uplink for this tick, interleaved stereo; a mono sender
+    /// arrives on both sides.
+    pub pcm: &'a [f32; MIX_LEN],
     /// Host-set broadcast fader, unity when unset.
     pub fader: Fader,
 }
@@ -311,7 +312,9 @@ struct Member {
     resp_cache: Option<RespCache>,
     link: ControlLink,
     jitter: JitterBuffer,
-    /// Mono uplink decoder; musicians only.
+    /// Uplink decoder, stereo whatever the member sends: Opus plays a mono
+    /// packet on both sides, so one decoder serves a member that sends
+    /// either, or switches mid-session. Musicians only.
     decoder: Option<Decoder>,
     /// Personal mix encoder; musicians only. Personal mixes genuinely differ
     /// per member, so each needs its own encoder state. Listeners all get the
@@ -375,7 +378,7 @@ pub struct ServerCore {
     /// Encoded-frame scratch, reused.
     pkt_buf: Vec<u8>,
     /// This tick's decoded musician audio, reused.
-    decoded: Vec<(MemberId, [f32; TICK_SAMPLES])>,
+    decoded: Vec<(MemberId, [f32; MIX_LEN])>,
     /// 20 ms broadcast accumulator.
     bcast_accum: Vec<f32>,
     /// The one encoder every listener's stream comes out of, built when the
@@ -587,7 +590,7 @@ impl ServerCore {
             if !m.connected || m.role != Role::Musician {
                 continue;
             }
-            let mut pcm = [0.0f32; TICK_SAMPLES];
+            let mut pcm = [0.0f32; MIX_LEN];
             let pulled = m.jitter.pull();
             if let Some(dec) = m.decoder.as_mut() {
                 let result = match &pulled {
@@ -596,7 +599,7 @@ impl ServerCore {
                     Pull::Waiting => Ok(()),
                 };
                 if result.is_err() {
-                    pcm = [0.0; TICK_SAMPLES];
+                    pcm = [0.0; MIX_LEN];
                 }
             }
             if self.bcast_tap {
@@ -610,7 +613,7 @@ impl ServerCore {
                     peak = peak.max(s.abs());
                     sum_sq += s * s;
                 }
-                let rms = (sum_sq / TICK_SAMPLES as f32).sqrt();
+                let rms = (sum_sq / MIX_LEN as f32).sqrt();
                 m.level_peak = peak.max(m.level_peak * BCAST_LEVEL_DECAY);
                 m.level_rms = rms.max(m.level_rms * BCAST_LEVEL_DECAY);
             }
@@ -1420,7 +1423,7 @@ impl ServerCore {
             Role::Musician => {
                 Encoder::new(Channels::Stereo, FrameDuration::Ms2_5, PERSONAL_MIX_BITRATE).and_then(
                     |e| {
-                        Decoder::new(Channels::Mono, FrameDuration::Ms2_5)
+                        Decoder::new(Channels::Stereo, FrameDuration::Ms2_5)
                             .map(|d| (Some(e), Some(d)))
                     },
                 )

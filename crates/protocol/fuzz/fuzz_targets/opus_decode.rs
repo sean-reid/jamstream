@@ -48,9 +48,10 @@
 //!
 //! Seeds in `corpus/opus_decode/` are programs in the layout above whose
 //! packets are real Opus frames, produced by this workspace's own `Encoder`
-//! at the shipped settings: mono 2.5 ms at 128 kbps (the server's uplink
-//! decode), stereo 2.5 ms at 192 kbps, stereo 20 ms at 128 kbps, mono 20 ms
-//! at 128 kbps, over a couple of hundred milliseconds of harmonics plus
+//! at the shipped settings: mono 2.5 ms at 128 kbps (a mono uplink, which
+//! the server's stereo decoder also has to take), stereo 2.5 ms at 192 kbps
+//! (the server's uplink decode and the personal mix), stereo 20 ms at 128
+//! kbps, mono 20 ms at 128 kbps, over a couple of hundred milliseconds of harmonics plus
 //! noise, with variants that drop frames to reach concealment and set the FEC
 //! bit. Random bytes almost never form a decodable packet, so without these
 //! the fuzzer spends its night in the reject path.
@@ -72,10 +73,11 @@ fuzz_target!(|data: &[u8]| {
     let mut r = fixtures::Reader::new(data);
     let Some(selector) = r.u8() else { return };
 
-    // The four configurations the product actually constructs. Mono 2.5 ms is
-    // the server's, and the only one an unauthenticated stranger could ever
-    // aim at; the others are what a client runs on a malicious server's
-    // downlink, which the threat model puts in scope for crashes.
+    // The four configurations the product constructs or meets. Stereo 2.5 ms
+    // is the server's uplink decoder, the only one an unauthenticated stranger
+    // could ever aim at, and it takes mono packets too; the others are what a
+    // client runs on a malicious server's downlink, which the threat model
+    // puts in scope for crashes.
     let (channels, duration) = match selector & 0b11 {
         0 => (Channels::Mono, FrameDuration::Ms2_5),
         1 => (Channels::Stereo, FrameDuration::Ms2_5),
