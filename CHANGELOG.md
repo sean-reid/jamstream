@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.7](https://github.com/sean-reid/jamstream/compare/v0.5.6...v0.5.7) (2026-10-30)
+
+
+### Features
+
+* pick which input pair a wider interface sends ([#651](https://github.com/sean-reid/jamstream/issues/651)) ([1933bed](https://github.com/sean-reid/jamstream/commit/1933bed8db4724991325e0b64e3d8f65ede65169))
+
 ## [0.5.6](https://github.com/sean-reid/jamstream/compare/v0.5.5...v0.5.6) (2026-10-30)
 
 
