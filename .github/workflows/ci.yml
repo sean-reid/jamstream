@@ -556,7 +556,7 @@ jobs:
         run: scripts/install-pinned-mediamtx.sh "$RUNNER_TEMP/pinned-mediamtx"
       - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         run: echo "$RUNNER_TEMP/pinned-mediamtx" >> "$GITHUB_PATH"
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         if: needs.changes.outputs.docs-only != 'true'
         with:
           tool: cargo-nextest
@@ -739,7 +739,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: needs.changes.outputs.docs-only != 'true'
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         if: needs.changes.outputs.docs-only != 'true'
         with:
           tool: cargo-nextest
@@ -799,7 +799,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # cargo-nextest for the same reason the test and harness jobs install
       # it: the runs below go through `cargo llvm-cov nextest`.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
