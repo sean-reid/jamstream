@@ -262,6 +262,90 @@ mod tests {
         }
     }
 
+    /// Opus carries the channel count in every packet's first byte, so a
+    /// decoder built for one layout still decodes the other: a mono decoder
+    /// averages a stereo packet down, a stereo decoder plays a mono packet on
+    /// both sides. This is what lets a stereo uplink meet the server's mono
+    /// decoder, and a mono uplink meet a stereo one, without a protocol
+    /// version bump: an old build degrades to mono rather than failing. The
+    /// personal mix's own settings are used so the pair proves the shipped
+    /// configuration and not a convenient one.
+    #[test]
+    fn a_stereo_packet_decodes_on_a_mono_decoder_as_the_sum() {
+        let duration = FrameDuration::Ms2_5;
+        let frame = duration.samples() as usize;
+        let per_channel = frame * (19_200 / frame);
+        let left = sine(per_channel, 440.0, 0.5);
+        let right = sine(per_channel, 660.0, 0.5);
+        let mut input = vec![0.0f32; per_channel * 2];
+        for (i, pair) in input.chunks_exact_mut(2).enumerate() {
+            pair[0] = left[i];
+            pair[1] = right[i];
+        }
+        let mut enc = Encoder::new(Channels::Stereo, duration, 192_000).unwrap();
+        let mut dec = Decoder::new(Channels::Mono, duration).unwrap();
+        let mut packet = Vec::new();
+        let mut decoded = vec![0.0f32; per_channel];
+        for (i, chunk) in input.chunks_exact(frame * 2).enumerate() {
+            enc.encode(chunk, &mut packet).unwrap();
+            dec.decode(
+                Some(&packet),
+                &mut decoded[i * frame..(i + 1) * frame],
+                false,
+            )
+            .expect("a mono decoder accepts a stereo packet");
+        }
+        let tail = &decoded[per_channel / 2..];
+        // Both tones at about half their sent amplitude: the sum, not one side.
+        let a440 = tone_amp(tail, 440.0);
+        let a660 = tone_amp(tail, 660.0);
+        assert!(
+            (0.15..0.35).contains(&a440),
+            "440 Hz reads {a440}, expected about 0.25"
+        );
+        assert!(
+            (0.15..0.35).contains(&a660),
+            "660 Hz reads {a660}, expected about 0.25"
+        );
+    }
+
+    #[test]
+    fn a_mono_packet_decodes_on_a_stereo_decoder_on_both_sides() {
+        let duration = FrameDuration::Ms2_5;
+        let frame = duration.samples() as usize;
+        let total = frame * (19_200 / frame);
+        let input = sine(total, 440.0, 0.5);
+        let mut enc = Encoder::new(Channels::Mono, duration, 128_000).unwrap();
+        let mut dec = Decoder::new(Channels::Stereo, duration).unwrap();
+        let mut packet = Vec::new();
+        let mut decoded = vec![0.0f32; total * 2];
+        for (i, chunk) in input.chunks_exact(frame).enumerate() {
+            enc.encode(chunk, &mut packet).unwrap();
+            dec.decode(
+                Some(&packet),
+                &mut decoded[i * frame * 2..(i + 1) * frame * 2],
+                false,
+            )
+            .expect("a stereo decoder accepts a mono packet");
+        }
+        let out_left: Vec<f32> = decoded.chunks_exact(2).map(|p| p[0]).collect();
+        let out_right: Vec<f32> = decoded.chunks_exact(2).map(|p| p[1]).collect();
+        let peak_left = corr_peak(&input, &out_left, 1_500, 4_800);
+        let peak_right = corr_peak(&input, &out_right, 1_500, 4_800);
+        assert!(peak_left > 0.8, "left peak {peak_left}");
+        assert!(peak_right > 0.8, "right peak {peak_right}");
+        let a_left = tone_amp(&out_left[total / 2..], 440.0);
+        let a_right = tone_amp(&out_right[total / 2..], 440.0);
+        assert!(
+            (0.4..0.6).contains(&a_left),
+            "left reads {a_left}, expected about 0.5"
+        );
+        assert!(
+            (0.4..0.6).contains(&a_right),
+            "right reads {a_right}, expected about 0.5"
+        );
+    }
+
     /// Concealment stands in for audio, so it has to sound like the audio it
     /// replaced: Opus extends the pitch it was playing. Every lost frame in the
     /// client and the server takes this path, and a zero fill is hard silence
