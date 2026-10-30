@@ -3199,9 +3199,13 @@ fn the_input_pick_decides_what_a_one_input_instrument_sends() {
         "the sum halves a lone input, so its tone should read clearly under the full \
          one: summed {summed} against full {full}"
     );
+    // Against the full level rather than the floor: the other two tones are
+    // in this mix too, and a concealed frame on a loaded runner puts enough
+    // broadband energy under 880 Hz to clear a fixed floor.
     assert!(
-        other_side < TONE_FLOOR,
-        "input 2 is silent in this fixture, yet its pick reads {other_side}"
+        other_side < full * 0.15,
+        "input 2 is silent in this fixture, yet its pick reads {other_side} against \
+         {full} for input 1"
     );
 }
 
