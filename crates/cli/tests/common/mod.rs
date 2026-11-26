@@ -50,6 +50,7 @@ pub fn jamstreamd_binary() -> PathBuf {
     let mut build = std::process::Command::new(cargo);
     build.args([
         "build",
+        "--locked",
         "-p",
         "jamstream-server",
         "--bin",
