@@ -9,7 +9,7 @@ cask "jamstream" do
       verified: "github.com/sean-reid/jamstream/"
   name "JamStream"
   desc "Host a short-lived jam server in your own cloud account and play together"
-  homepage "https://sean-reid.github.io/jamstream"
+  homepage "https://jamstream.seanre.id"
 
   livecheck do
     url :url

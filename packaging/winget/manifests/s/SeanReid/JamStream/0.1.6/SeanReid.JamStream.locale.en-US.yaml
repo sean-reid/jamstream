@@ -8,7 +8,7 @@ PublisherUrl: https://github.com/sean-reid
 PublisherSupportUrl: https://github.com/sean-reid/jamstream/issues
 Author: JamStream contributors
 PackageName: JamStream
-PackageUrl: https://sean-reid.github.io/jamstream
+PackageUrl: https://jamstream.seanre.id
 License: MIT OR Apache-2.0
 # Either license, at the user's option. LICENSE-APACHE sits beside the file
 # below in the same tree; winget takes one url.
@@ -36,6 +36,6 @@ Tags:
 ReleaseNotesUrl: https://github.com/sean-reid/jamstream/releases/tag/v0.1.6
 Documentations:
   - DocumentLabel: Documentation
-    DocumentUrl: https://sean-reid.github.io/jamstream
+    DocumentUrl: https://jamstream.seanre.id
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0
