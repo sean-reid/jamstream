@@ -47,48 +47,43 @@ fn link_of(panel: &InvitesPanel, label: &str) -> (TokenId, String) {
     (invite.token, invite.encoded.clone())
 }
 
-#[cfg(windows)]
-const BIN_NAME: &str = "jamstreamd.exe";
-#[cfg(not(windows))]
-const BIN_NAME: &str = "jamstreamd";
-
 /// Builds (if needed) and returns the jamstreamd binary for this profile;
 /// same mechanism as the CLI's local_host test, because CARGO_BIN_EXE_
 /// only covers binaries of the package under test.
 fn jamstreamd_binary() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let profile_dir = exe
-        .parent() // deps/
-        .and_then(|d| d.parent()) // target/<profile>/
-        .expect("test executable must sit in target/<profile>/deps")
-        .to_path_buf();
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
 
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut build = std::process::Command::new(cargo);
-    build.args(["build", "-p", "jamstream-server", "--bin", "jamstreamd"]);
-    if profile_dir.file_name().is_some_and(|n| n == "release") {
+    build.args([
+        "build",
+        "-p",
+        "jamstream-server",
+        "--bin",
+        "jamstreamd",
+        "--message-format=json-render-diagnostics",
+    ]);
+    if !cfg!(debug_assertions) {
         build.arg("--release");
     }
-    let status = build.current_dir(&workspace).status();
+    let output = build
+        .current_dir(&workspace)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("run cargo build -p jamstream-server");
+    assert!(
+        output.status.success(),
+        "cargo build -p jamstream-server failed"
+    );
 
-    let binary = profile_dir.join(BIN_NAME);
-    match status {
-        Ok(s) if s.success() => {}
-        _ if binary.is_file() => eprintln!(
-            "warning: cargo build -p jamstream-server failed; using the existing {}",
-            binary.display()
-        ),
-        _ => panic!(
-            "cannot build jamstreamd and none exists at {}; \
-             run `cargo build -p jamstream-server` first",
-            binary.display()
-        ),
-    }
-    assert!(binary.is_file(), "missing {}", binary.display());
-    binary
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "jamstreamd")
+        .find_map(|m| m["executable"].as_str().map(PathBuf::from))
+        .expect("cargo did not report a jamstreamd executable")
 }
 
 /// Takes the recorder has finished writing: a `.part` is a take still in
