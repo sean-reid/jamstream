@@ -9,7 +9,7 @@
 # newer; older distributions should use cargo install --path crates/cli.
 class JamstreamCli < Formula
   desc "Terminal client for jam sessions hosted in your own cloud account"
-  homepage "https://sean-reid.github.io/jamstream"
+  homepage "https://jamstream.seanre.id"
   version "0.1.6"
   license any_of: ["MIT", "Apache-2.0"]
 

@@ -2,7 +2,7 @@
 # JamStream CLI uninstaller, the pair of install.sh. Served by the site at
 # /uninstall.sh the same way:
 #
-#   curl -fsSL https://sean-reid.github.io/jamstream/uninstall.sh | sh
+#   curl -fsSL https://jamstream.seanre.id/uninstall.sh | sh
 #
 # Removes the jamstream CLI (and jamstreamd, if --with-server installed it)
 # from wherever install.sh put them. Session data and credentials are kept

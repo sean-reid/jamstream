@@ -1,7 +1,7 @@
 # JamStream installer for Windows. This file lives in site/src/ so mdBook
 # copies it verbatim into the built site, which serves it at /install.ps1:
 #
-#   powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://jamstream.seanre.id/install.ps1 | iex"
 #
 # Downloads the jamstream CLI from a GitHub release, verifies its sha256
 # against that release's SHA256SUMS file, and installs it. A winget package is
@@ -47,7 +47,7 @@ if ($Tag) {
 
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
     Write-Host 'This is the Windows installer; on macOS and Linux run:'
-    Write-Host '  curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh'
+    Write-Host '  curl -fsSL https://jamstream.seanre.id/install.sh | sh'
     exit 1
 }
 # Is64BitOperatingSystem is true on ARM64 too, where only emulated x64 would run.

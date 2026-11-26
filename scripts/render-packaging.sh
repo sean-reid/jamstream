@@ -41,7 +41,7 @@ set -eu
 REPO="sean-reid/jamstream"
 RELEASE_BASE="https://github.com/${REPO}/releases/download"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}"
-HOMEPAGE="https://sean-reid.github.io/jamstream"
+HOMEPAGE="https://jamstream.seanre.id"
 
 fail() {
   printf 'error: %s\n' "$1" >&2

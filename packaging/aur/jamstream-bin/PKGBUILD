@@ -10,7 +10,7 @@ pkgver=0.1.6
 pkgrel=1
 pkgdesc="Host a short-lived jam server in your own cloud account and play together (desktop app)"
 arch=('x86_64')
-url="https://sean-reid.github.io/jamstream"
+url="https://jamstream.seanre.id"
 license=('MIT OR Apache-2.0')
 depends=('alsa-lib' 'dbus' 'gcc-libs' 'glibc' 'libglvnd' 'libpipewire'
          'libx11' 'libxcursor' 'libxi' 'libxkbcommon' 'libxkbcommon-x11'

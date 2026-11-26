@@ -86,7 +86,7 @@ The CLI suits scripts, automation, and machines without a display; the [CLI refe
 On macOS and Linux:
 
 ```console
-curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
+curl -fsSL https://jamstream.seanre.id/install.sh | sh
 ```
 
 The script:
@@ -99,7 +99,7 @@ The script:
 Uninstalling is the same shape:
 
 ```console
-curl -fsSL https://sean-reid.github.io/jamstream/uninstall.sh | sh
+curl -fsSL https://jamstream.seanre.id/uninstall.sh | sh
 ```
 
 It removes what install.sh installed and nothing else. A session still running makes it stop and say so, since the binary being removed is what ends sessions; session records are kept unless you pass `--purge`, and credentials stay in your OS keychain either way.
@@ -107,7 +107,7 @@ It removes what install.sh installed and nothing else. A session still running m
 On Windows:
 
 ```console
-powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://jamstream.seanre.id/install.ps1 | iex"
 ```
 
 The script installs to `%LOCALAPPDATA%\Programs\jamstream` (set `JAMSTREAM_INSTALL_DIR` to pick the directory yourself) and adds that directory to your user Path; open a new terminal to pick it up.
@@ -115,7 +115,7 @@ The script installs to `%LOCALAPPDATA%\Programs\jamstream` (set `JAMSTREAM_INSTA
 Flags need the script saved first, because `iex` cannot pass them:
 
 ```powershell
-irm https://sean-reid.github.io/jamstream/install.ps1 -OutFile install.ps1
+irm https://jamstream.seanre.id/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -WithApp
 ```
 
@@ -124,7 +124,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -WithApp
 Uninstalling on Windows is the same shape:
 
 ```console
-powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/uninstall.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://jamstream.seanre.id/uninstall.ps1 | iex"
 ```
 
 It removes the binaries install.ps1 put in place and nothing else. A session still running makes it stop and say so. Your session records and local recordings are kept unless you pass `-Purge` (saved-script form again), which deletes both; credentials stay in Credential Manager either way.
