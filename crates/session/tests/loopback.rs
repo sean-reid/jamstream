@@ -666,8 +666,8 @@ fn chat_from_field_is_forced_by_server() {
 
     h.clients[0].core.send_chat("hello").unwrap();
     h.run_ms(100);
-    for i in 0..2 {
-        assert!(h.clients[i].events.contains(&ClientEvent::Chat {
+    for client in &h.clients[..2] {
+        assert!(client.events.contains(&ClientEvent::Chat {
             from: MemberId(0),
             text: "hello".into()
         }));
@@ -685,12 +685,12 @@ fn chat_from_field_is_forced_by_server() {
         },
     );
     h.run_ms(100);
-    for i in 0..2 {
-        assert!(h.clients[i].events.contains(&ClientEvent::Chat {
+    for client in &h.clients[..2] {
+        assert!(client.events.contains(&ClientEvent::Chat {
             from: MemberId(3),
             text: "spoof".into()
         }));
-        assert!(!h.clients[i].events.contains(&ClientEvent::Chat {
+        assert!(!client.events.contains(&ClientEvent::Chat {
             from: MemberId(0),
             text: "spoof".into()
         }));
@@ -708,15 +708,13 @@ fn metronome_host_controls_and_clicks() {
 
     h.clients[0].core.set_metronome(120, 4, true).unwrap();
     h.run_ms(250);
-    for i in 0..3 {
+    for (i, client) in h.clients.iter().enumerate().take(3) {
         assert!(
-            h.clients[i]
-                .events
-                .contains(&ClientEvent::MetronomeChanged {
-                    bpm: 120,
-                    beats_per_bar: 4,
-                    enabled: true
-                }),
+            client.events.contains(&ClientEvent::MetronomeChanged {
+                bpm: 120,
+                beats_per_bar: 4,
+                enabled: true
+            }),
             "client {i} missed the metronome change"
         );
     }

@@ -34,60 +34,48 @@ pub fn budget(laptop: Duration) -> Duration {
     Duration::from_secs_f64(laptop.as_secs_f64() * budget_scale(raw.as_deref()))
 }
 
-#[cfg(windows)]
-pub const BIN_NAME: &str = "jamstreamd.exe";
-#[cfg(not(windows))]
-pub const BIN_NAME: &str = "jamstreamd";
-
 /// Builds (if needed) and returns the jamstreamd binary for this profile.
 ///
 /// CARGO_BIN_EXE_<name> only covers binaries of the package under test, so
-/// the cli tests cannot ask Cargo for jamstreamd directly. Instead this
-/// derives the profile directory from the test's own executable path
-/// (target/<profile>/deps/<test>-<hash>), runs `cargo build -p
-/// jamstream-server --bin jamstreamd` against the workspace to guarantee
-/// the binary exists and is fresh (a no-op when it already is), and returns
-/// target/<profile>/jamstreamd for JAMSTREAMD_PATH.
+/// the cli tests cannot ask Cargo for jamstreamd directly. Instead this runs
+/// `cargo build -p jamstream-server --bin jamstreamd` against the workspace,
+/// which guarantees the binary exists and is fresh, and takes its path from
+/// Cargo's own artifact report so the target layout does not matter.
 pub fn jamstreamd_binary() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let profile_dir = exe
-        .parent() // deps/
-        .and_then(|d| d.parent()) // target/<profile>/
-        .expect("test executable must sit in target/<profile>/deps")
-        .to_path_buf();
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
 
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut build = std::process::Command::new(cargo);
-    build.args(["build", "-p", "jamstream-server", "--bin", "jamstreamd"]);
-    if profile_dir.file_name().is_some_and(|n| n == "release") {
+    build.args([
+        "build",
+        "--locked",
+        "-p",
+        "jamstream-server",
+        "--bin",
+        "jamstreamd",
+        "--message-format=json-render-diagnostics",
+    ]);
+    if !cfg!(debug_assertions) {
         build.arg("--release");
     }
-    let status = build.current_dir(&workspace).status();
-
-    let binary = profile_dir.join(BIN_NAME);
-    match status {
-        Ok(s) if s.success() => {}
-        // A failed or unavailable cargo is tolerable if an earlier build
-        // already produced the binary; without one the test cannot run.
-        _ if binary.is_file() => eprintln!(
-            "warning: cargo build -p jamstream-server failed; using the existing {}",
-            binary.display()
-        ),
-        _ => panic!(
-            "cannot build jamstreamd and none exists at {}; \
-             run `cargo build -p jamstream-server` first",
-            binary.display()
-        ),
-    }
+    let output = build
+        .current_dir(&workspace)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("run cargo build -p jamstream-server");
     assert!(
-        binary.is_file(),
-        "cargo build succeeded but {} is missing; unusual target layout?",
-        binary.display()
+        output.status.success(),
+        "cargo build -p jamstream-server failed"
     );
-    binary
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "jamstreamd")
+        .find_map(|m| m["executable"].as_str().map(PathBuf::from))
+        .expect("cargo did not report a jamstreamd executable")
 }
 
 /// Bind-then-drop; racy in principle, unique enough in practice.
