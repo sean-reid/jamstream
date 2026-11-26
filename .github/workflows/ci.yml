@@ -430,7 +430,7 @@ jobs:
         if: needs.changes.outputs.docs-only != 'true'
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
         if: needs.changes.outputs.docs-only != 'true'
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         if: needs.changes.outputs.docs-only != 'true'
 
   # The only gate that reads doc comments. An intra-doc link to an item that
@@ -556,7 +556,7 @@ jobs:
         run: scripts/install-pinned-mediamtx.sh "$RUNNER_TEMP/pinned-mediamtx"
       - if: needs.changes.outputs.docs-only != 'true' && (runner.os == 'Linux')
         run: echo "$RUNNER_TEMP/pinned-mediamtx" >> "$GITHUB_PATH"
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         if: needs.changes.outputs.docs-only != 'true'
         with:
           tool: cargo-nextest
@@ -739,7 +739,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: needs.changes.outputs.docs-only != 'true'
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         if: needs.changes.outputs.docs-only != 'true'
         with:
           tool: cargo-nextest
@@ -799,7 +799,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # cargo-nextest for the same reason the test and harness jobs install
       # it: the runs below go through `cargo llvm-cov nextest`.
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev libdbus-1-dev
