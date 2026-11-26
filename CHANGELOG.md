@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.7](https://github.com/sean-reid/jamstream/compare/v0.5.6...v0.5.7) (2026-11-26)
+
+
+### Features
+
+* pick which input pair a wider interface sends ([#651](https://github.com/sean-reid/jamstream/issues/651)) ([1933bed](https://github.com/sean-reid/jamstream/commit/1933bed8db4724991325e0b64e3d8f65ede65169))
+
+
+### Bug Fixes
+
+* point the site, installers and package metadata at jamstream.seanre.id ([#656](https://github.com/sean-reid/jamstream/issues/656)) ([f2f06e4](https://github.com/sean-reid/jamstream/commit/f2f06e453b07db45610043382cbb391fc0cf1070))
+* update url for RUSTSEC-2026-0592 and build cleanly on Rust 1.100 ([#657](https://github.com/sean-reid/jamstream/issues/657)) ([30f37e7](https://github.com/sean-reid/jamstream/commit/30f37e7374317fb83c40c98dea7566367541f9e7))
+
 ## [0.5.6](https://github.com/sean-reid/jamstream/compare/v0.5.5...v0.5.6) (2026-10-30)
 
 
