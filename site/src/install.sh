@@ -2,7 +2,7 @@
 # JamStream CLI installer. This file lives in site/src/ so mdBook copies it
 # verbatim into the built site, which serves it at /install.sh:
 #
-#   curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
+#   curl -fsSL https://jamstream.seanre.id/install.sh | sh
 #
 # Downloads the jamstream CLI from a GitHub release, verifies its sha256
 # against that release's SHA256SUMS file, and installs it.
@@ -25,7 +25,7 @@
 set -eu
 
 REPO="sean-reid/jamstream"
-SITE_URL="https://sean-reid.github.io/jamstream"
+SITE_URL="https://jamstream.seanre.id"
 
 if [ -t 1 ]; then
   bold=$(tput bold 2>/dev/null) || bold=""

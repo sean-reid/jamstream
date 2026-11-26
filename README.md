@@ -11,7 +11,7 @@ with personal invite links, and the bill goes to the host's provider by the
 second. A local session costs nothing.
 
 In beta. Downloads for macOS, Windows, and Linux, and the full guide, are
-at [sean-reid.github.io/jamstream](https://sean-reid.github.io/jamstream/).
+at [jamstream.seanre.id](https://jamstream.seanre.id/).
 
 ## Build from source
 

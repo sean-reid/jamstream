@@ -925,7 +925,7 @@ fn parse_ingress(xml: &str) -> Vec<IngressRule> {
 /// The AWS setup page in the published user reference. A missing action is
 /// a policy the host has to edit, not a bug, so the error points at the
 /// page that has the policy to paste.
-const AWS_SETUP_URL: &str = "https://sean-reid.github.io/jamstream/guides/providers/aws.html";
+const AWS_SETUP_URL: &str = "https://jamstream.seanre.id/guides/providers/aws.html";
 
 /// AWS appends `Encoded authorization failure message: <~700 characters of
 /// base64>` to UnauthorizedOperation. Decoding it takes

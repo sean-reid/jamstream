@@ -1,7 +1,7 @@
 # JamStream uninstaller for Windows, the pair of install.ps1. Served by the
 # site at /uninstall.ps1 the same way:
 #
-#   powershell -ExecutionPolicy Bypass -c "irm https://sean-reid.github.io/jamstream/uninstall.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://jamstream.seanre.id/uninstall.ps1 | iex"
 #
 # Removes what install.ps1 installed and nothing else: the JamStream
 # binaries from the install directory, and the directory itself once it is
@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
     Write-Host 'This is the Windows uninstaller; on macOS and Linux run:'
-    Write-Host '  curl -fsSL https://sean-reid.github.io/jamstream/uninstall.sh | sh'
+    Write-Host '  curl -fsSL https://jamstream.seanre.id/uninstall.sh | sh'
     exit 1
 }
 

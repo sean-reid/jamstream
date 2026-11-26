@@ -98,7 +98,7 @@ The Invites tab works exactly as in the local path; the links now work from anyw
 The `jamstream` CLI hosts, monitors, and ends the same sessions, for scripts, automation, and machines without a display. One line installs it on macOS and Linux (the [Download](download.md) page has the Windows line and every artifact):
 
 ```console
-$ curl -fsSL https://sean-reid.github.io/jamstream/install.sh | sh
+$ curl -fsSL https://jamstream.seanre.id/install.sh | sh
 ```
 
 Cloud credentials come from the environment (for example `DIGITALOCEAN_TOKEN`); local hosting with the CLI alone also needs a `jamstreamd` on this computer, which the install script's `--with-server` flag provides on Linux.
